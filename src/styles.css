@@ -1,0 +1,57 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace;
+
+  --color-octo-bg: #0a0a0b;
+  --color-octo-panel: #101013;
+  --color-octo-border: #1f1f25;
+  --color-octo-accent: #a78bfa;
+  --color-octo-accent-dim: #7c6dd8;
+  --color-octo-success: #34d399;
+  --color-octo-warning: #fbbf24;
+  --color-octo-danger: #f87171;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* xterm container */
+.xterm-container {
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  background: var(--color-octo-bg);
+}
+
+.xterm-container .xterm,
+.xterm-container .xterm .xterm-viewport,
+.xterm-container .xterm .xterm-screen {
+  background: var(--color-octo-bg) !important;
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--color-octo-border);
+  border-radius: 4px;
+}
+
+/* Make terminal text selectable */
+.xterm .xterm-screen {
+  user-select: text;
+}

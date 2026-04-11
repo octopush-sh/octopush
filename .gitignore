@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+dist-ssr/
+build/
+*.local
+
+# Rust / Cargo
+src-tauri/target/
+src-tauri/gen/schemas/
+Cargo.lock
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.zed/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Octopus runtime data
+~/.octopus-sh/
+octopus.db
+octopus.db-journal
