@@ -38,6 +38,37 @@ pub fn is_git_repo(path: &Path) -> bool {
     Repository::open(path).is_ok()
 }
 
+/// Return the name of the default branch, or None if the repo has no commits.
+pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
+    let repo = open_repo(path)?;
+    let result = match repo.head() {
+        Ok(head) => head.shorthand().map(String::from),
+        Err(_) => None, // Empty repo — no HEAD
+    };
+    Ok(result)
+}
+
+/// Ensure the repo has at least one commit (needed before creating branches).
+/// If the repo is empty, creates an initial empty commit on "main".
+pub fn ensure_initial_commit(path: &Path) -> AppResult<()> {
+    let repo = open_repo(path)?;
+    if repo.head().is_ok() {
+        return Ok(()); // Already has commits
+    }
+    // Create an initial empty commit
+    let sig = repo.signature()
+        .or_else(|_| git2::Signature::now("Octopus sh", "octopus@localhost"))
+        .map_err(|e| AppError::Other(format!("git signature: {e}")))?;
+    let tree_id = repo.index()
+        .and_then(|mut idx| { idx.write()?; idx.write_tree() })
+        .map_err(|e| AppError::Other(format!("write tree: {e}")))?;
+    let tree = repo.find_tree(tree_id)
+        .map_err(|e| AppError::Other(format!("find tree: {e}")))?;
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+        .map_err(|e| AppError::Other(format!("initial commit: {e}")))?;
+    Ok(())
+}
+
 pub fn get_status(path: &Path) -> AppResult<GitStatus> {
     let repo = open_repo(path)?;
     let branch = current_branch(&repo);

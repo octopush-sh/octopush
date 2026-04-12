@@ -430,7 +430,15 @@ pub async fn create_workspace(
 ) -> AppResult<crate::db::WorkspaceRow> {
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
-    crate::git_ops::create_branch(project_path, &branch, &from_branch)?;
+
+    // Ensure the repo has at least one commit (empty repos can't branch).
+    crate::git_ops::ensure_initial_commit(project_path)?;
+
+    // Detect the actual default branch instead of assuming "main".
+    let base = crate::git_ops::default_branch(project_path)?
+        .unwrap_or_else(|| from_branch.clone());
+
+    crate::git_ops::create_branch(project_path, &branch, &base)?;
     let wt_path = project_path.parent().unwrap_or(project_path)
         .join(format!(".octopus-worktrees/{}", &branch));
     crate::git_ops::create_worktree(project_path, &branch, &wt_path)?;

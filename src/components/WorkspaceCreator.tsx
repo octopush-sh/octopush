@@ -23,6 +23,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
   const [task, setTask] = useState("");
   const [setupScript, setSetupScript] = useState("");
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
 
@@ -32,9 +33,12 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
   async function handleCreate() {
     if (!task.trim()) return;
     setCreating(true);
+    setError(null);
     try {
       await create(projectId, projectPath, workspaceName, task.trim(), branch, "main", setupScript);
       onCreated();
+    } catch (e) {
+      setError(String(e));
     } finally {
       setCreating(false);
     }
@@ -147,6 +151,12 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
           <ChevronDown size={12} />
           Teardown commands (optional)
         </button>
+
+        {error && (
+          <div className="mt-4 rounded-md border border-octo-danger/40 bg-octo-danger/10 px-3 py-2 text-xs text-octo-danger">
+            {error}
+          </div>
+        )}
 
         {/* Actions */}
         <div className="mt-6 flex items-center justify-between">
