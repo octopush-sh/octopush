@@ -432,6 +432,15 @@ function App() {
             onViewChange={(v) => {
               setView(v);
               setShowCreator(false);
+              // When switching category, select the active tab within that category
+              if (v !== "changes" && activeWorkspaceId) {
+                const tabs = tabsPerWorkspace[activeWorkspaceId] || [];
+                const currentActive = tabs.find(t => t.id === activeTabId);
+                if (!currentActive || currentActive.type !== v) {
+                  const firstOfType = tabs.find(t => t.type === v);
+                  if (firstOfType) setActiveTabId(firstOfType.id);
+                }
+              }
             }}
             onDeleteWorkspace={handleDeleteWorkspace}
             workspaceName={activeWorkspace.name}
