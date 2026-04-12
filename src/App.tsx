@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { WelcomeScreen } from "./components/WelcomeScreen";
 import { NewProjectFlow } from "./components/NewProjectFlow";
 import { ProjectSidebar } from "./components/ProjectSidebar";
-import { WorkspaceHub } from "./components/WorkspaceHub";
+import { WorkspaceBar } from "./components/WorkspaceBar";
 import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
@@ -16,7 +16,7 @@ import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useThemeStore } from "./stores/themeStore";
 import { ipc } from "./lib/ipc";
 
-type AppView = "welcome" | "new-project" | "hub" | "terminal" | "chat" | "changes";
+type AppView = "welcome" | "new-project" | "terminal" | "chat" | "changes";
 
 function App() {
   const project = useProjectStore((s) => s.current);
@@ -60,7 +60,7 @@ function App() {
   // When project becomes non-null, switch to hub and load workspaces
   useEffect(() => {
     if (project) {
-      setView("hub");
+      setView("chat");
       setShowCreator(false);
       loadWorkspaces(project.id);
     } else {
@@ -74,7 +74,7 @@ function App() {
   useEffect(() => {
     if (activeWorkspaceId && activeWorkspaceId !== prevWorkspaceRef.current) {
       const lastView = viewPerWorkspace[activeWorkspaceId];
-      _setView((lastView as AppView) || "hub");
+      _setView((lastView as AppView) || "chat");
       setShowCreator(false);
     }
     prevWorkspaceRef.current = activeWorkspaceId;
@@ -184,6 +184,24 @@ function App() {
 
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
 
+  // Delete workspace handler
+  const handleDeleteWorkspace = useCallback(async () => {
+    if (!activeWorkspace || !project) return;
+    const ok = window.confirm(
+      `Delete workspace "${activeWorkspace.name}" (${activeWorkspace.branch})?\n\nThis will delete the branch and worktree. Cannot be undone.`
+    );
+    if (!ok) return;
+    const { remove, workspaces: wsList, select } = useWorkspaceStore.getState();
+    await remove(activeWorkspace.id, project.path, activeWorkspace.branch, activeWorkspace.worktreePath ?? null);
+    // Select next workspace if available
+    const remaining = wsList.filter((w) => w.id !== activeWorkspace.id);
+    if (remaining.length > 0) {
+      select(remaining[0].id);
+    } else {
+      setShowCreator(true);
+    }
+  }, [activeWorkspace, project]);
+
   // Full-screen views (no sidebar)
   if (!project) {
     if (view === "new-project") {
@@ -212,7 +230,22 @@ function App() {
           projectPath={project.path}
           onCreated={() => {
             setShowCreator(false);
-            setView("hub");
+            setView("chat");
+          }}
+          onCancel={() => setShowCreator(false)}
+        />
+      );
+    }
+
+    if (!activeWorkspace) {
+      // No workspaces yet — prompt to create one
+      return (
+        <WorkspaceCreator
+          projectId={project!.id}
+          projectPath={project!.path}
+          onCreated={() => {
+            setShowCreator(false);
+            setView("chat");
           }}
           onCancel={() => setShowCreator(false)}
         />
@@ -221,21 +254,16 @@ function App() {
 
     switch (view) {
       case "terminal":
-        if (activeWorkspaceId && terminalSessions[activeWorkspaceId]) {
+        if (activeWorkspaceId && !terminalSessions[activeWorkspaceId]) {
+          // Session still being created — show loading
           return (
-            <TerminalPane
-              sessionId={terminalSessions[activeWorkspaceId]}
-              visible
-              layoutVersion={layoutVersion}
-            />
+            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              Starting terminal...
+            </div>
           );
         }
-        // Session still being created — show loading
-        return (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-            Starting terminal...
-          </div>
-        );
+        // Terminal is rendered persistently below, this returns null so the persistent div shows through
+        return null;
 
       case "chat":
         if (activeWorkspaceId) {
@@ -259,28 +287,8 @@ function App() {
         }
         return null;
 
-      case "hub":
       default:
-        if (!activeWorkspace) {
-          // No workspaces yet — prompt to create one
-          return (
-            <WorkspaceCreator
-              projectId={project!.id}
-              projectPath={project!.path}
-              onCreated={() => {
-                setShowCreator(false);
-                setView("hub");
-              }}
-              onCancel={() => setView("hub")}
-            />
-          );
-        }
-        return (
-          <WorkspaceHub
-            onOpenTerminal={openTerminal}
-            onOpenChat={openChat}
-          />
-        );
+        return null;
     }
   }
 
@@ -293,9 +301,44 @@ function App() {
       )}
 
       <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+        {activeWorkspace && (
+          <WorkspaceBar
+            activeView={view}
+            onViewChange={(v) => {
+              if (v === "terminal") {
+                openTerminal();
+              } else {
+                setView(v);
+                setShowCreator(false);
+              }
+            }}
+            onDeleteWorkspace={handleDeleteWorkspace}
+            workspaceName={activeWorkspace.name}
+            branch={activeWorkspace.branch}
+          />
+        )}
+
         <div className="relative flex min-w-0 flex-1 overflow-hidden">
           <div className="min-w-0 flex-1 overflow-hidden">
             {renderMainContent()}
+
+            {/* Terminal — always rendered for active workspaces, shown/hidden via CSS */}
+            {Object.entries(terminalSessions).map(([wsId, sessionId]) => (
+              <div
+                key={wsId}
+                style={{
+                  display: wsId === activeWorkspaceId && view === "terminal" ? "block" : "none",
+                  width: "100%",
+                  height: "100%",
+                }}
+              >
+                <TerminalPane
+                  sessionId={sessionId}
+                  visible={wsId === activeWorkspaceId && view === "terminal"}
+                  layoutVersion={layoutVersion}
+                />
+              </div>
+            ))}
           </div>
 
           {showTokens && <TokenDashboard />}
