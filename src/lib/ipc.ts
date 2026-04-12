@@ -2,10 +2,14 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AdapterInfo,
   BudgetStatus,
   CreateSessionArgs,
+  ModelSuggestion,
+  ModelWithProvider,
   Session,
   SessionTemplate,
+  TaskType,
   TokenEvent,
   TokenReport,
 } from "./types";
@@ -56,4 +60,15 @@ export const ipc = {
 
   deleteTemplate: (name: string) =>
     invoke<void>("delete_template", { name }),
+
+  // ─── Providers / Agents ───────────────────────────────────────
+  listModels: () => invoke<ModelWithProvider[]>("list_models"),
+
+  suggestModel: (taskType: TaskType) =>
+    invoke<ModelSuggestion>("suggest_model", { taskType }),
+
+  listAdapters: () => invoke<AdapterInfo[]>("list_adapters"),
+
+  switchAgent: (sessionId: string, newModel: string) =>
+    invoke<Session>("switch_agent", { sessionId, newModel }),
 };

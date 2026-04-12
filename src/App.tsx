@@ -3,12 +3,14 @@ import { SessionSidebar } from "./components/SessionSidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { TokenDashboard } from "./components/TokenDashboard";
 import { NewSessionDialog } from "./components/NewSessionDialog";
+import { ModelSwitcher, ModelSwitcherButton } from "./components/ModelSwitcher";
 import { useSessionStore } from "./stores/sessionStore";
 
 function App() {
   const { sessions, activeId, refresh } = useSessionStore();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [showTokens, setShowTokens] = useState(false);
+  const [showModelSwitcher, setShowModelSwitcher] = useState(false);
 
   useEffect(() => {
     refresh();
@@ -26,6 +28,10 @@ function App() {
         e.preventDefault();
         setShowTokens((v) => !v);
       }
+      if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
+        e.preventDefault();
+        setShowModelSwitcher((v) => !v);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -41,13 +47,14 @@ function App() {
     <div className="flex h-screen w-screen bg-octo-bg text-zinc-100">
       <SessionSidebar onNewSession={() => setDialogOpen(true)} />
 
-      <main className="flex flex-1 flex-col">
+      <main className="relative flex flex-1 flex-col">
         {active ? (
           <Titlebar
             name={active.name}
             model={active.agent.model}
             showTokens={showTokens}
             onToggleTokens={() => setShowTokens((v) => !v)}
+            onToggleModel={() => setShowModelSwitcher((v) => !v)}
           />
         ) : null}
 
@@ -68,6 +75,12 @@ function App() {
 
           {showTokens && <TokenDashboard />}
         </div>
+
+        {/* Model switcher dropdown */}
+        <ModelSwitcher
+          open={showModelSwitcher}
+          onClose={() => setShowModelSwitcher(false)}
+        />
       </main>
 
       <NewSessionDialog
@@ -83,11 +96,13 @@ function Titlebar({
   model,
   showTokens,
   onToggleTokens,
+  onToggleModel,
 }: {
   name: string;
   model: string;
   showTokens: boolean;
   onToggleTokens: () => void;
+  onToggleModel: () => void;
 }) {
   return (
     <header
@@ -97,7 +112,7 @@ function Titlebar({
       <div className="flex items-center gap-2 text-sm">
         <span className="font-mono font-medium">{name}</span>
         <span className="text-zinc-600">•</span>
-        <span className="text-xs text-zinc-500">{model}</span>
+        <ModelSwitcherButton model={model} onClick={onToggleModel} />
       </div>
       <button
         onClick={onToggleTokens}

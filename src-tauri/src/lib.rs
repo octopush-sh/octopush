@@ -1,9 +1,11 @@
 //! Octopus sh — native core.
 
+pub mod agent_adapter;
 mod commands;
 pub mod context_guard;
 mod db;
 mod error;
+pub mod provider_router;
 mod pty_manager;
 mod session;
 mod state;
@@ -47,6 +49,12 @@ pub fn run() {
             commands::list_templates,
             commands::save_template,
             commands::delete_template,
+            // Providers / Agents
+            commands::list_providers,
+            commands::list_models,
+            commands::suggest_model,
+            commands::list_adapters,
+            commands::switch_agent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

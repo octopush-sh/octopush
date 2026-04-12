@@ -6,6 +6,7 @@ use crate::pty_manager::SpawnOptions;
 use crate::session::{CreateSessionArgs, Session, SessionStatus};
 use crate::state::AppState;
 use crate::token_engine::{BudgetStatus, TokenEvent, TokenReport};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::Path;
 use tauri::{AppHandle, State};
@@ -182,6 +183,55 @@ pub async fn save_template(
 #[tauri::command]
 pub async fn delete_template(name: String) -> AppResult<()> {
     crate::template::delete_template(&name)
+}
+
+// ─── Provider / Agent commands ────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_providers(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::provider_router::ProviderConfig>> {
+    Ok(state.router.lock().list_providers().into_iter().cloned().collect())
+}
+
+#[tauri::command]
+pub async fn list_models(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::provider_router::ModelWithProvider>> {
+    Ok(state.router.lock().list_models())
+}
+
+#[tauri::command]
+pub async fn suggest_model(
+    state: State<'_, AppState>,
+    task_type: crate::provider_router::TaskType,
+) -> AppResult<crate::provider_router::ModelSuggestion> {
+    Ok(state.router.lock().suggest_model(&task_type))
+}
+
+#[tauri::command]
+pub async fn list_adapters() -> AppResult<Vec<crate::agent_adapter::AdapterInfo>> {
+    Ok(crate::agent_adapter::adapter_info_list())
+}
+
+#[tauri::command]
+pub async fn switch_agent(
+    state: State<'_, AppState>,
+    session_id: String,
+    new_model: String,
+) -> AppResult<crate::session::Session> {
+    // Update session's agent config in DB.
+    let mut session = state
+        .db
+        .lock()
+        .get_session(&session_id)?
+        .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
+
+    session.agent.model = new_model;
+    session.last_active = chrono::Utc::now();
+    state.db.lock().upsert_session(&session)?;
+
+    Ok(session)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────

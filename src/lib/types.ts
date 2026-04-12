@@ -111,6 +111,48 @@ export interface BudgetStatus {
 
 // ─── Templates ────────────────────────────────────────────────────
 
+// ─── Providers / Models ───────────────────────────────────────────
+
+export interface ModelInfo {
+  id: string;
+  displayName: string;
+  inputCostPerM: number;
+  outputCostPerM: number;
+  maxContext: number;
+  supportsVision: boolean;
+  supportsTools: boolean;
+}
+
+export interface ModelWithProvider {
+  provider: string;
+  model: ModelInfo;
+}
+
+export interface ModelSuggestion {
+  modelId: string;
+  provider: string;
+  reason: string;
+  estimatedCostTier: "low" | "medium" | "high";
+}
+
+export type TaskType =
+  | "code_review"
+  | "architecture"
+  | "quick_fix"
+  | "debugging"
+  | "documentation"
+  | "testing"
+  | "refactoring"
+  | "general";
+
+export interface AdapterInfo {
+  name: string;
+  displayName: string;
+  supportsHotSwap: boolean;
+}
+
+// ─── Templates ────────────────────────────────────────────────────
+
 export interface SessionTemplate {
   name: string;
   projectRoot: string;
