@@ -124,7 +124,7 @@ function App() {
         <SessionSidebar onNewSession={() => setDialogOpen(true)} />
       )}
 
-      <main className="relative flex flex-1 flex-col">
+      <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
         {active ? (
           <Titlebar
             name={active.name}
@@ -135,7 +135,7 @@ function App() {
           />
         ) : null}
 
-        <div className="relative flex flex-1 overflow-hidden">
+        <div className="relative flex min-w-0 flex-1 overflow-hidden">
           {aliveSessions.length === 0 && !active ? (
             <div className="min-w-0 flex-1">
               <EmptyMain onNewSession={() => setDialogOpen(true)} />
