@@ -4,7 +4,7 @@ import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
 import { AgentBar } from "./AgentBar";
 import { ChatMessage } from "./ChatMessage";
-import { ToolCallCard } from "./ToolCallCard";
+// import { ToolCallCard } from "./ToolCallCard";
 
 interface Props {
   workspaceId: string;
@@ -122,9 +122,11 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         ) : (
           <>
             {/* Render the timeline: messages + tool cards interleaved */}
-            {timeline.map((item) =>
+            {timeline.map((item, idx) =>
               item.kind === "tool" ? (
-                <ToolCallCard key={`tool-${item.id}`} tool={item.tool} workspacePath={workspacePath} />
+                <div key={`tool-${item.id}`} style={{ background: "red", color: "white", padding: 12, borderRadius: 8, margin: "4px 0" }}>
+                  TOOL #{idx}: {item.tool.toolName} — {JSON.stringify(item.tool.toolInput).slice(0, 80)}
+                </div>
               ) : (
                 <ChatMessage key={item.message.id} message={item.message} />
               ),
