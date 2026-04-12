@@ -3,6 +3,7 @@ import { WelcomeScreen } from "./components/WelcomeScreen";
 import { NewProjectFlow } from "./components/NewProjectFlow";
 import { ProjectSidebar } from "./components/ProjectSidebar";
 import { WorkspaceBar } from "./components/WorkspaceBar";
+import type { WorkspaceTab } from "./components/WorkspaceBar";
 import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
@@ -27,6 +28,10 @@ function App() {
   const [viewPerWorkspace, setViewPerWorkspace] = useState<Record<string, string>>({});
   const [showSidebar, setShowSidebar] = useState(true);
 
+  // Multi-tab state
+  const [tabsPerWorkspace, setTabsPerWorkspace] = useState<Record<string, WorkspaceTab[]>>({});
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+
   // Wrapper that tracks per-workspace view
   const setView = useCallback((v: AppView) => {
     _setView(v);
@@ -40,8 +45,6 @@ function App() {
   const [showCreator, setShowCreator] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
-  // Map of workspaceId -> sessionId for terminal sessions
-  const [terminalSessions, setTerminalSessions] = useState<Record<string, string>>({});
   const creatingSessionRef = useRef<Set<string>>(new Set());
 
   const layoutVersionRef = useRef(0);
@@ -51,6 +54,17 @@ function App() {
     layoutVersionRef.current += 1;
     setLayoutVersion(layoutVersionRef.current);
   }, []);
+
+  // Ensure tabs exist for a workspace, returns current tabs
+  const ensureTabs = useCallback((wsId: string): WorkspaceTab[] => {
+    const existing = tabsPerWorkspace[wsId];
+    if (existing && existing.length > 0) return existing;
+    const initial: WorkspaceTab[] = [
+      { id: `chat-${wsId}`, type: "chat", label: "Chat", conversationId: wsId },
+    ];
+    setTabsPerWorkspace((prev) => ({ ...prev, [wsId]: initial }));
+    return initial;
+  }, [tabsPerWorkspace]);
 
   // Load theme on startup
   useEffect(() => {
@@ -69,51 +83,149 @@ function App() {
     }
   }, [project, loadWorkspaces]);
 
-  // When active workspace changes (sidebar click), restore last view or default to hub
+  // When active workspace changes (sidebar click), restore last view or default to chat
   const prevWorkspaceRef = useRef(activeWorkspaceId);
   useEffect(() => {
     if (activeWorkspaceId && activeWorkspaceId !== prevWorkspaceRef.current) {
-      const lastView = viewPerWorkspace[activeWorkspaceId];
-      _setView((lastView as AppView) || "chat");
+      const tabs = ensureTabs(activeWorkspaceId);
+      const lastView = viewPerWorkspace[activeWorkspaceId] as AppView || "chat";
+      _setView(lastView);
+      // Find a tab matching the last view, or fall back to first tab
+      if (lastView === "chat" || lastView === "terminal") {
+        const matchingTab = tabs.find((t) => t.type === lastView);
+        setActiveTabId(matchingTab?.id || tabs[0]?.id || null);
+      }
       setShowCreator(false);
     }
     prevWorkspaceRef.current = activeWorkspaceId;
   }, [activeWorkspaceId, viewPerWorkspace]);
 
-  // Create terminal session for a workspace if needed
-  const ensureTerminalSession = useCallback(async (workspaceId: string) => {
-    if (terminalSessions[workspaceId]) return;
-    if (creatingSessionRef.current.has(workspaceId)) return;
+  // Ensure terminal session for a tab
+  const ensureTerminalForTab = useCallback(async (tab: WorkspaceTab) => {
+    if (tab.sessionId) return;
+    if (!activeWorkspaceId) return;
+    if (creatingSessionRef.current.has(tab.id)) return;
 
-    creatingSessionRef.current.add(workspaceId);
+    creatingSessionRef.current.add(tab.id);
     try {
-      const ws = useWorkspaceStore.getState().workspaces.find((w) => w.id === workspaceId);
+      const ws = useWorkspaceStore.getState().workspaces.find((w) => w.id === activeWorkspaceId);
       const proj = useProjectStore.getState().current;
       if (!ws || !proj) return;
 
       const session = await ipc.createSession({
-        name: ws.name,
+        name: `${ws.name} - ${tab.label}`,
         projectRoot: ws.worktreePath || proj.path,
       });
-      setTerminalSessions((prev) => ({ ...prev, [workspaceId]: session.id }));
+      setTabsPerWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId!]: (prev[activeWorkspaceId!] || []).map((t) =>
+          t.id === tab.id ? { ...t, sessionId: session.id } : t
+        ),
+      }));
     } finally {
-      creatingSessionRef.current.delete(workspaceId);
+      creatingSessionRef.current.delete(tab.id);
     }
-  }, [terminalSessions]);
+  }, [activeWorkspaceId]);
 
-  // Handle switching to terminal view
+  // Tab actions
+  const addChatTab = useCallback(() => {
+    if (!activeWorkspaceId) return;
+    const newId = `chat-${Date.now()}`;
+    const convId = crypto.randomUUID ? crypto.randomUUID() : `conv-${Date.now()}`;
+    const existing = tabsPerWorkspace[activeWorkspaceId] || [];
+    const chatCount = existing.filter((t) => t.type === "chat").length;
+    const tab: WorkspaceTab = {
+      id: newId,
+      type: "chat",
+      label: `Chat ${chatCount + 1}`,
+      conversationId: convId,
+    };
+    setTabsPerWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: [...(prev[activeWorkspaceId] || []), tab],
+    }));
+    setActiveTabId(newId);
+    setView("chat");
+  }, [activeWorkspaceId, tabsPerWorkspace, setView]);
+
+  const addTerminalTab = useCallback(() => {
+    if (!activeWorkspaceId) return;
+    const newId = `term-${Date.now()}`;
+    const existing = tabsPerWorkspace[activeWorkspaceId] || [];
+    const termCount = existing.filter((t) => t.type === "terminal").length;
+    const tab: WorkspaceTab = {
+      id: newId,
+      type: "terminal",
+      label: `Terminal ${termCount + 1}`,
+    };
+    setTabsPerWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: [...(prev[activeWorkspaceId] || []), tab],
+    }));
+    setActiveTabId(newId);
+    setView("terminal");
+  }, [activeWorkspaceId, tabsPerWorkspace, setView]);
+
+  const closeTab = useCallback((tabId: string) => {
+    if (!activeWorkspaceId) return;
+    const tabs = tabsPerWorkspace[activeWorkspaceId] || [];
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    // Don't close the last tab of a type
+    const sameType = tabs.filter((t) => t.type === tab.type);
+    if (sameType.length <= 1) return;
+    const newTabs = tabs.filter((t) => t.id !== tabId);
+    setTabsPerWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: newTabs }));
+    // If closing the active tab, switch to another of the same type
+    if (activeTabId === tabId) {
+      const next = newTabs.find((t) => t.type === tab.type);
+      if (next) {
+        setActiveTabId(next.id);
+      }
+    }
+  }, [activeWorkspaceId, tabsPerWorkspace, activeTabId]);
+
+  const selectTab = useCallback((tabId: string) => {
+    const tabs = tabsPerWorkspace[activeWorkspaceId || ""] || [];
+    const tab = tabs.find((t) => t.id === tabId);
+    if (tab) {
+      setActiveTabId(tabId);
+      setView(tab.type);
+      // If it's a terminal tab without a session, create one
+      if (tab.type === "terminal" && !tab.sessionId) {
+        ensureTerminalForTab(tab);
+      }
+    }
+  }, [activeWorkspaceId, tabsPerWorkspace, setView, ensureTerminalForTab]);
+
+  // Handle switching to terminal view (for keyboard shortcut)
   const openTerminal = useCallback(() => {
     if (!activeWorkspaceId) return;
-    setView("terminal");
     setShowCreator(false);
-    ensureTerminalSession(activeWorkspaceId);
-  }, [activeWorkspaceId, ensureTerminalSession]);
+    const tabs = tabsPerWorkspace[activeWorkspaceId] || ensureTabs(activeWorkspaceId);
+    const termTab = tabs.find((t) => t.type === "terminal");
+    if (termTab) {
+      setActiveTabId(termTab.id);
+      setView("terminal");
+      if (!termTab.sessionId) {
+        ensureTerminalForTab(termTab);
+      }
+    } else {
+      // No terminal tabs exist yet, create one
+      addTerminalTab();
+    }
+  }, [activeWorkspaceId, tabsPerWorkspace, ensureTabs, setView, ensureTerminalForTab, addTerminalTab]);
 
   const openChat = useCallback(() => {
     if (!activeWorkspaceId) return;
-    setView("chat");
     setShowCreator(false);
-  }, [activeWorkspaceId]);
+    const tabs = tabsPerWorkspace[activeWorkspaceId] || ensureTabs(activeWorkspaceId);
+    const chatTab = tabs.find((t) => t.type === "chat");
+    if (chatTab) {
+      setActiveTabId(chatTab.id);
+      setView("chat");
+    }
+  }, [activeWorkspaceId, tabsPerWorkspace, ensureTabs, setView]);
 
   const openChanges = useCallback(() => {
     setView("changes");
@@ -184,6 +296,9 @@ function App() {
 
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
 
+  // Current workspace tabs
+  const currentTabs = activeWorkspaceId ? (tabsPerWorkspace[activeWorkspaceId] || ensureTabs(activeWorkspaceId)) : [];
+
   // Delete workspace handler
   const handleDeleteWorkspace = useCallback(async () => {
     if (!activeWorkspace || !project) return;
@@ -253,9 +368,10 @@ function App() {
     }
 
     switch (view) {
-      case "terminal":
-        if (activeWorkspaceId && !terminalSessions[activeWorkspaceId]) {
-          // Session still being created — show loading
+      case "terminal": {
+        // Check if the active terminal tab has a session yet
+        const termTab = currentTabs.find((t) => t.id === activeTabId && t.type === "terminal");
+        if (termTab && !termTab.sessionId) {
           return (
             <div className="flex h-full items-center justify-center text-sm text-zinc-500">
               Starting terminal...
@@ -264,12 +380,14 @@ function App() {
         }
         // Terminal is rendered persistently below, this returns null so the persistent div shows through
         return null;
+      }
 
-      case "chat":
-        if (activeWorkspaceId) {
+      case "chat": {
+        const chatTab = currentTabs.find((t) => t.id === activeTabId && t.type === "chat");
+        if (chatTab?.conversationId) {
           return (
             <ChatView
-              workspaceId={activeWorkspaceId}
+              workspaceId={chatTab.conversationId}
               workspacePath={activeWorkspace?.worktreePath || project?.path || ""}
               onOpenSettings={() => setShowSettings(true)}
             />
@@ -280,6 +398,7 @@ function App() {
             Select a workspace to start chatting
           </div>
         );
+      }
 
       case "changes":
         if (project) {
@@ -303,14 +422,16 @@ function App() {
       <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
         {activeWorkspace && (
           <WorkspaceBar
+            tabs={currentTabs}
+            activeTabId={activeTabId}
             activeView={view}
+            onSelectTab={selectTab}
+            onAddChat={addChatTab}
+            onAddTerminal={addTerminalTab}
+            onCloseTab={closeTab}
             onViewChange={(v) => {
-              if (v === "terminal") {
-                openTerminal();
-              } else {
-                setView(v);
-                setShowCreator(false);
-              }
+              setView(v);
+              setShowCreator(false);
             }}
             onDeleteWorkspace={handleDeleteWorkspace}
             workspaceName={activeWorkspace.name}
@@ -322,23 +443,25 @@ function App() {
           <div className="min-w-0 flex-1 overflow-hidden">
             {renderMainContent()}
 
-            {/* Terminal — always rendered for active workspaces, shown/hidden via CSS */}
-            {Object.entries(terminalSessions).map(([wsId, sessionId]) => (
-              <div
-                key={wsId}
-                style={{
-                  display: wsId === activeWorkspaceId && view === "terminal" ? "block" : "none",
-                  width: "100%",
-                  height: "100%",
-                }}
-              >
-                <TerminalPane
-                  sessionId={sessionId}
-                  visible={wsId === activeWorkspaceId && view === "terminal"}
-                  layoutVersion={layoutVersion}
-                />
-              </div>
-            ))}
+            {/* Terminal tabs — always rendered for persistence, shown/hidden via CSS */}
+            {currentTabs
+              .filter((t) => t.type === "terminal" && t.sessionId)
+              .map((tab) => (
+                <div
+                  key={tab.id}
+                  style={{
+                    display: activeTabId === tab.id && view === "terminal" ? "block" : "none",
+                    width: "100%",
+                    height: "100%",
+                  }}
+                >
+                  <TerminalPane
+                    sessionId={tab.sessionId!}
+                    visible={activeTabId === tab.id && view === "terminal"}
+                    layoutVersion={layoutVersion}
+                  />
+                </div>
+              ))}
           </div>
 
           {showTokens && <TokenDashboard />}
