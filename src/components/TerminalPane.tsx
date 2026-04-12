@@ -9,9 +9,11 @@ import type { PtyDataEvent, PtyExitEvent } from "../lib/types";
 interface Props {
   sessionId: string;
   visible: boolean;
+  /** Incremented by parent when layout changes (sidebar/tokens/split toggle). */
+  layoutVersion?: number;
 }
 
-export function TerminalPane({ sessionId, visible }: Props) {
+export function TerminalPane({ sessionId, visible, layoutVersion }: Props) {
   // Outer wrapper — stable size, observed by ResizeObserver.
   const wrapperRef = useRef<HTMLDivElement>(null);
   // Inner container — where xterm attaches its DOM.
@@ -162,8 +164,6 @@ export function TerminalPane({ sessionId, visible }: Props) {
   // Refit + focus when becoming visible.
   useEffect(() => {
     if (visible) {
-      // Multiple attempts to ensure the container has layout dimensions.
-      // requestAnimationFrame alone isn't enough when CSS transitions are involved.
       const t1 = requestAnimationFrame(() => syncSize());
       const t2 = setTimeout(() => {
         syncSize();
@@ -177,6 +177,20 @@ export function TerminalPane({ sessionId, visible }: Props) {
       };
     }
   }, [visible, syncSize]);
+
+  // Refit when parent layout changes (sidebar/tokens/split toggled).
+  useEffect(() => {
+    if (!visible || layoutVersion === undefined) return;
+    // Give the browser time to recalculate the flex layout.
+    const t1 = requestAnimationFrame(() => syncSize());
+    const t2 = setTimeout(() => syncSize(), 100);
+    const t3 = setTimeout(() => syncSize(), 300);
+    return () => {
+      cancelAnimationFrame(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [layoutVersion, visible, syncSize]);
 
   return (
     <div

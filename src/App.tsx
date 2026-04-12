@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { TokenDashboard } from "./components/TokenDashboard";
@@ -18,6 +18,14 @@ function App() {
   const [showSidebar, setShowSidebar] = useState(true);
   /** ID of the second session shown in split view (null = no split). */
   const [splitId, setSplitId] = useState<string | null>(null);
+  /** Increments on any layout change that affects terminal container size. */
+  const layoutVersionRef = useRef(0);
+  const [layoutVersion, setLayoutVersion] = useState(0);
+
+  const bumpLayout = () => {
+    layoutVersionRef.current += 1;
+    setLayoutVersion(layoutVersionRef.current);
+  };
 
   const loadTheme = useThemeStore((s) => s.load);
 
@@ -37,6 +45,7 @@ function App() {
       if (mod && e.shiftKey && (e.key === "T" || e.key === "t")) {
         e.preventDefault();
         setShowTokens((v) => !v);
+        bumpLayout();
       }
       if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
         e.preventDefault();
@@ -48,6 +57,7 @@ function App() {
       }
       if (mod && !e.shiftKey && e.key === "d") {
         e.preventDefault();
+        bumpLayout();
         setSplitId((prev) => {
           if (prev) return null; // toggle off
           const { sessions: ss, activeId: aid } = useSessionStore.getState();
@@ -84,6 +94,7 @@ function App() {
       if (mod && e.key === "\\") {
         e.preventDefault();
         setShowSidebar((v) => !v);
+        bumpLayout();
       }
       // Ctrl+Tab — next session
       if (e.ctrlKey && e.key === "Tab") {
@@ -138,6 +149,7 @@ function App() {
                     key={s.id}
                     sessionId={s.id}
                     visible={s.id === activeId}
+                    layoutVersion={layoutVersion}
                   />
                 ))}
               </div>
@@ -151,6 +163,7 @@ function App() {
                       key={`split-${splitId}`}
                       sessionId={splitId}
                       visible
+                      layoutVersion={layoutVersion}
                     />
                   </div>
                 </>
