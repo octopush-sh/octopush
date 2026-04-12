@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { MessageSquare, ArrowUp, AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
-import { useChatStore } from "../stores/chatStore";
+import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
 import { AgentBar } from "./AgentBar";
 import { ChatMessage } from "./ChatMessage";
 import { ToolCallCard } from "./ToolCallCard";
@@ -27,10 +27,27 @@ const AGENT_NAMES: Record<string, string> = {
 };
 
 export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) {
-  const { messages, streaming, streamBuffer, model, error, loadHistory, send, setModel, clearError, getTimeline } =
+  const { messages, streaming, streamBuffer, model, error, loadHistory, send, setModel, clearError } =
     useChatStore();
 
-  const timeline = getTimeline();
+  // Compute timeline directly from messages — no store indirection.
+  const timeline = useMemo<ConversationItem[]>(() => {
+    const items: ConversationItem[] = [];
+    for (const msg of messages) {
+      const role = String(msg.role);
+      if (role === "tool") {
+        try {
+          const tool: ToolExecution = JSON.parse(msg.content);
+          items.push({ kind: "tool", tool, id: msg.id });
+        } catch {
+          items.push({ kind: "message", message: msg });
+        }
+      } else {
+        items.push({ kind: "message", message: msg });
+      }
+    }
+    return items;
+  }, [messages]);
 
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -41,30 +58,13 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
     loadHistory(workspaceId);
   }, [workspaceId, loadHistory]);
 
-  // Auto-scroll ONLY during active streaming (while agent is working).
-  // When streaming ends and DB reloads messages, do NOT scroll —
-  // the tool cards would be yanked above the viewport.
-  const prevStreamingRef = useRef(false);
+  // Simple scroll: follow during streaming only.
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
     if (streaming) {
-      // During streaming: always scroll to bottom to follow progress.
-      el.scrollTop = el.scrollHeight;
-    } else if (prevStreamingRef.current && !streaming) {
-      // Just stopped streaming: scroll to show the first tool card
-      // after the last user message, not the very bottom.
-      // Find the last user message bubble and scroll it into view.
-      const userBubbles = el.querySelectorAll("[data-role='user']");
-      if (userBubbles.length > 0) {
-        const lastUser = userBubbles[userBubbles.length - 1] as HTMLElement;
-        lastUser.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
     }
-
-    prevStreamingRef.current = streaming;
-  }, [streaming, messages, streamBuffer]);
+  }, [streaming, streamBuffer]);
 
   // Auto-grow textarea
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
@@ -106,6 +106,11 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         ref={scrollRef}
         className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4"
       >
+        {/* DEBUG: visible counter — remove after fixing */}
+        <div className="shrink-0 rounded bg-zinc-800 px-2 py-1 text-[10px] font-mono text-octo-warning">
+          msgs={messages.length} timeline={timeline.length} tools={timeline.filter(i => i.kind === "tool").length} roles=[{messages.map(m => String(m.role)[0]).join(",")}]
+        </div>
+
         {messages.length === 0 && !streaming ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
             <MessageSquare size={36} className="text-zinc-700" />
