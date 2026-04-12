@@ -468,28 +468,47 @@ impl ChatEngine {
             // Execute each tool, persist to DB, and collect results.
             let mut tool_results: Vec<serde_json::Value> = Vec::new();
             for (tool_id, tool_name, tool_input) in &tool_uses {
+                tracing::info!(tool = %tool_name, "executing tool");
                 let result = execute_tool(&workspace_path, tool_name, tool_input);
+
+                // For persistence and events, strip large file contents from
+                // the input (the file is already on disk). This prevents
+                // multi-KB JSON payloads that slow down events and DB.
+                let input_for_display = if tool_name == "write_file" {
+                    let mut display = tool_input.clone();
+                    if let Some(content) = display.get("content").and_then(|c| c.as_str()) {
+                        let len = content.len();
+                        display["content"] = serde_json::json!(format!("({len} chars, written to disk)"));
+                    }
+                    display
+                } else {
+                    tool_input.clone()
+                };
 
                 // Persist tool execution to DB as role="tool" message.
                 let tool_record = serde_json::json!({
                     "toolName": tool_name,
-                    "toolInput": tool_input,
+                    "toolInput": input_for_display,
                     "result": result,
                 });
-                let _ = self.db.lock().insert_chat_message(
+                if let Err(e) = self.db.lock().insert_chat_message(
                     &request.workspace_id,
                     "tool",
                     &tool_record.to_string(),
                     None, None, None, None,
-                );
+                ) {
+                    tracing::error!(tool = %tool_name, error = %e, "failed to persist tool execution");
+                }
 
                 // Emit tool use event for the frontend.
-                let _ = app.emit("chat://tool-use", &ToolUseEvent {
+                if let Err(e) = app.emit("chat://tool-use", &ToolUseEvent {
                     workspace_id: request.workspace_id.clone(),
                     tool_name: tool_name.clone(),
-                    tool_input: tool_input.clone(),
+                    tool_input: input_for_display,
                     result: result.clone(),
-                });
+                }) {
+                    tracing::error!(tool = %tool_name, error = %e, "failed to emit tool-use event");
+                }
 
                 tool_results.push(serde_json::json!({
                     "type": "tool_result",
