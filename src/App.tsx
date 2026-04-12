@@ -126,13 +126,13 @@ function App() {
 
         <div className="relative flex flex-1 overflow-hidden">
           {aliveSessions.length === 0 && !active ? (
-            <div className="flex-1">
+            <div className="min-w-0 flex-1">
               <EmptyMain onNewSession={() => setDialogOpen(true)} />
             </div>
           ) : (
-            <div className="flex flex-1">
-              {/* Primary pane — always visible */}
-              <div className="flex-1 overflow-hidden">
+            <div className="flex min-w-0 flex-1">
+              {/* Primary pane */}
+              <div className="min-w-0 flex-1 overflow-hidden">
                 {aliveSessions.map((s) => (
                   <TerminalPane
                     key={s.id}
@@ -146,7 +146,7 @@ function App() {
               {splitId && (
                 <>
                   <div className="w-px shrink-0 bg-octo-border" />
-                  <div className="flex-1 overflow-hidden">
+                  <div className="min-w-0 flex-1 overflow-hidden">
                     <TerminalPane
                       key={`split-${splitId}`}
                       sessionId={splitId}
@@ -158,6 +158,7 @@ function App() {
             </div>
           )}
 
+          {/* Token dashboard — fixed width, shrinks the terminal area */}
           {showTokens && <TokenDashboard />}
         </div>
 

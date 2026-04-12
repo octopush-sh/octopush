@@ -42,7 +42,7 @@ export function TokenDashboard() {
   const totalTokens = report.totalInput + report.totalOutput;
 
   return (
-    <aside className="flex h-full w-72 flex-col overflow-y-auto border-l border-octo-border bg-octo-panel">
+    <aside className="flex h-full w-72 shrink-0 flex-col overflow-y-auto border-l border-octo-border bg-octo-panel">
       <header className="border-b border-octo-border px-4 py-3">
         <div className="flex items-center gap-2 text-sm font-semibold tracking-tight">
           <Coins size={14} className="text-octo-accent" />

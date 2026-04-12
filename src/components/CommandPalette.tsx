@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
+import { pushToast } from "./Toasts";
 import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { useThemeStore } from "../stores/themeStore";
 
@@ -123,8 +124,13 @@ export function CommandPalette({
                   onSelect={() =>
                     run(async () => {
                       if (activeId) {
-                        await ipc.switchAgent(activeId, m.model.id);
+                        const result = await ipc.switchAgent(activeId, m.model.id);
                         await refresh();
+                        pushToast({
+                          level: result.appliedToPty ? "success" : "info",
+                          title: `Model → ${m.model.displayName}`,
+                          body: result.message,
+                        });
                       }
                     })
                   }

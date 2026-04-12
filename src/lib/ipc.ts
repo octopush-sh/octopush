@@ -72,7 +72,10 @@ export const ipc = {
   listAdapters: () => invoke<AdapterInfo[]>("list_adapters"),
 
   switchAgent: (sessionId: string, newModel: string) =>
-    invoke<Session>("switch_agent", { sessionId, newModel }),
+    invoke<{ session: Session; appliedToPty: boolean; message: string }>(
+      "switch_agent",
+      { sessionId, newModel },
+    ),
 
   // ─── Recap / Export ────────────────────────────────────────────
   getSessionRecap: (sessionId: string) =>

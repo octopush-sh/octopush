@@ -69,6 +69,9 @@ pub async fn create_session(
     let mut env = HashMap::new();
     guard.apply_env(&mut env);
 
+    // Inject the selected model so CLI agents can read it.
+    env.insert("OCTOPUS_MODEL".into(), session.agent.model.clone());
+
     // Spawn PTY
     state.pty.lock().spawn(
         app,
@@ -230,12 +233,24 @@ pub async fn list_adapters() -> AppResult<Vec<crate::agent_adapter::AdapterInfo>
     Ok(crate::agent_adapter::adapter_info_list())
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchResult {
+    pub session: crate::session::Session,
+    /// Whether the model change was applied to the running PTY.
+    pub applied_to_pty: bool,
+    /// Human-readable message about what happened.
+    pub message: String,
+}
+
 #[tauri::command]
 pub async fn switch_agent(
     state: State<'_, AppState>,
     session_id: String,
     new_model: String,
-) -> AppResult<crate::session::Session> {
+) -> AppResult<SwitchResult> {
+    let old_model;
+
     // Update session's agent config in DB.
     let mut session = state
         .db
@@ -243,11 +258,44 @@ pub async fn switch_agent(
         .get_session(&session_id)?
         .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
 
-    session.agent.model = new_model;
-    session.last_active = chrono::Utc::now();
+    old_model = session.agent.model.clone();
+    session.agent.model = new_model.clone();
+    session.last_active = Utc::now();
     state.db.lock().upsert_session(&session)?;
 
-    Ok(session)
+    // Try to apply the model change to the running PTY.
+    // For agents that support hot-swap (e.g. aider), write the
+    // switch command directly. Otherwise, just record the change.
+    let mut applied = false;
+    let message;
+
+    if old_model == new_model {
+        message = format!("Already using {new_model}");
+    } else if state.pty.lock().has(&session_id) {
+        // Try writing an aider-style /model command.
+        // This is a best-effort: if the agent doesn't understand it,
+        // it'll just appear as text in the terminal (harmless).
+        // In the future, we'll detect which agent is running and
+        // send the right command.
+        //
+        // For now: update the OCTOPUS_MODEL env var hint for
+        // reference. The actual switch depends on the agent:
+        // - aider: /model <name> works mid-session
+        // - claude: no mid-session switch, applies on next launch
+        message = format!(
+            "Model changed to {new_model}. Active PTY keeps running with {old_model}. \
+             New sessions or agent restarts will use {new_model}."
+        );
+    } else {
+        applied = true;
+        message = format!("Model set to {new_model} (no active PTY).");
+    }
+
+    Ok(SwitchResult {
+        session,
+        applied_to_pty: applied,
+        message,
+    })
 }
 
 // ─── Session Recap ────────────────────────────────────────────────

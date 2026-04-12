@@ -185,6 +185,12 @@ export interface AdapterInfo {
   supportsHotSwap: boolean;
 }
 
+export interface SwitchResult {
+  session: Session;
+  appliedToPty: boolean;
+  message: string;
+}
+
 // ─── Templates ────────────────────────────────────────────────────
 
 export interface SessionTemplate {

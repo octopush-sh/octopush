@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
-import type { SessionTemplate } from "../lib/types";
+import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 
 interface Props {
   open: boolean;
@@ -28,20 +28,26 @@ export function NewSessionDialog({ open, onClose }: Props) {
   const [icon, setIcon] = useState(ICONS[0]);
   const [color, setColor] = useState(COLORS[0]);
   const [tagsInput, setTagsInput] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Templates
+  // Templates + models
   const [templates, setTemplates] = useState<SessionTemplate[]>([]);
+  const [models, setModels] = useState<ModelWithProvider[]>([]);
   const [loadingTemplates, setLoadingTemplates] = useState(false);
 
   useEffect(() => {
     if (open) {
       setLoadingTemplates(true);
-      ipc
-        .listTemplates()
-        .then(setTemplates)
-        .catch(() => setTemplates([]))
+      Promise.all([
+        ipc.listTemplates().catch(() => [] as SessionTemplate[]),
+        ipc.listModels().catch(() => [] as ModelWithProvider[]),
+      ])
+        .then(([t, m]) => {
+          setTemplates(t);
+          setModels(m);
+        })
         .finally(() => setLoadingTemplates(false));
     } else {
       resetForm();
@@ -54,6 +60,7 @@ export function NewSessionDialog({ open, onClose }: Props) {
     setIcon(ICONS[0]);
     setColor(COLORS[0]);
     setTagsInput("");
+    setSelectedModel("");
     setError(null);
     setSubmitting(false);
   }
@@ -86,6 +93,17 @@ export function NewSessionDialog({ open, onClose }: Props) {
           .split(",")
           .map((t) => t.trim())
           .filter(Boolean),
+        ...(selectedModel
+          ? {
+              agent: {
+                provider: { type: "anthropic" as const },
+                model: selectedModel,
+                temperature: 1.0,
+                maxTokens: 8192,
+                systemPromptOverride: null,
+              },
+            }
+          : {}),
       });
       onClose();
     } catch (err) {
@@ -157,6 +175,30 @@ export function NewSessionDialog({ open, onClose }: Props) {
             className="w-full rounded-md border border-octo-border bg-octo-bg px-3 py-2 text-sm font-mono outline-none focus:border-octo-accent"
           />
         </label>
+
+        {/* Model picker */}
+        {models.length > 0 && (
+          <label className="mb-3 block">
+            <span className="mb-1 block text-xs uppercase tracking-wider text-zinc-500">
+              Model{" "}
+              <span className="text-zinc-600">
+                (sets OCTOPUS_MODEL env var in terminal)
+              </span>
+            </span>
+            <select
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              className="w-full rounded-md border border-octo-border bg-octo-bg px-3 py-2 text-sm outline-none focus:border-octo-accent"
+            >
+              <option value="">Default (agent decides)</option>
+              {models.map((m) => (
+                <option key={m.model.id} value={m.model.id}>
+                  {m.model.displayName} — {m.provider} (${m.model.inputCostPerM}/M in)
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
 
         <div className="mb-3 grid grid-cols-2 gap-3">
           <div>

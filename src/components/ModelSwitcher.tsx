@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Zap, ChevronDown, Check } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useSessionStore } from "../stores/sessionStore";
+import { pushToast } from "./Toasts";
 import type { ModelWithProvider } from "../lib/types";
 import { clsx } from "clsx";
 
@@ -59,11 +60,17 @@ export function ModelSwitcher({ open, onClose }: Props) {
     }
     setSwitching(modelId);
     try {
-      await ipc.switchAgent(activeId, modelId);
+      const result = await ipc.switchAgent(activeId, modelId);
       await refresh();
       onClose();
+      pushToast({
+        level: result.appliedToPty ? "success" : "info",
+        title: `Model → ${modelId}`,
+        body: result.message,
+      });
     } catch (err) {
       console.error("switch agent failed", err);
+      pushToast({ level: "error", title: "Switch failed", body: String(err) });
     } finally {
       setSwitching(null);
     }
