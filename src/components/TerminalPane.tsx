@@ -8,36 +8,41 @@ import type { PtyDataEvent, PtyExitEvent } from "../lib/types";
 
 interface Props {
   sessionId: string;
-  /** When false the terminal stays alive in the DOM but hidden via CSS. */
   visible: boolean;
 }
 
-/**
- * Persistent xterm.js instance bound to a PTY session.
- *
- * The terminal is created once on mount and kept alive across tab switches.
- * Only the `visible` prop toggles CSS visibility — no teardown/rebuild.
- * The component unmounts only when the session is deleted.
- */
 export function TerminalPane({ sessionId, visible }: Props) {
+  // Outer wrapper — stable size, observed by ResizeObserver.
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  // Inner container — where xterm attaches its DOM.
   const containerRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // Track last known size to avoid no-op resize IPC calls.
+  const lastSizeRef = useRef<{ rows: number; cols: number }>({ rows: 0, cols: 0 });
 
-  // Refit + focus when becoming visible or when the container resizes.
-  const doFit = useCallback(() => {
+  const syncSize = useCallback(() => {
     const fit = fitRef.current;
     const term = termRef.current;
     if (!fit || !term) return;
+    // Don't fit if the container is hidden (0×0).
+    const wrapper = wrapperRef.current;
+    if (!wrapper || wrapper.clientWidth === 0 || wrapper.clientHeight === 0) return;
     try {
       fit.fit();
-      ipc.resizeSession(sessionId, term.rows, term.cols).catch(() => {});
     } catch {
-      /* container not measured yet */
+      return;
+    }
+    const { rows, cols } = term;
+    const last = lastSizeRef.current;
+    // Only send resize to PTY if dimensions actually changed.
+    if (rows !== last.rows || cols !== last.cols) {
+      lastSizeRef.current = { rows, cols };
+      ipc.resizeSession(sessionId, rows, cols).catch(() => {});
     }
   }, [sessionId]);
 
-  // Create terminal once.
+  // Create terminal once on mount.
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -81,18 +86,33 @@ export function TerminalPane({ sessionId, visible }: Props) {
     termRef.current = term;
     fitRef.current = fit;
 
-    // ResizeObserver for auto-fit.
+    // Debounced ResizeObserver — observe the WRAPPER (stable outer box),
+    // not the xterm container (whose dimensions shift as content flows).
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const ro = new ResizeObserver(() => {
-      if (containerRef.current?.offsetParent !== null) {
-        try {
-          fit.fit();
-          ipc.resizeSession(sessionId, term.rows, term.cols).catch(() => {});
-        } catch { /* */ }
-      }
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const w = wrapperRef.current;
+        if (w && w.clientWidth > 0 && w.clientHeight > 0) {
+          try {
+            fit.fit();
+          } catch {
+            return;
+          }
+          const { rows, cols } = term;
+          const last = lastSizeRef.current;
+          if (rows !== last.rows || cols !== last.cols) {
+            lastSizeRef.current = { rows, cols };
+            ipc.resizeSession(sessionId, rows, cols).catch(() => {});
+          }
+        }
+      }, 100); // 100ms debounce
     });
-    ro.observe(containerRef.current);
+    if (wrapperRef.current) {
+      ro.observe(wrapperRef.current);
+    }
 
-    // PTY → term: stream bytes from backend event bus.
+    // PTY → term
     let unlistenData: UnlistenFn | undefined;
     let unlistenExit: UnlistenFn | undefined;
 
@@ -110,18 +130,24 @@ export function TerminalPane({ sessionId, visible }: Props) {
       unlistenExit = u;
     });
 
-    // term → PTY: forward user keystrokes.
+    // term → PTY
     const dataDisp = term.onData((data) => {
       ipc.writeTextToSession(sessionId, data).catch((err) => {
         console.error("write to pty failed", err);
       });
     });
 
+    // Only sync size on explicit xterm resize events (not on every write).
     const resizeDisp = term.onResize(({ rows, cols }) => {
-      ipc.resizeSession(sessionId, rows, cols).catch(() => {});
+      const last = lastSizeRef.current;
+      if (rows !== last.rows || cols !== last.cols) {
+        lastSizeRef.current = { rows, cols };
+        ipc.resizeSession(sessionId, rows, cols).catch(() => {});
+      }
     });
 
     return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
       dataDisp.dispose();
       resizeDisp.dispose();
       ro.disconnect();
@@ -136,20 +162,32 @@ export function TerminalPane({ sessionId, visible }: Props) {
   // Refit + focus when becoming visible.
   useEffect(() => {
     if (visible) {
-      // Delay slightly so the container has layout dimensions.
-      const id = requestAnimationFrame(() => {
-        doFit();
+      // Multiple attempts to ensure the container has layout dimensions.
+      // requestAnimationFrame alone isn't enough when CSS transitions are involved.
+      const t1 = requestAnimationFrame(() => syncSize());
+      const t2 = setTimeout(() => {
+        syncSize();
         termRef.current?.focus();
-      });
-      return () => cancelAnimationFrame(id);
+      }, 50);
+      const t3 = setTimeout(() => syncSize(), 200);
+      return () => {
+        cancelAnimationFrame(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+      };
     }
-  }, [visible, doFit]);
+  }, [visible, syncSize]);
 
   return (
     <div
-      ref={containerRef}
-      className="xterm-container h-full w-full"
+      ref={wrapperRef}
+      className="h-full w-full overflow-hidden"
       style={{ display: visible ? "block" : "none" }}
-    />
+    >
+      <div
+        ref={containerRef}
+        className="xterm-container h-full w-full"
+      />
+    </div>
   );
 }

@@ -26,8 +26,24 @@ pub async fn create_session(
     // Expand ~/... paths to absolute before spawning.
     session.project_root = expand_tilde(&session.project_root);
 
+    // Ensure the project root directory exists.
+    let root_path = Path::new(&session.project_root);
+    if !root_path.exists() {
+        std::fs::create_dir_all(root_path).map_err(|e| {
+            AppError::Other(format!(
+                "Cannot create project root '{}': {e}",
+                session.project_root
+            ))
+        })?;
+    } else if !root_path.is_dir() {
+        return Err(AppError::Other(format!(
+            "'{}' exists but is not a directory",
+            session.project_root
+        )));
+    }
+
     // Auto-configure context from project root.
-    let guard = ContextGuard::auto_configure(&id, Path::new(&session.project_root));
+    let guard = ContextGuard::auto_configure(&id, root_path);
     // Store detected context files in the session record.
     session.context_files = guard
         .context_files
