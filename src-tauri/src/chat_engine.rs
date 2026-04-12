@@ -327,7 +327,7 @@ impl ChatEngine {
         for iteration in 0..MAX_TOOL_ITERATIONS {
             let body = serde_json::json!({
                 "model": &request.model,
-                "max_tokens": 16384_u32.max(request.max_tokens),
+                "max_tokens": 32768_u32.max(request.max_tokens),
                 "system": &system_prompt,
                 "tools": tool_definitions(),
                 "messages": &messages,
@@ -404,15 +404,24 @@ impl ChatEngine {
 
             // Handle max_tokens truncation during tool use.
             if stop_reason == "max_tokens" && !tool_uses.is_empty() {
-                tracing::warn!("Response truncated at max_tokens during tool_use — tool input may be incomplete");
-                // The tool_use JSON was likely cut off. Ask Claude to retry with smaller output.
+                tracing::warn!("Response truncated at max_tokens during tool_use — providing error tool_results and retrying");
+                // Add the truncated assistant message to history.
                 messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": content,
                 }));
+                // Provide error tool_results for each tool_use (API requires matching pairs).
+                let error_results: Vec<serde_json::Value> = tool_uses.iter().map(|(id, _, _)| {
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "is_error": true,
+                        "content": "ERROR: Your response was truncated because it exceeded the output token limit. The file content was cut off and NOT written. Please retry with smaller files — split into multiple files or keep each under 200 lines. Write one file at a time.",
+                    })
+                }).collect();
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": "Your previous response was truncated because it exceeded the output limit. Please break your work into smaller steps — write one file at a time, keeping each file under 300 lines. Continue from where you left off.",
+                    "content": error_results,
                 }));
                 continue;
             }
