@@ -82,10 +82,10 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
   return (
     <div
       className={clsx(
-        "group mx-auto w-full max-w-[85%] overflow-hidden rounded-lg border transition-all",
+        "group mx-auto w-full max-w-[85%] overflow-hidden rounded-lg border",
         expanded
           ? "border-octo-border bg-zinc-900/60"
-          : "border-transparent hover:border-octo-border/50 hover:bg-zinc-900/30",
+          : "border-octo-border/30 bg-zinc-900/30 hover:border-octo-border/50 hover:bg-zinc-900/40",
       )}
     >
       {/* Header — always visible, clickable */}

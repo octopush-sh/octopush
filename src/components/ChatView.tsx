@@ -4,7 +4,7 @@ import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
 import { AgentBar } from "./AgentBar";
 import { ChatMessage } from "./ChatMessage";
-// import { ToolCallCard } from "./ToolCallCard";
+import { ToolCallCard } from "./ToolCallCard";
 
 interface Props {
   workspaceId: string;
@@ -106,11 +106,6 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         ref={scrollRef}
         className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4"
       >
-        {/* DEBUG: visible counter — remove after fixing */}
-        <div className="shrink-0 rounded bg-zinc-800 px-2 py-1 text-[10px] font-mono text-octo-warning">
-          msgs={messages.length} timeline={timeline.length} tools={timeline.filter(i => i.kind === "tool").length} roles=[{messages.map(m => String(m.role)[0]).join(",")}]
-        </div>
-
         {messages.length === 0 && !streaming ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
             <MessageSquare size={36} className="text-zinc-700" />
@@ -122,11 +117,9 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         ) : (
           <>
             {/* Render the timeline: messages + tool cards interleaved */}
-            {timeline.map((item, idx) =>
+            {timeline.map((item) =>
               item.kind === "tool" ? (
-                <div key={`tool-${item.id}`} style={{ background: "red", color: "white", padding: 12, borderRadius: 8, margin: "4px 0" }}>
-                  TOOL #{idx}: {item.tool.toolName} — {JSON.stringify(item.tool.toolInput).slice(0, 80)}
-                </div>
+                <ToolCallCard key={`tool-${item.id}`} tool={item.tool} workspacePath={workspacePath} />
               ) : (
                 <ChatMessage key={item.message.id} message={item.message} />
               ),
