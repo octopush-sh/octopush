@@ -42,3 +42,6 @@ yarn-error.log*
 ~/.octopus-sh/
 octopus.db
 octopus.db-journal
+
+# Brainstorming companion (visual mockups)
+.superpowers/
