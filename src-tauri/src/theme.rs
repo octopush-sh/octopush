@@ -1,7 +1,7 @@
 //! Theme configuration — load/save/list themes.
 //!
 //! Themes are stored as `~/.octopus-sh/theme.json`. If absent, defaults
-//! to the built-in "dark" theme.
+//! to the built-in "atelier" theme.
 
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
