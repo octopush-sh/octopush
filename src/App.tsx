@@ -467,7 +467,11 @@ function App() {
                         visibility: activeMode === "review" ? "visible" : "hidden",
                       }}
                     >
-                      <ChangesPanel projectPath={activeWorkspace.worktreePath || project.path} />
+                      {(gitStatus?.changedFiles.length ?? 0) > 0 ? (
+                        <ChangesPanel projectPath={activeWorkspace.worktreePath || project.path} />
+                      ) : (
+                        <ReviewEmptyState />
+                      )}
                     </div>
                   </>
                 )}
@@ -553,6 +557,27 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
       >
         Open terminal
       </button>
+    </div>
+  );
+}
+
+function ReviewEmptyState() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
+      <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
+        Review
+      </div>
+      <div className="font-serif italic text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
+        Nothing to review yet.
+      </div>
+      <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
+        When the workspace has uncommitted changes, the diff appears here.
+      </p>
+      <div
+        aria-hidden
+        className="mt-2 h-px w-7"
+        style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
+      />
     </div>
   );
 }
