@@ -15,7 +15,10 @@ export function ContextHeader({ workspaceName, branch, gitStatus }: Props) {
         <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
           Workspace
         </div>
-        <div className="font-serif italic text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory">
+        <div
+          key={workspaceName}
+          className="animate-name-in font-serif italic text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"
+        >
           {workspaceName}
         </div>
       </div>
