@@ -3,6 +3,7 @@ import { AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
 import { AgentBar } from "./AgentBar";
+import { BrassRule } from "./BrassRule";
 import { ChatMessage } from "./ChatMessage";
 import { ToolCallCard } from "./ToolCallCard";
 
@@ -193,11 +194,7 @@ function EmptyState() {
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
         Ask anything — Octopus will read files, run commands, and write changes inside this workspace's worktree.
       </p>
-      <div
-        aria-hidden
-        className="mt-2 h-px w-7"
-        style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-      />
+      <BrassRule className="mt-2 w-7" />
     </div>
   );
 }

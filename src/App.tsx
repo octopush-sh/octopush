@@ -12,6 +12,7 @@ import { ChangesPanel } from "./components/ChangesPanel";
 import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
 import { ToastContainer } from "./components/Toasts";
+import { BrassRule } from "./components/BrassRule";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
@@ -581,11 +582,7 @@ function ReviewEmptyState() {
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
         When the workspace has uncommitted changes, the diff appears here.
       </p>
-      <div
-        aria-hidden
-        className="mt-2 h-px w-7"
-        style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-      />
+      <BrassRule className="mt-2 w-7" />
     </div>
   );
 }

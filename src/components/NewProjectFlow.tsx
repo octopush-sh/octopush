@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { BrassRule } from "./BrassRule";
 import { useProjectStore } from "../stores/projectStore";
 
 interface Props {
@@ -56,11 +57,7 @@ export function NewProjectFlow({ onBack }: Props) {
           <StepIndex active={step === 2} numeral="II" label="Type" onClick={() => nameValid && setStep(2)} disabled={!nameValid && step !== 2} />
         </div>
 
-        <div
-          aria-hidden
-          className="mt-10 h-px w-7"
-          style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-        />
+        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}

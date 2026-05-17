@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { BrassRule } from "./BrassRule";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 
 interface Props {
@@ -80,11 +81,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
           />
         </div>
 
-        <div
-          aria-hidden
-          className="mt-10 h-px w-7"
-          style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-        />
+        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}

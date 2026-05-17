@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BrassRule } from "./BrassRule";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 
@@ -99,11 +100,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
       </div>
 
       {/* Brass rule */}
-      <div
-        aria-hidden
-        className="my-6 h-px w-7"
-        style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-      />
+      <BrassRule className="my-6 w-7" />
 
       {/* Primary CTA */}
       <button
