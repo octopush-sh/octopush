@@ -24,10 +24,11 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+const listChatMessagesMock = vi.fn().mockResolvedValue([]);
 vi.mock("../lib/ipc", () => ({
   ipc: {
     sendChatMessage: vi.fn().mockResolvedValue(undefined),
-    listChatMessages: vi.fn().mockResolvedValue([]),
+    listChatMessages: listChatMessagesMock,
     revealInFinder: vi.fn(),
     openFileInSystem: vi.fn(),
   },
@@ -148,6 +149,73 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("foo.txt")).toBeInTheDocument();
     expect(screen.getByText("hi")).toBeInTheDocument();
     expect(screen.getByText(/Done with that/i)).toBeInTheDocument();
+  });
+
+  it("renders historic tools after loadHistory returns DB-shaped rows", async () => {
+    // Mirrors the EXACT production scenario the user reported: open a workspace
+    // with persisted tool rows in SQLite. loadHistory fetches them via IPC.
+    // Tool content uses the actual JSON shape seen in the user's DB
+    // (toolInput.content was truncated to a placeholder string by an earlier
+    // fix cycle — that's expected, but the path is intact).
+    const historicRows = [
+      {
+        id: 1, workspaceId: "ws-1", role: "user",
+        content: "Crea una landing page para un supermercado.",
+        model: null, inputTokens: null, outputTokens: null, costUsd: null,
+        createdAt: "2026-05-16T10:00:00Z",
+      },
+      {
+        id: 2, workspaceId: "ws-1", role: "tool",
+        content: JSON.stringify({
+          result: ".git",
+          toolInput: { path: "." },
+          toolName: "list_files",
+        }),
+        model: null, inputTokens: null, outputTokens: null, costUsd: null,
+        createdAt: "2026-05-16T10:00:01Z",
+      },
+      {
+        id: 3, workspaceId: "ws-1", role: "tool",
+        content: JSON.stringify({
+          result: "Wrote 20584 bytes to index.html",
+          toolInput: { content: "(20584 chars, written to disk)", path: "index.html" },
+          toolName: "write_file",
+        }),
+        model: null, inputTokens: null, outputTokens: null, costUsd: null,
+        createdAt: "2026-05-16T10:00:02Z",
+      },
+      {
+        id: 4, workspaceId: "ws-1", role: "tool",
+        content: JSON.stringify({
+          result: "Wrote 31679 bytes to styles.css",
+          toolInput: { content: "(31679 chars, written to disk)", path: "styles.css" },
+          toolName: "write_file",
+        }),
+        model: null, inputTokens: null, outputTokens: null, costUsd: null,
+        createdAt: "2026-05-16T10:00:03Z",
+      },
+      {
+        id: 5, workspaceId: "ws-1", role: "assistant",
+        content: "¡La landing page está lista!",
+        model: "claude-sonnet-4-6",
+        inputTokens: 1000, outputTokens: 200, costUsd: 0.01,
+        createdAt: "2026-05-16T10:00:04Z",
+      },
+    ];
+    listChatMessagesMock.mockResolvedValueOnce(historicRows);
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    // Wait for loadHistory to resolve and React to render.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Tool cards must be visible after historical load.
+    expect(screen.getByText("LIST")).toBeInTheDocument();
+    expect(screen.getAllByText("WRITE")).toHaveLength(2);
+    expect(screen.getByText("index.html")).toBeInTheDocument();
+    expect(screen.getByText("styles.css")).toBeInTheDocument();
   });
 
   it("renders multiple tool cards in order between user and assistant", () => {
