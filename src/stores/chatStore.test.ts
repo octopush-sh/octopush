@@ -1,33 +1,27 @@
 /**
  * Regression test for the "tool cards disappearing" bug.
  *
- * Bug history: 11+ "fixes" in git (4077188, 61d4739, 03252b9, 8b67549, ...).
- * Symptom: tool cards appear progressively during the agentic loop, then
- *   disappear when the final `chat://stream { done: true }` event arrives.
- *   Only user prompt + final assistant message remain in the timeline.
+ * Architectural invariant under test: every chat message has a stable,
+ * unique id supplied by the backend (DB rowid). The frontend never
+ * invents ids via Date.now(). This eliminates the class of bugs where
+ * user-msg and assistant-msg shared the same React key, causing
+ * reconciliation to drop tool cards in between.
  *
- * This test mocks Tauri's `listen` to capture the chatStore's event handlers,
- * then simulates the exact event sequence the backend emits:
- *   1. user calls send() → user msg appears, streaming begins
- *   2. backend emits tool-use × N → N tool messages appended
- *   3. backend emits stream { done: true } → final assistant msg appended
- *
- * Assertion: after `done`, `messages` MUST still contain all N tool entries.
+ * If any future change reintroduces Date.now() ids or strips messages
+ * on the done event, these tests fail loudly.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ChatStreamEvent } from "../lib/types";
-import type { ToolUseEvent } from "./chatStore";
+import type { MessageAddedEvent } from "./chatStore";
 
 // ─── Mocks ────────────────────────────────────────────────────────────
-// Capture event handlers registered by chatStore during create().
-
 type EventHandler = (ev: { payload: unknown }) => void;
 const handlers: Record<string, EventHandler> = {};
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn((eventName: string, handler: EventHandler) => {
     handlers[eventName] = handler;
-    return Promise.resolve(() => {}); // unlisten fn
+    return Promise.resolve(() => {});
   }),
 }));
 
@@ -54,8 +48,22 @@ function resetStore() {
     streaming: false,
     streamBuffer: "",
     error: null,
-    liveTools: [],
   });
+}
+
+function makeMsg(overrides: Partial<MessageAddedEvent>): MessageAddedEvent {
+  return {
+    workspaceId: "ws-1",
+    id: 1,
+    role: "user",
+    content: "",
+    model: null,
+    inputTokens: null,
+    outputTokens: null,
+    costUsd: null,
+    createdAt: "2026-05-17T10:00:00Z",
+    ...overrides,
+  };
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -64,31 +72,39 @@ describe("chatStore — tool card persistence through done event", () => {
     resetStore();
   });
 
-  it("reproduces the agentic-loop event sequence and keeps tool cards after done", async () => {
+  it("preserves tool messages through the full agentic loop sequence", async () => {
     const workspaceId = "ws-1";
     const workspacePath = "/tmp/octopus-test";
 
-    // 1. User sends a prompt.
+    // 1. User calls send → streaming begins, no optimistic local message.
     await useChatStore.getState().send(workspaceId, workspacePath, "build me a thing");
+    expect(useChatStore.getState().streaming).toBe(true);
+    expect(useChatStore.getState().messages).toHaveLength(0);
 
+    // 2. Backend persists user msg → emits message-added (id=1).
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "build me a thing" }));
     expect(useChatStore.getState().messages).toHaveLength(1);
     expect(useChatStore.getState().messages[0].role).toBe("user");
-    expect(useChatStore.getState().streaming).toBe(true);
 
-    // 2. Backend emits tool-use × 3 during the loop.
-    const tools: ToolUseEvent[] = [
-      { workspaceId, toolName: "list_files", toolInput: { path: "." }, result: "a\nb\nc" },
-      { workspaceId, toolName: "read_file", toolInput: { path: "a" }, result: "// file a" },
-      { workspaceId, toolName: "write_file", toolInput: { path: "b", content: "(123 chars)" }, result: "wrote" },
+    // 3. Backend persists 3 tool executions → emits message-added per tool.
+    const tools = [
+      { toolName: "list_files", toolInput: { path: "." }, result: "a\nb\nc" },
+      { toolName: "read_file", toolInput: { path: "a" }, result: "// file a" },
+      { toolName: "write_file", toolInput: { path: "b", content: "(123 chars)" }, result: "wrote" },
     ];
-    for (const t of tools) emit("chat://tool-use", t);
+    tools.forEach((tool, i) => {
+      emit("chat://message-added", makeMsg({
+        id: 2 + i,
+        role: "tool",
+        content: JSON.stringify(tool),
+      }));
+    });
 
-    // After tool events: user + 3 tools = 4 messages.
-    const beforeDone = useChatStore.getState().messages;
-    expect(beforeDone).toHaveLength(4);
-    expect(beforeDone.slice(1).every((m) => String(m.role) === "tool")).toBe(true);
+    expect(useChatStore.getState().messages).toHaveLength(4);
+    expect(useChatStore.getState().messages.slice(1).every((m) => String(m.role) === "tool")).toBe(true);
 
-    // 3. Backend emits final stream delta (the summary text), then done.
+    // 4. Backend streams final delta, then emits message-added for assistant,
+    //    then emits stream { done: true } as metadata.
     emit("chat://stream", {
       workspaceId,
       delta: "Done. Built the thing.",
@@ -96,6 +112,15 @@ describe("chatStore — tool card persistence through done event", () => {
       inputTokens: null,
       outputTokens: null,
     } satisfies ChatStreamEvent);
+
+    emit("chat://message-added", makeMsg({
+      id: 5,
+      role: "assistant",
+      content: "Done. Built the thing.",
+      model: "claude-sonnet-4-6",
+      inputTokens: 1000,
+      outputTokens: 200,
+    }));
 
     emit("chat://stream", {
       workspaceId,
@@ -105,11 +130,8 @@ describe("chatStore — tool card persistence through done event", () => {
       outputTokens: 200,
     } satisfies ChatStreamEvent);
 
-    // 4. EXPECTED: messages = user + 3 tools + assistant = 5.
-    //    Bug: messages = user + assistant = 2 (tools dropped).
+    // 5. Final state: user + 3 tools + assistant = 5. Tools survive the done event.
     const afterDone = useChatStore.getState().messages;
-
-    // Role breakdown helps diagnose.
     const roleCounts = afterDone.reduce<Record<string, number>>((acc, m) => {
       const r = String(m.role);
       acc[r] = (acc[r] ?? 0) + 1;
@@ -120,169 +142,56 @@ describe("chatStore — tool card persistence through done event", () => {
     expect(afterDone).toHaveLength(5);
     expect(useChatStore.getState().streaming).toBe(false);
     expect(useChatStore.getState().streamBuffer).toBe("");
-    // liveTools is cleared on done by design — that's fine.
-    expect(useChatStore.getState().liveTools).toEqual([]);
   });
 
-  it("survives Date.now() collisions between user msg and final assistant msg", () => {
-    // Force Date.now to return the same value for the user msg and the
-    // final assistant msg — this would collide React keys if both are
-    // rendered as messages at the same key.
-    const fixedNow = 1_700_000_000_000;
-    const realNow = Date.now;
-    Date.now = () => fixedNow;
+  it("uses unique, monotonic backend-provided ids — no Date.now() collisions", () => {
+    // The new architecture: backend rowids are integers, monotonically
+    // increasing per insert. They cannot collide with each other.
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "hi" }));
+    emit("chat://message-added", makeMsg({ id: 2, role: "tool", content: JSON.stringify({ toolName: "read_file", toolInput: {}, result: "" }) }));
+    emit("chat://message-added", makeMsg({ id: 3, role: "assistant", content: "done" }));
 
-    try {
-      // Manually craft the sequence (skip send → no async timing).
-      useChatStore.setState({
-        messages: [
-          {
-            id: fixedNow,
-            workspaceId: "ws-1",
-            role: "user",
-            content: "hi",
-            model: null,
-            inputTokens: null,
-            outputTokens: null,
-            costUsd: null,
-            createdAt: "now",
-          },
-        ],
-        streaming: true,
-        streamBuffer: "the answer",
-        liveTools: [],
-      });
-
-      // Add a tool event (which uses Date.now() + Math.random() — float id).
-      emit("chat://tool-use", {
-        workspaceId: "ws-1",
-        toolName: "read_file",
-        toolInput: { path: "x" },
-        result: "ok",
-      });
-
-      // Now done.
-      emit("chat://stream", {
-        workspaceId: "ws-1",
-        delta: "",
-        done: true,
-        inputTokens: null,
-        outputTokens: null,
-      });
-
-      const msgs = useChatStore.getState().messages;
-      // Should still have user + tool + assistant.
-      const roles = msgs.map((m) => String(m.role));
-      expect(roles).toEqual(["user", "tool", "assistant"]);
-
-      // Critical: user and assistant ids must not collide for React keys.
-      const ids = msgs.map((m) => m.id);
-      const uniqueIds = new Set(ids);
-      expect(uniqueIds.size).toBe(ids.length); // ← will fail under Date.now collision
-    } finally {
-      Date.now = realNow;
-    }
+    const msgs = useChatStore.getState().messages;
+    const ids = msgs.map((m) => m.id);
+    expect(ids).toEqual([1, 2, 3]);
+    expect(new Set(ids).size).toBe(3); // unique
   });
 
-  it("Date.now collision causes duplicate React keys in timeline", () => {
-    // Simulate the exact id-assignment used by send() (user msg) and the
-    // done handler (final assistant msg) when both call Date.now() in the
-    // same millisecond — observable when the agentic loop is fast.
-    const fixedNow = 1_700_000_000_000;
-    const userMsgId = fixedNow;
-    const assistantMsgId = fixedNow;
+  it("React keys are unique across timeline (no duplicate-key reconciliation bugs)", () => {
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "hi" }));
+    emit("chat://message-added", makeMsg({ id: 2, role: "tool", content: JSON.stringify({ toolName: "read_file", toolInput: {}, result: "" }) }));
+    emit("chat://message-added", makeMsg({ id: 3, role: "assistant", content: "done" }));
 
-    useChatStore.setState({
-      messages: [
-        {
-          id: userMsgId,
-          workspaceId: "ws-1",
-          role: "user",
-          content: "hi",
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-        {
-          id: 1700000000000.5, // tool msg id (float — Date.now + Math.random)
-          workspaceId: "ws-1",
-          role: "tool" as "user" | "assistant",
-          content: JSON.stringify({ toolName: "read_file", toolInput: {}, result: "" }),
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-        {
-          id: assistantMsgId,
-          workspaceId: "ws-1",
-          role: "assistant",
-          content: "done",
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-      ],
-    });
-
-    // Compute React keys exactly as ChatView does.
     const timeline = useChatStore.getState().getTimeline();
     const keys = timeline.map((it) =>
       it.kind === "tool" ? `tool-${it.id}` : String(it.message.id),
     );
-    // Bug: ["1700000000000", "tool-1700000000000.5", "1700000000000"] → duplicate.
     const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
-    expect(dupes, `Duplicate React keys found: ${JSON.stringify(keys)}`).toEqual([]);
+    expect(dupes, `Duplicate React keys: ${JSON.stringify(keys)}`).toEqual([]);
+  });
+
+  it("is idempotent under duplicate message-added events (defends against HMR)", () => {
+    const ev = makeMsg({ id: 42, role: "user", content: "hi" });
+    emit("chat://message-added", ev);
+    emit("chat://message-added", ev); // duplicate — should no-op
+    emit("chat://message-added", ev); // duplicate again
+
+    const msgs = useChatStore.getState().messages;
+    expect(msgs).toHaveLength(1);
   });
 
   it("getTimeline parses tool messages into tool items", () => {
-    useChatStore.setState({
-      messages: [
-        {
-          id: 1,
-          workspaceId: "ws-1",
-          role: "user",
-          content: "hi",
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-        {
-          id: 2,
-          workspaceId: "ws-1",
-          // Intentional: role is "tool" at runtime, but typed as user|assistant.
-          role: "tool" as "user" | "assistant",
-          content: JSON.stringify({
-            toolName: "read_file",
-            toolInput: { path: "x" },
-            result: "ok",
-          }),
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-        {
-          id: 3,
-          workspaceId: "ws-1",
-          role: "assistant",
-          content: "done",
-          model: null,
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          createdAt: "now",
-        },
-      ],
-    });
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "hi" }));
+    emit("chat://message-added", makeMsg({
+      id: 2,
+      role: "tool",
+      content: JSON.stringify({
+        toolName: "read_file",
+        toolInput: { path: "x" },
+        result: "ok",
+      }),
+    }));
+    emit("chat://message-added", makeMsg({ id: 3, role: "assistant", content: "done" }));
 
     const timeline = useChatStore.getState().getTimeline();
     expect(timeline).toHaveLength(3);
