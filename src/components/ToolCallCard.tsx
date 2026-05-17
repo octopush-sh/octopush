@@ -7,48 +7,48 @@ interface Props {
   workspacePath?: string;
 }
 
+// Tool name → uppercase mono label. Falls back to the raw tool name.
 const TOOL_LABELS: Record<string, string> = {
-  run_command: "Ran command",
-  read_file: "Read file",
-  write_file: "Wrote file",
-  list_files: "Listed files",
+  run_command: "RUN",
+  read_file: "READ",
+  write_file: "WRITE",
+  list_files: "LIST",
 };
 
-const TOOL_COLORS: Record<string, string> = {
-  run_command: "#fbbf24",
-  read_file: "#60a5fa",
-  write_file: "#34d399",
-  list_files: "#a1a1aa",
-};
+// Onyx & Brass design tokens. Defined inline because this component renders
+// inside react-markdown siblings — the previous fix cycle (commit d9c1517)
+// proved Tailwind cascade can leak in this context. Inline styles are
+// deliberate and load-bearing.
+const BRASS = "#d4a574";
+const BRASS_DIM = "rgba(212, 165, 116, 0.4)";
+const BRASS_GHOST = "rgba(212, 165, 116, 0.08)";
+const IVORY = "#f4ecdb";
+const SAGE = "#95897a";
+const MUTE = "#6d6354";
+const ONYX = "#0c0a08";
+const HAIRLINE = "#2a2419";
 
-const TOOL_ICONS: Record<string, string> = {
-  run_command: "▸_",
-  read_file: "◫",
-  write_file: "◫+",
-  list_files: "⊟",
-};
-
-// All styles defined as constants to prevent any Tailwind/cascade interference.
 const cardStyle: CSSProperties = {
   display: "block",
   width: "100%",
-  maxWidth: "85%",
-  margin: "4px auto",
-  borderRadius: 8,
-  border: "1px solid rgba(255,255,255,0.1)",
-  background: "rgba(24,24,27,0.4)",
-  fontSize: 13,
-  fontFamily: "system-ui, -apple-system, sans-serif",
-  color: "#d4d4d8",
+  maxWidth: "100%",
+  margin: "8px 0",
+  borderRadius: 6,
+  borderLeft: `1px solid ${BRASS_DIM}`,
+  background: BRASS_GHOST,
+  fontSize: 12,
+  fontFamily: "-apple-system, 'Helvetica Neue', sans-serif",
+  color: SAGE,
   lineHeight: "1.4",
   boxSizing: "border-box" as const,
+  overflow: "hidden",
 };
 
 const headerStyle: CSSProperties = {
   display: "flex",
   alignItems: "center",
   width: "100%",
-  padding: "10px 14px",
+  padding: "8px 12px",
   gap: 10,
   cursor: "pointer",
   background: "transparent",
@@ -65,9 +65,7 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const label = TOOL_LABELS[tool.toolName] ?? tool.toolName;
-  const color = TOOL_COLORS[tool.toolName] ?? "#a1a1aa";
-  const icon = TOOL_ICONS[tool.toolName] ?? "•";
+  const label = TOOL_LABELS[tool.toolName] ?? tool.toolName.toUpperCase();
   const summary = buildSummary(tool);
   const filePath = getFilePath(tool);
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
@@ -82,49 +80,60 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
           onKeyDown={(e) => e.key === "Enter" && setExpanded((v) => !v)}
           style={headerStyle}
         >
-          <span style={{
-            fontSize: 11,
-            color: "#52525b",
-            transform: expanded ? "rotate(90deg)" : "none",
-            transition: "transform 150ms",
-            flexShrink: 0,
-          }}>
-            ▸
+          <span
+            style={{
+              fontSize: 13,
+              color: BRASS,
+              fontFamily: "'Spectral', serif",
+              fontStyle: "italic",
+              flexShrink: 0,
+            }}
+            aria-hidden
+          >
+            §
           </span>
-          <span style={{
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 22,
-            height: 22,
-            borderRadius: 4,
-            background: `${color}20`,
-            color: color,
-            fontSize: 11,
-            fontFamily: "monospace",
-            fontWeight: 600,
-            flexShrink: 0,
-          }}>
-            {icon}
-          </span>
-          <span style={{ fontSize: 11, color: "#71717a", flexShrink: 0 }}>
+          <span
+            style={{
+              fontSize: 10,
+              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              letterSpacing: "0.2em",
+              textTransform: "uppercase",
+              color: BRASS,
+              flexShrink: 0,
+            }}
+          >
             {label}
           </span>
-          <span style={{
-            fontSize: 12,
-            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-            color: color,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            minWidth: 0,
-            flex: 1,
-          }}>
+          <span
+            style={{
+              fontSize: 11,
+              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              color: SAGE,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              minWidth: 0,
+              flex: 1,
+              marginLeft: 4,
+            }}
+          >
             {summary}
+          </span>
+          <span
+            style={{
+              fontSize: 10,
+              color: MUTE,
+              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              transform: expanded ? "rotate(90deg)" : "none",
+              transition: "transform 150ms",
+              flexShrink: 0,
+            }}
+            aria-hidden
+          >
+            ▸
           </span>
         </div>
 
-        {/* Reveal in Finder button for all write_file cards */}
         {filePath && tool.toolName === "write_file" && (
           <div
             role="button"
@@ -135,13 +144,11 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
             onKeyDown={() => {}}
             title="Reveal in Finder"
             style={{
-              fontSize: 13,
-              fontWeight: 500,
-              color: "#71717a",
-              background: "rgba(113,113,122,0.12)",
+              fontSize: 12,
+              color: MUTE,
+              background: "transparent",
               border: "none",
-              borderRadius: 4,
-              padding: "3px 7px",
+              padding: "4px 8px",
               cursor: "pointer",
               marginRight: 4,
               flexShrink: 0,
@@ -153,7 +160,6 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
           </div>
         )}
 
-        {/* Open button for HTML files */}
         {filePath && tool.toolName === "write_file" && isWebFile && (
           <div
             role="button"
@@ -163,17 +169,17 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
             }}
             onKeyDown={() => {}}
             style={{
+              fontFamily: "'Spectral', serif",
+              fontStyle: "italic",
               fontSize: 11,
-              fontWeight: 500,
-              color: "#a78bfa",
-              background: "rgba(167,139,250,0.15)",
-              border: "none",
+              color: BRASS,
+              background: BRASS_GHOST,
+              border: `1px solid ${BRASS_DIM}`,
               borderRadius: 4,
-              padding: "4px 10px",
+              padding: "3px 10px",
               cursor: "pointer",
-              marginRight: 12,
+              marginRight: 10,
               flexShrink: 0,
-              fontFamily: "system-ui, sans-serif",
             }}
           >
             Open
@@ -181,12 +187,13 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
         )}
       </div>
 
-      {/* Expanded content */}
       {expanded && (
-        <div style={{
-          borderTop: "1px solid rgba(255,255,255,0.06)",
-          padding: "8px 14px 12px",
-        }}>
+        <div
+          style={{
+            borderTop: `1px solid ${HAIRLINE}`,
+            padding: "8px 12px 12px",
+          }}
+        >
           <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
             <span
               role="button"
@@ -198,31 +205,36 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
               }}
               onKeyDown={() => {}}
               style={{
-                fontSize: 10,
-                color: copied ? "#34d399" : "#52525b",
+                fontSize: 9,
+                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                letterSpacing: "0.2em",
+                textTransform: "uppercase",
+                color: copied ? "#8fc9a8" : MUTE,
                 cursor: "pointer",
                 padding: "2px 6px",
-                fontFamily: "system-ui, sans-serif",
               }}
             >
-              {copied ? "✓ Copied" : "Copy"}
+              {copied ? "✓ COPIED" : "COPY"}
             </span>
           </div>
-          <pre style={{
-            maxHeight: 256,
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            borderRadius: 6,
-            background: "rgba(0,0,0,0.4)",
-            padding: "8px 12px",
-            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-            fontSize: 11,
-            lineHeight: 1.6,
-            color: "#a1a1aa",
-            margin: 0,
-            boxSizing: "border-box" as const,
-          }}>
+          <pre
+            style={{
+              maxHeight: 256,
+              overflow: "auto",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              borderRadius: 4,
+              background: ONYX,
+              padding: "10px 12px",
+              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              fontSize: 11,
+              lineHeight: 1.55,
+              color: IVORY,
+              margin: 0,
+              boxSizing: "border-box" as const,
+              border: `1px solid ${HAIRLINE}`,
+            }}
+          >
             {tool.result}
           </pre>
         </div>
@@ -235,7 +247,7 @@ function buildSummary(tool: ToolExecution): string {
   switch (tool.toolName) {
     case "run_command": {
       const cmd = String(tool.toolInput?.command ?? "");
-      return `$ ${cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd}`;
+      return cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
     }
     case "write_file":
     case "read_file":
