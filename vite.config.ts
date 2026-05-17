@@ -32,6 +32,13 @@ export default defineConfig(async () => ({
     },
   },
 
+  // Vitest configuration
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test-setup.ts"],
+  },
+
   // Vite options tailored for Tauri development
   clearScreen: false,
   server: {
