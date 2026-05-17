@@ -58,13 +58,11 @@ function MonogramButton({
   const tint = TINTS[mono.tint];
 
   return (
-    <div className="relative">
-      {active && (
-        <span
-          aria-hidden
-          className="absolute -left-3 top-1/2 h-6 w-[2px] -translate-y-1/2 rounded-r-sm bg-octo-brass"
-        />
-      )}
+    <div
+      className={`relative flex items-center pl-[6px] border-l-2 ${
+        active ? "border-octo-brass" : "border-transparent"
+      }`}
+    >
       <button
         type="button"
         onClick={onSelect}
@@ -74,10 +72,12 @@ function MonogramButton({
         }}
         title={`${workspace.name} (right-click to customize)`}
         aria-label={workspace.name}
-        aria-current={active ? "true" : undefined}
+        aria-current={active ? "location" : undefined}
         className="flex h-7 w-7 items-center justify-center rounded-md border font-serif italic transition"
         style={{
           color: tint.accent,
+          // Inline borderColor used because tint values are runtime, not Tailwind tokens.
+          // Always set to keep the border 1px box-model present (prevents layout shift on activation).
           borderColor: active ? tint.accent : "transparent",
           background: active ? tint.bg : "transparent",
         }}
