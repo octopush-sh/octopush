@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { ChevronDown } from "lucide-react";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 
 interface Props {
@@ -8,6 +7,8 @@ interface Props {
   onCreated: () => void;
   onCancel: () => void;
 }
+
+type Step = 1 | 2;
 
 function slugify(text: string): string {
   return text
@@ -19,7 +20,7 @@ function slugify(text: string): string {
 }
 
 export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }: Props) {
-  const [step, setStep] = useState<1 | 2>(1);
+  const [step, setStep] = useState<Step>(1);
   const [task, setTask] = useState("");
   const [setupScript, setSetupScript] = useState("");
   const [creating, setCreating] = useState(false);
@@ -29,9 +30,10 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
 
   const branch = slugify(task) || "new-workspace";
   const workspaceName = branch;
+  const taskValid = task.trim().length > 0;
 
   async function handleCreate() {
-    if (!task.trim()) return;
+    if (!taskValid) return;
     setCreating(true);
     setError(null);
     try {
@@ -44,146 +46,224 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
     }
   }
 
-  if (step === 1) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center bg-octo-bg">
-        <div className="w-full max-w-md px-4">
-          {/* Step indicator */}
-          <div className="mb-1 text-[10px] uppercase tracking-widest text-zinc-600">
-            Step 1 of 2
-          </div>
-
-          <h2 className="mb-1 text-xl font-semibold text-zinc-100">
-            Create your first workspace
-          </h2>
-          <p className="mb-6 text-sm text-zinc-500">
-            Workspaces are isolated task environments backed by git worktrees.
-          </p>
-
-          {/* Task input */}
-          <label className="mb-1.5 block text-xs font-medium text-zinc-400">
-            Task
-          </label>
-          <input
-            type="text"
-            value={task}
-            onChange={(e) => setTask(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && task.trim()) setStep(2);
-            }}
-            placeholder="e.g. Add dark mode, Fix checkout bug"
-            className="w-full rounded-md border border-octo-border bg-octo-panel px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none transition focus:border-octo-accent/50 focus:ring-1 focus:ring-octo-accent/20"
-            autoFocus
-          />
-
-          {/* Branch preview */}
-          <div className="mt-2 flex items-center gap-2 text-[11px] text-zinc-600">
-            <span className="font-mono text-zinc-400">{branch}</span>
-            <span>from</span>
-            <span className="font-mono text-zinc-500">main</span>
-          </div>
-
-          {/* Advanced options collapsible */}
-          <button className="mt-4 flex items-center gap-1 text-xs text-zinc-600 transition hover:text-zinc-400">
-            <ChevronDown size={12} />
-            Advanced options
-          </button>
-
-          {/* Actions */}
-          <div className="mt-6 flex justify-end">
-            <button
-              onClick={onCancel}
-              className="mr-3 rounded-md px-4 py-2 text-sm text-zinc-500 transition hover:text-zinc-300"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={() => setStep(2)}
-              disabled={!task.trim()}
-              className="rounded-md bg-octo-accent px-4 py-2 text-sm font-medium text-zinc-900 transition hover:bg-octo-accent/90 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Continue &gt;
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="flex h-full flex-col items-center justify-center bg-octo-bg">
-      <div className="w-full max-w-md px-4">
-        {/* Step indicator */}
-        <div className="mb-1 text-[10px] uppercase tracking-widest text-zinc-600">
-          Step 2 of 2
-        </div>
-
-        <h2 className="mb-1 text-xl font-semibold text-zinc-100">
-          Setup script
-        </h2>
-        <p className="mb-6 text-sm text-zinc-500">
-          These commands run automatically when a workspace is created.
-        </p>
-
-        {/* Package manager detection notice */}
-        <div className="rounded-md border border-octo-border bg-octo-panel px-4 py-3">
-          <p className="text-xs text-zinc-500">
-            We couldn't detect a package manager or environment config.
-          </p>
-          <div className="mt-3 flex gap-2">
-            <button
-              onClick={() => setSetupScript("")}
-              className="rounded-md border border-octo-border px-3 py-1.5 text-xs text-zinc-400 transition hover:border-zinc-600 hover:text-zinc-200"
-            >
-              Add commands
-            </button>
-            <button
-              onClick={() => setSetupScript("")}
-              className="rounded-md px-3 py-1.5 text-xs text-zinc-600 transition hover:text-zinc-400"
-            >
-              Skip
-            </button>
-          </div>
-        </div>
-
-        {/* Teardown commands collapsible */}
-        <button className="mt-4 flex items-center gap-1 text-xs text-zinc-600 transition hover:text-zinc-400">
-          <ChevronDown size={12} />
-          Teardown commands (optional)
+    <div
+      data-tauri-drag-region
+      className="flex h-full w-full bg-octo-bg"
+      style={{
+        background:
+          "radial-gradient(ellipse at 30% 25%, rgba(212,165,116,0.05), transparent 50%), var(--color-octo-onyx)",
+      }}
+    >
+      {/* Left index pane */}
+      <aside className="w-[220px] shrink-0 border-r border-octo-hairline bg-octo-panel px-6 py-10">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="mb-10 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute hover:text-octo-sage"
+        >
+          ← Back
         </button>
 
-        {error && (
-          <div className="mt-4 rounded-md border border-octo-danger/40 bg-octo-danger/10 px-3 py-2 text-xs text-octo-danger">
-            {error}
-          </div>
-        )}
-
-        {/* Actions */}
-        <div className="mt-6 flex items-center justify-between">
-          <button
-            onClick={() => setStep(1)}
-            className="rounded-md px-4 py-2 text-sm text-zinc-500 transition hover:text-zinc-300"
-          >
-            &lt; Back
-          </button>
-
-          <div className="flex gap-2">
-            <button
-              onClick={onCreated}
-              className="rounded-md px-4 py-2 text-sm text-zinc-500 transition hover:text-zinc-300"
-            >
-              Skip for now
-            </button>
-            <button
-              onClick={handleCreate}
-              disabled={creating || !task.trim()}
-              className="rounded-md bg-octo-accent px-4 py-2 text-sm font-medium text-zinc-900 transition hover:bg-octo-accent/90 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {creating ? "Creating..." : "Create workspace >"}
-            </button>
-          </div>
+        <div className="font-serif italic text-[18px] text-octo-ivory">
+          A new workspace
         </div>
-      </div>
+
+        <div className="mt-6 space-y-1">
+          <StepIndex active={step === 1} numeral="I" label="Task & intent" onClick={() => setStep(1)} />
+          <StepIndex
+            active={step === 2}
+            numeral="II"
+            label="Setup script"
+            onClick={() => taskValid && setStep(2)}
+            disabled={!taskValid && step !== 2}
+          />
+        </div>
+
+        <div
+          aria-hidden
+          className="mt-10 h-px w-7"
+          style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
+        />
+      </aside>
+
+      {/* Right content pane */}
+      <main className="flex flex-1 flex-col justify-center px-14 py-10">
+        {step === 1 ? (
+          <>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+              STEP I · OF II
+            </div>
+            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+              What are you setting out to do?
+            </h1>
+            <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
+              A workspace is an isolated task environment backed by a git worktree. The task name becomes the branch.
+            </p>
+
+            <div className="mt-8 max-w-[520px]">
+              <Field label="TASK">
+                <input
+                  autoFocus
+                  value={task}
+                  onChange={(e) => setTask(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && taskValid) setStep(2);
+                  }}
+                  placeholder="e.g. Add dark mode, Fix checkout bug"
+                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                />
+              </Field>
+
+              {/* Branch preview */}
+              <div className="mt-4 flex items-baseline gap-2 font-mono text-[10px] uppercase tracking-[0.2em]">
+                <span className="text-octo-mute">BRANCH</span>
+                <span className="text-octo-brass">{branch}</span>
+                <span className="text-octo-mute">from</span>
+                <span className="text-octo-sage">main</span>
+              </div>
+            </div>
+
+            <div className="mt-10 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(2)}
+                disabled={!taskValid}
+                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                Continue
+              </button>
+              <button
+                type="button"
+                onClick={onCancel}
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+              >
+                Cancel
+              </button>
+              <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                ↵ to continue
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+              STEP II · OF II
+            </div>
+            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+              How does it start?
+            </h1>
+            <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
+              These commands run automatically when the workspace is created. Leave empty to skip.
+            </p>
+
+            <div className="mt-8 max-w-[640px]">
+              <Field label="SETUP SCRIPT">
+                <textarea
+                  value={setupScript}
+                  onChange={(e) => setSetupScript(e.target.value)}
+                  placeholder="npm install"
+                  rows={6}
+                  className="w-full resize-y rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                />
+              </Field>
+
+              <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
+                Runs inside the new worktree at <span className="text-octo-sage">{projectPath}/.octopus/{branch}</span>.
+              </div>
+            </div>
+
+            {error && (
+              <div
+                className="mt-6 max-w-[520px] rounded-md px-3 py-2 text-[12px] text-octo-rouge"
+                style={{ borderLeft: "1px solid var(--color-octo-rouge)", background: "rgba(209, 139, 139, 0.08)" }}
+              >
+                {error}
+              </div>
+            )}
+
+            <div className="mt-10 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+              >
+                ← Back
+              </button>
+              <button
+                type="button"
+                onClick={handleCreate}
+                disabled={!taskValid || creating}
+                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                {creating ? "Creating…" : "Begin"}
+              </button>
+              <button
+                type="button"
+                onClick={handleCreate}
+                disabled={creating}
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+                title="Skip the setup script"
+              >
+                Skip & begin
+              </button>
+            </div>
+          </>
+        )}
+      </main>
     </div>
+  );
+}
+
+function StepIndex({
+  active,
+  numeral,
+  label,
+  onClick,
+  disabled = false,
+}: {
+  active: boolean;
+  numeral: string;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="flex w-full items-baseline gap-3 py-1.5 text-left disabled:cursor-not-allowed"
+    >
+      <span
+        className={`w-6 font-mono text-[10px] uppercase tracking-[0.2em] ${
+          active ? "text-octo-brass" : "text-octo-mute"
+        }`}
+      >
+        {numeral}
+      </span>
+      <span
+        className={
+          active
+            ? "font-serif italic text-[14px] text-octo-ivory"
+            : "font-sans text-[12px] text-octo-mute"
+        }
+      >
+        {label}
+      </span>
+    </button>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+        {label}
+      </div>
+      {children}
+    </label>
   );
 }
