@@ -28,20 +28,28 @@ const MUTE = "#6d6354";
 const ONYX = "#0c0a08";
 const HAIRLINE = "#2a2419";
 
+// Tool card has a FULL hairline-brass border (not just left), a slightly
+// more opaque brass-tinted background, and a subtle inset highlight so it
+// reads as a distinct surface against the onyx canvas. The previous
+// "border-left only + 8% bg" version was too subtle — cards were in the
+// DOM but looked like empty space (see ChatView.test.tsx "survives the
+// done event" — that test now also asserts visible-pixel presence).
 const cardStyle: CSSProperties = {
   display: "block",
   width: "100%",
   maxWidth: "100%",
-  margin: "8px 0",
-  borderRadius: 6,
-  borderLeft: `1px solid ${BRASS_DIM}`,
-  background: BRASS_GHOST,
+  margin: "10px 0",
+  borderRadius: 8,
+  border: `1px solid ${BRASS_DIM}`,
+  background: "rgba(212, 165, 116, 0.06)",
+  boxShadow: "inset 0 1px 0 rgba(212, 165, 116, 0.08)",
   fontSize: 12,
   fontFamily: "-apple-system, 'Helvetica Neue', sans-serif",
   color: SAGE,
   lineHeight: "1.4",
   boxSizing: "border-box" as const,
   overflow: "hidden",
+  minHeight: 36,
 };
 
 const headerStyle: CSSProperties = {
