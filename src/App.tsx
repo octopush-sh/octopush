@@ -10,13 +10,14 @@ import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
 import { TerminalPane } from "./components/TerminalPane";
-import { TokenDashboard } from "./components/TokenDashboard";
 import { CommandPalette } from "./components/CommandPalette";
 import { ToastContainer } from "./components/Toasts";
-import { SettingsDialog } from "./components/SettingsDialog";
+import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useThemeStore } from "./stores/themeStore";
+import { useTokenStore } from "./stores/tokenStore";
+import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
@@ -40,6 +41,8 @@ type AppView = "project" | "new-project";
 function App() {
   const project = useProjectStore((s) => s.current);
   const loadTheme = useThemeStore((s) => s.load);
+  const tokenReport = useTokenStore((s) => s.report);
+  const refreshTokens = useTokenStore((s) => s.refresh);
   const {
     workspaces,
     activeId: activeWorkspaceId,
@@ -58,10 +61,9 @@ function App() {
   const [activeTerminalPerWorkspace, setActiveTerminalPerWorkspace] = useState<Record<string, string>>({});
 
   // Overlay/menu state
-  const [showTokens, setShowTokens] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [showPalette, setShowPalette] = useState(false);
   const [showCreator, setShowCreator] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
 
   // Git status (refreshed on workspace change)
@@ -81,6 +83,14 @@ function App() {
   useEffect(() => {
     loadTheme();
   }, [loadTheme]);
+
+  // Refresh token usage periodically so the Companion + Settings · Usage
+  // stay current. 30s is enough for a workspace-level glance.
+  useEffect(() => {
+    refreshTokens();
+    const id = setInterval(refreshTokens, 30_000);
+    return () => clearInterval(id);
+  }, [refreshTokens]);
 
   // ── Project switch → load workspaces, reset view ──
   useEffect(() => {
@@ -272,26 +282,24 @@ function App() {
         return;
       }
 
-      // ⌘\ → toggle companion
+      // ⌘\ → toggle companion (no-op for now; pending true companion visibility state)
       if (mod && e.key === "\\") {
         e.preventDefault();
-        setShowTokens((v) => !v);
         bumpLayout();
         return;
       }
 
-      // ⌘, → settings
+      // ⌘, → Settings (General tab)
       if (mod && e.key === ",") {
         e.preventDefault();
-        setShowSettings(true);
+        setSettingsTab("general");
         return;
       }
 
       // ⌘⇧T → Settings · Usage
       if (mod && e.shiftKey && (e.key === "T" || e.key === "t")) {
         e.preventDefault();
-        setShowTokens((v) => !v);
-        bumpLayout();
+        setSettingsTab("usage");
         return;
       }
     };
@@ -310,15 +318,16 @@ function App() {
       ) ?? null
     : null;
 
-  const companionContextProps = useMemo(
-    () => ({
-      tokensUsed: 0,        // wired to real data in Phase 6 (TokenDashboard migration)
+  const companionContextProps = useMemo(() => {
+    const tokensUsed =
+      (tokenReport?.totalInput ?? 0) + (tokenReport?.totalOutput ?? 0);
+    return {
+      tokensUsed,
       tokensLimit: 200_000,
       filesInFlight: gitStatus?.changedFiles.length ?? 0,
       toolCalls: 0,
-    }),
-    [gitStatus],
-  );
+    };
+  }, [gitStatus, tokenReport]);
 
   const companionHistoryProps = useMemo(
     () => ({
@@ -436,7 +445,7 @@ function App() {
                       <ChatView
                         workspaceId={activeChatId!}
                         workspacePath={activeWorkspace.worktreePath || project.path}
-                        onOpenSettings={() => setShowSettings(true)}
+                        onOpenSettings={() => setSettingsTab("general")}
                       />
                     </div>
 
@@ -496,8 +505,6 @@ function App() {
         )}
       </main>
 
-      {showTokens && <TokenDashboard />}
-
       {customizingWorkspace && (
         <div
           className="absolute inset-0 z-30 flex items-start justify-start bg-black/30 p-2"
@@ -524,12 +531,13 @@ function App() {
           setShowPalette(false);
           setShowCreator(true);
         }}
-        onToggleTokens={() => setShowTokens((v) => !v)}
+        onToggleTokens={() => setSettingsTab("usage")}
       />
 
-      <SettingsDialog
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
+      <Settings
+        open={settingsTab !== null}
+        initialTab={settingsTab ?? "general"}
+        onClose={() => setSettingsTab(null)}
       />
 
       <ToastContainer />
