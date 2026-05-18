@@ -53,13 +53,14 @@ function App() {
   const [chatsPerWorkspace, setChatsPerWorkspace] = useState<Record<string, ChatRef[]>>({});
   const [activeChatPerWorkspace, setActiveChatPerWorkspace] = useState<Record<string, string>>({});
 
-  // Terminal store selectors
-  const terminals = useTerminalsStore((s) =>
-    activeWorkspaceId ? s.getTerminals(activeWorkspaceId) : [],
-  );
-  const activeTerminalId = useTerminalsStore((s) =>
-    activeWorkspaceId ? s.getActiveId(activeWorkspaceId) : null,
-  );
+  // Terminal store selectors.
+  // Important: always call the store's getTerminals/getActiveId selectors with
+  // a non-null key — those return stable references (EMPTY_TERMINALS constant
+  // or null) when the workspace is unknown. Using an inline `[]` fallback here
+  // would create a fresh array each render and trigger an infinite re-render
+  // loop (React error #185), the same trap that bit chatStore historically.
+  const terminals = useTerminalsStore((s) => s.getTerminals(activeWorkspaceId ?? ""));
+  const activeTerminalId = useTerminalsStore((s) => s.getActiveId(activeWorkspaceId ?? ""));
   const loadTerminals = useTerminalsStore((s) => s.loadTerminals);
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const markRunning = useTerminalsStore((s) => s.markRunning);
