@@ -75,8 +75,7 @@ impl Db {
                 cache_read      INTEGER NOT NULL DEFAULT 0,
                 cache_create    INTEGER NOT NULL DEFAULT 0,
                 model           TEXT NOT NULL,
-                cost_usd        REAL NOT NULL DEFAULT 0,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                cost_usd        REAL NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_token_events_session
@@ -136,6 +135,46 @@ impl Db {
         // duplicate-column error if the migration has already run.
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN glyph TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN tint TEXT")?;
+
+        // Phase 9 — drop the FK from token_events.session_id. The original
+        // schema only ever expected CLI session ids, so chat-driven token
+        // events (keyed by workspace_id) were silently rejected by the FK
+        // constraint and the CONTEXT/Usage dashboards stayed at zero.
+        // SQLite has no ALTER TABLE DROP CONSTRAINT — recreate the table.
+        let has_fk: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('token_events')",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        ).unwrap_or(false);
+        if has_fk {
+            self.conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE token_events_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id      TEXT NOT NULL,
+                    timestamp       TEXT NOT NULL,
+                    input_tokens    INTEGER NOT NULL,
+                    output_tokens   INTEGER NOT NULL,
+                    cache_read      INTEGER NOT NULL DEFAULT 0,
+                    cache_create    INTEGER NOT NULL DEFAULT 0,
+                    model           TEXT NOT NULL,
+                    cost_usd        REAL NOT NULL DEFAULT 0
+                );
+                INSERT INTO token_events_new
+                    (id, session_id, timestamp, input_tokens, output_tokens,
+                     cache_read, cache_create, model, cost_usd)
+                    SELECT id, session_id, timestamp, input_tokens, output_tokens,
+                           cache_read, cache_create, model, cost_usd
+                    FROM token_events;
+                DROP TABLE token_events;
+                ALTER TABLE token_events_new RENAME TO token_events;
+                CREATE INDEX IF NOT EXISTS idx_token_events_session
+                    ON token_events(session_id, timestamp DESC);
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
