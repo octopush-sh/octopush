@@ -2,8 +2,7 @@ import type { WorkspaceMode } from "../lib/modes";
 import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
-import { CompanionChanged } from "./CompanionChanged";
-import type { FileChange } from "../lib/types";
+import { CompanionFileTree } from "./CompanionFileTree";
 
 interface ContextProps {
   tokensUsed: number;
@@ -19,8 +18,10 @@ interface HistoryProps {
   onNewChat: () => void;
 }
 
-interface ChangedProps {
-  changedFiles: FileChange[];
+interface FileTreeProps {
+  rootPath: string;
+  rootLabel: string;
+  changedPaths: Set<string>;
 }
 
 interface Props {
@@ -28,7 +29,7 @@ interface Props {
   workspaceId: string | null;
   contextProps: ContextProps;
   historyProps: HistoryProps;
-  changedProps: ChangedProps;
+  fileTree?: FileTreeProps;
 }
 
 export function Companion({
@@ -36,7 +37,7 @@ export function Companion({
   workspaceId,
   contextProps,
   historyProps,
-  changedProps,
+  fileTree,
 }: Props) {
   return (
     <aside
@@ -52,7 +53,9 @@ export function Companion({
       {mode === "run" && workspaceId && (
         <CompanionTerminals workspaceId={workspaceId} />
       )}
-      {mode === "review" && <CompanionChanged {...changedProps} />}
+      {mode === "review" && fileTree && (
+        <CompanionFileTree {...fileTree} />
+      )}
     </aside>
   );
 }

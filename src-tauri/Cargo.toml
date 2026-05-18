@@ -36,6 +36,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"
 regex = "1"
+ignore = "0.4"
 
 [dev-dependencies]
 

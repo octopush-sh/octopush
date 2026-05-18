@@ -184,6 +184,12 @@ export interface FileChange {
   status: "new" | "modified" | "deleted" | "renamed" | "unknown";
 }
 
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+}
+
 // ─── Settings ─────────────────────────────────────────────────────
 
 export interface GitCredentialEntry {

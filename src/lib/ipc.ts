@@ -7,6 +7,7 @@ import type {
   BudgetStatus,
   ChatMessage,
   CreateSessionArgs,
+  DirectoryEntry,
   GitStatus,
   ModelSuggestion,
   ModelWithProvider,
@@ -151,6 +152,9 @@ export const ipc = {
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
   revealInFinder: (path: string) => invoke<void>("reveal_in_finder", { path }),
+
+  // ─── Directory listing ─────────────────────────────────────────
+  readDirectory: (path: string) => invoke<DirectoryEntry[]>("read_directory", { path }),
 
   // ─── Settings ─────────────────────────────────────────────────
   getSettings: () =>

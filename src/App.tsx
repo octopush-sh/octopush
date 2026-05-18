@@ -303,10 +303,17 @@ function App() {
     [activeWorkspaceId, chatsPerWorkspace, activeChatId, handleSelectChat, handleNewChat],
   );
 
-  const companionChangedProps = useMemo(
-    () => ({ changedFiles: gitStatus?.changedFiles ?? [] }),
-    [gitStatus],
-  );
+  const fileTreeProps = useMemo(() => {
+    if (!activeWorkspace) return undefined;
+    const rootPath = activeWorkspace.worktreePath || project!.path;
+    return {
+      rootPath,
+      rootLabel: activeWorkspace.name,
+      changedPaths: new Set(
+        (gitStatus?.changedFiles ?? []).map((f) => `${rootPath}/${f.path}`),
+      ),
+    };
+  }, [activeWorkspace, project, gitStatus]);
 
   // ── Customize menu submit ──
   const handleCustomizeSubmit = useCallback(
@@ -461,7 +468,7 @@ function App() {
                 workspaceId={activeWorkspaceId}
                 contextProps={companionContextProps}
                 historyProps={companionHistoryProps}
-                changedProps={companionChangedProps}
+                fileTree={fileTreeProps}
               />
             </div>
           </>

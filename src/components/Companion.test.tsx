@@ -2,10 +2,16 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { Companion } from "./Companion";
 
-// Mock CompanionTerminals so it doesn't try to hit the real store/IPC.
+// Mock child companions so they don't hit real store/IPC.
 vi.mock("./CompanionTerminals", () => ({
   CompanionTerminals: ({ workspaceId }: { workspaceId: string }) => (
     <div>Terminals({workspaceId})</div>
+  ),
+}));
+
+vi.mock("./CompanionFileTree", () => ({
+  CompanionFileTree: ({ rootLabel }: { rootLabel: string }) => (
+    <div>FileTree({rootLabel})</div>
   ),
 }));
 
@@ -13,7 +19,12 @@ const defaultProps = {
   workspaceId: "ws-1",
   contextProps: { tokensUsed: 42000, tokensLimit: 200000, filesInFlight: 3, toolCalls: 7 },
   historyProps: { chats: [], activeChatId: null, onSelectChat: () => {}, onNewChat: () => {} },
-  changedProps: { changedFiles: [] },
+};
+
+const fileTree = {
+  rootPath: "/repo",
+  rootLabel: "my-project",
+  changedPaths: new Set<string>(),
 };
 
 describe("Companion", () => {
@@ -33,8 +44,14 @@ describe("Companion", () => {
     expect(screen.queryByText(/Terminals/i)).not.toBeInTheDocument();
   });
 
-  it("renders Changed section in review mode", () => {
+  it("renders FileTree in review mode when fileTree prop is provided", () => {
+    render(<Companion mode="review" {...defaultProps} fileTree={fileTree} />);
+    expect(screen.getByText(/FileTree\(my-project\)/i)).toBeInTheDocument();
+  });
+
+  it("renders nothing in review mode when fileTree prop is absent", () => {
     render(<Companion mode="review" {...defaultProps} />);
-    expect(screen.getByText(/changed/i)).toBeInTheDocument();
+    // Should not render any content in the companion aside beyond the container
+    expect(screen.queryByText(/FileTree/i)).not.toBeInTheDocument();
   });
 });

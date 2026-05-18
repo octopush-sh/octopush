@@ -875,6 +875,90 @@ pub async fn save_git_credentials(host: String, username: String, token: String)
     crate::settings::save_git_credentials(&host, &username, &token)
 }
 
+// ─── Directory listing ────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// Read one level of a directory, respecting `.gitignore`.
+/// Directories are returned first (alphabetical), then files (alphabetical).
+/// `.git` is always excluded.
+#[tauri::command]
+pub async fn read_directory(path: String) -> AppResult<Vec<DirectoryEntry>> {
+    let path = expand_tilde(&path);
+    let base = std::path::Path::new(&path);
+
+    if !base.exists() {
+        return Err(AppError::Other(format!("Path does not exist: {}", path)));
+    }
+    if !base.is_dir() {
+        return Err(AppError::Other(format!("Not a directory: {}", path)));
+    }
+
+    let mut dirs: Vec<DirectoryEntry> = Vec::new();
+    let mut files: Vec<DirectoryEntry> = Vec::new();
+
+    // WalkBuilder with max_depth(1) gives us the root entry + its direct children.
+    // standard_filters(true) enables .gitignore, .ignore, hidden-file filtering.
+    // We add_custom_ignore_filename(".gitignore") is already included in standard_filters.
+    let walker = ignore::WalkBuilder::new(base)
+        .max_depth(Some(1))
+        .standard_filters(true)
+        .require_git(false) // apply .gitignore rules even outside a git repo
+        .hidden(false) // include dot-files like .gitignore itself; gitignore rules handle exclusions
+        .build();
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Skip the root itself (depth 0).
+        if entry.depth() == 0 {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        let name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Always skip .git directory.
+        if name == ".git" {
+            continue;
+        }
+
+        let abs_path = entry_path.to_string_lossy().into_owned();
+        let is_dir = entry_path.is_dir();
+
+        let de = DirectoryEntry {
+            name,
+            path: abs_path,
+            is_dir,
+        };
+
+        if is_dir {
+            dirs.push(de);
+        } else {
+            files.push(de);
+        }
+    }
+
+    // Sort each group alphabetically, case-insensitive.
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    dirs.extend(files);
+    Ok(dirs)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.

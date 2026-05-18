@@ -439,3 +439,65 @@ mod scanner_tests {
         assert!(scan_pty_output("x", b"").is_none());
     }
 }
+
+#[cfg(test)]
+mod read_directory_tests {
+    use crate::commands::read_directory;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn lists_entries_respecting_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+
+        // Create subdir, a normal file, an ignored file, and a .gitignore.
+        fs::create_dir(tmp.path().join("subdir")).unwrap();
+        fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+        fs::write(tmp.path().join("ignored.txt"), "nope").unwrap();
+        fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+
+        let entries = read_directory(root).await.expect("should succeed");
+
+        // Should NOT include ignored.txt or .git
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"ignored.txt"), "ignored.txt must be filtered");
+        assert!(!names.contains(&".git"), ".git must be filtered");
+
+        // Should include subdir, file.txt, .gitignore
+        assert!(names.contains(&"subdir"), "subdir must appear");
+        assert!(names.contains(&"file.txt"), "file.txt must appear");
+
+        // Dirs sort before files
+        let first = &entries[0];
+        assert!(first.is_dir, "first entry must be a directory");
+
+        // Within files, alphabetical
+        let files: Vec<&str> = entries.iter().filter(|e| !e.is_dir).map(|e| e.name.as_str()).collect();
+        let mut sorted = files.clone();
+        sorted.sort_by_key(|s| s.to_lowercase());
+        assert_eq!(files, sorted, "files must be sorted alphabetically");
+    }
+
+    #[tokio::test]
+    async fn returns_error_for_nonexistent_path() {
+        let result = read_directory("/nonexistent/path/abc123".to_string()).await;
+        assert!(result.is_err(), "should return error for missing directory");
+    }
+
+    #[tokio::test]
+    async fn one_level_only() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("deep.txt"), "x").unwrap();
+
+        let entries = read_directory(tmp.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        // Should only see "a", not "a/b" or "a/b/deep.txt"
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a");
+    }
+}
