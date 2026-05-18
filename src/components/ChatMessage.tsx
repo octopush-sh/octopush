@@ -174,7 +174,7 @@ export function ChatMessage({ message }: Props) {
 
   if (role === "user") {
     return (
-      <div data-role="user" className="flex flex-col gap-1.5">
+      <div data-role="user" className="chat-selectable flex flex-col gap-1.5">
         <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
           — You
         </div>
@@ -189,7 +189,7 @@ export function ChatMessage({ message }: Props) {
   const { keyPhrase, body } = parseKeyPhrase(content);
 
   return (
-    <div data-role="assistant" className="flex flex-col gap-2">
+    <div data-role="assistant" className="chat-selectable flex flex-col gap-2">
       <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
         — {modelDisplayName(model)}
       </div>

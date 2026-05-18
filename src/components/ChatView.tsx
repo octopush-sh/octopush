@@ -2,9 +2,9 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
-import { AgentBar } from "./AgentBar";
 import { BrassRule } from "./BrassRule";
 import { ChatMessage } from "./ChatMessage";
+import { ModelPicker } from "./ModelPicker";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface Props {
@@ -49,11 +49,16 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
   }, [messages]);
 
   const [input, setInput] = useState("");
+  const [history, setHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number>(-1); // -1 = not navigating
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     loadHistory(workspaceId);
+    // Reset per-workspace prompt history when switching workspaces.
+    setHistory([]);
+    setHistoryIndex(-1);
   }, [workspaceId, loadHistory]);
 
   useEffect(() => {
@@ -64,7 +69,10 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
   }, [streaming, streamBuffer]);
 
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
-    setInput(e.target.value);
+    const val = e.target.value;
+    setInput(val);
+    // Any manual edit exits history navigation.
+    setHistoryIndex(-1);
     const ta = e.target;
     ta.style.height = "auto";
     const lineHeight = 20;
@@ -76,13 +84,52 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
     const trimmed = input.trim();
     if (!trimmed || streaming) return;
     setInput("");
+    setHistoryIndex(-1);
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
+    // Prepend to history, deduplicate consecutive duplicates.
+    setHistory((prev) => {
+      if (prev[0] === trimmed) return prev;
+      return [trimmed, ...prev];
+    });
     send(workspaceId, workspacePath, trimmed);
   }, [input, streaming, send, workspaceId, workspacePath]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // ── Arrow-key prompt history ──────────────────────────────────
+    if (e.key === "ArrowUp" && !e.shiftKey) {
+      // Navigate back: only when input is empty OR already navigating.
+      if (input === "" || historyIndex >= 0) {
+        e.preventDefault();
+        setHistoryIndex((prev) => {
+          const next = Math.min(history.length - 1, prev + 1);
+          if (next >= 0) setInput(history[next] ?? "");
+          return next;
+        });
+        return;
+      }
+    }
+    if (e.key === "ArrowDown" && !e.shiftKey && historyIndex >= 0) {
+      e.preventDefault();
+      setHistoryIndex((prev) => {
+        const next = prev - 1;
+        if (next < 0) {
+          setInput("");
+          return -1;
+        }
+        setInput(history[next] ?? "");
+        return next;
+      });
+      return;
+    }
+    if (e.key === "Escape" && historyIndex >= 0) {
+      e.preventDefault();
+      setInput("");
+      setHistoryIndex(-1);
+      return;
+    }
+    // ── Regular send ─────────────────────────────────────────────
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -93,8 +140,6 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <AgentBar activeModel={model} onSelectModel={setModel} />
-
       <div
         ref={scrollRef}
         className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-8 py-6"
@@ -139,7 +184,18 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         )}
       </div>
 
-      <div className="border-t border-octo-hairline bg-octo-panel px-6 py-4">
+      <div className="border-t border-octo-hairline bg-octo-panel px-6 pb-0 pt-3">
+        {/* Model picker row — sits tight above the input box */}
+        <div className="mb-2 flex items-center">
+          <ModelPicker
+            activeModel={model}
+            onSelectModel={setModel}
+            onOpenSettings={onOpenSettings}
+          />
+        </div>
+
+        {/* Input wrapper */}
+        <div className="pb-4">
         <div
           className={clsx(
             "rounded-xl border bg-octo-onyx transition-colors",
@@ -183,6 +239,7 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
               Send
             </button>
           </div>
+        </div>
         </div>
       </div>
     </div>

@@ -120,6 +120,24 @@ impl ProviderRouter {
             }
 
             let defaults = builtin_providers();
+
+            // Migration: pre-Phase-8 shipped DeepSeek and Ollama as disabled.
+            // If a provider is still in that initial state (matches the old
+            // default shape), bring it up to the current default so users get
+            // them without manually editing providers.json.
+            for p in &mut list {
+                if let Some(def) = defaults.get(&p.name) {
+                    if p.name == "deepseek" && !p.enabled && p.models.len() == def.models.len() {
+                        p.enabled = true;
+                    }
+                    if p.name == "ollama" && p.models.is_empty() {
+                        p.enabled = true;
+                        p.models = def.models.clone();
+                        p.api_base = def.api_base.clone();
+                    }
+                }
+            }
+
             for (name, def) in &defaults {
                 if !list.iter().any(|p| p.name == *name) {
                     list.push(def.clone());
@@ -322,7 +340,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
             ],
             rate_limits: RateLimits::default(),
-            enabled: false,
+            enabled: true,
             protocol: "openai-compatible".into(),
             local: false,
         },
@@ -334,9 +352,37 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
             name: "ollama".into(),
             api_base: "http://localhost:11434/v1".into(),
             api_key_env: String::new(),
-            models: vec![],
+            models: vec![
+                ModelInfo {
+                    id: "llama3.3".into(),
+                    display_name: "Llama 3.3".into(),
+                    input_cost_per_m: 0.0,
+                    output_cost_per_m: 0.0,
+                    max_context: 128_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                },
+                ModelInfo {
+                    id: "qwen2.5-coder".into(),
+                    display_name: "Qwen 2.5 Coder".into(),
+                    input_cost_per_m: 0.0,
+                    output_cost_per_m: 0.0,
+                    max_context: 128_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                },
+                ModelInfo {
+                    id: "deepseek-r1".into(),
+                    display_name: "DeepSeek R1".into(),
+                    input_cost_per_m: 0.0,
+                    output_cost_per_m: 0.0,
+                    max_context: 64_000,
+                    supports_vision: false,
+                    supports_tools: false,
+                },
+            ],
             rate_limits: RateLimits::default(),
-            enabled: false,
+            enabled: true,
             protocol: "openai-compatible".into(),
             local: true,
         },
@@ -452,5 +498,20 @@ mod tests {
         let back: ProviderConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.protocol, "openai-compatible");
         assert!(!back.local);
+    }
+
+    #[test]
+    fn deepseek_enabled_by_default() {
+        let providers = builtin_providers();
+        assert!(providers["deepseek"].enabled, "deepseek should ship enabled");
+        assert!(providers["ollama"].enabled, "ollama should ship enabled");
+    }
+
+    #[test]
+    fn ollama_has_default_models() {
+        let providers = builtin_providers();
+        let ollama = &providers["ollama"];
+        assert!(!ollama.models.is_empty(), "ollama must ship with default models");
+        assert!(ollama.models.iter().any(|m| m.id == "llama3.3"));
     }
 }

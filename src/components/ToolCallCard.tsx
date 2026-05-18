@@ -79,7 +79,7 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
 
   return (
-    <div style={cardStyle}>
+    <div className="chat-selectable" style={cardStyle}>
       <div style={{ display: "flex", alignItems: "center" }}>
         <div
           role="button"

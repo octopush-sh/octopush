@@ -11,7 +11,7 @@
  * specific DOM content.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
 type EventHandler = (ev: { payload: unknown }) => void;
@@ -327,5 +327,132 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("styles.css")).toBeInTheDocument();
     expect(screen.getAllByText("WRITE")).toHaveLength(2);
     expect(screen.getByText(/landing page está lista/i)).toBeInTheDocument();
+  });
+});
+
+// ─── Arrow-key prompt history ────────────────────────────────────────────────
+
+describe("ChatView — arrow-key prompt history", () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  function getTextarea() {
+    return screen.getByPlaceholderText(/Ask Octopus anything/i) as HTMLTextAreaElement;
+  }
+
+  it("input clears after sending a message", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "hello" } });
+    expect(ta.value).toBe("hello");
+
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("");
+  });
+
+  it("ArrowUp on empty input recalls the last sent message", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+
+    // Type and send "hello".
+    fireEvent.change(ta, { target: { value: "hello" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("");
+
+    // ArrowUp should recall "hello".
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta.value).toBe("hello");
+  });
+
+  it("ArrowUp cycles through multiple history entries", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+
+    // Send "first".
+    fireEvent.change(ta, { target: { value: "first" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // Send "second".
+    fireEvent.change(ta, { target: { value: "second" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // First ArrowUp → "second" (most recent).
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta.value).toBe("second");
+
+    // Second ArrowUp → "first".
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta.value).toBe("first");
+  });
+
+  it("ArrowDown navigates forward through history and back to empty", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+
+    // Send "alpha" then "beta".
+    fireEvent.change(ta, { target: { value: "alpha" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.change(ta, { target: { value: "beta" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // Navigate back twice.
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); // → "beta"
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); // → "alpha"
+
+    // Now come forward.
+    fireEvent.keyDown(ta, { key: "ArrowDown" }); // → "beta"
+    expect(ta.value).toBe("beta");
+
+    fireEvent.keyDown(ta, { key: "ArrowDown" }); // → ""
+    expect(ta.value).toBe("");
+  });
+
+  it("Escape while navigating clears input and exits history mode", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+
+    fireEvent.change(ta, { target: { value: "escape-me" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); // → "escape-me"
+    expect(ta.value).toBe("escape-me");
+
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(ta.value).toBe("");
+
+    // ArrowDown should do nothing now (not navigating).
+    fireEvent.keyDown(ta, { key: "ArrowDown" });
+    expect(ta.value).toBe("");
+  });
+
+  it("does not deduplicate non-consecutive identical prompts", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+
+    // Send "a", "b", "a" — "b" breaks the run so "a" should appear at 0 and 2.
+    fireEvent.change(ta, { target: { value: "a" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.change(ta, { target: { value: "b" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.change(ta, { target: { value: "a" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // History is ["a", "b", "a"]. ArrowUp x3 should yield "a" → "b" → "a".
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("a");
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("b");
+    fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("a");
   });
 });

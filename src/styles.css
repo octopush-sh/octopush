@@ -167,6 +167,13 @@ body {
   user-select: text;
 }
 
+/* Chat content is selectable so users can copy prompts, responses, and errors */
+.chat-selectable,
+.chat-selectable * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* Attention indicator pulse animation */
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
