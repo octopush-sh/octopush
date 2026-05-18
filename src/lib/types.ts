@@ -177,8 +177,12 @@ export interface FileChange {
 // ─── Settings ─────────────────────────────────────────────────────
 
 export interface AppSettings {
-  anthropicApiKey: string | null;
-  openaiApiKey: string | null;
+  providerKeys: Record<string, string>;
+  providerBaseUrls: Record<string, string>;
+  /** @deprecated use providerKeys.anthropic */
+  anthropicApiKey?: string | null;
+  /** @deprecated use providerKeys.openai */
+  openaiApiKey?: string | null;
 }
 
 // ─── Theme ────────────────────────────────────────────────────────

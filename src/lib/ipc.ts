@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
+  AppSettings,
   BudgetStatus,
   ChatMessage,
   CreateSessionArgs,
@@ -137,7 +138,7 @@ export const ipc = {
 
   // ─── Settings ─────────────────────────────────────────────────
   getSettings: () =>
-    invoke<{ anthropicApiKey: string | null; openaiApiKey: string | null }>("get_settings"),
-  saveSettings: (settings: { anthropicApiKey: string | null; openaiApiKey: string | null }) =>
+    invoke<AppSettings>("get_settings"),
+  saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
 };

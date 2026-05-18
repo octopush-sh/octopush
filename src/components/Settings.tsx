@@ -197,8 +197,9 @@ function ModelsPane() {
 
   useEffect(() => {
     ipc.getSettings().then((s) => {
-      setAnthropicKey(s.anthropicApiKey ?? "");
-      setOpenaiKey(s.openaiApiKey ?? "");
+      // Read from new providerKeys map; fall back to legacy fields for old settings files.
+      setAnthropicKey(s.providerKeys?.["anthropic"] ?? s.anthropicApiKey ?? "");
+      setOpenaiKey(s.providerKeys?.["openai"] ?? s.openaiApiKey ?? "");
       setSaved(false);
     });
   }, []);
@@ -206,8 +207,11 @@ function ModelsPane() {
   async function handleSave() {
     setSaving(true);
     await ipc.saveSettings({
-      anthropicApiKey: anthropicKey || null,
-      openaiApiKey: openaiKey || null,
+      providerKeys: {
+        ...(anthropicKey ? { anthropic: anthropicKey } : {}),
+        ...(openaiKey ? { openai: openaiKey } : {}),
+      },
+      providerBaseUrls: {},
     });
     setSaving(false);
     setSaved(true);
