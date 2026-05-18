@@ -23,6 +23,21 @@ pub struct ProviderConfig {
     pub rate_limits: RateLimits,
     #[serde(default)]
     pub enabled: bool,
+
+    /// Wire protocol the provider speaks: "anthropic" or "openai-compatible".
+    /// "openai-compatible" covers OpenAI, DeepSeek, Ollama, and any
+    /// self-hosted server (vllm, llama.cpp, LMStudio, etc.).
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+
+    /// True for providers running on this machine (Ollama, self-hosted).
+    /// Affects the UI: no API key field, base URL is editable.
+    #[serde(default)]
+    pub local: bool,
+}
+
+fn default_protocol() -> String {
+    "anthropic".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -89,11 +104,34 @@ impl ProviderRouter {
         let path = config_path();
         let providers = if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let list: Vec<ProviderConfig> = serde_json::from_str(&content)?;
+            let mut list: Vec<ProviderConfig> = serde_json::from_str(&content)?;
+
+            for p in &mut list {
+                if p.protocol.is_empty() || p.protocol == "anthropic" {
+                    match p.name.as_str() {
+                        "openai" | "deepseek" => p.protocol = "openai-compatible".into(),
+                        "ollama" => {
+                            p.protocol = "openai-compatible".into();
+                            p.local = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let defaults = builtin_providers();
+            for (name, def) in &defaults {
+                if !list.iter().any(|p| p.name == *name) {
+                    list.push(def.clone());
+                }
+            }
+
+            let snapshot: Vec<&ProviderConfig> = list.iter().collect();
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&snapshot)?);
+
             list.into_iter().map(|p| (p.name.clone(), p)).collect()
         } else {
             let defaults = builtin_providers();
-            // Persist so user can edit.
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -219,6 +257,8 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 tokens_per_minute: Some(80_000),
             },
             enabled: true,
+            protocol: "anthropic".into(),
+            local: false,
         },
     );
 
@@ -250,6 +290,41 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
             ],
             rate_limits: RateLimits::default(),
             enabled: true,
+            protocol: "openai-compatible".into(),
+            local: false,
+        },
+    );
+
+    map.insert(
+        "deepseek".into(),
+        ProviderConfig {
+            name: "deepseek".into(),
+            api_base: "https://api.deepseek.com/v1".into(),
+            api_key_env: "DEEPSEEK_API_KEY".into(),
+            models: vec![
+                ModelInfo {
+                    id: "deepseek-chat".into(),
+                    display_name: "DeepSeek Chat".into(),
+                    input_cost_per_m: 0.14,
+                    output_cost_per_m: 0.28,
+                    max_context: 64_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                },
+                ModelInfo {
+                    id: "deepseek-reasoner".into(),
+                    display_name: "DeepSeek Reasoner".into(),
+                    input_cost_per_m: 0.55,
+                    output_cost_per_m: 2.19,
+                    max_context: 64_000,
+                    supports_vision: false,
+                    supports_tools: false,
+                },
+            ],
+            rate_limits: RateLimits::default(),
+            enabled: false,
+            protocol: "openai-compatible".into(),
+            local: false,
         },
     );
 
@@ -257,11 +332,13 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
         "ollama".into(),
         ProviderConfig {
             name: "ollama".into(),
-            api_base: "http://localhost:11434".into(),
+            api_base: "http://localhost:11434/v1".into(),
             api_key_env: String::new(),
             models: vec![],
             rate_limits: RateLimits::default(),
             enabled: false,
+            protocol: "openai-compatible".into(),
+            local: true,
         },
     );
 
@@ -327,5 +404,53 @@ mod tests {
         assert!(models.len() >= 5);
         // Cheapest first.
         assert!(models[0].model.input_cost_per_m <= models[1].model.input_cost_per_m);
+    }
+
+    #[test]
+    fn builtin_providers_includes_all_four() {
+        let providers = builtin_providers();
+        assert!(providers.contains_key("anthropic"));
+        assert!(providers.contains_key("openai"));
+        assert!(providers.contains_key("deepseek"));
+        assert!(providers.contains_key("ollama"));
+    }
+
+    #[test]
+    fn protocols_are_set_correctly() {
+        let providers = builtin_providers();
+        assert_eq!(providers["anthropic"].protocol, "anthropic");
+        assert_eq!(providers["openai"].protocol, "openai-compatible");
+        assert_eq!(providers["deepseek"].protocol, "openai-compatible");
+        assert_eq!(providers["ollama"].protocol, "openai-compatible");
+    }
+
+    #[test]
+    fn ollama_is_local() {
+        let providers = builtin_providers();
+        assert!(providers["ollama"].local);
+        assert!(!providers["anthropic"].local);
+        assert!(!providers["openai"].local);
+        assert!(!providers["deepseek"].local);
+    }
+
+    #[test]
+    fn find_model_returns_provider_with_protocol() {
+        let router = ProviderRouter { providers: builtin_providers() };
+        let (p, m) = router.find_model("gpt-4o").expect("gpt-4o must be findable");
+        assert_eq!(p.name, "openai");
+        assert_eq!(p.protocol, "openai-compatible");
+        assert_eq!(m.id, "gpt-4o");
+
+        let (p, _) = router.find_model("deepseek-chat").expect("deepseek-chat must be findable");
+        assert_eq!(p.name, "deepseek");
+    }
+
+    #[test]
+    fn provider_config_serde_roundtrip_with_new_fields() {
+        let cfg = builtin_providers().get("openai").unwrap().clone();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ProviderConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.protocol, "openai-compatible");
+        assert!(!back.local);
     }
 }
