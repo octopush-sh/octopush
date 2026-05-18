@@ -455,16 +455,13 @@ function App() {
               />
 
               <div className="relative min-w-0 flex-1 overflow-hidden">
-                {showCreator && (
-                  <WorkspaceCreator
-                    projectId={project.id}
-                    projectPath={project.path}
-                    onCreated={() => setShowCreator(false)}
-                    onCancel={() => setShowCreator(false)}
-                  />
-                )}
-                {!showCreator && (
-                  <>
+                {/* Mode panels are always mounted so TerminalPanes, the
+                    chat editor, and PTYs survive across overlays like the
+                    workspace creator. The creator floats on top via z-index
+                    when showCreator is true. Unmounting these to swap views
+                    was killing PTYs and wiping editor tabs every time the
+                    user opened any workspace dialog. */}
+                <>
                     <div
                       className="absolute inset-0 transition-opacity duration-200 ease-out"
                       style={{
@@ -556,7 +553,19 @@ function App() {
                         </div>
                       </div>
                     </div>
-                  </>
+                </>
+
+                {/* Workspace creator floats above the mode panels so the
+                    underlying PTYs and editor state stay mounted. */}
+                {showCreator && (
+                  <div className="absolute inset-0 z-50 bg-octo-bg">
+                    <WorkspaceCreator
+                      projectId={project.id}
+                      projectPath={project.path}
+                      onCreated={() => setShowCreator(false)}
+                      onCancel={() => setShowCreator(false)}
+                    />
+                  </div>
                 )}
               </div>
 
