@@ -29,6 +29,8 @@ function makeRecord(
   };
 }
 
+import type { PtySession } from "../lib/types";
+
 const mockIpc = {
   listTerminals: vi.fn<(workspaceId: string) => Promise<TerminalRecord[]>>(),
   createTerminal: vi.fn<
@@ -36,6 +38,7 @@ const mockIpc = {
   >(),
   renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
   deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
+  listPtySessions: vi.fn<() => Promise<PtySession[]>>(),
 };
 
 vi.mock("../lib/ipc", () => ({
@@ -50,6 +53,8 @@ function resetStore() {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
   nextId = 0;
   vi.clearAllMocks();
+  // Default: daemon has no live sessions (cold start).
+  mockIpc.listPtySessions.mockResolvedValue([]);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────
@@ -63,6 +68,8 @@ describe("terminalsStore — loadTerminals", () => {
       makeRecord(ws, "Main", 0),
       makeRecord(ws, "Terminal 2", 1),
     ]);
+    // Daemon has no live sessions (cold start).
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
 
     await useTerminalsStore.getState().loadTerminals(ws);
 
@@ -71,15 +78,41 @@ describe("terminalsStore — loadTerminals", () => {
     expect(terminals[0].label).toBe("Main");
     expect(terminals[1].label).toBe("Terminal 2");
     expect(terminals.every((t) => t.running === false)).toBe(true);
+    expect(terminals.every((t) => t.restored === false)).toBe(true);
 
     const active = useTerminalsStore.getState().getActiveId(ws);
     expect(active).toBe(terminals[0].id);
+  });
+
+  it("marks running=true and restored=true when daemon has a live session", async () => {
+    const ws = "ws-reattach";
+    const rec0 = makeRecord(ws, "Main", 0);
+    const rec1 = makeRecord(ws, "Secondary", 1);
+    mockIpc.listTerminals.mockResolvedValueOnce([rec0, rec1]);
+    // Daemon reports rec0 as alive (e.g. survived Octopush restart).
+    mockIpc.listPtySessions.mockResolvedValueOnce([
+      { id: rec0.id, running: true, startedAt: Date.now() },
+    ]);
+
+    await useTerminalsStore.getState().loadTerminals(ws);
+
+    const terminals = useTerminalsStore.getState().getTerminals(ws);
+    expect(terminals).toHaveLength(2);
+
+    const t0 = terminals.find((t) => t.id === rec0.id)!;
+    expect(t0.running).toBe(true);
+    expect(t0.restored).toBe(true);
+
+    const t1 = terminals.find((t) => t.id === rec1.id)!;
+    expect(t1.running).toBe(false);
+    expect(t1.restored).toBe(false);
   });
 
   it("does not overwrite an already-selected active id on reload", async () => {
     const ws = "ws-reload";
     const records = [makeRecord(ws, "Main", 0), makeRecord(ws, "Secondary", 1)];
     mockIpc.listTerminals.mockResolvedValueOnce(records);
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
     await useTerminalsStore.getState().loadTerminals(ws);
 
     // User switched to second terminal
@@ -87,6 +120,7 @@ describe("terminalsStore — loadTerminals", () => {
 
     // Reload (e.g., workspace re-focus)
     mockIpc.listTerminals.mockResolvedValueOnce(records);
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
     await useTerminalsStore.getState().loadTerminals(ws);
 
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe(records[1].id);
@@ -95,6 +129,7 @@ describe("terminalsStore — loadTerminals", () => {
   it("sets active to null when workspace has no terminals", async () => {
     const ws = "ws-empty";
     mockIpc.listTerminals.mockResolvedValueOnce([]);
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
 
     await useTerminalsStore.getState().loadTerminals(ws);
 
@@ -122,7 +157,7 @@ describe("terminalsStore — createTerminal", () => {
     const existing = makeRecord(ws, "Main", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: existing.id, label: existing.label, position: 0, running: false }],
+        [ws]: [{ id: existing.id, label: existing.label, position: 0, running: false, restored: false }],
       },
       activeByWs: { [ws]: existing.id },
     });
@@ -172,7 +207,7 @@ describe("terminalsStore — renameTerminal", () => {
     const rec = makeRecord(ws, "Old", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Old", position: 0, running: false }],
+        [ws]: [{ id: rec.id, label: "Old", position: 0, running: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -194,7 +229,7 @@ describe("terminalsStore — renameTerminal", () => {
     const rec = makeRecord(ws, "Original", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Original", position: 0, running: false }],
+        [ws]: [{ id: rec.id, label: "Original", position: 0, running: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -218,7 +253,7 @@ describe("terminalsStore — deleteTerminal", () => {
     const rec = makeRecord(ws, "Main", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Main", position: 0, running: false }],
+        [ws]: [{ id: rec.id, label: "Main", position: 0, running: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -233,9 +268,9 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-active";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-a", label: "A", position: 0, running: false };
-    const b = { id: "t-b", label: "B", position: 1, running: false };
-    const c = { id: "t-c", label: "C", position: 2, running: false };
+    const a = { id: "t-a", label: "A", position: 0, running: false, restored: false };
+    const b = { id: "t-b", label: "B", position: 1, running: false, restored: false };
+    const c = { id: "t-c", label: "C", position: 2, running: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b, c] },
@@ -254,8 +289,8 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-last";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-a2", label: "A", position: 0, running: false };
-    const b = { id: "t-b2", label: "B", position: 1, running: false };
+    const a = { id: "t-a2", label: "A", position: 0, running: false, restored: false };
+    const b = { id: "t-b2", label: "B", position: 1, running: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b] },
@@ -271,8 +306,8 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-nonactive";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-na-a", label: "A", position: 0, running: false };
-    const b = { id: "t-na-b", label: "B", position: 1, running: false };
+    const a = { id: "t-na-a", label: "A", position: 0, running: false, restored: false };
+    const b = { id: "t-na-b", label: "B", position: 1, running: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b] },
@@ -290,7 +325,7 @@ describe("terminalsStore — markRunning", () => {
 
   it("sets running true/false on the targeted terminal", () => {
     const ws = "ws-running";
-    const t = { id: "t-run", label: "Main", position: 0, running: false };
+    const t = { id: "t-run", label: "Main", position: 0, running: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [t] },
@@ -317,6 +352,9 @@ describe("terminalsStore — workspace isolation", () => {
     mockIpc.listTerminals
       .mockResolvedValueOnce([recA])
       .mockResolvedValueOnce([recB]);
+    mockIpc.listPtySessions
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
 
     await useTerminalsStore.getState().loadTerminals(wsA);
     await useTerminalsStore.getState().loadTerminals(wsB);
@@ -334,8 +372,8 @@ describe("terminalsStore — workspace isolation", () => {
     const wsA = "ws-iso-rename-a";
     const wsB = "ws-iso-rename-b";
 
-    const tA = { id: "ti-a", label: "A", position: 0, running: false };
-    const tB = { id: "ti-b", label: "B", position: 0, running: false };
+    const tA = { id: "ti-a", label: "A", position: 0, running: false, restored: false };
+    const tB = { id: "ti-b", label: "B", position: 0, running: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [wsA]: [tA], [wsB]: [tB] },

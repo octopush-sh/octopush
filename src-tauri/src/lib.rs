@@ -159,6 +159,9 @@ pub fn run() {
             commands::create_terminal,
             commands::rename_terminal,
             commands::delete_terminal,
+            // PTY daemon
+            commands::list_pty_sessions,
+            commands::spawn_or_attach_terminal,
             // Directory listing
             commands::read_directory,
             // File I/O

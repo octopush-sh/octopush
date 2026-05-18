@@ -89,9 +89,12 @@ function emitEvent<T>(event: string, payload: T) {
 
 // ─── Mock IPC ─────────────────────────────────────────────────────
 
-const mockSession = { id: "pty-session-123" };
+// Phase 3: TerminalPane uses spawnOrAttachTerminal instead of createSession.
+// The PTY session id is now the terminalId prop itself (not a new UUID).
 const mockIpc = {
-  createSession: vi.fn(() => Promise.resolve(mockSession)),
+  spawnOrAttachTerminal: vi.fn(() =>
+    Promise.resolve({ mode: "Spawned", pid: 12345 } as const),
+  ),
   killSession: vi.fn(() => Promise.resolve()),
   resizeSession: vi.fn(() => Promise.resolve()),
   writeTextToSession: vi.fn(() => Promise.resolve()),
@@ -109,11 +112,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Reset event listeners between tests.
   Object.keys(eventListeners).forEach((k) => delete eventListeners[k]);
-  mockIpc.createSession.mockResolvedValue(mockSession);
+  mockIpc.spawnOrAttachTerminal.mockResolvedValue({ mode: "Spawned", pid: 12345 });
 });
 
 describe("TerminalPane — spawn callback", () => {
-  it("calls onSpawn after createSession resolves", async () => {
+  it("calls onSpawn after spawnOrAttachTerminal resolves", async () => {
     const onSpawn = vi.fn();
     render(
       <TerminalPane
@@ -125,22 +128,23 @@ describe("TerminalPane — spawn callback", () => {
       />,
     );
 
-    // Wait for the createSession promise to resolve.
+    // Wait for the spawnOrAttachTerminal promise to resolve.
     await act(async () => {
       await Promise.resolve();
     });
 
-    expect(mockIpc.createSession).toHaveBeenCalledWith({
-      name: "Main",
-      projectRoot: "/path/to/ws",
-    });
+    expect(mockIpc.spawnOrAttachTerminal).toHaveBeenCalledWith(
+      "t1",
+      "/path/to/ws",
+      "Main",
+    );
     expect(onSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("does not call onSpawn if the component unmounts before spawn resolves", async () => {
-    let resolveCreate!: (v: typeof mockSession) => void;
-    mockIpc.createSession.mockReturnValueOnce(
-      new Promise<typeof mockSession>((res) => {
+    let resolveCreate!: (v: { mode: "Spawned"; pid: number }) => void;
+    mockIpc.spawnOrAttachTerminal.mockReturnValueOnce(
+      new Promise<{ mode: "Spawned"; pid: number }>((res) => {
         resolveCreate = res;
       }),
     );
@@ -160,7 +164,7 @@ describe("TerminalPane — spawn callback", () => {
     unmount();
 
     await act(async () => {
-      resolveCreate(mockSession);
+      resolveCreate({ mode: "Spawned", pid: 99 });
       await Promise.resolve();
     });
 
@@ -182,13 +186,14 @@ describe("TerminalPane — exit callback", () => {
     );
 
     // Let the event listener attach and spawn resolve.
+    // The PTY session id is now the terminalId ("t-exit") directly.
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
 
     act(() => {
-      emitEvent("pty://exit", { sessionId: mockSession.id, code: 0 });
+      emitEvent("pty://exit", { sessionId: "t-exit", code: 0 });
     });
 
     expect(onExit).toHaveBeenCalledTimes(1);
@@ -212,7 +217,7 @@ describe("TerminalPane — exit callback", () => {
     });
 
     act(() => {
-      emitEvent("pty://exit", { sessionId: "different-session-id", code: 0 });
+      emitEvent("pty://exit", { sessionId: "different-terminal-id", code: 0 });
     });
 
     expect(onExit).not.toHaveBeenCalled();

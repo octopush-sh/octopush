@@ -148,6 +148,18 @@ export interface TerminalRecord {
   createdAt: number;
 }
 
+/** A live PTY session reported by the daemon (via `list_pty_sessions`). */
+export interface PtySession {
+  id: string;
+  running: boolean;
+  startedAt: number;
+}
+
+/** Payload of the `pty://reattached` Tauri event. */
+export interface PtyReattachedEvent {
+  sessionId: string;
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────
 
 export interface ChatMessage {

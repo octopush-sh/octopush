@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useTerminalsStore } from "../stores/terminalsStore";
 
 // Re-export for backward-compat with Companion.tsx type imports.
@@ -19,6 +19,24 @@ export function CompanionTerminals({ workspaceId }: Props) {
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
+  const clearRestored = useTerminalsStore((s) => s.clearRestored);
+
+  // Auto-dismiss `restored` badges after 5 seconds.
+  useEffect(() => {
+    const restoredIds = terminals.filter((t) => t.restored).map((t) => t.id);
+    if (restoredIds.length === 0) return;
+    const timers = restoredIds.map((id) =>
+      setTimeout(() => clearRestored(workspaceId, id), 5000),
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [
+    // Re-run when the set of restored ids changes. We use a stable string key
+    // to avoid re-triggering when other terminal props change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    terminals.map((t) => (t.restored ? t.id : "")).join(","),
+    workspaceId,
+    clearRestored,
+  ]);
 
   // id of the terminal whose label is currently being edited
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -126,6 +144,18 @@ export function CompanionTerminals({ workspaceId }: Props) {
                       }}
                     >
                       {t.label}
+                    </span>
+                  )}
+
+                  {/* Restored badge — transient, auto-dismissed after 5s */}
+                  {t.restored && !isEditing && (
+                    <span
+                      data-testid={`restored-badge-${t.id}`}
+                      className="flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.25em]"
+                      style={{ color: "var(--brass-dim)" }}
+                      title="Session restored from previous Octopush run"
+                    >
+                      ↺ Restored
                     </span>
                   )}
 

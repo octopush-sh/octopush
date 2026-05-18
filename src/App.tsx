@@ -121,6 +121,23 @@ function App() {
     setLayoutVersion(layoutVersionRef.current);
   }, []);
 
+  // ── Startup toast: count restored terminal sessions ──
+  // We only fire this once per Octopush lifetime, not on every re-render.
+  const restoredToastFiredRef = useRef(false);
+  useEffect(() => {
+    if (restoredToastFiredRef.current) return;
+    const allTerminals = Object.values(terminalsByWs).flat();
+    const restoredCount = allTerminals.filter((t) => t.restored).length;
+    if (restoredCount > 0) {
+      restoredToastFiredRef.current = true;
+      pushToast({
+        level: "info",
+        title: `Restored ${restoredCount} terminal session${restoredCount > 1 ? "s" : ""}`,
+        body: "Continuing from before Octopush restarted.",
+      });
+    }
+  }, [terminalsByWs]);
+
   // ── Theme load ──
   useEffect(() => {
     loadTheme();
@@ -564,6 +581,10 @@ function App() {
                       layoutVersion={layoutVersion}
                       onSpawn={() => markRunning(t.workspaceId, t.id, true)}
                       onExit={() => markRunning(t.workspaceId, t.id, false)}
+                      onReattach={() => {
+                        // Mark as running (it already was, but be explicit).
+                        markRunning(t.workspaceId, t.id, true);
+                      }}
                     />
                   );
                 })}

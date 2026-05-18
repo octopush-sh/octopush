@@ -565,6 +565,103 @@ pub async fn reveal_in_finder(path: String) -> AppResult<()> {
     Ok(())
 }
 
+// ─── PTY daemon commands ──────────────────────────────────────────
+
+/// Describes a single PTY session known to the daemon.
+///
+/// Used by the frontend on startup to reconcile DB-persisted terminal records
+/// with live daemon state: records whose id appears here as `running: true`
+/// can be reattached; others are shown as Stopped.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtySession {
+    pub id: String,
+    pub running: bool,
+    pub started_at: i64,
+}
+
+/// Result of calling `spawn_or_attach_terminal`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "mode")]
+pub enum SpawnOrAttachResult {
+    /// A fresh shell was started for this terminal id.
+    Spawned { pid: u32 },
+    /// The terminal was already alive in the daemon; scrollback replayed.
+    Reattached,
+}
+
+/// Spawn a PTY for the given terminal record id, or reattach if one is already
+/// running in the daemon (e.g. from before an Octopush restart).
+///
+/// The `id` must match the terminal record's id stored in the DB — it is used
+/// as the PTY session id end-to-end so the reattach check works across restarts.
+#[tauri::command]
+pub async fn spawn_or_attach_terminal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    cwd: String,
+    label: String,
+) -> AppResult<SpawnOrAttachResult> {
+    use crate::pty_manager::{SpawnMode, SpawnOptions};
+
+    let db_for_hook = std::sync::Arc::clone(&state.db);
+    let hook_id = id.clone();
+    let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, bytes| {
+        if let Some(ev) = crate::token_engine::scan_pty_output(sid, bytes) {
+            let engine =
+                crate::token_engine::TokenEngine::new(std::sync::Arc::clone(&db_for_hook));
+            let _ = engine.record(ev);
+        }
+        let _ = hook_id.as_str(); // suppress unused warning
+    });
+
+    let mode = state.pty.lock().spawn_or_attach(
+        app,
+        SpawnOptions {
+            id: id.clone(),
+            session_name: label,
+            cwd,
+            env: std::collections::HashMap::new(),
+            rows: 24,
+            cols: 80,
+            shell: None,
+            on_output: Some(scanner_hook),
+        },
+    )?;
+
+    Ok(match mode {
+        SpawnMode::Spawned { pid } => SpawnOrAttachResult::Spawned { pid },
+        SpawnMode::Reattached => SpawnOrAttachResult::Reattached,
+    })
+}
+
+/// List all PTY sessions currently known to the daemon.
+///
+/// Returns an empty list if the daemon is unavailable — callers should treat
+/// that identically to "no surviving PTYs" rather than surfacing an error.
+#[tauri::command]
+pub async fn list_pty_sessions(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<PtySession>> {
+    // If the daemon client is a stub (daemon unavailable), list_terminals will
+    // return an error; we swallow it and return an empty list so the frontend
+    // degrades gracefully.
+    let sessions = state
+        .pty
+        .lock()
+        .list_live_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| PtySession {
+            id: info.id,
+            running: info.running,
+            started_at: info.started_at,
+        })
+        .collect();
+    Ok(sessions)
+}
+
 // ─── Terminal commands ────────────────────────────────────────────
 
 #[tauri::command]

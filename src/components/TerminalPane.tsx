@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
-import type { PtyDataEvent, PtyExitEvent } from "../lib/types";
+import type { PtyDataEvent, PtyExitEvent, PtyReattachedEvent } from "../lib/types";
 
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
@@ -20,6 +20,12 @@ interface Props {
   onSpawn?: () => void;
   /** Called when the PTY process exits. */
   onExit?: () => void;
+  /**
+   * Called when this terminal is successfully reattached to a surviving daemon
+   * session (i.e. after an Octopush restart).  The parent uses this to mark
+   * the terminal as `restored` in the store so the Companion can show the badge.
+   */
+  onReattach?: () => void;
 }
 
 export function TerminalPane({
@@ -30,6 +36,7 @@ export function TerminalPane({
   layoutVersion,
   onSpawn,
   onExit,
+  onReattach,
 }: Props) {
   // Outer wrapper — stable size, observed by ResizeObserver.
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -39,13 +46,16 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   // Track last known size to avoid no-op resize IPC calls.
   const lastSizeRef = useRef<{ rows: number; cols: number }>({ rows: 0, cols: 0 });
-  // The PTY session id returned by ipc.createSession (internal, not the store id).
+  // The PTY session id — for TerminalPane this is always equal to `terminalId`
+  // because we use the DB terminal record id as the PTY id end-to-end.
   const ptySessionIdRef = useRef<string | null>(null);
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
   const onExitRef = useRef(onExit);
+  const onReattachRef = useRef(onReattach);
   onSpawnRef.current = onSpawn;
   onExitRef.current = onExit;
+  onReattachRef.current = onReattach;
 
   const syncSize = useCallback(() => {
     const fit = fitRef.current;
@@ -143,6 +153,7 @@ export function TerminalPane({
     // PTY → term (listens on the global event bus; filters by session id).
     let unlistenData: UnlistenFn | undefined;
     let unlistenExit: UnlistenFn | undefined;
+    let unlistenReattached: UnlistenFn | undefined;
 
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
@@ -157,6 +168,14 @@ export function TerminalPane({
       onExitRef.current?.();
     }).then((u) => {
       unlistenExit = u;
+    });
+
+    // Fired by the backend when spawn_or_attach chose the reattach path.
+    listen<PtyReattachedEvent>("pty://reattached", (ev) => {
+      if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      onReattachRef.current?.();
+    }).then((u) => {
+      unlistenReattached = u;
     });
 
     // term → PTY
@@ -179,16 +198,24 @@ export function TerminalPane({
       }
     });
 
-    // Spawn the PTY session. We do this here so TerminalPane owns the full
-    // lifecycle; the xterm instance is already attached to the DOM so output
-    // arrives immediately without a separate mount-then-spawn race.
+    // Spawn-or-attach the PTY session.  We use the terminal record's stable id
+    // as the PTY id so the daemon can find a surviving session on restart.
     let cancelled = false;
+    // Register the id immediately so event listeners can match before the
+    // IPC round-trip completes (rare race with very fast daemon response).
+    ptySessionIdRef.current = terminalId;
+
     ipc
-      .createSession({ name: label, projectRoot: workspacePath })
-      .then((session) => {
+      .spawnOrAttachTerminal(terminalId, workspacePath, label)
+      .then((result) => {
         if (cancelled) return;
-        ptySessionIdRef.current = session.id;
         onSpawnRef.current?.();
+        // Note: onReattach is fired by the pty://reattached event listener above,
+        // which the backend emits synchronously before the first data chunk.
+        if (result.mode === "Reattached") {
+          // Reattach path: the pty://reattached event already fired (or will fire
+          // momentarily) so onReattach will be called there.  Nothing extra needed.
+        }
         // Fit now that the PTY is alive.
         requestAnimationFrame(() => {
           if (!cancelled) syncSize();
@@ -208,15 +235,15 @@ export function TerminalPane({
       ro.disconnect();
       unlistenData?.();
       unlistenExit?.();
+      unlistenReattached?.();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
-      // Kill the PTY if we have one.
-      const ptyId = ptySessionIdRef.current;
+      // Note: we intentionally do NOT kill the PTY here — the daemon owns it
+      // and it should survive this TerminalPane unmounting (e.g. workspace
+      // switch, Octopush restart).  The user explicitly kills a terminal via
+      // the × button in CompanionTerminals, which calls ipc.deleteTerminal.
       ptySessionIdRef.current = null;
-      if (ptyId) {
-        ipc.killSession(ptyId).catch(() => {});
-      }
     };
     // terminalId is the React key — changes cause a full remount, not a re-run.
     // workspacePath + label intentionally not in deps: only used at spawn time.

@@ -8,8 +8,14 @@ export interface TerminalState {
   id: string;
   label: string;
   position: number;
-  /** true once the frontend has spawned a PTY for this id this app session */
+  /** true once the frontend has spawned (or reattached) a PTY for this id */
   running: boolean;
+  /**
+   * Transient flag: true when this terminal was reattached to a surviving
+   * daemon session on startup (as opposed to a fresh spawn).  Cleared after
+   * 5 seconds by CompanionTerminals so the badge auto-dismisses.
+   */
+  restored: boolean;
 }
 
 // Stable empty list — returning a new array per call would bust React memo.
@@ -32,6 +38,8 @@ interface TerminalsStore {
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
   setActive: (workspaceId: string, id: string | null) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
+  /** Clear the transient `restored` badge for a given terminal. */
+  clearRestored: (workspaceId: string, id: string) => void;
 }
 
 // ─── Store implementation ─────────────────────────────────────────
@@ -53,7 +61,17 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   // ── Actions ───────────────────────────────────────────────────
 
   loadTerminals: async (workspaceId) => {
-    const records = await ipc.listTerminals(workspaceId);
+    // Fetch DB records and live daemon sessions in parallel.
+    const [records, liveSessions] = await Promise.all([
+      ipc.listTerminals(workspaceId),
+      ipc.listPtySessions().catch(() => [] as import("../lib/types").PtySession[]),
+    ]);
+
+    // Build a fast lookup of daemon-live ids.
+    const liveRunningIds = new Set(
+      liveSessions.filter((s) => s.running).map((s) => s.id),
+    );
+
     set((s) => {
       // Preserve `running` for terminals already in the store — TerminalPane
       // doesn't unmount when the user navigates away, so existing PTYs are
@@ -63,12 +81,30 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const prevRunningById = new Map(
         (prev ?? []).map((t) => [t.id, t.running]),
       );
-      const terminals: TerminalState[] = records.map((r) => ({
-        id: r.id,
-        label: r.label,
-        position: r.position,
-        running: prevRunningById.get(r.id) ?? false,
-      }));
+
+      const terminals: TerminalState[] = records.map((r) => {
+        // A terminal is "running" if:
+        //   (a) it was already marked running in the store (from a live TerminalPane
+        //       in this Octopush session), OR
+        //   (b) the daemon reports it as alive — meaning we're on startup and
+        //       it survived from the previous Octopush session.
+        const wasRunningInStore = prevRunningById.get(r.id) ?? false;
+        const daemonRunning = liveRunningIds.has(r.id);
+        const running = wasRunningInStore || daemonRunning;
+
+        // `restored` is set when the daemon has it but the store didn't — i.e.,
+        // this is the first load of a surviving session after Octopush restart.
+        // If it was already in the store as running, it's not a "new restore".
+        const restored = daemonRunning && !wasRunningInStore;
+
+        return {
+          id: r.id,
+          label: r.label,
+          position: r.position,
+          running,
+          restored,
+        };
+      });
 
       const currentActive = s.activeByWs[workspaceId] ?? null;
       const newActive =
@@ -96,6 +132,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       label: record.label,
       position: record.position,
       running: false,
+      restored: false,
     };
 
     set((s) => {
@@ -166,6 +203,19 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           ...s.terminalsByWs,
           [workspaceId]: prev.map((t) =>
             t.id === id ? { ...t, running } : t,
+          ),
+        },
+      };
+    }),
+
+  clearRestored: (workspaceId, id) =>
+    set((s) => {
+      const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+      return {
+        terminalsByWs: {
+          ...s.terminalsByWs,
+          [workspaceId]: prev.map((t) =>
+            t.id === id ? { ...t, restored: false } : t,
           ),
         },
       };

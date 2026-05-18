@@ -13,6 +13,7 @@ import type {
   ModelWithProvider,
   ProjectInfo,
   ProviderConfig,
+  PtySession,
   Session,
   SessionRecap,
   SessionTemplate,
@@ -175,4 +176,19 @@ export const ipc = {
     invoke<void>("rename_terminal", { id, label }),
   deleteTerminal: (id: string) =>
     invoke<void>("delete_terminal", { id }),
+
+  // ─── PTY daemon ───────────────────────────────────────────────
+  /** List all PTY sessions currently alive in the daemon. */
+  listPtySessions: () =>
+    invoke<PtySession[]>("list_pty_sessions"),
+
+  /**
+   * Spawn a PTY for `id`, or reattach if the daemon already has a running
+   * session for that id (e.g. after an Octopush restart).
+   */
+  spawnOrAttachTerminal: (id: string, cwd: string, label: string) =>
+    invoke<{ mode: "Spawned"; pid: number } | { mode: "Reattached" }>(
+      "spawn_or_attach_terminal",
+      { id, cwd, label },
+    ),
 };

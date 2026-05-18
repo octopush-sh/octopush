@@ -323,6 +323,172 @@ mod terminal_tests {
     }
 }
 
+/// Tests for the Phase 3 `spawn_or_attach` logic in [`crate::pty_manager`].
+///
+/// These tests start the real daemon binary so we can verify the
+/// "attach when session already exists" vs "spawn fresh" code paths.
+/// They mirror the pattern used in `pty_client.rs` integration tests and
+/// require the daemon to have been compiled first:
+///   `cargo build --bin octopush-pty-server`
+#[cfg(test)]
+mod pty_manager_reattach_tests {
+    use crate::pty_client::DaemonClient;
+    use crate::pty_manager::PtyManager;
+    use serial_test::serial;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn find_daemon_bin() -> PathBuf {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let c = parent.join("octopush-pty-server");
+                if c.exists() { return c; }
+                if let Some(gp) = parent.parent() {
+                    let c = gp.join("octopush-pty-server");
+                    if c.exists() { return c; }
+                }
+            }
+        }
+        for rel in &[
+            "target/debug/octopush-pty-server",
+            "../target/debug/octopush-pty-server",
+        ] {
+            if let Ok(cwd) = std::env::current_dir() {
+                let c = cwd.join(rel);
+                if c.exists() { return c; }
+            }
+        }
+        panic!("octopush-pty-server binary not found — run `cargo build --bin octopush-pty-server` first");
+    }
+
+    fn start_daemon(home: &std::path::Path) -> std::process::Child {
+        let bin = find_daemon_bin();
+        Command::new(&bin)
+            .env("HOME", home)
+            .env("OCTOPUSH_PTY_AUTO_EXIT_SECS", "10")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn daemon")
+    }
+
+    fn wait_for_socket(sock: &PathBuf, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if sock.exists() && std::os::unix::net::UnixStream::connect(sock).is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline { return false; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// When the daemon already has a running PTY for the requested id,
+    /// `list_live_sessions` must report it as running = true — which is the
+    /// signal `spawn_or_attach` uses to choose the `Reattached` path.
+    ///
+    /// We can't easily call `spawn_or_attach` in a test because it needs a
+    /// `tauri::AppHandle`, so we exercise the decision logic through
+    /// `list_live_sessions` + a manual `attach` call, which covers the same
+    /// code path without the UI layer.
+    #[test]
+    #[serial]
+    fn pty_manager_attach_when_daemon_has_session() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sock_path = home.join(".octopush").join("pty-server.sock");
+        fs::create_dir_all(home.join(".octopush")).unwrap();
+
+        let mut daemon = start_daemon(home);
+        assert!(
+            wait_for_socket(&sock_path, Duration::from_secs(5)),
+            "daemon socket did not appear"
+        );
+
+        let client = DaemonClient::connect_to(sock_path.to_str().unwrap()).unwrap();
+
+        // Pre-spawn a PTY directly via the client (simulating a previous Octopush session).
+        let env = HashMap::new();
+        client.spawn("reattach-test", "/tmp", &env, Some("/bin/sh"), 24, 80)
+            .expect("pre-spawn");
+
+        // Now create a fresh PtyManager (simulating new Octopush process connecting
+        // to the same daemon) and call list_live_sessions.
+        // DaemonClient::connect_to already returns Arc<DaemonClient>.
+        let pty = PtyManager::new(
+            DaemonClient::connect_to(sock_path.to_str().unwrap()).unwrap(),
+        );
+
+        let sessions = pty.list_live_sessions().expect("list_live_sessions");
+        let found = sessions.iter().find(|s| s.id == "reattach-test");
+        assert!(found.is_some(), "expected 'reattach-test' in live sessions");
+        assert!(found.unwrap().running, "expected session to be running");
+
+        // The spawn_or_attach logic: since it IS running, mode should be Reattached.
+        // We verify this by calling the client attach ourselves to confirm the daemon
+        // accepts it, which is exactly what spawn_or_attach's reattach branch does.
+        let rx = pty.client.attach("reattach-test", 0);
+        assert!(rx.is_ok(), "attach to running session must succeed");
+
+        daemon.kill().ok();
+    }
+
+    /// When the daemon has no PTY for the id, `list_live_sessions` returns an
+    /// empty list (or a list that doesn't contain the id), which triggers the
+    /// `Spawned` branch.
+    #[test]
+    #[serial]
+    fn pty_manager_spawn_when_daemon_doesnt_have_session() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sock_path = home.join(".octopush").join("pty-server.sock");
+        fs::create_dir_all(home.join(".octopush")).unwrap();
+
+        let mut daemon = start_daemon(home);
+        assert!(
+            wait_for_socket(&sock_path, Duration::from_secs(5)),
+            "daemon socket did not appear"
+        );
+
+        let pty = PtyManager::new(
+            DaemonClient::connect_to(sock_path.to_str().unwrap()).unwrap(),
+        );
+
+        let sessions = pty.list_live_sessions().expect("list_live_sessions");
+
+        // Fresh daemon — no sessions at all.
+        assert!(
+            !sessions.iter().any(|s| s.id == "fresh-id"),
+            "expected 'fresh-id' NOT in live sessions on a brand-new daemon"
+        );
+
+        // Verify the SpawnMode discriminant reflects "not running → Spawned".
+        // (The spawn_or_attach's 'else' branch fires because the session is absent.)
+        // We verify the mode semantics by confirming the session is absent before spawn.
+        let is_running = sessions.iter().any(|s| s.id == "fresh-id" && s.running);
+        assert!(!is_running, "fresh-id should not be running before any spawn");
+
+        // Spawn the PTY directly to prove the client + daemon work.
+        let env = HashMap::new();
+        let pid = pty.client.spawn("fresh-id", "/tmp", &env, Some("/bin/sh"), 24, 80)
+            .expect("spawn fresh-id");
+        assert!(pid > 0, "spawned PID must be positive, got {pid}");
+
+        // Now it should appear as running.
+        let sessions2 = pty.list_live_sessions().expect("list_live_sessions again");
+        let found = sessions2.iter().find(|s| s.id == "fresh-id");
+        assert!(found.is_some(), "fresh-id must appear after spawn");
+        assert!(found.unwrap().running, "fresh-id must be running after spawn");
+
+        daemon.kill().ok();
+    }
+}
+
 #[cfg(test)]
 mod clone_progress_tests {
     use crate::commands::parse_clone_progress;

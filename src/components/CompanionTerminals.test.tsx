@@ -14,6 +14,7 @@ const mockIpc = {
   createTerminal: vi.fn(),
   renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
   deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
+  listPtySessions: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -28,7 +29,7 @@ const { CompanionTerminals } = await import("./CompanionTerminals");
 const WS = "ws-test";
 
 function seedTerminals(
-  terminals: Array<{ id: string; label: string; running?: boolean }>,
+  terminals: Array<{ id: string; label: string; running?: boolean; restored?: boolean }>,
   activeId?: string,
 ) {
   useTerminalsStore.setState({
@@ -38,6 +39,7 @@ function seedTerminals(
         label: t.label,
         position: i,
         running: t.running ?? false,
+        restored: t.restored ?? false,
       })),
     },
     activeByWs: { [WS]: activeId ?? terminals[0]?.id ?? null },
@@ -219,5 +221,41 @@ describe("CompanionTerminals — create + delete", () => {
     fireEvent.click(deleteBtn);
 
     expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("t-del");
+  });
+});
+
+describe("CompanionTerminals — Restored badge", () => {
+  beforeEach(() => resetStore());
+
+  it("shows Restored badge when terminal has restored=true", () => {
+    seedTerminals([{ id: "t-restored", label: "Main", running: true, restored: true }]);
+    render(<CompanionTerminals workspaceId={WS} />);
+
+    expect(screen.getByTestId("restored-badge-t-restored")).toBeInTheDocument();
+    expect(screen.getByTestId("restored-badge-t-restored")).toHaveTextContent("Restored");
+  });
+
+  it("does not show Restored badge when restored=false", () => {
+    seedTerminals([{ id: "t-normal", label: "Main", running: true, restored: false }]);
+    render(<CompanionTerminals workspaceId={WS} />);
+
+    expect(screen.queryByTestId("restored-badge-t-normal")).not.toBeInTheDocument();
+  });
+
+  it("auto-dismisses Restored badge after 5 seconds", async () => {
+    vi.useFakeTimers();
+    seedTerminals([{ id: "t-dismiss", label: "Main", running: true, restored: true }]);
+    render(<CompanionTerminals workspaceId={WS} />);
+
+    // Badge should be visible immediately.
+    expect(screen.getByTestId("restored-badge-t-dismiss")).toBeInTheDocument();
+
+    // Advance timers past the 5s dismiss window.
+    await act(async () => {
+      vi.advanceTimersByTime(5001);
+    });
+
+    expect(screen.queryByTestId("restored-badge-t-dismiss")).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 });
