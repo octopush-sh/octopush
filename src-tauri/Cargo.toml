@@ -46,6 +46,7 @@ libc = "0.2"
 ctrlc = "3"
 
 [dev-dependencies]
+serial_test = "3"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!

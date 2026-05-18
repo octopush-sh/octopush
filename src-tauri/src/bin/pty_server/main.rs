@@ -241,6 +241,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use parking_lot::Mutex;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // Serialize all integration tests that mutate process HOME.
@@ -307,6 +308,7 @@ mod tests {
     // This avoids events interleaving with request responses.
     // -----------------------------------------------------------------------
     #[test]
+    #[serial]
     fn spawn_emits_data() {
         let _lock = test_lock();
         let (_home, base) = isolated_home();
@@ -377,6 +379,7 @@ mod tests {
     // with since_seq=0; assert B sees all three markers from disk replay.
     // -----------------------------------------------------------------------
     #[test]
+    #[serial]
     fn scrollback_replay_on_reattach() {
         let _lock = test_lock();
         let (_home, base) = isolated_home();
@@ -463,6 +466,7 @@ mod tests {
     // Verify the idle-condition logic without actually calling process::exit.
     // -----------------------------------------------------------------------
     #[test]
+    #[serial]
     fn auto_exit_when_idle() {
         // No HOME mutation needed for this test; it only examines state.
         let state: SharedState = Arc::new(Mutex::new(ServerState::new()));
@@ -508,6 +512,7 @@ mod tests {
     // detect it as alive and return false.
     // -----------------------------------------------------------------------
     #[test]
+    #[serial]
     fn pid_file_prevents_double_start() {
         let _lock = test_lock();
         let (_home, base) = isolated_home();
@@ -541,6 +546,7 @@ mod tests {
     // recent bytes are preserved.
     // -----------------------------------------------------------------------
     #[test]
+    #[serial]
     fn disk_log_rotation() {
         use crate::storage::{append_pty_log, open_pty_log, pty_log_path, MAX_PTY_LOG_BYTES};
         use std::io::Seek;
