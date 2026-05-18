@@ -12,26 +12,22 @@ import type { FileChange, GitStatus } from "../lib/types";
 
 interface Props {
   projectPath: string;
+  diff: string;
 }
 
 const POLL_MS = 5_000;
 
 type TabView = "files" | "diffs";
 
-export function ChangesPanel({ projectPath }: Props) {
+export function ChangesPanel({ projectPath, diff }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
-  const [diff, setDiff] = useState<string>("");
   const [activeTab, setActiveTab] = useState<TabView>("files");
   const [commitMessage, setCommitMessage] = useState("");
 
   async function refresh() {
     try {
-      const [status, d] = await Promise.all([
-        ipc.getGitStatus(projectPath),
-        ipc.getGitDiff(projectPath).catch(() => ""),
-      ]);
+      const status = await ipc.getGitStatus(projectPath);
       setGitStatus(status);
-      setDiff(d);
     } catch {
       // silently ignore — project may not be a git repo yet
     }

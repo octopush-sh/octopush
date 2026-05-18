@@ -101,6 +101,9 @@ pub fn run() {
             commands::delete_terminal,
             // Directory listing
             commands::read_directory,
+            // File I/O
+            commands::read_file,
+            commands::write_file,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.

@@ -152,6 +152,8 @@ export const ipc = {
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
   revealInFinder: (path: string) => invoke<void>("reveal_in_finder", { path }),
+  readFile: (path: string) => invoke<string>("read_file", { path }),
+  writeFile: (path: string, content: string) => invoke<void>("write_file", { path, content }),
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string) => invoke<DirectoryEntry[]>("read_directory", { path }),

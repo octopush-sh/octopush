@@ -959,6 +959,22 @@ pub async fn read_directory(path: String) -> AppResult<Vec<DirectoryEntry>> {
     Ok(dirs)
 }
 
+// ─── File I/O ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn read_file(path: String) -> AppResult<String> {
+    let path = expand_tilde(&path);
+    std::fs::read_to_string(&path)
+        .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
+}
+
+#[tauri::command]
+pub async fn write_file(path: String, content: String) -> AppResult<()> {
+    let path = expand_tilde(&path);
+    std::fs::write(&path, content)
+        .map_err(|e| AppError::Other(format!("write_file({}): {e}", path)))
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.

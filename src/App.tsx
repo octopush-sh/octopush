@@ -9,6 +9,9 @@ import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
 import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
+import { EditorPane } from "./components/EditorPane";
+import { EditorTabs } from "./components/EditorTabs";
+import { useEditorStore } from "./stores/editorStore";
 import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
 import { ToastContainer } from "./components/Toasts";
@@ -84,8 +87,9 @@ function App() {
   const [showCreator, setShowCreator] = useState(false);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
 
-  // Git status (refreshed on workspace change)
+  // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
+  const [gitDiff, setGitDiff] = useState<string>("");
 
   // Layout version (forces TerminalPane fit-resize when sidebar/companion toggle)
   const layoutVersionRef = useRef(0);
@@ -143,17 +147,24 @@ function App() {
     }).catch(console.error);
   }, [activeWorkspaceId, loadTerminals, createTerminal]);
 
-  // ── Refresh git status on workspace change ──
+  // ── Refresh git status + diff on workspace change ──
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
     const path = ws?.worktreePath ?? project?.path;
     if (!path) {
       setGitStatus(null);
+      setGitDiff("");
       return;
     }
     let cancelled = false;
-    ipc.getGitStatus(path).then((s) => {
-      if (!cancelled) setGitStatus(s);
+    Promise.all([
+      ipc.getGitStatus(path),
+      ipc.getGitDiff(path).catch(() => ""),
+    ]).then(([s, d]) => {
+      if (!cancelled) {
+        setGitStatus(s);
+        setGitDiff(d);
+      }
     }).catch(() => {});
     return () => {
       cancelled = true;
@@ -303,6 +314,8 @@ function App() {
     [activeWorkspaceId, chatsPerWorkspace, activeChatId, handleSelectChat, handleNewChat],
   );
 
+  const openFileInEditor = useEditorStore((s) => s.openFile);
+
   const fileTreeProps = useMemo(() => {
     if (!activeWorkspace) return undefined;
     const rootPath = activeWorkspace.worktreePath || project!.path;
@@ -312,8 +325,9 @@ function App() {
       changedPaths: new Set(
         (gitStatus?.changedFiles ?? []).map((f) => `${rootPath}/${f.path}`),
       ),
+      onFileClick: (p: string) => openFileInEditor(activeWorkspace.id, p).catch(console.error),
     };
-  }, [activeWorkspace, project, gitStatus]);
+  }, [activeWorkspace, project, gitStatus, openFileInEditor]);
 
   // ── Customize menu submit ──
   const handleCustomizeSubmit = useCallback(
@@ -454,7 +468,24 @@ function App() {
                       }}
                     >
                       {(gitStatus?.changedFiles.length ?? 0) > 0 ? (
-                        <ChangesPanel projectPath={activeWorkspace.worktreePath || project.path} />
+                        <div className="flex h-full min-h-0">
+                          {/* Left: Changes panel (fixed width) */}
+                          <div className="w-[320px] shrink-0 border-r border-octo-hairline">
+                            <ChangesPanel
+                              projectPath={activeWorkspace.worktreePath || project.path}
+                              diff={gitDiff}
+                            />
+                          </div>
+                          {/* Middle: Editor canvas */}
+                          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                            <EditorTabs workspaceId={activeWorkspaceId!} />
+                            <EditorPane
+                              workspaceId={activeWorkspaceId!}
+                              workspacePath={activeWorkspace.worktreePath || project.path}
+                              diffText={gitDiff}
+                            />
+                          </div>
+                        </div>
                       ) : (
                         <ReviewEmptyState />
                       )}

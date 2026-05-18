@@ -22,6 +22,7 @@ interface FileTreeProps {
   rootPath: string;
   rootLabel: string;
   changedPaths: Set<string>;
+  onFileClick?: (absPath: string) => void;
 }
 
 interface Props {

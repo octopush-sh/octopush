@@ -150,6 +150,29 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.queryByText("src")).not.toBeInTheDocument());
   });
 
+  it("clicking a file row calls onFileClick with the absolute path", async () => {
+    const onFileClick = vi.fn();
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        onFileClick={onFileClick}
+      />,
+    );
+
+    // Expand src/ to reveal files
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+
+    // Click the file row
+    await userEvent.click(screen.getByTestId("file-row-/repo/src/Main.java"));
+
+    expect(onFileClick).toHaveBeenCalledTimes(1);
+    expect(onFileClick).toHaveBeenCalledWith("/repo/src/Main.java");
+  });
+
   it("renders depth ≥ 4 file rows with text-octo-mute (unless changed)", async () => {
     // Build a 5-level deep tree: /r/a/b/c/d/deep.txt at depth=5
     const DEEP_ROOT = "/r";

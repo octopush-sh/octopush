@@ -501,3 +501,58 @@ mod read_directory_tests {
         assert_eq!(entries[0].name, "a");
     }
 }
+
+#[cfg(test)]
+mod file_io_tests {
+    use crate::commands::{read_file, write_file};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn read_file_returns_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hello.txt");
+        fs::write(&path, "hello world").unwrap();
+
+        let content = read_file(path.to_string_lossy().to_string())
+            .await
+            .expect("read_file should succeed");
+        assert_eq!(content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn write_file_persists() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("out.txt");
+
+        write_file(path.to_string_lossy().to_string(), "written".to_string())
+            .await
+            .expect("write_file should succeed");
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "written");
+    }
+
+    #[tokio::test]
+    async fn read_file_errors_on_missing() {
+        let result = read_file("/nonexistent/path/missing_abc123.txt".to_string()).await;
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("missing_abc123.txt"),
+            "error message should mention the path, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_parent_file_on_existing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("newfile.txt");
+
+        write_file(path.to_string_lossy().to_string(), "content".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "content");
+    }
+}

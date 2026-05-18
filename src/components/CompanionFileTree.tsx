@@ -6,11 +6,12 @@ interface Props {
   rootPath: string;
   rootLabel: string;
   changedPaths: Set<string>;
+  onFileClick?: (absPath: string) => void;
 }
 
 type ChildState = DirectoryEntry[] | "loading" | "error";
 
-export function CompanionFileTree({ rootPath, rootLabel, changedPaths }: Props) {
+export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileClick }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set([rootPath]));
   const [children, setChildren] = useState<Record<string, ChildState>>({});
 
@@ -68,6 +69,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths }: Props) 
           children={children}
           changedPaths={changedPaths}
           onToggle={toggleExpand}
+          onFileClick={onFileClick}
         />
       </div>
     </section>
@@ -84,6 +86,7 @@ interface TreeNodeProps {
   children: Record<string, ChildState>;
   changedPaths: Set<string>;
   onToggle: (path: string) => void;
+  onFileClick?: (absPath: string) => void;
 }
 
 /** Returns the label color class for a file/folder based on depth and changed state. */
@@ -103,6 +106,7 @@ function TreeNode({
   children,
   changedPaths,
   onToggle,
+  onFileClick,
 }: TreeNodeProps) {
   const isExpanded = expanded.has(path);
   const isChanged = !isDir && changedPaths.has(path);
@@ -123,7 +127,11 @@ function TreeNode({
           (e.currentTarget as HTMLElement).style.background = "transparent";
         }}
         onClick={() => {
-          if (isDir) onToggle(path);
+          if (isDir) {
+            onToggle(path);
+          } else if (onFileClick) {
+            onFileClick(path);
+          }
         }}
         data-testid={!isDir ? `file-row-${path}` : undefined}
       >
@@ -231,6 +239,7 @@ function TreeNode({
                 children={children}
                 changedPaths={changedPaths}
                 onToggle={onToggle}
+                onFileClick={onFileClick}
               />
             ));
           })()}
