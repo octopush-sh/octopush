@@ -21,6 +21,8 @@ import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
+import { useChatStore } from "./stores/chatStore";
+import { listen } from "@tauri-apps/api/event";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
@@ -109,6 +111,19 @@ function App() {
     refreshTokens();
     const id = setInterval(refreshTokens, 30_000);
     return () => clearInterval(id);
+  }, [refreshTokens]);
+
+  // Refresh tokens immediately when a chat turn finishes — the backend has
+  // just persisted the final assistant message with its token counts, so the
+  // Companion's tokens row should reflect that without waiting for the 30s
+  // poll tick.
+  useEffect(() => {
+    const unlistenPromise = listen<{ done: boolean }>("chat://stream", (ev) => {
+      if (ev.payload.done) refreshTokens();
+    });
+    return () => {
+      unlistenPromise.then((u) => u());
+    };
   }, [refreshTokens]);
 
   // ── Project switch → load workspaces, reset view ──
@@ -302,16 +317,27 @@ function App() {
     ? activeChatPerWorkspace[activeWorkspaceId] ?? activeWorkspaceId
     : null;
 
+  // Count tool calls live from the active chat's messages — chatStore is
+  // updated on every `chat://message-added` event the backend emits, so the
+  // counter ticks up in real time as the agent invokes tools.
+  const activeChatMessages = useChatStore((s) =>
+    s.getMessages(activeChatId ?? ""),
+  );
+  const liveToolCalls = useMemo(
+    () => activeChatMessages.filter((m) => m.role === "tool").length,
+    [activeChatMessages],
+  );
+
   const companionContextProps = useMemo(() => {
     const tokensUsed =
       (tokenReport?.totalInput ?? 0) + (tokenReport?.totalOutput ?? 0);
     return {
       tokensUsed,
       tokensLimit: 200_000,
-      filesInFlight: gitStatus?.changedFiles.length ?? 0,
-      toolCalls: 0,
+      unstaged: gitStatus?.changedFiles.length ?? 0,
+      toolCalls: liveToolCalls,
     };
-  }, [gitStatus, tokenReport]);
+  }, [gitStatus, tokenReport, liveToolCalls]);
 
   const companionHistoryProps = useMemo(
     () => ({

@@ -1,11 +1,11 @@
 interface Props {
   tokensUsed: number;
   tokensLimit: number;
-  filesInFlight: number;
+  unstaged: number;
   toolCalls: number;
 }
 
-export function CompanionContext({ tokensUsed, tokensLimit, filesInFlight, toolCalls }: Props) {
+export function CompanionContext({ tokensUsed, tokensLimit, unstaged, toolCalls }: Props) {
   const pct = tokensLimit > 0 ? Math.min(100, (tokensUsed / tokensLimit) * 100) : 0;
 
   return (
@@ -24,7 +24,7 @@ export function CompanionContext({ tokensUsed, tokensLimit, filesInFlight, toolC
             style={{ width: `${pct}%`, background: "var(--color-octo-brass)" }}
           />
         </div>
-        <Row label="files in flight" value={String(filesInFlight)} />
+        <Row label="unstaged" value={String(unstaged)} />
         <Row label="tool calls" value={String(toolCalls)} />
       </div>
     </section>

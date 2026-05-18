@@ -17,7 +17,7 @@ vi.mock("./CompanionFileTree", () => ({
 
 const defaultProps = {
   workspaceId: "ws-1",
-  contextProps: { tokensUsed: 42000, tokensLimit: 200000, filesInFlight: 3, toolCalls: 7 },
+  contextProps: { tokensUsed: 42000, tokensLimit: 200000, unstaged: 3, toolCalls: 7 },
   historyProps: { chats: [], activeChatId: null, onSelectChat: () => {}, onNewChat: () => {} },
 };
 

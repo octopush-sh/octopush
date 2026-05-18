@@ -7,7 +7,7 @@ import { CompanionFileTree } from "./CompanionFileTree";
 interface ContextProps {
   tokensUsed: number;
   tokensLimit: number;
-  filesInFlight: number;
+  unstaged: number;
   toolCalls: number;
 }
 
