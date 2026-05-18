@@ -8,6 +8,7 @@ mod db;
 mod error;
 pub mod git_ops;
 pub mod provider_router;
+pub mod providers;
 mod pty_manager;
 mod session;
 pub mod session_recap;
