@@ -91,9 +91,14 @@ function emitEvent<T>(event: string, payload: T) {
 
 // Phase 3: TerminalPane uses spawnOrAttachTerminal instead of createSession.
 // The PTY session id is now the terminalId prop itself (not a new UUID).
+type SpawnOrAttachResult =
+  | { mode: "Spawned"; pid: number }
+  | { mode: "Reattached" };
+
 const mockIpc = {
-  spawnOrAttachTerminal: vi.fn(() =>
-    Promise.resolve({ mode: "Spawned", pid: 12345 } as const),
+  spawnOrAttachTerminal: vi.fn(
+    (_id: string, _cwd: string, _label: string): Promise<SpawnOrAttachResult> =>
+      Promise.resolve({ mode: "Spawned", pid: 12345 }),
   ),
   killSession: vi.fn(() => Promise.resolve()),
   resizeSession: vi.fn(() => Promise.resolve()),
