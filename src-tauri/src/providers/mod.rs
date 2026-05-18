@@ -104,3 +104,4 @@ pub trait LlmProvider: Send + Sync {
 // ─── Sub-modules ──────────────────────────────────────────────────────────────
 
 pub mod anthropic;
+pub mod openai_compat;
