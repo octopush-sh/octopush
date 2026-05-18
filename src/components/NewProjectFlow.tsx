@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { BrassRule } from "./BrassRule";
 import { useProjectStore } from "../stores/projectStore";
 import { ipc } from "../lib/ipc";
@@ -9,7 +10,7 @@ interface Props {
   onBack: () => void;
 }
 
-type ProjectType = "empty" | "clone" | "template";
+type ProjectType = "empty" | "clone" | "template" | "open";
 type Step = 1 | 2;
 
 interface CloneProgress {
@@ -110,6 +111,11 @@ export function NewProjectFlow({ onBack }: Props) {
   // SSH key missing panel
   const [sshKeyMissingHost, setSshKeyMissingHost] = useState<string | null>(null);
 
+  // Open-folder state
+  const [openFolderPath, setOpenFolderPath] = useState<string | null>(null);
+  const [openFolderError, setOpenFolderError] = useState<string | null>(null);
+  const [openFolderLoading, setOpenFolderLoading] = useState(false);
+
   const urlInputRef = useRef<HTMLInputElement>(null);
 
   // ── Auto-detect name from URL ───────────────────────────────────────
@@ -152,6 +158,37 @@ export function NewProjectFlow({ onBack }: Props) {
     if (type === "template") return; // still disabled
     setProjectType(type);
     setStep(2);
+    if (type !== "open") {
+      // Reset open-folder state when switching away
+      setOpenFolderPath(null);
+      setOpenFolderError(null);
+    }
+  }
+
+  async function handlePickFolder() {
+    const selected = await openFolderDialog({
+      directory: true,
+      multiple: false,
+      title: "Open project folder",
+    });
+    if (typeof selected === "string") {
+      setOpenFolderPath(selected);
+      setOpenFolderError(null);
+    }
+  }
+
+  async function handleOpenFolder() {
+    if (!openFolderPath) return;
+    setOpenFolderLoading(true);
+    setOpenFolderError(null);
+    try {
+      const project = await ipc.openProject(openFolderPath);
+      useProjectStore.setState({ current: project, loading: false });
+    } catch (err: unknown) {
+      setOpenFolderError(String(err));
+    } finally {
+      setOpenFolderLoading(false);
+    }
   }
 
   async function handleCreate() {
@@ -285,10 +322,10 @@ export function NewProjectFlow({ onBack }: Props) {
               Where does it begin?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
-              Start from scratch, clone an existing repository, or scaffold from a template.
+              Start from scratch, clone an existing repository, open a local folder, or scaffold from a template.
             </p>
 
-            <div className="mt-8 grid max-w-[640px] grid-cols-3 gap-3">
+            <div className="mt-8 grid max-w-[860px] grid-cols-4 gap-3">
               <TypeCard
                 glyph="∅"
                 label="Empty"
@@ -306,6 +343,14 @@ export function NewProjectFlow({ onBack }: Props) {
                 onClick={() => handleTypeSelect("clone")}
               />
               <TypeCard
+                glyph="⌖"
+                label="Open"
+                description="From an existing folder."
+                selected={projectType === "open"}
+                disabled={false}
+                onClick={() => handleTypeSelect("open")}
+              />
+              <TypeCard
                 glyph="❦"
                 label="Template"
                 description="Coming soon."
@@ -313,6 +358,86 @@ export function NewProjectFlow({ onBack }: Props) {
                 disabled
                 onClick={() => {}}
               />
+            </div>
+          </>
+        ) : projectType === "open" ? (
+          /* ── Step II — Open existing folder ─────────────────────── */
+          <>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+              STEP II · OF II
+            </div>
+            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+              Open a folder.
+            </h1>
+            <p className="mt-3 max-w-[52ch] text-[13px] leading-[1.6] text-octo-sage">
+              Point Octopush at an existing repository on your machine. We'll register it as a project and load its workspaces.
+            </p>
+
+            <div className="mt-8 max-w-[520px]">
+              {!openFolderPath ? (
+                <button
+                  type="button"
+                  onClick={handlePickFolder}
+                  className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+                  style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                >
+                  Pick a folder…
+                </button>
+              ) : (
+                <div
+                  className="rounded-md px-4 py-3"
+                  style={{
+                    border: "1px solid var(--brass-dim)",
+                    background: "var(--brass-ghost)",
+                  }}
+                >
+                  <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
+                    § {openFolderPath.split("/").filter(Boolean).pop() ?? openFolderPath}
+                  </div>
+                  <div className="mt-1 font-mono text-[11px] text-octo-mute">
+                    {openFolderPath}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handlePickFolder}
+                    className="mt-3 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-sage transition"
+                  >
+                    Change folder
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Inline error */}
+            {openFolderError && (
+              <div
+                className="mt-6 max-w-[520px] rounded-md px-3 py-2 text-[12px] text-octo-rouge"
+                style={{
+                  borderLeft: "1px solid var(--color-octo-rouge)",
+                  background: "rgba(209, 139, 139, 0.08)",
+                }}
+              >
+                {openFolderError}
+              </div>
+            )}
+
+            <div className="mt-10 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+              >
+                ← Back
+              </button>
+              <button
+                type="button"
+                onClick={handleOpenFolder}
+                disabled={!openFolderPath || openFolderLoading}
+                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                {openFolderLoading ? "Opening…" : "Open"}
+              </button>
             </div>
           </>
         ) : projectType === "clone" ? (

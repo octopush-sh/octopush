@@ -28,6 +28,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 const cloneProjectMock = vi.fn();
 const createMock = vi.fn().mockResolvedValue(undefined);
+const openProjectMock = vi.fn().mockResolvedValue(undefined);
 const saveGitCredentialsMock = vi.fn().mockResolvedValue(undefined);
 const getSettingsMock = vi.fn().mockResolvedValue({
   providerKeys: {},
@@ -38,16 +39,24 @@ const getSettingsMock = vi.fn().mockResolvedValue({
 vi.mock("../lib/ipc", () => ({
   ipc: {
     cloneProject: cloneProjectMock,
+    openProject: openProjectMock,
     saveGitCredentials: saveGitCredentialsMock,
     getSettings: getSettingsMock,
   },
 }));
 
-// Minimal projectStore mock — expose create + error + loading
+// Mock the tauri dialog plugin
+const openDialogMock = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: openDialogMock,
+}));
+
+// Minimal projectStore mock — expose create + open + error + loading
 vi.mock("../stores/projectStore", async () => {
   const { create: zustandCreate } = await import("zustand");
   const useProjectStore = zustandCreate(() => ({
     create: createMock,
+    open: vi.fn().mockResolvedValue(undefined),
     loading: false,
     error: null,
     current: null,
@@ -80,11 +89,18 @@ describe("NewProjectFlow — Step I (type selection)", () => {
     });
   });
 
-  it("renders three TypeCards on Step I", () => {
+  it("renders four TypeCards on Step I", () => {
     render_flow();
     expect(screen.getByText("Empty")).toBeInTheDocument();
     expect(screen.getByText("Clone")).toBeInTheDocument();
+    expect(screen.getByText("Open")).toBeInTheDocument();
     expect(screen.getByText("Template")).toBeInTheDocument();
+  });
+
+  it("Open card is enabled (not disabled)", () => {
+    render_flow();
+    const openCard = screen.getByRole("button", { name: /open/i });
+    expect(openCard).not.toBeDisabled();
   });
 
   it("Clone card is selectable (not disabled)", () => {
@@ -498,5 +514,121 @@ describe("NewProjectFlow — clone progress bar (new payload shape)", () => {
       );
       expect(fillBar).toBeTruthy();
     });
+  });
+});
+
+// ─── Open existing folder flow ────────────────────────────────────────────────
+
+describe("NewProjectFlow — Open existing folder flow", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    openDialogMock.mockReset();
+    openProjectMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: {},
+    });
+  });
+
+  function goToOpenStep() {
+    render_flow();
+    // TypeCard buttons contain glyph + label + description as accessible name.
+    // Click on the "Open" text label inside the card directly.
+    fireEvent.click(screen.getByText("Open").closest("button")!);
+  }
+
+  it("clicking Open card advances to Step II with Pick a folder button", async () => {
+    goToOpenStep();
+    await waitFor(() => {
+      expect(screen.getByText("STEP II · OF II")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /pick a folder/i })).toBeInTheDocument();
+    });
+  });
+
+  it("after picking a folder, shows preview row with basename and full path", async () => {
+    openDialogMock.mockResolvedValueOnce("/Users/jonathan/some/repo");
+
+    goToOpenStep();
+    await waitFor(() => screen.getByRole("button", { name: /pick a folder/i }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /pick a folder/i }));
+    });
+
+    await waitFor(() => {
+      // basename in brass mono
+      expect(screen.getByText(/§ repo/)).toBeInTheDocument();
+      // full path in muted mono below
+      expect(screen.getByText("/Users/jonathan/some/repo")).toBeInTheDocument();
+    });
+  });
+
+  it("clicking Open calls ipc.openProject with the selected path", async () => {
+    openDialogMock.mockResolvedValueOnce("/Users/jonathan/some/repo");
+    openProjectMock.mockResolvedValueOnce({
+      id: "proj-1",
+      name: "repo",
+      path: "/Users/jonathan/some/repo",
+    });
+
+    goToOpenStep();
+    await waitFor(() => screen.getByRole("button", { name: /pick a folder/i }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /pick a folder/i }));
+    });
+
+    // Wait for preview row
+    await waitFor(() => screen.getByText(/§ repo/));
+
+    // Click Open
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    });
+
+    await waitFor(() => {
+      expect(openProjectMock).toHaveBeenCalledWith("/Users/jonathan/some/repo");
+    });
+  });
+
+  it("shows rouge error inline when openProject rejects (e.g. not a git repo)", async () => {
+    openDialogMock.mockResolvedValueOnce("/Users/jonathan/not-a-repo");
+    openProjectMock.mockRejectedValueOnce("not a git repository");
+
+    goToOpenStep();
+    await waitFor(() => screen.getByRole("button", { name: /pick a folder/i }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /pick a folder/i }));
+    });
+
+    await waitFor(() => screen.getByText(/§ not-a-repo/));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/not a git repository/i)).toBeInTheDocument();
+    });
+  });
+
+  it("when the picker is cancelled (returns null), form stays on unselected state", async () => {
+    openDialogMock.mockResolvedValueOnce(null);
+
+    goToOpenStep();
+    await waitFor(() => screen.getByRole("button", { name: /pick a folder/i }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /pick a folder/i }));
+    });
+
+    // No preview row — still shows the Pick a folder button
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /pick a folder/i })).toBeInTheDocument();
+    });
+    // Open CTA button should remain disabled
+    expect(screen.getByRole("button", { name: /^open$/i })).toBeDisabled();
   });
 });
