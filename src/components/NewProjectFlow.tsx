@@ -397,13 +397,25 @@ export function NewProjectFlow({ onBack }: Props) {
                   <div className="mt-1 font-mono text-[11px] text-octo-mute">
                     {openFolderPath}
                   </div>
-                  <button
-                    type="button"
-                    onClick={handlePickFolder}
-                    className="mt-3 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-sage transition"
-                  >
-                    Change folder
-                  </button>
+                  <div className="mt-3 flex items-center gap-4">
+                    <button
+                      type="button"
+                      onClick={handlePickFolder}
+                      className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-sage transition"
+                    >
+                      Change folder
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOpenFolderPath(null);
+                        setOpenFolderError(null);
+                      }}
+                      className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-rouge transition"
+                    >
+                      × Clear
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -424,7 +436,11 @@ export function NewProjectFlow({ onBack }: Props) {
             <div className="mt-10 flex items-center gap-3">
               <button
                 type="button"
-                onClick={() => setStep(1)}
+                onClick={() => {
+                  setStep(1);
+                  setOpenFolderPath(null);
+                  setOpenFolderError(null);
+                }}
                 className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
               >
                 ← Back

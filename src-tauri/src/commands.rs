@@ -381,9 +381,21 @@ pub struct ProjectInfo {
 #[tauri::command]
 pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult<ProjectInfo> {
     let path = expand_tilde(&path);
-    if !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
-        return Err(AppError::Other(format!("'{}' is not a git repository", path)));
+    let path_buf = std::path::PathBuf::from(&path);
+
+    if !path_buf.exists() {
+        return Err(AppError::Other(format!("'{}' does not exist", path)));
     }
+    if !path_buf.is_dir() {
+        return Err(AppError::Other(format!("'{}' is not a directory", path)));
+    }
+
+    // If the folder isn't a git repo, initialize one — opening an existing
+    // codebase that isn't yet versioned is a reasonable starting point.
+    if !crate::git_ops::is_git_repo(&path_buf) {
+        crate::git_ops::init_repo(&path_buf)?;
+    }
+
     let db = state.db.lock();
     if let Some((id, name, p)) = db.get_project_by_path(&path)? {
         db.touch_project(&id)?;
