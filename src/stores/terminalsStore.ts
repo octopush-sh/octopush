@@ -54,13 +54,22 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
 
   loadTerminals: async (workspaceId) => {
     const records = await ipc.listTerminals(workspaceId);
-    const terminals: TerminalState[] = records.map((r) => ({
-      id: r.id,
-      label: r.label,
-      position: r.position,
-      running: false,
-    }));
     set((s) => {
+      // Preserve `running` for terminals already in the store — TerminalPane
+      // doesn't unmount when the user navigates away, so existing PTYs are
+      // still alive. Treating a workspace re-load as "everything stopped"
+      // would desync the status dots.
+      const prev = s.terminalsByWs[workspaceId];
+      const prevRunningById = new Map(
+        (prev ?? []).map((t) => [t.id, t.running]),
+      );
+      const terminals: TerminalState[] = records.map((r) => ({
+        id: r.id,
+        label: r.label,
+        position: r.position,
+        running: prevRunningById.get(r.id) ?? false,
+      }));
+
       const currentActive = s.activeByWs[workspaceId] ?? null;
       const newActive =
         currentActive !== null

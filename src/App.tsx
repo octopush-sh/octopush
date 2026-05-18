@@ -61,10 +61,22 @@ function App() {
   // loop (React error #185), the same trap that bit chatStore historically.
   const terminals = useTerminalsStore((s) => s.getTerminals(activeWorkspaceId ?? ""));
   const activeTerminalId = useTerminalsStore((s) => s.getActiveId(activeWorkspaceId ?? ""));
+  const terminalsByWs = useTerminalsStore((s) => s.terminalsByWs);
   const loadTerminals = useTerminalsStore((s) => s.loadTerminals);
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const markRunning = useTerminalsStore((s) => s.markRunning);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
+
+  // Flat list of every (workspace, terminal) pair so the Run panel can mount
+  // every TerminalPane simultaneously. This is the only way to keep PTYs and
+  // their xterm scrollback alive across workspace switches — if we only
+  // rendered the active workspace's panes, switching would unmount the
+  // previous workspace's panes and their cleanup would kill the PTYs.
+  const allTerminalRefs = useMemo(() => {
+    return Object.entries(terminalsByWs).flatMap(([wsId, ts]) =>
+      ts.map((t) => ({ workspaceId: wsId, ...t })),
+    );
+  }, [terminalsByWs]);
 
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
@@ -391,22 +403,31 @@ function App() {
                         visibility: activeMode === "run" ? "visible" : "hidden",
                       }}
                     >
-                      {/* Mount-once panes — one per terminal in the store.
-                          Visibility toggled via display:block/none so xterm
-                          never unmounts and scrollback is always preserved. */}
+                      {/* Mount-once panes — one per (workspace, terminal) pair
+                          across the entire store. Visibility is toggled via
+                          display:block/none so xterm never unmounts and PTYs
+                          stay alive across workspace AND mode switches. */}
                       <div className="relative h-full w-full">
-                        {terminals.map((t) => (
-                          <TerminalPane
-                            key={t.id}
-                            terminalId={t.id}
-                            workspacePath={activeWorkspace.worktreePath || project.path}
-                            label={t.label}
-                            visible={activeMode === "run" && t.id === activeTerminalId}
-                            layoutVersion={layoutVersion}
-                            onSpawn={() => markRunning(activeWorkspaceId!, t.id, true)}
-                            onExit={() => markRunning(activeWorkspaceId!, t.id, false)}
-                          />
-                        ))}
+                        {allTerminalRefs.map((t) => {
+                          const ws = workspaces.find((w) => w.id === t.workspaceId);
+                          const wsPath = ws?.worktreePath || project.path;
+                          return (
+                            <TerminalPane
+                              key={t.id}
+                              terminalId={t.id}
+                              workspacePath={wsPath}
+                              label={t.label}
+                              visible={
+                                activeMode === "run" &&
+                                t.workspaceId === activeWorkspaceId &&
+                                t.id === activeTerminalId
+                              }
+                              layoutVersion={layoutVersion}
+                              onSpawn={() => markRunning(t.workspaceId, t.id, true)}
+                              onExit={() => markRunning(t.workspaceId, t.id, false)}
+                            />
+                          );
+                        })}
                         {terminals.length === 0 && (
                           <RunEmptyState
                             onStart={() => {
