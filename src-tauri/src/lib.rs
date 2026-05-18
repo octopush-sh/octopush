@@ -90,6 +90,11 @@ pub fn run() {
             // Settings
             commands::get_settings,
             commands::save_settings,
+            // Terminals
+            commands::list_terminals,
+            commands::create_terminal,
+            commands::rename_terminal,
+            commands::delete_terminal,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.

@@ -119,6 +119,16 @@ impl Db {
                 FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_workspace ON chat_messages(workspace_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS terminals (
+                id              TEXT PRIMARY KEY,
+                workspace_id    TEXT NOT NULL,
+                label           TEXT NOT NULL,
+                position        INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_terminals_workspace ON terminals(workspace_id);
             "#,
         )?;
         // Phase 2 — workspace customization columns (glyph + tint).
@@ -568,6 +578,65 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    // ─── Terminals ────────────────────────────────────────────────
+
+    pub fn list_terminals(&self, workspace_id: &str) -> AppResult<Vec<TerminalRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, label, position, created_at
+             FROM terminals WHERE workspace_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace_id], |r| {
+            Ok(TerminalRow {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                label: r.get(2)?,
+                position: r.get::<_, i64>(3)? as u32,
+                created_at: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_terminal(
+        &self,
+        id: &str,
+        workspace_id: &str,
+        label: &str,
+        position: u32,
+        created_at: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO terminals (id, workspace_id, label, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, workspace_id, label, position as i64, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn max_terminal_position(&self, workspace_id: &str) -> AppResult<Option<u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT MAX(position) FROM terminals WHERE workspace_id = ?1",
+        )?;
+        let val: Option<i64> = stmt.query_row(params![workspace_id], |r| r.get(0))?;
+        Ok(val.map(|v| v as u32))
+    }
+
+    pub fn rename_terminal(&self, id: &str, label: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE terminals SET label = ?1 WHERE id = ?2",
+            params![label, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_terminal(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "DELETE FROM terminals WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_chat_messages(&self, workspace_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at
@@ -605,6 +674,16 @@ pub struct WorkspaceRow {
     pub last_active: String,
     pub glyph: Option<String>,
     pub tint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub label: String,
+    pub position: u32,
+    pub created_at: i64,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

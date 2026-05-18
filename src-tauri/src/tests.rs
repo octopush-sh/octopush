@@ -228,6 +228,102 @@ mod workspace_tests {
 }
 
 #[cfg(test)]
+mod terminal_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn setup_workspace(db: &Db, project_id: &str, workspace_id: &str) {
+        db.insert_project(project_id, "Test Project", &format!("/tmp/{}", project_id))
+            .unwrap();
+        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "")
+            .unwrap();
+    }
+
+    #[test]
+    fn terminals_table_persists() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t1", "ws-t1");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-a", "ws-t1", "Main", 0, ts).unwrap();
+        db.create_terminal("term-b", "ws-t1", "Terminal 2", 1, ts).unwrap();
+        db.create_terminal("term-c", "ws-t1", "Terminal 3", 2, ts).unwrap();
+
+        let list = db.list_terminals("ws-t1").unwrap();
+        assert_eq!(list.len(), 3);
+        // Positions must be in ascending order
+        let positions: Vec<u32> = list.iter().map(|t| t.position).collect();
+        assert_eq!(positions, vec![0, 1, 2]);
+        assert_eq!(list[0].label, "Main");
+        assert_eq!(list[1].label, "Terminal 2");
+        assert_eq!(list[2].label, "Terminal 3");
+    }
+
+    #[test]
+    fn rename_terminal_updates_label() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t2", "ws-t2");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-r", "ws-t2", "Old Label", 0, ts).unwrap();
+        db.rename_terminal("term-r", "New Label").unwrap();
+
+        let list = db.list_terminals("ws-t2").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label, "New Label");
+    }
+
+    #[test]
+    fn delete_terminal_kills_pty_gracefully() {
+        // This tests that delete_terminal works even when the PTY id isn't
+        // registered in PtyManager (no panic, no error propagation for "not found").
+        let db = test_db();
+        setup_workspace(&db, "proj-t3", "ws-t3");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-d", "ws-t3", "Doomed", 0, ts).unwrap();
+
+        // Simulate the command-level behaviour: ignore "not found" from pty.kill,
+        // then delete from DB.
+        let mut pty = crate::pty_manager::PtyManager::new();
+        let _ = pty.kill("term-d"); // must not panic
+
+        db.delete_terminal("term-d").unwrap();
+
+        let list = db.list_terminals("ws-t3").unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn max_terminal_position_returns_none_when_empty() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t4", "ws-t4");
+
+        let max = db.max_terminal_position("ws-t4").unwrap();
+        assert_eq!(max, None);
+    }
+
+    #[test]
+    fn max_terminal_position_returns_highest() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t5", "ws-t5");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-p1", "ws-t5", "A", 0, ts).unwrap();
+        db.create_terminal("term-p2", "ws-t5", "B", 1, ts).unwrap();
+        db.create_terminal("term-p3", "ws-t5", "C", 5, ts).unwrap();
+
+        let max = db.max_terminal_position("ws-t5").unwrap();
+        assert_eq!(max, Some(5));
+    }
+}
+
+#[cfg(test)]
 mod scanner_tests {
     use crate::token_engine::scan_pty_output;
 

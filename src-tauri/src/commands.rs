@@ -565,6 +565,62 @@ pub async fn reveal_in_finder(path: String) -> AppResult<()> {
     Ok(())
 }
 
+// ─── Terminal commands ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_terminals(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Vec<crate::db::TerminalRow>> {
+    state.db.lock().list_terminals(&workspace_id)
+}
+
+#[tauri::command]
+pub async fn create_terminal(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    label: String,
+) -> AppResult<crate::db::TerminalRow> {
+    let id = Uuid::new_v4().to_string();
+    let position = state
+        .db
+        .lock()
+        .max_terminal_position(&workspace_id)?
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let created_at = chrono::Utc::now().timestamp();
+    state
+        .db
+        .lock()
+        .create_terminal(&id, &workspace_id, &label, position, created_at)?;
+    Ok(crate::db::TerminalRow {
+        id,
+        workspace_id,
+        label,
+        position,
+        created_at,
+    })
+}
+
+#[tauri::command]
+pub async fn rename_terminal(
+    state: State<'_, AppState>,
+    id: String,
+    label: String,
+) -> AppResult<()> {
+    state.db.lock().rename_terminal(&id, &label)
+}
+
+#[tauri::command]
+pub async fn delete_terminal(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<()> {
+    // Kill the live PTY if one exists; ignore "not found".
+    let _ = state.pty.lock().kill(&id);
+    state.db.lock().delete_terminal(&id)
+}
+
 // ─── Settings ─────────────────────────────────────────────────────
 
 #[tauri::command]

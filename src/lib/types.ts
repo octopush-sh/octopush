@@ -138,6 +138,16 @@ export interface Workspace {
   tint: TintName | null;
 }
 
+// ─── Terminals ────────────────────────────────────────────────────
+
+export interface TerminalRecord {
+  id: string;
+  workspaceId: string;
+  label: string;
+  position: number;
+  createdAt: number;
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────
 
 export interface ChatMessage {

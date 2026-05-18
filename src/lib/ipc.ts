@@ -16,6 +16,7 @@ import type {
   SessionRecap,
   SessionTemplate,
   TaskType,
+  TerminalRecord,
   ThemeConfig,
   TintName,
   TokenEvent,
@@ -144,4 +145,14 @@ export const ipc = {
     invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
+
+  // ─── Terminals ────────────────────────────────────────────────
+  listTerminals: (workspaceId: string) =>
+    invoke<TerminalRecord[]>("list_terminals", { workspaceId }),
+  createTerminal: (workspaceId: string, label: string) =>
+    invoke<TerminalRecord>("create_terminal", { workspaceId, label }),
+  renameTerminal: (id: string, label: string) =>
+    invoke<void>("rename_terminal", { id, label }),
+  deleteTerminal: (id: string) =>
+    invoke<void>("delete_terminal", { id }),
 };
