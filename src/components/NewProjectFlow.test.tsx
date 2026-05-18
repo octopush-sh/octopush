@@ -6,14 +6,24 @@
  *  - Manual name edit detaches from URL parsing
  *  - AuthRequired error shows credential panel
  *  - Credential submit calls cloneProject with creds; if Remember, also saveGitCredentials
+ *  - Progress bar updates with new { phase, percent, current, total } payload shape
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 
 // ─── Mocks — must be declared before the component is imported ───────────────
 
+// Capture registered event listeners so tests can fire them manually.
+type ListenerCallback = (event: { payload: unknown }) => void;
+const registeredListeners: Map<string, ListenerCallback> = new Map();
+
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
+  listen: vi.fn().mockImplementation((eventName: string, cb: ListenerCallback) => {
+    registeredListeners.set(eventName, cb);
+    return Promise.resolve(() => {
+      registeredListeners.delete(eventName);
+    });
+  }),
 }));
 
 const cloneProjectMock = vi.fn();
@@ -395,5 +405,98 @@ describe("NewProjectFlow — SshKeyMissing error flow", () => {
 
     const urlInput = screen.getByPlaceholderText(/paste a git remote url/i) as HTMLInputElement;
     expect(urlInput.value).toBe("https://github.com/octocat/private.git");
+  });
+});
+
+describe("NewProjectFlow — clone progress bar (new payload shape)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cloneProjectMock.mockReset();
+    registeredListeners.clear();
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: {},
+    });
+  });
+
+  function goToCloneStep() {
+    render_flow();
+    fireEvent.click(screen.getByRole("button", { name: /clone/i }));
+  }
+
+  it("progress bar appears while cloning and shows phase · current/total · percent% label", async () => {
+    // Clone never resolves during this test — we just want to observe progress UI.
+    cloneProjectMock.mockReturnValue(new Promise(() => {}));
+
+    goToCloneStep();
+    const urlInput = await screen.findByPlaceholderText(/paste a git remote url/i);
+    fireEvent.change(urlInput, { target: { value: "https://github.com/octocat/Hello-World.git" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /clone & open/i })).not.toBeDisabled();
+    });
+
+    // Start cloning (don't await — it never resolves).
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+
+    // Wait for the listener to be registered.
+    await waitFor(() => {
+      expect(registeredListeners.has("clone://progress")).toBe(true);
+    });
+
+    // Fire a progress event with the new payload shape.
+    await act(async () => {
+      const listener = registeredListeners.get("clone://progress");
+      listener?.({
+        payload: { phase: "Receiving objects", percent: 47, current: 118, total: 250 },
+      });
+    });
+
+    // Progress label should be visible.
+    await waitFor(() => {
+      expect(screen.getByText(/Receiving objects/)).toBeInTheDocument();
+      expect(screen.getByText(/118\/250/)).toBeInTheDocument();
+      expect(screen.getByText(/47%/)).toBeInTheDocument();
+    });
+  });
+
+  it("progress bar width matches percent from event", async () => {
+    cloneProjectMock.mockReturnValue(new Promise(() => {}));
+
+    goToCloneStep();
+    const urlInput = await screen.findByPlaceholderText(/paste a git remote url/i);
+    fireEvent.change(urlInput, { target: { value: "https://github.com/octocat/Hello-World.git" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /clone & open/i })).not.toBeDisabled();
+    });
+
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+
+    await waitFor(() => {
+      expect(registeredListeners.has("clone://progress")).toBe(true);
+    });
+
+    await act(async () => {
+      const listener = registeredListeners.get("clone://progress");
+      listener?.({
+        payload: { phase: "Resolving deltas", percent: 100, current: 50, total: 50 },
+      });
+    });
+
+    // The brass fill bar should have width: 100%
+    await waitFor(() => {
+      // Find the inner fill div — it's the child of the rounded overflow container.
+      const bars = document.querySelectorAll('[style*="width"]');
+      const fillBar = Array.from(bars).find(
+        (el) => (el as HTMLElement).style.width === "100%",
+      );
+      expect(fillBar).toBeTruthy();
+    });
   });
 });

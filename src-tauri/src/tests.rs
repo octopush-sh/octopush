@@ -324,6 +324,92 @@ mod terminal_tests {
 }
 
 #[cfg(test)]
+mod clone_progress_tests {
+    use crate::commands::parse_clone_progress;
+
+    fn pct(v: &serde_json::Value) -> u64 {
+        v["percent"].as_u64().unwrap()
+    }
+    fn cur(v: &serde_json::Value) -> u64 {
+        v["current"].as_u64().unwrap()
+    }
+    fn tot(v: &serde_json::Value) -> u64 {
+        v["total"].as_u64().unwrap()
+    }
+    fn phase(v: &serde_json::Value) -> &str {
+        v["phase"].as_str().unwrap()
+    }
+
+    #[test]
+    fn receiving_objects_mid_progress() {
+        let line = "Receiving objects:  47% (118/250), 1.23 MiB | 512.00 KiB/s";
+        let v = parse_clone_progress(line).unwrap();
+        assert_eq!(phase(&v), "Receiving objects");
+        assert_eq!(pct(&v), 47);
+        assert_eq!(cur(&v), 118);
+        assert_eq!(tot(&v), 250);
+    }
+
+    #[test]
+    fn receiving_objects_complete() {
+        let line = "Receiving objects: 100% (250/250), 5.00 MiB | 1.00 MiB/s, done.";
+        let v = parse_clone_progress(line).unwrap();
+        assert_eq!(phase(&v), "Receiving objects");
+        assert_eq!(pct(&v), 100);
+        assert_eq!(cur(&v), 250);
+        assert_eq!(tot(&v), 250);
+    }
+
+    #[test]
+    fn resolving_deltas_done() {
+        let line = "Resolving deltas: 100% (50/50), done.";
+        let v = parse_clone_progress(line).unwrap();
+        assert_eq!(phase(&v), "Resolving deltas");
+        assert_eq!(pct(&v), 100);
+        assert_eq!(cur(&v), 50);
+        assert_eq!(tot(&v), 50);
+    }
+
+    #[test]
+    fn counting_objects() {
+        let line = "Counting objects: 100% (250/250), done.";
+        let v = parse_clone_progress(line).unwrap();
+        assert_eq!(phase(&v), "Counting objects");
+        assert_eq!(pct(&v), 100);
+        assert_eq!(cur(&v), 250);
+        assert_eq!(tot(&v), 250);
+    }
+
+    #[test]
+    fn compressing_objects() {
+        let line = "Compressing objects:  60% (30/50)";
+        let v = parse_clone_progress(line).unwrap();
+        assert_eq!(phase(&v), "Compressing objects");
+        assert_eq!(pct(&v), 60);
+        assert_eq!(cur(&v), 30);
+        assert_eq!(tot(&v), 50);
+    }
+
+    #[test]
+    fn remote_counting_with_leading_remote_prefix() {
+        // git sometimes prefixes lines with "remote: "
+        let line = "remote: Counting objects: 100% (4/4), done.";
+        // This should NOT match because "remote: Counting" starts with "remote" not a phase word
+        // (the regex requires the line to start with the phase name)
+        assert!(parse_clone_progress(line).is_none());
+    }
+
+    #[test]
+    fn non_progress_lines_return_none() {
+        assert!(parse_clone_progress("").is_none());
+        assert!(parse_clone_progress("Cloning into 'myrepo'...").is_none());
+        assert!(parse_clone_progress("Permission denied (publickey).").is_none());
+        assert!(parse_clone_progress("fatal: Could not read from remote repository.").is_none());
+        assert!(parse_clone_progress("remote: Enumerating objects: 4, done.").is_none());
+    }
+}
+
+#[cfg(test)]
 mod scanner_tests {
     use crate::token_engine::scan_pty_output;
 

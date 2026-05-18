@@ -630,6 +630,180 @@ pub struct CloneCredentials {
     pub token: String,
 }
 
+/// Parse a single stderr line from `git clone --progress` into structured
+/// progress data.  Returns `None` for lines that don't match.
+///
+/// Git progress lines look like:
+///   `Receiving objects:  47% (118/250), 1.23 MiB | 512.00 KiB/s`
+///   `Resolving deltas: 100% (50/50), done.`
+///   `Counting objects: 100% (250/250), done.`
+pub fn parse_clone_progress(line: &str) -> Option<serde_json::Value> {
+    use regex::Regex;
+    // Compile once per parse call — acceptable for non-hot-loop usage.
+    let re = Regex::new(
+        r"^(?P<phase>[A-Za-z][A-Za-z ]+):\s+(?P<pct>\d+)%\s+\((?P<cur>\d+)/(?P<total>\d+)\)",
+    )
+    .ok()?;
+
+    let caps = re.captures(line.trim())?;
+    let phase = caps["phase"].trim().to_string();
+    let percent: u32 = caps["pct"].parse().ok()?;
+    let current: u32 = caps["cur"].parse().ok()?;
+    let total: u32 = caps["total"].parse().ok()?;
+
+    Some(serde_json::json!({
+        "phase": phase,
+        "percent": percent,
+        "current": current,
+        "total": total,
+    }))
+}
+
+/// Clone `url` into `target` by shelling out to the user's login shell.
+///
+/// This ensures the child process inherits SSH_AUTH_SOCK, ~/.ssh/config,
+/// credential helpers (osxkeychain), gitconfig — exactly as if the user
+/// ran `git clone` in their own terminal.
+async fn clone_via_shell(
+    app: &tauri::AppHandle,
+    url: &str,
+    target: &std::path::Path,
+    host: &str,
+    is_ssh: bool,
+    credentials: Option<&CloneCredentials>,
+) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+    use std::process::Stdio;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+
+    // Escape target path for use in the shell command.
+    let target_str = target.to_string_lossy();
+    // Use printf '%s' style quoting — single-quote the path, escaping any
+    // single quotes within by ending the quoted string, adding an escaped
+    // single quote, then reopening.
+    let target_escaped = target_str.replace('\'', "'\\''");
+    let url_escaped = url.replace('\'', "'\\''");
+
+    let git_cmd = format!(
+        "git clone --progress -- '{}' '{}'",
+        url_escaped, target_escaped
+    );
+
+    // Build environment overrides.
+    let mut env_overrides: Vec<(String, String)> = vec![
+        // Prevent git from blocking on tty prompts.
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+    ];
+
+    // Askpass script path — only created when credentials are provided.
+    // We hold an `Option<tempfile::NamedTempFile>` so the file lives until
+    // after `child.wait()` completes, then is auto-deleted on drop.
+    let _askpass_tmp: Option<tempfile::NamedTempFile>;
+
+    if let Some(creds) = credentials {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%%s' \"$OCTOPUS_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%%s' \"$OCTOPUS_GIT_TOKEN\" ;;\nesac\n"
+        );
+
+        let mut tmp = tempfile::Builder::new()
+            .prefix("octopus-askpass-")
+            .suffix(".sh")
+            .tempfile()
+            .map_err(|e| AppError::Other(format!("failed to create askpass tempfile: {e}")))?;
+
+        use std::io::Write as _;
+        tmp.write_all(script.as_bytes())
+            .map_err(|e| AppError::Other(format!("failed to write askpass script: {e}")))?;
+
+        // Make executable.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| AppError::Other(format!("failed to chmod askpass: {e}")))?;
+
+        let askpass_path = tmp.path().to_string_lossy().to_string();
+        env_overrides.push(("OCTOPUS_GIT_USERNAME".into(), creds.username.clone()));
+        env_overrides.push(("OCTOPUS_GIT_TOKEN".into(), creds.token.clone()));
+        env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
+
+        _askpass_tmp = Some(tmp);
+    } else {
+        _askpass_tmp = None;
+    }
+
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-l").arg("-c").arg(&git_cmd);
+    cmd.envs(env_overrides);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::Other(format!("failed to spawn shell for git clone: {e}")))?;
+
+    // Stream stderr line-by-line: parse progress, collect for error context.
+    let stderr_handle = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Other("no stderr handle".into()))?;
+
+    let mut lines = tokio::io::BufReader::new(stderr_handle).lines();
+    let mut stderr_lines: Vec<String> = Vec::new();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(payload) = parse_clone_progress(&line) {
+            let _ = app.emit("clone://progress", payload);
+        }
+        stderr_lines.push(line);
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| AppError::Other(format!("git clone wait failed: {e}")))?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    // Build a context string from the last few non-empty stderr lines.
+    let context: String = stderr_lines
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let full_stderr = stderr_lines.join("\n");
+
+    // Classify the error so the frontend can show the right panel.
+    if full_stderr.contains("Permission denied (publickey)")
+        || full_stderr.contains("Could not read from remote repository")
+        || (full_stderr.contains("Permission denied") && is_ssh)
+    {
+        return Err(AppError::SshKeyMissing { host: host.to_string() });
+    }
+
+    if full_stderr.contains("Authentication failed")
+        || full_stderr.contains("terminal prompts disabled")
+        || full_stderr.contains("could not read Username")
+        || full_stderr.contains("could not read Password")
+        || (full_stderr.contains("Repository not found") && !is_ssh)
+    {
+        return Err(AppError::AuthRequired { host: host.to_string() });
+    }
+
+    Err(AppError::Other(format!(
+        "git clone failed:\n{context}"
+    )))
+}
+
 #[tauri::command]
 pub async fn clone_project(
     state: State<'_, AppState>,
@@ -640,7 +814,6 @@ pub async fn clone_project(
     credentials: Option<CloneCredentials>,
 ) -> AppResult<ProjectInfo> {
     use crate::git_url::parse_git_url;
-    use git2::{build::RepoBuilder, FetchOptions, RemoteCallbacks};
 
     let parsed = parse_git_url(&url)
         .ok_or_else(|| AppError::Other(format!("Could not parse git URL: {url}")))?;
@@ -660,77 +833,15 @@ pub async fn clone_project(
         )));
     }
 
-    // We need to move values into the spawn_blocking closure.
-    let url_clone = url.clone();
-    let host_clone = parsed.host.clone();
-    let is_ssh = parsed.is_ssh;
-    let creds_for_closure = credentials.map(|c| (c.username, c.token));
-    let app_clone = app.clone();
-    let target_path_for_closure = target_path.clone();
-
-    let result = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        let target_path = target_path_for_closure;
-        let mut callbacks = RemoteCallbacks::new();
-
-        // Credentials callback
-        callbacks.credentials(move |_url, username_from_url, _allowed| {
-            if is_ssh {
-                git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
-            } else if let Some((ref uname, ref tok)) = creds_for_closure {
-                git2::Cred::userpass_plaintext(uname, tok)
-            } else {
-                Err(git2::Error::from_str("No credentials available for HTTPS clone"))
-            }
-        });
-
-        // Transfer progress → emit event
-        callbacks.transfer_progress(move |stats| {
-            let _ = app_clone.emit(
-                "clone://progress",
-                serde_json::json!({
-                    "receivedObjects": stats.received_objects(),
-                    "totalObjects": stats.total_objects(),
-                    "receivedBytes": stats.received_bytes(),
-                }),
-            );
-            true
-        });
-
-        let mut fetch_opts = FetchOptions::new();
-        fetch_opts.remote_callbacks(callbacks);
-
-        RepoBuilder::new()
-            .fetch_options(fetch_opts)
-            .clone(&url_clone, &target_path)
-            .map_err(|e| {
-                let msg = e.message().to_string();
-                let class = e.class();
-                // Detect authentication/credential failures for either protocol.
-                let auth_failed = class == git2::ErrorClass::Http
-                    || class == git2::ErrorClass::Ssh
-                    || msg.contains("401")
-                    || msg.contains("403")
-                    || msg.contains("authentication")
-                    || msg.contains("Authentication")
-                    || msg.contains("credential");
-
-                if auth_failed {
-                    if is_ssh {
-                        AppError::SshKeyMissing { host: host_clone.clone() }
-                    } else {
-                        AppError::AuthRequired { host: host_clone.clone() }
-                    }
-                } else {
-                    AppError::Other(format!("git clone failed: {msg}"))
-                }
-            })?;
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("spawn_blocking failed: {e}")))?;
-
-    result?;
+    clone_via_shell(
+        &app,
+        &url,
+        &target_path,
+        &parsed.host,
+        parsed.is_ssh,
+        credentials.as_ref(),
+    )
+    .await?;
 
     // Insert into DB and return ProjectInfo.
     let id = uuid::Uuid::new_v4().to_string();

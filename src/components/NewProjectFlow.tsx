@@ -13,9 +13,10 @@ type ProjectType = "empty" | "clone" | "template";
 type Step = 1 | 2;
 
 interface CloneProgress {
-  receivedObjects: number;
-  totalObjects: number;
-  receivedBytes: number;
+  phase: string;
+  percent: number;
+  current: number;
+  total: number;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -225,10 +226,7 @@ export function NewProjectFlow({ onBack }: Props) {
   }
 
   // ── Derived ─────────────────────────────────────────────────────────
-  const progressPct =
-    cloneProgress && cloneProgress.totalObjects > 0
-      ? Math.round((cloneProgress.receivedObjects / cloneProgress.totalObjects) * 100)
-      : 0;
+  const progressPct = cloneProgress?.percent ?? 0;
 
   const displayError = cloneError ?? createError;
 
@@ -385,9 +383,11 @@ export function NewProjectFlow({ onBack }: Props) {
                 </div>
                 {cloneProgress && (
                   <div className="mt-1 font-mono text-[9px] text-octo-mute">
-                    {cloneProgress.receivedObjects}/{cloneProgress.totalObjects} objects
+                    {cloneProgress.phase}
                     {" · "}
-                    {Math.round(cloneProgress.receivedBytes / 1024)} KB
+                    {cloneProgress.current}/{cloneProgress.total}
+                    {" · "}
+                    {cloneProgress.percent}%
                   </div>
                 )}
               </div>

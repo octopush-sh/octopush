@@ -34,9 +34,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 async-trait = "0.1"
+tempfile = "3"
+regex = "1"
 
 [dev-dependencies]
-tempfile = "3"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
