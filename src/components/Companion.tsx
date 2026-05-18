@@ -42,7 +42,7 @@ export function Companion({
 }: Props) {
   return (
     <aside
-      className="m-4 ml-0 flex w-[280px] flex-col gap-4 rounded-xl border border-octo-hairline bg-octo-panel p-4"
+      className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto rounded-xl border border-octo-hairline bg-octo-panel p-4"
       aria-label="Companion"
     >
       {mode === "talk" && (

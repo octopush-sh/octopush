@@ -17,7 +17,7 @@ export function ModeSwitcher({ mode, onChange }: Props) {
     <div
       role="group"
       aria-label="Workspace mode"
-      className="relative m-4 inline-flex items-center rounded-lg border border-octo-hairline bg-octo-panel p-1"
+      className="relative inline-flex items-center self-end rounded-lg border border-octo-hairline bg-octo-panel p-1"
     >
       {/* Gliding brass indicator. Translates by activeIndex * BUTTON_W. */}
       <div

@@ -384,21 +384,23 @@ function App() {
         onNewWorkspace={() => setShowCreator(true)}
       />
 
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="flex min-w-0 flex-1 overflow-hidden">
         {activeWorkspace ? (
           <>
-            <div className="flex items-start">
-              <div className="min-w-0 flex-1">
-                <ContextHeader
-                  workspaceName={activeWorkspace.name}
-                  branch={activeWorkspace.branch}
-                  gitStatus={gitStatus}
-                />
-              </div>
-              <ModeSwitcher mode={activeMode} onChange={setMode} />
-            </div>
+            {/* LEFT COLUMN — header + canvas (input lives inside the canvas).
+                Layout note: putting ContextHeader inside the left column (not
+                spanning the full window) means its top edge aligns with the
+                ModeSwitcher in the right column, and the canvas bottom aligns
+                with the Companion bottom. Eliminates the dead zones above the
+                Companion and below it that came from a flex-col main with the
+                ModeSwitcher in its own row. */}
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
+              <ContextHeader
+                workspaceName={activeWorkspace.name}
+                branch={activeWorkspace.branch}
+                gitStatus={gitStatus}
+              />
 
-            <div className="flex min-h-0 flex-1 overflow-hidden">
               <div className="relative min-w-0 flex-1 overflow-hidden">
                 {showCreator && (
                   <WorkspaceCreator
@@ -505,6 +507,13 @@ function App() {
                 )}
               </div>
 
+            </div>
+
+            {/* RIGHT COLUMN — ModeSwitcher pinned at the top, Companion fills
+                the rest. Same vertical extents as the left column so top and
+                bottom edges align cleanly. */}
+            <div className="flex w-[312px] shrink-0 flex-col gap-3 p-4 pl-0">
+              <ModeSwitcher mode={activeMode} onChange={setMode} />
               <Companion
                 mode={activeMode}
                 workspaceId={activeWorkspaceId}
