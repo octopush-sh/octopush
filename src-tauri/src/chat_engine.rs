@@ -455,6 +455,27 @@ impl ChatEngine {
             total_input += response.input_tokens;
             total_output += response.output_tokens;
 
+            // Record a token usage event so the Companion CONTEXT card and
+            // Settings · Usage stats can read aggregate counts. Without this
+            // the `token_events` table never sees chat turns and the
+            // dashboards stay frozen at zero.
+            if response.input_tokens > 0 || response.output_tokens > 0 {
+                let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
+                if let Err(e) = engine.record(token_engine::TokenEvent {
+                    id: None,
+                    session_id: request.workspace_id.clone(),
+                    timestamp: String::new(),
+                    input_tokens: response.input_tokens,
+                    output_tokens: response.output_tokens,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    model: request.model.clone(),
+                    cost_usd: 0.0,
+                }) {
+                    tracing::warn!(error = %e, "failed to record chat token event");
+                }
+            }
+
             tracing::info!(
                 iteration = iteration,
                 stop_reason = ?response.stop_reason,
