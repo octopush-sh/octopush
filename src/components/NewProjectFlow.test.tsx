@@ -314,3 +314,86 @@ describe("NewProjectFlow — AuthRequired error flow", () => {
     expect(saveGitCredentialsMock).not.toHaveBeenCalled();
   });
 });
+
+describe("NewProjectFlow — SshKeyMissing error flow", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cloneProjectMock.mockReset();
+    saveGitCredentialsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: {},
+    });
+  });
+
+  function goToCloneStep() {
+    render_flow();
+    fireEvent.click(screen.getByRole("button", { name: /clone/i }));
+  }
+
+  async function fillSshAndClone() {
+    goToCloneStep();
+    const urlInput = await screen.findByPlaceholderText(/paste a git remote url/i);
+    fireEvent.change(urlInput, { target: { value: "git@github.com:octocat/private.git" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /clone & open/i })).not.toBeDisabled();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+  }
+
+  it("shows SSH panel with ssh-add snippet when cloneProject rejects with SshKeyMissing", async () => {
+    cloneProjectMock.mockRejectedValueOnce(
+      JSON.stringify({ kind: "SshKeyMissing", host: "github.com" }),
+    );
+
+    await fillSshAndClone();
+
+    // The panel heading contains "SSH KEY · github.com" — match it exactly via the mono eyebrow element
+    await waitFor(() => {
+      expect(screen.getByText(/SSH KEY · github\.com/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/ssh-add ~\/.ssh\/id_ed25519/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /switch to https/i })).toBeInTheDocument();
+  });
+
+  it("does NOT show the HTTPS credential panel for SshKeyMissing", async () => {
+    cloneProjectMock.mockRejectedValueOnce(
+      JSON.stringify({ kind: "SshKeyMissing", host: "github.com" }),
+    );
+
+    await fillSshAndClone();
+
+    await waitFor(() => {
+      expect(screen.getByText(/SSH KEY · github\.com/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("PERSONAL ACCESS TOKEN")).not.toBeInTheDocument();
+  });
+
+  it("Switch to HTTPS converts the URL and dismisses the SSH panel", async () => {
+    cloneProjectMock.mockRejectedValueOnce(
+      JSON.stringify({ kind: "SshKeyMissing", host: "github.com" }),
+    );
+
+    await fillSshAndClone();
+
+    await waitFor(() => {
+      expect(screen.getByText(/SSH KEY · github\.com/i)).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /switch to https/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText(/SSH KEY · github\.com/i)).not.toBeInTheDocument();
+    });
+
+    const urlInput = screen.getByPlaceholderText(/paste a git remote url/i) as HTMLInputElement;
+    expect(urlInput.value).toBe("https://github.com/octocat/private.git");
+  });
+});

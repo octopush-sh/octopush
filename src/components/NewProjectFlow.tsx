@@ -19,27 +19,58 @@ interface CloneProgress {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// AuthRequired error shape the Rust backend sends back
+// Error-shape helpers for structured errors the Rust backend sends back
 // ──────────────────────────────────────────────────────────────────────────────
-function isAuthRequired(err: unknown): { host: string } | null {
+
+/** Normalise an unknown thrown value to a plain object (or null). */
+function parseBackendError(err: unknown): Record<string, unknown> | null {
   if (err && typeof err === "object") {
-    const e = err as Record<string, unknown>;
-    if (e["kind"] === "AuthRequired" && typeof e["host"] === "string") {
-      return { host: e["host"] as string };
-    }
+    return err as Record<string, unknown>;
   }
-  // Some Tauri versions wrap the error in a string — try JSON-parsing it.
   if (typeof err === "string") {
     try {
       const parsed = JSON.parse(err);
-      if (parsed?.kind === "AuthRequired" && typeof parsed?.host === "string") {
-        return { host: parsed.host };
-      }
+      if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>;
     } catch {
       // fall through
     }
   }
   return null;
+}
+
+function isAuthRequired(err: unknown): { host: string } | null {
+  const e = parseBackendError(err);
+  if (e?.["kind"] === "AuthRequired" && typeof e["host"] === "string") {
+    return { host: e["host"] as string };
+  }
+  return null;
+}
+
+function isSshKeyMissing(err: unknown): { host: string } | null {
+  const e = parseBackendError(err);
+  if (e?.["kind"] === "SshKeyMissing" && typeof e["host"] === "string") {
+    return { host: e["host"] as string };
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SSH-to-HTTPS URL conversion
+// ──────────────────────────────────────────────────────────────────────────────
+
+/** Convert an SSH remote URL to its HTTPS equivalent.
+ *  git@github.com:owner/repo.git      → https://github.com/owner/repo.git
+ *  ssh://git@github.com/owner/repo.git → https://github.com/owner/repo.git
+ *  Already-HTTPS URLs are returned unchanged.
+ */
+export function sshToHttps(url: string): string {
+  // SCP style: git@github.com:owner/repo.git
+  const sshScp = url.match(/^git@([^:]+):(.+)$/);
+  if (sshScp) return `https://${sshScp[1]}/${sshScp[2]}`;
+  // ssh:// scheme: ssh://git@github.com/owner/repo.git
+  const sshProto = url.match(/^ssh:\/\/git@([^/]+)\/(.+)$/);
+  if (sshProto) return `https://${sshProto[1]}/${sshProto[2]}`;
+  return url; // already HTTPS or unknown
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -68,12 +99,15 @@ export function NewProjectFlow({ onBack }: Props) {
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [cloneProgress, setCloneProgress] = useState<CloneProgress | null>(null);
 
-  // Auth fallback panel
+  // HTTPS auth fallback panel
   const [authHost, setAuthHost] = useState<string | null>(null);
   const [authUsername, setAuthUsername] = useState("");
   const [authToken, setAuthToken] = useState("");
   const [authRemember, setAuthRemember] = useState(true);
   const [authLoading, setAuthLoading] = useState(false);
+
+  // SSH key missing panel
+  const [sshKeyMissingHost, setSshKeyMissingHost] = useState<string | null>(null);
 
   const urlInputRef = useRef<HTMLInputElement>(null);
 
@@ -130,6 +164,7 @@ export function NewProjectFlow({ onBack }: Props) {
     setCloneError(null);
     setCloneProgress(null);
     setAuthHost(null);
+    setSshKeyMissingHost(null);
 
     try {
       const project = await ipc.cloneProject({
@@ -141,14 +176,23 @@ export function NewProjectFlow({ onBack }: Props) {
       useProjectStore.setState({ current: project, loading: false });
     } catch (err: unknown) {
       const auth = isAuthRequired(err);
+      const ssh = isSshKeyMissing(err);
       if (auth) {
         setAuthHost(auth.host);
+      } else if (ssh) {
+        setSshKeyMissingHost(ssh.host);
       } else {
         setCloneError(String(err));
       }
     } finally {
       setCloning(false);
     }
+  }
+
+  function switchToHttps() {
+    setCloneUrl((prev) => sshToHttps(prev));
+    setSshKeyMissingHost(null);
+    setCloneError(null);
   }
 
   async function handleAuthRetry() {
@@ -349,7 +393,7 @@ export function NewProjectFlow({ onBack }: Props) {
               </div>
             )}
 
-            {/* Auth fallback panel */}
+            {/* HTTPS auth fallback panel */}
             {authHost && (
               <div
                 className="mt-6 max-w-[520px] rounded-md p-4 space-y-4"
@@ -404,6 +448,51 @@ export function NewProjectFlow({ onBack }: Props) {
                 >
                   {authLoading ? "Trying…" : "Try again"}
                 </button>
+              </div>
+            )}
+
+            {/* SSH key missing panel */}
+            {sshKeyMissingHost && (
+              <div
+                className="mt-6 max-w-[520px] rounded-md p-4 space-y-4"
+                style={{
+                  border: "1px solid var(--brass-dim)",
+                  background: "var(--brass-ghost)",
+                }}
+              >
+                <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+                  SSH KEY · {sshKeyMissingHost}
+                </div>
+                <p className="text-[13px] leading-[1.55] text-octo-sage">
+                  Octopus couldn't find an SSH key in your agent for{" "}
+                  <span className="font-mono text-octo-ivory">{sshKeyMissingHost}</span>.
+                  Add one in a terminal, then click{" "}
+                  <em className="font-serif italic text-octo-ivory">Try again</em>:
+                </p>
+                <div className="rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-sage">
+                  ssh-add ~/.ssh/id_ed25519
+                </div>
+                <p className="text-[13px] leading-[1.55] text-octo-sage">
+                  Or paste an HTTPS URL instead — Octopus will ask for a Personal Access Token.
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleClone()}
+                    className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+                    style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                  >
+                    Try again
+                  </button>
+                  <button
+                    type="button"
+                    onClick={switchToHttps}
+                    className="rounded-md px-4 py-2 font-mono text-[11px] uppercase tracking-[0.15em] text-octo-sage transition hover:text-octo-ivory"
+                    style={{ border: "1px solid var(--color-octo-hairline)" }}
+                  >
+                    Switch to HTTPS
+                  </button>
+                </div>
               </div>
             )}
 

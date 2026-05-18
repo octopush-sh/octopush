@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseGitUrl } from "./parseGitUrl";
+import { sshToHttps } from "../components/NewProjectFlow";
 
 describe("parseGitUrl", () => {
   // ── Happy path ──────────────────────────────────────────────────────
@@ -83,5 +84,31 @@ describe("parseGitUrl", () => {
     const r = parseGitUrl("  https://github.com/owner/repo  ");
     expect(r).not.toBeNull();
     expect(r?.repo).toBe("repo");
+  });
+});
+
+describe("sshToHttps", () => {
+  it("converts SCP-style SSH to HTTPS", () => {
+    expect(sshToHttps("git@github.com:owner/repo.git")).toBe(
+      "https://github.com/owner/repo.git",
+    );
+  });
+
+  it("converts ssh:// scheme to HTTPS", () => {
+    expect(sshToHttps("ssh://git@github.com/owner/repo.git")).toBe(
+      "https://github.com/owner/repo.git",
+    );
+  });
+
+  it("leaves an already-HTTPS URL unchanged", () => {
+    expect(sshToHttps("https://github.com/owner/repo.git")).toBe(
+      "https://github.com/owner/repo.git",
+    );
+  });
+
+  it("converts Bitbucket SCP-style SSH to HTTPS", () => {
+    expect(sshToHttps("git@bitbucket.org:owner/repo.git")).toBe(
+      "https://bitbucket.org/owner/repo.git",
+    );
   });
 });

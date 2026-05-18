@@ -28,6 +28,11 @@ pub enum AppError {
     /// The frontend detects `kind == "AuthRequired"` to show the credential panel.
     #[error("Authentication required for {host}")]
     AuthRequired { host: String },
+
+    /// Returned when an SSH clone fails because no key is available in the agent.
+    /// The frontend detects `kind == "SshKeyMissing"` to show the SSH help panel.
+    #[error("SSH key not found in agent for {host}")]
+    SshKeyMissing { host: String },
 }
 
 impl From<anyhow::Error> for AppError {
@@ -50,6 +55,12 @@ impl Serialize for AppError {
                 map.serialize_entry("host", host)?;
                 map.end()
             }
+            AppError::SshKeyMissing { host } => {
+                let mut map = ser.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "SshKeyMissing")?;
+                map.serialize_entry("host", host)?;
+                map.end()
+            }
             other => ser.serialize_str(&other.to_string()),
         }
     }
@@ -69,6 +80,15 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(val["kind"], "AuthRequired");
+        assert_eq!(val["host"], "github.com");
+    }
+
+    #[test]
+    fn ssh_key_missing_serializes_correctly() {
+        let err = AppError::SshKeyMissing { host: "github.com".into() };
+        let json = serde_json::to_string(&err).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["kind"], "SshKeyMissing");
         assert_eq!(val["host"], "github.com");
     }
 

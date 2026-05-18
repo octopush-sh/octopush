@@ -704,15 +704,22 @@ pub async fn clone_project(
             .clone(&url_clone, &target_path)
             .map_err(|e| {
                 let msg = e.message().to_string();
-                // Detect HTTP 401/403 to surface structured AuthRequired.
-                if e.class() == git2::ErrorClass::Http
+                let class = e.class();
+                // Detect authentication/credential failures for either protocol.
+                let auth_failed = class == git2::ErrorClass::Http
+                    || class == git2::ErrorClass::Ssh
                     || msg.contains("401")
                     || msg.contains("403")
-                    || msg.contains("Authentication")
                     || msg.contains("authentication")
-                    || msg.contains("credential")
-                {
-                    AppError::AuthRequired { host: host_clone.clone() }
+                    || msg.contains("Authentication")
+                    || msg.contains("credential");
+
+                if auth_failed {
+                    if is_ssh {
+                        AppError::SshKeyMissing { host: host_clone.clone() }
+                    } else {
+                        AppError::AuthRequired { host: host_clone.clone() }
+                    }
                 } else {
                     AppError::Other(format!("git clone failed: {msg}"))
                 }
