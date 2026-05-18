@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "octopush-pty-server"
-path = "src/bin/pty_server/main.rs"
+path = "src/bin/octopush-pty-server/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
