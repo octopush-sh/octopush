@@ -243,9 +243,10 @@ export function TerminalPane({
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       term.write(new Uint8Array(ev.payload.bytes));
-      // Reset the idle-TUI timer on each chunk of output. The timer
-      // only fires (and pings attention) if no new bytes arrive for
-      // IDLE_TUI_MS *and* we're in alt-screen at that moment.
+      // Track the burst size so the idle-output timer can distinguish
+      // a meaningful notification surface (long output then pause) from
+      // just a shell prompt going quiet.
+      bytesSinceLastPing += ev.payload.bytes.length;
       scheduleIdleCheck();
     }).then((u) => {
       unlistenData = u;
@@ -294,47 +295,45 @@ export function TerminalPane({
       useAttentionStore.getState().ping(workspaceIdRef.current, "terminal");
     });
 
-    // ── Idle-in-alt-screen detection ──────────────────────────────
-    // Modern TUIs (Claude Code, vim, less, k9s, …) don't ring the
-    // bell when they want your input — they just redraw their UI and
-    // wait. We notice they're waiting by combining two signals:
-    //   1. the terminal is in the alternate screen buffer (TUI mode),
-    //   2. PTY output has been quiet for ~2s after recent activity.
-    // When that pair is true AND the pane isn't currently visible, we
-    // ping attention. The timer resets every time new bytes arrive,
-    // so a continuously-painting app (htop) doesn't trigger; only the
-    // moment it goes quiet does.
-    const IDLE_TUI_MS = 2_000;
+    // ── Idle-output detection ─────────────────────────────────────
+    // The user's terminal needs them when it emitted a meaningful
+    // burst of output and then went quiet — that's "TUI finished
+    // painting and is waiting for input." Examples we want to catch:
+    //   - Claude Code asking "Do you want to proceed?" (normal buffer)
+    //   - vim/less/k9s waiting after redraw (alt screen)
+    //   - npm install just finishing (normal buffer)
+    //
+    // We DON'T require alt-screen any more — Claude Code and many
+    // modern INK-based CLIs paint into the normal buffer, which was
+    // the bug we shipped in v0.1.4/.5/.6/.7. The new filter is
+    // "enough bytes since the last ping" — a freshly-launched shell
+    // emits only ~50–200 bytes of prompt and won't reach the
+    // threshold; an actual notification surface (long output then
+    // pause) will.
+    const IDLE_OUTPUT_MS = 2_000;
+    const MIN_BYTES_FOR_PING = 200;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let bytesSinceLastPing = 0;
     const scheduleIdleCheck = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimer = null;
         const visible = visibleRef.current;
-        // Defensive optional-chaining for the test env where the xterm
-        // mock has no buffer object.
-        const bufferType = term.buffer?.active?.type;
-        // Log so the user/devs can inspect why attention DID or DID NOT
-        // fire — most common cause is "still in normal buffer" because
-        // the inner app didn't actually go into alt-screen yet.
+        const bytes = bytesSinceLastPing;
+        const willPing = !visible && bytes >= MIN_BYTES_FOR_PING;
         // eslint-disable-next-line no-console
-        console.debug(
-          "[attention] idle-TUI timer fired",
-          {
-            workspaceId: workspaceIdRef.current,
-            visible,
-            bufferType,
-            willPing: !visible && bufferType === "alternate",
-          },
-        );
-        if (visible) return;
-        // Only ping if the inner app is in alt-screen (TUI mode);
-        // a plain shell prompt going idle isn't a notification case.
-        if (bufferType !== "alternate") return;
+        console.debug("[attention] idle-output timer fired", {
+          workspaceId: workspaceIdRef.current,
+          visible,
+          bytesSinceLastPing: bytes,
+          willPing,
+        });
+        if (!willPing) return;
+        bytesSinceLastPing = 0;
         useAttentionStore
           .getState()
           .ping(workspaceIdRef.current, "terminal");
-      }, IDLE_TUI_MS);
+      }, IDLE_OUTPUT_MS);
     };
 
     // term → PTY
