@@ -143,6 +143,23 @@ impl ProviderRouter {
                 }
             }
 
+            // Migration: backfill `tags` on built-in models. Users who upgraded
+            // from a pre-tags version have `"tags": []` written to disk and
+            // serde happily preserves that empty vec, which would hide the
+            // Recommended section + tag pills in the UI. For every on-disk
+            // model whose id matches a built-in AND whose tags are empty,
+            // copy the curated tags over.
+            for p in &mut list {
+                let Some(def) = defaults.get(&p.name) else { continue };
+                for m in &mut p.models {
+                    if m.tags.is_empty() {
+                        if let Some(def_model) = def.models.iter().find(|x| x.id == m.id) {
+                            m.tags = def_model.tags.clone();
+                        }
+                    }
+                }
+            }
+
             for (name, def) in &defaults {
                 if !list.iter().any(|p| p.name == *name) {
                     list.push(def.clone());
