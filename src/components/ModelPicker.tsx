@@ -59,9 +59,43 @@ interface Props {
   activeModel: string;
   onSelectModel: (model: string) => void;
   onOpenSettings?: () => void;
+  /**
+   * Estimated input tokens for the message the user is about to send,
+   * including conversation context. When > 0, the picker swaps the
+   * per-million cost display for an "≈ $X.XX" per-message cost so the
+   * user can compare what THIS turn would cost across models.
+   */
+  estimatedInputTokens?: number;
 }
 
-export function ModelPicker({ activeModel, onSelectModel, onOpenSettings }: Props) {
+/**
+ * Estimate output tokens as a fixed fraction of input — a reasonable proxy
+ * for typical assistant replies (200-500 tokens for short answers, more for
+ * code/explanations). The user understands this is an estimate.
+ */
+const OUTPUT_RATIO = 0.3;
+
+function estimatePerMessageCost(model: ModelInfo, inputTokens: number): number {
+  if (inputTokens <= 0) return 0;
+  const inputCost = (inputTokens / 1_000_000) * model.inputCostPerM;
+  const outputCost =
+    ((inputTokens * OUTPUT_RATIO) / 1_000_000) * model.outputCostPerM;
+  return inputCost + outputCost;
+}
+
+function formatPerMessageCost(cost: number): string {
+  if (cost === 0) return "free";
+  if (cost < 0.01) return `≈ <$0.01`;
+  if (cost < 1) return `≈ $${cost.toFixed(2)}`;
+  return `≈ $${cost.toFixed(1)}`;
+}
+
+export function ModelPicker({
+  activeModel,
+  onSelectModel,
+  onOpenSettings,
+  estimatedInputTokens = 0,
+}: Props) {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [open, setOpen] = useState(false);
   const [recents, setRecents] = useState<string[]>(() => loadRecents());
@@ -91,6 +125,52 @@ export function ModelPicker({ activeModel, onSelectModel, onOpenSettings }: Prop
         .map((id) => modelIndex.get(id))
         .filter((x): x is { model: ModelInfo; providerName: string } => !!x),
     [recents, modelIndex],
+  );
+
+  // Intent-based recommendations. Each intent picks the first model whose
+  // tags match the pattern. The intents are deliberately broad so users
+  // pick by what they need ("I want this fast"), not by model trivia.
+  const recommendations = useMemo(() => {
+    function pick(predicate: (m: ModelInfo) => boolean) {
+      for (const p of providers) {
+        for (const m of p.models) {
+          if (predicate(m)) return { model: m, providerName: p.name };
+        }
+      }
+      return null;
+    }
+    const all = (model: ModelInfo): string[] => model.tags ?? [];
+    const has = (model: ModelInfo, t: string) =>
+      all(model).some((tag) => tag.toLowerCase().includes(t));
+
+    return [
+      {
+        intent: "For depth",
+        entry: pick(
+          (m) =>
+            has(m, "reasoning") || has(m, "largest"),
+        ),
+      },
+      {
+        intent: "For speed",
+        entry: pick((m) => has(m, "fast")),
+      },
+      {
+        intent: "For cost",
+        entry: pick((m) => has(m, "free") || has(m, "cheap")),
+      },
+    ].filter((r): r is { intent: string; entry: NonNullable<typeof r.entry> } =>
+      r.entry !== null,
+    );
+  }, [providers]);
+
+  // Local-only filter — toggled by a small chip in the dropdown header. The
+  // filter applies to the per-provider list, not the Recents or Recommended
+  // rows (those are pinned regardless so users don't lose context).
+  const [localOnly, setLocalOnly] = useState(false);
+  const visibleProviders = useMemo(
+    () => (localOnly ? providers.filter((p) => p.local) : providers),
+    [providers, localOnly],
   );
 
   function handleSelect(modelId: string) {
@@ -178,6 +258,65 @@ export function ModelPicker({ activeModel, onSelectModel, onOpenSettings }: Prop
             </div>
           ) : (
             <div className="py-2">
+              {/* Filter strip — currently just a Local-only toggle. Filters
+                  apply to the per-provider list at the bottom; pinned
+                  sections (Recommended, Recents) are always shown so the
+                  user doesn't lose access to their go-to picks. */}
+              <div className="flex items-center justify-end px-3 pb-1.5">
+                <button
+                  type="button"
+                  onClick={() => setLocalOnly((v) => !v)}
+                  aria-pressed={localOnly}
+                  className={clsx(
+                    "rounded-sm px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.25em] transition-colors",
+                    localOnly
+                      ? "text-octo-brass"
+                      : "text-octo-mute hover:text-octo-sage",
+                  )}
+                  style={
+                    localOnly
+                      ? {
+                          background: "var(--brass-ghost)",
+                          border: "1px solid var(--brass-dim)",
+                        }
+                      : { border: "1px solid var(--color-octo-hairline)" }
+                  }
+                >
+                  Local only
+                </button>
+              </div>
+
+              {/* Recommended — intent-based picks. Three rows max, each
+                  prefaced by the intent (italic-serif) and showing the
+                  matching model row. Always visible regardless of filters. */}
+              {recommendations.length > 0 && (
+                <>
+                  <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+                    Recommended
+                  </div>
+                  {recommendations.map(({ intent, entry }) => (
+                    <div
+                      key={`rec-${intent}`}
+                      className="flex items-center gap-1.5"
+                    >
+                      <span className="w-[68px] shrink-0 pl-3 font-serif text-[10px] italic text-octo-sage">
+                        {intent}
+                      </span>
+                      <div className="flex-1">
+                        <ModelRow
+                          model={entry.model}
+                          providerName={entry.providerName}
+                          isActive={activeModel === entry.model.id}
+                          onClick={() => handleSelect(entry.model.id)}
+                          estimatedInputTokens={estimatedInputTokens}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                </>
+              )}
+
               {/* Recents — last 3 selected models, pinned at the top so the
                   user can flip between the ones they actually use without
                   scanning every provider. */}
@@ -193,37 +332,45 @@ export function ModelPicker({ activeModel, onSelectModel, onOpenSettings }: Prop
                       providerName={providerName}
                       isActive={activeModel === model.id}
                       onClick={() => handleSelect(model.id)}
+                      estimatedInputTokens={estimatedInputTokens}
                     />
                   ))}
                   <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
                 </>
               )}
 
-              {providers.map((provider, idx) => (
-                <div key={provider.name}>
-                  {idx > 0 && (
-                    <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
-                  )}
-
-                  {/* Provider eyebrow */}
-                  <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
-                    {provider.name === "ollama"
-                      ? "OLLAMA · local"
-                      : provider.name.toUpperCase()}
-                  </div>
-
-                  {/* Model rows */}
-                  {provider.models.map((model) => (
-                    <ModelRow
-                      key={model.id}
-                      model={model}
-                      providerName={provider.name}
-                      isActive={activeModel === model.id}
-                      onClick={() => handleSelect(model.id)}
-                    />
-                  ))}
+              {visibleProviders.length === 0 ? (
+                <div className="px-3 py-2 font-serif text-[11px] italic text-octo-mute">
+                  No models match the current filter.
                 </div>
-              ))}
+              ) : (
+                visibleProviders.map((provider, idx) => (
+                  <div key={provider.name}>
+                    {idx > 0 && (
+                      <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                    )}
+
+                    {/* Provider eyebrow */}
+                    <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+                      {provider.name === "ollama"
+                        ? "OLLAMA · local"
+                        : provider.name.toUpperCase()}
+                    </div>
+
+                    {/* Model rows */}
+                    {provider.models.map((model) => (
+                      <ModelRow
+                        key={model.id}
+                        model={model}
+                        providerName={provider.name}
+                        isActive={activeModel === model.id}
+                        onClick={() => handleSelect(model.id)}
+                        estimatedInputTokens={estimatedInputTokens}
+                      />
+                    ))}
+                  </div>
+                ))
+              )}
             </div>
           )}
         </div>
@@ -253,14 +400,29 @@ function ModelRow({
   providerName,
   isActive,
   onClick,
+  estimatedInputTokens = 0,
 }: {
   model: ModelInfo;
   providerName: string;
   isActive: boolean;
   onClick: () => void;
+  estimatedInputTokens?: number;
 }) {
   const label = model.displayName || model.id;
   const dot = providerColor(providerName);
+
+  // When there's a pending prompt, show the projected cost of THIS turn
+  // for THIS model instead of the abstract per-million rate. Falls back
+  // to the per-million display when the user hasn't typed anything yet.
+  const perTurnCost =
+    estimatedInputTokens > 0
+      ? estimatePerMessageCost(model, estimatedInputTokens)
+      : null;
+  const meta =
+    perTurnCost !== null
+      ? `${formatPerMessageCost(perTurnCost)} · ${formatCtx(model.maxContext)} ctx`
+      : `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatCtx(model.maxContext)} ctx`;
+
   return (
     <button
       role="option"
@@ -298,7 +460,7 @@ function ModelRow({
         </span>
       )}
       <span className="ml-auto shrink-0 font-mono text-[9px] text-octo-mute">
-        {formatCost(model.inputCostPerM)}/{formatCost(model.outputCostPerM)} · {formatCtx(model.maxContext)} ctx
+        {meta}
       </span>
     </button>
   );

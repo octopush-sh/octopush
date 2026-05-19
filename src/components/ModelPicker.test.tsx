@@ -154,8 +154,10 @@ describe("ModelPicker", () => {
     await act(async () => { await Promise.resolve(); });
 
     fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
-    expect(screen.getByText("largest ctx")).toBeInTheDocument();
-    expect(screen.getByText("best reasoning")).toBeInTheDocument();
+    // The tags appear once in the Recommended section + once in the provider
+    // section because the only model has the matching tags.
+    expect(screen.getAllByText("largest ctx").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("best reasoning").length).toBeGreaterThanOrEqual(1);
   });
 
   it("pins recently-used models into a Recents section read from localStorage", async () => {
@@ -209,5 +211,75 @@ describe("ModelPicker", () => {
     expect(settingsBtn).toBeInTheDocument();
     fireEvent.click(settingsBtn);
     expect(onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Recommended section with intent rows when tags match", async () => {
+    listProvidersMock.mockResolvedValueOnce([
+      {
+        ...twoProviders[0],
+        models: [
+          {
+            ...twoProviders[0].models[0],
+            tags: ["best reasoning", "fast", "free"],
+          },
+        ],
+      },
+    ]);
+    render(<ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    expect(screen.getByText("Recommended")).toBeInTheDocument();
+    expect(screen.getByText("For depth")).toBeInTheDocument();
+    expect(screen.getByText("For speed")).toBeInTheDocument();
+    expect(screen.getByText("For cost")).toBeInTheDocument();
+  });
+
+  it("filters provider list to local-only when toggle is pressed", async () => {
+    const localProvider = {
+      ...twoProviders[1],
+      name: "ollama",
+      local: true,
+      models: [
+        {
+          id: "llama3.3",
+          displayName: "Llama 3.3",
+          inputCostPerM: 0,
+          outputCostPerM: 0,
+          maxContext: 128_000,
+          supportsVision: false,
+          supportsTools: true,
+        },
+      ],
+    };
+    listProvidersMock.mockResolvedValueOnce([twoProviders[0], localProvider]);
+    render(<ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    expect(screen.getByText("ANTHROPIC")).toBeInTheDocument();
+    expect(screen.getByText("OLLAMA · local")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Local only"));
+    // After filtering, the cloud provider section disappears.
+    expect(screen.queryByText("ANTHROPIC")).not.toBeInTheDocument();
+    expect(screen.getByText("OLLAMA · local")).toBeInTheDocument();
+  });
+
+  it("renders per-turn cost preview when estimatedInputTokens is provided", async () => {
+    listProvidersMock.mockResolvedValueOnce(twoProviders);
+    render(
+      <ModelPicker
+        activeModel="claude-opus-4-6"
+        onSelectModel={vi.fn()}
+        estimatedInputTokens={10_000}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    // Some row must show an "≈" cost preview rather than the per-million rate.
+    const previews = screen.getAllByText(/≈/);
+    expect(previews.length).toBeGreaterThan(0);
   });
 });

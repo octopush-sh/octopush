@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
+import type { ChatMessage as ChatMessageType } from "../lib/types";
 import { BrassRule } from "./BrassRule";
 import { ChatMessage } from "./ChatMessage";
 import { ModelPicker } from "./ModelPicker";
@@ -216,6 +217,7 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
             activeModel={model}
             onSelectModel={setModel}
             onOpenSettings={onOpenSettings}
+            estimatedInputTokens={estimateNextTurnTokens(messages, input)}
           />
         </div>
 
@@ -269,6 +271,46 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
       </div>
     </div>
   );
+}
+
+/**
+ * Estimate how many input tokens the next chat turn will consume — used by
+ * the ModelPicker's cost preview. Three ingredients:
+ *
+ *   1. The most recent assistant message's inputTokens, if present. That's
+ *      the model-reported size of the prompt that fed the previous reply
+ *      and is the most accurate proxy for what the next turn will resend.
+ *   2. Otherwise, char/4 estimate of every prior message in the chat —
+ *      back-of-the-envelope token count for fresh conversations.
+ *   3. Plus the pending text the user is currently typing, also char/4.
+ *
+ * Returns 0 when there's nothing to estimate — callers treat that as
+ * "fall back to per-million rates" rather than showing "≈ $0".
+ */
+function estimateNextTurnTokens(
+  messages: ChatMessageType[],
+  pendingText: string,
+): number {
+  const pendingTokens = pendingText.trim().length === 0
+    ? 0
+    : Math.ceil(pendingText.length / 4);
+
+  let historyTokens = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && m.inputTokens != null) {
+      historyTokens = m.inputTokens;
+      break;
+    }
+  }
+  if (historyTokens === 0) {
+    for (const m of messages) {
+      historyTokens += Math.ceil((m.content?.length ?? 0) / 4);
+    }
+  }
+
+  const total = historyTokens + pendingTokens;
+  return total > 0 ? total : 0;
 }
 
 function EmptyState() {
