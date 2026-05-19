@@ -244,7 +244,6 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
             activeModel={model}
             onSelectModel={setModel}
             onOpenSettings={onOpenSettings}
-            estimatedInputTokens={estimateNextTurnTokens(messages, input)}
           />
         </div>
 

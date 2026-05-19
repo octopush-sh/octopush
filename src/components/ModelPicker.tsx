@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
-import { estimatePerMessageCost, formatPerMessageCost } from "../lib/cost";
 import type { ModelInfo, ProviderConfig } from "../lib/types";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
@@ -60,20 +59,12 @@ interface Props {
   activeModel: string;
   onSelectModel: (model: string) => void;
   onOpenSettings?: () => void;
-  /**
-   * Estimated input tokens for the message the user is about to send,
-   * including conversation context. When > 0, the picker swaps the
-   * per-million cost display for an "≈ $X.XX" per-message cost so the
-   * user can compare what THIS turn would cost across models.
-   */
-  estimatedInputTokens?: number;
 }
 
 export function ModelPicker({
   activeModel,
   onSelectModel,
   onOpenSettings,
-  estimatedInputTokens = 0,
 }: Props) {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [open, setOpen] = useState(false);
@@ -287,7 +278,6 @@ export function ModelPicker({
                           providerName={entry.providerName}
                           isActive={activeModel === entry.model.id}
                           onClick={() => handleSelect(entry.model.id)}
-                          estimatedInputTokens={estimatedInputTokens}
                         />
                       </div>
                     </div>
@@ -311,7 +301,6 @@ export function ModelPicker({
                       providerName={providerName}
                       isActive={activeModel === model.id}
                       onClick={() => handleSelect(model.id)}
-                      estimatedInputTokens={estimatedInputTokens}
                     />
                   ))}
                   <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
@@ -344,8 +333,7 @@ export function ModelPicker({
                         providerName={provider.name}
                         isActive={activeModel === model.id}
                         onClick={() => handleSelect(model.id)}
-                        estimatedInputTokens={estimatedInputTokens}
-                      />
+                        />
                     ))}
                   </div>
                 ))
@@ -379,28 +367,20 @@ function ModelRow({
   providerName,
   isActive,
   onClick,
-  estimatedInputTokens = 0,
 }: {
   model: ModelInfo;
   providerName: string;
   isActive: boolean;
   onClick: () => void;
-  estimatedInputTokens?: number;
 }) {
   const label = model.displayName || model.id;
   const dot = providerColor(providerName);
 
-  // When there's a pending prompt, show the projected cost of THIS turn
-  // for THIS model instead of the abstract per-million rate. Falls back
-  // to the per-million display when the user hasn't typed anything yet.
-  const perTurnCost =
-    estimatedInputTokens > 0
-      ? estimatePerMessageCost(model, estimatedInputTokens)
-      : null;
-  const meta =
-    perTurnCost !== null
-      ? `${formatPerMessageCost(perTurnCost)} · ${formatCtx(model.maxContext)} ctx`
-      : `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatCtx(model.maxContext)} ctx`;
+  // Static per-provider rates — the picker is a reference surface for
+  // comparing providers, not a live cost estimator. The inline preview
+  // below the chat input handles "what does THIS prompt cost?" because
+  // there you can edit text and see the number update in place.
+  const meta = `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatCtx(model.maxContext)} ctx`;
 
   return (
     <button

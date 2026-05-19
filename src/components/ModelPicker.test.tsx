@@ -266,20 +266,17 @@ describe("ModelPicker", () => {
     expect(screen.getByText("OLLAMA · local")).toBeInTheDocument();
   });
 
-  it("renders per-turn cost preview when estimatedInputTokens is provided", async () => {
+  it("renders per-provider rate (per-million) in the dropdown — never the dynamic per-turn estimate", async () => {
     listProvidersMock.mockResolvedValueOnce(twoProviders);
     render(
-      <ModelPicker
-        activeModel="claude-opus-4-6"
-        onSelectModel={vi.fn()}
-        estimatedInputTokens={10_000}
-      />,
+      <ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />,
     );
     await act(async () => { await Promise.resolve(); });
 
     fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
-    // Some row must show an "≈" cost preview rather than the per-million rate.
-    const previews = screen.getAllByText(/≈/);
-    expect(previews.length).toBeGreaterThan(0);
+    // No "≈" estimate anywhere — the dropdown is a static reference surface.
+    expect(screen.queryByText(/≈/)).not.toBeInTheDocument();
+    // The per-million rate shape ($X/$Y · Nk ctx) is what we DO render.
+    expect(screen.getAllByText(/\$\d+\/\$\d+ · \d+k ctx/i).length).toBeGreaterThan(0);
   });
 });
