@@ -111,14 +111,14 @@ function makeMarkdownComponents(
   },
   h1({ children }) {
     return (
-      <h1 className="mb-3 mt-4 font-serif italic text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory first:mt-0">
+      <h1 className="mb-3 mt-4 font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory first:mt-0">
         {children}
       </h1>
     );
   },
   h2({ children }) {
     return (
-      <h2 className="mb-2 mt-4 font-serif italic text-[16px] text-octo-ivory first:mt-0">
+      <h2 className="mb-2 mt-4 font-serif text-[16px] text-octo-ivory first:mt-0">
         {children}
       </h2>
     );
@@ -241,7 +241,7 @@ export function ChatMessage({ message, onOpenInEditor }: Props) {
               },
               p({ children }) {
                 return (
-                  <p className="font-serif italic text-[20px] leading-[1.15] tracking-[-0.005em] text-octo-ivory">
+                  <p className="font-serif text-[20px] leading-[1.15] tracking-[-0.005em] text-octo-ivory">
                     {children}
                   </p>
                 );

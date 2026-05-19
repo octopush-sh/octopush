@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Download, RefreshCw, CheckCircle, Loader2 } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
+import { useAttentionStore } from "../stores/attentionStore";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell,
@@ -58,7 +59,7 @@ export function Settings({ open, initialTab = "general", onClose }: Props) {
         <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
           Preferences
         </span>
-        <h1 className="font-serif italic text-[22px] tracking-[-0.005em] text-octo-ivory">
+        <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">
           Octopus
         </h1>
         <button
@@ -125,7 +126,7 @@ function TabButton({
       <span
         className={
           active
-            ? "font-serif italic text-[14px] text-octo-brass"
+            ? "font-serif text-[14px] text-octo-brass"
             : "font-sans text-[13px] text-octo-sage hover:text-octo-ivory"
         }
       >
@@ -147,7 +148,7 @@ function PaneHeader({ eyebrow, title, subtitle }: {
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
         {eyebrow}
       </div>
-      <h2 className="mt-2 font-serif italic text-[22px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <h2 className="mt-2 font-serif text-[22px] leading-tight tracking-[-0.005em] text-octo-ivory">
         {title}
       </h2>
       {subtitle && (
@@ -167,17 +168,13 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Placeholder({ note }: { note: string }) {
-  return (
-    <div className="text-[13px] leading-[1.6] text-octo-mute">
-      <em className="font-serif">{note}</em>
-    </div>
-  );
-}
 
 // ─── Tab: General ─────────────────────────────────────────────────────
 
 function GeneralPane() {
+  const soundEnabled = useAttentionStore((s) => s.soundEnabled);
+  const setSoundEnabled = useAttentionStore((s) => s.setSoundEnabled);
+
   return (
     <>
       <PaneHeader
@@ -185,8 +182,75 @@ function GeneralPane() {
         title="The basics."
         subtitle="Application-wide preferences live here. More options will appear as the app grows."
       />
-      <Placeholder note="Nothing to configure yet." />
+
+      <div className="max-w-[640px] space-y-4">
+        <SectionLabel>Attention</SectionLabel>
+        <ToggleRow
+          label="Play sound when an agent or terminal needs attention"
+          description="A short chime plays when a chat finishes a response or a terminal rings the bell in a workspace you're not currently looking at."
+          checked={soundEnabled}
+          onChange={setSoundEnabled}
+        />
+      </div>
     </>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label
+      className="flex cursor-pointer items-start justify-between gap-4 rounded-lg px-4 py-3"
+      style={{
+        border: "1px solid var(--color-octo-hairline)",
+        background: "var(--color-octo-panel)",
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="font-serif text-[14px] leading-tight text-octo-ivory">
+          {label}
+        </div>
+        {description && (
+          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+            {description}
+          </div>
+        )}
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        onClick={() => onChange(!checked)}
+        className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
+        style={{
+          background: checked
+            ? "var(--brass-ghost)"
+            : "var(--color-octo-onyx)",
+          border: `1px solid ${
+            checked ? "var(--brass-dim)" : "var(--color-octo-hairline)"
+          }`,
+        }}
+      >
+        <span
+          className="absolute top-[2px] h-3.5 w-3.5 rounded-full transition-all"
+          style={{
+            left: checked ? "18px" : "3px",
+            background: checked
+              ? "var(--color-octo-brass)"
+              : "var(--color-octo-mute)",
+          }}
+        />
+      </button>
+    </label>
   );
 }
 
@@ -281,7 +345,7 @@ function ModelsPane() {
           type="button"
           onClick={handleRefreshPricing}
           disabled={refreshingPricing}
-          className="rounded-md px-3 py-1.5 font-serif italic text-[12px] text-octo-brass transition disabled:opacity-50"
+          className="rounded-md px-3 py-1.5 font-serif text-[12px] text-octo-brass transition disabled:opacity-50"
           style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
         >
           {refreshingPricing ? "Refreshing…" : "Refresh pricing"}
@@ -307,7 +371,7 @@ function ModelsPane() {
             type="button"
             onClick={handleSave}
             disabled={saving}
-            className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:opacity-50"
+            className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
             style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
           >
             {saved ? "✓ Saved" : saving ? "Saving…" : "Save changes"}
@@ -338,7 +402,7 @@ function ProviderRow({
   return (
     <div>
       <div className="flex items-baseline justify-between">
-        <span className="font-serif italic text-[16px] text-octo-ivory">{displayName}</span>
+        <span className="font-serif text-[16px] text-octo-ivory">{displayName}</span>
         <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">
           {provider.models.length} models · {provider.local ? "local" : "cloud"}
         </span>
@@ -428,8 +492,8 @@ function AppearancePane() {
               />
               <div className="min-w-0 flex-1">
                 <div className={active
-                  ? "font-serif italic text-[14px] text-octo-brass"
-                  : "font-serif italic text-[14px] text-octo-ivory"}
+                  ? "font-serif text-[14px] text-octo-brass"
+                  : "font-serif text-[14px] text-octo-ivory"}
                 >
                   {t.name}
                 </div>
@@ -663,7 +727,7 @@ function UsagePane() {
                   className="h-2.5 w-2.5 rounded-full"
                   style={{ background: BRASS_PALETTE[i % BRASS_PALETTE.length] }}
                 />
-                <span className="flex-1 truncate font-serif italic text-[13px] text-octo-ivory">
+                <span className="flex-1 truncate font-serif text-[13px] text-octo-ivory">
                   {m.label}
                 </span>
                 <span className="font-mono text-[11px] text-octo-sage">
@@ -710,7 +774,7 @@ function UsagePane() {
             type="button"
             onClick={handleExport}
             disabled={exporting}
-            className="ml-auto rounded-md px-4 py-1.5 font-serif italic text-[13px] text-octo-brass transition disabled:opacity-50"
+            className="ml-auto rounded-md px-4 py-1.5 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
             style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
           >
             {exporting ? "Exporting…" : "Export CSV"}
@@ -803,7 +867,7 @@ function BudgetsSection({
 
             return (
               <div key={groupKey}>
-                <div className="mb-1.5 font-serif italic text-[13px] text-octo-sage">
+                <div className="mb-1.5 font-serif text-[13px] text-octo-sage">
                   {scopeLabel}
                 </div>
                 <div className="space-y-1.5 rounded-md border border-octo-hairline bg-octo-panel px-3 py-2">
@@ -913,7 +977,7 @@ function BudgetsSection({
                 type="button"
                 onClick={handleSaveBudget}
                 disabled={saving || !addState.limit}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:opacity-50"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {saving ? "Saving…" : "Save budget"}
@@ -1022,7 +1086,7 @@ function Stat({ label, value }: { label: string; value: string }) {
       <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
         {label}
       </div>
-      <div className="mt-1.5 font-serif italic text-[18px] tracking-[-0.005em] text-octo-ivory">
+      <div className="mt-1.5 font-serif text-[18px] tracking-[-0.005em] text-octo-ivory">
         {value}
       </div>
     </div>
@@ -1139,9 +1203,9 @@ function PrivacyPane() {
       />
 
       <ul className="max-w-[640px] space-y-2 text-[13px] leading-[1.6] text-octo-sage">
-        <li>· <span className="font-serif italic text-octo-ivory">Local-only data:</span> projects, workspaces, chat messages, tool executions, token usage. Stored in <span className="font-mono text-octo-brass">~/Library/Application Support/octopush/octopush.db</span>.</li>
-        <li>· <span className="font-serif italic text-octo-ivory">API keys:</span> stored in <span className="font-mono text-octo-brass">~/.octopush/settings.json</span>.</li>
-        <li>· <span className="font-serif italic text-octo-ivory">Outbound traffic:</span> only to providers you configure (Anthropic, OpenAI). No analytics, no telemetry.</li>
+        <li>· <span className="font-serif text-octo-ivory">Local-only data:</span> projects, workspaces, chat messages, tool executions, token usage. Stored in <span className="font-mono text-octo-brass">~/Library/Application Support/octopush/octopush.db</span>.</li>
+        <li>· <span className="font-serif text-octo-ivory">API keys:</span> stored in <span className="font-mono text-octo-brass">~/.octopush/settings.json</span>.</li>
+        <li>· <span className="font-serif text-octo-ivory">Outbound traffic:</span> only to providers you configure (Anthropic, OpenAI). No analytics, no telemetry.</li>
       </ul>
     </>
   );
@@ -1198,7 +1262,7 @@ function AboutPane() {
             <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
               Installed version
             </div>
-            <div className="mt-0.5 font-serif italic text-[18px] leading-tight text-octo-ivory">
+            <div className="mt-0.5 font-serif text-[18px] leading-tight text-octo-ivory">
               {currentVersion ? `v${currentVersion}` : "—"}
             </div>
           </div>
@@ -1239,7 +1303,7 @@ function AboutPane() {
                 <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
                   New version
                 </div>
-                <div className="mt-0.5 font-serif italic text-[16px] leading-tight text-octo-ivory">
+                <div className="mt-0.5 font-serif text-[16px] leading-tight text-octo-ivory">
                   Octopush {update.version} is ready.
                 </div>
                 {update.body && (
@@ -1295,7 +1359,7 @@ function AboutPane() {
         {phase === "no-update" && (
           <div className="flex items-center gap-2 text-[12px] text-octo-sage">
             <CheckCircle size={13} className="text-octo-verdigris" />
-            <span className="font-serif italic">
+            <span className="font-serif">
               You're on the latest version.
             </span>
             <span className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">

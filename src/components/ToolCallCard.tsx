@@ -96,7 +96,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
               fontSize: 13,
               color: BRASS,
               fontFamily: "'Spectral', serif",
-              fontStyle: "italic",
+              
               flexShrink: 0,
             }}
             aria-hidden
@@ -162,7 +162,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
             title="Open in editor"
             style={{
               fontFamily: "'Spectral', serif",
-              fontStyle: "italic",
+              
               fontSize: 11,
               color: BRASS,
               background: BRASS_GHOST,
@@ -215,7 +215,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
             onKeyDown={() => {}}
             style={{
               fontFamily: "'Spectral', serif",
-              fontStyle: "italic",
+              
               fontSize: 11,
               color: BRASS,
               background: BRASS_GHOST,

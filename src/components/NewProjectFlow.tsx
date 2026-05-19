@@ -287,7 +287,7 @@ export function NewProjectFlow({ onBack }: Props) {
           ← Back
         </button>
 
-        <div className="font-serif italic text-[18px] text-octo-ivory">
+        <div className="font-serif text-[18px] text-octo-ivory">
           A new project
         </div>
 
@@ -318,7 +318,7 @@ export function NewProjectFlow({ onBack }: Props) {
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP I · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Where does it begin?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -366,7 +366,7 @@ export function NewProjectFlow({ onBack }: Props) {
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP II · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Open a folder.
             </h1>
             <p className="mt-3 max-w-[52ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -378,7 +378,7 @@ export function NewProjectFlow({ onBack }: Props) {
                 <button
                   type="button"
                   onClick={handlePickFolder}
-                  className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+                  className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition"
                   style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                 >
                   Pick a folder…
@@ -449,7 +449,7 @@ export function NewProjectFlow({ onBack }: Props) {
                 type="button"
                 onClick={handleOpenFolder}
                 disabled={!openFolderPath || openFolderLoading}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {openFolderLoading ? "Opening…" : "Open"}
@@ -462,7 +462,7 @@ export function NewProjectFlow({ onBack }: Props) {
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP II · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Clone a repository.
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -478,7 +478,7 @@ export function NewProjectFlow({ onBack }: Props) {
                     value={cloneUrl}
                     onChange={(e) => setCloneUrl(e.target.value)}
                     placeholder="*Paste a git remote URL…*"
-                    className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                    className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
                   {parsedCloneUrl && (
                     <span className="absolute right-3 top-1/2 -translate-y-1/2 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
@@ -496,7 +496,7 @@ export function NewProjectFlow({ onBack }: Props) {
                     setCloneNameManual(true);
                   }}
                   placeholder="*auto-detected from URL*"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -553,7 +553,7 @@ export function NewProjectFlow({ onBack }: Props) {
                       value={authUsername}
                       onChange={(e) => setAuthUsername(e.target.value)}
                       placeholder="*your username*"
-                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>
 
@@ -563,7 +563,7 @@ export function NewProjectFlow({ onBack }: Props) {
                       value={authToken}
                       onChange={(e) => setAuthToken(e.target.value)}
                       placeholder="ghp_…"
-                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>
                 </div>
@@ -584,7 +584,7 @@ export function NewProjectFlow({ onBack }: Props) {
                   type="button"
                   onClick={handleAuthRetry}
                   disabled={authLoading || !authUsername || !authToken}
-                  className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                  className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                   style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                 >
                   {authLoading ? "Trying…" : "Try again"}
@@ -608,7 +608,7 @@ export function NewProjectFlow({ onBack }: Props) {
                   Octopus couldn't find an SSH key in your agent for{" "}
                   <span className="font-mono text-octo-ivory">{sshKeyMissingHost}</span>.
                   Add one in a terminal, then click{" "}
-                  <em className="font-serif italic text-octo-ivory">Try again</em>:
+                  <em className="font-serif text-octo-ivory">Try again</em>:
                 </p>
                 <div className="rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-sage">
                   ssh-add ~/.ssh/id_ed25519
@@ -620,7 +620,7 @@ export function NewProjectFlow({ onBack }: Props) {
                   <button
                     type="button"
                     onClick={() => handleClone()}
-                    className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+                    className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition"
                     style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                   >
                     Try again
@@ -662,7 +662,7 @@ export function NewProjectFlow({ onBack }: Props) {
                 type="button"
                 onClick={() => handleClone()}
                 disabled={cloning || !cloneUrlValid || !cloneNameValid}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {cloning ? "Cloning…" : "Clone & open"}
@@ -675,7 +675,7 @@ export function NewProjectFlow({ onBack }: Props) {
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP II · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Name your new study.
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -692,7 +692,7 @@ export function NewProjectFlow({ onBack }: Props) {
                     if (e.key === "Enter" && emptyNameValid) void handleCreate();
                   }}
                   placeholder="Hyperion"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -730,7 +730,7 @@ export function NewProjectFlow({ onBack }: Props) {
                 type="button"
                 onClick={handleCreate}
                 disabled={!emptyNameValid || createLoading}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {createLoading ? "Creating…" : "Bring it to life"}
@@ -780,7 +780,7 @@ function StepIndex({
       <span
         className={
           active
-            ? "font-serif italic text-[14px] text-octo-ivory"
+            ? "font-serif text-[14px] text-octo-ivory"
             : "font-sans text-[12px] text-octo-mute"
         }
       >
@@ -828,7 +828,7 @@ function TypeCard({
       }}
     >
       <span
-        className="font-serif italic text-[20px]"
+        className="font-serif text-[20px]"
         style={{ color: selected ? "var(--color-octo-brass)" : "var(--color-octo-sage)" }}
       >
         {glyph}
@@ -840,7 +840,7 @@ function TypeCard({
         >
           {label}
         </div>
-        <div className="mt-1 font-serif italic text-[12px] text-octo-sage">
+        <div className="mt-1 font-serif text-[12px] text-octo-sage">
           {description}
         </div>
       </div>

@@ -5,10 +5,14 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import type { PtyDataEvent, PtyExitEvent, PtyReattachedEvent } from "../lib/types";
+import { useAttentionStore } from "../stores/attentionStore";
 
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
   terminalId: string;
+  /** The owning workspace id — used to surface attention pings on the rail
+   *  when a BEL fires in a hidden terminal. */
+  workspaceId: string;
   /** Filesystem path of the workspace root, used when spawning the PTY. */
   workspacePath: string;
   /** Human label shown in the session name. */
@@ -36,6 +40,7 @@ interface Props {
 
 export function TerminalPane({
   terminalId,
+  workspaceId,
   workspacePath,
   label,
   visible,
@@ -49,6 +54,13 @@ export function TerminalPane({
   // latest callback without re-registering on every prop change.
   const onOpenFileRef = useRef(onOpenFile);
   onOpenFileRef.current = onOpenFile;
+  // Keep the latest `visible` flag accessible inside the BEL handler,
+  // which is registered once and would otherwise capture the mount-time
+  // value.
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const workspaceIdRef = useRef(workspaceId);
+  workspaceIdRef.current = workspaceId;
   // Outer wrapper — stable size, observed by ResizeObserver.
   const wrapperRef = useRef<HTMLDivElement>(null);
   // Inner container — where xterm attaches its DOM.
@@ -270,6 +282,14 @@ export function TerminalPane({
       unlistenReattached = u;
     });
 
+    // BEL → attention ping (only when this terminal isn't visible —
+    // otherwise the user is already looking at it and a chime would be
+    // noise). xterm emits onBell for every \x07 it processes.
+    const bellDisp = term.onBell(() => {
+      if (visibleRef.current) return;
+      useAttentionStore.getState().ping(workspaceIdRef.current, "terminal");
+    });
+
     // term → PTY
     const dataDisp = term.onData((data) => {
       const ptyId = ptySessionIdRef.current;
@@ -324,6 +344,7 @@ export function TerminalPane({
       if (resizeTimer) clearTimeout(resizeTimer);
       dataDisp.dispose();
       resizeDisp.dispose();
+      bellDisp.dispose();
       ro.disconnect();
       unlistenData?.();
       unlistenExit?.();

@@ -79,7 +79,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
       {/* Mark */}
       <div
         aria-hidden
-        className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif italic text-[26px] text-octo-brass"
+        className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif text-[26px] text-octo-brass"
         style={{ border: "1px solid var(--brass-dim)" }}
       >
         O
@@ -90,7 +90,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
       </div>
 
       {/* Logo */}
-      <h1 className="mt-6 font-serif italic text-[32px] leading-[1.05] tracking-[-0.01em] text-octo-ivory">
+      <h1 className="mt-6 font-serif text-[32px] leading-[1.05] tracking-[-0.01em] text-octo-ivory">
         Octopus<span className="px-1.5 text-octo-brass">&amp;</span>you
       </h1>
 
@@ -106,7 +106,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
       <button
         type="button"
         onClick={onNewProject}
-        className="rounded-md px-5 py-2.5 font-serif italic text-[14px] text-octo-brass transition"
+        className="rounded-md px-5 py-2.5 font-serif text-[14px] text-octo-brass transition"
         style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
       >
         Begin a new study
@@ -124,7 +124,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
           <button
             type="button"
             onClick={handleOpenClick}
-            className="font-serif italic text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
+            className="font-serif text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
           >
             open one from disk
           </button>
@@ -191,7 +191,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
                   title={project.path}
                 >
                   <span
-                    className="flex h-7 w-7 items-center justify-center rounded-md font-serif italic text-[14px] text-octo-brass"
+                    className="flex h-7 w-7 items-center justify-center rounded-md font-serif text-[14px] text-octo-brass"
                     style={{
                       background: "var(--brass-ghost)",
                       border: "1px solid var(--brass-dim)",
@@ -199,7 +199,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
                   >
                     {project.name.charAt(0).toUpperCase() || "?"}
                   </span>
-                  <span className="font-serif italic text-[13px] text-octo-ivory">
+                  <span className="font-serif text-[13px] text-octo-ivory">
                     {project.name}
                   </span>
                 </button>

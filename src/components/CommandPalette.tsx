@@ -73,7 +73,7 @@ export function CommandPalette({
             <Command.Input
               autoFocus
               placeholder="Type a command, or search…"
-              className="flex-1 bg-transparent font-serif italic text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
+              className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
             />
             <button
               type="button"
@@ -86,7 +86,7 @@ export function CommandPalette({
           </div>
 
           <Command.List className="max-h-[380px] overflow-y-auto py-2">
-            <Command.Empty className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+            <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
               Nothing matches.
             </Command.Empty>
 
@@ -303,7 +303,7 @@ function Item({
     >
       <span
         aria-hidden
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded font-serif italic text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded font-serif text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
         style={{
           border: "1px solid var(--color-octo-hairline)",
         }}

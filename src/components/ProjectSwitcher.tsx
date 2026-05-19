@@ -68,7 +68,7 @@ export function ProjectSwitcher({
               >
                 <div className="flex items-center gap-2">
                   <span
-                    className={`font-serif italic text-[14px] leading-snug ${
+                    className={`font-serif text-[14px] leading-snug ${
                       isActive ? "text-octo-ivory" : "text-octo-sage group-hover:text-octo-ivory"
                     } transition`}
                   >
@@ -104,7 +104,7 @@ export function ProjectSwitcher({
               onAddProject();
               onClose();
             }}
-            className="font-serif italic text-[13px] text-octo-brass transition hover:text-octo-brass-hi"
+            className="font-serif text-[13px] text-octo-brass transition hover:text-octo-brass-hi"
           >
             + Add project ↗
           </button>

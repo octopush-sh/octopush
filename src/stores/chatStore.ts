@@ -4,6 +4,8 @@ import { ipc } from "../lib/ipc";
 import type { ChatMessage, ChatStreamEvent } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
+import { useAttentionStore } from "./attentionStore";
+import { focus } from "../lib/focus";
 
 export interface ToolExecution {
   toolName: string;
@@ -118,6 +120,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         streamingByWs: { ...s.streamingByWs, [wsId]: false },
         streamBufferByWs: { ...s.streamBufferByWs, [wsId]: "" },
       }));
+      // Only ring the chime / pulse the rail if the user isn't already
+      // looking at this chat — otherwise they'll just be told what
+      // they're already seeing.
+      if (focus.workspaceId !== wsId || focus.mode !== "talk") {
+        useAttentionStore.getState().ping(wsId, "chat");
+      }
     } else {
       set((s) => ({
         streamBufferByWs: {

@@ -82,7 +82,7 @@ export function CompanionTerminals({ workspaceId }: Props) {
       </div>
       <ul className="mt-2 space-y-1">
         {terminals.length === 0 && (
-          <li className="px-2 py-1 text-[11px] italic text-octo-mute">No active terminals.</li>
+          <li className="px-2 py-1 text-[11px] text-octo-mute">No active terminals.</li>
         )}
         {terminals.map((t) => {
           const active = t.id === activeTerminalId;
@@ -118,7 +118,7 @@ export function CompanionTerminals({ workspaceId }: Props) {
                     <input
                       ref={inputRef}
                       data-testid={`rename-input-${t.id}`}
-                      className="min-w-0 flex-1 rounded bg-transparent font-serif italic text-[12px] leading-tight text-octo-ivory outline outline-1 outline-octo-brass"
+                      className="min-w-0 flex-1 rounded bg-transparent font-serif text-[12px] leading-tight text-octo-ivory outline outline-1 outline-octo-brass"
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
                       onBlur={commitEdit}
@@ -137,7 +137,7 @@ export function CompanionTerminals({ workspaceId }: Props) {
                   ) : (
                     <span
                       data-testid={`label-${t.id}`}
-                      className="min-w-0 flex-1 truncate font-serif italic text-[12px] leading-tight text-octo-ivory"
+                      className="min-w-0 flex-1 truncate font-serif text-[12px] leading-tight text-octo-ivory"
                       onDoubleClick={(e) => {
                         e.stopPropagation();
                         startEdit(t.id, t.label);

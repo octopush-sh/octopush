@@ -44,7 +44,7 @@ export function ContextHeader({
           <span className="font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
             Project
           </span>
-          <span className="font-serif italic text-[13px] leading-none text-octo-ivory">
+          <span className="font-serif text-[13px] leading-none text-octo-ivory">
             {projectName}
           </span>
           <span className="font-mono text-[9px] text-octo-mute transition group-hover:text-octo-brass">
@@ -59,7 +59,7 @@ export function ContextHeader({
           </div>
           <div
             key={workspaceName}
-            className="animate-name-in font-serif italic text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"
+            className="animate-name-in font-serif text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"
           >
             {workspaceName}
           </div>

@@ -16,8 +16,11 @@
  */
 
 import { useEffect } from "react";
-import { Download, X, Loader2 } from "lucide-react";
+import { Download, X, Loader2, ExternalLink } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
+import { ipc } from "../lib/ipc";
+
+const RELEASES_URL = "https://github.com/johnatan-velez/octopush/releases/tag";
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
@@ -64,12 +67,27 @@ export function UpdateNotifier() {
           <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
             Update available
           </div>
-          <div className="mt-0.5 font-serif italic text-[14px] leading-tight text-octo-ivory">
+          <div className="mt-0.5 font-serif text-[14px] leading-tight text-octo-ivory">
             Octopush {update.version} is ready.
           </div>
           {update.body && (
-            <div className="mt-1 line-clamp-3 text-[11px] leading-[1.5] text-octo-sage">
+            <div className="mt-1 line-clamp-2 text-[11px] leading-[1.5] text-octo-sage">
               {update.body}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() =>
+              ipc.openFileInSystem(`${RELEASES_URL}/v${update.version}`)
+            }
+            className="mt-1.5 inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors hover:text-octo-brass-hi"
+          >
+            What's new
+            <ExternalLink size={9} aria-hidden />
+          </button>
+          {error && (
+            <div className="mt-1.5 text-[11px] leading-[1.45] text-octo-rouge">
+              Install failed: {error}
             </div>
           )}
           {error && (

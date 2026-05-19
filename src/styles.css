@@ -80,6 +80,23 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* Brass attention pulse — used on workspace monograms when a chat or
+   terminal in that workspace needs the user's eye. */
+@keyframes brass-pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 var(--brass-dim);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 4px rgba(212, 165, 116, 0.0);
+  }
+}
+
+.animate-brass-pulse {
+  animation: brass-pulse 1.4s var(--ease-octo) infinite;
+}
+
 /* Utility classes that wire keyframes to Phase 1 ease/dur variables. */
 .animate-brass-grow {
   animation: brassgrow var(--dur-reveal) var(--ease-octo) forwards;

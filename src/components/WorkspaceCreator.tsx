@@ -66,7 +66,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
           ← Back
         </button>
 
-        <div className="font-serif italic text-[18px] text-octo-ivory">
+        <div className="font-serif text-[18px] text-octo-ivory">
           A new workspace
         </div>
 
@@ -91,7 +91,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP I · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               What are you setting out to do?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -108,7 +108,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
                     if (e.key === "Enter" && taskValid) setStep(2);
                   }}
                   placeholder="e.g. Add dark mode, Fix checkout bug"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -126,7 +126,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
                 type="button"
                 onClick={() => setStep(2)}
                 disabled={!taskValid}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 Continue
@@ -148,7 +148,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
               STEP II · OF II
             </div>
-            <h1 className="mt-3 font-serif italic text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               How does it start?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
@@ -192,7 +192,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
                 type="button"
                 onClick={handleCreate}
                 disabled={!taskValid || creating}
-                className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {creating ? "Creating…" : "Begin"}
@@ -244,7 +244,7 @@ function StepIndex({
       <span
         className={
           active
-            ? "font-serif italic text-[14px] text-octo-ivory"
+            ? "font-serif text-[14px] text-octo-ivory"
             : "font-sans text-[12px] text-octo-mute"
         }
       >

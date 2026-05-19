@@ -44,6 +44,7 @@ vi.mock("@xterm/xterm", () => {
     open = vi.fn();
     onData = vi.fn(() => ({ dispose: vi.fn() }));
     onResize = vi.fn(() => ({ dispose: vi.fn() }));
+    onBell = vi.fn(() => ({ dispose: vi.fn() }));
     writeln = vi.fn();
     write = vi.fn();
     focus = vi.fn();
@@ -126,6 +127,7 @@ describe("TerminalPane — spawn callback", () => {
     render(
       <TerminalPane
         terminalId="t1"
+        workspaceId="ws-test"
         workspacePath="/path/to/ws"
         label="Main"
         visible={true}
@@ -158,6 +160,7 @@ describe("TerminalPane — spawn callback", () => {
     const { unmount } = render(
       <TerminalPane
         terminalId="t-unmount"
+        workspaceId="ws-test"
         workspacePath="/ws"
         label="Temp"
         visible={true}
@@ -183,6 +186,7 @@ describe("TerminalPane — exit callback", () => {
     render(
       <TerminalPane
         terminalId="t-exit"
+        workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
         visible={true}
@@ -209,6 +213,7 @@ describe("TerminalPane — exit callback", () => {
     render(
       <TerminalPane
         terminalId="t-exit-other"
+        workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
         visible={true}
@@ -234,6 +239,7 @@ describe("TerminalPane — visibility", () => {
     const { container } = render(
       <TerminalPane
         terminalId="t-hidden"
+        workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
         visible={false}
@@ -247,6 +253,7 @@ describe("TerminalPane — visibility", () => {
     const { container } = render(
       <TerminalPane
         terminalId="t-visible"
+        workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
         visible={true}

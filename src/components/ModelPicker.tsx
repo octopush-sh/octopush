@@ -269,7 +269,7 @@ export function ModelPicker({
                       key={`rec-${intent}`}
                       className="flex items-center gap-1.5"
                     >
-                      <span className="w-[68px] shrink-0 pl-3 font-serif text-[10px] italic text-octo-sage">
+                      <span className="w-[68px] shrink-0 pl-3 font-serif text-[10px] text-octo-sage">
                         {intent}
                       </span>
                       <div className="flex-1">
@@ -308,7 +308,7 @@ export function ModelPicker({
               )}
 
               {visibleProviders.length === 0 ? (
-                <div className="px-3 py-2 font-serif text-[11px] italic text-octo-mute">
+                <div className="px-3 py-2 font-serif text-[11px] text-octo-mute">
                   No models match the current filter.
                 </div>
               ) : (
@@ -407,7 +407,7 @@ function ModelRow({
           {model.tags.map((tag) => (
             <span
               key={tag}
-              className="rounded-sm px-1.5 py-px font-serif text-[9px] italic leading-tight text-octo-brass/80"
+              className="rounded-sm px-1.5 py-px font-serif text-[9px] leading-tight text-octo-brass/80"
               style={{
                 background: "var(--brass-ghost)",
                 border: "1px solid var(--brass-dim)",

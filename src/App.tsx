@@ -16,6 +16,8 @@ import { EditorPane } from "./components/EditorPane";
 import { EditorTabs } from "./components/EditorTabs";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { useEditorStore } from "./stores/editorStore";
+import { useAttentionStore } from "./stores/attentionStore";
+import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
@@ -332,6 +334,19 @@ function App() {
   // ── Mode helpers ──
   const activeMode: WorkspaceMode =
     (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
+
+  // ── Focus → background stores ──
+  // Mirror the active workspace + mode into the module-level `focus`
+  // object so chatStore / TerminalPane can decide whether to fire an
+  // attention chime (skip if user is already looking at it). Also clear
+  // the attention flag the moment the user switches to that workspace.
+  useEffect(() => {
+    focusGlobal.workspaceId = activeWorkspaceId ?? null;
+    focusGlobal.mode = activeMode;
+    if (activeWorkspaceId) {
+      useAttentionStore.getState().clear(activeWorkspaceId);
+    }
+  }, [activeWorkspaceId, activeMode]);
 
   const setMode = useCallback(
     (next: WorkspaceMode) => {
@@ -771,6 +786,7 @@ function App() {
                     <TerminalPane
                       key={t.id}
                       terminalId={t.id}
+                      workspaceId={t.workspaceId}
                       workspacePath={wsPath}
                       label={t.label}
                       visible={
@@ -1048,7 +1064,7 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Run
       </div>
-      <div className="font-serif italic text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <div className="font-serif text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
         Start a new terminal.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
@@ -1057,7 +1073,7 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
       <button
         type="button"
         onClick={() => onStart()}
-        className="mt-2 rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+        className="mt-2 rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition"
         style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
       >
         Open terminal
@@ -1080,7 +1096,7 @@ function EmptyProjectState({
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Project
       </div>
-      <div className="font-serif italic text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <div className="font-serif text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
         {projectName}
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
@@ -1090,7 +1106,7 @@ function EmptyProjectState({
         <button
           type="button"
           onClick={onCreateWorkspace}
-          className="rounded-md px-4 py-2 font-serif italic text-[13px] text-octo-brass transition"
+          className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition"
           style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
         >
           Create a workspace

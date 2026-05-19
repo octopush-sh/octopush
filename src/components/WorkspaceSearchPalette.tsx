@@ -159,7 +159,7 @@ export function WorkspaceSearchPalette({
                   ? "Search files by path…"
                   : "Search text in every file…"
               }
-              className="flex-1 bg-transparent font-serif italic text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
+              className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
             />
             <button
               type="button"
@@ -271,21 +271,21 @@ function FilesResults({
 }) {
   if (loading && files.length === 0) {
     return (
-      <div className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         Scanning workspace…
       </div>
     );
   }
   if (files.length === 0) {
     return (
-      <Command.Empty className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         No files in this workspace.
       </Command.Empty>
     );
   }
   return (
     <>
-      <Command.Empty className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         No matching files.
       </Command.Empty>
       {files.map((path) => {
@@ -329,28 +329,28 @@ function TextResults({
 }) {
   if (error) {
     return (
-      <div className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-rouge">
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-rouge">
         {error}
       </div>
     );
   }
   if (emptyHint) {
     return (
-      <div className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         {emptyHint}
       </div>
     );
   }
   if (loading) {
     return (
-      <div className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         Searching…
       </div>
     );
   }
   if (hits.length === 0) {
     return (
-      <div className="px-6 py-8 text-center font-serif italic text-[13px] text-octo-mute">
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
         No matches.
       </div>
     );

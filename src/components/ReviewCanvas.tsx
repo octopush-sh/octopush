@@ -246,7 +246,7 @@ function HunkCard({
             </div>
           )}
           {whyError && (
-            <p className="font-serif italic text-[12px] leading-[1.5] text-octo-sage">
+            <p className="font-serif text-[12px] leading-[1.5] text-octo-sage">
               {whyError}
             </p>
           )}
@@ -524,7 +524,7 @@ export function ReviewCanvas({
                     setTestCommandEditing(false);
                   }
                 }}
-                className="w-36 bg-transparent px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
+                className="w-36 bg-transparent px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
                 placeholder="npm test"
                 autoFocus
               />
@@ -535,7 +535,7 @@ export function ReviewCanvas({
                   "px-2 py-1 transition-colors",
                   testCommand
                     ? "font-mono text-[11px] text-octo-sage hover:text-octo-ivory"
-                    : "font-serif italic text-[11px] text-octo-mute hover:text-octo-sage",
+                    : "font-serif text-[11px] text-octo-mute hover:text-octo-sage",
                 ].join(" ")}
                 title="Click to set the command Octopus runs for tests"
               >
@@ -706,7 +706,7 @@ function EmptyDiffState({ stagedCount }: { stagedCount: number }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
       <CheckCircle size={24} className="text-octo-brass opacity-60" />
-      <div className="font-serif italic text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <div className="font-serif text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
         {hasStaged
           ? `${stagedCount} file${stagedCount !== 1 ? "s" : ""} staged.`
           : "Nothing to review."}

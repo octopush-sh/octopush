@@ -180,7 +180,7 @@ function TreeNode({
         {/* Label */}
         {isRoot ? (
           <span
-            className="min-w-0 truncate font-serif italic text-[13px] text-octo-ivory"
+            className="min-w-0 truncate font-serif text-[13px] text-octo-ivory"
           >
             {label}
           </span>
@@ -201,7 +201,7 @@ function TreeNode({
             if (!state || state === "loading") {
               return (
                 <div
-                  className="py-[2px] font-serif italic text-[11px] text-octo-mute"
+                  className="py-[2px] font-serif text-[11px] text-octo-mute"
                   style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
                 >
                   loading…
@@ -211,7 +211,7 @@ function TreeNode({
             if (state === "error") {
               return (
                 <div
-                  className="py-[2px] font-serif italic text-[11px] text-octo-rouge"
+                  className="py-[2px] font-serif text-[11px] text-octo-rouge"
                   style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
                 >
                   error reading directory.
@@ -221,7 +221,7 @@ function TreeNode({
             if (state.length === 0) {
               return (
                 <div
-                  className="py-[2px] font-serif italic text-[11px] text-octo-mute"
+                  className="py-[2px] font-serif text-[11px] text-octo-mute"
                   style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
                 >
                   empty.

@@ -61,7 +61,7 @@ export function WorkspaceCustomizeMenu({
         value={glyph}
         onChange={(e) => setGlyph(e.target.value)}
         maxLength={2}
-        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-serif italic text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
+        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
       />
 
       <div className="mt-3 font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute">
@@ -87,7 +87,7 @@ export function WorkspaceCustomizeMenu({
                 outlineOffset: "1px",
               }}
             >
-              <span className="font-serif italic" style={{ color: t.accent }}>•</span>
+              <span className="font-serif" style={{ color: t.accent }}>•</span>
             </button>
           );
         })}
@@ -96,7 +96,7 @@ export function WorkspaceCustomizeMenu({
       <div className="mt-4 flex items-center gap-2">
         <button
           type="submit"
-          className="rounded-md px-3 py-1.5 font-serif italic text-[12px] text-octo-brass"
+          className="rounded-md px-3 py-1.5 font-serif text-[12px] text-octo-brass"
           style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
         >
           Save

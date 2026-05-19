@@ -1,5 +1,6 @@
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import type { Workspace } from "../lib/types";
+import { useAttentionStore } from "../stores/attentionStore";
 
 interface Props {
   workspaces: Workspace[];
@@ -66,6 +67,13 @@ function MonogramButton({
 }) {
   const mono = resolveMonogram(workspace);
   const tint = TINTS[mono.tint];
+  const attentionFlag = useAttentionStore(
+    (s) => s.flagsByWs[workspace.id],
+  );
+  // Hide the pulse when this workspace IS the active one — the flag is
+  // cleared on the next render but for the single render between
+  // ping-then-focus we don't want to show a stale dot.
+  const showPulse = !!attentionFlag && !active;
 
   return (
     <div
@@ -84,10 +92,18 @@ function MonogramButton({
             onCustomize();
           }
         }}
-        title={`${workspace.name} (right-click to customize)`}
-        aria-label={workspace.name}
+        title={
+          showPulse
+            ? `${workspace.name} — needs your attention (${attentionFlag.kind})`
+            : `${workspace.name} (right-click to customize)`
+        }
+        aria-label={
+          showPulse
+            ? `${workspace.name} — needs attention`
+            : workspace.name
+        }
         aria-current={active ? "location" : undefined}
-        className="flex h-7 w-7 items-center justify-center rounded-md border font-serif italic transition"
+        className="relative flex h-7 w-7 items-center justify-center rounded-md border font-serif transition"
         style={{
           color: tint.accent,
           // Inline borderColor used because tint values are runtime, not Tailwind tokens.
@@ -97,6 +113,16 @@ function MonogramButton({
         }}
       >
         {mono.glyph}
+        {/* Brass pulse — top-right corner. Renders only when this
+            workspace has an outstanding attention flag and isn't the
+            currently-focused one. */}
+        {showPulse && (
+          <span
+            aria-hidden
+            className="animate-brass-pulse absolute -right-1 -top-1 h-2 w-2 rounded-full"
+            style={{ background: "var(--color-octo-brass)" }}
+          />
+        )}
       </button>
     </div>
   );

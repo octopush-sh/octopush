@@ -217,7 +217,7 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
           placeholder="Describe what you're shipping…"
           rows={2}
           disabled={committing}
-          className="w-full resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-1.5 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:italic placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-50"
+          className="w-full resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-1.5 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-50"
         />
 
         <button
@@ -302,7 +302,7 @@ function Section({
         {headerAction && <span className="ml-auto">{headerAction}</span>}
       </div>
       {count === 0 ? (
-        <div className="px-4 pb-2 font-serif italic text-[11px] text-octo-mute">
+        <div className="px-4 pb-2 font-serif text-[11px] text-octo-mute">
           {emptyHint}
         </div>
       ) : (
@@ -427,7 +427,7 @@ function shortenPath(filePath: string): string {
 function EmptyHint() {
   return (
     <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
-      <div className="font-serif italic text-[13px] text-octo-mute">
+      <div className="font-serif text-[13px] text-octo-mute">
         Working tree is clean.
       </div>
       <div className="h-px w-6 bg-octo-brass/40" aria-hidden />

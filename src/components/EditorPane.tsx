@@ -122,7 +122,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   if (!activeFile) {
     return (
       <div className="flex h-full w-full items-center justify-center">
-        <span className="font-serif italic text-[15px] text-octo-mute">
+        <span className="font-serif text-[15px] text-octo-mute">
           Select a file from the tree to begin.
         </span>
       </div>

@@ -294,7 +294,7 @@ export function ChatView({
             disabled={streaming}
             placeholder="Ask Octopus anything…"
             rows={1}
-            className="w-full resize-none bg-transparent px-4 py-3 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
+            className="w-full resize-none bg-transparent px-4 py-3 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
             style={{ maxHeight: "calc(6 * 1.25rem + 1.5rem)" }}
           />
 
@@ -349,7 +349,7 @@ function EmptyState() {
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Talk
       </div>
-      <div className="font-serif italic text-[24px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <div className="font-serif text-[24px] leading-tight tracking-[-0.005em] text-octo-ivory">
         Begin a conversation.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
@@ -368,7 +368,7 @@ function ThinkingIndicator() {
         className="inline-block h-1.5 w-1.5 animate-pulse rounded-full"
         style={{ background: "var(--color-octo-brass)" }}
       />
-      <span className="font-serif italic text-[13px] text-octo-sage">Thinking…</span>
+      <span className="font-serif text-[13px] text-octo-sage">Thinking…</span>
     </div>
   );
 }
@@ -391,7 +391,7 @@ function ErrorBlock({
       <div className="flex items-start gap-2">
         <AlertTriangle size={14} className="mt-0.5 shrink-0 text-octo-rouge" />
         <div className="min-w-0 flex-1">
-          <div className="font-serif italic text-[14px] text-octo-rouge">
+          <div className="font-serif text-[14px] text-octo-rouge">
             Something went wrong.
           </div>
           <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{error}</div>
@@ -422,7 +422,7 @@ function BudgetErrorBlock({ onOverride }: { onOverride: () => void }) {
       <div className="flex items-start gap-2">
         <AlertTriangle size={14} className="mt-0.5 shrink-0 text-octo-rouge" />
         <div className="min-w-0 flex-1">
-          <div className="font-serif italic text-[14px] text-octo-rouge">
+          <div className="font-serif text-[14px] text-octo-rouge">
             Budget cap reached.
           </div>
           <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
