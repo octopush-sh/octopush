@@ -264,6 +264,8 @@ export interface ModelInfo {
   maxContext: number;
   supportsVision: boolean;
   supportsTools: boolean;
+  /** Curated short labels rendered next to the model name in the picker. */
+  tags?: string[];
 }
 
 export interface ModelWithProvider {

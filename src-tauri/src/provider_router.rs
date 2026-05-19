@@ -54,6 +54,11 @@ pub struct ModelInfo {
     pub supports_vision: bool,
     #[serde(default)]
     pub supports_tools: bool,
+    /// Short curated labels shown next to the model name in the picker, e.g.
+    /// "fastest", "largest", "reasoning". Static configuration today — the
+    /// model picker UI rests on these to help users choose between options.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -250,6 +255,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,
+                    tags: vec!["largest ctx".into(), "best reasoning".into()],
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
@@ -259,6 +265,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 200_000,
                     supports_vision: true,
                     supports_tools: true,
+                    tags: vec!["balanced".into(), "coding".into()],
                 },
                 ModelInfo {
                     id: "claude-haiku-4-5".into(),
@@ -268,6 +275,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 200_000,
                     supports_vision: true,
                     supports_tools: true,
+                    tags: vec!["fast".into(), "cheap".into()],
                 },
             ],
             rate_limits: RateLimits {
@@ -295,6 +303,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
+                    tags: vec!["balanced".into(), "vision".into()],
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
@@ -304,6 +313,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
+                    tags: vec!["fast".into(), "cheap".into()],
                 },
             ],
             rate_limits: RateLimits::default(),
@@ -328,6 +338,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 64_000,
                     supports_vision: false,
                     supports_tools: true,
+                    tags: vec!["cheapest cloud".into()],
                 },
                 ModelInfo {
                     id: "deepseek-reasoner".into(),
@@ -337,6 +348,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 64_000,
                     supports_vision: false,
                     supports_tools: false,
+                    tags: vec!["reasoning".into(), "cheap".into()],
                 },
             ],
             rate_limits: RateLimits::default(),
@@ -361,6 +373,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 128_000,
                     supports_vision: false,
                     supports_tools: true,
+                    tags: vec!["local".into(), "free".into()],
                 },
                 ModelInfo {
                     id: "qwen2.5-coder".into(),
@@ -370,6 +383,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 128_000,
                     supports_vision: false,
                     supports_tools: true,
+                    tags: vec!["local".into(), "coding".into(), "free".into()],
                 },
                 ModelInfo {
                     id: "deepseek-r1".into(),
@@ -379,6 +393,7 @@ fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 64_000,
                     supports_vision: false,
                     supports_tools: false,
+                    tags: vec!["local".into(), "reasoning".into(), "free".into()],
                 },
             ],
             rate_limits: RateLimits::default(),

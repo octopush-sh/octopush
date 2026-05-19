@@ -136,6 +136,63 @@ describe("ModelPicker", () => {
     expect(screen.queryByText("ANTHROPIC")).not.toBeInTheDocument();
   });
 
+  it("renders tag pills next to a model when the provider exposes tags", async () => {
+    listProvidersMock.mockResolvedValueOnce([
+      {
+        ...twoProviders[0],
+        models: [
+          {
+            ...twoProviders[0].models[0],
+            tags: ["largest ctx", "best reasoning"],
+          },
+        ],
+      },
+    ]);
+    render(
+      <ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    expect(screen.getByText("largest ctx")).toBeInTheDocument();
+    expect(screen.getByText("best reasoning")).toBeInTheDocument();
+  });
+
+  it("pins recently-used models into a Recents section read from localStorage", async () => {
+    localStorage.setItem(
+      "octopush.modelPicker.recents",
+      JSON.stringify(["gpt-4o"]),
+    );
+    listProvidersMock.mockResolvedValueOnce(twoProviders);
+    render(
+      <ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    expect(screen.getByText("Recents")).toBeInTheDocument();
+    // GPT-4o appears twice now: once in Recents, once under OPENAI.
+    expect(screen.getAllByText("GPT-4o").length).toBeGreaterThanOrEqual(2);
+    localStorage.clear();
+  });
+
+  it("appends a freshly selected model to the front of the Recents list", async () => {
+    localStorage.clear();
+    listProvidersMock.mockResolvedValueOnce(twoProviders);
+    const onSelect = vi.fn();
+    render(<ModelPicker activeModel="claude-opus-4-6" onSelectModel={onSelect} />);
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    fireEvent.click(screen.getByText("GPT-4o"));
+
+    const stored = JSON.parse(
+      localStorage.getItem("octopush.modelPicker.recents") ?? "[]",
+    );
+    expect(stored[0]).toBe("gpt-4o");
+    localStorage.clear();
+  });
+
   it("renders Settings button when onOpenSettings is provided", async () => {
     listProvidersMock.mockResolvedValueOnce(twoProviders);
     const onSettings = vi.fn();
