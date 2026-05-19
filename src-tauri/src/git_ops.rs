@@ -224,31 +224,46 @@ pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> 
     let repo = open_repo(repo_path)?;
 
     // ── Self-heal stale worktree state ───────────────────────────
-    // A previous failed attempt can leave orphan state in two places:
-    //   1. A registered-but-invalid worktree in `repo.worktrees()`
-    //      (its working tree no longer exists on disk).
-    //   2. An orphan directory `.git/worktrees/<name>/` that libgit2
-    //      never finished initialising (no entry in `worktrees()`),
-    //      which makes the next `git worktree add` fail with
-    //      "directory exists".
-    // We prune (1) and remove (2) here so the user can retry without
-    // having to learn `git worktree prune` themselves.
+    // A previous failed attempt can leave the repo in one of three
+    // states, all of which would make `repo.worktree(branch, …)` fail:
+    //   1. Registered-but-invalid worktree (`validate().is_err()` —
+    //      working tree dir was deleted out from under libgit2).
+    //   2. Orphan directory at `.git/worktrees/<name>/` that libgit2
+    //      never finished initialising.
+    //   3. A "registered and valid" worktree whose name collides with
+    //      ours — the user is retrying the same task name after a
+    //      previous failure, and the previous attempt got far enough
+    //      to register the worktree even though the user never saw it
+    //      succeed.
+    //
+    // For (3), we force-prune the colliding worktree only when our
+    // top-level `worktree_path.exists()` removal has already wiped its
+    // working tree from disk. That signals "we already decided to
+    // recycle this slot." If the user has an unrelated hand-made
+    // worktree with the same name, its directory wouldn't have been
+    // at `worktree_path`, so it survives.
     if let Ok(names) = repo.worktrees() {
         for opt_name in names.iter() {
             let Some(name) = opt_name else { continue };
-            if let Ok(wt) = repo.find_worktree(name) {
-                if wt.validate().is_err() {
-                    let _ = wt.prune(None);
-                }
+            let Ok(wt) = repo.find_worktree(name) else { continue };
+            let invalid = wt.validate().is_err();
+            let same_name = name == branch;
+            if invalid || same_name {
+                let mut prune_opts = git2::WorktreePruneOptions::new();
+                // Allow pruning even if libgit2 thinks the worktree is
+                // currently valid — we just decided to recycle it.
+                prune_opts.valid(true);
+                prune_opts.working_tree(true);
+                let _ = wt.prune(Some(&mut prune_opts));
             }
         }
     }
-    // Pass (2): look for any orphan directories under .git/worktrees/.
+    // Sweep any orphan directories under .git/worktrees/ that the
+    // registry no longer references (typical when libgit2 created the
+    // dir before failing the rest of the init).
     if let Some(git_dir) = repo.path().to_str() {
         let worktrees_meta = std::path::Path::new(git_dir).join("worktrees");
         if worktrees_meta.exists() {
-            // Re-fetch the list after pruning above so registered names
-            // are current.
             let registered: std::collections::HashSet<String> = repo
                 .worktrees()
                 .ok()
@@ -265,8 +280,6 @@ pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> 
                     if registered.contains(&name) {
                         continue;
                     }
-                    // Not in libgit2's worktree registry → orphan from
-                    // a failed prior attempt. Safe to remove.
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
