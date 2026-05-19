@@ -338,12 +338,22 @@ function App() {
   // ── Focus → background stores ──
   // Mirror the active workspace + mode into the module-level `focus`
   // object so chatStore / TerminalPane can decide whether to fire an
-  // attention chime (skip if user is already looking at it). Also clear
-  // the attention flag the moment the user switches to that workspace.
+  // attention chime (skip if user is already looking at it).
+  //
+  // We only CLEAR the workspace's attention flag when the user is on
+  // the mode that actually matches the alert. If a terminal in
+  // workspace A pings while the user is in A's Talk mode, the Run
+  // tab pulses; clearing the flag on workspace-switch would wipe
+  // that signal before the user can act on it. Once they switch to
+  // Run mode the flag clears.
   useEffect(() => {
     focusGlobal.workspaceId = activeWorkspaceId ?? null;
     focusGlobal.mode = activeMode;
-    if (activeWorkspaceId) {
+    if (!activeWorkspaceId) return;
+    const flag = useAttentionStore.getState().flagsByWs[activeWorkspaceId];
+    if (!flag) return;
+    const matchingMode = flag.kind === "chat" ? "talk" : "run";
+    if (activeMode === matchingMode) {
       useAttentionStore.getState().clear(activeWorkspaceId);
     }
   }, [activeWorkspaceId, activeMode]);
@@ -729,7 +739,13 @@ function App() {
             gitStatus={gitStatus}
             openPr={openPrByWs[activeWorkspace.id] ?? null}
             onOpenPr={(url) => ipc.openFileInSystem(url)}
-            rightSlot={<ModeSwitcher mode={activeMode} onChange={setMode} />}
+            rightSlot={
+              <ModeSwitcher
+                mode={activeMode}
+                onChange={setMode}
+                workspaceId={activeWorkspaceId ?? undefined}
+              />
+            }
           />
         )}
 
