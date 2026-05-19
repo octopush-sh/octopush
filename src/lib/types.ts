@@ -180,6 +180,13 @@ export interface PtyReattachedEvent {
   sessionId: string;
 }
 
+/** Payload of the `pty://attention` Tauri event. Emitted by the
+ *  daemon when a session has been idle long enough after a
+ *  meaningful burst of output to count as "waiting on the user". */
+export interface PtyAttentionEvent {
+  sessionId: string;
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────
 
 export interface ChatMessage {

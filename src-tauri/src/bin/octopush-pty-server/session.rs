@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -45,7 +46,30 @@ pub struct Session {
 
     /// Optional attached client channel; at most one at a time.
     attached: Option<ClientSender>,
+
+    // ── Attention-detection state ─────────────────────────────────
+    /// Wall-clock time of the most recent `push_output`.
+    last_data_at: Instant,
+    /// Bytes written since the last Attention event was emitted (or
+    /// since session start). Used to filter out empty-shell-prompt
+    /// false positives — small bursts under MIN_BYTES_FOR_ATTENTION
+    /// never fire.
+    bytes_since_attention: u64,
+    /// Latched so we don't re-emit Attention for the same idle
+    /// window. Cleared on the next chunk of output.
+    attention_pending: bool,
 }
+
+/// Idle threshold (no PTY output for this long) before we consider
+/// the session to be waiting on the user. 10s is long enough that
+/// any agent that's actually thinking (Claude Code's spinner, LLM
+/// streaming, npm install progress lines) emits something within
+/// the window and resets the clock.
+pub const IDLE_THRESHOLD_MS: u64 = 10_000;
+
+/// Minimum bytes since the last attention emit. Filters out a
+/// freshly-spawned shell whose only output is the prompt itself.
+pub const MIN_BYTES_FOR_ATTENTION: u64 = 200;
 
 impl Session {
     pub fn new(id: TerminalId, label: String, cwd: String, started_at: i64) -> Self {
@@ -68,6 +92,9 @@ impl Session {
             ring_bytes: 0,
             log_file,
             attached: None,
+            last_data_at: Instant::now(),
+            bytes_since_attention: 0,
+            attention_pending: false,
         }
     }
 
@@ -79,6 +106,13 @@ impl Session {
     /// 4. Forwards to attached client (if any).
     pub fn push_output(&mut self, data: &[u8]) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+
+        // ---- attention-detection state ----
+        self.last_data_at = Instant::now();
+        self.bytes_since_attention = self.bytes_since_attention.saturating_add(data.len() as u64);
+        // New output → reset the latch so the next idle window can
+        // re-fire if conditions remain met.
+        self.attention_pending = false;
 
         // ---- ring buffer ----
         self.ring.push_back((seq, data.to_vec()));
@@ -160,6 +194,44 @@ impl Session {
     /// Returns the oldest seq still in the ring buffer, or `u64::MAX` if empty.
     pub fn ring_oldest_seq(&self) -> u64 {
         self.ring.front().map(|(s, _)| *s).unwrap_or(u64::MAX)
+    }
+
+    /// Called by the periodic tick task. If the session has gone
+    /// quiet long enough AND there's been a meaningful burst of
+    /// output since the last attention emit, return true to signal
+    /// the caller to emit an `Event::Attention` and latch
+    /// `attention_pending` so we don't re-emit until new output
+    /// arrives.
+    pub fn check_attention(&mut self) -> bool {
+        if !self.running {
+            return false;
+        }
+        if self.attention_pending {
+            return false;
+        }
+        if self.bytes_since_attention < MIN_BYTES_FOR_ATTENTION {
+            return false;
+        }
+        if self.last_data_at.elapsed().as_millis() < IDLE_THRESHOLD_MS as u128 {
+            return false;
+        }
+        // Latch + reset the counter so the next "burst then idle"
+        // window has to clear the bar again.
+        self.attention_pending = true;
+        self.bytes_since_attention = 0;
+        true
+    }
+
+    /// Emit an `Event::Attention` to the attached client, if any.
+    /// Caller is expected to have just gotten `true` from
+    /// `check_attention()`.
+    pub fn emit_attention(&self) {
+        if let Some(ref tx) = self.attached {
+            let event = Event::Attention {
+                id: self.id.clone(),
+            };
+            let _ = tx.send(event.to_line());
+        }
     }
 }
 

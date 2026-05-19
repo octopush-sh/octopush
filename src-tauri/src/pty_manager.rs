@@ -42,6 +42,15 @@ struct PtyExitEvent {
     code: Option<i32>,
 }
 
+/// Event payload for `pty://attention` — emitted by the daemon when a
+/// session has been idle long enough after a meaningful burst of
+/// output to be considered "waiting for user input."
+#[derive(Serialize, Clone)]
+struct PtyAttentionEvent {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
 /// Event payload for `pty://reattached` — emitted once when a PTY is
 /// reattached to a surviving daemon session (i.e., after an Octopush restart).
 #[derive(Serialize, Clone)]
@@ -283,6 +292,14 @@ fn start_reader_thread(
                             },
                         );
                         break;
+                    }
+                    Ok(TermEvent::Attention) => {
+                        let _ = app.emit(
+                            "pty://attention",
+                            PtyAttentionEvent {
+                                session_id: id.clone(),
+                            },
+                        );
                     }
                     Err(_) => {
                         // Channel closed — daemon disconnected or session ended.

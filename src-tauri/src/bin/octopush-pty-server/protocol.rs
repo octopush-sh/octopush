@@ -158,6 +158,14 @@ pub enum Event {
     Exit { id: String, code: Option<i32> },
     /// Error on a streaming connection.
     Error { id: String, message: String },
+    /// The PTY has been idle (no new output) for the configured
+    /// threshold after a meaningful burst of output — heuristically,
+    /// the inner program finished painting and is waiting for input.
+    /// Detection lives in the daemon so it benefits from
+    /// deterministic timing and authoritative access to the raw byte
+    /// stream (the frontend WebView's xterm.js buffer + React render
+    /// cycle made this unreliable in 0.1.4–0.1.10).
+    Attention { id: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -23,12 +23,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as stdmpsc;
 use std::sync::Arc;
 
-/// A live terminal event pushed by the daemon (`data`, `exit`, `error`).
+/// A live terminal event pushed by the daemon (`data`, `exit`, `error`,
+/// `attention`).
 #[derive(Debug, Clone)]
 pub enum TermEvent {
     Data { seq: u64, bytes: Vec<u8> },
     Exit { code: Option<i32> },
     Error { message: String },
+    /// Emitted when the PTY has been idle long enough after a
+    /// meaningful burst of output for the daemon to consider it
+    /// "waiting for user input". Frontend uses this to drive the
+    /// attention chime + monogram halo + mode-tab pulse.
+    Attention,
 }
 
 /// Minimal terminal descriptor returned by `list_terminals`.
@@ -419,6 +425,7 @@ fn run_reader(
                     let message = v["message"].as_str().unwrap_or("").to_string();
                     TermEvent::Error { message }
                 }
+                Some("attention") => TermEvent::Attention,
                 _ => continue,
             };
 

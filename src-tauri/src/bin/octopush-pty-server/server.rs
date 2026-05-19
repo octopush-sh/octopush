@@ -84,6 +84,31 @@ pub fn run_accept_loop(
             }
         })?;
 
+    // Attention-detection thread: every second, walks every live
+    // session and asks whether it has been idle long enough after a
+    // meaningful burst of output. When it has, the session emits an
+    // `Event::Attention` to its attached client. Detection lives in
+    // the daemon (not the WebView) so timing is deterministic and
+    // sees the raw byte stream directly. See `Session::check_attention`.
+    let attn_state = Arc::clone(&state);
+    std::thread::Builder::new()
+        .name("attention-checker".into())
+        .spawn(move || {
+            let tick = Duration::from_secs(1);
+            loop {
+                std::thread::sleep(tick);
+                let mut st = attn_state.lock();
+                if st.shutdown {
+                    break;
+                }
+                for sess in st.sessions.values_mut() {
+                    if sess.check_attention() {
+                        sess.emit_attention();
+                    }
+                }
+            }
+        })?;
+
     info!("accepting connections");
     for stream in listener.incoming() {
         match stream {

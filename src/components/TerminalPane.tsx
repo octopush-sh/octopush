@@ -4,7 +4,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
-import type { PtyDataEvent, PtyExitEvent, PtyReattachedEvent } from "../lib/types";
+import type {
+  PtyAttentionEvent,
+  PtyDataEvent,
+  PtyExitEvent,
+  PtyReattachedEvent,
+} from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 
 interface Props {
@@ -243,10 +248,23 @@ export function TerminalPane({
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       term.write(new Uint8Array(ev.payload.bytes));
-      bytesSinceLastPing += ev.payload.bytes.length;
-      scheduleIdleCheck();
     }).then((u) => {
       unlistenData = u;
+    });
+
+    // Daemon-driven attention: when the daemon decides the PTY went
+    // idle after a meaningful burst, it emits `pty://attention`.
+    // We forward it to the attention store unless this pane is the
+    // one the user is currently looking at.
+    let unlistenAttention: UnlistenFn | undefined;
+    listen<PtyAttentionEvent>("pty://attention", (ev) => {
+      if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      if (visibleRef.current) return;
+      useAttentionStore
+        .getState()
+        .ping(workspaceIdRef.current, "terminal");
+    }).then((u) => {
+      unlistenAttention = u;
     });
 
     listen<PtyExitEvent>("pty://exit", (ev) => {
@@ -292,41 +310,13 @@ export function TerminalPane({
       useAttentionStore.getState().ping(workspaceIdRef.current, "terminal");
     });
 
-    // ── Time-based "waiting" detection ────────────────────────────
-    // Pattern matching against AI output is brittle (LLMs are
-    // non-deterministic). Instead we trust time: any agent or TUI
-    // that's actually thinking emits SOMETHING — a spinner tick, a
-    // streamed token, a progress line — at least every few seconds.
-    // 10 seconds of complete silence is a strong signal it's done
-    // and waiting for you. The byte-count filter avoids false
-    // positives from a freshly-opened terminal whose only output is
-    // the shell prompt itself.
-    const IDLE_OUTPUT_MS = 10_000;
-    const MIN_BYTES_FOR_PING = 200;
-
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let bytesSinceLastPing = 0;
-    const scheduleIdleCheck = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        idleTimer = null;
-        const visible = visibleRef.current;
-        const bytes = bytesSinceLastPing;
-        const willPing = !visible && bytes >= MIN_BYTES_FOR_PING;
-        // eslint-disable-next-line no-console
-        console.debug("[attention] idle-output timer fired", {
-          workspaceId: workspaceIdRef.current,
-          visible,
-          bytesSinceLastPing: bytes,
-          willPing,
-        });
-        if (!willPing) return;
-        bytesSinceLastPing = 0;
-        useAttentionStore
-          .getState()
-          .ping(workspaceIdRef.current, "terminal");
-      }, IDLE_OUTPUT_MS);
-    };
+    // Attention detection lives in the Rust daemon (see
+    // `Session::check_attention`). The frontend just listens for
+    // `pty://attention` events and routes them to the attention
+    // store. This was moved out of the WebView in v0.1.11 because
+    // five iterations of in-process heuristics couldn't beat the
+    // timing drift + xterm.js buffer ambiguity + non-deterministic
+    // AI output combination.
 
     // term → PTY
     const dataDisp = term.onData((data) => {
@@ -380,7 +370,6 @@ export function TerminalPane({
     return () => {
       cancelled = true;
       if (resizeTimer) clearTimeout(resizeTimer);
-      if (idleTimer) clearTimeout(idleTimer);
       dataDisp.dispose();
       resizeDisp.dispose();
       bellDisp.dispose();
@@ -388,6 +377,7 @@ export function TerminalPane({
       unlistenData?.();
       unlistenExit?.();
       unlistenReattached?.();
+      unlistenAttention?.();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
