@@ -92,25 +92,74 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
 }));
 
 // ── Chime synthesis ────────────────────────────────────────────────
+//
+// Safari (and WKWebView) creates AudioContexts in the `suspended`
+// state. `resume()` from a non-gesture callsite (e.g. a setTimeout
+// fired by our idle-TUI detector) is rejected silently — that's why
+// the chime was inaudible in the wild even though the rest of the
+// notification pipeline was working.
+//
+// The fix is the standard "audio unlock" pattern: create ONE shared
+// AudioContext at module load, then on the very first user gesture
+// (any click or keydown anywhere in the app) resume it. After that,
+// every subsequent chime — even ones fired from timers — plays
+// reliably because the context is no longer suspended.
+
+let sharedCtx: AudioContext | null = null;
+let unlockTried = false;
+
+function getCtx(): AudioContext | null {
+  if (sharedCtx) return sharedCtx;
+  const Ctx =
+    typeof window !== "undefined"
+      ? window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext
+      : undefined;
+  if (!Ctx) return null;
+  try {
+    sharedCtx = new Ctx();
+  } catch {
+    return null;
+  }
+  return sharedCtx;
+}
+
+/** Install one-time listeners that unlock the AudioContext on the
+ *  first user interaction. After the unlock, the listeners detach so
+ *  they don't pile up. Safe to call multiple times — the `unlockTried`
+ *  guard makes subsequent calls no-ops. */
+function ensureUnlockListeners() {
+  if (unlockTried || typeof document === "undefined") return;
+  unlockTried = true;
+  const unlock = () => {
+    const ctx = getCtx();
+    if (ctx && ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+    document.removeEventListener("click", unlock, true);
+    document.removeEventListener("keydown", unlock, true);
+  };
+  document.addEventListener("click", unlock, true);
+  document.addEventListener("keydown", unlock, true);
+}
 
 /**
- * A short two-note brass-y chime synthesised live so we don't ship a
- * .wav. ~250ms total. Uses Web Audio API. Resolves once playback
- * actually starts (so the caller can detect autoplay rejection if it
- * matters; we don't currently care).
+ * Short two-note brass-y chime, synthesised live so we don't ship a
+ * .wav. ~250ms total. Uses the shared AudioContext so the autoplay
+ * unlock from the first user gesture sticks for every later chime.
  */
 async function playChime(): Promise<void> {
-  // Lazy-init the AudioContext to avoid burning resources at boot.
-  const Ctx =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext })
-      .webkitAudioContext;
-  if (!Ctx) return;
-  const ctx = new Ctx();
+  ensureUnlockListeners();
+  const ctx = getCtx();
+  if (!ctx) return;
   if (ctx.state === "suspended") {
     try {
       await ctx.resume();
     } catch {
+      // Still suspended — autoplay policy hasn't been unlocked yet by
+      // a user gesture. The listeners installed above will pick up
+      // the next click/keydown; nothing to do here.
       return;
     }
   }
@@ -119,10 +168,8 @@ async function playChime(): Promise<void> {
   // Two-note pleasant chime: A5 then E6, staggered ~80ms apart.
   playNote(ctx, 880, now, 0.18, 0.12);
   playNote(ctx, 1318.5, now + 0.08, 0.22, 0.1);
-
-  // Auto-close the context once the notes have finished so we don't
-  // accumulate stale ones across many chimes.
-  setTimeout(() => ctx.close().catch(() => {}), 600);
+  // Do NOT close the context — keep it alive for the next chime so
+  // we don't have to re-unlock autoplay every time.
 }
 
 function playNote(
@@ -144,3 +191,8 @@ function playNote(
   osc.start(start);
   osc.stop(start + duration + 0.05);
 }
+
+// Install the autoplay-unlock listeners eagerly on module load so the
+// AudioContext is ready to fire before the first attention event,
+// not on the second one.
+ensureUnlockListeners();

@@ -310,12 +310,27 @@ export function TerminalPane({
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimer = null;
-        if (visibleRef.current) return;
-        // Only ping if the inner app is in alt-screen (TUI mode);
-        // a plain shell prompt going idle isn't a notification case.
+        const visible = visibleRef.current;
         // Defensive optional-chaining for the test env where the xterm
         // mock has no buffer object.
-        if (term.buffer?.active?.type !== "alternate") return;
+        const bufferType = term.buffer?.active?.type;
+        // Log so the user/devs can inspect why attention DID or DID NOT
+        // fire — most common cause is "still in normal buffer" because
+        // the inner app didn't actually go into alt-screen yet.
+        // eslint-disable-next-line no-console
+        console.debug(
+          "[attention] idle-TUI timer fired",
+          {
+            workspaceId: workspaceIdRef.current,
+            visible,
+            bufferType,
+            willPing: !visible && bufferType === "alternate",
+          },
+        );
+        if (visible) return;
+        // Only ping if the inner app is in alt-screen (TUI mode);
+        // a plain shell prompt going idle isn't a notification case.
+        if (bufferType !== "alternate") return;
         useAttentionStore
           .getState()
           .ping(workspaceIdRef.current, "terminal");
