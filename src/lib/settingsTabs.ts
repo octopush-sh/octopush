@@ -7,7 +7,8 @@ export type SettingsTab =
   | "appearance"
   | "usage"
   | "shortcuts"
-  | "privacy";
+  | "privacy"
+  | "about";
 
 export const SETTINGS_TABS: SettingsTab[] = [
   "general",
@@ -16,6 +17,7 @@ export const SETTINGS_TABS: SettingsTab[] = [
   "usage",
   "shortcuts",
   "privacy",
+  "about",
 ];
 
 export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
@@ -25,4 +27,5 @@ export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   usage: "Usage",
   shortcuts: "Shortcuts",
   privacy: "Privacy",
+  about: "About",
 };

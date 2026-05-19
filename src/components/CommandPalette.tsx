@@ -5,6 +5,7 @@ import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
 import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { useThemeStore } from "../stores/themeStore";
+import { useUpdaterStore } from "../stores/updaterStore";
 
 interface Props {
   open: boolean;
@@ -156,6 +157,38 @@ export function CommandPalette({
 
             {/* Actions */}
             <Group heading="Actions">
+              <Item
+                glyph="↺"
+                label="Check for updates"
+                onSelect={() =>
+                  run(async () => {
+                    const store = useUpdaterStore.getState();
+                    await store.checkForUpdates(true);
+                    const next = useUpdaterStore.getState();
+                    if (next.phase === "no-update") {
+                      pushToast({
+                        level: "success",
+                        title: "Up to date",
+                        body: next.currentVersion
+                          ? `You're on v${next.currentVersion} — no newer release available.`
+                          : "No newer release available.",
+                      });
+                    } else if (next.phase === "available" && next.update) {
+                      pushToast({
+                        level: "info",
+                        title: `Octopush ${next.update.version} is ready`,
+                        body: "Use the toast in the corner or Settings → About to install.",
+                      });
+                    } else if (next.phase === "error" && next.error) {
+                      pushToast({
+                        level: "error",
+                        title: "Update check failed",
+                        body: next.error,
+                      });
+                    }
+                  })
+                }
+              />
               <Item
                 glyph="§"
                 label="Open Settings · Usage"

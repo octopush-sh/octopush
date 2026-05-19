@@ -1,94 +1,47 @@
 /**
- * UpdateNotifier — silent auto-check for new Octopush releases.
+ * UpdateNotifier — silent auto-check + the brass "Update available" toast.
  *
- * Polls the Tauri updater on mount and every 6h. When a new version is
- * available, shows a brass toast with "Install" / "Later" — neither
- * blocks the app. "Install" downloads + verifies the Ed25519 signature,
- * applies the update in-place, and relaunches the app.
+ * State is read from `useUpdaterStore` so the manual "Check for updates"
+ * button in Settings (and any future surface) shares the same state.
  *
- * Silent on failure: if the network is unavailable or the manifest is
- * missing, we log to console and stay quiet — there's nothing the user
- * can do, and an error toast every 6h would be annoying.
+ * Background behavior:
+ *   - Triggers one check on mount (fresh app launch).
+ *   - Re-checks every 6 hours.
+ *   - Silent on failure for background checks.
+ *
+ * Toast shows only when `phase === "available"` and the user hasn't
+ * dismissed the current version. "no-update" / "error" states from
+ * background checks stay invisible — Settings is where the user
+ * inspects those.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { Download, X, Loader2 } from "lucide-react";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { useUpdaterStore } from "../stores/updaterStore";
 
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6 hours
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export function UpdateNotifier() {
-  const [update, setUpdate] = useState<Update | null>(null);
-  const [dismissed, setDismissed] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [installError, setInstallError] = useState<string | null>(null);
-  const checkedOnce = useRef(false);
+  const phase = useUpdaterStore((s) => s.phase);
+  const update = useUpdaterStore((s) => s.update);
+  const progress = useUpdaterStore((s) => s.progress);
+  const error = useUpdaterStore((s) => s.error);
+  const dismissed = useUpdaterStore((s) => s.dismissed);
+  const checkForUpdates = useUpdaterStore((s) => s.checkForUpdates);
+  const installAndRelaunch = useUpdaterStore((s) => s.installAndRelaunch);
+  const dismiss = useUpdaterStore((s) => s.dismiss);
 
   useEffect(() => {
-    let cancelled = false;
+    checkForUpdates(false);
+    const id = setInterval(() => checkForUpdates(false), CHECK_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [checkForUpdates]);
 
-    const doCheck = async () => {
-      try {
-        const result = await check();
-        if (cancelled) return;
-        if (result?.available) {
-          setUpdate(result);
-          setDismissed(false);
-        }
-      } catch (e) {
-        // Silent — usually network/endpoint issues, not actionable.
-        if (!checkedOnce.current) {
-          console.warn("update check failed:", e);
-        }
-      } finally {
-        checkedOnce.current = true;
-      }
-    };
+  const installing = phase === "downloading" || phase === "installing";
+  const visible =
+    (phase === "available" && !dismissed) || installing || phase === "error";
 
-    doCheck();
-    const id = setInterval(doCheck, CHECK_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
-
-  if (!update || dismissed) return null;
-
-  async function handleInstall() {
-    if (!update) return;
-    setInstalling(true);
-    try {
-      let downloaded = 0;
-      let total = 0;
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            total = event.data.contentLength ?? 0;
-            break;
-          case "Progress":
-            downloaded += event.data.chunkLength;
-            if (total > 0) setProgress(Math.round((downloaded / total) * 100));
-            break;
-          case "Finished":
-            setProgress(100);
-            break;
-        }
-      });
-      // After the install completes, relaunch into the new version.
-      await relaunch();
-    } catch (e) {
-      console.error("update install failed:", e);
-      setInstalling(false);
-      // Keep the toast visible so the user can retry; surface the error
-      // inline.
-      setInstallError(String(e));
-    }
-  }
-
-  const err = installError;
+  if (!visible || !update) return null;
 
   return (
     <div
@@ -119,16 +72,16 @@ export function UpdateNotifier() {
               {update.body}
             </div>
           )}
-          {err && (
+          {error && (
             <div className="mt-1.5 text-[11px] leading-[1.45] text-octo-rouge">
-              Install failed: {err}
+              Install failed: {error}
             </div>
           )}
         </div>
         {!installing && (
           <button
             type="button"
-            onClick={() => setDismissed(true)}
+            onClick={dismiss}
             aria-label="Dismiss"
             className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
           >
@@ -137,7 +90,7 @@ export function UpdateNotifier() {
         )}
       </div>
 
-      {installing && progress > 0 && progress < 100 && (
+      {phase === "downloading" && progress > 0 && progress < 100 && (
         <div className="px-4 pb-2">
           <div
             className="h-[3px] overflow-hidden rounded-sm"
@@ -160,7 +113,7 @@ export function UpdateNotifier() {
       <div className="flex items-center gap-2 border-t border-octo-hairline px-3 py-2">
         <button
           type="button"
-          onClick={() => setDismissed(true)}
+          onClick={dismiss}
           disabled={installing}
           className="rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute transition-colors hover:text-octo-sage disabled:opacity-40"
         >
@@ -168,7 +121,7 @@ export function UpdateNotifier() {
         </button>
         <button
           type="button"
-          onClick={handleInstall}
+          onClick={installAndRelaunch}
           disabled={installing}
           className="ml-auto flex items-center gap-1.5 rounded px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors disabled:opacity-40"
           style={{
@@ -181,7 +134,11 @@ export function UpdateNotifier() {
           ) : (
             <Download size={11} />
           )}
-          {installing ? "Installing…" : "Install & restart"}
+          {phase === "installing"
+            ? "Installing…"
+            : phase === "downloading"
+              ? "Downloading…"
+              : "Install & restart"}
         </button>
       </div>
     </div>
