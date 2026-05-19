@@ -2,7 +2,14 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
-import type { ChatMessage as ChatMessageType } from "../lib/types";
+import {
+  estimateNextTurnTokens,
+  estimatePerMessageCost,
+  formatPerMessageCost,
+  formatTokens,
+} from "../lib/cost";
+import { ipc } from "../lib/ipc";
+import type { ModelInfo, ProviderConfig } from "../lib/types";
 import { BrassRule } from "./BrassRule";
 import { ChatMessage } from "./ChatMessage";
 import { ModelPicker } from "./ModelPicker";
@@ -59,6 +66,26 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
     inputRef.current = val;
     setInputState(val);
   }
+
+  // Load the provider/model catalog once so the inline cost preview can find
+  // the active model's price.
+  const [modelCatalog, setModelCatalog] = useState<ProviderConfig[]>([]);
+  useEffect(() => {
+    ipc.listProviders().then(setModelCatalog).catch(() => {});
+  }, []);
+  const activeModelInfo: ModelInfo | null = (() => {
+    for (const p of modelCatalog) {
+      for (const m of p.models) {
+        if (m.id === model) return m;
+      }
+    }
+    return null;
+  })();
+  const estimatedTokens = estimateNextTurnTokens(messages, input);
+  const inlineCost =
+    activeModelInfo && estimatedTokens > 0
+      ? estimatePerMessageCost(activeModelInfo, estimatedTokens)
+      : null;
   // Prompt history — use refs so handleKeyDown always sees current values
   // without needing to be recreated on every render.
   const historyRef = useRef<string[]>([]);
@@ -243,10 +270,25 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
             style={{ maxHeight: "calc(6 * 1.25rem + 1.5rem)" }}
           />
 
-          <div className="flex items-center justify-between px-3 pb-2.5">
+          <div className="flex items-center justify-between gap-3 px-3 pb-2.5">
             <div className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
               ⌘ K to focus
             </div>
+
+            {/* Inline cost preview — shows the projected $ and rough token
+                count for the active model + current prompt. Only renders
+                when the user has typed something and the catalog is loaded;
+                otherwise the row stays clean. */}
+            {inlineCost !== null && (
+              <div
+                className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
+                title={`Estimate for ${activeModelInfo!.displayName || activeModelInfo!.id}; assumes 30% output ratio`}
+              >
+                <span className="text-octo-brass">{formatPerMessageCost(inlineCost)}</span>
+                <span className="px-1 opacity-50">·</span>
+                <span>{formatTokens(estimatedTokens)}</span>
+              </div>
+            )}
 
             <button
               onClick={handleSend}
@@ -271,46 +313,6 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
       </div>
     </div>
   );
-}
-
-/**
- * Estimate how many input tokens the next chat turn will consume — used by
- * the ModelPicker's cost preview. Three ingredients:
- *
- *   1. The most recent assistant message's inputTokens, if present. That's
- *      the model-reported size of the prompt that fed the previous reply
- *      and is the most accurate proxy for what the next turn will resend.
- *   2. Otherwise, char/4 estimate of every prior message in the chat —
- *      back-of-the-envelope token count for fresh conversations.
- *   3. Plus the pending text the user is currently typing, also char/4.
- *
- * Returns 0 when there's nothing to estimate — callers treat that as
- * "fall back to per-million rates" rather than showing "≈ $0".
- */
-function estimateNextTurnTokens(
-  messages: ChatMessageType[],
-  pendingText: string,
-): number {
-  const pendingTokens = pendingText.trim().length === 0
-    ? 0
-    : Math.ceil(pendingText.length / 4);
-
-  let historyTokens = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === "assistant" && m.inputTokens != null) {
-      historyTokens = m.inputTokens;
-      break;
-    }
-  }
-  if (historyTokens === 0) {
-    for (const m of messages) {
-      historyTokens += Math.ceil((m.content?.length ?? 0) / 4);
-    }
-  }
-
-  const total = historyTokens + pendingTokens;
-  return total > 0 ? total : 0;
 }
 
 function EmptyState() {

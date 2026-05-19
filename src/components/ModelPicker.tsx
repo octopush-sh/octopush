@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
+import { estimatePerMessageCost, formatPerMessageCost } from "../lib/cost";
 import type { ModelInfo, ProviderConfig } from "../lib/types";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
@@ -66,28 +67,6 @@ interface Props {
    * user can compare what THIS turn would cost across models.
    */
   estimatedInputTokens?: number;
-}
-
-/**
- * Estimate output tokens as a fixed fraction of input — a reasonable proxy
- * for typical assistant replies (200-500 tokens for short answers, more for
- * code/explanations). The user understands this is an estimate.
- */
-const OUTPUT_RATIO = 0.3;
-
-function estimatePerMessageCost(model: ModelInfo, inputTokens: number): number {
-  if (inputTokens <= 0) return 0;
-  const inputCost = (inputTokens / 1_000_000) * model.inputCostPerM;
-  const outputCost =
-    ((inputTokens * OUTPUT_RATIO) / 1_000_000) * model.outputCostPerM;
-  return inputCost + outputCost;
-}
-
-function formatPerMessageCost(cost: number): string {
-  if (cost === 0) return "free";
-  if (cost < 0.01) return `≈ <$0.01`;
-  if (cost < 1) return `≈ $${cost.toFixed(2)}`;
-  return `≈ $${cost.toFixed(1)}`;
 }
 
 export function ModelPicker({
