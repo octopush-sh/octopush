@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
   AppSettings,
+  Budget,
+  BudgetPeriod,
+  BudgetScope,
   BudgetStatus,
   ChatMessage,
   CreateSessionArgs,
@@ -17,6 +20,7 @@ import type {
   Session,
   SessionRecap,
   SessionTemplate,
+  SpendSnapshot,
   TaskType,
   TerminalRecord,
   ThemeConfig,
@@ -158,6 +162,21 @@ export const ipc = {
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string) => invoke<DirectoryEntry[]>("read_directory", { path }),
+
+  // ─── Budgets ──────────────────────────────────────────────────
+  listBudgets: () => invoke<Budget[]>("list_budgets"),
+
+  setBudget: (scopeType: BudgetScope, scopeId: string, period: BudgetPeriod, limitUsd: number) =>
+    invoke<void>("set_budget", { scopeType, scopeId, period, limitUsd }),
+
+  clearBudget: (scopeType: BudgetScope, scopeId: string, period: BudgetPeriod) =>
+    invoke<void>("clear_budget", { scopeType, scopeId, period }),
+
+  currentSpend: (scopeType: BudgetScope, scopeId: string, period: BudgetPeriod) =>
+    invoke<SpendSnapshot>("current_spend", { scopeType, scopeId, period }),
+
+  exportTokenEventsCsv: (startIso: string, endIso: string) =>
+    invoke<string>("export_token_events_csv", { startIso, endIso }),
 
   // ─── Settings ─────────────────────────────────────────────────
   getSettings: () =>

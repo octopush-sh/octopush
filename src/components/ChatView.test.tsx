@@ -32,6 +32,8 @@ vi.mock("../lib/ipc", () => ({
     listProviders: vi.fn().mockResolvedValue([]),
     revealInFinder: vi.fn(),
     openFileInSystem: vi.fn(),
+    listBudgets: vi.fn().mockResolvedValue([]),
+    currentSpend: vi.fn().mockResolvedValue({ costUsd: 0, tokens: 0 }),
   },
 }));
 
@@ -39,6 +41,7 @@ vi.mock("../lib/ipc", () => ({
 const { useChatStore } = await import("../stores/chatStore");
 const { ChatView } = await import("./ChatView");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
+const { useBudgetsStore, BUDGET_CAP_MSG } = await import("../stores/budgetsStore");
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 function resetStore() {
@@ -47,6 +50,12 @@ function resetStore() {
     streamingByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
+  });
+  useBudgetsStore.setState({
+    budgets: [],
+    spend: {},
+    notifiedThresholds: new Set(),
+    overrideActive: false,
   });
   // Workspace store must have an active id for the "notify on non-active
   // workspace" logic in the listener to no-op.
@@ -507,5 +516,48 @@ describe("ChatView — arrow-key prompt history", () => {
     fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("a");
     fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("b");
     fireEvent.keyDown(ta, { key: "ArrowUp" }); expect(ta.value).toBe("a");
+  });
+});
+
+// ─── Budget error & override ──────────────────────────────────────────
+describe("ChatView — budget error and override", () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  it("shows BudgetErrorBlock with Override button when error is budget cap message", () => {
+    useChatStore.setState({
+      errorByWs: { "ws-1": BUDGET_CAP_MSG },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    expect(screen.getByText(/Budget cap reached/i)).toBeTruthy();
+    expect(screen.getByText(/Override for this turn/i)).toBeTruthy();
+  });
+
+  it("Override button enables override and clears error", async () => {
+    useChatStore.setState({
+      errorByWs: { "ws-1": BUDGET_CAP_MSG },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    const overrideBtn = screen.getByText(/Override for this turn/i);
+    await act(async () => {
+      fireEvent.click(overrideBtn);
+    });
+
+    // Error is cleared
+    expect(useChatStore.getState().errorByWs["ws-1"]).toBeNull();
+    // Override is armed
+    expect(useBudgetsStore.getState().overrideActive).toBe(true);
+  });
+
+  it("does NOT show BudgetErrorBlock for generic errors", () => {
+    useChatStore.setState({
+      errorByWs: { "ws-1": "Something else went wrong" },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    expect(screen.queryByText(/Budget cap reached/i)).toBeNull();
+    expect(screen.queryByText(/Override for this turn/i)).toBeNull();
+    expect(screen.getByText(/Something went wrong/i)).toBeTruthy();
   });
 });

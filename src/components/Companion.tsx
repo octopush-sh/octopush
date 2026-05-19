@@ -1,4 +1,5 @@
 import type { WorkspaceMode } from "../lib/modes";
+import type { Budget, SpendSnapshot } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
@@ -9,6 +10,8 @@ interface ContextProps {
   tokensLimit: number;
   unstaged: number;
   toolCalls: number;
+  budgets?: Budget[];
+  spend?: Record<string, SpendSnapshot>;
 }
 
 interface HistoryProps {
@@ -47,7 +50,10 @@ export function Companion({
     >
       {mode === "talk" && (
         <>
-          <CompanionContext {...contextProps} />
+          <CompanionContext
+            {...contextProps}
+            workspaceId={workspaceId ?? undefined}
+          />
           <CompanionHistory {...historyProps} />
         </>
       )}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AlertTriangle, Settings } from "lucide-react";
 import { clsx } from "clsx";
 import { useChatStore, type ToolExecution, type ConversationItem } from "../stores/chatStore";
+import { useBudgetsStore, BUDGET_CAP_MSG } from "../stores/budgetsStore";
 import {
   estimateNextTurnTokens,
   estimatePerMessageCost,
@@ -173,7 +174,10 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
     }
   }
 
-  const canSend = !streaming && input.trim().length > 0;
+  const enableOverride = useBudgetsStore((s) => s.enableOverride);
+  const isBudgetError = error === BUDGET_CAP_MSG;
+  const overrideActive = useBudgetsStore((s) => s.overrideActive);
+  const canSend = !streaming && input.trim().length > 0 && (!isBudgetError || overrideActive);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -181,7 +185,7 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
         ref={scrollRef}
         className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-8 py-6"
       >
-        {messages.length === 0 && !streaming ? (
+        {messages.length === 0 && !streaming && !error ? (
           <EmptyState />
         ) : (
           <>
@@ -227,12 +231,20 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
 
             {streaming && !streamBuffer && <ThinkingIndicator />}
 
-            {error && (
+            {error && isBudgetError ? (
+              <BudgetErrorBlock
+                onOverride={() => {
+                  enableOverride();
+                  clearError(workspaceId);
+                  // Override is armed; user still needs to click Send.
+                }}
+              />
+            ) : error ? (
               <ErrorBlock
                 error={error}
                 onConfigureApiKey={onOpenSettings ? () => { clearError(workspaceId); onOpenSettings(); } : null}
               />
-            )}
+            ) : null}
           </>
         )}
       </div>
@@ -375,6 +387,36 @@ function ErrorBlock({
               Configure API key
             </button>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BudgetErrorBlock({ onOverride }: { onOverride: () => void }) {
+  return (
+    <div
+      className="mx-auto max-w-lg rounded-md p-4"
+      style={{
+        borderLeft: "1px solid var(--color-octo-rouge)",
+        background: "rgba(209, 139, 139, 0.08)",
+      }}
+    >
+      <div className="flex items-start gap-2">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0 text-octo-rouge" />
+        <div className="min-w-0 flex-1">
+          <div className="font-serif italic text-[14px] text-octo-rouge">
+            Budget cap reached.
+          </div>
+          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+            Sending is blocked to stay within your configured budget.
+          </div>
+          <button
+            onClick={onOverride}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:text-octo-brass"
+          >
+            Override for this turn
+          </button>
         </div>
       </div>
     </div>

@@ -323,6 +323,184 @@ mod terminal_tests {
     }
 }
 
+/// Tests for Token Budgets & Governance (Feature 5).
+#[cfg(test)]
+mod budget_tests {
+    use crate::db::Db;
+    use crate::token_engine::TokenEvent;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn setup_project_and_workspace(db: &Db, project_id: &str, workspace_id: &str) {
+        db.insert_project(project_id, "Test Project", &format!("/tmp/{}", project_id))
+            .unwrap();
+        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "")
+            .unwrap();
+    }
+
+    #[test]
+    fn upsert_budget_round_trip() {
+        let db = test_db();
+        db.upsert_budget("global", "", "daily", 5.0).unwrap();
+        db.upsert_budget("global", "", "monthly", 80.0).unwrap();
+        db.upsert_budget("workspace", "ws-1", "daily", 2.0).unwrap();
+
+        let budgets = db.list_budgets().unwrap();
+        assert_eq!(budgets.len(), 3);
+
+        // Update
+        db.upsert_budget("global", "", "daily", 10.0).unwrap();
+        let budgets2 = db.list_budgets().unwrap();
+        assert_eq!(budgets2.len(), 3); // no new row
+        let global_daily = budgets2.iter().find(|b| b.scope_type == "global" && b.period == "daily").unwrap();
+        assert!((global_daily.limit_usd - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn delete_budget() {
+        let db = test_db();
+        db.upsert_budget("global", "", "daily", 5.0).unwrap();
+        db.upsert_budget("global", "", "monthly", 80.0).unwrap();
+
+        db.delete_budget("global", "", "daily").unwrap();
+        let remaining = db.list_budgets().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].period, "monthly");
+    }
+
+    #[test]
+    fn period_spend_global() {
+        let db = test_db();
+        setup_project_and_workspace(&db, "proj-spend", "ws-spend");
+
+        // Insert a token event with today's timestamp
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-spend".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 1.23,
+        }).unwrap();
+
+        let (cost, tokens) = db.period_spend("global", "", "daily").unwrap();
+        assert!((cost - 1.23).abs() < 0.001);
+        assert_eq!(tokens, 1500);
+    }
+
+    #[test]
+    fn period_spend_workspace_scope() {
+        let db = test_db();
+        setup_project_and_workspace(&db, "proj-ws-scope", "ws-scope-a");
+        setup_project_and_workspace(&db, "proj-ws-scope2", "ws-scope-b");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-scope-a".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 0.50,
+        }).unwrap();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-scope-b".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 200,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 1.00,
+        }).unwrap();
+
+        // ws-scope-a only
+        let (cost_a, tokens_a) = db.period_spend("workspace", "ws-scope-a", "daily").unwrap();
+        assert!((cost_a - 0.50).abs() < 0.001);
+        assert_eq!(tokens_a, 150);
+
+        // global sees both
+        let (cost_all, _) = db.period_spend("global", "", "daily").unwrap();
+        assert!((cost_all - 1.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn period_spend_project_scope() {
+        let db = test_db();
+        setup_project_and_workspace(&db, "proj-scope", "ws-in-proj");
+        setup_project_and_workspace(&db, "proj-other", "ws-other-proj");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-in-proj".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 500,
+            output_tokens: 250,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 2.00,
+        }).unwrap();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-other-proj".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 0.50,
+        }).unwrap();
+
+        let (cost, tokens) = db.period_spend("project", "proj-scope", "daily").unwrap();
+        assert!((cost - 2.00).abs() < 0.001);
+        assert_eq!(tokens, 750);
+    }
+
+    #[test]
+    fn export_csv_shape() {
+        let db = test_db();
+        setup_project_and_workspace(&db, "proj-csv", "ws-csv");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_token_event(&TokenEvent {
+            id: None,
+            session_id: "ws-csv".to_string(),
+            timestamp: now.clone(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            cost_usd: 0.25,
+        }).unwrap();
+
+        let start = "2020-01-01T00:00:00Z";
+        let end = "2099-12-31T23:59:59Z";
+        let csv = db.export_token_events_csv(start, end).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "timestamp,workspace_id,model,input_tokens,output_tokens,cost_usd");
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[1].contains("ws-csv"));
+        assert!(lines[1].contains("claude-sonnet-4-6"));
+        assert!(lines[1].contains("100"));
+    }
+}
+
 /// Tests for the Phase 3 `spawn_or_attach` logic in [`crate::pty_manager`].
 ///
 /// These tests start the real daemon binary so we can verify the

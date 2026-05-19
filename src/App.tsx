@@ -25,6 +25,7 @@ import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
+import { useBudgetsStore } from "./stores/budgetsStore";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta } from "./lib/chatTitle";
 import type { ModelWithProvider } from "./lib/types";
@@ -46,6 +47,7 @@ function App() {
   const project = useProjectStore((s) => s.current);
   const loadTheme = useThemeStore((s) => s.load);
   const refreshTokens = useTokenStore((s) => s.refresh);
+  const { loadAll: loadBudgets, refreshAllSpend, budgets, spend } = useBudgetsStore();
   const {
     workspaces,
     activeId: activeWorkspaceId,
@@ -144,6 +146,11 @@ function App() {
     loadTheme();
   }, [loadTheme]);
 
+  // ── Load budgets on startup ──
+  useEffect(() => {
+    loadBudgets();
+  }, [loadBudgets]);
+
   // Refresh token usage periodically so the Companion + Settings · Usage
   // stay current. 30s is enough for a workspace-level glance.
   useEffect(() => {
@@ -152,18 +159,61 @@ function App() {
     return () => clearInterval(id);
   }, [refreshTokens]);
 
-  // Refresh tokens immediately when a chat turn finishes — the backend has
-  // just persisted the final assistant message with its token counts, so the
-  // Companion's tokens row should reflect that without waiting for the 30s
-  // poll tick.
+  // Refresh tokens + budget spend immediately when a chat turn finishes.
   useEffect(() => {
-    const unlistenPromise = listen<{ done: boolean }>("chat://stream", (ev) => {
-      if (ev.payload.done) refreshTokens();
+    const unlistenPromise = listen<{ done: boolean }>("chat://stream", async (ev) => {
+      if (ev.payload.done) {
+        refreshTokens();
+        await refreshAllSpend();
+        // Check threshold crossings after refreshing spend
+        const state = useBudgetsStore.getState();
+        for (const b of state.budgets) {
+          const key = `${b.scopeType}:${b.scopeId}:${b.period}`;
+          const snap = state.spend[key];
+          if (!snap || b.limitUsd <= 0) continue;
+          const pct = (snap.costUsd / b.limitUsd) * 100;
+          const scopeLabel = b.scopeType === "global"
+            ? "global"
+            : b.scopeType === "project"
+            ? `project`
+            : `workspace`;
+
+          for (const threshold of [50, 80, 100] as const) {
+            if (pct >= threshold) {
+              const tKey = `${key}:${threshold}`;
+              if (!state.notifiedThresholds.has(tKey)) {
+                useBudgetsStore.setState((s) => ({
+                  notifiedThresholds: new Set([...s.notifiedThresholds, tKey]),
+                }));
+                if (threshold === 100) {
+                  pushToast({
+                    level: "error",
+                    title: `Budget cap hit — Send blocked`,
+                    body: `${scopeLabel} ${b.period} budget: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                  });
+                } else if (threshold === 80) {
+                  pushToast({
+                    level: "warning",
+                    title: `80% of ${scopeLabel} budget used`,
+                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                  });
+                } else {
+                  pushToast({
+                    level: "info",
+                    title: `50% of ${scopeLabel} budget used`,
+                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
     });
     return () => {
       unlistenPromise.then((u) => u());
     };
-  }, [refreshTokens]);
+  }, [refreshTokens, refreshAllSpend]);
 
   // ── Project switch → load workspaces, reset view ──
   useEffect(() => {
@@ -408,8 +458,10 @@ function App() {
       tokensLimit: activeModelMaxContext,
       unstaged: gitStatus?.changedFiles.length ?? 0,
       toolCalls: liveToolCalls,
+      budgets,
+      spend,
     };
-  }, [gitStatus, lastTurnInputTokens, activeModelMaxContext, liveToolCalls]);
+  }, [gitStatus, lastTurnInputTokens, activeModelMaxContext, liveToolCalls, budgets, spend]);
 
   // Re-derive titles whenever new messages arrive — title comes from the
   // first user message, meta comes from the relative time of the latest.

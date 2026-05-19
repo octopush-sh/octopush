@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import type { ChatMessage, ChatStreamEvent } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
+import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
 
 export interface ToolExecution {
   toolName: string;
@@ -169,6 +170,17 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     send: async (workspaceId, workspacePath, content, systemPrompt) => {
+      // ── Budget hard-stop ────────────────────────────────────────
+      const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
+      if (isOverBudget("workspace", workspaceId) || isOverBudget("global", "")) {
+        if (!consumeOverride()) {
+          set((s) => ({
+            errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
+          }));
+          return;
+        }
+      }
+
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },

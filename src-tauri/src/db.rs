@@ -128,6 +128,15 @@ impl Db {
                 FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_terminals_workspace ON terminals(workspace_id);
+
+            CREATE TABLE IF NOT EXISTS budgets (
+                scope_type    TEXT NOT NULL,
+                scope_id      TEXT NOT NULL,
+                period        TEXT NOT NULL,
+                limit_usd     REAL NOT NULL,
+                updated_at    TEXT NOT NULL,
+                PRIMARY KEY (scope_type, scope_id, period)
+            );
             "#,
         )?;
         // Phase 2 — workspace customization columns (glyph + tint).
@@ -676,6 +685,138 @@ impl Db {
         Ok(())
     }
 
+    // ─── Budgets ──────────────────────────────────────────────────
+
+    pub fn list_budgets(&self) -> AppResult<Vec<BudgetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_type, scope_id, period, limit_usd, updated_at FROM budgets ORDER BY scope_type, scope_id, period",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(BudgetRow {
+                scope_type: r.get(0)?,
+                scope_id: r.get(1)?,
+                period: r.get(2)?,
+                limit_usd: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_budget(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        period: &str,
+        limit_usd: f64,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO budgets (scope_type, scope_id, period, limit_usd, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(scope_type, scope_id, period) DO UPDATE SET
+                 limit_usd = excluded.limit_usd,
+                 updated_at = excluded.updated_at",
+            params![scope_type, scope_id, period, limit_usd, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_budget(&self, scope_type: &str, scope_id: &str, period: &str) -> AppResult<()> {
+        self.conn.execute(
+            "DELETE FROM budgets WHERE scope_type = ?1 AND scope_id = ?2 AND period = ?3",
+            params![scope_type, scope_id, period],
+        )?;
+        Ok(())
+    }
+
+    /// Returns (cost_usd, tokens) for the given scope and period.
+    /// - period = "daily"   → events since start of today UTC
+    /// - period = "monthly" → events since start of this month UTC
+    /// - scope_type = "global"    → all events
+    /// - scope_type = "workspace" → events where session_id = scope_id
+    /// - scope_type = "project"   → events whose session_id is a workspace belonging to scope_id project
+    pub fn period_spend(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        period: &str,
+    ) -> AppResult<(f64, i64)> {
+        let since = match period {
+            "monthly" => "datetime('now', 'start of month')",
+            _ => "datetime('now', 'start of day')",
+        };
+
+        let (cost, tokens) = match scope_type {
+            "workspace" => {
+                let sql = format!(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
+                     FROM token_events
+                     WHERE session_id = ?1 AND timestamp >= {since}"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                stmt.query_row(params![scope_id], |r| {
+                    Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
+                })?
+            }
+            "project" => {
+                let sql = format!(
+                    "SELECT COALESCE(SUM(e.cost_usd), 0.0), COALESCE(SUM(e.input_tokens + e.output_tokens), 0)
+                     FROM token_events e
+                     JOIN workspaces w ON w.id = e.session_id
+                     WHERE w.project_id = ?1 AND e.timestamp >= {since}"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                stmt.query_row(params![scope_id], |r| {
+                    Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
+                })?
+            }
+            _ => {
+                // global
+                let sql = format!(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
+                     FROM token_events
+                     WHERE timestamp >= {since}"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                stmt.query_row([], |r| {
+                    Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
+                })?
+            }
+        };
+        Ok((cost, tokens))
+    }
+
+    /// Export token events in the given time range as CSV.
+    pub fn export_token_events_csv(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+    ) -> AppResult<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, session_id, model, input_tokens, output_tokens, cost_usd
+             FROM token_events
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp",
+        )?;
+        let mut csv = String::from("timestamp,workspace_id,model,input_tokens,output_tokens,cost_usd\n");
+        let rows = stmt.query_map(params![start_iso, end_iso], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, f64>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (ts, ws, model, input, output, cost) = row?;
+            csv.push_str(&format!("{},{},{},{},{},{:.6}\n", ts, ws, model, input, output, cost));
+        }
+        Ok(csv)
+    }
+
     pub fn list_chat_messages(&self, workspace_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at
@@ -737,6 +878,16 @@ pub struct ChatMessageRow {
     pub output_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub created_at: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetRow {
+    pub scope_type: String,
+    pub scope_id: String,
+    pub period: String,
+    pub limit_usd: f64,
+    pub updated_at: String,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {

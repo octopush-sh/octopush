@@ -312,6 +312,24 @@ export interface SwitchResult {
   message: string;
 }
 
+// ─── Budgets ──────────────────────────────────────────────────────
+
+export type BudgetScope = "global" | "project" | "workspace";
+export type BudgetPeriod = "daily" | "monthly";
+
+export interface Budget {
+  scopeType: BudgetScope;
+  scopeId: string;
+  period: BudgetPeriod;
+  limitUsd: number;
+  updatedAt: string;
+}
+
+export interface SpendSnapshot {
+  costUsd: number;
+  tokens: number;
+}
+
 // ─── Templates ────────────────────────────────────────────────────
 
 export interface SessionTemplate {

@@ -151,6 +151,12 @@ pub fn run() {
             commands::reveal_in_finder,
             // Clone
             commands::clone_project,
+            // Budgets
+            commands::list_budgets,
+            commands::set_budget,
+            commands::clear_budget,
+            commands::current_spend,
+            commands::export_token_events_csv,
             // Settings
             commands::get_settings,
             commands::save_settings,

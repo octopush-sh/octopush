@@ -1030,6 +1030,63 @@ pub async fn clone_project(
     })
 }
 
+// ─── Budget commands ──────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendSnapshot {
+    pub cost_usd: f64,
+    pub tokens: i64,
+}
+
+#[tauri::command]
+pub async fn list_budgets(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::db::BudgetRow>> {
+    state.db.lock().list_budgets()
+}
+
+#[tauri::command]
+pub async fn set_budget(
+    state: State<'_, AppState>,
+    scope_type: String,
+    scope_id: String,
+    period: String,
+    limit_usd: f64,
+) -> AppResult<()> {
+    state.db.lock().upsert_budget(&scope_type, &scope_id, &period, limit_usd)
+}
+
+#[tauri::command]
+pub async fn clear_budget(
+    state: State<'_, AppState>,
+    scope_type: String,
+    scope_id: String,
+    period: String,
+) -> AppResult<()> {
+    state.db.lock().delete_budget(&scope_type, &scope_id, &period)
+}
+
+#[tauri::command]
+pub async fn current_spend(
+    state: State<'_, AppState>,
+    scope_type: String,
+    scope_id: String,
+    period: String,
+) -> AppResult<SpendSnapshot> {
+    let (cost_usd, tokens) = state.db.lock().period_spend(&scope_type, &scope_id, &period)?;
+    Ok(SpendSnapshot { cost_usd, tokens })
+}
+
+#[tauri::command]
+pub async fn export_token_events_csv(
+    state: State<'_, AppState>,
+    start_iso: String,
+    end_iso: String,
+) -> AppResult<String> {
+    state.db.lock().export_token_events_csv(&start_iso, &end_iso)
+}
+
 // ─── Settings ─────────────────────────────────────────────────────
 
 #[tauri::command]
