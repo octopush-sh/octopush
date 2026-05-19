@@ -103,26 +103,30 @@ function MonogramButton({
             : workspace.name
         }
         aria-current={active ? "location" : undefined}
-        className="relative flex h-7 w-7 items-center justify-center rounded-md border font-serif transition"
+        // When a workspace is asking for attention, we pulse the
+        // monogram itself (brass border + halo) instead of a small
+        // dot offset from the corner — that dot was hard to associate
+        // unambiguously with one specific monogram when monograms sit
+        // close together. Pulsing the whole tile makes the source
+        // obvious.
+        className={`relative flex h-7 w-7 items-center justify-center rounded-md border font-serif transition ${
+          showPulse ? "animate-attention-pulse" : ""
+        }`}
         style={{
           color: tint.accent,
-          // Inline borderColor used because tint values are runtime, not Tailwind tokens.
-          // Always set to keep the border 1px box-model present (prevents layout shift on activation).
-          borderColor: active ? tint.accent : "transparent",
-          background: active ? tint.bg : "transparent",
+          borderColor: showPulse
+            ? "var(--color-octo-brass)"
+            : active
+              ? tint.accent
+              : "transparent",
+          background: showPulse
+            ? "var(--brass-ghost)"
+            : active
+              ? tint.bg
+              : "transparent",
         }}
       >
         {mono.glyph}
-        {/* Brass pulse — top-right corner. Renders only when this
-            workspace has an outstanding attention flag and isn't the
-            currently-focused one. */}
-        {showPulse && (
-          <span
-            aria-hidden
-            className="animate-brass-pulse absolute -right-1 -top-1 h-2 w-2 rounded-full"
-            style={{ background: "var(--color-octo-brass)" }}
-          />
-        )}
       </button>
     </div>
   );

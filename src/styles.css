@@ -80,21 +80,21 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
-/* Brass attention pulse — used on workspace monograms when a chat or
-   terminal in that workspace needs the user's eye. */
-@keyframes brass-pulse {
+/* Brass attention pulse — applied directly to the workspace monogram
+   when a chat or terminal in that workspace needs the user's eye.
+   The halo grows outward from the monogram itself so the source of
+   the alert is visually unambiguous (no floating dot to misread). */
+@keyframes attention-pulse {
   0%, 100% {
-    transform: scale(1);
-    box-shadow: 0 0 0 0 var(--brass-dim);
+    box-shadow: 0 0 0 0 rgba(212, 165, 116, 0.55);
   }
   50% {
-    transform: scale(1.15);
-    box-shadow: 0 0 0 4px rgba(212, 165, 116, 0.0);
+    box-shadow: 0 0 0 5px rgba(212, 165, 116, 0);
   }
 }
 
-.animate-brass-pulse {
-  animation: brass-pulse 1.4s var(--ease-octo) infinite;
+.animate-attention-pulse {
+  animation: attention-pulse 1.4s var(--ease-octo) infinite;
 }
 
 /* Utility classes that wire keyframes to Phase 1 ease/dur variables. */

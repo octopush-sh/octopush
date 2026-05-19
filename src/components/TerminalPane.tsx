@@ -243,10 +243,6 @@ export function TerminalPane({
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       term.write(new Uint8Array(ev.payload.bytes));
-      // Track the burst size so the idle-output timer can distinguish
-      // a meaningful notification surface (long output then pause) from
-      // just a shell prompt going quiet.
-      bytesSinceLastPing += ev.payload.bytes.length;
       scheduleIdleCheck();
     }).then((u) => {
       unlistenData = u;
@@ -295,41 +291,83 @@ export function TerminalPane({
       useAttentionStore.getState().ping(workspaceIdRef.current, "terminal");
     });
 
-    // ── Idle-output detection ─────────────────────────────────────
-    // The user's terminal needs them when it emitted a meaningful
-    // burst of output and then went quiet — that's "TUI finished
-    // painting and is waiting for input." Examples we want to catch:
-    //   - Claude Code asking "Do you want to proceed?" (normal buffer)
-    //   - vim/less/k9s waiting after redraw (alt screen)
-    //   - npm install just finishing (normal buffer)
+    // ── "Waiting for input" detection ─────────────────────────────
+    // A pure "idle after output" heuristic is too noisy — Claude
+    // Code's "Cooked for 1m 23s" spinner naturally pauses between
+    // ticks and would chime mid-thinking. Instead we read the
+    // visible buffer at idle time and look for tell-tale "input
+    // expected here" markers:
     //
-    // We DON'T require alt-screen any more — Claude Code and many
-    // modern INK-based CLIs paint into the normal buffer, which was
-    // the bug we shipped in v0.1.4/.5/.6/.7. The new filter is
-    // "enough bytes since the last ping" — a freshly-launched shell
-    // emits only ~50–200 bytes of prompt and won't reach the
-    // threshold; an actual notification surface (long output then
-    // pause) will.
+    //   - Claude Code: "for shortcuts" / "Esc to cancel · Tab to
+    //     amend" / "Do you want to proceed?"
+    //   - Generic prompts: "[y/n]" / "[Y/n]" / "(y/N)" / "Continue?"
+    //   - Press-any-key style: "press any key" / "press enter"
+    //   - Full-screen TUIs (vim/less/k9s/htop) — those switch to
+    //     alt-screen, and a hidden TUI in alt-screen is by
+    //     definition waiting on you.
+    //
+    // Negative filter: if the tail looks like an active spinner
+    // ("Cooked for", "Thinking…", "esc to interrupt"), we suppress
+    // the ping even if a positive marker also appears earlier in
+    // the buffer.
     const IDLE_OUTPUT_MS = 2_000;
-    const MIN_BYTES_FOR_PING = 200;
+    const WAITING_PATTERNS: RegExp[] = [
+      /for shortcuts\b/i,
+      /esc to (cancel|interrupt|exit)/i,
+      /tab to (amend|cycle)/i,
+      /\[\s*[yY]\s*\/\s*[nN]\s*\]/, // [y/n] [Y/n] [y/N]
+      /\(\s*[yY]\s*\/\s*[nN]\s*\)/, // (y/n) variants
+      /\b(continue|proceed)\?/i,
+      /press (any key|enter|return)/i,
+      /do you want to/i,
+    ];
+    const SPINNER_PATTERNS: RegExp[] = [
+      /\bcooked for\b/i, // Claude Code spinner footer
+      /\bthinking\b/i, // generic agent spinner
+      /esc to interrupt/i, // Claude Code "still working" hint
+    ];
+
+    function readTail(): string {
+      try {
+        const buf = term.buffer?.active;
+        if (!buf) return "";
+        // Read the bottom ~15 rows — enough to catch the
+        // "Esc to cancel · …" hint that lives below the question.
+        const end = buf.length;
+        const start = Math.max(0, end - 15);
+        const lines: string[] = [];
+        for (let i = start; i < end; i++) {
+          const line = buf.getLine(i);
+          if (line) lines.push(line.translateToString(true));
+        }
+        return lines.join("\n");
+      } catch {
+        return "";
+      }
+    }
+
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let bytesSinceLastPing = 0;
     const scheduleIdleCheck = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimer = null;
         const visible = visibleRef.current;
-        const bytes = bytesSinceLastPing;
-        const willPing = !visible && bytes >= MIN_BYTES_FOR_PING;
+        if (visible) return; // user already looking — never chime
+        const tail = readTail();
+        const altScreen = term.buffer?.active?.type === "alternate";
+        const spinning = SPINNER_PATTERNS.some((re) => re.test(tail));
+        const waiting = WAITING_PATTERNS.some((re) => re.test(tail));
+        const willPing = !spinning && (waiting || altScreen);
         // eslint-disable-next-line no-console
         console.debug("[attention] idle-output timer fired", {
           workspaceId: workspaceIdRef.current,
           visible,
-          bytesSinceLastPing: bytes,
+          altScreen,
+          spinning,
+          waiting,
           willPing,
         });
         if (!willPing) return;
-        bytesSinceLastPing = 0;
         useAttentionStore
           .getState()
           .ping(workspaceIdRef.current, "terminal");
