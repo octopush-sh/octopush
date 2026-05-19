@@ -36,11 +36,11 @@ describe("ContextHeader", () => {
         gitStatus={{
           branch: "main",
           changedFiles: [
-            { path: "a.ts", status: "modified" },
-            { path: "b.ts", status: "new" },
+            { path: "a.ts", status: "modified", staged: false, unstaged: true },
+            { path: "b.ts", status: "new", staged: false, unstaged: true },
           ],
           ahead: 0,
-          behind: 0,
+          behind: 0, hasUpstream: false,
         }}
       />,
     );
@@ -53,7 +53,7 @@ describe("ContextHeader", () => {
         {...baseProps}
         workspaceName="X"
         branch="main"
-        gitStatus={{ branch: "main", changedFiles: [], ahead: 0, behind: 0 }}
+        gitStatus={{ branch: "main", changedFiles: [], ahead: 0, behind: 0, hasUpstream: false }}
       />,
     );
     expect(screen.queryByText(/unstaged/)).not.toBeInTheDocument();

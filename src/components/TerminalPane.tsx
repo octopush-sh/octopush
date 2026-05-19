@@ -26,6 +26,12 @@ interface Props {
    * the terminal as `restored` in the store so the Companion can show the badge.
    */
   onReattach?: () => void;
+  /**
+   * Called when the user clicks a file-path link rendered in the terminal
+   * output. Receives the raw matched path (may be relative to the workspace
+   * or absolute). The parent typically routes this through Review → Editor.
+   */
+  onOpenFile?: (path: string) => void;
 }
 
 export function TerminalPane({
@@ -37,7 +43,12 @@ export function TerminalPane({
   onSpawn,
   onExit,
   onReattach,
+  onOpenFile,
 }: Props) {
+  // Ref so the link provider (registered once on mount) always reads the
+  // latest callback without re-registering on every prop change.
+  const onOpenFileRef = useRef(onOpenFile);
+  onOpenFileRef.current = onOpenFile;
   // Outer wrapper — stable size, observed by ResizeObserver.
   const wrapperRef = useRef<HTMLDivElement>(null);
   // Inner container — where xterm attaches its DOM.
@@ -123,6 +134,68 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
 
+    // File-path link provider — scans each rendered terminal line for
+    // path-shaped tokens (anything with at least one slash + a short
+    // extension) and turns them into clickable links. Excludes URL
+    // fragments (the WebLinksAddon already handles those).
+    //
+    // Pattern intent:
+    //   - optional `./` or `../` prefix
+    //   - one or more `<chunk>/` segments
+    //   - a final `<chunk>.<ext>` token
+    //   - optional `:line` or `:line:col` suffix (Vite/TS error format)
+    const filePathRegex =
+      /(?<![\w/:])(?:\.{1,2}\/)?(?:[\w@.\-]+\/)+[\w@.\-]+\.[A-Za-z0-9]{1,8}(?::\d+(?::\d+)?)?/g;
+
+    // Some test environments stub Terminal without `registerLinkProvider`;
+    // skip the link-provider registration there.
+    if (typeof term.registerLinkProvider === "function") {
+    term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        const line = term.buffer.active.getLine(bufferLineNumber - 1);
+        if (!line) {
+          callback(undefined);
+          return;
+        }
+        const text = line.translateToString(true);
+        if (!text) {
+          callback([]);
+          return;
+        }
+        const links: Array<{
+          range: {
+            start: { x: number; y: number };
+            end: { x: number; y: number };
+          };
+          text: string;
+          activate: (_e: MouseEvent, txt: string) => void;
+          hover?: () => void;
+          leave?: () => void;
+        }> = [];
+        let match: RegExpExecArray | null;
+        filePathRegex.lastIndex = 0;
+        while ((match = filePathRegex.exec(text)) !== null) {
+          const startCol = match.index + 1;
+          const endCol = startCol + match[0].length - 1;
+          links.push({
+            range: {
+              start: { x: startCol, y: bufferLineNumber },
+              end: { x: endCol, y: bufferLineNumber },
+            },
+            text: match[0],
+            activate: (_e, txt) => {
+              // Strip any `:line[:col]` suffix — the editor opens at top
+              // for now; jumping to a line is a future enhancement.
+              const pathOnly = txt.replace(/:\d+(?::\d+)?$/, "");
+              onOpenFileRef.current?.(pathOnly);
+            },
+          });
+        }
+        callback(links);
+      },
+    });
+    }
+
     // Debounced ResizeObserver — observe the WRAPPER (stable outer box),
     // not the xterm container (whose dimensions shift as content flows).
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -174,6 +247,25 @@ export function TerminalPane({
     listen<PtyReattachedEvent>("pty://reattached", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       onReattachRef.current?.();
+      // Apps that own the screen via alt-screen + sticky status bars
+      // (Claude Code, htop, vim, etc.) don't recover cleanly from a
+      // replayed byte stream because xterm starts in a fresh state but
+      // the replay includes mid-session cursor positioning. Trigger a
+      // SIGWINCH on the PTY a short while after reattach so the inner
+      // app redraws its UI from scratch. The wiggle (cols-1 → cols) is
+      // necessary because the daemon only forwards a SIGWINCH when the
+      // dimensions actually change.
+      setTimeout(() => {
+        const ptyId = ptySessionIdRef.current;
+        const t = termRef.current;
+        if (!ptyId || !t) return;
+        const { rows, cols } = t;
+        if (rows < 1 || cols < 2) return;
+        ipc
+          .resizeSession(ptyId, rows, Math.max(1, cols - 1))
+          .then(() => ipc.resizeSession(ptyId, rows, cols))
+          .catch(() => {});
+      }, 600);
     }).then((u) => {
       unlistenReattached = u;
     });

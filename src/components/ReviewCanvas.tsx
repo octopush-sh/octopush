@@ -7,7 +7,6 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  GitBranch,
   CheckCircle,
   XCircle,
   HelpCircle,
@@ -18,13 +17,14 @@ import {
   PenLine,
   LayoutList,
   CheckSquare,
-  AlertCircle,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { parseFullDiff, type DiffFile, type DiffHunk } from "../lib/diffParser";
 import type { ChatMessage, FileEdit, GitStatus, TestRunResult } from "../lib/types";
 
 // ─── Types ─────────────────────────────────────────────────────────
+
+export type ReviewViewMode = "diff" | "editor";
 
 interface Props {
   workspaceId: string;
@@ -37,6 +37,11 @@ interface Props {
   initialTestCommand?: string | null;
   /** Render children (Editor mode) when not in diff view. */
   children?: React.ReactNode;
+  /** Controlled view mode — when provided, the canvas is fully driven by
+   *  the parent. Used so other surfaces (FILES rail, terminal links, chat
+   *  message links) can deep-link straight into Diff or Editor view. */
+  viewMode?: ReviewViewMode;
+  onViewModeChange?: (next: ReviewViewMode) => void;
 }
 
 // ─── Hunk card ─────────────────────────────────────────────────────
@@ -110,7 +115,9 @@ function HunkCard({
           const msg = await ipc.getMessage(fromProp.messageId);
           setWhyMessage(msg);
         } else {
-          setWhyError("No agent message linked to this file. Was it edited by an agent?");
+          setWhyError(
+            "This change isn't linked to an agent turn — likely a manual edit (or made before agent-edit tracking landed).",
+          );
         }
       }
     } catch (e) {
@@ -124,27 +131,37 @@ function HunkCard({
 
   const isAccepted = status === "accepted";
 
+  // Skip the @@ header line — it's already rendered in the card header.
+  const bodyLines = hunk.lines.length > 0 && hunk.lines[0].startsWith("@@")
+    ? hunk.lines.slice(1)
+    : hunk.lines;
+
   return (
     <div
       className={[
-        "rounded-md border transition-all duration-200",
+        "overflow-hidden rounded-md border transition-all duration-200",
         isAccepted
           ? "border-octo-hairline bg-octo-panel/40 opacity-60"
           : "border-octo-hairline bg-octo-panel",
       ].join(" ")}
     >
       {/* Hunk header */}
-      <div className="flex items-center gap-2 border-b border-octo-hairline px-3 py-1.5">
-        <span className="font-mono text-[10px] text-octo-textMuted">{hunk.header}</span>
-        <span className="ml-auto flex items-center gap-2 text-[10px]">
+      <div className="flex items-center gap-2 border-b border-octo-hairline bg-octo-onyx/40 px-3 py-1.5">
+        <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+          {formatHunkRange(hunk.header)}
+        </span>
+        <span className="ml-auto flex items-center gap-2 font-mono text-[10px]">
           {hunk.additions > 0 && (
-            <span className="text-octo-success">+{hunk.additions}</span>
+            <span className="text-octo-verdigris">+{hunk.additions}</span>
           )}
           {hunk.deletions > 0 && (
-            <span className="text-octo-danger">-{hunk.deletions}</span>
+            <span className="text-octo-rouge">−{hunk.deletions}</span>
           )}
           {isAccepted && (
-            <span className="rounded-sm bg-octo-brass/20 px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-octo-brass">
+            <span
+              className="rounded-sm px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.18em] text-octo-brass"
+              style={{ background: "var(--brass-ghost)" }}
+            >
               Staged
             </span>
           )}
@@ -153,8 +170,8 @@ function HunkCard({
 
       {/* Diff lines */}
       <div className="overflow-x-auto">
-        <pre className="px-0 font-mono text-xs leading-relaxed">
-          {hunk.lines.map((line, i) => (
+        <pre className="px-0 font-mono text-[11.5px] leading-[1.55]">
+          {bodyLines.map((line, i) => (
             <DiffLine key={i} line={line} />
           ))}
         </pre>
@@ -162,19 +179,23 @@ function HunkCard({
 
       {/* Action bar */}
       {!isAccepted && (
-        <div className="flex items-center justify-end gap-2 border-t border-octo-hairline px-3 py-2">
+        <div className="flex items-center justify-end gap-1 border-t border-octo-hairline bg-octo-onyx/30 px-3 py-2">
+          {/* Why? — tertiary, mute */}
           <button
             onClick={handleWhy}
             disabled={whyLoading}
-            className="flex items-center gap-1 rounded px-2.5 py-1 text-xs text-octo-textMuted transition-colors hover:bg-octo-bg hover:text-octo-text"
+            className="flex items-center gap-1 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
           >
-            <HelpCircle size={12} />
+            <HelpCircle size={11} />
             Why?
           </button>
+          <span className="mx-1 h-3 w-px bg-octo-hairline" aria-hidden />
+          {/* Reject — secondary, rouge-dimmed */}
           <button
             onClick={handleReject}
             disabled={status === "rejecting" || status === "accepting"}
-            className="flex items-center gap-1 rounded px-2.5 py-1 text-xs text-octo-danger/80 transition-colors hover:bg-octo-danger/10 hover:text-octo-danger"
+            className="flex items-center gap-1 rounded px-2.5 py-1 text-[11px] text-octo-sage transition-colors hover:bg-octo-rouge/10 hover:text-octo-rouge disabled:opacity-40"
+            style={{ border: "1px solid transparent" }}
           >
             {status === "rejecting" ? (
               <Loader2 size={12} className="animate-spin" />
@@ -183,10 +204,15 @@ function HunkCard({
             )}
             Reject
           </button>
+          {/* Accept — primary, brass-solid */}
           <button
             onClick={handleAccept}
             disabled={status === "rejecting" || status === "accepting"}
-            className="flex items-center gap-1 rounded bg-octo-brass/10 px-2.5 py-1 text-xs text-octo-brass transition-colors hover:bg-octo-brass/20"
+            className="flex items-center gap-1.5 rounded px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors disabled:opacity-40"
+            style={{
+              background: "var(--brass-ghost)",
+              border: "1px solid var(--brass-dim)",
+            }}
           >
             {status === "accepting" ? (
               <Loader2 size={12} className="animate-spin" />
@@ -200,31 +226,34 @@ function HunkCard({
 
       {/* Why? drawer */}
       {whyOpen && (
-        <div className="border-t border-octo-hairline bg-octo-bg/60 px-3 py-3">
+        <div className="border-t border-octo-hairline bg-octo-onyx/60 px-3 py-3">
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-octo-brass">
+            <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-octo-brass">
               § Agent origin
             </span>
             <button
               onClick={() => setWhyOpen(false)}
-              className="rounded p-0.5 text-octo-textMuted hover:text-octo-text"
+              aria-label="Close"
+              className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
             >
-              <X size={12} />
+              <X size={14} />
             </button>
           </div>
           {whyLoading && (
-            <div className="flex items-center gap-2 text-xs text-octo-textMuted">
+            <div className="flex items-center gap-2 text-[11px] text-octo-sage">
               <Loader2 size={12} className="animate-spin" />
               Looking up agent message…
             </div>
           )}
           {whyError && (
-            <p className="text-xs text-octo-danger">{whyError}</p>
+            <p className="font-serif italic text-[12px] leading-[1.5] text-octo-sage">
+              {whyError}
+            </p>
           )}
           {whyMessage && (
-            <div className="space-y-1">
-              <div className="flex items-center gap-2 text-[10px] text-octo-textMuted">
-                <span className="font-mono">{whyMessage.role}</span>
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+                <span className="text-octo-brass">{whyMessage.role}</span>
                 <span>·</span>
                 <span>{new Date(whyMessage.createdAt).toLocaleTimeString()}</span>
                 {whyMessage.model && (
@@ -234,7 +263,7 @@ function HunkCard({
                   </>
                 )}
               </div>
-              <p className="max-h-32 overflow-y-auto whitespace-pre-wrap text-xs text-octo-text">
+              <p className="max-h-32 overflow-y-auto whitespace-pre-wrap text-[12px] leading-[1.55] text-octo-ivory">
                 {whyMessage.content.length > 800
                   ? whyMessage.content.slice(0, 800) + "…"
                   : whyMessage.content}
@@ -247,25 +276,41 @@ function HunkCard({
   );
 }
 
+/** Strip the trailing function-context from `@@ -X,Y +A,B @@ extra` for a
+ *  cleaner hunk label, e.g. "lines 12–18 → 12–22". */
+function formatHunkRange(header: string): string {
+  const m = header.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+  if (!m) return header;
+  const [, oldStart, oldCount, newStart, newCount] = m;
+  const oldEnd = parseInt(oldStart, 10) + (parseInt(oldCount || "1", 10) - 1);
+  const newEnd = parseInt(newStart, 10) + (parseInt(newCount || "1", 10) - 1);
+  return `lines ${oldStart}–${oldEnd} → ${newStart}–${newEnd}`;
+}
+
 // ─── Diff line ─────────────────────────────────────────────────────
 
 function DiffLine({ line }: { line: string }) {
-  if (line.startsWith("@@")) {
-    return (
-      <div className="bg-blue-950/20 px-3 text-blue-400/80">{line}</div>
-    );
-  }
   if (line.startsWith("+") && !line.startsWith("+++")) {
     return (
-      <div className="bg-emerald-950/25 px-3 text-emerald-300">{line}</div>
+      <div
+        className="px-3 text-octo-verdigris"
+        style={{ background: "rgba(143, 201, 168, 0.08)" }}
+      >
+        {line}
+      </div>
     );
   }
   if (line.startsWith("-") && !line.startsWith("---")) {
     return (
-      <div className="bg-red-950/25 px-3 text-red-300">{line}</div>
+      <div
+        className="px-3 text-octo-rouge"
+        style={{ background: "rgba(209, 139, 139, 0.08)" }}
+      >
+        {line}
+      </div>
     );
   }
-  return <div className="px-3 text-octo-textMuted">{line}</div>;
+  return <div className="px-3 text-octo-sage">{line}</div>;
 }
 
 // ─── Test drawer ───────────────────────────────────────────────────
@@ -295,7 +340,8 @@ function TestDrawer({
         </span>
         <button
           onClick={onClose}
-          className="ml-auto rounded p-1 text-octo-textMuted hover:text-octo-text"
+          aria-label="Dismiss"
+          className="ml-auto flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
           title="Dismiss (Esc)"
         >
           <X size={14} />
@@ -330,8 +376,15 @@ export function ReviewCanvas({
   onDiffChange,
   initialTestCommand,
   children,
+  viewMode: viewModeProp,
+  onViewModeChange,
 }: Props) {
-  const [viewMode, setViewMode] = useState<"diff" | "editor">("diff");
+  const [viewModeState, setViewModeState] = useState<ReviewViewMode>("diff");
+  const viewMode = viewModeProp ?? viewModeState;
+  const setViewMode = (next: ReviewViewMode) => {
+    if (onViewModeChange) onViewModeChange(next);
+    else setViewModeState(next);
+  };
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
 
   // Test runner state
@@ -404,57 +457,50 @@ export function ReviewCanvas({
     }
   }
 
-  const branch = gitStatus?.branch ?? null;
   const fileCount = gitStatus?.changedFiles.length ?? 0;
-  const addCount = gitDiff.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).length;
-  const delCount = gitDiff.split("\n").filter((l) => l.startsWith("-") && !l.startsWith("---")).length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {/* ── Toolbar ─────────────────────────────────────────────── */}
-      <header className="flex shrink-0 items-center gap-3 border-b border-octo-hairline px-4 py-2">
-        {/* Branch + summary */}
-        <div className="flex items-center gap-2 text-xs text-octo-textMuted">
-          {branch && (
-            <span className="flex items-center gap-1.5 rounded bg-zinc-800/80 px-2 py-0.5 font-mono">
-              <GitBranch size={11} className="text-octo-brass" />
-              <span className="text-octo-text">{branch}</span>
-            </span>
-          )}
-          {fileCount > 0 && (
-            <span>
-              {fileCount} file{fileCount !== 1 ? "s" : ""}
-              {" · "}
-              <span className="text-emerald-400">+{addCount}</span>
-              {" / "}
-              <span className="text-red-400">-{delCount}</span>
-            </span>
-          )}
-        </div>
-
+      {/* Same height as the left rail's CHANGES eyebrow and the right
+          rail's FILES eyebrow — the three form one continuous rhythm
+          row across the three columns. No floating stats on the left:
+          file count lives in the workspace header, +/- line totals live
+          in the CHANGES rail. */}
+      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-octo-hairline bg-octo-panel px-4">
         <div className="ml-auto flex items-center gap-2">
           {/* View toggle */}
-          <div className="flex items-center rounded-md border border-octo-hairline">
+          <div className="flex items-center rounded-md border border-octo-hairline overflow-hidden">
             <button
               onClick={() => setViewMode("diff")}
               className={[
-                "flex items-center gap-1 rounded-l-md px-2.5 py-1 text-xs transition-colors",
+                "flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors",
                 viewMode === "diff"
-                  ? "bg-octo-brass/10 text-octo-brass"
-                  : "text-octo-textMuted hover:text-octo-text",
+                  ? "text-octo-brass"
+                  : "text-octo-mute hover:text-octo-sage",
               ].join(" ")}
+              style={
+                viewMode === "diff"
+                  ? { background: "var(--brass-ghost)" }
+                  : undefined
+              }
             >
               <LayoutList size={12} />
-              Diff view
+              Diff
             </button>
             <button
               onClick={() => setViewMode("editor")}
               className={[
-                "flex items-center gap-1 rounded-r-md border-l border-octo-hairline px-2.5 py-1 text-xs transition-colors",
+                "flex items-center gap-1 border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors",
                 viewMode === "editor"
-                  ? "bg-octo-brass/10 text-octo-brass"
-                  : "text-octo-textMuted hover:text-octo-text",
+                  ? "text-octo-brass"
+                  : "text-octo-mute hover:text-octo-sage",
               ].join(" ")}
+              style={
+                viewMode === "editor"
+                  ? { background: "var(--brass-ghost)" }
+                  : undefined
+              }
             >
               <PenLine size={12} />
               Editor
@@ -462,7 +508,10 @@ export function ReviewCanvas({
           </div>
 
           {/* Test runner */}
-          <div className="flex items-center gap-1 rounded-md border border-octo-hairline px-1">
+          <div className="flex items-center gap-0.5 rounded-md border border-octo-hairline pl-2 pr-1">
+            <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+              tests
+            </span>
             {testCommandEditing ? (
               <input
                 ref={testInputRef}
@@ -475,23 +524,28 @@ export function ReviewCanvas({
                     setTestCommandEditing(false);
                   }
                 }}
-                className="w-32 bg-transparent px-1.5 py-1 font-mono text-xs text-octo-text outline-none placeholder-octo-textMuted"
+                className="w-36 bg-transparent px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
                 placeholder="npm test"
                 autoFocus
               />
             ) : (
               <button
                 onClick={() => setTestCommandEditing(true)}
-                className="px-1.5 py-1 font-mono text-xs text-octo-textMuted hover:text-octo-text"
-                title="Click to edit test command"
+                className={[
+                  "px-2 py-1 transition-colors",
+                  testCommand
+                    ? "font-mono text-[11px] text-octo-sage hover:text-octo-ivory"
+                    : "font-serif italic text-[11px] text-octo-mute hover:text-octo-sage",
+                ].join(" ")}
+                title="Click to set the command Octopus runs for tests"
               >
-                {testCommand || "no test command"}
+                {testCommand || "set a test command…"}
               </button>
             )}
             <button
               onClick={handleRunTests}
               disabled={!testCommand.trim() || testRunning}
-              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-octo-textMuted transition-colors hover:bg-octo-bg hover:text-octo-text disabled:opacity-40"
+              className="flex items-center gap-1 rounded px-2 py-1 text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-brass disabled:opacity-30"
               title="Run tests"
             >
               {testRunning ? (
@@ -506,7 +560,11 @@ export function ReviewCanvas({
           {fileCount > 0 && viewMode === "diff" && (
             <button
               onClick={handleAcceptAll}
-              className="flex items-center gap-1.5 rounded-md bg-octo-brass/10 px-3 py-1 text-xs text-octo-brass transition-colors hover:bg-octo-brass/20"
+              className="flex items-center gap-1.5 rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors"
+              style={{
+                background: "var(--brass-ghost)",
+                border: "1px solid var(--brass-dim)",
+              }}
               title="Stages every change. Commit from the left panel."
             >
               <CheckSquare size={12} />
@@ -522,7 +580,11 @@ export function ReviewCanvas({
         {viewMode === "diff" && (
           <div className="absolute inset-0 overflow-y-auto">
             {diffFiles.length === 0 ? (
-              <EmptyDiffState />
+              <EmptyDiffState
+                stagedCount={
+                  gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0
+                }
+              />
             ) : (
               <div className="space-y-6 px-4 py-4">
                 {diffFiles.map((file) => (
@@ -584,32 +646,42 @@ function FileDiffSection({
 
   const typeLabel =
     file.changeType === "new"
-      ? "new file"
+      ? "NEW"
       : file.changeType === "deleted"
-        ? "deleted"
-        : "modified";
+        ? "DELETED"
+        : "MODIFIED";
 
   const typeColor =
     file.changeType === "new"
-      ? "text-octo-success"
+      ? "text-octo-verdigris"
       : file.changeType === "deleted"
-        ? "text-octo-danger"
-        : "text-octo-textMuted";
+        ? "text-octo-rouge"
+        : "text-octo-brass";
 
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-3 scroll-mt-4"
+      id={`review-file-${encodeURIComponent(file.filePath)}`}
+    >
       {/* File header */}
-      <div className="flex items-center gap-2">
-        <span className="font-mono text-sm text-octo-text">{file.filePath}</span>
-        <span className={`text-xs ${typeColor}`}>({typeLabel})</span>
-        <ChevronRight size={13} className="text-octo-textMuted" />
-        <span className="text-xs text-octo-textMuted">
+      <div className="flex items-center gap-2 border-b border-octo-hairline pb-1.5">
+        <span
+          className={`font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
+        >
+          {typeLabel}
+        </span>
+        <span className="text-octo-hairline">·</span>
+        <span className="font-mono text-[12.5px] text-octo-ivory">
+          {file.filePath}
+        </span>
+        <ChevronRight size={11} className="text-octo-mute" />
+        <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
           {visibleHunks.length} hunk{visibleHunks.length !== 1 ? "s" : ""}
         </span>
       </div>
 
       {/* Hunk cards */}
-      <div className="space-y-2">
+      <div className="space-y-3">
         {visibleHunks.map((hunkIdx) => (
           <HunkCard
             key={hunkIdx}
@@ -629,15 +701,22 @@ function FileDiffSection({
 
 // ─── Empty state ───────────────────────────────────────────────────
 
-function EmptyDiffState() {
+function EmptyDiffState({ stagedCount }: { stagedCount: number }) {
+  const hasStaged = stagedCount > 0;
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-      <AlertCircle size={28} className="text-octo-textMuted opacity-40" />
-      <p className="text-sm text-octo-textMuted">No changes to review</p>
-      <p className="max-w-xs text-xs text-octo-textMuted opacity-60">
-        Differences between this workspace and the base branch will appear here
-        when the agent writes files.
+    <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+      <CheckCircle size={24} className="text-octo-brass opacity-60" />
+      <div className="font-serif italic text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
+        {hasStaged
+          ? `${stagedCount} file${stagedCount !== 1 ? "s" : ""} staged.`
+          : "Nothing to review."}
+      </div>
+      <p className="max-w-xs text-[12px] leading-[1.6] text-octo-sage">
+        {hasStaged
+          ? "Write a commit message in the Changes rail and commit when you're ready."
+          : "When the agent edits files in this workspace, the diff will appear here for hunk-by-hunk approval."}
       </p>
+      <div className="h-px w-7 bg-octo-brass/60" aria-hidden />
     </div>
   );
 }

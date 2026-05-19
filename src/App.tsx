@@ -14,10 +14,11 @@ import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
 import { EditorPane } from "./components/EditorPane";
 import { EditorTabs } from "./components/EditorTabs";
-import { ReviewCanvas } from "./components/ReviewCanvas";
+import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { useEditorStore } from "./stores/editorStore";
 import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
+import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
@@ -34,7 +35,7 @@ import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
-import type { GitStatus, TintName } from "./lib/types";
+import type { GitStatus, OpenPr, TintName } from "./lib/types";
 
 interface ChatRef {
   id: string;
@@ -98,6 +99,8 @@ function App() {
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [showPalette, setShowPalette] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchMode, setSearchMode] = useState<"files" | "text">("files");
   const [showCreator, setShowCreator] = useState(false);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
   const [showProjectSwitcher, setShowProjectSwitcher] = useState(false);
@@ -116,6 +119,10 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // Per-workspace cache of the most recently fetched open PR (or null when
+  // there isn't one). Keyed by workspace id so switching back to a
+  // workspace doesn't flicker until the next refresh.
+  const [openPrByWs, setOpenPrByWs] = useState<Record<string, OpenPr | null>>({});
 
   // Layout version (forces TerminalPane fit-resize when sidebar/companion toggle)
   const layoutVersionRef = useRef(0);
@@ -291,6 +298,36 @@ function App() {
     };
   }, [activeWorkspaceId, workspaces, project]);
 
+  // ── Open-PR fetch ──
+  // Fetch once per workspace switch and then every 60s. GitHub's
+  // unauthenticated rate limit is 60 req/hr per IP, so a faster cadence
+  // would exhaust it within a few workspace switches.
+  useEffect(() => {
+    const ws = workspaces.find((w) => w.id === activeWorkspaceId);
+    if (!ws) return;
+    const path = ws.worktreePath ?? project?.path;
+    if (!path) return;
+    let cancelled = false;
+    const fetchPr = () => {
+      ipc
+        .findOpenPr(path)
+        .then((pr) => {
+          if (!cancelled) {
+            setOpenPrByWs((prev) => ({ ...prev, [ws.id]: pr }));
+          }
+        })
+        .catch(() => {
+          // Network / auth errors are non-fatal — just leave the chip hidden.
+        });
+    };
+    fetchPr();
+    const id = setInterval(fetchPr, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [activeWorkspaceId, workspaces, project]);
+
   // ── Mode helpers ──
   const activeMode: WorkspaceMode =
     (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
@@ -364,6 +401,22 @@ function App() {
       if (mod && !e.shiftKey && e.key === "k") {
         e.preventDefault();
         setShowPalette((v) => !v);
+        return;
+      }
+
+      // ⌘P → file finder (workspace-wide fuzzy file search)
+      if (mod && !e.shiftKey && e.key === "p") {
+        e.preventDefault();
+        setSearchMode("files");
+        setShowSearch(true);
+        return;
+      }
+
+      // ⌘⇧F → workspace-wide text search
+      if (mod && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        setSearchMode("text");
+        setShowSearch(true);
         return;
       }
 
@@ -513,6 +566,51 @@ function App() {
 
   const openFileInEditor = useEditorStore((s) => s.openFile);
 
+  // Lifted from ReviewCanvas so any surface (terminal, chat link, FILES tree,
+  // CHANGES rail) can deep-link straight into either the diff or the editor.
+  const [reviewViewMode, setReviewViewMode] = useState<ReviewViewMode>("diff");
+
+  /**
+   * Open `path` (relative or absolute) in the Review canvas.
+   *
+   * @param view  "editor" → switches to the in-canvas Editor and opens the
+   *              file as a tab. "diff" → switches to the Diff view and
+   *              scrolls the canvas to that file's hunks.
+   */
+  const navigateToFile = useCallback(
+    (path: string, view: ReviewViewMode = "editor") => {
+      if (!activeWorkspace) return;
+      const rootPath = activeWorkspace.worktreePath || project!.path;
+      const absolute = path.startsWith("/") ? path : `${rootPath}/${path}`;
+      const relative = absolute.startsWith(rootPath + "/")
+        ? absolute.slice(rootPath.length + 1)
+        : path;
+
+      setMode("review");
+      setReviewViewMode(view);
+
+      if (view === "editor") {
+        openFileInEditor(activeWorkspace.id, absolute).catch((e) =>
+          pushToast({
+            level: "error",
+            title: "Could not open file",
+            body: String(e),
+          }),
+        );
+      } else {
+        // Diff view — scroll to the anchor for that file. Defer one frame so
+        // the canvas has switched modes before we try to find the anchor.
+        requestAnimationFrame(() => {
+          const el = document.getElementById(
+            `review-file-${encodeURIComponent(relative)}`,
+          );
+          el?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      }
+    },
+    [activeWorkspace, project, openFileInEditor, setMode],
+  );
+
   const fileTreeProps = useMemo(() => {
     if (!activeWorkspace) return undefined;
     const rootPath = activeWorkspace.worktreePath || project!.path;
@@ -522,9 +620,10 @@ function App() {
       changedPaths: new Set(
         (gitStatus?.changedFiles ?? []).map((f) => `${rootPath}/${f.path}`),
       ),
-      onFileClick: (p: string) => openFileInEditor(activeWorkspace.id, p).catch(console.error),
+      // FILES rail click → land in the Editor with the file open as a tab.
+      onFileClick: (p: string) => navigateToFile(p, "editor"),
     };
-  }, [activeWorkspace, project, gitStatus, openFileInEditor]);
+  }, [activeWorkspace, project, gitStatus, navigateToFile]);
 
   // ── Customize menu submit ──
   const handleCustomizeSubmit = useCallback(
@@ -597,7 +696,29 @@ function App() {
         onNewWorkspace={() => setShowCreator(true)}
       />
 
-      <main className="flex min-w-0 flex-1 overflow-hidden">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {/* TOP HEADER BAND — spans the full main width and includes the mode
+            switcher on its right, so the entire top of the app reads as one
+            unified header card instead of two floating containers in
+            separate columns. */}
+        {activeWorkspace && (
+          <ContextHeader
+            projectName={project.name}
+            onOpenProjectSwitcher={() => {
+              loadRecentProjects();
+              setShowProjectSwitcher(true);
+            }}
+            workspaceName={activeWorkspace.name}
+            branch={activeWorkspace.branch}
+            gitStatus={gitStatus}
+            openPr={openPrByWs[activeWorkspace.id] ?? null}
+            onOpenPr={(url) => ipc.openFileInSystem(url)}
+            rightSlot={<ModeSwitcher mode={activeMode} onChange={setMode} />}
+          />
+        )}
+
+        {/* CONTENT ROW — columns flush under the header band. */}
+        <div className="flex min-w-0 flex-1 overflow-hidden">
         {/* LEFT COLUMN — always mounted so the canvas (and the TerminalPanes
             inside the Run mode panel) survive any moment when there's no
             active workspace, e.g. just after creating a fresh project that
@@ -606,19 +727,6 @@ function App() {
             unmounting every running PTY whenever the user crossed that
             boundary. */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
-          {activeWorkspace && (
-            <ContextHeader
-              projectName={project.name}
-              onOpenProjectSwitcher={() => {
-                loadRecentProjects();
-                setShowProjectSwitcher(true);
-              }}
-              workspaceName={activeWorkspace.name}
-              branch={activeWorkspace.branch}
-              gitStatus={gitStatus}
-            />
-          )}
-
           <div className="relative min-w-0 flex-1 overflow-hidden">
             {/* Talk panel — chat for the active workspace. */}
             <div
@@ -636,6 +744,7 @@ function App() {
                   workspaceId={activeChatId!}
                   workspacePath={activeWorkspace.worktreePath || project.path}
                   onOpenSettings={() => setSettingsTab("general")}
+                  onOpenInEditor={(p) => navigateToFile(p, "editor")}
                 />
               )}
             </div>
@@ -676,6 +785,7 @@ function App() {
                         // Mark as running (it already was, but be explicit).
                         markRunning(t.workspaceId, t.id, true);
                       }}
+                      onOpenFile={(p) => navigateToFile(p, "editor")}
                     />
                   );
                 })}
@@ -702,11 +812,26 @@ function App() {
             >
               {activeWorkspace && (
                 <div className="flex h-full min-h-0">
-                  {/* Left: slim Changes panel (file index + commit) */}
-                  <div className="w-[280px] shrink-0 border-r border-octo-hairline">
+                  {/* Left: slim Changes outline (file index + commit) */}
+                  <div className="w-[260px] shrink-0 border-r border-octo-hairline">
                     <ChangesPanel
                       projectPath={activeWorkspace.worktreePath || project.path}
                       diff={gitDiff}
+                      onFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                      onChange={() => {
+                        // Refetch diff + status after commit / push so the
+                        // canvas catches up immediately.
+                        const path = activeWorkspace.worktreePath || project.path;
+                        Promise.all([
+                          ipc.getGitStatus(path),
+                          ipc.getGitDiff(path).catch(() => ""),
+                        ])
+                          .then(([s, d]) => {
+                            setGitStatus(s);
+                            setGitDiff(d);
+                          })
+                          .catch(() => {});
+                      }}
                     />
                   </div>
 
@@ -717,6 +842,8 @@ function App() {
                       workspacePath={activeWorkspace.worktreePath || project.path}
                       gitStatus={gitStatus}
                       gitDiff={gitDiff}
+                      viewMode={reviewViewMode}
+                      onViewModeChange={setReviewViewMode}
                       onDiffChange={() => {
                         // Re-fetch git status + diff after a hunk action
                         const path = activeWorkspace.worktreePath || project.path;
@@ -785,11 +912,11 @@ function App() {
           </div>
         </div>
 
-        {/* RIGHT COLUMN — ModeSwitcher + Companion always mounted. When
-            there's no active workspace the panel just shows empty/default
-            data; the structure is preserved. */}
-        <div className="flex w-[312px] shrink-0 flex-col gap-3 p-4 pl-0">
-          <ModeSwitcher mode={activeMode} onChange={setMode} />
+        {/* RIGHT COLUMN — Companion always mounted. When there's no active
+            workspace the panel just shows empty/default data; the structure
+            is preserved. The mode switcher now lives in the unified header
+            band above. */}
+        <div className="flex w-[312px] shrink-0 flex-col p-4 pl-0 pt-0">
           <Companion
             mode={activeMode}
             workspaceId={activeWorkspaceId}
@@ -797,6 +924,7 @@ function App() {
             historyProps={companionHistoryProps}
             fileTree={fileTreeProps}
           />
+        </div>
         </div>
       </main>
 
@@ -828,6 +956,16 @@ function App() {
         }}
         onToggleTokens={() => setSettingsTab("usage")}
       />
+
+      {activeWorkspace && (
+        <WorkspaceSearchPalette
+          open={showSearch}
+          initialMode={searchMode}
+          workspacePath={activeWorkspace.worktreePath || project!.path}
+          onClose={() => setShowSearch(false)}
+          onOpenFile={(relativePath) => navigateToFile(relativePath, "editor")}
+        />
+      )}
 
       <Settings
         open={settingsTab !== null}

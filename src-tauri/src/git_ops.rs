@@ -12,6 +12,10 @@ pub struct GitStatus {
     pub changed_files: Vec<FileChange>,
     pub ahead: usize,
     pub behind: usize,
+    /// Whether the current branch has an upstream tracking branch configured.
+    /// `false` means the branch has never been pushed — Publish needs to
+    /// `--set-upstream` to create it.
+    pub has_upstream: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -19,6 +23,10 @@ pub struct GitStatus {
 pub struct FileChange {
     pub path: String,
     pub status: String,
+    /// The file has changes in the index (staged for commit).
+    pub staged: bool,
+    /// The file has unstaged worktree modifications.
+    pub unstaged: bool,
 }
 
 pub fn init_repo(path: &Path) -> AppResult<()> {
@@ -149,14 +157,46 @@ pub fn get_status(path: &Path) -> AppResult<GitStatus> {
     let changed_files: Vec<FileChange> = statuses.iter().map(|entry| {
         let path = entry.path().unwrap_or("").to_string();
         let st = entry.status();
+        let staged =
+            st.is_index_new() || st.is_index_modified() || st.is_index_deleted()
+            || st.is_index_renamed() || st.is_index_typechange();
+        let unstaged =
+            st.is_wt_new() || st.is_wt_modified() || st.is_wt_deleted()
+            || st.is_wt_renamed() || st.is_wt_typechange();
         let status = if st.is_index_new() || st.is_wt_new() { "new" }
             else if st.is_index_modified() || st.is_wt_modified() { "modified" }
             else if st.is_index_deleted() || st.is_wt_deleted() { "deleted" }
             else if st.is_index_renamed() || st.is_wt_renamed() { "renamed" }
             else { "unknown" };
-        FileChange { path, status: status.to_string() }
+        FileChange {
+            path,
+            status: status.to_string(),
+            staged,
+            unstaged,
+        }
     }).collect();
-    Ok(GitStatus { branch, changed_files, ahead: 0, behind: 0 })
+
+    // Compute ahead/behind against the upstream tracking branch, if any.
+    let upstream = upstream_ahead_behind(&repo);
+    let has_upstream = upstream.is_some();
+    let (ahead, behind) = upstream.unwrap_or((0, 0));
+
+    Ok(GitStatus { branch, changed_files, ahead, behind, has_upstream })
+}
+
+/// Return (ahead, behind) commits relative to the configured upstream of
+/// HEAD. Returns None if no upstream is configured (e.g. a branch that has
+/// never been pushed) or the comparison cannot be computed.
+fn upstream_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
+    let head = repo.head().ok()?;
+    let branch_name = head.shorthand()?;
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .ok()?;
+    let upstream = branch.upstream().ok()?;
+    let local_oid = head.target()?;
+    let upstream_oid = upstream.get().target()?;
+    repo.graph_ahead_behind(local_oid, upstream_oid).ok()
 }
 
 pub fn create_branch(path: &Path, branch_name: &str, from: &str) -> AppResult<()> {
@@ -229,7 +269,15 @@ pub fn delete_branch(path: &Path, branch_name: &str) -> AppResult<()> {
 
 pub fn get_diff_text(path: &Path) -> AppResult<String> {
     let repo = open_repo(path)?;
-    let diff = repo.diff_index_to_workdir(None, None)
+    // Include untracked files (treat each as a synthesized "new file" diff)
+    // and recurse into untracked directories. Without these flags, brand-new
+    // files in the worktree are invisible to the Review canvas — see the
+    // "Nothing to review" bug on workspaces where every change is a new file.
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = repo.diff_index_to_workdir(None, Some(&mut opts))
         .map_err(|e| AppError::Other(format!("diff: {e}")))?;
     let mut buf = Vec::new();
     diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {

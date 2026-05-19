@@ -58,14 +58,15 @@ export function EditorTabs({ workspaceId }: Props) {
               </span>
             )}
 
-            {/* Close button (visible on hover or when active) */}
+            {/* Close button — bigger tap target (20×20) with a clear
+                rouge hover so it reads as a destructive action. */}
             <button
               type="button"
               data-testid={`close-tab-${file.path}`}
-              className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-sm font-mono text-[10px] transition-opacity duration-[220ms] ${
+              className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-sm font-mono text-[14px] leading-none transition-all duration-[220ms] hover:bg-octo-rouge/15 hover:!text-octo-rouge ${
                 isActive
-                  ? "opacity-60 hover:opacity-100"
-                  : "opacity-0 group-hover:opacity-60 hover:!opacity-100"
+                  ? "opacity-70"
+                  : "opacity-0 group-hover:opacity-70"
               }`}
               style={{ color: "var(--color-octo-sage)" }}
               onClick={(e) => {

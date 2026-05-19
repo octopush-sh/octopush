@@ -185,6 +185,16 @@ pub fn run() {
             commands::revert_hunk,
             commands::stage_hunk,
             commands::stage_all_changes,
+            // Stage / commit / push flow
+            commands::stage_file,
+            commands::unstage_file,
+            commands::unstage_all_changes,
+            commands::commit_changes,
+            commands::push_branch,
+            commands::find_open_pr,
+            // Workspace-wide file & text search
+            commands::list_workspace_files,
+            commands::search_workspace_text,
             // Test runner
             commands::run_test_command,
             commands::set_workspace_test_command,

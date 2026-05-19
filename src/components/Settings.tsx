@@ -993,8 +993,9 @@ function BudgetRow({
         <button
           type="button"
           onClick={onClear}
-          className="shrink-0 rounded px-1 font-mono text-[9px] text-octo-mute transition hover:text-octo-rouge"
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded font-mono text-[14px] leading-none text-octo-mute transition hover:bg-octo-rouge/15 hover:text-octo-rouge"
           title="Remove budget"
+          aria-label="Remove budget"
         >
           ×
         </button>

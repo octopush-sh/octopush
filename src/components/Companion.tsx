@@ -45,20 +45,26 @@ export function Companion({
 }: Props) {
   return (
     <aside
-      className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto rounded-xl border border-octo-hairline bg-octo-panel p-4"
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-xl border border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
+      {/* Talk and Run modes keep the legacy inner padding. Review mode
+          uses a flush top-bar (FILES eyebrow) that aligns with the canvas
+          toolbar and CHANGES rail eyebrow, so it provides its own
+          padding internally. */}
       {mode === "talk" && (
-        <>
+        <div className="flex flex-col gap-4 p-4">
           <CompanionContext
             {...contextProps}
             workspaceId={workspaceId ?? undefined}
           />
           <CompanionHistory {...historyProps} />
-        </>
+        </div>
       )}
       {mode === "run" && workspaceId && (
-        <CompanionTerminals workspaceId={workspaceId} />
+        <div className="p-4">
+          <CompanionTerminals workspaceId={workspaceId} />
+        </div>
       )}
       {mode === "review" && fileTree && (
         <CompanionFileTree {...fileTree} />

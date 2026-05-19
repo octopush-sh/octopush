@@ -20,9 +20,18 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
   onOpenSettings?: () => void;
+  /** Open a file (relative or absolute) in the in-app editor. When provided,
+   *  WRITE tool cards show an "Open in editor" button, and bare file paths
+   *  rendered in chat messages become clickable links. */
+  onOpenInEditor?: (path: string) => void;
 }
 
-export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) {
+export function ChatView({
+  workspaceId,
+  workspacePath,
+  onOpenSettings,
+  onOpenInEditor,
+}: Props) {
   const messages = useChatStore((s) => s.getMessages(workspaceId));
   const streaming = useChatStore((s) => s.getStreaming(workspaceId));
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
@@ -196,6 +205,7 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
                     key={`tool-${item.id}`}
                     tool={item.tool}
                     workspacePath={workspacePath}
+                    onOpenInEditor={onOpenInEditor}
                   />
                 );
               }
@@ -214,7 +224,13 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
                   />
                 );
               }
-              return <ChatMessage key={item.message.id} message={item.message} />;
+              return (
+                <ChatMessage
+                  key={item.message.id}
+                  message={item.message}
+                  onOpenInEditor={onOpenInEditor}
+                />
+              );
             })}
 
             {streaming && streamBuffer && (
@@ -226,6 +242,7 @@ export function ChatView({ workspaceId, workspacePath, onOpenSettings }: Props) 
                   inputTokens: null,
                   outputTokens: null,
                 }}
+                onOpenInEditor={onOpenInEditor}
               />
             )}
 

@@ -159,13 +159,15 @@ export function CompanionTerminals({ workspaceId }: Props) {
                     </span>
                   )}
 
-                  {/* Delete button — visible on hover */}
+                  {/* Delete button — visible on hover, sized for a real
+                      tap target (20×20). */}
                   {!isEditing && (
                     <button
                       type="button"
                       data-testid={`delete-btn-${t.id}`}
-                      className="ml-auto flex-shrink-0 rounded px-0.5 font-mono text-[9px] text-octo-mute opacity-0 transition hover:text-octo-ivory group-hover:opacity-100"
+                      className="ml-auto flex h-5 w-5 flex-shrink-0 items-center justify-center rounded font-mono text-[14px] leading-none text-octo-mute opacity-0 transition hover:bg-octo-rouge/15 hover:text-octo-rouge group-hover:opacity-100"
                       title="Close terminal"
+                      aria-label="Close terminal"
                       onClick={(e) => {
                         e.stopPropagation();
                         deleteTerminal(workspaceId, t.id).catch(console.error);
@@ -176,7 +178,9 @@ export function CompanionTerminals({ workspaceId }: Props) {
                   )}
                 </div>
 
-                <div className="mt-0.5 font-mono text-[8px] uppercase tracking-[0.15em] text-octo-mute">
+                {/* `pl-3` lines up the meta text with the start of the
+                    label above (dot 6px + gap 6px = 12px). */}
+                <div className="mt-0.5 pl-3 font-mono text-[8px] uppercase tracking-[0.15em] text-octo-mute">
                   {t.running ? "RUNNING" : "STOPPED"}
                 </div>
               </button>

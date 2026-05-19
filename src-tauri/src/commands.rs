@@ -1443,6 +1443,371 @@ pub async fn stage_all_changes(workspace_path: String) -> AppResult<()> {
     Ok(())
 }
 
+/// Stage a single file. `file_path` is relative to `workspace_path`.
+#[tauri::command]
+pub async fn stage_file(workspace_path: String, file_path: String) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let output = std::process::Command::new("git")
+        .args(["add", "--", &file_path])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git add: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(format!("git add failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Unstage every staged change in the workspace (`git reset HEAD --`).
+/// Idempotent: running it with an empty index is a no-op success.
+#[tauri::command]
+pub async fn unstage_all_changes(workspace_path: String) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let output = std::process::Command::new("git")
+        .args(["reset", "HEAD", "--"])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git reset: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(format!("git reset failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Unstage a single file (`git restore --staged <path>` semantics, with a
+/// fall-back to `git reset HEAD --` for repos that have no commits yet).
+#[tauri::command]
+pub async fn unstage_file(workspace_path: String, file_path: String) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    // Try `git restore --staged` first (Git 2.23+).
+    let output = std::process::Command::new("git")
+        .args(["restore", "--staged", "--", &file_path])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git restore: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Fall back to `git reset HEAD -- <path>` for older git or empty repos.
+    let output = std::process::Command::new("git")
+        .args(["reset", "HEAD", "--", &file_path])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git reset: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(format!("unstage failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Commit the staged changes with `message`. Uses the user's login shell so
+/// `user.name`/`user.email` from gitconfig and any commit signing setup
+/// behave as if the user ran `git commit` in their own terminal.
+#[tauri::command]
+pub async fn commit_changes(workspace_path: String, message: String) -> AppResult<String> {
+    if message.trim().is_empty() {
+        return Err(AppError::Other("commit message cannot be empty".into()));
+    }
+    let workspace_path = expand_tilde(&workspace_path);
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let msg_escaped = message.replace('\'', "'\\''");
+    let cmd = format!("git commit -m '{}'", msg_escaped);
+
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git commit: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.to_string()
+        } else {
+            stdout.to_string()
+        };
+        return Err(AppError::Other(format!("git commit failed: {}", detail.trim())));
+    }
+
+    // Return the new HEAD short SHA so the frontend can show a confirmation.
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to read HEAD: {e}")))?;
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    Ok(sha)
+}
+
+/// A single open pull request for the current branch.
+///
+/// Returned by `find_open_pr` so the UI can show a "PR · #42" chip and link
+/// the user back to the GitHub web interface. Only the fields the UI
+/// actually renders are deserialised — extra GitHub fields are ignored.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPr {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub is_draft: bool,
+    pub state: String,
+}
+
+/// Ask the `gh` CLI for an open PR on `branch`. Returns `None` if gh isn't
+/// installed, isn't authed, or there's no matching PR. Runs in the user's
+/// login shell so PATH and keychain credentials behave like in a terminal.
+async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<OpenPr> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    // `gh pr list --json …` returns a JSON array. Field names map to OpenPr.
+    let cmd = format!(
+        "gh pr list --state open --head '{}' --json number,title,url,state,isDraft --limit 1",
+        branch.replace('\'', "'\\''"),
+    );
+
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(workspace_path)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "find_open_pr: gh cli not usable, falling back to API",
+        );
+        return None;
+    }
+
+    let prs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    let pr = prs.into_iter().next()?;
+
+    Some(OpenPr {
+        number: pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+        title: pr.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        url: pr.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+        is_draft: pr.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false),
+        state: pr.get("state").and_then(|s| s.as_str()).unwrap_or("open").to_lowercase(),
+    })
+}
+
+/// Look up an open pull request for the current branch on GitHub.
+///
+/// Returns `None` (encoded as null on the JS side) when:
+///   - the workspace is not a git repo
+///   - the `origin` remote is missing or not on GitHub
+///   - the branch has no open PR
+///
+/// Uses the saved GitHub PAT (Settings → Git credentials → github.com) if
+/// available; otherwise hits the API unauthenticated, which is fine for
+/// public repos but rate-limited to 60 requests/hour per IP.
+#[tauri::command]
+pub async fn find_open_pr(workspace_path: String) -> AppResult<Option<OpenPr>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let path = std::path::Path::new(&workspace_path);
+
+    // Read everything we need from libgit2 into owned Strings, then drop
+    // the Repository handle before any `.await`. `git2::Repository` is not
+    // Send, so holding it across an await would mark the future !Send and
+    // refuse to compile.
+    let (branch, owner, repo_name) = {
+        let repo = match crate::git_ops::open_repo(path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(error = %e, "find_open_pr: cannot open repo");
+                return Ok(None);
+            }
+        };
+        let branch = match crate::git_ops::current_branch(&repo) {
+            Some(b) => b,
+            None => {
+                tracing::info!("find_open_pr: detached HEAD");
+                return Ok(None);
+            }
+        };
+        let remote = match repo.find_remote("origin") {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(error = %e, "find_open_pr: no `origin` remote");
+                return Ok(None);
+            }
+        };
+        let url = match remote.url() {
+            Some(u) => u.to_string(),
+            None => {
+                tracing::info!("find_open_pr: remote `origin` has no url");
+                return Ok(None);
+            }
+        };
+        let parsed = match crate::git_url::parse_git_url(&url) {
+            Some(p) => p,
+            None => {
+                tracing::info!(url = %url, "find_open_pr: could not parse remote url");
+                return Ok(None);
+            }
+        };
+        if parsed.host != "github.com" {
+            tracing::info!(host = %parsed.host, "find_open_pr: non-github host");
+            return Ok(None);
+        }
+        (branch, parsed.owner, parsed.repo)
+    };
+
+    // 1. Try the `gh` CLI first — most users who ran `gh pr create` already
+    //    have an authed `gh`, no extra setup required. Runs in their login
+    //    shell so PATH and macOS keychain credential storage work as if
+    //    they invoked `gh` from a terminal.
+    if let Some(pr) = try_gh_cli(&workspace_path, &branch).await {
+        tracing::info!(number = pr.number, "find_open_pr: resolved via gh cli");
+        return Ok(Some(pr));
+    }
+
+    // 2. Fall back to a direct GitHub API call, optionally authenticated
+    //    with a saved Octopush PAT or a GITHUB_TOKEN / GH_TOKEN env var.
+    let token = crate::settings::get_git_credentials("github.com")
+        .map(|c| c.token)
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .or_else(|| std::env::var("GH_TOKEN").ok());
+    let has_token = token.is_some();
+
+    let api = format!(
+        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open&per_page=1",
+        owner,
+        repo_name,
+        owner,
+        // The branch passes through a URL — keep the path-encoded form so
+        // branch names containing `/` (e.g. `feat/foo`) survive.
+        urlencoding::encode(&branch),
+    );
+
+    tracing::info!(
+        owner = %owner,
+        repo = %repo_name,
+        branch = %branch,
+        authenticated = has_token,
+        "find_open_pr: querying github",
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("octopush/0.1")
+        .build()
+        .map_err(|e| AppError::Other(format!("http client: {e}")))?;
+
+    let mut req = client.get(&api).header("Accept", "application/vnd.github+json");
+    if let Some(tok) = token {
+        req = req.header("Authorization", format!("Bearer {}", tok));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "find_open_pr: network error");
+            AppError::Other(format!("github request failed: {e}"))
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // 404 happens for private repos accessed without a token. Surface
+        // it in logs so the user can diagnose, but keep the chip hidden
+        // gracefully.
+        let body = resp.text().await.unwrap_or_default();
+        tracing::info!(
+            status = %status,
+            authenticated = has_token,
+            body = %body.chars().take(200).collect::<String>(),
+            "find_open_pr: non-success response",
+        );
+        return Ok(None);
+    }
+
+    let prs: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Other(format!("github response parse: {e}")))?;
+
+    tracing::info!(count = prs.len(), "find_open_pr: github returned");
+    let Some(pr) = prs.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+    let title = pr
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let html_url = pr
+        .get("html_url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_draft = pr
+        .get("draft")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    let state = pr
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or("open")
+        .to_string();
+
+    Ok(Some(OpenPr {
+        number,
+        title,
+        url: html_url,
+        is_draft,
+        state,
+    }))
+}
+
+/// Push the current branch to its tracked upstream (creating it on the remote
+/// if needed via `--set-upstream`). Uses the login shell so SSH agents, the
+/// macOS credential helper, and `~/.gitconfig` work like they do in the
+/// user's terminal. Returns the trimmed final stderr line, which usually
+/// includes either the new remote refs or the error reason.
+#[tauri::command]
+pub async fn push_branch(workspace_path: String) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+
+    // Read current branch shorthand to pass as upstream target.
+    let branch_out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to read branch: {e}")))?;
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err(AppError::Other(
+            "cannot push: not on a named branch".into(),
+        ));
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!(
+        "git push --set-upstream origin '{}' 2>&1",
+        branch.replace('\'', "'\\''")
+    );
+
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git push: {e}")))?;
+
+    let combined = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(format!("git push failed: {}", combined.trim())));
+    }
+    Ok(combined.trim().to_string())
+}
+
 // ─── Test runner ──────────────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1509,6 +1874,197 @@ pub async fn detect_default_test_command(workspace_path: String) -> AppResult<Op
         return Ok(Some("pytest".into()));
     }
     Ok(None)
+}
+
+// ─── Workspace-wide file & text search ────────────────────────────
+
+/// A single text-search hit, relative to the workspace root.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    /// File path relative to the workspace root.
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+    /// 1-based column of the first character of the match.
+    pub col: u32,
+    /// The full source line containing the match, trimmed for transport.
+    /// Useful as a preview in the UI.
+    pub preview: String,
+}
+
+/// Hard limits so a giant repo or pathological query can't lock the UI.
+const FILE_LIST_CAP: usize = 20_000;
+const FILE_SIZE_CAP_BYTES: u64 = 1_000_000; // skip files > 1 MB
+const SEARCH_RESULT_CAP: usize = 500;
+const PREVIEW_LEN_CAP: usize = 200;
+
+/// List every non-ignored file in the workspace. Honors `.gitignore`,
+/// `.ignore`, `core.excludesFile`, and skips `.git`. Returns file paths
+/// relative to `workspace_path` so the frontend can display them cleanly
+/// and pass them to `openFile`.
+#[tauri::command]
+pub async fn list_workspace_files(workspace_path: String) -> AppResult<Vec<String>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let base = std::path::PathBuf::from(&workspace_path);
+    if !base.is_dir() {
+        return Err(AppError::Other(format!("not a directory: {workspace_path}")));
+    }
+
+    // Walking + collecting can take seconds on huge repos. Move it to a
+    // blocking task so we don't park the tokio runtime.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::with_capacity(1024);
+        let walker = ignore::WalkBuilder::new(&base)
+            .standard_filters(true)
+            .require_git(false)
+            .hidden(false)
+            .build();
+        for entry in walker {
+            let Ok(entry) = entry else { continue };
+            if entry.depth() == 0 {
+                continue;
+            }
+            // Skip directories and any path that crosses through `.git`.
+            let path = entry.path();
+            if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+                continue;
+            }
+            if path.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(&base) {
+                files.push(rel.to_string_lossy().into_owned());
+            }
+            if files.len() >= FILE_LIST_CAP {
+                break;
+            }
+        }
+        files.sort();
+        files
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("file walk join error: {e}")))?;
+
+    Ok(result)
+}
+
+/// Search every non-ignored text file for `query`. Always literal (not
+/// regex); case-insensitive when `case_sensitive` is false. Skips binary
+/// files (defined as files containing a NUL in the first 8 KiB) and any
+/// file larger than 1 MB. Returns up to 500 hits.
+#[tauri::command]
+pub async fn search_workspace_text(
+    workspace_path: String,
+    query: String,
+    case_sensitive: bool,
+) -> AppResult<Vec<SearchHit>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let base = std::path::PathBuf::from(&workspace_path);
+    if !base.is_dir() {
+        return Err(AppError::Other(format!("not a directory: {workspace_path}")));
+    }
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let needle_owned = if case_sensitive {
+        query.clone()
+    } else {
+        query.to_lowercase()
+    };
+
+    let hits = tokio::task::spawn_blocking(move || {
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&base)
+            .standard_filters(true)
+            .require_git(false)
+            .hidden(false)
+            .build();
+
+        for entry in walker {
+            if hits.len() >= SEARCH_RESULT_CAP {
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.depth() == 0 {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+                continue;
+            }
+            if path.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            // Skip oversized files outright.
+            let size = match std::fs::metadata(path).map(|m| m.len()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if size > FILE_SIZE_CAP_BYTES {
+                continue;
+            }
+            // Read in bytes; bail on binary files.
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if bytes
+                .iter()
+                .take(8192)
+                .any(|&b| b == 0)
+            {
+                continue;
+            }
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let rel = match path.strip_prefix(&base) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            };
+
+            for (idx, line) in text.lines().enumerate() {
+                let haystack = if case_sensitive {
+                    line.to_string()
+                } else {
+                    line.to_lowercase()
+                };
+                if let Some(col) = haystack.find(&needle_owned) {
+                    // Trim very long lines for transport.
+                    let preview = if line.len() > PREVIEW_LEN_CAP {
+                        let start = col.saturating_sub(40);
+                        let end = (col + needle_owned.len() + 60).min(line.len());
+                        let snippet = &line[start..end];
+                        if start > 0 {
+                            format!("…{snippet}")
+                        } else {
+                            snippet.to_string()
+                        }
+                    } else {
+                        line.to_string()
+                    };
+                    hits.push(SearchHit {
+                        file: rel.clone(),
+                        line: (idx as u32) + 1,
+                        col: (col as u32) + 1,
+                        preview,
+                    });
+                    if hits.len() >= SEARCH_RESULT_CAP {
+                        break;
+                    }
+                }
+            }
+        }
+        hits
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("search join error: {e}")))?;
+
+    Ok(hits)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────

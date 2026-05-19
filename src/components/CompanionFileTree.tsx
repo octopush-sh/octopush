@@ -52,13 +52,14 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
   );
 
   return (
-    <section>
-      {/* Eyebrow header */}
-      <h3 className="border-b border-octo-hairline pb-2 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
-        FILES
+    <section className="flex h-full min-h-0 flex-col">
+      {/* Eyebrow — same height & padding as the canvas toolbar and the
+          left rail's CHANGES eyebrow so the three top bars form one row. */}
+      <h3 className="flex h-11 shrink-0 items-center border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+        Files
       </h3>
 
-      <div className="mt-2 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         <TreeNode
           path={rootPath}
           label={rootLabel}

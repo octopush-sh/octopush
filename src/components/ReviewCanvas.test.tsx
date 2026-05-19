@@ -59,9 +59,9 @@ index abc1234..def5678 100644
 
 const SAMPLE_GIT_STATUS = {
   branch: "feat/test",
-  changedFiles: [{ path: "src/foo.ts", status: "modified" as const }],
+  changedFiles: [{ path: "src/foo.ts", status: "modified" as const, staged: false, unstaged: true }],
   ahead: 0,
-  behind: 0,
+  behind: 0, hasUpstream: false,
 };
 
 function renderCanvas(overrides?: Partial<Parameters<typeof ReviewCanvas>[0]>) {
@@ -104,9 +104,9 @@ describe("ReviewCanvas", () => {
     await waitFor(() => {
       expect(screen.getByText(/src\/foo\.ts/)).toBeTruthy();
     });
-    // The @@ header appears in two places (card header + diff line) — just check at least one
-    const hunkHeaders = screen.getAllByText(/@@ -1,4/);
-    expect(hunkHeaders.length).toBeGreaterThan(0);
+    // Hunk header is now rendered as a human-readable line range
+    // (e.g. "lines 1–4 → 1–5") instead of the raw @@ marker.
+    expect(screen.getByText(/lines 1–4 → 1–5/)).toBeTruthy();
   });
 
   it("Accept button calls ipc.stageHunk and shows Staged badge", async () => {
@@ -200,7 +200,7 @@ describe("ReviewCanvas", () => {
   });
 
   it("shows empty state when diff is empty", () => {
-    renderCanvas({ gitDiff: "", gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0 } });
-    expect(screen.getByText(/No changes to review/)).toBeTruthy();
+    renderCanvas({ gitDiff: "", gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false } });
+    expect(screen.getByText(/Nothing to review/)).toBeTruthy();
   });
 });

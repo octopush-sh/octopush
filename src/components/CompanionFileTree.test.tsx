@@ -41,7 +41,7 @@ beforeEach(() => {
 describe("CompanionFileTree", () => {
   it("renders FILES eyebrow header", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
-    await waitFor(() => expect(screen.getByText("FILES")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Files/i)).toBeInTheDocument());
   });
 
   it("renders root label in italic serif", async () => {

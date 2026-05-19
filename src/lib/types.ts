@@ -209,11 +209,40 @@ export interface GitStatus {
   changedFiles: FileChange[];
   ahead: number;
   behind: number;
+  /** False when the current branch has never been pushed (no upstream
+   *  tracking branch configured). UI uses this to enable Publish for the
+   *  first push, since `ahead` is 0 with no upstream to compare against. */
+  hasUpstream: boolean;
 }
 
 export interface FileChange {
   path: string;
   status: "new" | "modified" | "deleted" | "renamed" | "unknown";
+  /** The file has changes in the index (staged for commit). */
+  staged: boolean;
+  /** The file has unstaged worktree modifications. */
+  unstaged: boolean;
+}
+
+/** A single open pull request on the current branch (GitHub only for now). */
+export interface OpenPr {
+  number: number;
+  title: string;
+  url: string;
+  isDraft: boolean;
+  state: string;
+}
+
+/** A single text-search hit (line-level match) within the workspace. */
+export interface SearchHit {
+  /** Path relative to the workspace root. */
+  file: string;
+  /** 1-based line number. */
+  line: number;
+  /** 1-based column where the match starts. */
+  col: number;
+  /** The full or partially-snipped source line for preview. */
+  preview: string;
 }
 
 export interface DirectoryEntry {

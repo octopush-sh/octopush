@@ -49,6 +49,13 @@ export function CommandPalette({
       className="fixed inset-0 z-50 flex items-start justify-center pt-[18vh]"
       style={{ background: "rgba(12, 10, 8, 0.55)", backdropFilter: "blur(4px)" }}
       onClick={onClose}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          onClose();
+        }
+      }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
@@ -67,9 +74,14 @@ export function CommandPalette({
               placeholder="Type a command, or search…"
               className="flex-1 bg-transparent font-serif italic text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
             />
-            <span className="rounded border border-octo-hairline bg-octo-onyx px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="rounded border border-octo-hairline bg-octo-onyx px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute transition-colors hover:border-octo-brass hover:text-octo-brass"
+            >
               ESC
-            </span>
+            </button>
           </div>
 
           <Command.List className="max-h-[380px] overflow-y-auto py-2">

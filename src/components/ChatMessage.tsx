@@ -13,6 +13,21 @@ interface MessageProps {
 
 interface Props {
   message: MessageProps;
+  /** When supplied, file-path-shaped inline code becomes a clickable link
+   *  that opens the file in the in-app editor. */
+  onOpenInEditor?: (path: string) => void;
+}
+
+// Detects file-path-shaped strings inside inline code. We deliberately keep
+// the heuristic conservative — only strings that contain a slash OR end in
+// a short extension qualify. Excludes URLs (anything with `://`).
+function looksLikeFilePath(s: string): boolean {
+  const trimmed = s.trim();
+  if (!trimmed || trimmed.includes("://") || trimmed.includes(" ")) return false;
+  if (trimmed.length > 200) return false;
+  if (trimmed.includes("/")) return true;
+  // Filename with extension (e.g. App.tsx, config.json, README.md)
+  return /^[\w.\-]+\.[A-Za-z0-9]{1,8}$/.test(trimmed);
 }
 
 // Maps Anthropic / OpenAI model IDs to short display names. Falls back to
@@ -28,10 +43,27 @@ const MODEL_DISPLAY: Record<string, string> = {
 
 // Markdown renderers using Onyx & Brass design tokens. Body text only —
 // the lead sentence (key phrase) is rendered separately above as italic serif.
-const markdownComponents: Components = {
+function makeMarkdownComponents(
+  onOpenInEditor?: (path: string) => void,
+): Components {
+  return {
   code({ className, children, ...rest }) {
     const isInline = !className;
     if (isInline) {
+      const text = String(children ?? "").trim();
+      if (onOpenInEditor && looksLikeFilePath(text)) {
+        return (
+          <button
+            type="button"
+            onClick={() => onOpenInEditor(text)}
+            className="rounded-[3px] px-1.5 py-0.5 font-mono text-[12px] text-octo-brass transition-colors hover:bg-octo-brass/20"
+            style={{ background: "var(--brass-ghost)" }}
+            title="Open in editor"
+          >
+            {children}
+          </button>
+        );
+      }
       return (
         <code
           className="rounded-[3px] px-1.5 py-0.5 font-mono text-[12px] text-octo-brass"
@@ -155,7 +187,8 @@ const markdownComponents: Components = {
       </td>
     );
   },
-};
+  };
+}
 
 function formatTokenCount(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
@@ -167,8 +200,9 @@ function modelDisplayName(model: string | null | undefined): string {
   return MODEL_DISPLAY[model] ?? model;
 }
 
-export function ChatMessage({ message }: Props) {
+export function ChatMessage({ message, onOpenInEditor }: Props) {
   const { role, content, model, inputTokens, outputTokens } = message;
+  const markdownComponents = makeMarkdownComponents(onOpenInEditor);
 
   if (!content || !content.trim()) return null;
 

@@ -422,6 +422,17 @@ impl ChatEngine {
         let mut total_input: u64 = 0;
         let mut total_output: u64 = 0;
 
+        // Snapshot files already modified before this turn started. Anything
+        // present here was the user's own change — we won't credit it to the
+        // agent even if a later iteration touches the same file.
+        let initial_modified = git_status_files(&workspace_path);
+
+        // Track which (file, msg_id) pairs we've already inserted so the
+        // git-status fallback doesn't double-up rows the write_file branch
+        // already wrote.
+        let mut attributed: std::collections::HashSet<(String, i64)> =
+            std::collections::HashSet::new();
+
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..MAX_TOOL_ITERATIONS {
             let llm_req = LlmRequest {
@@ -616,6 +627,8 @@ impl ChatEngine {
                             msg_id,
                         ) {
                             tracing::warn!(tool = "write_file", path = path, error = %e, "failed to record file edit");
+                        } else if assistant_msg_id >= 0 {
+                            attributed.insert((path.to_string(), assistant_msg_id));
                         }
                     }
                 }
@@ -657,6 +670,49 @@ impl ChatEngine {
                 });
             }
 
+            // ── Catch-all file-edit attribution ───────────────────
+            // Some tools (most commonly `run_command` with sed/awk/redirects)
+            // change files without going through write_file. Snapshot git
+            // status now and credit any file that's newly changed (or not
+            // already attributed to this assistant message) to the current
+            // assistant_msg_id, so the Review canvas can always show the
+            // agent message that produced the change.
+            if assistant_msg_id >= 0 {
+                let current_modified = git_status_files(&workspace_path);
+                for path in &current_modified {
+                    // Skip files the user had already modified before this
+                    // turn started — those are not agent-attributable unless
+                    // a tool that ran during this turn changed them again.
+                    if initial_modified.contains(path) {
+                        // Determine if the file was actually touched this
+                        // iteration by checking whether any tool's input
+                        // mentions it (best-effort heuristic).
+                        let touched = response.tool_uses.iter().any(|u| {
+                            serde_json::to_string(&u.input)
+                                .map(|s| s.contains(path.as_str()))
+                                .unwrap_or(false)
+                        });
+                        if !touched {
+                            continue;
+                        }
+                    }
+                    let key = (path.clone(), assistant_msg_id);
+                    if attributed.contains(&key) {
+                        continue;
+                    }
+                    if let Err(e) = self.db.lock().insert_file_edit(
+                        &request.workspace_id,
+                        path,
+                        "agent_edit",
+                        Some(assistant_msg_id),
+                    ) {
+                        tracing::warn!(path = %path, error = %e, "failed to record agent file edit");
+                    } else {
+                        attributed.insert(key);
+                    }
+                }
+            }
+
             // Add tool results as user message and continue the loop.
             messages.push(LlmMessage {
                 role: LlmRole::User,
@@ -687,4 +743,36 @@ impl ChatEngine {
         }
         Err(loop_err)
     }
+}
+
+/// Return the set of files reported as modified, added, or untracked by
+/// `git status --porcelain` inside `workspace_path`. Used to credit file
+/// changes to the current agent turn when a tool other than write_file
+/// (e.g. run_command with sed) is what actually modified the file.
+fn git_status_files(workspace_path: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut files = std::collections::HashSet::new();
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace_path)
+        .output();
+    let Ok(output) = output else { return files };
+    if !output.status.success() {
+        return files;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // Format: "XY path" — X = index status, Y = worktree status.
+        // Renames look like "R  old -> new"; we keep only the new name.
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = &line[3..];
+        let path = if let Some(idx) = rest.find(" -> ") {
+            &rest[idx + 4..]
+        } else {
+            rest
+        };
+        files.insert(path.trim().to_string());
+    }
+    files
 }

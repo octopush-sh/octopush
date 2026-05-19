@@ -108,7 +108,8 @@ export function ToastContainer() {
           </div>
           <button
             onClick={() => dismiss(t.id)}
-            className="shrink-0 text-zinc-600 hover:text-zinc-300"
+            aria-label="Dismiss notification"
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
           >
             <X size={14} />
           </button>

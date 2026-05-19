@@ -5,6 +5,9 @@ import type { ToolExecution } from "../stores/chatStore";
 interface Props {
   tool: ToolExecution;
   workspacePath?: string;
+  /** Called when the user wants to open the written file in the in-app
+   *  editor (Review → Editor view). When omitted, the button is hidden. */
+  onOpenInEditor?: (relativePath: string) => void;
 }
 
 // Tool name → uppercase mono label. Falls back to the raw tool name.
@@ -69,7 +72,7 @@ const headerStyle: CSSProperties = {
   boxSizing: "border-box" as const,
 };
 
-export function ToolCallCard({ tool, workspacePath }: Props) {
+export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -142,11 +145,45 @@ export function ToolCallCard({ tool, workspacePath }: Props) {
           </span>
         </div>
 
+        {filePath && tool.toolName === "write_file" && onOpenInEditor && (
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenInEditor(filePath);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onOpenInEditor(filePath);
+              }
+            }}
+            title="Open in editor"
+            style={{
+              fontFamily: "'Spectral', serif",
+              fontStyle: "italic",
+              fontSize: 11,
+              color: BRASS,
+              background: BRASS_GHOST,
+              border: `1px solid ${BRASS_DIM}`,
+              borderRadius: 4,
+              padding: "3px 10px",
+              cursor: "pointer",
+              marginRight: 6,
+              flexShrink: 0,
+            }}
+          >
+            Open in editor
+          </div>
+        )}
+
         {filePath && tool.toolName === "write_file" && (
           <div
             role="button"
             tabIndex={0}
-            onClick={() => {
+            onClick={(e) => {
+              e.stopPropagation();
               if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
             }}
             onKeyDown={() => {}}

@@ -15,12 +15,14 @@ import type {
   GitStatus,
   ModelSuggestion,
   ModelWithProvider,
+  OpenPr,
   ProjectInfo,
   ProviderConfig,
   PtySession,
   RefreshPricingResult,
   Session,
   SessionRecap,
+  SearchHit,
   SessionTemplate,
   SpendSnapshot,
   TaskType,
@@ -222,6 +224,48 @@ export const ipc = {
 
   stageAllChanges: (workspacePath: string) =>
     invoke<void>("stage_all_changes", { workspacePath }),
+
+  // ─── Stage / commit / push flow ───────────────────────────────
+  stageFile: (workspacePath: string, filePath: string) =>
+    invoke<void>("stage_file", { workspacePath, filePath }),
+
+  unstageFile: (workspacePath: string, filePath: string) =>
+    invoke<void>("unstage_file", { workspacePath, filePath }),
+
+  unstageAllChanges: (workspacePath: string) =>
+    invoke<void>("unstage_all_changes", { workspacePath }),
+
+  /** Returns the new short SHA on success. */
+  commitChanges: (workspacePath: string, message: string) =>
+    invoke<string>("commit_changes", { workspacePath, message }),
+
+  /** Returns the trimmed git-push output (combined stdout+stderr). */
+  pushBranch: (workspacePath: string) =>
+    invoke<string>("push_branch", { workspacePath }),
+
+  /** Workspace-wide file listing (respects .gitignore). Returns paths
+   *  relative to the workspace root. Capped at 20k entries. */
+  listWorkspaceFiles: (workspacePath: string) =>
+    invoke<string[]>("list_workspace_files", { workspacePath }),
+
+  /** Workspace-wide text search. Literal substring match (not regex);
+   *  case-insensitive when `caseSensitive` is false. Capped at 500 hits. */
+  searchWorkspaceText: (
+    workspacePath: string,
+    query: string,
+    caseSensitive = false,
+  ) =>
+    invoke<SearchHit[]>("search_workspace_text", {
+      workspacePath,
+      query,
+      caseSensitive,
+    }),
+
+  /** Look up an open pull request on GitHub for the current branch.
+   *  Resolves to `null` when there's no PR, no GitHub remote, or any
+   *  network error — UI is expected to hide the chip silently. */
+  findOpenPr: (workspacePath: string) =>
+    invoke<OpenPr | null>("find_open_pr", { workspacePath }),
 
   // ─── Test runner ──────────────────────────────────────────────
   runTestCommand: (workspacePath: string, command: string) =>

@@ -136,7 +136,8 @@ function SessionRow({
             e.stopPropagation();
             onRemove();
           }}
-          className="opacity-0 transition hover:text-octo-danger group-hover:opacity-100"
+          aria-label="Delete session"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute opacity-0 transition-colors hover:bg-octo-rouge/15 hover:text-octo-rouge group-hover:opacity-100"
           title="Delete session"
         >
           <X size={14} />
