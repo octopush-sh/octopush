@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -48,6 +48,25 @@ pub struct Session {
     attached: Option<ClientSender>,
 
     // ── Attention-detection state ─────────────────────────────────
+    // Implementation note: previous releases tried to detect "the
+    // inner program is waiting on input" purely from the byte
+    // stream (idle timer + byte threshold + content patterns + alt-
+    // screen). Every variant had false positives or misses on
+    // INK-based TUIs like Claude Code. Switching to kernel signals:
+    //
+    //   - `tcgetpgrp(master_fd)` (exposed via portable_pty's
+    //     `process_group_leader()`) tells us which process group
+    //     currently owns the PTY. When it transitions away from a
+    //     child and back to the shell, the child just exited:
+    //     `Event::Attention` for "command finished".
+    //
+    //   - `proc_pidinfo(PROC_PIDTASKINFO)` gives us the foreground
+    //     process's total CPU nanoseconds. Two consecutive samples
+    //     1s apart whose delta is <1% of elapsed wall time mean the
+    //     process is parked (blocked on `read()`). When the fg
+    //     process is parked AND the byte stream has been quiet
+    //     AND there was substantial recent output, fire
+    //     `Event::Attention` for "TUI waiting on input".
     /// Wall-clock time of the most recent `push_output`.
     last_data_at: Instant,
     /// Bytes written since the last Attention event was emitted (or
@@ -58,14 +77,27 @@ pub struct Session {
     /// Latched so we don't re-emit Attention for the same idle
     /// window. Cleared on the next chunk of output.
     attention_pending: bool,
+    /// PID of the *shell* process spawned at session start. We
+    /// compare the PTY's current foreground pgroup against this to
+    /// classify "child is running" vs "shell is at prompt".
+    pub shell_pid: Option<i32>,
+    /// Previous foreground pgroup observed by `check_attention`.
+    /// `None` until the first tick.
+    last_fg_pgroup: Option<i32>,
+    /// Last CPU sample: (when, total ns). The next tick computes
+    /// (delta_ns, elapsed_ns) and decides whether the process is
+    /// idle this tick.
+    last_cpu_sample: Option<(Instant, u64)>,
+    /// Number of consecutive ticks the foreground process has been
+    /// observed at <1% CPU. We require two in a row before firing
+    /// to filter out single quiet-tick blips.
+    consecutive_idle_ticks: u8,
 }
 
-/// Idle threshold (no PTY output for this long) before we consider
-/// the session to be waiting on the user. 10s is long enough that
-/// any agent that's actually thinking (Claude Code's spinner, LLM
-/// streaming, npm install progress lines) emits something within
-/// the window and resets the clock.
-pub const IDLE_THRESHOLD_MS: u64 = 10_000;
+/// Output-quiet window before considering the byte stream "calm"
+/// enough to even consider a notification. Short — kernel signals
+/// do most of the discriminating now.
+pub const OUTPUT_QUIET_MS: u64 = 2_000;
 
 /// Minimum bytes since the last attention emit. Filters out a
 /// freshly-spawned shell whose only output is the prompt itself.
@@ -95,6 +127,10 @@ impl Session {
             last_data_at: Instant::now(),
             bytes_since_attention: 0,
             attention_pending: false,
+            shell_pid: None,
+            last_fg_pgroup: None,
+            last_cpu_sample: None,
+            consecutive_idle_ticks: 0,
         }
     }
 
@@ -196,13 +232,25 @@ impl Session {
         self.ring.front().map(|(s, _)| *s).unwrap_or(u64::MAX)
     }
 
-    /// Called by the periodic tick task. If the session has gone
-    /// quiet long enough AND there's been a meaningful burst of
-    /// output since the last attention emit, return true to signal
-    /// the caller to emit an `Event::Attention` and latch
-    /// `attention_pending` so we don't re-emit until new output
-    /// arrives.
-    pub fn check_attention(&mut self) -> bool {
+    /// Called by the periodic tick task. Uses kernel signals
+    /// (foreground pgroup + foreground process CPU delta) to decide
+    /// whether the session is waiting on the user.
+    ///
+    /// `fg_pgroup` is the result of `tcgetpgrp(master_fd)` —
+    /// supplied by the caller because only the caller can access
+    /// the `MasterPty` handles. `None` means "couldn't determine"
+    /// (we bail safely).
+    ///
+    /// Two events can fire, both reported as a single boolean:
+    ///   - **command-finished**: fg pgroup transitioned away from a
+    ///     non-shell child back to the shell. The child just exited
+    ///     (npm install done, tests finished, etc.).
+    ///   - **tui-parked**: fg is not the shell, the foreground
+    ///     process's CPU usage has been <1% for two consecutive
+    ///     ticks, and the byte stream has been quiet for
+    ///     OUTPUT_QUIET_MS. The process is blocked on `read()` —
+    ///     classic "Claude Code is waiting" signature.
+    pub fn check_attention(&mut self, fg_pgroup: Option<i32>) -> bool {
         if !self.running {
             return false;
         }
@@ -212,14 +260,78 @@ impl Session {
         if self.bytes_since_attention < MIN_BYTES_FOR_ATTENTION {
             return false;
         }
-        if self.last_data_at.elapsed().as_millis() < IDLE_THRESHOLD_MS as u128 {
+
+        let Some(fg) = fg_pgroup else {
+            return false;
+        };
+        if fg <= 0 {
             return false;
         }
-        // Latch + reset the counter so the next "burst then idle"
-        // window has to clear the bar again.
-        self.attention_pending = true;
-        self.bytes_since_attention = 0;
-        true
+        let Some(shell_pid) = self.shell_pid else {
+            return false;
+        };
+
+        let prev_fg = self.last_fg_pgroup;
+        self.last_fg_pgroup = Some(fg);
+
+        // ── Event A: command-finished ─────────────────────────────
+        // Shell just regained PTY control after a non-shell child.
+        if fg == shell_pid {
+            // Reset CPU tracking — we only care about CPU while a
+            // child is foreground.
+            self.last_cpu_sample = None;
+            self.consecutive_idle_ticks = 0;
+            if let Some(prev) = prev_fg {
+                if prev != 0 && prev != shell_pid {
+                    self.attention_pending = true;
+                    self.bytes_since_attention = 0;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ── Event B: TUI parked ───────────────────────────────────
+        // A child process is foreground; sample CPU and check if
+        // it's been quiet on both fronts (CPU + bytes).
+        let total_ns = match proc_total_cpu_ns(fg) {
+            Some(n) => n,
+            None => {
+                self.consecutive_idle_ticks = 0;
+                return false;
+            }
+        };
+        let now = Instant::now();
+        let is_idle_now = match self.last_cpu_sample {
+            Some((t, prev_ns)) => {
+                let wall_ns = now.duration_since(t).as_nanos() as u64;
+                if wall_ns == 0 {
+                    false
+                } else {
+                    let cpu_delta = total_ns.saturating_sub(prev_ns);
+                    // <1% CPU over the sample window.
+                    cpu_delta.saturating_mul(100) < wall_ns
+                }
+            }
+            None => false, // First sample — can't tell yet.
+        };
+        self.last_cpu_sample = Some((now, total_ns));
+
+        if is_idle_now {
+            self.consecutive_idle_ticks = self.consecutive_idle_ticks.saturating_add(1);
+        } else {
+            self.consecutive_idle_ticks = 0;
+        }
+
+        let quiet = self.last_data_at.elapsed() >= Duration::from_millis(OUTPUT_QUIET_MS);
+
+        if self.consecutive_idle_ticks >= 2 && quiet {
+            self.attention_pending = true;
+            self.bytes_since_attention = 0;
+            self.consecutive_idle_ticks = 0;
+            return true;
+        }
+        false
     }
 
     /// Emit an `Event::Attention` to the attached client, if any.
@@ -232,6 +344,38 @@ impl Session {
             };
             let _ = tx.send(event.to_line());
         }
+    }
+}
+
+/// Sum of user + system CPU time for `pid` in nanoseconds, as
+/// reported by `proc_pidinfo(PROC_PIDTASKINFO)`. Returns `None` if
+/// the process has gone away or libc rejects the call.
+///
+/// We only sum the parent's CPU because the cost of walking the
+/// whole process group every second would be too high for what is
+/// already a heuristic; modern TUIs (Claude Code, vim, less) keep
+/// almost all CPU in the parent process anyway. If we ever need
+/// process-group totals the right tool is `proc_listpidspath` or a
+/// `kqueue` walk.
+fn proc_total_cpu_ns(pid: i32) -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `proc_pidinfo` is documented to write exactly `size`
+    // bytes when it returns `size`, and our buffer is exactly that
+    // big. `pid` may be invalid; libc handles that by returning <= 0.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret == size {
+        Some(info.pti_total_user + info.pti_total_system)
+    } else {
+        None
     }
 }
 

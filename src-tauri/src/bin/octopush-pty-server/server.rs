@@ -85,11 +85,13 @@ pub fn run_accept_loop(
         })?;
 
     // Attention-detection thread: every second, walks every live
-    // session and asks whether it has been idle long enough after a
-    // meaningful burst of output. When it has, the session emits an
-    // `Event::Attention` to its attached client. Detection lives in
-    // the daemon (not the WebView) so timing is deterministic and
-    // sees the raw byte stream directly. See `Session::check_attention`.
+    // session and asks whether the PTY's foreground process group is
+    // (a) the shell again (a child just exited) or (b) parked on
+    // `read()` with negligible CPU. Either case emits
+    // `Event::Attention` to the attached client. Detection uses
+    // kernel signals via portable_pty's `process_group_leader()`
+    // (which is `tcgetpgrp(master_fd)`) and `proc_pidinfo` —
+    // see `Session::check_attention` for the gating logic.
     let attn_state = Arc::clone(&state);
     std::thread::Builder::new()
         .name("attention-checker".into())
@@ -101,9 +103,25 @@ pub fn run_accept_loop(
                 if st.shutdown {
                     break;
                 }
-                for sess in st.sessions.values_mut() {
-                    if sess.check_attention() {
-                        sess.emit_attention();
+                // Pre-collect (id, fg_pgroup) so we can read from
+                // `handles` without holding two mutable references
+                // to `st` at once.
+                let ids: Vec<String> = st.sessions.keys().cloned().collect();
+                let fg_by_id: Vec<(String, Option<i32>)> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let fg = st.handles.get(&id).and_then(|h| {
+                            let hg = h.lock();
+                            hg.master.process_group_leader()
+                        });
+                        (id, fg)
+                    })
+                    .collect();
+                for (id, fg) in fg_by_id {
+                    if let Some(sess) = st.sessions.get_mut(&id) {
+                        if sess.check_attention(fg) {
+                            sess.emit_attention();
+                        }
                     }
                 }
             }
@@ -358,6 +376,10 @@ fn cmd_spawn(params: SpawnParams, state: &SharedState, _tx: ClientSender) -> Res
     let started_at = Utc::now().timestamp();
     let mut sess = Session::new(id.clone(), id.clone(), cwd, started_at);
     sess.pid = Some(pid);
+    // shell_pid is what the attention-checker compares the PTY's
+    // foreground pgroup against to tell shell-at-prompt vs.
+    // child-running. `pid` from portable_pty is the spawned shell.
+    sess.shell_pid = Some(pid as i32);
 
     {
         let mut st = state.lock();
