@@ -31,9 +31,10 @@ import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useBudgetsStore } from "./stores/budgetsStore";
+import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta } from "./lib/chatTitle";
-import type { ModelWithProvider } from "./lib/types";
+import type { ModelWithProvider, Workspace } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
@@ -711,11 +712,40 @@ function App() {
   // ── Render: workspace shell ──
   const customizingWorkspace = workspaces.find((w) => w.id === customizingWorkspaceId) ?? null;
 
+  const projectGroups: ProjectGroup[] = useMemo(() => {
+    if (!project) return [];
+
+    const allProjects = new Map<string, { id: string; name: string }>();
+    if (project) {
+      allProjects.set(project.id, { id: project.id, name: project.name });
+    }
+    recentProjects.forEach((p) => {
+      if (!allProjects.has(p.id)) {
+        allProjects.set(p.id, { id: p.id, name: p.name });
+      }
+    });
+
+    const workspacesByProject = new Map<string, Workspace[]>();
+    (workspaces || []).forEach((ws) => {
+      if (ws && ws.projectId) {
+        const list = workspacesByProject.get(ws.projectId) || [];
+        list.push(ws);
+        workspacesByProject.set(ws.projectId, list);
+      }
+    });
+
+    return Array.from(allProjects.entries()).map(([projectId, projectInfo]) => ({
+      id: projectInfo.id,
+      name: projectInfo.name,
+      workspaces: workspacesByProject.get(projectId) || [],
+    }));
+  }, [project, recentProjects, workspaces]);
+
   return (
     <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
       <WorkspaceRail
-        workspaces={workspaces}
-        activeId={activeWorkspaceId}
+        projects={projectGroups}
+        activeWorkspaceId={activeWorkspaceId}
         onSelect={(id) => selectWorkspace(id)}
         onCustomize={(id) => setCustomizingWorkspaceId(id)}
         onContextMenu={(workspaceId, x, y) => setContextMenu({ workspaceId, x, y })}
