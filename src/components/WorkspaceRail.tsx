@@ -137,12 +137,9 @@ function WorkspaceRow({
   );
   const showPulse = !!attentionFlag && !active;
 
-  return (
-    <div
-      className={`relative flex items-center ${
-        isCollapsed ? "justify-center" : "px-3"
-      } border-l-2 ${active ? "border-octo-brass" : "border-transparent"}`}
-    >
+  if (isCollapsed) {
+    // Collapsed mode: 32px monogram only
+    return (
       <button
         type="button"
         onClick={onSelect}
@@ -154,42 +151,94 @@ function WorkspaceRow({
             onCustomize();
           }
         }}
-        title={
-          showPulse
-            ? `${workspace.name} — needs your attention (${attentionFlag.kind})`
-            : `${workspace.name} (right-click to customize)`
-        }
+        title={workspace.name}
         aria-label={
           showPulse
             ? `${workspace.name} — needs attention`
             : workspace.name
         }
         aria-current={active ? "location" : undefined}
-        className={`relative flex h-7 w-7 items-center justify-center rounded-md border font-serif transition ${
+        className={`relative flex h-8 w-8 items-center justify-center rounded-md border font-serif transition ${
           showPulse ? "animate-attention-pulse" : ""
-        } ${!isCollapsed ? "flex-shrink-0" : ""}`}
+        }`}
         style={{
-          color: tint.accent,
+          color: '#0c0a08',
           borderColor: showPulse
             ? "var(--color-octo-brass)"
             : active
               ? tint.accent
               : "transparent",
-          background: showPulse
-            ? "var(--brass-ghost)"
-            : active
-              ? tint.bg
-              : "transparent",
+          background: active ? tint.bg : "transparent",
         }}
       >
         {mono.glyph}
       </button>
-      {/* Workspace name (only when expanded) */}
-      {!isCollapsed && (
-        <div className="ml-3 flex-1 text-left">
-          <span className="text-sm text-octo-ivory">{workspace.name}</span>
-        </div>
+    );
+  }
+
+  // Expanded mode
+  const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
+    e.preventDefault();
+    if (onContextMenu) {
+      onContextMenu(e.clientX, e.clientY);
+    } else {
+      onCustomize();
+    }
+  };
+
+  return (
+    <div
+      className={`group relative flex h-11 items-center gap-2 border-l-2 px-3 transition-all duration-[220ms] ${
+        active ? "border-octo-brass bg-octo-panel-2" : "border-transparent hover:bg-octo-panel-2"
+      }`}
+    >
+      {/* Monogram (24px) */}
+      <button
+        type="button"
+        onClick={onSelect}
+        onContextMenu={handleContextMenu}
+        title={workspace.name}
+        aria-label={workspace.name}
+        className={`relative flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md border bg-transparent font-serif transition ${
+          showPulse ? "animate-attention-pulse" : ""
+        }`}
+        style={{
+          color: '#0c0a08',
+          borderColor: showPulse
+            ? "var(--color-octo-brass)"
+            : active
+              ? tint.accent
+              : "transparent",
+          background: tint.bg,
+        }}
+      >
+        {mono.glyph}
+      </button>
+
+      {/* Workspace name (clickable div, not a button) */}
+      <div
+        onClick={onSelect}
+        onContextMenu={handleContextMenu}
+        title={
+          showPulse
+            ? `${workspace.name} — needs your attention (${attentionFlag.kind})`
+            : `${workspace.name} (right-click to customize)`
+        }
+        className="flex-1 truncate text-left text-sm transition cursor-pointer"
+        style={{
+          color: active ? "var(--color-octo-ivory)" : "var(--color-octo-sage)",
+        }}
+      >
+        {workspace.name}
+      </div>
+
+      {/* Active dot (6px, brass, visible only when active) */}
+      {active && (
+        <div className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-octo-brass" />
       )}
+
+      {/* Fade-out gradient (placeholder for Task 4) */}
+      <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-10 bg-gradient-to-l from-octo-onyx to-transparent opacity-0 transition-opacity duration-[220ms] group-hover:opacity-100" />
     </div>
   );
 }
