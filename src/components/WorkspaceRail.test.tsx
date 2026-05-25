@@ -22,7 +22,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
 }
 
 describe("WorkspaceRail", () => {
-  it("renders one button per workspace plus a 'new workspace' button", () => {
+  it("renders one button per workspace plus new workspace and toggle buttons", () => {
     const workspaces = [
       makeWorkspace({ id: "a", name: "Alpha" }),
       makeWorkspace({ id: "b", name: "Beta" }),
@@ -40,7 +40,8 @@ describe("WorkspaceRail", () => {
         onNewWorkspace={vi.fn()}
       />,
     );
-    expect(screen.getAllByRole("button")).toHaveLength(workspaces.length + 1);
+    // workspace buttons + new workspace button + toggle button
+    expect(screen.getAllByRole("button")).toHaveLength(workspaces.length + 2);
   });
 
   it("renders the workspace monogram glyph", () => {

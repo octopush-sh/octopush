@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import type { Workspace } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
@@ -27,70 +28,120 @@ export function WorkspaceRail({
   onContextMenu,
   onNewWorkspace,
 }: Props) {
-  // Temporary: flatten projects to workspaces for the current implementation.
-  // Task 2 will refactor the rendering to use the hierarchical structure.
-  const workspaces = projects.flatMap((p) => p.workspaces);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+
+  // Listen for ⌘\ keyboard shortcut to toggle collapse
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
+        e.preventDefault();
+        setIsCollapsed((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   return (
     <aside
-      className="flex h-full w-12 flex-col items-center gap-2 border-r border-octo-hairline bg-octo-panel pb-3 pt-9"
+      className={`flex h-full flex-col items-center gap-2 border-r border-octo-hairline bg-octo-panel pb-3 pt-9 transition-all duration-[220ms] ${
+        isCollapsed ? "w-[50px]" : "w-[280px]"
+      }`}
       aria-label="Workspaces"
     >
-      {workspaces.map((ws) => (
-        <MonogramButton
-          key={ws.id}
-          workspace={ws}
-          active={ws.id === activeWorkspaceId}
-          onSelect={() => onSelect(ws.id)}
-          onCustomize={() => onCustomize(ws.id)}
-          onContextMenu={
-            onContextMenu
-              ? (x, y) => onContextMenu(ws.id, x, y)
-              : undefined
-          }
-        />
-      ))}
+      <div className="flex-1 flex flex-col gap-2 w-full overflow-y-auto">
+        {projects.map((project, projectIndex) => (
+          <div key={project.id} className="flex flex-col gap-2">
+            {/* Project header (only when expanded) */}
+            {!isCollapsed && (
+              <div className="px-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+                — {project.name}
+              </div>
+            )}
+
+            {/* Project separator (only when collapsed, not on first project) */}
+            {isCollapsed && projectIndex > 0 && (
+              <div className="flex justify-center">
+                <div className="h-[1px] w-6 bg-octo-hairline opacity-50" />
+              </div>
+            )}
+
+            {/* Workspaces in this project */}
+            {project.workspaces.map((ws) => (
+              <WorkspaceRow
+                key={ws.id}
+                workspace={ws}
+                active={ws.id === activeWorkspaceId}
+                isCollapsed={isCollapsed}
+                onSelect={() => onSelect(ws.id)}
+                onCustomize={() => onCustomize(ws.id)}
+                onContextMenu={
+                  onContextMenu
+                    ? (x, y) => onContextMenu(ws.id, x, y)
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* New workspace button */}
       <button
         type="button"
         onClick={onNewWorkspace}
         title="New workspace (⌘N)"
         aria-label="New workspace"
-        className="mt-1 flex h-6 w-6 items-center justify-center rounded-md border border-dashed border-octo-hairline font-mono text-sm text-octo-mute transition hover:border-octo-brass hover:text-octo-brass"
+        className="flex h-6 w-6 items-center justify-center rounded-md border border-dashed border-octo-hairline font-mono text-sm text-octo-mute transition hover:border-octo-brass hover:text-octo-brass"
       >
         +
+      </button>
+
+      {/* Toggle button at bottom */}
+      <button
+        type="button"
+        onClick={() => setIsCollapsed(!isCollapsed)}
+        title={`${isCollapsed ? "Expand" : "Collapse"} workspace rail (⌘\\)`}
+        aria-label={`${isCollapsed ? "Expand" : "Collapse"} workspace rail`}
+        className={`w-full border border-octo-hairline text-octo-mute transition hover:border-octo-brass hover:text-octo-sage ${
+          isCollapsed ? "px-1" : "px-3"
+        } py-1 text-center font-mono text-[11px]`}
+      >
+        {isCollapsed ? "▲" : "▼ Collapse"}
       </button>
     </aside>
   );
 }
 
-function MonogramButton({
-  workspace,
-  active,
-  onSelect,
-  onCustomize,
-  onContextMenu,
-}: {
+interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
+  isCollapsed: boolean;
   onSelect: () => void;
   onCustomize: () => void;
   onContextMenu?: (x: number, y: number) => void;
-}) {
+}
+
+function WorkspaceRow({
+  workspace,
+  active,
+  isCollapsed,
+  onSelect,
+  onCustomize,
+  onContextMenu,
+}: WorkspaceRowProps) {
   const mono = resolveMonogram(workspace);
   const tint = TINTS[mono.tint];
   const attentionFlag = useAttentionStore(
     (s) => s.flagsByWs[workspace.id],
   );
-  // Hide the pulse when this workspace IS the active one — the flag is
-  // cleared on the next render but for the single render between
-  // ping-then-focus we don't want to show a stale dot.
   const showPulse = !!attentionFlag && !active;
 
   return (
     <div
-      className={`relative flex items-center pl-[6px] border-l-2 ${
-        active ? "border-octo-brass" : "border-transparent"
-      }`}
+      className={`relative flex items-center ${
+        isCollapsed ? "justify-center" : "px-3"
+      } border-l-2 ${active ? "border-octo-brass" : "border-transparent"}`}
     >
       <button
         type="button"
@@ -114,15 +165,9 @@ function MonogramButton({
             : workspace.name
         }
         aria-current={active ? "location" : undefined}
-        // When a workspace is asking for attention, we pulse the
-        // monogram itself (brass border + halo) instead of a small
-        // dot offset from the corner — that dot was hard to associate
-        // unambiguously with one specific monogram when monograms sit
-        // close together. Pulsing the whole tile makes the source
-        // obvious.
         className={`relative flex h-7 w-7 items-center justify-center rounded-md border font-serif transition ${
           showPulse ? "animate-attention-pulse" : ""
-        }`}
+        } ${!isCollapsed ? "flex-shrink-0" : ""}`}
         style={{
           color: tint.accent,
           borderColor: showPulse
@@ -139,6 +184,13 @@ function MonogramButton({
       >
         {mono.glyph}
       </button>
+      {/* Workspace name (only when expanded) */}
+      {!isCollapsed && (
+        <div className="ml-3 flex-1 text-left">
+          <span className="text-sm text-octo-ivory">{workspace.name}</span>
+        </div>
+      )}
     </div>
   );
 }
+
