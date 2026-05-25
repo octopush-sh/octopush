@@ -311,7 +311,7 @@ describe("WorkspaceRail", () => {
     const projects: ProjectGroup[] = [
       { id: "proj-1", name: "Project", workspaces },
     ];
-    const { container } = render(
+    render(
       <WorkspaceRail
         projects={projects}
         activeWorkspaceId="a"

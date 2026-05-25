@@ -183,7 +183,7 @@ function WorkspaceRow({
           showPulse ? "animate-attention-pulse" : ""
         }`}
         style={{
-          color: '#0c0a08',
+          color: "var(--color-octo-onyx)",
           borderColor: showPulse
             ? "var(--color-octo-brass)"
             : active
@@ -224,7 +224,7 @@ function WorkspaceRow({
           showPulse ? "animate-attention-pulse" : ""
         }`}
         style={{
-          color: '#0c0a08',
+          color: "var(--color-octo-onyx)",
           borderColor: showPulse
             ? "var(--color-octo-brass)"
             : active
