@@ -13,8 +13,11 @@ interface WorkspaceState {
    * jumping to the first one in the list.
    */
   lastActiveByProject: Record<string, string>;
+  /** Workspaces grouped by project ID for hierarchical display in the rail. */
+  workspacesByProjectId: Record<string, Workspace[]>;
 
   load: (projectId: string) => Promise<void>;
+  loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
   create: (projectId: string, projectPath: string, name: string, task: string,
            branch: string, fromBranch: string, setupScript: string) => Promise<Workspace>;
   select: (id: string | null) => void;
@@ -24,12 +27,23 @@ interface WorkspaceState {
   clearNotification: (workspaceId: string) => void;
 }
 
+// Restore lastActiveByProject from localStorage on module load
+const loadLastActiveFromStorage = (): Record<string, string> => {
+  try {
+    const stored = localStorage.getItem("lastActiveWorkspacePerProject");
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+};
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   workspaces: [],
   activeId: null,
   loading: false,
   notifications: {},
-  lastActiveByProject: {},
+  lastActiveByProject: loadLastActiveFromStorage(),
+  workspacesByProjectId: {},
 
   load: async (projectId) => {
     set({ loading: true });
@@ -46,16 +60,59 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       : workspaces.length > 0
         ? workspaces[0].id
         : null;
-    set({ workspaces, loading: false, activeId: nextActive });
+    set((s) => ({
+      workspaces,
+      loading: false,
+      activeId: nextActive,
+      workspacesByProjectId: {
+        ...s.workspacesByProjectId,
+        [projectId]: workspaces,
+      },
+    }));
+  },
+
+  loadAllWorkspaces: async (projectIds) => {
+    if (projectIds.length === 0) return;
+    set({ loading: true });
+    try {
+      const results = await Promise.all(
+        projectIds.map(async (id) => {
+          const wss = await ipc.listWorkspaces(id);
+          return { projectId: id, workspaces: wss };
+        })
+      );
+      set((s) => {
+        const newByProject = { ...s.workspacesByProjectId };
+        results.forEach(({ projectId, workspaces }) => {
+          newByProject[projectId] = workspaces;
+        });
+        return { workspacesByProjectId: newByProject, loading: false };
+      });
+    } catch (err) {
+      console.error("loadAllWorkspaces failed:", err);
+      set({ loading: false });
+    }
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript) => {
     const ws = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript);
-    set((s) => ({
-      workspaces: [ws, ...s.workspaces],
-      activeId: ws.id,
-      lastActiveByProject: { ...s.lastActiveByProject, [projectId]: ws.id },
-    }));
+    set((s) => {
+      const updated = { ...s.lastActiveByProject, [projectId]: ws.id };
+      try {
+        localStorage.setItem("lastActiveWorkspacePerProject", JSON.stringify(updated));
+      } catch (err) {
+        console.error("Failed to persist lastActiveByProject:", err);
+      }
+      return {
+        workspaces: [ws, ...s.workspaces],
+        activeId: ws.id,
+        lastActiveByProject: updated,
+        workspacesByProjectId: {
+          ...s.workspacesByProjectId,
+          [projectId]: [ws, ...(s.workspacesByProjectId[projectId] || [])],
+        },
+      };
+    });
     return ws;
   },
 
@@ -67,10 +124,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         // restores the workspace the user was last viewing.
         const ws = s.workspaces.find((w) => w.id === id);
         if (ws) {
-          next.lastActiveByProject = {
+          const updated = {
             ...s.lastActiveByProject,
             [ws.projectId]: id,
           };
+          next.lastActiveByProject = updated;
+          // Persist to localStorage
+          try {
+            localStorage.setItem("lastActiveWorkspacePerProject", JSON.stringify(updated));
+          } catch (err) {
+            console.error("Failed to persist lastActiveByProject:", err);
+          }
         }
       }
       return next as WorkspaceState;

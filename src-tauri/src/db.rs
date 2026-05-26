@@ -555,6 +555,37 @@ impl Db {
         Ok(row)
     }
 
+    pub fn get_project_by_id(&self, id: &str) -> AppResult<Option<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, path FROM projects WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {
+        if let Some(name_val) = name {
+            self.conn.execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2",
+                params![name_val, id],
+            )?;
+        }
+        if let Some(tint_val) = tint {
+            self.conn.execute(
+                "UPDATE projects SET tint = ?1 WHERE id = ?2",
+                params![tint_val, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_project(&self, id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     // ─── Workspaces ───────────────────────────────────────────────
 
     pub fn insert_workspace(

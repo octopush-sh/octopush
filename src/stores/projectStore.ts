@@ -12,6 +12,8 @@ interface ProjectState {
   create: (path: string, name: string) => Promise<void>;
   loadRecent: () => Promise<void>;
   close: () => void;
+  getLastOpenedPath: () => string | null;
+  saveLastOpenedPath: (path: string) => void;
 }
 
 export const useProjectStore = create<ProjectState>((set) => ({
@@ -25,6 +27,12 @@ export const useProjectStore = create<ProjectState>((set) => ({
     try {
       const project = await ipc.openProject(path);
       set({ current: project, loading: false });
+      // Persist last opened project path
+      try {
+        localStorage.setItem("lastOpenedProjectPath", path);
+      } catch (err) {
+        console.error("Failed to save lastOpenedProjectPath:", err);
+      }
     } catch (e) {
       set({ error: String(e), loading: false });
     }
@@ -50,4 +58,20 @@ export const useProjectStore = create<ProjectState>((set) => ({
   },
 
   close: () => set({ current: null }),
+
+  getLastOpenedPath: () => {
+    try {
+      return localStorage.getItem("lastOpenedProjectPath");
+    } catch {
+      return null;
+    }
+  },
+
+  saveLastOpenedPath: (path) => {
+    try {
+      localStorage.setItem("lastOpenedProjectPath", path);
+    } catch (err) {
+      console.error("Failed to save lastOpenedProjectPath:", err);
+    }
+  },
 }));
