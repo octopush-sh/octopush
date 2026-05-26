@@ -1,10 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 interface Props {
   title: string;
   body: string;
   destructiveLabel: string;
   cancelLabel?: string;
+  requireInput?: string;
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
 }
@@ -14,23 +15,27 @@ export function ConfirmDialog({
   body,
   destructiveLabel,
   cancelLabel = "Cancel",
+  requireInput,
   onConfirm,
   onCancel,
 }: Props) {
+  const [inputValue, setInputValue] = useState("");
+  const isConfirmDisabled = requireInput ? inputValue !== requireInput : false;
+
   // Esc → cancel, Enter → confirm
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onCancel();
-      } else if (e.key === "Enter") {
+      } else if (e.key === "Enter" && !isConfirmDisabled) {
         e.preventDefault();
         void onConfirm();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onConfirm, onCancel]);
+  }, [onConfirm, onCancel, isConfirmDisabled]);
 
   return (
     <div
@@ -55,6 +60,23 @@ export function ConfirmDialog({
           {body}
         </p>
 
+        {requireInput && (
+          <div className="mt-5 space-y-2">
+            <label className="block text-[11px] font-mono text-octo-mute">
+              Type "{requireInput}" to confirm:
+            </label>
+            <input
+              type="text"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              placeholder="Type here to confirm"
+              aria-label={`Type "${requireInput}" to confirm`}
+              autoFocus
+              className="w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none transition focus:border-octo-brass"
+            />
+          </div>
+        )}
+
         <div className="mt-6 flex items-center justify-end gap-3">
           <button
             type="button"
@@ -66,11 +88,12 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={() => void onConfirm()}
-            className="rounded-md px-4 py-2 font-mono text-[11px] text-octo-rouge transition"
-            style={{
-              background: "rgba(209, 139, 139, 0.1)",
-              border: "1px solid rgba(209, 139, 139, 0.3)",
-            }}
+            disabled={isConfirmDisabled}
+            className={`rounded-md border border-[color:var(--rouge-border)] px-4 py-2 font-mono text-[11px] text-octo-rouge transition disabled:cursor-not-allowed disabled:opacity-50 ${
+              isConfirmDisabled
+                ? "bg-[var(--rouge-disabled-bg)]"
+                : "bg-[var(--rouge-active-bg)]"
+            }`}
           >
             {destructiveLabel}
           </button>
