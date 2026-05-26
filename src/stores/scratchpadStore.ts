@@ -101,7 +101,21 @@ export const useScratchpadStore = create<ScratchpadState>((set) => ({
 
       // Check for duplicates
       const exists = state.tabs.some((t) => t.id !== tabId && t.name === trimmed);
-      const finalName = exists ? `${trimmed.slice(0, -3)}1${trimmed.slice(-3)}` : trimmed;
+
+      let finalName = trimmed;
+      if (exists) {
+        // Handle duplicate: insert "1" before the file extension
+        const lastDot = trimmed.lastIndexOf('.');
+        if (lastDot > 0) {
+          // Has extension: insert before extension
+          const name = trimmed.slice(0, lastDot);
+          const ext = trimmed.slice(lastDot);
+          finalName = `${name}1${ext}`;
+        } else {
+          // No extension: just append "1"
+          finalName = `${trimmed}1`;
+        }
+      }
 
       const language = detectLanguageFromName(finalName);
 

@@ -75,14 +75,18 @@ describe("useScratchpadStore", () => {
     state.createTab();
     state.createTab();
     const initialState = useScratchpadStore.getState();
+    const firstTabId = initialState.tabs[0].id;
     const secondTabId = initialState.tabs[1].id;
 
+    // Rename first tab to "data.json"
+    state.renameTab(firstTabId, "data.json");
+    // Try to rename second tab to the same name
     state.renameTab(secondTabId, "data.json");
-    state.renameTab(secondTabId, "data.json"); // Try to create duplicate
 
     const updated = useScratchpadStore.getState();
-    // Should append number to prevent collision
-    expect(updated.tabs[1].name).toMatch(/data.*\.json/);
+    // Should append number before extension to prevent collision
+    expect(updated.tabs[0].name).toBe("data.json");
+    expect(updated.tabs[1].name).toBe("data1.json");
   });
 
   it("deletes a tab", () => {
