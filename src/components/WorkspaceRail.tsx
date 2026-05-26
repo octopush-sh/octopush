@@ -18,6 +18,12 @@ interface Props {
   /** Called when the user right-clicks a workspace monogram. */
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
   onNewWorkspace: () => void;
+  /** Called when user clicks to create a workspace for a specific project. */
+  onNewWorkspaceForProject?: (projectId: string) => void;
+  /** Called when user clicks to add a new project. */
+  onAddProject?: () => void;
+  /** Called when user right-clicks on a project header. */
+  onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
 }
 
 export function WorkspaceRail({
@@ -27,6 +33,9 @@ export function WorkspaceRail({
   onCustomize,
   onContextMenu,
   onNewWorkspace,
+  onNewWorkspaceForProject,
+  onAddProject,
+  onProjectContextMenu,
 }: Props) {
   const [isCollapsed, setIsCollapsed] = useState(false);
 
@@ -39,11 +48,31 @@ export function WorkspaceRail({
     >
       <div className="flex-1 flex flex-col gap-2 w-full overflow-y-auto">
         {(projects || []).map((project, projectIndex) => (
-          <div key={project?.id || `project-${projectIndex}`} className="flex flex-col gap-2">
+          <div key={project?.id || `project-${projectIndex}`} className="flex flex-col gap-1" style={{ marginBottom: projectIndex < projects.length - 1 ? '0.75rem' : '0' }}>
             {/* Project header (only when expanded) */}
             {!isCollapsed && project?.name && (
-              <div className="px-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-                — {project.name}
+              <div
+                className="flex items-center justify-between gap-2 px-3 group"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (onProjectContextMenu) {
+                    onProjectContextMenu(project.id, e.clientX, e.clientY);
+                  }
+                }}
+              >
+                <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+                  — {project.name}
+                </div>
+                {onNewWorkspaceForProject && (
+                  <button
+                    type="button"
+                    onClick={() => onNewWorkspaceForProject(project.id)}
+                    title={`New workspace in ${project.name}`}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 text-xs text-octo-mute hover:text-octo-brass"
+                  >
+                    +
+                  </button>
+                )}
               </div>
             )}
 
@@ -74,13 +103,26 @@ export function WorkspaceRail({
         ))}
       </div>
 
+      {/* Add project button */}
+      {onAddProject && (
+        <button
+          type="button"
+          onClick={onAddProject}
+          className={`w-full flex ${isCollapsed ? "justify-center" : ""} items-center gap-2 px-3 py-2 text-octo-mute hover:text-octo-brass transition font-mono text-sm`}
+          title="Add project"
+          aria-label="Add project"
+        >
+          ◉ {!isCollapsed && "Add project"}
+        </button>
+      )}
+
       {/* New workspace button */}
       <button
         type="button"
         onClick={onNewWorkspace}
         title="New workspace (⌘N)"
         aria-label="New workspace"
-        className="flex h-6 w-6 items-center justify-center rounded-md border border-dashed border-octo-hairline font-mono text-sm text-octo-mute transition hover:border-octo-brass hover:text-octo-brass"
+        className="flex h-7 w-7 items-center justify-center rounded-md border border-dashed border-octo-hairline font-mono text-base text-octo-mute transition hover:border-octo-brass hover:text-octo-brass"
       >
         +
       </button>
