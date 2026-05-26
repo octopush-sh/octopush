@@ -1,4 +1,6 @@
 import type { GitStatus, OpenPr } from "../lib/types";
+import { ScratchpadIcon } from "./ScratchpadIcon";
+import { useScratchpadStore } from "../stores/scratchpadStore";
 
 interface Props {
   projectName: string;
@@ -30,6 +32,7 @@ export function ContextHeader({
   rightSlot,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
+  const toggleScratchpad = useScratchpadStore((s) => s.toggleOpen);
 
   return (
     <div className="m-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
@@ -97,7 +100,10 @@ export function ContextHeader({
         {rightSlot && (
           <>
             <span className="h-6 w-px bg-octo-hairline" aria-hidden />
-            {rightSlot}
+            <div className="flex items-center gap-2">
+              <ScratchpadIcon onClick={toggleScratchpad} />
+              {rightSlot}
+            </div>
           </>
         )}
       </div>
