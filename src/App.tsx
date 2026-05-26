@@ -957,118 +957,118 @@ function App() {
             unmounting every running PTY whenever the user crossed that
             boundary. */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
-          <div className="relative min-w-0 flex-1 overflow-hidden">
-            {/* Talk panel — chat for the active workspace. */}
-            <div
-              className="absolute inset-0 transition-opacity duration-200 ease-out"
-              style={{
-                opacity: activeWorkspace && activeMode === "talk" ? 1 : 0,
-                pointerEvents:
-                  activeWorkspace && activeMode === "talk" ? "auto" : "none",
-                visibility:
-                  activeWorkspace && activeMode === "talk" ? "visible" : "hidden",
-              }}
-            >
-              {activeWorkspace && (
-                <ChatView
-                  workspaceId={activeChatId!}
-                  workspacePath={activeWorkspace.worktreePath || project.path}
-                  onOpenSettings={() => setSettingsTab("general")}
-                  onOpenInEditor={(p) => navigateToFile(p, "editor")}
-                />
-              )}
-            </div>
-
-            {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs
-                in the store are mounted here unconditionally. Individual
-                panes hide via display:none when not the active one, but the
-                container itself is never gated by activeWorkspace, so PTYs
-                survive project switches and new-project creation. */}
-            <div
-              className="absolute inset-0 transition-opacity duration-200 ease-out"
-              style={{
-                opacity: activeMode === "run" ? 1 : 0,
-                pointerEvents: activeMode === "run" ? "auto" : "none",
-                visibility: activeMode === "run" ? "visible" : "hidden",
-              }}
-            >
-              <div className="relative h-full w-full">
-                {allTerminalRefs.map((t) => {
-                  const ws = workspaces.find((w) => w.id === t.workspaceId);
-                  const wsPath = ws?.worktreePath || project.path;
-                  return (
-                    <TerminalPane
-                      key={t.id}
-                      terminalId={t.id}
-                      workspaceId={t.workspaceId}
-                      workspacePath={wsPath}
-                      label={t.label}
-                      visible={
-                        activeMode === "run" &&
-                        !!activeWorkspaceId &&
-                        t.workspaceId === activeWorkspaceId &&
-                        t.id === activeTerminalId
-                      }
-                      layoutVersion={layoutVersion}
-                      onSpawn={() => markRunning(t.workspaceId, t.id, true)}
-                      onExit={() => markRunning(t.workspaceId, t.id, false)}
-                      onReattach={() => {
-                        // Mark as running (it already was, but be explicit).
-                        markRunning(t.workspaceId, t.id, true);
-                      }}
-                      onOpenFile={(p) => navigateToFile(p, "editor")}
-                    />
-                  );
-                })}
-                {activeWorkspace && terminals.length === 0 && (
-                  <RunEmptyState
-                    onStart={() => {
-                      createTerminal(activeWorkspaceId!, "Main").catch(console.error);
-                    }}
+          <CanvasSplit>
+            <div className="relative w-full h-full min-w-0 flex-1 overflow-hidden">
+              {/* Talk panel — chat for the active workspace. */}
+              <div
+                className="absolute inset-0 transition-opacity duration-200 ease-out"
+                style={{
+                  opacity: activeWorkspace && activeMode === "talk" ? 1 : 0,
+                  pointerEvents:
+                    activeWorkspace && activeMode === "talk" ? "auto" : "none",
+                  visibility:
+                    activeWorkspace && activeMode === "talk" ? "visible" : "hidden",
+                }}
+              >
+                {activeWorkspace && (
+                  <ChatView
+                    workspaceId={activeChatId!}
+                    workspacePath={activeWorkspace.worktreePath || project.path}
+                    onOpenSettings={() => setSettingsTab("general")}
+                    onOpenInEditor={(p) => navigateToFile(p, "editor")}
                   />
                 )}
               </div>
-            </div>
 
-            {/* Review panel — only meaningful with an active workspace. */}
-            <div
-              className="absolute inset-0 transition-opacity duration-200 ease-out"
-              style={{
-                opacity: activeWorkspace && activeMode === "review" ? 1 : 0,
-                pointerEvents:
-                  activeWorkspace && activeMode === "review" ? "auto" : "none",
-                visibility:
-                  activeWorkspace && activeMode === "review" ? "visible" : "hidden",
-              }}
-            >
-              {activeWorkspace && (
-                <div className="flex h-full min-h-0">
-                  {/* Left: slim Changes outline (file index + commit) */}
-                  <div className="w-[260px] shrink-0 border-r border-octo-hairline">
-                    <ChangesPanel
-                      projectPath={activeWorkspace.worktreePath || project.path}
-                      diff={gitDiff}
-                      onFileClick={(filePath) => navigateToFile(filePath, "diff")}
-                      onChange={() => {
-                        // Refetch diff + status after commit / push so the
-                        // canvas catches up immediately.
-                        const path = activeWorkspace.worktreePath || project.path;
-                        Promise.all([
-                          ipc.getGitStatus(path),
-                          ipc.getGitDiff(path).catch(() => ""),
-                        ])
-                          .then(([s, d]) => {
-                            setGitStatus(s);
-                            setGitDiff(d);
-                          })
-                          .catch(() => {});
+              {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs
+                  in the store are mounted here unconditionally. Individual
+                  panes hide via display:none when not the active one, but the
+                  container itself is never gated by activeWorkspace, so PTYs
+                  survive project switches and new-project creation. */}
+              <div
+                className="absolute inset-0 transition-opacity duration-200 ease-out"
+                style={{
+                  opacity: activeMode === "run" ? 1 : 0,
+                  pointerEvents: activeMode === "run" ? "auto" : "none",
+                  visibility: activeMode === "run" ? "visible" : "hidden",
+                }}
+              >
+                <div className="relative h-full w-full">
+                  {allTerminalRefs.map((t) => {
+                    const ws = workspaces.find((w) => w.id === t.workspaceId);
+                    const wsPath = ws?.worktreePath || project.path;
+                    return (
+                      <TerminalPane
+                        key={t.id}
+                        terminalId={t.id}
+                        workspaceId={t.workspaceId}
+                        workspacePath={wsPath}
+                        label={t.label}
+                        visible={
+                          activeMode === "run" &&
+                          !!activeWorkspaceId &&
+                          t.workspaceId === activeWorkspaceId &&
+                          t.id === activeTerminalId
+                        }
+                        layoutVersion={layoutVersion}
+                        onSpawn={() => markRunning(t.workspaceId, t.id, true)}
+                        onExit={() => markRunning(t.workspaceId, t.id, false)}
+                        onReattach={() => {
+                          // Mark as running (it already was, but be explicit).
+                          markRunning(t.workspaceId, t.id, true);
+                        }}
+                        onOpenFile={(p) => navigateToFile(p, "editor")}
+                      />
+                    );
+                  })}
+                  {activeWorkspace && terminals.length === 0 && (
+                    <RunEmptyState
+                      onStart={() => {
+                        createTerminal(activeWorkspaceId!, "Main").catch(console.error);
                       }}
                     />
-                  </div>
+                  )}
+                </div>
+              </div>
 
-                  {/* Centre: ReviewCanvas with Diff/Editor toggle */}
-                  <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                    <CanvasSplit>
+              {/* Review panel — only meaningful with an active workspace. */}
+              <div
+                className="absolute inset-0 transition-opacity duration-200 ease-out"
+                style={{
+                  opacity: activeWorkspace && activeMode === "review" ? 1 : 0,
+                  pointerEvents:
+                    activeWorkspace && activeMode === "review" ? "auto" : "none",
+                  visibility:
+                    activeWorkspace && activeMode === "review" ? "visible" : "hidden",
+                }}
+              >
+                {activeWorkspace && (
+                  <div className="flex h-full min-h-0">
+                    {/* Left: slim Changes outline (file index + commit) */}
+                    <div className="w-[260px] shrink-0 border-r border-octo-hairline">
+                      <ChangesPanel
+                        projectPath={activeWorkspace.worktreePath || project.path}
+                        diff={gitDiff}
+                        onFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                        onChange={() => {
+                          // Refetch diff + status after commit / push so the
+                          // canvas catches up immediately.
+                          const path = activeWorkspace.worktreePath || project.path;
+                          Promise.all([
+                            ipc.getGitStatus(path),
+                            ipc.getGitDiff(path).catch(() => ""),
+                          ])
+                            .then(([s, d]) => {
+                              setGitStatus(s);
+                              setGitDiff(d);
+                            })
+                            .catch(() => {});
+                        }}
+                      />
+                    </div>
+
+                    {/* Centre: ReviewCanvas with Diff/Editor toggle */}
+                    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                       <ReviewCanvas
                         workspaceId={activeWorkspaceId!}
                         workspacePath={activeWorkspace.worktreePath || project.path}
@@ -1099,11 +1099,12 @@ function App() {
                           diffText={gitDiff}
                         />
                       </ReviewCanvas>
-                    </CanvasSplit>
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
+          </CanvasSplit>
 
             {/* Workspace creator overlay (from the rail "+" button or project header). */}
             {showCreator && (() => {
@@ -1152,7 +1153,6 @@ function App() {
                 )}
               </div>
             )}
-          </div>
         </div>
 
         {/* RIGHT COLUMN — Companion always mounted. When there's no active

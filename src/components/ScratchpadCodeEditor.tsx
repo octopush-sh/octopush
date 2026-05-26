@@ -1,13 +1,26 @@
 import hljs from "highlight.js";
 import "highlight.js/styles/atom-one-dark.css";
 import { useScratchpadStore } from "../stores/scratchpadStore";
+import { useEffect, useRef } from "react";
 
 export function ScratchpadCodeEditor() {
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+
   const activeTabId = useScratchpadStore((s) => s.activeTabId);
   const tabs = useScratchpadStore((s) => s.tabs);
   const setContent = useScratchpadStore((s) => s.setContent);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
+
+  useEffect(() => {
+    console.log(`[ScratchpadCodeEditor] render #${renderCountRef.current}:`, {
+      activeTabId,
+      tabCount: tabs.length,
+      activeTabContentLength: activeTab?.content.length,
+      activeTabContentPreview: activeTab?.content.substring(0, 50),
+    });
+  });
 
   if (!activeTab) {
     return (
@@ -19,7 +32,34 @@ export function ScratchpadCodeEditor() {
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (activeTabId) {
-      setContent(activeTabId, e.target.value);
+      const newValue = e.target.value;
+      const eventKey = `onChange_${Date.now()}_${Math.random()}`;
+
+      console.log(`[ScratchpadCodeEditor] onChange START [${eventKey}]:`, {
+        activeTabId,
+        newValueLength: newValue.length,
+        newValue: newValue.substring(0, 100),
+        currentActiveTab: activeTab?.content.substring(0, 50),
+        currentActiveTabLength: activeTab?.content.length,
+      });
+
+      // Verify the new value doesn't have accidental duplication
+      const duplicateCharCount = newValue.split('').filter((char, idx, arr) => {
+        return idx > 0 && arr[idx - 1] === char;
+      }).length;
+
+      console.log(`[ScratchpadCodeEditor] onChange char analysis:`, {
+        eventKey,
+        totalChars: newValue.length,
+        consecutiveDuplicates: duplicateCharCount,
+        uniqueChars: new Set(newValue.split('')).size,
+      });
+
+      setContent(activeTabId, newValue);
+
+      console.log(`[ScratchpadCodeEditor] onChange END [${eventKey}]: setContent called`);
+    } else {
+      console.warn(`[ScratchpadCodeEditor] onChange but activeTabId is falsy:`, { activeTabId });
     }
   };
 
@@ -49,14 +89,17 @@ export function ScratchpadCodeEditor() {
         </div>
       )}
 
-      {/* Textarea for editing */}
+      {/* Textarea for editing (text invisible, only input) */}
       <textarea
         value={activeTab.content}
         onChange={handleChange}
-        className="absolute inset-0 w-full h-full bg-transparent text-octo-ivory font-mono text-[12px] p-4 resize-none focus:outline-none z-20"
+        className="absolute inset-0 w-full h-full bg-transparent resize-none focus:outline-none z-20"
         style={{
           fontFamily: "JetBrains Mono, monospace",
+          fontSize: "12px",
           lineHeight: 1.5,
+          padding: "16px",
+          color: "transparent",
           caretColor: "var(--color-octo-brass)",
         }}
         spellCheck="false"
@@ -64,7 +107,15 @@ export function ScratchpadCodeEditor() {
       />
 
       {/* Syntax highlighted code display (read-only, behind textarea) */}
-      <pre className="absolute inset-0 w-full h-full bg-octo-onyx text-octo-ivory font-mono text-[12px] p-4 overflow-auto pointer-events-none m-0">
+      <pre
+        className="absolute inset-0 w-full h-full bg-octo-onyx text-octo-ivory overflow-auto pointer-events-none m-0"
+        style={{
+          fontFamily: "JetBrains Mono, monospace",
+          fontSize: "12px",
+          lineHeight: 1.5,
+          padding: "16px",
+        }}
+      >
         <code
           className={`hljs language-${activeTab.language}`}
           dangerouslySetInnerHTML={{ __html: highlightedCode }}

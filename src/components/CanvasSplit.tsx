@@ -31,7 +31,11 @@ export function CanvasSplit({ children }: Props) {
   };
 
   if (!isOpen) {
-    return <>{children}</>;
+    return (
+      <div className="h-full w-full">
+        {children}
+      </div>
+    );
   }
 
   return (
@@ -40,7 +44,7 @@ export function CanvasSplit({ children }: Props) {
       className="flex h-full w-full gap-0"
     >
       {/* Left column: Canvas */}
-      <div style={{ width: `${splitRatio}%` }} className="overflow-hidden">
+      <div style={{ width: `${splitRatio}%` }} className="h-full overflow-hidden">
         {children}
       </div>
 
@@ -53,7 +57,7 @@ export function CanvasSplit({ children }: Props) {
       />
 
       {/* Right column: Scratchpad */}
-      <div style={{ width: `${100 - splitRatio}%` }} className="overflow-hidden">
+      <div style={{ width: `${100 - splitRatio}%` }} className="h-full overflow-hidden">
         <ScratchpadEditor />
       </div>
     </div>
