@@ -861,18 +861,20 @@ function App() {
     // Load customizations from localStorage
     const customizations = JSON.parse(localStorage.getItem("projectCustomizations") || "{}");
 
-    const allProjects = new Map<string, { id: string; name: string }>();
+    const allProjects = new Map<string, { id: string; name: string; tint?: string }>();
     const currentProjCustom = customizations[project.id];
     allProjects.set(project.id, {
       id: project.id,
-      name: currentProjCustom?.name || project.name
+      name: currentProjCustom?.name || project.name,
+      tint: currentProjCustom?.tint
     });
     recentProjects.forEach((p) => {
       if (!allProjects.has(p.id)) {
         const pCustom = customizations[p.id];
         allProjects.set(p.id, {
           id: p.id,
-          name: pCustom?.name || p.name
+          name: pCustom?.name || p.name,
+          tint: pCustom?.tint
         });
       }
     });
@@ -880,6 +882,7 @@ function App() {
     return Array.from(allProjects.entries()).map(([projectId, projectInfo]) => ({
       id: projectInfo.id,
       name: projectInfo.name,
+      tint: projectInfo.tint,
       workspaces: workspacesByProjectId[projectId] || [],
     }));
   })();

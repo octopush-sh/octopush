@@ -7,6 +7,7 @@ import { useAttentionStore } from "../stores/attentionStore";
 export interface ProjectGroup {
   id: string;
   name: string;
+  tint?: string;
   workspaces: Workspace[];
 }
 
@@ -50,7 +51,9 @@ export function WorkspaceRail({
         {(projects || []).map((project, projectIndex) => (
           <div key={project?.id || `project-${projectIndex}`} className="flex flex-col gap-1" style={{ marginBottom: projectIndex < projects.length - 1 ? '0.75rem' : '0' }}>
             {/* Project header (only when expanded) */}
-            {!isCollapsed && project?.name && (
+            {!isCollapsed && project?.name && (() => {
+              const tint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : TINTS.brass;
+              return (
               <div
                 className="flex items-center justify-between gap-2 px-3 group"
                 onContextMenu={(e) => {
@@ -60,7 +63,10 @@ export function WorkspaceRail({
                   }
                 }}
               >
-                <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+                <div
+                  className="font-mono text-[10px] uppercase tracking-[0.25em]"
+                  style={{ color: tint.accent }}
+                >
                   — {project.name}
                 </div>
                 {onNewWorkspaceForProject && (
@@ -74,7 +80,8 @@ export function WorkspaceRail({
                   </button>
                 )}
               </div>
-            )}
+            );
+            })()}
 
             {/* Project separator (only when collapsed, not on first project) */}
             {isCollapsed && projectIndex > 0 && (
