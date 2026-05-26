@@ -1,12 +1,10 @@
-import { useState } from 'react';
-import { X } from 'lucide-react';
-import type { TintName } from '@/lib/types';
-import { TINTS, TINT_NAMES } from '@/lib/monogram';
+import { useState } from "react";
+import { TINTS, TINT_NAMES } from "../lib/monogram";
+import type { TintName } from "../lib/types";
 
-export interface ProjectCustomizeMenuProps {
-  projectId: string;
+interface Props {
   currentName: string;
-  currentTint: TintName | null;
+  currentTint: TintName;
   onCustomized: (name: string, tint: TintName) => void;
   onCancel: () => void;
 }
@@ -16,139 +14,84 @@ export function ProjectCustomizeMenu({
   currentTint,
   onCustomized,
   onCancel,
-}: ProjectCustomizeMenuProps) {
+}: Props) {
   const [name, setName] = useState(currentName);
-  const [tint, setTint] = useState<TintName>(currentTint ?? 'brass');
-  const [saving, setSaving] = useState(false);
+  const [tint, setTint] = useState<TintName>(currentTint);
 
-  const isNameEmpty = name.trim().length === 0;
-  const isSaveDisabled = isNameEmpty || saving;
-
-  const handleSave = async () => {
-    if (isSaveDisabled) return;
-
-    setSaving(true);
-    try {
-      onCustomized(name, tint);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleCancel = () => {
-    onCancel();
-  };
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    onCustomized(name.trim(), tint);
+  }
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div
-        className="bg-octo-bg rounded-lg shadow-lg p-6 w-96 border border-octo-border"
-        style={{
-          borderColor: `var(--octo-border)`,
-          backgroundColor: `var(--octo-bg)`,
-        }}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-[16px] font-sans font-semibold tracking-[-0.005em] text-octo-text">
-            Customize Project
-          </h2>
-          <button
-            onClick={handleCancel}
-            className="text-octo-mute hover:text-octo-text transition-colors"
-            aria-label="Close"
-          >
-            <X size={20} />
-          </button>
-        </div>
-
-        {/* Name Input */}
-        <div className="mb-6">
-          <label className="block text-[11px] font-sans font-normal text-octo-text mb-2">
-            Project Name
-          </label>
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Enter project name…"
-            className="w-full px-3 py-2 bg-octo-panel border border-octo-border rounded text-octo-text placeholder:font-serif placeholder:italic placeholder-octo-mute focus:outline-none focus:ring-2 focus:ring-octo-brass"
-            style={{
-              backgroundColor: `var(--octo-panel)`,
-              borderColor: `var(--octo-border)`,
-              color: `var(--octo-text)`,
-            }}
-          />
-          {isNameEmpty && (
-            <p className="text-xs text-red-500 mt-1">
-              Project name is required
-            </p>
-          )}
-        </div>
-
-        {/* Tint Picker */}
-        <div className="mb-6">
-          <label className="block text-[11px] font-sans font-normal text-octo-text mb-3">
-            Tint
-          </label>
-          <div className="grid grid-cols-7 gap-2">
-            {TINT_NAMES.map((tintName) => (
-              <button
-                key={tintName}
-                onClick={() => setTint(tintName)}
-                className={`w-full h-10 rounded border-2 transition-all ${
-                  tint === tintName
-                    ? 'border-octo-brass'
-                    : 'border-octo-border'
-                }`}
-                style={{
-                  backgroundColor: TINTS[tintName].accent,
-                  borderColor:
-                    tint === tintName ? `var(--octo-brass)` : `var(--octo-border)`,
-                }}
-                title={tintName}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/* Action Buttons */}
-        <div className="flex gap-3 justify-end">
-          <button
-            onClick={handleCancel}
-            className="px-4 py-2 bg-octo-panel border border-octo-border rounded text-octo-text hover:bg-octo-sage transition-colors"
-            style={{
-              backgroundColor: `var(--octo-panel)`,
-              borderColor: `var(--octo-border)`,
-              color: `var(--octo-text)`,
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={isSaveDisabled}
-            className={`px-4 py-2 rounded text-octo-bg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-              isSaveDisabled
-                ? 'bg-octo-mute'
-                : 'bg-octo-brass hover:bg-opacity-90'
-            }`}
-            style={
-              !isSaveDisabled
-                ? {
-                    backgroundColor: `var(--octo-brass)`,
-                    color: `var(--octo-bg)`,
-                  }
-                : {
-                    backgroundColor: `var(--octo-mute)`,
-                    color: `var(--octo-bg)`,
-                  }
-            }
-          >
-            {saving ? 'Saving...' : 'Save'}
-          </button>
-        </div>
+    <form
+      onSubmit={handleSubmit}
+      className="w-[260px] rounded-xl border border-octo-hairline bg-octo-panel p-4 shadow-xl"
+      aria-label="Customize project"
+    >
+      <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+        Customize
       </div>
-    </div>
+
+      <label htmlFor="name-input" className="mt-3 block font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute">
+        Name
+      </label>
+      <input
+        id="name-input"
+        type="text"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
+        placeholder="Project name"
+      />
+
+      <div className="mt-3 font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute">
+        Tint
+      </div>
+      <div className="mt-2 grid grid-cols-7 gap-1.5">
+        {TINT_NAMES.map((tintName) => {
+          const tintValue = TINTS[tintName];
+          const selected = tintName === tint;
+          return (
+            <button
+              key={tintName}
+              type="button"
+              onClick={() => setTint(tintName)}
+              title={tintName}
+              aria-label={tintName}
+              aria-pressed={selected}
+              className="h-7 w-7 rounded-md border transition"
+              style={{
+                background: tintValue.bg,
+                borderColor: selected ? tintValue.accent : "transparent",
+                outline: selected ? `1px solid ${tintValue.accent}` : "none",
+                outlineOffset: "1px",
+              }}
+            >
+              <span className="font-serif" style={{ color: tintValue.accent }}>•</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-4 flex items-center gap-2">
+        <button
+          type="submit"
+          disabled={!name.trim()}
+          className="rounded-md px-3 py-1.5 font-serif text-[12px] text-octo-brass disabled:opacity-50 disabled:cursor-not-allowed"
+          style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+        >
+          Save
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md px-3 py-1.5 font-sans text-[12px] text-octo-mute hover:text-octo-sage"
+        >
+          Cancel
+        </button>
+      </div>
+    </form>
   );
 }

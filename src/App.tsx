@@ -858,11 +858,22 @@ function App() {
   const projectGroups: ProjectGroup[] = (() => {
     if (!project) return [];
 
+    // Load customizations from localStorage
+    const customizations = JSON.parse(localStorage.getItem("projectCustomizations") || "{}");
+
     const allProjects = new Map<string, { id: string; name: string }>();
-    allProjects.set(project.id, { id: project.id, name: project.name });
+    const currentProjCustom = customizations[project.id];
+    allProjects.set(project.id, {
+      id: project.id,
+      name: currentProjCustom?.name || project.name
+    });
     recentProjects.forEach((p) => {
       if (!allProjects.has(p.id)) {
-        allProjects.set(p.id, { id: p.id, name: p.name });
+        const pCustom = customizations[p.id];
+        allProjects.set(p.id, {
+          id: p.id,
+          name: pCustom?.name || p.name
+        });
       }
     });
 
@@ -1215,13 +1226,21 @@ function App() {
         const customized = customizations[customizingProjectId] || {};
 
         return (
-          <ProjectCustomizeMenu
-            projectId={customizingProjectId}
-            currentName={customized.name || proj.name}
-            currentTint={customized.tint || "brass"}
-            onCustomized={(name, tint) => handleProjectCustomized(name, tint)}
-            onCancel={() => setShowProjectCustomizer(false)}
-          />
+          <div
+            className="absolute inset-0 z-30 flex items-start justify-start bg-black/30 p-2"
+            onClick={() => setShowProjectCustomizer(false)}
+            role="dialog"
+            aria-modal="true"
+          >
+            <div onClick={(e) => e.stopPropagation()} className="ml-14 mt-12">
+              <ProjectCustomizeMenu
+                currentName={customized.name || proj.name}
+                currentTint={customized.tint || "brass"}
+                onCustomized={(name, tint) => handleProjectCustomized(name, tint)}
+                onCancel={() => setShowProjectCustomizer(false)}
+              />
+            </div>
+          </div>
         );
       })()}
 
