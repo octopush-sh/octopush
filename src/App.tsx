@@ -8,6 +8,8 @@ import { Companion } from "./components/Companion";
 import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
 import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
+import { ProjectContextMenu } from "./components/ProjectContextMenu";
+import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ProjectSwitcher } from "./components/ProjectSwitcher";
 import { ChatView } from "./components/ChatView";
@@ -34,7 +36,7 @@ import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta } from "./lib/chatTitle";
-import type { ModelWithProvider, Workspace } from "./lib/types";
+import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
@@ -58,9 +60,11 @@ function App() {
     workspaces,
     activeId: activeWorkspaceId,
     load: loadWorkspaces,
+    loadAllWorkspaces,
     updateCustomization,
     select: selectWorkspace,
     remove: removeWorkspace,
+    workspacesByProjectId,
   } = useWorkspaceStore();
 
   const [appView, setAppView] = useState<AppView>("project");
@@ -99,6 +103,14 @@ function App() {
   const recentProjects = useProjectStore((s) => s.recent);
   const loadRecentProjects = useProjectStore((s) => s.loadRecent);
   const openProject = useProjectStore((s) => s.open);
+  const getLastOpenedPath = useProjectStore((s) => s.getLastOpenedPath);
+  const saveLastOpenedPath = useProjectStore((s) => s.saveLastOpenedPath);
+
+  // Helper to find a project by ID
+  const getProjectById = useCallback((projectId: string) => {
+    if (project?.id === projectId) return project;
+    return recentProjects.find(p => p.id === projectId) ?? null;
+  }, [project, recentProjects]);
 
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
@@ -106,6 +118,7 @@ function App() {
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
   const [showCreator, setShowCreator] = useState(false);
+  const [creatorProjectId, setCreatorProjectId] = useState<string | null>(null);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
   const [showProjectSwitcher, setShowProjectSwitcher] = useState(false);
   // When the user opens NewProjectFlow from the switcher (not from the welcome
@@ -119,6 +132,11 @@ function App() {
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   // Inline workspace creator shown from the empty-project state.
   const [showInlineCreator, setShowInlineCreator] = useState(false);
+  // Project customization state
+  const [showProjectCustomizer, setShowProjectCustomizer] = useState(false);
+  const [customizingProjectId, setCustomizingProjectId] = useState<string | null>(null);
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
 
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
@@ -162,6 +180,30 @@ function App() {
   useEffect(() => {
     loadBudgets();
   }, [loadBudgets]);
+
+  // ── Startup: load recent projects and restore last opened project ──
+  const startupFiredRef = useRef(false);
+  useEffect(() => {
+    if (startupFiredRef.current) return;
+    startupFiredRef.current = true;
+
+    (async () => {
+      await loadRecentProjects();
+      // Check if we have projects stored and no current project
+      const state = useProjectStore.getState();
+      if (!state.current && state.recent.length > 0) {
+        // Try to restore last opened project
+        const lastPath = getLastOpenedPath();
+        if (lastPath) {
+          try {
+            await openProject(lastPath);
+          } catch {
+            // If last project can't be opened, leave the welcome screen
+          }
+        }
+      }
+    })();
+  }, [loadRecentProjects, openProject, getLastOpenedPath]);
 
   // Refresh token usage periodically so the Companion + Settings · Usage
   // stay current. 30s is enough for a workspace-level glance.
@@ -239,10 +281,23 @@ function App() {
       // shows the empty state, not the creator from the previous project.
       setShowInlineCreator(false);
       loadWorkspaces(project.id);
+      // Persist this project as last opened
+      saveLastOpenedPath(project.path);
     } else {
       setShowCreator(false);
     }
-  }, [project, loadWorkspaces]);
+  }, [project, loadWorkspaces, saveLastOpenedPath]);
+
+  // ── Load all workspaces from all projects for the rail ──
+  useEffect(() => {
+    if (!project || recentProjects.length === 0) return;
+
+    const projectIds = new Set<string>();
+    projectIds.add(project.id);
+    recentProjects.forEach((p) => projectIds.add(p.id));
+
+    loadAllWorkspaces(Array.from(projectIds));
+  }, [project, recentProjects, loadAllWorkspaces]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
@@ -691,6 +746,43 @@ function App() {
     }
   }, [deletingWorkspaceId, project, workspaces, removeWorkspace, selectWorkspace]);
 
+  // ── Project context menu handler ──
+  const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
+    setProjectContextMenu({ projectId, x, y });
+  };
+
+  // ── Project rename handler ──
+  const handleRenameProject = (projectId: string) => {
+    setCustomizingProjectId(projectId);
+    setShowProjectCustomizer(true);
+    setProjectContextMenu(null);
+  };
+
+  // ── Project delete handler ──
+  const handleDeleteProject = (projectId: string) => {
+    setDeletingProjectId(projectId);
+    setProjectContextMenu(null);
+  };
+
+  // ── Project customized handler ──
+  const handleProjectCustomized = async (name: string, tint: string) => {
+    if (!customizingProjectId) return;
+    try {
+      // Update localStorage
+      const customizations = JSON.parse(localStorage.getItem("projectCustomizations") || "{}");
+      customizations[customizingProjectId] = { name, tint };
+      localStorage.setItem("projectCustomizations", JSON.stringify(customizations));
+
+      // Call IPC to update backend (will be implemented in Task 6)
+      pushToast({ level: "success", title: "Project updated" });
+    } catch (err) {
+      pushToast({ level: "error", title: "Failed to update project", body: String(err) });
+    } finally {
+      setShowProjectCustomizer(false);
+      setCustomizingProjectId(null);
+    }
+  };
+
   // ── Render: pre-project views ──
   if (!project) {
     if (appView === "new-project") {
@@ -723,19 +815,10 @@ function App() {
       }
     });
 
-    const workspacesByProject = new Map<string, Workspace[]>();
-    (workspaces || []).forEach((ws) => {
-      if (ws && ws.projectId) {
-        const list = workspacesByProject.get(ws.projectId) || [];
-        list.push(ws);
-        workspacesByProject.set(ws.projectId, list);
-      }
-    });
-
     return Array.from(allProjects.entries()).map(([projectId, projectInfo]) => ({
       id: projectInfo.id,
       name: projectInfo.name,
-      workspaces: workspacesByProject.get(projectId) || [],
+      workspaces: workspacesByProjectId[projectId] || [],
     }));
   })();
 
@@ -748,6 +831,12 @@ function App() {
         onCustomize={(id) => setCustomizingWorkspaceId(id)}
         onContextMenu={(workspaceId, x, y) => setContextMenu({ workspaceId, x, y })}
         onNewWorkspace={() => setShowCreator(true)}
+        onNewWorkspaceForProject={(projectId) => {
+          setCreatorProjectId(projectId);
+          setShowCreator(true);
+        }}
+        onAddProject={() => setShowAddProject(true)}
+        onProjectContextMenu={handleProjectContextMenu}
       />
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -933,17 +1022,27 @@ function App() {
               )}
             </div>
 
-            {/* Workspace creator overlay (from the rail "+" button). */}
-            {showCreator && (
-              <div className="absolute inset-0 z-50 bg-octo-bg">
-                <WorkspaceCreator
-                  projectId={project.id}
-                  projectPath={project.path}
-                  onCreated={() => setShowCreator(false)}
-                  onCancel={() => setShowCreator(false)}
-                />
-              </div>
-            )}
+            {/* Workspace creator overlay (from the rail "+" button or project header). */}
+            {showCreator && (() => {
+              const targetProjectId = creatorProjectId || project.id;
+              const targetProject = getProjectById(targetProjectId);
+              return targetProject ? (
+                <div className="absolute inset-0 z-50 bg-octo-bg">
+                  <WorkspaceCreator
+                    projectId={targetProject.id}
+                    projectPath={targetProject.path}
+                    onCreated={() => {
+                      setShowCreator(false);
+                      setCreatorProjectId(null);
+                    }}
+                    onCancel={() => {
+                      setShowCreator(false);
+                      setCreatorProjectId(null);
+                    }}
+                  />
+                </div>
+              ) : null;
+            })()}
 
             {/* Empty-project layer — overlays the canvas when there is no
                 active workspace. The shell underneath stays mounted so any
@@ -1033,6 +1132,73 @@ function App() {
         initialTab={settingsTab ?? "general"}
         onClose={() => setSettingsTab(null)}
       />
+
+      {/* Project context menu (right-click on project header) */}
+      {projectContextMenu && (() => {
+        const proj = recentProjects.find(p => p.id === projectContextMenu.projectId);
+        return proj ? (
+          <ProjectContextMenu
+            projectId={projectContextMenu.projectId}
+            projectName={proj.name}
+            x={projectContextMenu.x}
+            y={projectContextMenu.y}
+            onRename={() => handleRenameProject(projectContextMenu.projectId)}
+            onChangeTint={() => {
+              setCustomizingProjectId(projectContextMenu.projectId);
+              setShowProjectCustomizer(true);
+              setProjectContextMenu(null);
+            }}
+            onClose={() => {
+              // Will implement in Task 6
+              console.warn("Close project not yet implemented");
+              setProjectContextMenu(null);
+            }}
+            onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
+            onDismiss={() => setProjectContextMenu(null)}
+          />
+        ) : null;
+      })()}
+
+      {/* Project customization menu */}
+      {showProjectCustomizer && customizingProjectId && (() => {
+        const proj = recentProjects.find(p => p.id === customizingProjectId);
+        if (!proj) return null;
+
+        const customizations = JSON.parse(localStorage.getItem("projectCustomizations") || "{}");
+        const customized = customizations[customizingProjectId] || {};
+
+        return (
+          <ProjectCustomizeMenu
+            projectId={customizingProjectId}
+            currentName={customized.name || proj.name}
+            currentTint={customized.tint || "brass"}
+            onCustomized={(name, tint) => handleProjectCustomized(name, tint)}
+            onCancel={() => setShowProjectCustomizer(false)}
+          />
+        );
+      })()}
+
+      {/* Project delete confirmation dialog */}
+      {deletingProjectId && (() => {
+        const proj = recentProjects.find(p => p.id === deletingProjectId);
+        if (!proj) return null;
+
+        return (
+          <ConfirmDialog
+            title="Delete Project Permanently?"
+            body={`This will permanently delete "${proj.name}" and ALL its workspaces from disk.`}
+            destructiveLabel="Delete"
+            cancelLabel="Cancel"
+            requireInput={proj.name}
+            onConfirm={() => {
+              // Will implement in Task 6
+              console.warn("Delete project not yet implemented");
+              setDeletingProjectId(null);
+            }}
+            onCancel={() => setDeletingProjectId(null)}
+          />
+        );
+      })()}
 
       {/* Workspace context menu (right-click on monogram) */}
       {contextMenu && (() => {
