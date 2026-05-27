@@ -51,7 +51,6 @@ describe("ScratchpadIcon - Integration Tests", () => {
     const { container } = render(<ScratchpadIcon onClick={vi.fn()} />);
 
     const button = container.querySelector("button");
-    const computedStyle = window.getComputedStyle(button!);
     // Opacity should be 0.2 when closed
     expect(button).toHaveStyle("opacity: 0.2");
   });
@@ -87,7 +86,7 @@ describe("ScratchpadIcon - Integration Tests", () => {
   });
 
   it("CRITICAL: Icon has correct styling classes", () => {
-    const { container } = render(<ScratchpadIcon onClick={vi.fn()} />);
+    render(<ScratchpadIcon onClick={vi.fn()} />);
 
     const button = screen.getByRole("button");
     expect(button).toHaveClass("flex");

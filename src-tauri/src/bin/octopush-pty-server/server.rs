@@ -445,7 +445,7 @@ fn cmd_attach(
     // Clone tx for replaying backlog; the original is given to the session.
     let replay_tx = tx.clone();
 
-    let (backlog, use_disk) = {
+    let (backlog, ring_oldest) = {
         let mut st = state.lock();
         st.touch();
         match st.sessions.get_mut(&id) {
@@ -455,9 +455,20 @@ fn cmd_attach(
                 }
             }
             Some(sess) => {
-                let disk_needed = since < sess.ring_oldest_seq();
+                // Attach the client to receive live events going forward.
+                // This returns the backlog from the ring buffer for seqs >= since.
+                let oldest = sess.ring_oldest_seq();
                 let backlog = sess.attach(tx, since);
-                (backlog, disk_needed)
+
+                debug!(
+                    id = %id,
+                    since_seq = since,
+                    backlog_len = backlog.len(),
+                    ring_oldest = oldest,
+                    "attached client for replay"
+                );
+
+                (backlog, oldest)
             }
         }
     };
@@ -467,29 +478,61 @@ fn cmd_attach(
     let ok_resp = Response::with_reqid(ResponsePayload::Ok {}, reqid);
     let _ = replay_tx.send(ok_resp.to_line());
 
-    // Then send backlog (from disk or ring).
-    if use_disk {
+    // Determine if we need to fill a gap from disk (when client requests seq
+    // older than what's in the ring buffer).
+    let disk_needed = since < ring_oldest;
+
+    if disk_needed {
+        // Gap exists: read the full disk log to fill it.
+        // The disk log is a raw byte stream without seq information.
+        // We replay it as one or more events. To avoid huge single events,
+        // we split into 16 KiB chunks.
         match read_pty_log(&id) {
             Ok(bytes) if !bytes.is_empty() => {
-                let ev = crate::protocol::Event::Data {
-                    id: id.clone(),
-                    seq: 0,
-                    bytes: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                };
-                let _ = replay_tx.send(ev.to_line());
+                const CHUNK_SIZE: usize = 16 * 1024;
+                let total_chunks = (bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+                for (chunk_idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+                    let ev = crate::protocol::Event::Data {
+                        id: id.clone(),
+                        // Use a fake seq that's negative (in practice, u64 space)
+                        // to distinguish from ring buffer seqs. This won't be used
+                        // by the frontend anyway, but helps with debugging.
+                        seq: u64::MAX - (total_chunks as u64 - chunk_idx as u64),
+                        bytes: base64::engine::general_purpose::STANDARD.encode(chunk),
+                    };
+                    debug!(
+                        id = %id,
+                        chunk = chunk_idx,
+                        total_chunks = total_chunks,
+                        chunk_bytes = chunk.len(),
+                        "replaying disk history chunk"
+                    );
+                    let _ = replay_tx.send(ev.to_line());
+                }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                debug!(id = %id, "disk log is empty");
+            }
             Err(e) => {
                 warn!(id = %id, error = %e, "failed to read disk log for replay");
             }
         }
     } else {
+        // No gap: ring buffer has all requested data.
+        // Send the ring backlog items as separate events (one per chunk).
         for (seq, data) in backlog {
             let ev = crate::protocol::Event::Data {
                 id: id.clone(),
                 seq,
                 bytes: base64::engine::general_purpose::STANDARD.encode(&data),
             };
+            debug!(
+                id = %id,
+                seq = seq,
+                bytes_len = data.len(),
+                "replaying ring buffer chunk"
+            );
             let _ = replay_tx.send(ev.to_line());
         }
     }
