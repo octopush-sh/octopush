@@ -70,7 +70,7 @@ export function ScratchpadCodeEditor() {
         />
       </pre>
 
-      {/* Textarea for input capture (positioned on top, text completely invisible) */}
+      {/* Textarea for input capture (completely invisible via opacity, but fully functional) */}
       <textarea
         ref={textareaRef}
         value={activeTab.content}
@@ -85,20 +85,12 @@ export function ScratchpadCodeEditor() {
           margin: 0,
           border: "none",
           boxSizing: "border-box",
-          backgroundColor: "transparent",
-          // Make text completely invisible - use multiple approaches for cross-browser compatibility
-          color: "transparent !important",
-          WebkitTextFillColor: "transparent !important",
-          textFillColor: "transparent",
-          // Also make caret color visible
-          caretColor: "var(--color-octo-brass)",
+          // Use opacity: 0 to completely hide the textarea while keeping it interactive
+          opacity: 0,
           zIndex: 10,
           resize: "none",
-          // Ensure no text shadow or any rendering of the textarea text
-          textShadow: "none",
-          WebkitTextStrokeColor: "transparent",
-          // Make selection invisible but still functional
-          selectionBackgroundColor: "transparent",
+          // Caret color won't be visible with opacity 0, but input still works
+          // The pre element below provides visual feedback
         } as React.CSSProperties}
         spellCheck="false"
         wrap="off"

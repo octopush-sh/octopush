@@ -18,6 +18,7 @@ interface ScratchpadState {
   deleteTab: (tabId: string) => void;
   renameTab: (tabId: string, newName: string) => void;
   setContent: (tabId: string, content: string) => void;
+  setLanguage: (tabId: string, language: string) => void;
   setActiveTab: (tabId: string) => void;
   reset: () => void;
 }
@@ -148,6 +149,16 @@ export const useScratchpadStore = create<ScratchpadState>((set) => {
           newContentPreview: updatedTab?.content.substring(0, 50),
         });
         return { tabs: newTabs };
+      });
+    },
+
+    setLanguage: (tabId: string, language: string) => {
+      set((state) => {
+        return {
+          tabs: state.tabs.map((t) =>
+            t.id === tabId ? { ...t, language } : t
+          ),
+        };
       });
     },
 
