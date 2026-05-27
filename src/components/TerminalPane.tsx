@@ -319,23 +319,10 @@ export function TerminalPane({
     // AI output combination.
 
     // term → PTY
-    let inputCount = 0;
     const dataDisp = term.onData((data) => {
-      inputCount++;
       const ptyId = ptySessionIdRef.current;
       if (!ptyId) return;
-
-      console.log(`[TerminalPane] onData event #${inputCount}:`, {
-        terminalId,
-        dataLength: data.length,
-        dataPreview: data.substring(0, 20),
-        charCodes: data.split('').map(c => c.charCodeAt(0)).slice(0, 10),
-        timestamp: Date.now(),
-      });
-
-      ipc.writeTextToSession(ptyId, data).catch((err) => {
-        console.error(`[TerminalPane] write to pty failed on event #${inputCount}:`, err);
-      });
+      ipc.writeTextToSession(ptyId, data).catch(() => {});
     });
 
     // Propagate xterm resize events to PTY (handles manual terminal resize).

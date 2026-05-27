@@ -1,120 +1,80 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+
+// Stub the editor so this integration test exercises the split layout only,
+// without booting a real CodeMirror EditorView (which can't render in jsdom).
+vi.mock("./ScratchpadEditor", () => ({
+  ScratchpadEditor: () => <div data-testid="scratchpad-editor">editor</div>,
+}));
+
 import { ScratchpadIcon } from "./ScratchpadIcon";
 import { CanvasSplit } from "./CanvasSplit";
 import { useScratchpadStore } from "../stores/scratchpadStore";
 
 /**
- * FULL INTEGRATION TEST: Icon Click → Store Toggle → CanvasSplit Re-render
+ * Integration: clicking the scratchpad icon toggles the store, and the mounted
+ * CanvasSplit reacts by revealing the split affordance (the resize divider)
+ * while always keeping the canvas content mounted.
  *
- * Simulates the complete user flow:
- * 1. User clicks ScratchpadIcon
- * 2. toggleOpen is called
- * 3. Store state changes (isOpen = true)
- * 4. CanvasSplit re-renders with split layout visible
+ * Note on the current design: CanvasSplit ALWAYS renders both panes in the DOM
+ * (the scratchpad pane is collapsed to width 0 + hidden when closed) so that
+ * children — including live terminals — are never remounted. The reliable
+ * signal that the split is "open" is therefore the presence of the resize
+ * divider, not the appearance/disappearance of a pane.
  */
-
-describe("Full Integration: Icon Click → Split Render", () => {
+describe("Integration: Icon Click → Split toggles", () => {
   beforeEach(() => {
-    const store = useScratchpadStore.getState();
-    store.reset?.();
+    useScratchpadStore.getState().reset();
   });
 
-  it("CRITICAL: Clicking icon causes CanvasSplit to render split layout", async () => {
-    const user = userEvent.setup();
-    const store = useScratchpadStore.getState();
-
-    // Component that contains both icon and split
-    function TestApp() {
-      return (
-        <div className="h-screen flex flex-col">
-          <div className="flex items-center gap-2 p-4 bg-gray-100">
-            <ScratchpadIcon onClick={() => store.toggleOpen()} />
-          </div>
-          <div className="flex-1 overflow-hidden">
-            <CanvasSplit>
-              <div data-testid="canvas-content">Canvas Content</div>
-            </CanvasSplit>
-          </div>
-        </div>
-      );
-    }
-
-    const { container } = render(<TestApp />);
-
-    // Initially: no split layout, just canvas
-    expect(screen.getByTestId("canvas-content")).toBeInTheDocument();
-    let splitContainer = container.querySelector(".flex.gap-0");
-    expect(splitContainer).not.toBeInTheDocument();
-    console.log("✓ Initial state: no split");
-
-    // Click the icon
-    const icon = screen.getByRole("button");
-    await user.click(icon);
-    console.log("✓ Icon clicked");
-
-    // After click, verify store state changed
-    const stateAfterClick = useScratchpadStore.getState();
-    console.log("Store isOpen after click:", stateAfterClick.isOpen);
-    expect(stateAfterClick.isOpen).toBe(true);
-
-    // Wait for CanvasSplit to re-render
-    await waitFor(
-      () => {
-        splitContainer = container.querySelector(".flex.gap-0");
-        expect(splitContainer).toBeInTheDocument();
-      },
-      { timeout: 2000 }
-    );
-
-    console.log("✓ Split layout rendered");
-
-    // Verify split has two columns
-    const columns = container.querySelectorAll(".h-full.overflow-hidden");
-    expect(columns.length).toBeGreaterThanOrEqual(2);
-    console.log("✓ Split has", columns.length, "columns");
-
-    // Verify canvas is still there (left column)
-    expect(screen.getByTestId("canvas-content")).toBeInTheDocument();
-    console.log("✓ Canvas content still present");
-  });
-
-  it("CRITICAL: Store toggle directly causes visible split", async () => {
-    function TestApp() {
-      return (
-        <div className="h-screen flex flex-col">
-          <div className="flex-1 overflow-hidden">
-            <CanvasSplit>
-              <div data-testid="canvas">Canvas</div>
-            </CanvasSplit>
-          </div>
-        </div>
-      );
-    }
-
-    const { container, rerender } = render(<TestApp />);
-
-    // Initially no split
-    expect(container.querySelector(".flex.gap-0")).not.toBeInTheDocument();
-
-    // Toggle directly
-    const store = useScratchpadStore.getState();
-    store.toggleOpen();
-
-    // Re-render to pick up state change
-    rerender(
+  function TestApp() {
+    return (
       <div className="h-screen flex flex-col">
+        <div className="flex items-center gap-2 p-4">
+          <ScratchpadIcon onClick={() => useScratchpadStore.getState().toggleOpen()} />
+        </div>
         <div className="flex-1 overflow-hidden">
           <CanvasSplit>
-            <div data-testid="canvas">Canvas</div>
+            <div data-testid="canvas-content">Canvas Content</div>
           </CanvasSplit>
         </div>
       </div>
     );
+  }
 
-    // Now split should be visible
-    expect(container.querySelector(".flex.gap-0")).toBeInTheDocument();
-    console.log("✓ Split appeared after store toggle");
+  it("reveals the resize divider after the icon is clicked, keeping the canvas mounted", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<TestApp />);
+
+    // Closed: canvas present, no divider yet.
+    expect(screen.getByTestId("canvas-content")).toBeInTheDocument();
+    expect(container.querySelector(".cursor-col-resize")).toBeNull();
+
+    await user.click(screen.getByRole("button"));
+
+    expect(useScratchpadStore.getState().isOpen).toBe(true);
+    await waitFor(() => {
+      expect(container.querySelector(".cursor-col-resize")).toBeInTheDocument();
+    });
+    // Canvas content stays mounted across the toggle (no remount).
+    expect(screen.getByTestId("canvas-content")).toBeInTheDocument();
+  });
+
+  it("hides the divider again when toggled closed", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<TestApp />);
+    const button = screen.getByRole("button");
+
+    await user.click(button); // open
+    await waitFor(() =>
+      expect(container.querySelector(".cursor-col-resize")).toBeInTheDocument(),
+    );
+
+    await user.click(button); // close
+    await waitFor(() =>
+      expect(container.querySelector(".cursor-col-resize")).toBeNull(),
+    );
+    expect(useScratchpadStore.getState().isOpen).toBe(false);
   });
 });

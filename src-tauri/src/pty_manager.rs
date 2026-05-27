@@ -302,14 +302,13 @@ fn start_reader_thread(
                         );
                     }
                     Err(_) => {
-                        // Channel closed — daemon disconnected or session ended.
-                        let _ = app.emit(
-                            "pty://exit",
-                            PtyExitEvent {
-                                session_id: id.clone(),
-                                code: None,
-                            },
-                        );
+                        // The event channel was closed because this attach was
+                        // superseded by a newer one for the same terminal (the
+                        // pane was reopened) or the subscriber was removed. This
+                        // is NOT a process exit — a real PTY exit always arrives
+                        // as an explicit `TermEvent::Exit` above. Terminate this
+                        // stale reader thread silently so we don't emit a bogus
+                        // `pty://exit` that would tear down the live pane.
                         break;
                     }
                 }

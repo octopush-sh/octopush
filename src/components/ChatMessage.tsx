@@ -152,7 +152,7 @@ function makeMarkdownComponents(
     return <strong className="font-semibold text-octo-ivory">{children}</strong>;
   },
   em({ children }) {
-    return <em className="italic text-octo-ivory">{children}</em>;
+    return <em className="not-italic font-medium text-octo-ivory">{children}</em>;
   },
   a({ href, children }) {
     return (

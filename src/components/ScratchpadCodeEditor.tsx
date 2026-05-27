@@ -1,99 +1,155 @@
-import hljs from "highlight.js";
-import "highlight.js/styles/atom-one-dark.css";
+import { useEffect, useRef } from "react";
+import {
+  EditorView,
+  lineNumbers,
+  highlightActiveLineGutter,
+  highlightActiveLine,
+  drawSelection,
+  keymap,
+  placeholder,
+} from "@codemirror/view";
+import { EditorState } from "@codemirror/state";
+import {
+  defaultKeymap,
+  indentWithTab,
+  history,
+  historyKeymap,
+} from "@codemirror/commands";
+import { indentOnInput, bracketMatching } from "@codemirror/language";
+import { javascript } from "@codemirror/lang-javascript";
+import { rust } from "@codemirror/lang-rust";
+import { python } from "@codemirror/lang-python";
+import { java } from "@codemirror/lang-java";
+import { json } from "@codemirror/lang-json";
+import { markdown } from "@codemirror/lang-markdown";
+import { html } from "@codemirror/lang-html";
+import { css } from "@codemirror/lang-css";
+import { xml } from "@codemirror/lang-xml";
+import { yaml } from "@codemirror/lang-yaml";
+import type { Extension } from "@codemirror/state";
+import { atelierTheme } from "./editor/atelierTheme";
 import { useScratchpadStore } from "../stores/scratchpadStore";
-import { useRef } from "react";
+
+/**
+ * Maps a scratchpad tab's language id to the matching CodeMirror language
+ * extension. Languages without a dedicated CodeMirror package fall back to no
+ * extension (plain editing, no highlighting) — the editor stays fully usable.
+ *
+ * Exported for unit testing.
+ */
+export function langExtension(lang: string): Extension {
+  switch (lang) {
+    case "javascript":
+      return javascript({ jsx: true });
+    case "typescript":
+      return javascript({ typescript: true, jsx: true });
+    case "python":
+      return python();
+    case "rust":
+      return rust();
+    case "java":
+      return java();
+    case "json":
+      return json();
+    case "markdown":
+      return markdown();
+    case "html":
+      return html();
+    case "css":
+    case "scss":
+    case "sass":
+    case "less":
+      return css();
+    case "xml":
+      return xml();
+    case "yaml":
+      return yaml();
+    default:
+      return [];
+  }
+}
+
+// Italic-serif placeholder + full-height layout, layered on top of the shared
+// Atelier theme.
+const scratchpadLayout = EditorView.theme({
+  "&": { height: "100%" },
+  ".cm-scroller": { overflow: "auto" },
+  ".cm-placeholder": {
+    color: "var(--color-octo-brass)",
+  },
+});
 
 export function ScratchpadCodeEditor() {
   const activeTabId = useScratchpadStore((s) => s.activeTabId);
   const tabs = useScratchpadStore((s) => s.tabs);
   const setContent = useScratchpadStore((s) => s.setContent);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const activeLanguage = activeTab?.language ?? "plaintext";
+
+  const hostRef = useRef<HTMLDivElement>(null);
+  const viewRef = useRef<EditorView | null>(null);
+
+  useEffect(() => {
+    if (!activeTabId || !hostRef.current) return;
+
+    // Read the current content directly from the store at (re)create time so a
+    // tab switch loads that tab's saved content. We deliberately do NOT depend
+    // on `content` here — that would rebuild the editor on every keystroke and
+    // reset the cursor/undo history.
+    const initialContent =
+      useScratchpadStore.getState().tabs.find((t) => t.id === activeTabId)
+        ?.content ?? "";
+
+    const state = EditorState.create({
+      doc: initialContent,
+      extensions: [
+        lineNumbers(),
+        highlightActiveLineGutter(),
+        highlightActiveLine(),
+        drawSelection(),
+        history(),
+        indentOnInput(),
+        bracketMatching(),
+        placeholder("Paste code here, or start typing…"),
+        keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
+        langExtension(activeLanguage),
+        atelierTheme,
+        scratchpadLayout,
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            setContent(activeTabId, update.state.doc.toString());
+          }
+        }),
+      ],
+    });
+
+    const view = new EditorView({ state, parent: hostRef.current });
+    viewRef.current = view;
+
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
+    // Rebuild only when the active tab or its language changes — not on content
+    // edits (handled live by the update listener above).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId, activeLanguage]);
 
   if (!activeTab) {
     return (
       <div className="h-full w-full flex items-center justify-center bg-octo-onyx">
-        <p className="text-octo-mute">No tab selected</p>
+        <p className="font-serif text-octo-mute">No tab selected</p>
       </div>
     );
   }
 
-  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    if (activeTabId) {
-      setContent(activeTabId, e.target.value);
-    }
-  };
-
-  // Get highlighted code
-  let highlightedCode = activeTab.content;
-  if (activeTab.language !== "plaintext" && activeTab.content) {
-    try {
-      const highlighted = hljs.highlight(activeTab.content, {
-        language: activeTab.language,
-        ignoreIllegals: true,
-      });
-      highlightedCode = highlighted.value;
-    } catch {
-      highlightedCode = activeTab.content;
-    }
-  }
-
   return (
-    <div className="h-full w-full bg-octo-onyx overflow-hidden flex flex-col relative">
-      {/* Empty state placeholder */}
-      {!activeTab.content && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-          <p className="font-serif italic text-[14px] text-octo-brass text-center px-4">
-            Paste code here, or start typing…
-          </p>
-        </div>
-      )}
-
-      {/* Syntax highlighted display (ONLY rendering layer) */}
-      <pre
-        className="absolute inset-0 w-full h-full m-0 overflow-auto pointer-events-none text-octo-ivory"
-        style={{
-          fontFamily: "'JetBrains Mono', 'Courier New', monospace",
-          fontSize: "12px",
-          lineHeight: "1.5",
-          letterSpacing: "0px",
-          padding: "16px",
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-word",
-          zIndex: 0,
-        }}
-      >
-        <code
-          className={`hljs language-${activeTab.language}`}
-          dangerouslySetInnerHTML={{ __html: highlightedCode }}
-        />
-      </pre>
-
-      {/* Textarea for input capture (completely invisible via opacity, but fully functional) */}
-      <textarea
-        ref={textareaRef}
-        value={activeTab.content}
-        onChange={handleTextareaChange}
-        className="absolute inset-0 w-full h-full resize-none focus:outline-none"
-        style={{
-          fontFamily: "'JetBrains Mono', 'Courier New', monospace",
-          fontSize: "12px",
-          lineHeight: "1.5",
-          letterSpacing: "0px",
-          padding: "16px",
-          margin: 0,
-          border: "none",
-          boxSizing: "border-box",
-          // Use opacity: 0 to completely hide the textarea while keeping it interactive
-          opacity: 0,
-          zIndex: 10,
-          resize: "none",
-          // Caret color won't be visible with opacity 0, but input still works
-          // The pre element below provides visual feedback
-        } as React.CSSProperties}
-        spellCheck="false"
-        wrap="off"
+    <div className="chat-selectable flex min-h-0 flex-1 flex-col overflow-hidden bg-octo-onyx">
+      <div
+        ref={hostRef}
+        data-testid="scratchpad-host"
+        className="min-h-0 flex-1 overflow-auto"
       />
     </div>
   );

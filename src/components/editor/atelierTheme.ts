@@ -115,15 +115,10 @@ const atelierHighlightStyle = HighlightStyle.define([
   { tag: tags.integer,            color: ROUGE },
   { tag: tags.float,              color: ROUGE },
 
-  // Comments: mute + Spectral italic
-  {
-    tag: tags.comment,
-    color: MUTE,
-    fontStyle: "italic",
-    fontFamily: '"Spectral", "Iowan Old Style", "Times New Roman", serif',
-  },
-  { tag: tags.lineComment,        color: MUTE, fontStyle: "italic" },
-  { tag: tags.blockComment,       color: MUTE, fontStyle: "italic" },
+  // Comments: mute (upright — no cursive type anywhere in the app)
+  { tag: tags.comment,            color: MUTE },
+  { tag: tags.lineComment,        color: MUTE },
+  { tag: tags.blockComment,       color: MUTE },
 
   // Functions: ivory
   { tag: tags.function(tags.variableName), color: IVORY },

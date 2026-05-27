@@ -147,6 +147,15 @@ body {
   user-select: none;
 }
 
+/* No cursive/italic type anywhere in the app. This neutralises the browser
+   default slant on <em>/<i> (including markdown-rendered emphasis) so the
+   whole UI stays upright. Explicit `italic` utility classes and inline
+   `font-style: italic` were removed alongside this rule. */
+em,
+i {
+  font-style: normal;
+}
+
 /* xterm container — must be overflow:hidden to prevent the terminal
    from expanding beyond its flex/grid parent. The FitAddon measures
    this element to determine how many cols/rows fit. */

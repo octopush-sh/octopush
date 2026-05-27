@@ -35,7 +35,9 @@ describe("ScratchpadIcon - Integration Tests", () => {
   it("CRITICAL: Icon renders with correct title when open", () => {
     const store = useScratchpadStore.getState();
     store.toggleOpen();
-    expect(store.isOpen).toBe(true);
+    // Re-read fresh state: the captured `store` snapshot is not mutated in
+    // place by Zustand (each set() produces a new state object).
+    expect(useScratchpadStore.getState().isOpen).toBe(true);
 
     render(<ScratchpadIcon onClick={vi.fn()} />);
 
@@ -58,7 +60,9 @@ describe("ScratchpadIcon - Integration Tests", () => {
   it("CRITICAL: Icon shows correct opacity when open", () => {
     const store = useScratchpadStore.getState();
     store.toggleOpen();
-    expect(store.isOpen).toBe(true);
+    // Re-read fresh state: the captured `store` snapshot is not mutated in
+    // place by Zustand (each set() produces a new state object).
+    expect(useScratchpadStore.getState().isOpen).toBe(true);
 
     const { container } = render(<ScratchpadIcon onClick={vi.fn()} />);
 

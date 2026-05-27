@@ -132,24 +132,11 @@ export const useScratchpadStore = create<ScratchpadState>((set) => {
     },
 
     setContent: (tabId: string, content: string) => {
-      console.log(`[ScratchpadStore] setContent called:`, {
-        tabId,
-        contentLength: content.length,
-        contentPreview: content.substring(0, 50),
-        timestamp: Date.now(),
-      });
-      set((state) => {
-        const newTabs = state.tabs.map((t) =>
+      set((state) => ({
+        tabs: state.tabs.map((t) =>
           t.id === tabId ? { ...t, content } : t
-        );
-        const updatedTab = newTabs.find((t) => t.id === tabId);
-        console.log(`[ScratchpadStore] setContent update complete:`, {
-          tabId,
-          newContentLength: updatedTab?.content.length,
-          newContentPreview: updatedTab?.content.substring(0, 50),
-        });
-        return { tabs: newTabs };
-      });
+        ),
+      }));
     },
 
     setLanguage: (tabId: string, language: string) => {

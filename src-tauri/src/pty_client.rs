@@ -52,7 +52,13 @@ pub struct TerminalInfo {
 // ---------------------------------------------------------------------------
 
 type ReqMap = HashMap<u64, stdmpsc::SyncSender<Value>>;
-type EventMap = HashMap<String, Vec<stdmpsc::SyncSender<TermEvent>>>;
+/// One subscriber per terminal id. The daemon keeps a single attached client
+/// per session and pushes each byte over the socket exactly once, so the
+/// client must route each event to exactly one receiver — the most recent
+/// attach. A re-attach (terminal reopened) *replaces* the prior subscriber;
+/// keeping a list here would fan every byte out to stale receivers from
+/// previous attaches and duplicate the rendered output.
+type EventMap = HashMap<String, stdmpsc::SyncSender<TermEvent>>;
 
 struct Inner {
     writer: Box<dyn Write + Send>,
@@ -209,12 +215,15 @@ impl DaemonClient {
         since_seq: u64,
     ) -> AppResult<stdmpsc::Receiver<TermEvent>> {
         // Register the event listener BEFORE sending the attach request so we
-        // don't miss early events.
+        // don't miss early events. Inserting REPLACES any prior subscriber for
+        // this id: dropping the old sender closes its receiver, which lets the
+        // stale reader thread from a previous attach terminate cleanly instead
+        // of duplicating every byte (see EventMap docs).
         let (tx, rx) = stdmpsc::sync_channel::<TermEvent>(256);
         {
             let inner_guard = self.inner.lock();
             let mut ev = inner_guard.events.lock();
-            ev.entry(id.to_string()).or_default().push(tx);
+            ev.insert(id.to_string(), tx);
         }
 
         let resp = self.send_request(serde_json::json!({
@@ -224,13 +233,10 @@ impl DaemonClient {
         }));
 
         if let Err(e) = resp {
-            // Clean up the listener we just registered.
-            let inner_guard = self.inner.lock();
-            let mut ev = inner_guard.events.lock();
-            if let Some(senders) = ev.get_mut(id) {
-                // Just pop the last one (which is ours).
-                senders.pop();
-            }
+            // The send failed (broken connection). Leave cleanup to lazy
+            // removal in `run_reader`: the caller drops `rx`, so the next
+            // event for this id finds a closed channel and removes it. We
+            // avoid removing here to not clobber a concurrent re-attach.
             return Err(e);
         }
 
@@ -429,11 +435,14 @@ fn run_reader(
                 _ => continue,
             };
 
-            // Fan-out to all registered listeners for this id, removing any
-            // whose channel has been dropped.
+            // Route to the single current subscriber for this id. If the
+            // channel is gone (the receiver was dropped — i.e. superseded by a
+            // newer attach, or the pane unmounted), remove the dead entry.
             let mut ev_map = events.lock();
-            if let Some(senders) = ev_map.get_mut(&id) {
-                senders.retain(|s| s.try_send(event.clone()).is_ok());
+            if let Some(sender) = ev_map.get(&id) {
+                if sender.try_send(event).is_err() {
+                    ev_map.remove(&id);
+                }
             }
         } else if v["type"].is_string() {
             // It's a response; dispatch to the reqid waiter.
@@ -647,5 +656,94 @@ mod tests {
         // The connection is now broken. The next call should fail gracefully.
         let result = client.list_terminals();
         assert!(result.is_err(), "expected error after daemon death, got Ok");
+    }
+
+    /// Helper: drain any pending events on a receiver (non-blocking-ish).
+    fn drain(rx: &stdmpsc::Receiver<TermEvent>) {
+        while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
+    }
+
+    /// Helper: poll a receiver up to `timeout` for a `Data` event whose bytes
+    /// contain `needle`. Returns true if seen.
+    fn saw_data_containing(rx: &stdmpsc::Receiver<TermEvent>, needle: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(TermEvent::Data { bytes, .. }) => {
+                    if String::from_utf8_lossy(&bytes).contains(needle) {
+                        return true;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Regression test for the terminal "buffer duplicated on reopen" bug.
+    ///
+    /// Reopening a terminal causes a second `attach` for the same id. The
+    /// daemon keeps a single attached client per session, so it sends each
+    /// byte over the socket exactly once. The *client* must therefore route
+    /// each event to exactly ONE subscriber — the most recent attach. If the
+    /// old subscriber is left registered (the original bug), every byte is
+    /// fanned out to both, so xterm writes the content twice.
+    ///
+    /// Assertion: after a second attach, the FIRST receiver must stop
+    /// receiving live data (it has been superseded), while the second
+    /// receives it exactly once.
+    #[test]
+    #[serial]
+    fn second_attach_supersedes_first() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let base = home.join(".octopush");
+        fs::create_dir_all(&base).unwrap();
+        let sock_path = base.join("pty-server.sock");
+
+        let mut daemon = start_daemon_process(home);
+        assert!(
+            wait_for_socket(&sock_path, Duration::from_secs(5)),
+            "daemon socket did not appear"
+        );
+
+        let client = DaemonClient::connect_to(sock_path.to_str().unwrap()).unwrap();
+
+        let env = HashMap::new();
+        client
+            .spawn("dup-test", "/tmp", &env, Some("/bin/sh"), 24, 80)
+            .expect("spawn");
+
+        // First attach (terminal opened once).
+        let rx1 = client.attach("dup-test", 0).expect("first attach");
+        // Let the shell prompt settle, then clear rx1.
+        std::thread::sleep(Duration::from_millis(300));
+        drain(&rx1);
+
+        // Second attach for the SAME id (terminal closed + reopened).
+        let rx2 = client.attach("dup-test", 0).expect("second attach");
+        std::thread::sleep(Duration::from_millis(300));
+        drain(&rx2);
+
+        // Produce fresh output after both attaches.
+        client
+            .write("dup-test", b"echo SUPERSEDE_MARKER\n")
+            .expect("write");
+
+        // The current (second) subscriber must receive the marker once.
+        let got_on_rx2 = saw_data_containing(&rx2, "SUPERSEDE_MARKER", Duration::from_secs(5));
+
+        // The superseded (first) subscriber must NOT receive the marker.
+        let got_on_rx1 = saw_data_containing(&rx1, "SUPERSEDE_MARKER", Duration::from_secs(1));
+
+        client.kill("dup-test", "KILL").ok();
+        daemon.kill().ok();
+
+        assert!(got_on_rx2, "expected the active subscriber to receive output");
+        assert!(
+            !got_on_rx1,
+            "superseded subscriber still received output — events are being duplicated across attaches"
+        );
     }
 }
