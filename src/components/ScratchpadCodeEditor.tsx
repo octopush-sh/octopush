@@ -3,14 +3,6 @@ import "highlight.js/styles/atom-one-dark.css";
 import { useScratchpadStore } from "../stores/scratchpadStore";
 import { useRef } from "react";
 
-const EDITOR_STYLES = {
-  fontFamily: "'JetBrains Mono', 'Courier New', monospace",
-  fontSize: "12px",
-  lineHeight: "1.5",
-  letterSpacing: "0px",
-  tabSize: 2,
-} as const;
-
 export function ScratchpadCodeEditor() {
   const activeTabId = useScratchpadStore((s) => s.activeTabId);
   const tabs = useScratchpadStore((s) => s.tabs);
@@ -27,10 +19,9 @@ export function ScratchpadCodeEditor() {
     );
   }
 
-  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (activeTabId) {
-      const newValue = e.target.value;
-      setContent(activeTabId, newValue);
+      setContent(activeTabId, e.target.value);
     }
   };
 
@@ -49,7 +40,7 @@ export function ScratchpadCodeEditor() {
   }
 
   return (
-    <div className="h-full w-full bg-octo-onyx overflow-hidden flex flex-col">
+    <div className="h-full w-full bg-octo-onyx overflow-hidden flex flex-col relative">
       {/* Empty state placeholder */}
       {!activeTab.content && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
@@ -59,58 +50,51 @@ export function ScratchpadCodeEditor() {
         </div>
       )}
 
-      {/* Container with both textarea and display layer */}
-      <div className="relative flex-1 overflow-hidden">
-        {/* Textarea for editing (positioned absolutely, invisible text) */}
-        <textarea
-          ref={textareaRef}
-          value={activeTab.content}
-          onChange={handleChange}
-          className="absolute inset-0 w-full h-full bg-transparent resize-none focus:outline-none"
-          style={{
-            ...EDITOR_STYLES,
-            padding: "16px",
-            color: "transparent",
-            WebkitTextFillColor: "transparent",
-            caretColor: "var(--color-octo-brass)",
-            zIndex: 20,
-            margin: 0,
-            border: "none",
-            boxSizing: "border-box",
-          } as React.CSSProperties}
-          spellCheck="false"
-          wrap="off"
+      {/* Syntax highlighted display (ONLY rendering layer) */}
+      <pre
+        className="absolute inset-0 w-full h-full m-0 overflow-auto pointer-events-none text-octo-ivory"
+        style={{
+          fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+          fontSize: "12px",
+          lineHeight: "1.5",
+          letterSpacing: "0px",
+          padding: "16px",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          zIndex: 0,
+        }}
+      >
+        <code
+          className={`hljs language-${activeTab.language}`}
+          dangerouslySetInnerHTML={{ __html: highlightedCode }}
         />
+      </pre>
 
-        {/* Syntax highlighted display layer (no interaction, behind textarea) */}
-        <div
-          className="absolute inset-0 w-full h-full overflow-auto"
-          style={{
-            ...EDITOR_STYLES,
-            padding: "16px",
-            margin: 0,
-            boxSizing: "border-box",
-            zIndex: 0,
-            pointerEvents: "none",
-            whiteSpace: "pre",
-            overflowWrap: "normal",
-          } as React.CSSProperties}
-        >
-          <pre
-            className="m-0 p-0"
-            style={{
-              ...EDITOR_STYLES,
-              margin: 0,
-              padding: 0,
-            }}
-          >
-            <code
-              className={`hljs language-${activeTab.language}`}
-              dangerouslySetInnerHTML={{ __html: highlightedCode }}
-            />
-          </pre>
-        </div>
-      </div>
+      {/* Textarea for input capture (positioned on top, text invisible) */}
+      <textarea
+        ref={textareaRef}
+        value={activeTab.content}
+        onChange={handleTextareaChange}
+        className="absolute inset-0 w-full h-full resize-none focus:outline-none"
+        style={{
+          fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+          fontSize: "12px",
+          lineHeight: "1.5",
+          letterSpacing: "0px",
+          padding: "16px",
+          margin: 0,
+          border: "none",
+          boxSizing: "border-box",
+          backgroundColor: "transparent",
+          color: "transparent",
+          WebkitTextFillColor: "transparent",
+          caretColor: "var(--color-octo-brass)",
+          zIndex: 10,
+          resize: "none",
+        }}
+        spellCheck="false"
+        wrap="off"
+      />
     </div>
   );
 }
