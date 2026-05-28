@@ -104,11 +104,16 @@ impl PerfState {
     }
 }
 
+impl Default for PerfState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resolve the daemon's pid from the pid file it writes on startup
 /// (`$HOME/.octopush/pty-server.pid`). Returns None if unreadable.
 pub fn daemon_pid() -> Option<u32> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".octopush").join("pty-server.pid");
+    let path = dirs::home_dir()?.join(".octopush").join("pty-server.pid");
     std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
 }
 
@@ -118,6 +123,9 @@ pub fn daemon_pid() -> Option<u32> {
 /// sysinfo 0.32 use `sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true)`.
 /// If the pinned version differs, match its signature (the compiler will tell
 /// you). Everything else here is version-stable.
+///
+/// The first call after `System::new()` returns 0% CPU for all processes;
+/// the frontend corrects itself on the next poll.
 pub fn sample_system(sys: &mut System) -> Vec<ProcSample> {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sys.processes()
