@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { WelcomeScreen } from "./components/WelcomeScreen";
 import { NewProjectFlow } from "./components/NewProjectFlow";
 import { WorkspaceRail } from "./components/WorkspaceRail";
+import { PerfMonitorBar } from "./components/PerfMonitorBar";
+import { usePerfStore } from "./stores/perfStore";
 import { ContextHeader } from "./components/ContextHeader";
 import { ModeSwitcher } from "./components/ModeSwitcher";
 import { Companion } from "./components/Companion";
@@ -208,6 +210,12 @@ function App() {
       }
     })();
   }, [loadRecentProjects, openProject, getLastOpenedPath]);
+
+  // Performance monitor polling — runs for the whole app lifetime.
+  useEffect(() => {
+    usePerfStore.getState().start();
+    return () => usePerfStore.getState().stop();
+  }, []);
 
   // Refresh token usage periodically so the Companion + Settings · Usage
   // stay current. 30s is enough for a workspace-level glance.
@@ -955,7 +963,8 @@ function App() {
   })();
 
   return (
-    <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
+    <div className="flex flex-col h-screen w-screen bg-octo-bg text-octo-ivory">
+      <div className="flex min-h-0 flex-1">
       <WorkspaceRail
         projects={projectGroups}
         activeWorkspaceId={activeWorkspaceId}
@@ -1220,6 +1229,8 @@ function App() {
         </div>
         </div>
       </main>
+      </div>
+      <PerfMonitorBar />
 
       {customizingWorkspace && (
         <div
