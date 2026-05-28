@@ -2132,6 +2132,19 @@ pub async fn search_workspace_text(
     Ok(hits)
 }
 
+// ─── Performance monitor ──────────────────────────────────────────
+
+/// Sample current RAM (RSS) + CPU% for Octopush's process groups.
+#[tauri::command]
+pub fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> crate::perf::PerfStats {
+    let mut sys = perf.0.lock();
+    let samples = crate::perf::sample_system(&mut sys);
+    let app_pid = std::process::id();
+    let daemon_pid = crate::perf::daemon_pid();
+    let ts = chrono::Utc::now().timestamp();
+    crate::perf::compute_stats(&samples, app_pid, daemon_pid, ts)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.

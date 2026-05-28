@@ -4,8 +4,10 @@
 //! helper descendants) and `daemon` (the `octopush-pty-server` process only —
 //! its shell children are user workloads, not Octopush overhead), plus a total.
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use sysinfo::System;
 
 /// A flattened, sysinfo-independent view of one process.
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +94,61 @@ pub fn sum_group(pids: &HashSet<u32>, samples: &HashMap<u32, ProcSample>) -> Pro
     g
 }
 
+/// Persistent sysinfo state so CPU% is computed between successive samples.
+/// Held in Tauri-managed state.
+pub struct PerfState(pub Mutex<System>);
+
+impl PerfState {
+    pub fn new() -> Self {
+        PerfState(Mutex::new(System::new()))
+    }
+}
+
+/// Resolve the daemon's pid from the pid file it writes on startup
+/// (`$HOME/.octopush/pty-server.pid`). Returns None if unreadable.
+pub fn daemon_pid() -> Option<u32> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(".octopush").join("pty-server.pid");
+    std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+/// Refresh `sys` and flatten every process into a `ProcSample`.
+///
+/// NOTE: the exact `refresh_processes` call is sysinfo-version specific. For
+/// sysinfo 0.32 use `sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true)`.
+/// If the pinned version differs, match its signature (the compiler will tell
+/// you). Everything else here is version-stable.
+pub fn sample_system(sys: &mut System) -> Vec<ProcSample> {
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.processes()
+        .iter()
+        .map(|(pid, p)| ProcSample {
+            pid: pid.as_u32(),
+            ppid: p.parent().map(|pp| pp.as_u32()),
+            rss_bytes: p.memory(),
+            cpu_pct: p.cpu_usage(),
+        })
+        .collect()
+}
+
+/// Given the flattened samples + the two anchor pids, build the grouped stats.
+/// Pure (no sysinfo) so it is unit-testable.
+pub fn compute_stats(samples: &[ProcSample], app_pid: u32, daemon_pid: Option<u32>, ts: i64) -> PerfStats {
+    let by_pid = samples_by_pid(samples);
+    let kids = children_map(samples);
+
+    let app_pids = collect_descendants(app_pid, &kids);
+    let app = sum_group(&app_pids, &by_pid);
+
+    let daemon = match daemon_pid {
+        Some(p) => sum_group(&HashSet::from([p]), &by_pid),
+        None => ProcGroup::zero(),
+    };
+
+    let total = app.plus(&daemon);
+    PerfStats { app, daemon, total, ts }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +205,29 @@ mod tests {
         assert!(json.contains("\"cpuPct\":2.0"));
         assert!(json.contains("\"processCount\":3"));
         assert!(json.contains("\"ts\":42"));
+    }
+
+    #[test]
+    fn compute_stats_groups_app_tree_and_single_daemon() {
+        // App tree: 100 (main) -> 101 (helper). Daemon 200 -> 201 (a shell, excluded).
+        let samples = vec![
+            s(100, None, 50, 1.0),
+            s(101, Some(100), 150, 2.0),
+            s(200, None, 30, 0.5),
+            s(201, Some(200), 9999, 99.0), // daemon's child shell — must be excluded
+        ];
+        let stats = compute_stats(&samples, 100, Some(200), 7);
+        assert_eq!(stats.app, ProcGroup { rss_bytes: 200, cpu_pct: 3.0, process_count: 2 });
+        assert_eq!(stats.daemon, ProcGroup { rss_bytes: 30, cpu_pct: 0.5, process_count: 1 });
+        assert_eq!(stats.total, ProcGroup { rss_bytes: 230, cpu_pct: 3.5, process_count: 3 });
+        assert_eq!(stats.ts, 7);
+    }
+
+    #[test]
+    fn compute_stats_daemon_absent_is_zero() {
+        let samples = vec![s(100, None, 50, 1.0)];
+        let stats = compute_stats(&samples, 100, None, 0);
+        assert_eq!(stats.daemon, ProcGroup::zero());
+        assert_eq!(stats.total, stats.app);
     }
 }

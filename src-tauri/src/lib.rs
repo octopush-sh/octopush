@@ -103,6 +103,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(app_state)
+        .manage(perf::PerfState::new())
         .invoke_handler(tauri::generate_handler![
             // Sessions
             commands::create_session,
@@ -179,6 +180,8 @@ pub fn run() {
             // PTY daemon
             commands::list_pty_sessions,
             commands::spawn_or_attach_terminal,
+            // Performance monitor
+            commands::get_perf_stats,
             // Directory listing
             commands::read_directory,
             // File I/O
