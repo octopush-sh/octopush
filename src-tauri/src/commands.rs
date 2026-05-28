@@ -2135,14 +2135,17 @@ pub async fn search_workspace_text(
 // ─── Performance monitor ──────────────────────────────────────────
 
 /// Sample current RAM (RSS) + CPU% for Octopush's process groups.
+/// Async so the per-poll process scan runs off the UI thread.
 #[tauri::command]
-pub fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> crate::perf::PerfStats {
+pub async fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> Result<crate::perf::PerfStats, String> {
     let mut sys = perf.0.lock();
     let samples = crate::perf::sample_system(&mut sys);
     let app_pid = std::process::id();
     let daemon_pid = crate::perf::daemon_pid();
+    let responsible = crate::perf::responsible_map(&samples);
+    let app_pids = crate::perf::compute_app_pids(&samples, app_pid, daemon_pid, &responsible);
     let ts = chrono::Utc::now().timestamp();
-    crate::perf::compute_stats(&samples, app_pid, daemon_pid, ts)
+    Ok(crate::perf::compute_stats(&samples, &app_pids, daemon_pid, ts))
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────

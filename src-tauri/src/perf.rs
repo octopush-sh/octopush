@@ -117,6 +117,62 @@ pub fn daemon_pid() -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
 }
 
+// macOS "responsibility" API: returns the pid responsible for `pid` — i.e. the
+// app that owns a helper/XPC process (e.g. WebKit content/GPU/networking
+// processes are "responsible to" their host app). This is how Activity Monitor
+// groups helper processes under an app. The symbol is in libSystem.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn responsibility_get_pid_responsible_for_pid(pid: i32) -> i32;
+}
+
+/// The pid macOS considers "responsible" for `pid`. Falls back to `pid` itself
+/// (a process is responsible for itself) when the call fails or off macOS.
+pub fn responsible_pid(pid: u32) -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the call takes a pid and returns a pid; shares no memory.
+        let r = unsafe { responsibility_get_pid_responsible_for_pid(pid as i32) };
+        if r > 0 {
+            r as u32
+        } else {
+            pid
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        pid
+    }
+}
+
+/// Build `pid -> responsible_pid` for all samples (impure: calls the OS per pid).
+pub fn responsible_map(samples: &[ProcSample]) -> HashMap<u32, u32> {
+    samples.iter().map(|s| (s.pid, responsible_pid(s.pid))).collect()
+}
+
+/// The set of pids belonging to the "App" group: every process whose responsible
+/// pid is `app_pid`, EXCLUDING the daemon and its subtree (the daemon is its own
+/// group and its shell children are user workloads, not app overhead).
+///
+/// `responsible_by_pid` maps each pid to its responsible pid (see `responsible_map`).
+pub fn compute_app_pids(
+    samples: &[ProcSample],
+    app_pid: u32,
+    daemon_pid: Option<u32>,
+    responsible_by_pid: &HashMap<u32, u32>,
+) -> HashSet<u32> {
+    let daemon_subtree = match daemon_pid {
+        Some(d) => collect_descendants(d, &children_map(samples)),
+        None => HashSet::new(),
+    };
+    samples
+        .iter()
+        .map(|s| s.pid)
+        .filter(|p| responsible_by_pid.get(p).copied().unwrap_or(*p) == app_pid)
+        .filter(|p| !daemon_subtree.contains(p))
+        .collect()
+}
+
 /// Refresh `sys` and flatten every process into a `ProcSample`.
 ///
 /// NOTE: the exact `refresh_processes` call is sysinfo-version specific. For
@@ -139,20 +195,20 @@ pub fn sample_system(sys: &mut System) -> Vec<ProcSample> {
         .collect()
 }
 
-/// Given the flattened samples + the two anchor pids, build the grouped stats.
-/// Pure (no sysinfo) so it is unit-testable.
-pub fn compute_stats(samples: &[ProcSample], app_pid: u32, daemon_pid: Option<u32>, ts: i64) -> PerfStats {
+/// Build the grouped stats from samples + the precomputed App pid set + the
+/// daemon pid. Pure (no OS calls) so it is unit-testable.
+pub fn compute_stats(
+    samples: &[ProcSample],
+    app_pids: &HashSet<u32>,
+    daemon_pid: Option<u32>,
+    ts: i64,
+) -> PerfStats {
     let by_pid = samples_by_pid(samples);
-    let kids = children_map(samples);
-
-    let app_pids = collect_descendants(app_pid, &kids);
-    let app = sum_group(&app_pids, &by_pid);
-
+    let app = sum_group(app_pids, &by_pid);
     let daemon = match daemon_pid {
         Some(p) => sum_group(&HashSet::from([p]), &by_pid),
         None => ProcGroup::zero(),
     };
-
     let total = app.plus(&daemon);
     PerfStats { app, daemon, total, ts }
 }
@@ -216,15 +272,47 @@ mod tests {
     }
 
     #[test]
-    fn compute_stats_groups_app_tree_and_single_daemon() {
-        // App tree: 100 (main) -> 101 (helper). Daemon 200 -> 201 (a shell, excluded).
+    fn compute_app_pids_includes_responsible_helpers_excludes_daemon_tree() {
+        // 100 = main app. 300 = a WebKit helper reparented to launchd (ppid 1)
+        // but RESPONSIBLE to the app. 200 = daemon (child of app, also
+        // responsible to app). 201 = a shell spawned by the daemon. 900 =
+        // an unrelated app's process.
         let samples = vec![
             s(100, None, 50, 1.0),
-            s(101, Some(100), 150, 2.0),
-            s(200, None, 30, 0.5),
-            s(201, Some(200), 9999, 99.0), // daemon's child shell — must be excluded
+            s(300, Some(1), 150, 2.0),   // WebKit helper, reparented
+            s(200, Some(100), 30, 0.5),  // daemon
+            s(201, Some(200), 9999, 99.0), // daemon's shell child
+            s(900, None, 1234, 5.0),     // someone else's process
         ];
-        let stats = compute_stats(&samples, 100, Some(200), 7);
+        let mut resp = HashMap::new();
+        resp.insert(100, 100); // app responsible for itself
+        resp.insert(300, 100); // helper responsible to app  -> INCLUDED
+        resp.insert(200, 100); // daemon responsible to app  -> excluded (daemon subtree)
+        resp.insert(201, 200); // shell responsible to daemon -> excluded
+        resp.insert(900, 900); // unrelated -> excluded
+        let app = compute_app_pids(&samples, 100, Some(200), &resp);
+        assert_eq!(app, HashSet::from([100, 300]));
+    }
+
+    #[test]
+    fn compute_app_pids_no_daemon_keeps_all_responsible() {
+        let samples = vec![s(100, None, 10, 0.0), s(300, Some(1), 20, 0.0)];
+        let resp = HashMap::from([(100u32, 100u32), (300u32, 100u32)]);
+        let app = compute_app_pids(&samples, 100, None, &resp);
+        assert_eq!(app, HashSet::from([100, 300]));
+    }
+
+    #[test]
+    fn compute_stats_sums_groups_with_precomputed_app_set() {
+        // App = {100, 300}; daemon = 200 (single, excludes its shell 201).
+        let samples = vec![
+            s(100, None, 50, 1.0),
+            s(300, Some(1), 150, 2.0),
+            s(200, Some(100), 30, 0.5),
+            s(201, Some(200), 9999, 99.0),
+        ];
+        let app_pids = HashSet::from([100u32, 300u32]);
+        let stats = compute_stats(&samples, &app_pids, Some(200), 7);
         assert_eq!(stats.app, ProcGroup { rss_bytes: 200, cpu_pct: 3.0, process_count: 2 });
         assert_eq!(stats.daemon, ProcGroup { rss_bytes: 30, cpu_pct: 0.5, process_count: 1 });
         assert_eq!(stats.total, ProcGroup { rss_bytes: 230, cpu_pct: 3.5, process_count: 3 });
@@ -234,7 +322,7 @@ mod tests {
     #[test]
     fn compute_stats_daemon_absent_is_zero() {
         let samples = vec![s(100, None, 50, 1.0)];
-        let stats = compute_stats(&samples, 100, None, 0);
+        let stats = compute_stats(&samples, &HashSet::from([100u32]), None, 0);
         assert_eq!(stats.daemon, ProcGroup::zero());
         assert_eq!(stats.total, stats.app);
     }
