@@ -20,6 +20,7 @@ mod state;
 pub mod template;
 pub mod theme;
 pub mod token_engine;
+pub mod perf;
 
 #[cfg(test)]
 mod tests;
