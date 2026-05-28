@@ -39,14 +39,22 @@ tree**.
 
 Two process **groups**, plus a total:
 
-- **App** = the main Octopush process (`std::process::id()`) **plus all of its
-  descendant processes** (the WebKit `*.Helper` content/GPU/network processes
-  Tauri spawns). RSS and CPU are summed across the tree. This is the number
-  that reflects what the user feels.
-- **Daemon** = the `octopush-pty-server` process **only**. Its child processes
-  are the user's shells and whatever they run (npm, tests, agents) — those are
-  user workloads, not Octopush overhead, so they are **excluded**.
-- **Total** = App + Daemon.
+- **App** = the main Octopush process (`std::process::id()`) **plus every process
+  macOS considers it "responsible" for** — chiefly the WebKit content/GPU/network
+  XPC processes. NOTE: on macOS those WebKit processes are *reparented to launchd*
+  (their parent pid is 1), so a naive process-tree walk from the app pid misses
+  them. We therefore group by the OS **responsible pid**
+  (`responsibility_get_pid_responsible_for_pid`, the same signal Activity Monitor
+  uses), not by parent/child descent. The daemon happens to be a *child* of the
+  app, so it is explicitly excluded from this group (see below). This is the
+  number that reflects what the user feels.
+- **Daemon** = the `octopush-pty-server` process **only**. It is a child of the
+  app process, and its own children are the user's shells and whatever they run
+  (npm, tests, agents) — all of that is user workload, not Octopush overhead, so
+  the daemon's whole subtree is **excluded** from the App group and only the
+  single daemon pid is counted here.
+- **Total** = App + Daemon. (No double-counting: the daemon is removed from the
+  App group via its process subtree before summing.)
 
 Each group reports `{ rss_bytes, cpu_pct, process_count }`.
 
@@ -86,16 +94,28 @@ struct PerfStats { app: ProcGroup, daemon: ProcGroup, total: ProcGroup, ts: i64 
 
 ### Logic
 
-1. Refresh the `System`.
-2. Build a `pid -> parent_pid` map from the process list.
-3. `collect_descendants(app_pid, &map)` → the set of app pids (app + WebKit
-   helpers). **Pure function, unit-tested** with a synthetic parent map.
-4. Read the daemon pid from `~/.octopush/pty-server.pid` (the file the daemon
+1. Lock the persistent `System` and refresh processes → flatten into
+   `Vec<ProcSample>` (`{ pid, ppid, rss_bytes, cpu_pct }`); release the lock.
+2. Read the daemon pid from `~/.octopush/pty-server.pid` (the file the daemon
    already writes via `acquire_pid_file`). If absent/stale, the daemon group is
-   reported as zero.
-5. `sum_group(pids, &system)` → `ProcGroup` (sum RSS, sum CPU, count). **Pure
-   function, unit-tested** with synthetic process data.
-6. Assemble `PerfStats` and return.
+   reported as zero (its pid won't be found in the live sample).
+3. Build `responsible_map` = `pid -> responsible_pid(pid)` via the macOS
+   `responsibility_get_pid_responsible_for_pid` FFI (`responsible_pid` falls back
+   to the pid itself on failure / off macOS).
+4. `compute_app_pids(samples, app_pid, daemon_pid, &responsible_map)` → the App
+   group: pids whose responsible pid is `app_pid`, **minus** the daemon's
+   process subtree (`collect_descendants(daemon_pid)`). **Pure function,
+   unit-tested** with a synthetic responsible map (covers: WebKit helper
+   reparented to launchd but responsible-to-app → included; daemon + its shell
+   child → excluded; unrelated process → excluded).
+5. `compute_stats(samples, &app_pids, daemon_pid, ts)` sums each group via
+   `sum_group` (App = app_pids, Daemon = the single daemon pid, Total =
+   App + Daemon). **Pure function, unit-tested.**
+
+The FFI (`responsible_pid`/`responsible_map`) and sampling are the only impure
+parts; the classification (`compute_app_pids`) and aggregation (`compute_stats`)
+are pure and fully unit-tested. The command is `async` so the per-poll process
+scan + FFI loop run off the Tauri main/UI thread.
 
 ## Frontend (React + Zustand)
 
