@@ -1,6 +1,6 @@
 //! Jira Cloud adapter. Auth: HTTP Basic with `email:api_token`.
 
-use super::{status_category_from_key, Issue, IssueTracker, StatusCategory};
+use super::{status_category_from_key, Issue, IssueTracker};
 use crate::error::{AppError, AppResult};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,7 @@ impl IssueTracker for JiraClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::StatusCategory;
 
     #[test]
     fn maps_jira_issue_json() {
