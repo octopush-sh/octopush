@@ -30,6 +30,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub last_pricing_refresh: Option<String>,
 
+    /// Issue tracker (Jira Cloud) configuration.
+    #[serde(default)]
+    pub issue_tracker: Option<crate::issue_tracker::jira::JiraConfig>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -100,6 +104,18 @@ pub fn get_git_credentials(host: &str) -> Option<GitCredentialEntry> {
     load_settings()
         .ok()
         .and_then(|s| s.git_credentials.get(host).cloned())
+}
+
+/// Get the saved issue tracker (Jira) configuration, if any.
+pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConfig> {
+    load_settings().ok().and_then(|s| s.issue_tracker)
+}
+
+/// Persist the issue tracker configuration.
+pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
+    let mut settings = load_settings()?;
+    settings.issue_tracker = Some(config);
+    save_settings(&settings)
 }
 
 /// Persist git credentials for a host.  Safe to call concurrently — the

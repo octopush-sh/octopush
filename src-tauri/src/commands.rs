@@ -1328,6 +1328,42 @@ pub fn get_default_providers() -> Vec<crate::provider_router::ProviderConfig> {
     crate::provider_router::default_providers_list()
 }
 
+// ─── Issue tracker commands ───────────────────────────────────────
+
+/// Build a Jira client from saved settings, or a clear error if unconfigured.
+fn jira_client() -> AppResult<crate::issue_tracker::jira::JiraClient> {
+    let cfg = crate::settings::get_issue_tracker_config()
+        .ok_or_else(|| AppError::Other("Issue tracker not configured".into()))?;
+    Ok(crate::issue_tracker::jira::JiraClient::new(cfg))
+}
+
+/// The current user's assigned, not-done issues (the backlog).
+#[tauri::command]
+pub async fn list_my_issues() -> AppResult<Vec<crate::issue_tracker::Issue>> {
+    use crate::issue_tracker::IssueTracker;
+    jira_client()?.list_my_issues().await
+}
+
+/// A single issue by key (for the active workspace's linked ticket).
+#[tauri::command]
+pub async fn get_issue(key: String) -> AppResult<crate::issue_tracker::Issue> {
+    use crate::issue_tracker::IssueTracker;
+    jira_client()?.get_issue(&key).await
+}
+
+/// Read the saved tracker config (token included so the Settings form can
+/// show it — same trust model as provider keys, on-device only).
+#[tauri::command]
+pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConfig> {
+    crate::settings::get_issue_tracker_config()
+}
+
+/// Persist the tracker config to ~/.octopush/settings.json.
+#[tauri::command]
+pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
+    crate::settings::save_issue_tracker_config(config)
+}
+
 // ─── Directory listing ────────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone, Debug)]

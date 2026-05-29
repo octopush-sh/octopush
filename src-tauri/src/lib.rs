@@ -213,6 +213,11 @@ pub fn run() {
             commands::run_test_command,
             commands::set_workspace_test_command,
             commands::detect_default_test_command,
+            // Issue tracker
+            commands::list_my_issues,
+            commands::get_issue,
+            commands::get_issue_tracker_config,
+            commands::save_issue_tracker_config,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.
