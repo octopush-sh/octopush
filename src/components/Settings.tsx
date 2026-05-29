@@ -432,16 +432,11 @@ export function ModelsPane() {
             type="button"
             onClick={handleSave}
             disabled={saving}
-            className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
+            className="min-w-[150px] rounded-md px-4 py-2 text-center font-serif text-[13px] text-octo-brass transition-colors disabled:opacity-50"
             style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
           >
             {saved ? "✓ Saved" : saving ? "Saving…" : "Save changes"}
           </button>
-          {saved && (
-            <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-verdigris">
-              Saved to disk
-            </span>
-          )}
         </div>
       </div>
 
