@@ -45,6 +45,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
 import type { GitStatus, OpenPr, TintName } from "./lib/types";
+import { detectIssueKey } from "./lib/detectIssueKey";
 
 interface ChatRef {
   id: string;
@@ -560,6 +561,7 @@ function App() {
 
   // ── Computed values ──
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
+  const activeIssueKey = activeWorkspace ? detectIssueKey(activeWorkspace.branch) : null;
   const activeChatId = activeWorkspaceId
     ? activeChatPerWorkspace[activeWorkspaceId] ?? activeWorkspaceId
     : null;
@@ -582,6 +584,15 @@ function App() {
   const [modelCatalog, setModelCatalog] = useState<ModelWithProvider[]>([]);
   useEffect(() => {
     ipc.listModels().then(setModelCatalog).catch(() => {});
+  }, []);
+
+  // Issue tracker config — load once on mount. We only need the boolean:
+  // whether the tracker is configured (all three fields present).
+  const [issueTrackerConfigured, setIssueTrackerConfigured] = useState(false);
+  useEffect(() => {
+    ipc.getIssueTrackerConfig()
+      .then((cfg) => setIssueTrackerConfigured(!!cfg?.baseUrl && !!cfg?.email && !!cfg?.apiToken))
+      .catch(() => {});
   }, []);
 
   const activeModelMaxContext = useMemo(() => {
@@ -996,6 +1007,8 @@ function App() {
             gitStatus={gitStatus}
             openPr={openPrByWs[activeWorkspace.id] ?? null}
             onOpenPr={(url) => ipc.openFileInSystem(url)}
+            activeIssueKey={activeIssueKey}
+            issueTrackerConfigured={issueTrackerConfigured}
             rightSlot={
               <ModeSwitcher
                 mode={activeMode}
@@ -1225,6 +1238,8 @@ function App() {
             contextProps={companionContextProps}
             historyProps={companionHistoryProps}
             fileTree={fileTreeProps}
+            activeIssueKey={activeIssueKey}
+            issueTrackerConfigured={issueTrackerConfigured}
           />
         </div>
         </div>

@@ -1,6 +1,31 @@
-import type { GitStatus, OpenPr } from "../lib/types";
+import { useEffect, useState } from "react";
+import type { GitStatus, OpenPr, Issue } from "../lib/types";
 import { ScratchpadIcon } from "./ScratchpadIcon";
 import { useScratchpadStore } from "../stores/scratchpadStore";
+import { useIssuesStore } from "../stores/issuesStore";
+import { ipc } from "../lib/ipc";
+
+/** Resolve an issue by key — prefers the store, falls back to getIssue() once
+ *  per key change. Returns null until an issue is found or the lookup fails. */
+function useActiveIssue(key: string | null | undefined): Issue | null {
+  const storeIssues = useIssuesStore((s) => s.issues);
+  const [fallback, setFallback] = useState<Issue | null>(null);
+
+  // Reset fallback whenever the key changes.
+  useEffect(() => {
+    setFallback(null);
+    if (!key) return;
+    // Try the store first; if found, no network call needed.
+    const found = storeIssues?.find((i) => i.key === key);
+    if (found) return;
+    // Single fallback network call.
+    ipc.getIssue(key).then(setFallback).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  if (!key) return null;
+  return storeIssues?.find((i) => i.key === key) ?? fallback;
+}
 
 interface Props {
   projectName: string;
@@ -14,6 +39,13 @@ interface Props {
   /** Called with the PR's html_url when the chip is clicked. Typically
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
+  /** Jira-style issue key detected from the active branch (e.g. "PROJ-123").
+   *  When present and the issue can be resolved, renders a ticket chip next
+   *  to the PR chip. */
+  activeIssueKey?: string | null;
+  /** Whether the issue tracker is configured. When false, no chip is shown
+   *  even if a key is present. */
+  issueTrackerConfigured?: boolean;
   /** Right-side slot — typically the mode switcher (TALK · RUN · REVIEW).
    *  Lives inside ContextHeader so the entire top of the app reads as one
    *  unified header band, rather than two floating cards in separate
@@ -29,10 +61,13 @@ export function ContextHeader({
   gitStatus,
   openPr,
   onOpenPr,
+  activeIssueKey,
+  issueTrackerConfigured = false,
   rightSlot,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const toggleScratchpad = useScratchpadStore((s) => s.toggleOpen);
+  const activeIssue = useActiveIssue(issueTrackerConfigured ? activeIssueKey : null);
 
   return (
     <div className="m-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
@@ -94,6 +129,25 @@ export function ContextHeader({
             <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>
               ↗
             </span>
+          </button>
+        )}
+
+        {activeIssue && (
+          <button
+            type="button"
+            onClick={() => ipc.openFileInSystem(activeIssue.url).catch(() => {})}
+            title={`${activeIssue.key} — ${activeIssue.summary}`}
+            className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors"
+            style={{
+              background: "var(--brass-ghost)",
+              border: "1px solid var(--brass-dim)",
+            }}
+          >
+            <span className="text-octo-brass" aria-hidden style={{ fontSize: 11, lineHeight: 1 }}>
+              ◈
+            </span>
+            <span className="text-octo-brass">{activeIssue.key}</span>
+            <span className="text-octo-mute">· {activeIssue.statusName}</span>
           </button>
         )}
 

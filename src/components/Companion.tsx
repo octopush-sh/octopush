@@ -4,6 +4,7 @@ import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionFileTree } from "./CompanionFileTree";
+import { BacklogPanel } from "./BacklogPanel";
 
 interface ContextProps {
   tokensUsed: number;
@@ -34,6 +35,11 @@ interface Props {
   contextProps: ContextProps;
   historyProps: HistoryProps;
   fileTree?: FileTreeProps;
+  /** Jira key detected from the active workspace's branch (e.g. "PROJ-123"),
+   *  or null when no key is present. Forwarded to BacklogPanel. */
+  activeIssueKey?: string | null;
+  /** Whether the issue tracker has been configured. Forwarded to BacklogPanel. */
+  issueTrackerConfigured?: boolean;
 }
 
 export function Companion({
@@ -42,6 +48,8 @@ export function Companion({
   contextProps,
   historyProps,
   fileTree,
+  activeIssueKey = null,
+  issueTrackerConfigured = false,
 }: Props) {
   return (
     <aside
@@ -65,6 +73,12 @@ export function Companion({
         <div className="p-4">
           <CompanionTerminals workspaceId={workspaceId} />
         </div>
+      )}
+      {mode === "run" && workspaceId && (
+        <BacklogPanel
+          activeKey={activeIssueKey}
+          configured={issueTrackerConfigured}
+        />
       )}
       {mode === "review" && fileTree && (
         <CompanionFileTree {...fileTree} />
