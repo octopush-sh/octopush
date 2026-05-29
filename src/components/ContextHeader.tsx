@@ -137,7 +137,7 @@ export function ContextHeader({
             type="button"
             onClick={() => ipc.openFileInSystem(activeIssue.url).catch(() => {})}
             title={`${activeIssue.key} — ${activeIssue.summary}`}
-            className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors"
+            className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass transition-colors"
             style={{
               background: "var(--brass-ghost)",
               border: "1px solid var(--brass-dim)",
