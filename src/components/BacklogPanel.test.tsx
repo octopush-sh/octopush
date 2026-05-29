@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { BacklogPanel } from "./BacklogPanel";
 import { useIssuesStore } from "../stores/issuesStore";
+import * as ipc from "../lib/ipc";
 
 // Mock ipc so the store's load() call resolves without side-effects by default.
 vi.mock("../lib/ipc", () => ({
@@ -98,13 +99,49 @@ describe("BacklogPanel", () => {
       ],
     });
     render(<BacklogPanel activeKey="PROJ-123" configured />);
-    // Active row should have brass border class
+    // Active row should have brass-dim inline border + brass-ghost background
     const activeKeyEl = screen.getByText("PROJ-123");
-    const rowBtn = activeKeyEl.closest("button");
-    expect(rowBtn?.className).toContain("border-octo-brass");
-    // Inactive row should have transparent border
+    const rowBtn = activeKeyEl.closest("[role='button']") as HTMLElement;
+    expect(rowBtn?.style.borderLeft).toContain("brass-dim");
+    expect(rowBtn?.style.background).toContain("brass-ghost");
+    // Inactive row should have a transparent border (no visual shift)
     const inactiveKeyEl = screen.getByText("PROJ-456");
-    const inactiveBtn = inactiveKeyEl.closest("button");
-    expect(inactiveBtn?.className).toContain("border-transparent");
+    const inactiveBtn = inactiveKeyEl.closest("[role='button']") as HTMLElement;
+    expect(inactiveBtn?.style.borderLeft).toContain("transparent");
+  });
+
+  it("clicking a ticket row calls openFileInSystem with its url", () => {
+    useIssuesStore.setState({
+      issues: [
+        {
+          key: "PROJ-123",
+          summary: "Login",
+          statusName: "In Progress",
+          statusCategory: "inProgress",
+          issueType: "Story",
+          priority: "High",
+          url: "https://example.atlassian.net/browse/PROJ-123",
+          parentKey: null,
+        },
+      ],
+    });
+    render(<BacklogPanel activeKey={null} configured />);
+    fireEvent.click(screen.getByText("PROJ-123").closest("[role='button']")!);
+    expect(vi.mocked(ipc.ipc.openFileInSystem)).toHaveBeenCalledWith(
+      "https://example.atlassian.net/browse/PROJ-123",
+    );
+  });
+
+  it("clicking the refresh button calls load()", () => {
+    const load = vi.fn().mockResolvedValue(undefined);
+    useIssuesStore.setState({
+      issues: [],
+      loading: false,
+      error: null,
+      load,
+    });
+    render(<BacklogPanel activeKey={null} configured />);
+    fireEvent.click(screen.getByLabelText("Refresh backlog"));
+    expect(load).toHaveBeenCalled();
   });
 });

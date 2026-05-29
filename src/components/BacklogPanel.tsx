@@ -87,14 +87,14 @@ export function BacklogPanel({ activeKey, configured }: Props) {
                 <button
                   key={it.key}
                   type="button"
+                  role="button"
                   onClick={() => ipc.openFileInSystem(it.url).catch(() => {})}
-                  className={[
-                    "flex w-full items-center gap-2 border-l-2 px-2 py-1 text-left",
-                    "transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]",
+                  className="flex w-full items-center gap-2 px-2 py-1 text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
+                  style={
                     isActive
-                      ? "border-octo-brass bg-octo-panel-2"
-                      : "border-transparent hover:bg-octo-panel-2",
-                  ].join(" ")}
+                      ? { borderLeft: "1px solid var(--brass-dim)", background: "var(--brass-ghost)" }
+                      : { borderLeft: "1px solid transparent" }
+                  }
                 >
                   {/* Status dot */}
                   <span
@@ -105,7 +105,7 @@ export function BacklogPanel({ activeKey, configured }: Props) {
                   </span>
 
                   {/* Ticket key — mono */}
-                  <span className="flex-shrink-0 font-mono text-[11px] text-octo-mute">
+                  <span className="flex-shrink-0 font-mono text-[11px] text-octo-ivory">
                     {it.key}
                   </span>
 
