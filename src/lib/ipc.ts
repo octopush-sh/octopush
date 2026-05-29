@@ -13,6 +13,8 @@ import type {
   DirectoryEntry,
   FileEdit,
   GitStatus,
+  Issue,
+  IssueTrackerConfig,
   ModelSuggestion,
   ModelWithProvider,
   OpenPr,
@@ -311,4 +313,12 @@ export const ipc = {
 
   getWorkspaceCacheSizes: (workspacePath: string) =>
     invoke<WorkspaceCacheSizes>("get_workspace_cache_sizes", { workspacePath }),
+
+  // ─── Issue Tracker ────────────────────────────────────────────
+  listMyIssues: () => invoke<Issue[]>("list_my_issues"),
+  getIssue: (key: string) => invoke<Issue>("get_issue", { key }),
+  getIssueTrackerConfig: () =>
+    invoke<IssueTrackerConfig | null>("get_issue_tracker_config"),
+  saveIssueTrackerConfig: (config: IssueTrackerConfig) =>
+    invoke<void>("save_issue_tracker_config", { config }),
 };

@@ -431,6 +431,27 @@ export interface WorkspaceCacheSizes {
   totalBytes: number;
 }
 
+// ─── Issue Tracker ────────────────────────────────────────────────
+
+export type StatusCategory = "todo" | "inProgress" | "done" | "unknown";
+
+export interface Issue {
+  key: string;
+  summary: string;
+  statusName: string;
+  statusCategory: StatusCategory;
+  issueType: string;
+  priority: string | null;
+  url: string;
+  parentKey: string | null;
+}
+
+export interface IssueTrackerConfig {
+  baseUrl: string;
+  email: string;
+  apiToken: string;
+}
+
 // ─── Templates ────────────────────────────────────────────────────
 
 export interface SessionTemplate {
