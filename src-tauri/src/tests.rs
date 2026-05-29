@@ -1337,3 +1337,64 @@ mod file_io_tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "content");
     }
 }
+
+#[cfg(test)]
+mod provider_catalog_tests {
+    use crate::provider_router::{
+        default_providers_list, validate_providers, write_providers, ProviderRouter, ProviderConfig, ModelInfo,
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn prov(name: &str, protocol: &str, local: bool, models: Vec<ModelInfo>) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            api_base: if local { String::new() } else { "https://x".into() },
+            api_key_env: String::new(),
+            models,
+            rate_limits: Default::default(),
+            enabled: true,
+            protocol: protocol.into(),
+            local,
+        }
+    }
+    fn model(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(), display_name: id.into(),
+            input_cost_per_m: 1.0, output_cost_per_m: 2.0,
+            cache_read_cost_per_m: 0.0, cache_creation_cost_per_m: 0.0,
+            max_context: 200_000, supports_vision: false, supports_tools: true, tags: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_dupes_and_empties() {
+        assert!(validate_providers(&[prov("", "anthropic", false, vec![])]).is_err());
+        assert!(validate_providers(&[prov("a", "anthropic", false, vec![]), prov("A", "anthropic", false, vec![])]).is_err());
+        assert!(validate_providers(&[prov("a", "weird", false, vec![])]).is_err());
+        assert!(validate_providers(&[prov("a", "anthropic", false, vec![model("m"), model("m")])]).is_err());
+        assert!(validate_providers(&[prov("a", "anthropic", false, vec![model("ok")])]).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn write_then_load_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let list = vec![prov("sonatype", "anthropic", false, vec![model("claude-x")])];
+        write_providers(&list).unwrap();
+        let router = ProviderRouter::load().unwrap();
+        let names: Vec<String> = router.list_providers().iter().map(|p| p.name.clone()).collect();
+        assert!(names.contains(&"sonatype".to_string()));
+        // The built-ins are also re-seeded by load(); our custom one persists.
+        assert!(router.find_model("claude-x").is_some());
+    }
+
+    #[test]
+    fn defaults_list_has_builtins() {
+        let d = default_providers_list();
+        let names: Vec<&str> = d.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"anthropic"));
+        assert!(names.contains(&"openai"));
+    }
+}

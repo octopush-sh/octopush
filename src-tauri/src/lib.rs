@@ -172,6 +172,9 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::save_git_credentials,
+            // Provider catalog
+            commands::save_providers,
+            commands::get_default_providers,
             // Terminals
             commands::list_terminals,
             commands::create_terminal,

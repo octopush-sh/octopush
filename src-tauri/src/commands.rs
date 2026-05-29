@@ -1313,6 +1313,21 @@ pub async fn save_git_credentials(host: String, username: String, token: String)
     crate::settings::save_git_credentials(&host, &username, &token)
 }
 
+/// Persist the full provider catalog to ~/.octopush/providers.json.
+#[tauri::command]
+pub async fn save_providers(providers: Vec<crate::provider_router::ProviderConfig>) -> AppResult<()> {
+    crate::provider_router::validate_providers(&providers)
+        .map_err(crate::error::AppError::Other)?;
+    crate::provider_router::write_providers(&providers)?;
+    Ok(())
+}
+
+/// Return the built-in provider defaults (for "reset to defaults" in the UI).
+#[tauri::command]
+pub fn get_default_providers() -> Vec<crate::provider_router::ProviderConfig> {
+    crate::provider_router::default_providers_list()
+}
+
 // ─── Directory listing ────────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone, Debug)]

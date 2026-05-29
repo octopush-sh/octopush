@@ -284,6 +284,52 @@ fn config_path() -> PathBuf {
         .join("providers.json")
 }
 
+/// Default providers as a list (for "reset to defaults" in the UI).
+pub fn default_providers_list() -> Vec<ProviderConfig> {
+    builtin_providers().into_values().collect()
+}
+
+/// Write the provider catalog to `~/.octopush/providers.json` (pretty JSON).
+pub fn write_providers(list: &[ProviderConfig]) -> AppResult<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(list)?)?;
+    Ok(())
+}
+
+/// Validate a provider list before persisting. Returns Err(message) on the
+/// first problem found.
+pub fn validate_providers(list: &[ProviderConfig]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for p in list {
+        let name = p.name.trim();
+        if name.is_empty() {
+            return Err("Provider name cannot be empty".into());
+        }
+        if !seen.insert(name.to_lowercase()) {
+            return Err(format!("Duplicate provider name: {name}"));
+        }
+        if p.protocol != "anthropic" && p.protocol != "openai-compatible" {
+            return Err(format!("Provider {name}: protocol must be 'anthropic' or 'openai-compatible'"));
+        }
+        if !p.local && p.api_base.trim().is_empty() {
+            return Err(format!("Provider {name}: base URL is required"));
+        }
+        let mut model_ids = std::collections::HashSet::new();
+        for m in &p.models {
+            if m.id.trim().is_empty() {
+                return Err(format!("Provider {name}: a model id is empty"));
+            }
+            if !model_ids.insert(m.id.trim().to_lowercase()) {
+                return Err(format!("Provider {name}: duplicate model id {}", m.id));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
     let mut map = HashMap::new();
 
