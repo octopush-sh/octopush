@@ -2,7 +2,7 @@
 //! (`jira.rs`); the normalized `Issue` here is what the UI and (later) the
 //! Octopush MCP consume, independent of the provider.
 
-// pub mod jira;  -- added in Task 2 when jira.rs is created
+pub mod jira;
 
 use serde::Serialize;
 
