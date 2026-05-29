@@ -589,11 +589,25 @@ function App() {
   // Issue tracker config — load once on mount. We only need the boolean:
   // whether the tracker is configured (all three fields present).
   const [issueTrackerConfigured, setIssueTrackerConfigured] = useState(false);
+
+  function isIssueTrackerConfigured(cfg: { baseUrl?: string; email?: string; apiToken?: string } | null | undefined): boolean {
+    return !!(cfg?.baseUrl && cfg?.email && cfg?.apiToken);
+  }
+
   useEffect(() => {
     ipc.getIssueTrackerConfig()
-      .then((cfg) => setIssueTrackerConfigured(!!cfg?.baseUrl && !!cfg?.email && !!cfg?.apiToken))
+      .then((cfg) => setIssueTrackerConfigured(isIssueTrackerConfigured(cfg)))
       .catch(() => {});
   }, []);
+
+  const refreshIssueTrackerConfigured = async () => {
+    try {
+      const cfg = await ipc.getIssueTrackerConfig();
+      setIssueTrackerConfigured(isIssueTrackerConfigured(cfg));
+    } catch {
+      // non-fatal
+    }
+  };
 
   const activeModelMaxContext = useMemo(() => {
     const found = modelCatalog.find((m) => m.model.id === activeModel);
@@ -1290,6 +1304,7 @@ function App() {
         open={settingsTab !== null}
         initialTab={settingsTab ?? "general"}
         onClose={() => setSettingsTab(null)}
+        onIssueTrackerConfigSaved={refreshIssueTrackerConfigured}
       />
 
       {/* Project context menu (right-click on project header) */}

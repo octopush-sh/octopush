@@ -23,11 +23,12 @@ interface Props {
   open: boolean;
   initialTab?: SettingsTab;
   onClose: () => void;
+  onIssueTrackerConfigSaved?: () => void;
 }
 
 const POLL_MS = 10_000;
 
-export function Settings({ open, initialTab = "general", onClose }: Props) {
+export function Settings({ open, initialTab = "general", onClose, onIssueTrackerConfigSaved }: Props) {
   const [tab, setTab] = useState<SettingsTab>(initialTab);
 
   // When (re)opened, jump to the requested tab.
@@ -96,6 +97,7 @@ export function Settings({ open, initialTab = "general", onClose }: Props) {
           {tab === "usage" && <UsagePane />}
           {tab === "shortcuts" && <ShortcutsPane />}
           {tab === "privacy" && <PrivacyPane />}
+          {tab === "integrations" && <IntegrationsPane onConfigSaved={onIssueTrackerConfigSaved} />}
           {tab === "about" && <AboutPane />}
         </main>
       </div>
@@ -1827,6 +1829,137 @@ function AboutPane() {
             · Updates are verified with an Ed25519 signature before install.
           </li>
         </ul>
+      </div>
+    </>
+  );
+}
+
+// ─── Tab: Integrations ────────────────────────────────────────────────
+
+function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
+  const [baseUrl, setBaseUrl] = useState("");
+  const [email, setEmail] = useState("");
+  const [apiToken, setApiToken] = useState("");
+  const [showToken, setShowToken] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    ipc.getIssueTrackerConfig()
+      .then((cfg) => {
+        if (cfg) {
+          setBaseUrl(cfg.baseUrl ?? "");
+          setEmail(cfg.email ?? "");
+          // Mask a saved token with bullet dots so the field is clearly pre-filled
+          // without exposing the actual secret (same pattern as provider keys).
+          setApiToken(cfg.apiToken ? "••••••••••••••••" : "");
+        }
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  }, []);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await ipc.saveIssueTrackerConfig({ baseUrl, email, apiToken });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      onConfigSaved?.();
+      // Fire-and-forget: refresh the backlog immediately so the RUN Companion
+      // populates without waiting for a re-mount.
+      const { useIssuesStore } = await import("../stores/issuesStore");
+      useIssuesStore.getState().load();
+    } catch (e) {
+      pushToast({ level: "error", title: "Save failed", body: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <>
+      <PaneHeader
+        eyebrow="Integrations"
+        title="Connect your tools."
+        subtitle="Wire up external services so Octopus can surface context right where you work."
+      />
+
+      {/* ── Issue Tracker section ── */}
+      <div className="max-w-[640px]">
+        <SectionLabel>Issue Tracker</SectionLabel>
+        <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
+          Jira Cloud — read-only access for the backlog and ticket chip.
+        </p>
+
+        <div className="space-y-3">
+          {/* Base URL */}
+          <div>
+            <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+              Base URL
+            </div>
+            <input
+              type="text"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://your-company.atlassian.net"
+              className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+            />
+          </div>
+
+          {/* Email */}
+          <div>
+            <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+              Email
+            </div>
+            <input
+              type="text"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@your-company.com"
+              className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+            />
+          </div>
+
+          {/* API Token — secret input with show/hide toggle */}
+          <div>
+            <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+              API Token
+            </div>
+            <div className="relative">
+              <input
+                type={showToken ? "text" : "password"}
+                value={apiToken}
+                onChange={(e) => setApiToken(e.target.value)}
+                placeholder="API token"
+                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 pr-10 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+              />
+              <button
+                type="button"
+                onClick={() => setShowToken((v) => !v)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 px-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
+              >
+                {showToken ? "Hide" : "Show"}
+              </button>
+            </div>
+          </div>
+
+          {/* Save button */}
+          <div className="flex items-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving}
+              className="min-w-[150px] rounded-md px-4 py-2 text-center font-serif text-[13px] text-octo-brass transition-colors disabled:opacity-50"
+              style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            >
+              {saved ? "✓ Saved" : saving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        </div>
       </div>
     </>
   );
