@@ -185,6 +185,7 @@ pub fn run() {
             commands::spawn_or_attach_terminal,
             // Performance monitor
             commands::get_perf_stats,
+            commands::get_workspace_cache_sizes,
             // Directory listing
             commands::read_directory,
             // File I/O

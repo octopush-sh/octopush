@@ -9,7 +9,95 @@
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use sysinfo::System;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskInfo {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntry {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCacheSizes {
+    pub entries: Vec<CacheEntry>,
+    pub total_bytes: u64,
+}
+
+/// Common build/cache directory names scanned at a workspace root.
+pub const CACHE_DIR_NAMES: &[&str] = &[
+    "target", "node_modules", "dist", "build", ".next", ".nuxt",
+    ".gradle", "__pycache__", ".venv", "venv", ".turbo", "out",
+];
+
+/// Recursively sum the byte sizes of regular files under `path`. Skips
+/// symlinks; ignores per-entry errors (permission, races). Never panics.
+pub fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if let Ok(md) = entry.metadata() {
+            total = total.saturating_add(md.len());
+        }
+    }
+    total
+}
+
+/// For each known cache dir name present (as a directory) directly under
+/// `workspace_root`, return (name, size). Absent names are omitted.
+pub fn scan_caches(workspace_root: &Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for name in CACHE_DIR_NAMES {
+        let p = workspace_root.join(name);
+        if p.is_dir() {
+            out.push((name.to_string(), dir_size(&p)));
+        }
+    }
+    out
+}
+
+/// Given `(mount_point, total, free)` tuples, pick the disk whose mount point
+/// is the longest prefix of `target`; fall back to the `/` mount, else the
+/// first, else zeros. Pure — unit-testable without sysinfo.
+pub fn pick_disk_for_path(mounts: &[(PathBuf, u64, u64)], target: &Path) -> DiskInfo {
+    let best = mounts
+        .iter()
+        .filter(|(mp, _, _)| target.starts_with(mp))
+        .max_by_key(|(mp, _, _)| mp.as_os_str().len())
+        .or_else(|| mounts.iter().find(|(mp, _, _)| mp == Path::new("/")))
+        .or_else(|| mounts.first());
+    match best {
+        Some((_, total, free)) => DiskInfo { free_bytes: *free, total_bytes: *total },
+        None => DiskInfo { free_bytes: 0, total_bytes: 0 },
+    }
+}
+
+/// Read the free/total bytes of the volume that `$HOME` lives on.
+pub fn home_disk() -> DiskInfo {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mounts: Vec<(PathBuf, u64, u64)> = disks
+        .list()
+        .iter()
+        .map(|d| (d.mount_point().to_path_buf(), d.total_space(), d.available_space()))
+        .collect();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    pick_disk_for_path(&mounts, &home)
+}
 
 /// A flattened, sysinfo-independent view of one process.
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +137,7 @@ pub struct PerfStats {
     pub app: ProcGroup,
     pub daemon: ProcGroup,
     pub total: ProcGroup,
+    pub disk: DiskInfo,
     pub ts: i64,
 }
 
@@ -203,6 +292,7 @@ pub fn compute_stats(
     samples: &[ProcSample],
     app_pids: &HashSet<u32>,
     daemon_pid: Option<u32>,
+    disk: DiskInfo,
     ts: i64,
 ) -> PerfStats {
     let by_pid = samples_by_pid(samples);
@@ -212,7 +302,7 @@ pub fn compute_stats(
         None => ProcGroup::zero(),
     };
     let total = app.plus(&daemon);
-    PerfStats { app, daemon, total, ts }
+    PerfStats { app, daemon, total, disk, ts }
 }
 
 #[cfg(test)]
@@ -265,7 +355,8 @@ mod tests {
     #[test]
     fn perf_stats_serializes_camel_case() {
         let g = ProcGroup { rss_bytes: 1, cpu_pct: 2.0, process_count: 3 };
-        let stats = PerfStats { app: g.clone(), daemon: g.clone(), total: g.clone(), ts: 42 };
+        let disk = DiskInfo { free_bytes: 10, total_bytes: 100 };
+        let stats = PerfStats { app: g.clone(), daemon: g.clone(), total: g.clone(), disk, ts: 42 };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"rssBytes\":1"));
         assert!(json.contains("\"cpuPct\":2.0"));
@@ -314,18 +405,55 @@ mod tests {
             s(201, Some(200), 9999, 99.0),
         ];
         let app_pids = HashSet::from([100u32, 300u32]);
-        let stats = compute_stats(&samples, &app_pids, Some(200), 7);
+        let disk = DiskInfo { free_bytes: 100, total_bytes: 500 };
+        let stats = compute_stats(&samples, &app_pids, Some(200), disk.clone(), 7);
         assert_eq!(stats.app, ProcGroup { rss_bytes: 200, cpu_pct: 3.0, process_count: 2 });
         assert_eq!(stats.daemon, ProcGroup { rss_bytes: 30, cpu_pct: 0.5, process_count: 1 });
         assert_eq!(stats.total, ProcGroup { rss_bytes: 230, cpu_pct: 3.5, process_count: 3 });
+        assert_eq!(stats.disk, disk);
         assert_eq!(stats.ts, 7);
     }
 
     #[test]
     fn compute_stats_daemon_absent_is_zero() {
         let samples = vec![s(100, None, 50, 1.0)];
-        let stats = compute_stats(&samples, &HashSet::from([100u32]), None, 0);
+        let stats = compute_stats(&samples, &HashSet::from([100u32]), None, DiskInfo { free_bytes: 0, total_bytes: 0 }, 0);
         assert_eq!(stats.daemon, ProcGroup::zero());
         assert_eq!(stats.total, stats.app);
+    }
+
+    #[test]
+    fn dir_size_sums_files_recursively() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), vec![0u8; 100]).unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), vec![0u8; 50]).unwrap();
+        assert_eq!(dir_size(tmp.path()), 150);
+    }
+
+    #[test]
+    fn scan_caches_returns_only_present_known_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target").join("x"), vec![0u8; 10]).unwrap();
+        std::fs::create_dir(tmp.path().join("node_modules")).unwrap();
+        std::fs::write(tmp.path().join("node_modules").join("y"), vec![0u8; 20]).unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap(); // not a cache name
+        let mut got = scan_caches(tmp.path());
+        got.sort();
+        assert_eq!(got, vec![("node_modules".to_string(), 20), ("target".to_string(), 10)]);
+    }
+
+    #[test]
+    fn pick_disk_chooses_longest_prefix_mount() {
+        let mounts = vec![
+            (PathBuf::from("/"), 1000u64, 100u64),
+            (PathBuf::from("/Users"), 2000u64, 200u64),
+        ];
+        let d = pick_disk_for_path(&mounts, Path::new("/Users/jonathan"));
+        assert_eq!(d, DiskInfo { free_bytes: 200, total_bytes: 2000 });
+        let root = pick_disk_for_path(&mounts, Path::new("/opt/x"));
+        assert_eq!(root, DiskInfo { free_bytes: 100, total_bytes: 1000 });
     }
 }

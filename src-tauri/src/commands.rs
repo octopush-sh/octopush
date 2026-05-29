@@ -2163,7 +2163,21 @@ pub async fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> R
     let responsible = crate::perf::responsible_map(&samples);
     let app_pids = crate::perf::compute_app_pids(&samples, app_pid, daemon_pid, &responsible);
     let ts = chrono::Utc::now().timestamp();
-    Ok(crate::perf::compute_stats(&samples, &app_pids, daemon_pid, ts))
+    let disk = crate::perf::home_disk();
+    Ok(crate::perf::compute_stats(&samples, &app_pids, daemon_pid, disk, ts))
+}
+
+/// On-demand sizes of common build/cache dirs in a workspace. Async so the
+/// directory walk runs off the UI thread.
+#[tauri::command]
+pub async fn get_workspace_cache_sizes(workspace_path: String) -> crate::perf::WorkspaceCacheSizes {
+    let root = std::path::PathBuf::from(&workspace_path);
+    let scanned = crate::perf::scan_caches(&root);
+    let total_bytes = scanned.iter().map(|(_, b)| *b).sum();
+    crate::perf::WorkspaceCacheSizes {
+        entries: scanned.into_iter().map(|(name, bytes)| crate::perf::CacheEntry { name, bytes }).collect(),
+        total_bytes,
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
