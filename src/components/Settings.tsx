@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, RefreshCw, CheckCircle, Loader2, Pencil, X } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { useAttentionStore } from "../stores/attentionStore";
@@ -1836,6 +1836,11 @@ function AboutPane() {
 
 // ─── Tab: Integrations ────────────────────────────────────────────────
 
+// Sentinel shown in the API-token field when a saved token is loaded; if the
+// user submits without editing the field we substitute the original token so
+// the bullets aren't persisted as the actual credential.
+const MASKED_TOKEN_PLACEHOLDER = "••••••••••••••••";
+
 function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
   const [baseUrl, setBaseUrl] = useState("");
   const [email, setEmail] = useState("");
@@ -1844,6 +1849,7 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const originalTokenRef = useRef("");
 
   useEffect(() => {
     ipc.getIssueTrackerConfig()
@@ -1851,9 +1857,10 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
         if (cfg) {
           setBaseUrl(cfg.baseUrl ?? "");
           setEmail(cfg.email ?? "");
-          // Mask a saved token with bullet dots so the field is clearly pre-filled
-          // without exposing the actual secret (same pattern as provider keys).
-          setApiToken(cfg.apiToken ? "••••••••••••••••" : "");
+          if (cfg.apiToken) {
+            originalTokenRef.current = cfg.apiToken;
+            setApiToken(MASKED_TOKEN_PLACEHOLDER);
+          }
         }
         setLoaded(true);
       })
@@ -1863,7 +1870,9 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
   async function handleSave() {
     setSaving(true);
     try {
-      await ipc.saveIssueTrackerConfig({ baseUrl, email, apiToken });
+      const tokenToSave =
+        apiToken === MASKED_TOKEN_PLACEHOLDER ? originalTokenRef.current : apiToken;
+      await ipc.saveIssueTrackerConfig({ baseUrl, email, apiToken: tokenToSave });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       onConfigSaved?.();

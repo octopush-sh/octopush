@@ -125,6 +125,40 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     });
   });
 
+  it("preserves the original token on save when the masked field is untouched", async () => {
+    getIssueTrackerConfigMock.mockResolvedValue({
+      baseUrl: "https://acme.atlassian.net",
+      email: "dev@acme.com",
+      apiToken: "real-secret-token",
+    });
+    await renderIntegrationsPane();
+
+    // Wait for prefill so the masked token is loaded into the field.
+    await waitFor(() => {
+      expect((screen.getByPlaceholderText(/api token/i) as HTMLInputElement).value).toMatch(/^•+$/);
+    });
+
+    // Edit only the email; do NOT touch the token field.
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText(/you@/i), {
+        target: { value: "alice@acme.com" },
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    });
+
+    await waitFor(() => {
+      expect(saveIssueTrackerConfigMock).toHaveBeenCalledTimes(1);
+      expect(saveIssueTrackerConfigMock).toHaveBeenCalledWith({
+        baseUrl: "https://acme.atlassian.net",
+        email: "alice@acme.com",
+        apiToken: "real-secret-token",
+      });
+    });
+  });
+
   it("calls onIssueTrackerConfigSaved callback after a successful save", async () => {
     const onSaved = vi.fn();
     await renderIntegrationsPane(onSaved);
