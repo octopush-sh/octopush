@@ -145,7 +145,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
             onClick={() => onPick(r.key)}
             onMouseEnter={() => setHighlight(idx)}
             className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left"
-            style={idx === highlight ? { background: "rgba(212,165,116,0.12)" } : undefined}
+            style={idx === highlight ? { background: "var(--brass-glow)" } : undefined}
           >
             <span
               aria-hidden
@@ -165,7 +165,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
               onClick={() => void pickFallback()}
               aria-label={`Use ${query}`}
               className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left"
-              style={{ background: "rgba(212,165,116,0.12)" }}
+              style={{ background: "var(--brass-glow)" }}
             >
               <span
                 aria-hidden
