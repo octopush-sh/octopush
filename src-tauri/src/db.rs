@@ -35,7 +35,9 @@ impl Db {
         Ok(db)
     }
 
-    /// Returns a reference to the underlying connection. Intended for tests only.
+    /// Returns a reference to the underlying connection. Tests only — the
+    /// `#[cfg(test)]` gate enforces the intent at compile time.
+    #[cfg(test)]
     pub fn conn_ref(&self) -> &Connection {
         &self.conn
     }
