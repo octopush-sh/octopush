@@ -231,6 +231,28 @@ mod workspace_tests {
     }
 
     #[test]
+    fn workspace_link_round_trip() {
+        let db = test_db();
+        db.insert_project("proj-link", "Test Project", "/tmp/proj-link")
+            .unwrap();
+        db.insert_workspace("ws-link", "proj-link", "ws", "", "main", None, "")
+            .unwrap();
+
+        // Set linked_issue_key and dismissed=false, then read back.
+        db.update_workspace_link("ws-link", Some("PROJ-42".into()), false)
+            .unwrap();
+        let ws = db.get_workspace("ws-link").unwrap().unwrap();
+        assert_eq!(ws.linked_issue_key.as_deref(), Some("PROJ-42"));
+        assert!(!ws.issue_link_dismissed);
+
+        // Clear link and set dismissed=true.
+        db.update_workspace_link("ws-link", None, true).unwrap();
+        let ws = db.get_workspace("ws-link").unwrap().unwrap();
+        assert_eq!(ws.linked_issue_key, None);
+        assert!(ws.issue_link_dismissed);
+    }
+
+    #[test]
     fn migrate_adds_contextual_issue_tracker_columns() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = Db::open(tmp.path()).unwrap();

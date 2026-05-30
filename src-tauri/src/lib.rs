@@ -149,6 +149,7 @@ pub fn run() {
             commands::list_workspaces,
             commands::delete_workspace,
             commands::update_workspace_customization,
+            commands::update_workspace_link,
             commands::get_git_status,
             commands::get_git_diff,
             // Chat

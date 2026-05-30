@@ -515,6 +515,16 @@ pub async fn list_workspaces(state: State<'_, AppState>, project_id: String) -> 
 }
 
 #[tauri::command]
+pub async fn update_workspace_link(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    linked_issue_key: Option<String>,
+    dismissed: bool,
+) -> AppResult<()> {
+    state.db.lock().update_workspace_link(&workspace_id, linked_issue_key, dismissed)
+}
+
+#[tauri::command]
 pub async fn get_git_status(path: String) -> AppResult<crate::git_ops::GitStatus> {
     let path = expand_tilde(&path);
     crate::git_ops::get_status(std::path::Path::new(&path))

@@ -630,7 +630,7 @@ impl Db {
 
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
              FROM workspaces WHERE project_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -648,9 +648,53 @@ impl Db {
                 glyph: r.get(10)?,
                 tint: r.get(11)?,
                 test_command: r.get(12)?,
+                linked_issue_key: r.get(13)?,
+                issue_link_dismissed: r.get::<_, i64>(14)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_workspace(&self, workspace_id: &str) -> AppResult<Option<WorkspaceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
+             FROM workspaces WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![workspace_id], |r| {
+                Ok(WorkspaceRow {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    name: r.get(2)?,
+                    task: r.get(3)?,
+                    branch: r.get(4)?,
+                    worktree_path: r.get(5)?,
+                    setup_script: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                    last_active: r.get(9)?,
+                    glyph: r.get(10)?,
+                    tint: r.get(11)?,
+                    test_command: r.get(12)?,
+                    linked_issue_key: r.get(13)?,
+                    issue_link_dismissed: r.get::<_, i64>(14)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn update_workspace_link(
+        &self,
+        workspace_id: &str,
+        linked_issue_key: Option<String>,
+        dismissed: bool,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET linked_issue_key = ?1, issue_link_dismissed = ?2 WHERE id = ?3",
+            rusqlite::params![linked_issue_key, dismissed as i64, workspace_id],
+        )?;
+        Ok(())
     }
 
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
@@ -1086,6 +1130,8 @@ pub struct WorkspaceRow {
     pub glyph: Option<String>,
     pub tint: Option<String>,
     pub test_command: Option<String>,
+    pub linked_issue_key: Option<String>,
+    pub issue_link_dismissed: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
