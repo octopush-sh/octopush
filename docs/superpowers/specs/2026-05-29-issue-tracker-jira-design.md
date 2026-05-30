@@ -82,8 +82,10 @@ pub fn detect_issue_key(branch: &str) -> Option<String>;
 
 - Config: `{ base_url (https://X.atlassian.net), email, api_token }`.
 - Auth: `Authorization: Basic base64(email:api_token)`.
-- `list_my_issues`: `POST {base}/rest/api/3/search` with body
+- `list_my_issues`: `POST {base}/rest/api/3/search/jql` with body
   `{ jql: "assignee = currentUser() AND statusCategory != Done ORDER BY status, priority", fields: ["summary","status","issuetype","priority","parent"], maxResults: 50 }`.
+  (Atlassian sunset `/rest/api/3/search` in Jira Cloud; `/search/jql` is the
+  current endpoint. Same body shape and same `{issues: [...]}` response.)
 - `get_issue(key)`: `GET {base}/rest/api/3/issue/{key}?fields=summary,status,issuetype,priority,parent`.
 - Mapping (pure fn `issue_from_json(&serde_json::Value) -> Issue`, unit-tested):
   - `key` ← `.key`; `summary` ← `.fields.summary`; `status_name` ←
