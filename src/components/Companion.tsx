@@ -84,6 +84,7 @@ export function Companion({
           <ActiveTicketPanel
             state={linkage}
             activeIssue={activeIssue}
+            issuesLoaded={issues !== null}
             candidates={issues ?? []}
             projectKey={projectKey}
             workspaceId={workspace.id}

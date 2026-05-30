@@ -9,12 +9,17 @@ import { InlineTicketPicker } from "./InlineTicketPicker";
 interface Props {
   state: LinkageState;
   activeIssue: Issue | null;
+  /** True once the global issuesStore has completed at least one load.
+   *  Suppresses the "no se pudo cargar" error card during first paint when
+   *  the store hasn't returned yet — otherwise a linked workspace flashes
+   *  the error + Desvincular button on cold start. */
+  issuesLoaded: boolean;
   candidates: Issue[];
   projectKey: string | null;
   workspaceId: string;
 }
 
-export function ActiveTicketPanel({ state, activeIssue, candidates, projectKey, workspaceId }: Props) {
+export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates, projectKey, workspaceId }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const [picking, setPicking] = useState(false);
   const parents = useParentIssuesStore((s) => s.parents);
@@ -92,7 +97,7 @@ export function ActiveTicketPanel({ state, activeIssue, candidates, projectKey, 
         </div>
       )}
 
-      {!collapsed && state.kind === "linked" && !activeIssue && (
+      {!collapsed && state.kind === "linked" && !activeIssue && issuesLoaded && (
         <div
           className="mt-2 rounded-r p-3"
           style={{ background: "var(--brass-ghost)", borderLeft: "1px solid var(--brass-dim)" }}

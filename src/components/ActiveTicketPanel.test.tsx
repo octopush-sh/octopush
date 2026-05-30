@@ -34,6 +34,7 @@ describe("ActiveTicketPanel", () => {
       <ActiveTicketPanel
         state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
         activeIssue={issue}
+        issuesLoaded={true}
         candidates={[issue]}
         projectKey="CLPNSNS"
         workspaceId="w1"
@@ -53,6 +54,7 @@ describe("ActiveTicketPanel", () => {
       <ActiveTicketPanel
         state={{ kind: "unlinked" }}
         activeIssue={null}
+        issuesLoaded={true}
         candidates={[]}
         projectKey={null}
         workspaceId="w1"
@@ -72,6 +74,7 @@ describe("ActiveTicketPanel", () => {
       <ActiveTicketPanel
         state={{ kind: "unlinked" }}
         activeIssue={null}
+        issuesLoaded={true}
         candidates={[issue]}
         projectKey="CLPNSNS"
         workspaceId="w1"
@@ -86,6 +89,7 @@ describe("ActiveTicketPanel", () => {
       <ActiveTicketPanel
         state={{ kind: "dismissed" }}
         activeIssue={null}
+        issuesLoaded={true}
         candidates={[]}
         projectKey={null}
         workspaceId="w1"
@@ -100,6 +104,7 @@ describe("ActiveTicketPanel", () => {
       <ActiveTicketPanel
         state={{ kind: "linked", key: "CLPNSNS-X", source: "manual" }}
         activeIssue={null}
+        issuesLoaded={true}
         candidates={[]}
         projectKey="CLPNSNS"
         workspaceId="w1"
@@ -111,5 +116,23 @@ describe("ActiveTicketPanel", () => {
     await waitFor(() => {
       expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, false);
     });
+  });
+
+  it("linked + null activeIssue + issuesLoaded=false: suppresses error card (first paint)", () => {
+    render(
+      <ActiveTicketPanel
+        state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
+        activeIssue={null}
+        issuesLoaded={false}
+        candidates={[]}
+        projectKey="CLPNSNS"
+        workspaceId="w1"
+      />,
+    );
+    // Eyebrow still renders, but the error card + Desvincular button must not
+    // appear while the global issues list is still loading on first paint.
+    expect(screen.getByText(/active ticket/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no se pudo cargar/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /desvincular/i })).not.toBeInTheDocument();
   });
 });
