@@ -45,7 +45,6 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
 import type { GitStatus, OpenPr, TintName } from "./lib/types";
-import { detectIssueKey } from "./lib/detectIssueKey";
 
 interface ChatRef {
   id: string;
@@ -562,7 +561,6 @@ function App() {
   // ── Computed values ──
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
   const activeProject = recentProjects.find((p) => p.id === activeWorkspace?.projectId) ?? (project?.id === activeWorkspace?.projectId ? project : null) ?? null;
-  const activeIssueKey = activeWorkspace ? detectIssueKey(activeWorkspace.branch) : null;
   const activeChatId = activeWorkspaceId
     ? activeChatPerWorkspace[activeWorkspaceId] ?? activeWorkspaceId
     : null;
@@ -1022,7 +1020,7 @@ function App() {
             gitStatus={gitStatus}
             openPr={openPrByWs[activeWorkspace.id] ?? null}
             onOpenPr={(url) => ipc.openFileInSystem(url)}
-            activeIssueKey={activeIssueKey}
+            workspace={activeWorkspace}
             issueTrackerConfigured={issueTrackerConfigured}
             rightSlot={
               <ModeSwitcher

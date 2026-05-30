@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import type { GitStatus, OpenPr, Issue } from "../lib/types";
+import type { GitStatus, OpenPr, Issue, Workspace } from "../lib/types";
 import { ScratchpadIcon } from "./ScratchpadIcon";
 import { useScratchpadStore } from "../stores/scratchpadStore";
 import { useIssuesStore } from "../stores/issuesStore";
 import { ipc } from "../lib/ipc";
+import { resolveLinkage } from "../lib/issueTrackerSelectors";
 
 /** Resolve an issue by key — prefers the store, falls back to getIssue() once
  *  per key change. Returns null until an issue is found or the lookup fails. */
@@ -39,10 +40,9 @@ interface Props {
   /** Called with the PR's html_url when the chip is clicked. Typically
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
-  /** Jira-style issue key detected from the active branch (e.g. "PROJ-123").
-   *  When present and the issue can be resolved, renders a ticket chip next
-   *  to the PR chip. */
-  activeIssueKey?: string | null;
+  /** The active workspace. Used to derive the ticket chip via resolveLinkage
+   *  (manual link wins over branch detection). */
+  workspace?: Workspace | null;
   /** Whether the issue tracker is configured. When false, no chip is shown
    *  even if a key is present. */
   issueTrackerConfigured?: boolean;
@@ -61,13 +61,16 @@ export function ContextHeader({
   gitStatus,
   openPr,
   onOpenPr,
-  activeIssueKey,
+  workspace = null,
   issueTrackerConfigured = false,
   rightSlot,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const toggleScratchpad = useScratchpadStore((s) => s.toggleOpen);
-  const activeIssue = useActiveIssue(issueTrackerConfigured ? activeIssueKey : null);
+  const linkage = workspace ? resolveLinkage(workspace, branch) : { kind: "unlinked" as const };
+  const activeIssueKey =
+    linkage.kind === "linked" && issueTrackerConfigured ? linkage.key : null;
+  const activeIssue = useActiveIssue(activeIssueKey);
 
   return (
     <div className="m-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
