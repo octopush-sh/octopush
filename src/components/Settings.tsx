@@ -15,7 +15,7 @@ import {
   SETTINGS_TAB_LABELS,
   type SettingsTab,
 } from "../lib/settingsTabs";
-import type { Budget, BudgetPeriod, BudgetScope, ModelInfo, ProviderConfig, UsageBreakdown } from "../lib/types";
+import type { Budget, BudgetPeriod, BudgetScope, ModelInfo, ProjectInfo, ProviderConfig, UsageBreakdown } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { pushToast } from "./Toasts";
 
@@ -1851,6 +1851,11 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
   const [loaded, setLoaded] = useState(false);
   const originalTokenRef = useRef("");
 
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [mapDrafts, setMapDrafts] = useState<Record<string, string>>({});
+  const [mapSaving, setMapSaving] = useState<Record<string, boolean>>({});
+  const [mapSaved, setMapSaved] = useState<Record<string, boolean>>({});
+
   useEffect(() => {
     ipc.getIssueTrackerConfig()
       .then((cfg) => {
@@ -1866,6 +1871,31 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
       })
       .catch(() => setLoaded(true));
   }, []);
+
+  useEffect(() => {
+    ipc.listRecentProjects()
+      .then((rows) => {
+        setProjects(rows);
+        const drafts: Record<string, string> = {};
+        for (const p of rows) drafts[p.id] = p.jiraProjectKey ?? "";
+        setMapDrafts(drafts);
+      })
+      .catch(() => { /* quiet — pane still renders the credentials section */ });
+  }, []);
+
+  async function saveMapping(projectId: string) {
+    const value = (mapDrafts[projectId] ?? "").trim();
+    setMapSaving((s) => ({ ...s, [projectId]: true }));
+    try {
+      await ipc.updateProjectJiraKey(projectId, value === "" ? null : value);
+      setMapSaved((s) => ({ ...s, [projectId]: true }));
+      setTimeout(() => setMapSaved((s) => ({ ...s, [projectId]: false })), 2000);
+    } catch (e) {
+      pushToast({ level: "error", title: "Save mapping failed", body: String(e) });
+    } finally {
+      setMapSaving((s) => ({ ...s, [projectId]: false }));
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -1968,6 +1998,41 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
               {saved ? "✓ Saved" : saving ? "Saving…" : "Save changes"}
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* ── Project Mappings sub-section ── */}
+      <div className="mt-8 max-w-[640px]">
+        <SectionLabel>Project Mappings</SectionLabel>
+        <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
+          Vincula cada Octopush Project a su clave de proyecto Jira. Vacío = se infiere desde la branch del workspace.
+        </p>
+        <div className="space-y-3">
+          {projects.map((p) => (
+            <div key={p.id} className="flex items-center gap-3">
+              <div className="w-[180px] truncate text-[13px] text-octo-ivory">{p.name}</div>
+              <input
+                type="text"
+                value={mapDrafts[p.id] ?? ""}
+                onChange={(e) => setMapDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                placeholder="Jira project key"
+                className="flex-1 rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+              />
+              <button
+                type="button"
+                onClick={() => void saveMapping(p.id)}
+                disabled={mapSaving[p.id]}
+                aria-label="Save mapping"
+                className="min-w-[120px] rounded-md px-3 py-2 text-center font-serif text-[12px] text-octo-brass transition-colors disabled:opacity-50"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                {mapSaved[p.id] ? "✓ Saved" : mapSaving[p.id] ? "Saving…" : "Save mapping"}
+              </button>
+            </div>
+          ))}
+          {projects.length === 0 && (
+            <p className="text-[12px] text-octo-mute">No hay proyectos abiertos todavía.</p>
+          )}
         </div>
       </div>
     </>

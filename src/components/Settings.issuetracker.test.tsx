@@ -10,11 +10,15 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 
 const getIssueTrackerConfigMock = vi.fn().mockResolvedValue(null);
 const saveIssueTrackerConfigMock = vi.fn().mockResolvedValue(undefined);
+const listRecentProjectsMock = vi.fn().mockResolvedValue([]);
+const updateProjectJiraKeyMock = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
     getIssueTrackerConfig: getIssueTrackerConfigMock,
     saveIssueTrackerConfig: saveIssueTrackerConfigMock,
+    listRecentProjects: listRecentProjectsMock,
+    updateProjectJiraKey: updateProjectJiraKeyMock,
     // stub the rest so Settings doesn't throw on other panes mounting
     listProviders: vi.fn().mockResolvedValue([]),
     getSettings: vi.fn().mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} }),
@@ -54,6 +58,8 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     vi.clearAllMocks();
     getIssueTrackerConfigMock.mockResolvedValue(null);
     saveIssueTrackerConfigMock.mockResolvedValue(undefined);
+    listRecentProjectsMock.mockResolvedValue([]);
+    updateProjectJiraKeyMock.mockResolvedValue(undefined);
   });
 
   it("renders the Issue Tracker section with all three fields and a save button", async () => {
@@ -181,6 +187,48 @@ describe("Settings — Integrations / Issue Tracker section", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /saved/i })).toBeInTheDocument();
+    });
+  });
+
+  it("renders a Project Mappings row per Octopush Project with the saved jiraProjectKey", async () => {
+    listRecentProjectsMock.mockResolvedValue([
+      { id: "p1", name: "Octopush", path: "/p1", jiraProjectKey: "CLPNSNS" },
+      { id: "p2", name: "Sandbox",  path: "/p2", jiraProjectKey: null },
+    ]);
+
+    await renderIntegrationsPane();
+
+    expect(await screen.findByText(/project mappings/i)).toBeInTheDocument();
+    expect(screen.getByText("Octopush")).toBeInTheDocument();
+    expect(screen.getByText("Sandbox")).toBeInTheDocument();
+
+    const inputs = screen.getAllByPlaceholderText(/jira project key/i) as HTMLInputElement[];
+    expect(inputs[0].value).toBe("CLPNSNS");
+    expect(inputs[1].value).toBe("");
+  });
+
+  it("saving a Project Mappings row calls updateProjectJiraKey with the right args", async () => {
+    listRecentProjectsMock.mockResolvedValue([
+      { id: "p1", name: "Octopush", path: "/p1", jiraProjectKey: "CLPNSNS" },
+      { id: "p2", name: "Sandbox",  path: "/p2", jiraProjectKey: null },
+    ]);
+
+    await renderIntegrationsPane();
+
+    await screen.findByText(/project mappings/i);
+
+    const inputs = screen.getAllByPlaceholderText(/jira project key/i) as HTMLInputElement[];
+    await act(async () => {
+      fireEvent.change(inputs[1], { target: { value: "SANDBOX" } });
+    });
+
+    const saveButtons = screen.getAllByRole("button", { name: /save mapping/i });
+    await act(async () => {
+      fireEvent.click(saveButtons[1]);
+    });
+
+    await waitFor(() => {
+      expect(updateProjectJiraKeyMock).toHaveBeenCalledWith("p2", "SANDBOX");
     });
   });
 });
