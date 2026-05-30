@@ -43,7 +43,9 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkP
             {projectKey ? (
               <>
                 {" · "}
-                <span className="text-octo-brass">{projectKey} · {filtered.length}</span>
+                <span className="text-octo-brass">{projectKey}</span>
+                {" · "}
+                {filtered.length}
               </>
             ) : (
               <> · <span className="text-octo-mute">(sin proyecto)</span></>

@@ -152,7 +152,11 @@ describe("BacklogPanel", () => {
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
     render(<BacklogPanel configured projectKey="CLPNSNS" activeKey={null} />);
-    expect(screen.getByText(/CLPNSNS · 2/)).toBeInTheDocument();
+    // Brass surgical: only the project key carries text-octo-brass; the count is
+    // rendered as plain text in the mute eyebrow.
+    const key = screen.getByText("CLPNSNS");
+    expect(key).toHaveClass("text-octo-brass");
+    expect(key.closest("button")?.textContent).toMatch(/CLPNSNS · 2/);
   });
 
   it("excludes the active key from the list", () => {
