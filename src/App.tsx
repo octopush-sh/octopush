@@ -1428,12 +1428,12 @@ function App() {
             }}
             onUnlinkJira={async () => {
               await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, false);
-              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              await useWorkspaceStore.getState().load(ws.projectId);
               setContextMenu(null);
             }}
             onSkipJira={async () => {
               await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, true);
-              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              await useWorkspaceStore.getState().load(ws.projectId);
               setContextMenu(null);
             }}
           />
@@ -1506,7 +1506,7 @@ function App() {
             title={jiraTicketPickerOpen.mode === "link" ? "Link Jira ticket" : "Change Jira ticket"}
             onPick={async (key) => {
               await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key, false);
-              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              await useWorkspaceStore.getState().load(pickerWs!.projectId);
               void useIssuesStore.getState().load();
               setJiraTicketPickerOpen(null);
             }}

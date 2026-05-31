@@ -40,15 +40,13 @@ export function BacklogPanel({ configured, projectKey = null, activeKey }: Props
         >
           <span>
             § Backlog
-            {projectKey ? (
+            {projectKey && (
               <>
                 {" · "}
                 <span className="text-octo-brass">{projectKey}</span>
                 {" · "}
                 {filtered.length}
               </>
-            ) : (
-              <> · <span className="text-octo-mute">(no project)</span></>
             )}
           </span>
           <span className="mr-1">{collapsed ? "▸" : "▾"}</span>

@@ -172,15 +172,15 @@ describe("BacklogPanel", () => {
     expect(screen.getByText("queued")).toBeInTheDocument();
   });
 
-  it("when projectKey is null, shows (no project) in eyebrow and no issue rows", () => {
+  it("when projectKey is null, renders the bare eyebrow with no project key/count and no Link button", () => {
     useIssuesStore.setState({
       issues: [], loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
     render(<BacklogPanel configured projectKey={null} activeKey={null} />);
-    // Companion doesn't render BacklogPanel when projectKey is null, but if
-    // it is rendered defensively, it shows "(no project)" in the eyebrow
-    // and does not render any ticket rows or a "Link project" button.
-    expect(screen.getByText(/no project/i)).toBeInTheDocument();
+    // Companion no longer renders BacklogPanel when projectKey is null, but
+    // the defensive shape stays minimal: the eyebrow reads just "§ Backlog"
+    // (no project key, no count) and no "Link project" CTA appears.
+    expect(screen.getByText(/§ backlog/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /link project/i })).not.toBeInTheDocument();
   });
 });
