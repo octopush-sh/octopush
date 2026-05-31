@@ -75,7 +75,18 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         </button>
       </div>
 
-      {!collapsed && state.kind === "linked" && activeIssue && (
+      {!collapsed && picking && (
+        <div className="mt-2">
+          <InlineTicketPicker
+            candidates={candidates}
+            projectKey={projectKey}
+            onPick={(key) => void confirmPick(key)}
+            onCancel={() => setPicking(false)}
+          />
+        </div>
+      )}
+
+      {!collapsed && !picking && state.kind === "linked" && activeIssue && (
         <div
           className="mt-2 rounded-r p-3"
           style={{ background: "var(--brass-ghost)", borderLeft: "1px solid var(--brass-dim)" }}
@@ -109,10 +120,28 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
               </>
             )}
           </div>
+          <div className="mt-2 flex justify-end gap-3">
+            <button
+              type="button"
+              aria-label="Cambiar ticket"
+              onClick={() => setPicking(true)}
+              className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
+            >
+              Cambiar
+            </button>
+            <button
+              type="button"
+              aria-label="Desvincular"
+              onClick={() => void unlink()}
+              className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
+            >
+              Desvincular
+            </button>
+          </div>
         </div>
       )}
 
-      {!collapsed && state.kind === "linked" && !activeIssue && issuesLoaded && (
+      {!collapsed && !picking && state.kind === "linked" && !activeIssue && issuesLoaded && (
         <div
           className="mt-2 rounded-r p-3"
           style={{ background: "var(--brass-ghost)", borderLeft: "1px solid var(--brass-dim)" }}
@@ -132,7 +161,7 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         </div>
       )}
 
-      {!collapsed && state.kind === "unlinked" && !picking && (
+      {!collapsed && !picking && state.kind === "unlinked" && (
         <div className="mt-2 flex items-center gap-3 text-[12px] text-octo-sage">
           <span>Sin ticket vinculado.</span>
           <button
@@ -153,18 +182,7 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         </div>
       )}
 
-      {!collapsed && state.kind === "unlinked" && picking && (
-        <div className="mt-2">
-          <InlineTicketPicker
-            candidates={candidates}
-            projectKey={projectKey}
-            onPick={(key) => void confirmPick(key)}
-            onCancel={() => setPicking(false)}
-          />
-        </div>
-      )}
-
-      {!collapsed && state.kind === "dismissed" && (
+      {!collapsed && !picking && state.kind === "dismissed" && (
         <div className="mt-1">
           <button
             type="button"

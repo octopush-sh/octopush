@@ -152,6 +152,46 @@ describe("ActiveTicketPanel", () => {
     });
   });
 
+  it("healthy linked card exposes Cambiar + Desvincular affordances", async () => {
+    render(
+      <ActiveTicketPanel
+        state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
+        activeIssue={issue}
+        issuesLoaded={true}
+        candidates={[issue]}
+        projectKey="CLPNSNS"
+        workspaceId="w1"
+        projectId="p1"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /cambiar ticket/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /desvincular/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /desvincular/i }));
+    await waitFor(() => {
+      expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, false);
+      expect(loadWorkspacesMock).toHaveBeenCalledWith("p1");
+    });
+  });
+
+  it("Cambiar on a healthy linked card opens the inline picker", () => {
+    render(
+      <ActiveTicketPanel
+        state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
+        activeIssue={issue}
+        issuesLoaded={true}
+        candidates={[issue]}
+        projectKey="CLPNSNS"
+        workspaceId="w1"
+        projectId="p1"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /cambiar ticket/i }));
+    expect(screen.getByPlaceholderText(/busca por clave o resumen/i)).toBeInTheDocument();
+    // The linked card body is hidden while the picker is open.
+    expect(screen.queryByRole("button", { name: /open in jira/i })).not.toBeInTheDocument();
+  });
+
   it("linked + null activeIssue + issuesLoaded=false: suppresses error card (first paint)", () => {
     render(
       <ActiveTicketPanel
