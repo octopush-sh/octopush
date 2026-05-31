@@ -31,7 +31,7 @@ describe("BacklogPanel", () => {
 
   it("prompts to connect when not configured", () => {
     render(<BacklogPanel activeKey={null} configured={false} projectKey={null} />);
-    expect(screen.getByText(/conecta jira/i)).toBeInTheDocument();
+    expect(screen.getByText(/connect jira/i)).toBeInTheDocument();
   });
 
   it("shows loading state while loading with no issues", () => {
@@ -43,13 +43,13 @@ describe("BacklogPanel", () => {
   it("shows error state when load fails", () => {
     useIssuesStore.setState({ issues: null, loading: false, error: "Network error" });
     render(<BacklogPanel activeKey={null} configured projectKey="CLPNSNS" />);
-    expect(screen.getByText(/no se pudo refrescar/i)).toBeInTheDocument();
+    expect(screen.getByText(/couldn't refresh/i)).toBeInTheDocument();
   });
 
   it("shows empty state when no issues in the project", () => {
     useIssuesStore.setState({ issues: [], loading: false, error: null });
     render(<BacklogPanel activeKey={null} configured projectKey="CLPNSNS" />);
-    expect(screen.getByText(/backlog limpio/i)).toBeInTheDocument();
+    expect(screen.getByText(/backlog clear/i)).toBeInTheDocument();
   });
 
   it("lists issues with key + summary + status", () => {
@@ -172,12 +172,12 @@ describe("BacklogPanel", () => {
     expect(screen.getByText("queued")).toBeInTheDocument();
   });
 
-  it("when projectKey is null, shows 'Vincular proyecto →' empty state", () => {
+  it("when projectKey is null, shows 'Link project →' empty state", () => {
     useIssuesStore.setState({
       issues: [], loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
     render(<BacklogPanel configured projectKey={null} activeKey={null} />);
-    expect(screen.getByText(/sin proyecto jira/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /vincular proyecto/i })).toBeInTheDocument();
+    expect(screen.getByText(/no jira project/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /link project/i })).toBeInTheDocument();
   });
 });

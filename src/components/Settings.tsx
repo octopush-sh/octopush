@@ -2005,7 +2005,7 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
       <div className="mt-8 max-w-[640px]">
         <SectionLabel>Project Mappings</SectionLabel>
         <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
-          Vincula cada Octopush Project a su clave de proyecto Jira. Vacío = se infiere desde la branch del workspace.
+          Link each Octopush Project to its Jira project key. Empty = inferred from the workspace branch.
         </p>
         <div className="space-y-3">
           {projects.map((p) => (
@@ -2031,7 +2031,7 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
             </div>
           ))}
           {projects.length === 0 && (
-            <p className="text-[12px] text-octo-mute">No hay proyectos abiertos todavía.</p>
+            <p className="text-[12px] text-octo-mute">No projects opened yet.</p>
           )}
         </div>
       </div>

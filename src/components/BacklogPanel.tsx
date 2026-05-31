@@ -15,7 +15,7 @@ interface Props {
   configured: boolean;
   projectKey?: string | null;
   activeKey: string | null;
-  /** Called when the empty-state "Vincular proyecto →" CTA is clicked. */
+  /** Called when the empty-state "Link project →" CTA is clicked. */
   onLinkProject?: () => void;
 }
 
@@ -67,18 +67,18 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkP
       </div>
 
       {!collapsed && !configured && (
-        <p className="mt-2 text-[12px] text-octo-mute">Conecta Jira en Settings →</p>
+        <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
       )}
 
       {!collapsed && configured && projectKey == null && (
         <div className="mt-2 flex items-center gap-2 text-[12px] text-octo-sage">
-          <span>Sin proyecto Jira vinculado para este Octopush Project.</span>
+          <span>No Jira project linked to this Octopush Project.</span>
           <button
             type="button"
             onClick={onLinkProject}
             className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass"
           >
-            Vincular proyecto →
+            Link project →
           </button>
         </div>
       )}
@@ -87,7 +87,7 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkP
         <>
           {error && (
             <p className="mt-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">
-              no se pudo refrescar
+              couldn't refresh
             </p>
           )}
           {loading && !issues && (
@@ -95,7 +95,7 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkP
           )}
           {filtered.length === 0 && !loading && !error && (
             <p className="mt-2 text-[12px] text-octo-verdigris">
-              Backlog limpio en este proyecto ✓
+              Backlog clear ✓
             </p>
           )}
           <div className="mt-1">

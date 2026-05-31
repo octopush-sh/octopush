@@ -31,13 +31,13 @@ export function ElsewhereModal({ issues, activeProjectKey, onClose }: Props) {
   return (
     <div
       role="dialog"
-      aria-label="Tickets en otros proyectos"
+      aria-label="Tickets elsewhere"
       className="fixed inset-0 z-50 flex items-center justify-center bg-octo-onyx/80 p-6"
     >
       <div className="flex max-h-[80vh] w-[640px] flex-col rounded-md border border-octo-hairline bg-octo-panel">
         <div className="flex items-center justify-between border-b border-octo-hairline px-4 py-3">
           <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
-            Tickets en otros proyectos
+            Tickets elsewhere
           </div>
           <button
             type="button"
@@ -51,7 +51,7 @@ export function ElsewhereModal({ issues, activeProjectKey, onClose }: Props) {
 
         <div className="overflow-y-auto px-4 py-3">
           {grouped.length === 0 && (
-            <p className="text-[12px] text-octo-mute">Nada in-progress fuera de este proyecto.</p>
+            <p className="text-[12px] text-octo-mute">Nothing in-progress elsewhere.</p>
           )}
           {grouped.map(([prefix, items]) => (
             <div key={prefix} className="mb-4">

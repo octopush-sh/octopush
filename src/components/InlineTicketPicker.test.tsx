@@ -41,12 +41,12 @@ describe("InlineTicketPicker", () => {
       />,
     );
     // Default scope is the project; type "notif" -> only CLPNSNS-92 matches.
-    fireEvent.change(screen.getByPlaceholderText(/busca/i), { target: { value: "notif" } });
+    fireEvent.change(screen.getByPlaceholderText(/search by key/i), { target: { value: "notif" } });
     expect(screen.getByText("CLPNSNS-92")).toBeInTheDocument();
     expect(screen.queryByText("OTHER-7")).not.toBeInTheDocument();
   });
 
-  it("scope toggle 'Todos' includes other-project matches", () => {
+  it("scope toggle 'All' includes other-project matches", () => {
     render(
       <InlineTicketPicker
         candidates={SAMPLE}
@@ -55,8 +55,8 @@ describe("InlineTicketPicker", () => {
         onCancel={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /todos/i }));
-    fireEvent.change(screen.getByPlaceholderText(/busca/i), { target: { value: "algo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^all$/i }));
+    fireEvent.change(screen.getByPlaceholderText(/search by key/i), { target: { value: "algo" } });
     expect(screen.getByText("OTHER-7")).toBeInTheDocument();
   });
 
@@ -70,8 +70,8 @@ describe("InlineTicketPicker", () => {
         onCancel={vi.fn()}
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText(/busca/i), { target: { value: "" } });
-    fireEvent.keyDown(screen.getByPlaceholderText(/busca/i), { key: "Enter" });
+    fireEvent.change(screen.getByPlaceholderText(/search by key/i), { target: { value: "" } });
+    fireEvent.keyDown(screen.getByPlaceholderText(/search by key/i), { key: "Enter" });
     expect(onPick).toHaveBeenCalledWith("CLPNSNS-92");
   });
 
@@ -85,8 +85,8 @@ describe("InlineTicketPicker", () => {
         onCancel={vi.fn()}
       />,
     );
-    fireEvent.keyDown(screen.getByPlaceholderText(/busca/i), { key: "ArrowDown" });
-    fireEvent.keyDown(screen.getByPlaceholderText(/busca/i), { key: "Enter" });
+    fireEvent.keyDown(screen.getByPlaceholderText(/search by key/i), { key: "ArrowDown" });
+    fireEvent.keyDown(screen.getByPlaceholderText(/search by key/i), { key: "Enter" });
     expect(onPick).toHaveBeenCalledWith("CLPNSNS-105");
   });
 
@@ -100,7 +100,7 @@ describe("InlineTicketPicker", () => {
         onCancel={onCancel}
       />,
     );
-    fireEvent.keyDown(screen.getByPlaceholderText(/busca/i), { key: "Escape" });
+    fireEvent.keyDown(screen.getByPlaceholderText(/search by key/i), { key: "Escape" });
     expect(onCancel).toHaveBeenCalled();
   });
 
@@ -115,7 +115,7 @@ describe("InlineTicketPicker", () => {
         onCancel={vi.fn()}
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText(/busca/i), { target: { value: "CLPNSNS-555" } });
+    fireEvent.change(screen.getByPlaceholderText(/search by key/i), { target: { value: "CLPNSNS-555" } });
     // The fallback row shows the key and a USE → affordance.
     const useBtn = await screen.findByRole("button", { name: /use clpnsns-555/i });
     fireEvent.click(useBtn);

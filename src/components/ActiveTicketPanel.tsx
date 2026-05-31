@@ -11,9 +11,9 @@ interface Props {
   state: LinkageState;
   activeIssue: Issue | null;
   /** True once the global issuesStore has completed at least one load.
-   *  Suppresses the "no se pudo cargar" error card during first paint when
+   *  Suppresses the "couldn't load" error card during first paint when
    *  the store hasn't returned yet — otherwise a linked workspace flashes
-   *  the error + Desvincular button on cold start. */
+   *  the error + Unlink button on cold start. */
   issuesLoaded: boolean;
   candidates: Issue[];
   projectKey: string | null;
@@ -123,19 +123,19 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
           <div className="mt-2 flex justify-end gap-3">
             <button
               type="button"
-              aria-label="Cambiar ticket"
+              aria-label="Change ticket"
               onClick={() => setPicking(true)}
               className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
             >
-              Cambiar
+              Change
             </button>
             <button
               type="button"
-              aria-label="Desvincular"
+              aria-label="Unlink"
               onClick={() => void unlink()}
               className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
             >
-              Desvincular
+              Unlink
             </button>
           </div>
         </div>
@@ -148,14 +148,14 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         >
           <div className="flex items-center gap-2 font-mono text-[12px] text-octo-mute">
             <span className="text-octo-brass">{state.key}</span>
-            <span className="text-[10px]">· no se pudo cargar este ticket</span>
+            <span className="text-[10px]">· couldn't load this ticket</span>
             <button
               type="button"
-              aria-label="Desvincular"
+              aria-label="Unlink"
               onClick={() => void unlink()}
               className="ml-auto font-mono text-[9px] uppercase tracking-[0.15em] text-octo-brass"
             >
-              Desvincular
+              Unlink
             </button>
           </div>
         </div>
@@ -163,21 +163,21 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
 
       {!collapsed && !picking && state.kind === "unlinked" && (
         <div className="mt-2 flex items-center gap-3 text-[12px] text-octo-sage">
-          <span>Sin ticket vinculado.</span>
+          <span>No ticket linked.</span>
           <button
             type="button"
-            aria-label="Vincular"
+            aria-label="Link"
             onClick={() => setPicking(true)}
             className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass"
           >
-            Vincular →
+            Link →
           </button>
           <button
             type="button"
             onClick={() => void dismiss()}
             className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
           >
-            No usar ticket aquí
+            No ticket for this workspace
           </button>
         </div>
       )}
@@ -186,11 +186,11 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         <div className="mt-1">
           <button
             type="button"
-            aria-label="+ Vincular ticket"
+            aria-label="+ Link ticket"
             onClick={() => void undismiss()}
             className="font-mono text-[10px] tracking-[0.1em] text-octo-mute hover:text-octo-brass"
           >
-            ↳ + Vincular ticket
+            ↳ + Link ticket
           </button>
         </div>
       )}

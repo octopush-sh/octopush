@@ -11,7 +11,7 @@ describe("ElsewhereFooter", () => {
   it("renders count and calls onOpen on click", () => {
     const onOpen = vi.fn();
     render(<ElsewhereFooter count={3} onOpen={onOpen} />);
-    expect(screen.getByText(/3 tickets in-progress en otros proyectos/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 tickets in-progress elsewhere/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
     expect(onOpen).toHaveBeenCalled();
   });

@@ -103,7 +103,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
           }`}
           style={scope === "all" ? { background: "var(--brass-ghost)" } : undefined}
         >
-          Todos
+          All
         </button>
       </div>
 
@@ -117,7 +117,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="busca por clave o resumen…"
+          placeholder="search by key or summary…"
           className="w-full rounded border border-octo-hairline bg-octo-onyx py-1 pl-7 pr-12 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
         />
         <button
@@ -131,9 +131,9 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
 
       {/* Hints */}
       <div className="mt-1 flex gap-3 font-mono text-[9px] tracking-[0.1em] text-octo-mute">
-        <span>↑↓ navegar</span>
-        <span>↵ seleccionar</span>
-        <span>ESC cancelar</span>
+        <span>↑↓ navigate</span>
+        <span>↵ select</span>
+        <span>ESC cancel</span>
       </div>
 
       {/* Results */}
@@ -174,7 +174,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
               />
               <span className="font-mono text-[11px] text-octo-brass">{query}</span>
               <span className="flex-1 truncate text-[12px] text-octo-sage">
-                (no asignado a ti — se verificará al vincular)
+                (not assigned to you — verified on link)
               </span>
               <span className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-brass">USE →</span>
             </button>
@@ -183,7 +183,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
 
         {results.length === 0 && !showFallback && (
           <p className="px-1 py-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">
-            Sin matches en tus tickets asignados.
+            No matches in your assigned tickets.
           </p>
         )}
       </div>

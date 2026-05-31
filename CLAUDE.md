@@ -24,6 +24,7 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 5. **Atelier layout is the law.** Rail (left) · ContextHeader · ModeSwitcher (Talk/Run/Review) · Canvas · Companion (right) · Input bar. Don't introduce new top-level chrome. Don't bring back tabs.
 6. **No bouncing, no spring, no glitter.** Motion is calm. 220–320ms, `cubic‑bezier(0.2, 0.8, 0.3, 1)`. Brass rules *grow*; they don't *appear*.
 7. **No new colors without spec update.** If a feature needs a hue not in the palette, propose updating the spec first — don't slip new accents in via a PR.
+8. **UI copy is English. Always. No exceptions.** Every visible string (labels, buttons, placeholders, helper text, empty states, error messages, aria-labels, tooltips, eyebrow text, modal titles) is English regardless of the developer's chat language. Mixing languages is a bug. The one exception is **user data** displayed verbatim from third-party APIs (e.g. Jira's `statusName` is whatever Jira returns in the user's account locale — we never translate it; if the user wants English statuses, they change their Jira profile language).
 
 ### Five signature details — preserve these always
 

@@ -60,7 +60,7 @@ describe("ActiveTicketPanel", () => {
     expect(openFileInSystemMock).toHaveBeenCalledWith(issue.url);
   });
 
-  it("unlinked state: shows two affordances and 'No usar' triggers dismiss", async () => {
+  it("unlinked state: shows two affordances and 'No ticket for this workspace' triggers dismiss", async () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "unlinked" }}
@@ -72,16 +72,16 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    expect(screen.getByText(/sin ticket vinculado/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /vincular/i })).toBeInTheDocument();
+    expect(screen.getByText(/no ticket linked/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^link$/i })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /no usar ticket aqu/i }));
+    fireEvent.click(screen.getByRole("button", { name: /no ticket for this workspace/i }));
     await waitFor(() => {
       expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, true);
     });
   });
 
-  it("'Vincular →' swaps the unlinked body for the picker", () => {
+  it("'Link →' swaps the unlinked body for the picker", () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "unlinked" }}
@@ -93,11 +93,11 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /vincular/i }));
-    expect(screen.getByPlaceholderText(/busca por clave o resumen/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^link$/i }));
+    expect(screen.getByPlaceholderText(/search by key or summary/i)).toBeInTheDocument();
   });
 
-  it("dismissed state: shows the eyebrow + a compact 'Vincular' resurface row", () => {
+  it("dismissed state: shows the eyebrow + a compact '+ Link ticket' resurface row", () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "dismissed" }}
@@ -110,10 +110,10 @@ describe("ActiveTicketPanel", () => {
       />,
     );
     expect(screen.getByText(/active ticket/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /\+ vincular ticket/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\+ link ticket/i })).toBeInTheDocument();
   });
 
-  it("linked but activeIssue is null: shows error card with Desvincular", async () => {
+  it("linked but activeIssue is null: shows error card with Unlink", async () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "linked", key: "CLPNSNS-X", source: "manual" }}
@@ -125,9 +125,9 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    expect(screen.getByText(/no se pudo cargar/i)).toBeInTheDocument();
+    expect(screen.getByText(/couldn't load/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /desvincular/i }));
+    fireEvent.click(screen.getByRole("button", { name: /unlink/i }));
     await waitFor(() => {
       expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, false);
     });
@@ -145,14 +145,14 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /no usar ticket aqu/i }));
+    fireEvent.click(screen.getByRole("button", { name: /no ticket for this workspace/i }));
     await waitFor(() => {
       expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, true);
       expect(loadWorkspacesMock).toHaveBeenCalledWith("p1");
     });
   });
 
-  it("healthy linked card exposes Cambiar + Desvincular affordances", async () => {
+  it("healthy linked card exposes Change + Unlink affordances", async () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
@@ -164,17 +164,17 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    expect(screen.getByRole("button", { name: /cambiar ticket/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /desvincular/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /change ticket/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /unlink/i })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /desvincular/i }));
+    fireEvent.click(screen.getByRole("button", { name: /unlink/i }));
     await waitFor(() => {
       expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, false);
       expect(loadWorkspacesMock).toHaveBeenCalledWith("p1");
     });
   });
 
-  it("Cambiar on a healthy linked card opens the inline picker", () => {
+  it("Change on a healthy linked card opens the inline picker", () => {
     render(
       <ActiveTicketPanel
         state={{ kind: "linked", key: "CLPNSNS-92", source: "detected" }}
@@ -186,8 +186,8 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /cambiar ticket/i }));
-    expect(screen.getByPlaceholderText(/busca por clave o resumen/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /change ticket/i }));
+    expect(screen.getByPlaceholderText(/search by key or summary/i)).toBeInTheDocument();
     // The linked card body is hidden while the picker is open.
     expect(screen.queryByRole("button", { name: /open in jira/i })).not.toBeInTheDocument();
   });
@@ -204,10 +204,10 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    // Eyebrow still renders, but the error card + Desvincular button must not
+    // Eyebrow still renders, but the error card + Unlink button must not
     // appear while the global issues list is still loading on first paint.
     expect(screen.getByText(/active ticket/i)).toBeInTheDocument();
-    expect(screen.queryByText(/no se pudo cargar/i)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /desvincular/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/couldn't load/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /unlink/i })).not.toBeInTheDocument();
   });
 });

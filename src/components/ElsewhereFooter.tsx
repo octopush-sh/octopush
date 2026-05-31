@@ -12,7 +12,7 @@ export function ElsewhereFooter({ count, onOpen }: Props) {
         onClick={onOpen}
         className="font-mono text-[10px] tracking-[0.1em] text-octo-mute hover:text-octo-brass"
       >
-        ↳ {count} tickets in-progress en otros proyectos
+        ↳ {count} tickets in-progress elsewhere
       </button>
     </div>
   );
