@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Pencil, Palette, Settings, Lock, BookOpen, Trash2 } from "lucide-react";
+import { Pencil, Palette, Settings, Lock, BookOpen, Trash2, Link2 } from "lucide-react";
 
 interface Props {
   projectId: string;
@@ -11,6 +11,7 @@ interface Props {
   onClose: () => void;
   onDelete: () => void;
   onDismiss: () => void;
+  onSetJiraProjectKey?: () => void;
 }
 
 export function ProjectContextMenu({
@@ -23,6 +24,7 @@ export function ProjectContextMenu({
   onClose,
   onDelete,
   onDismiss,
+  onSetJiraProjectKey,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -97,6 +99,21 @@ export function ProjectContextMenu({
         <Palette size={12} className="shrink-0" />
         Change tint
       </button>
+
+      {onSetJiraProjectKey && (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            onSetJiraProjectKey();
+            onDismiss();
+          }}
+          className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+        >
+          <Link2 size={12} className="shrink-0" />
+          Set Jira project key…
+        </button>
+      )}
 
       <button
         type="button"

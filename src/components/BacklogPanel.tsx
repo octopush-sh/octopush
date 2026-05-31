@@ -13,13 +13,13 @@ const STATUS_DOT_COLOR: Record<StatusCategory, string> = {
 
 interface Props {
   configured: boolean;
+  /** Caller guarantees this is non-null when Companion renders BacklogPanel.
+   *  Kept optional here for backward-compat with tests that pass null. */
   projectKey?: string | null;
   activeKey: string | null;
-  /** Called when the empty-state "Link project →" CTA is clicked. */
-  onLinkProject?: () => void;
 }
 
-export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkProject }: Props) {
+export function BacklogPanel({ configured, projectKey = null, activeKey }: Props) {
   const { issues, loading, error, load } = useIssuesStore();
   const [collapsed, setCollapsed] = useState(false);
 
@@ -68,19 +68,6 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onLinkP
 
       {!collapsed && !configured && (
         <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
-      )}
-
-      {!collapsed && configured && projectKey == null && (
-        <div className="mt-2 flex items-center gap-2 text-[12px] text-octo-sage">
-          <span>No Jira project linked to this Octopush Project.</span>
-          <button
-            type="button"
-            onClick={onLinkProject}
-            className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass"
-          >
-            Link project →
-          </button>
-        </div>
       )}
 
       {!collapsed && configured && projectKey != null && (

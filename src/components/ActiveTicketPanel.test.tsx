@@ -60,8 +60,8 @@ describe("ActiveTicketPanel", () => {
     expect(openFileInSystemMock).toHaveBeenCalledWith(issue.url);
   });
 
-  it("unlinked state: shows two affordances and 'No ticket for this workspace' triggers dismiss", async () => {
-    render(
+  it("unlinked state: returns null (component is not rendered by Companion when unlinked)", () => {
+    const { container } = render(
       <ActiveTicketPanel
         state={{ kind: "unlinked" }}
         activeIssue={null}
@@ -72,33 +72,12 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    expect(screen.getByText(/no ticket linked/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^link$/i })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /no ticket for this workspace/i }));
-    await waitFor(() => {
-      expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, true);
-    });
+    // Defensive early return — component renders nothing when not linked
+    expect(container.firstChild).toBeNull();
   });
 
-  it("'Link →' swaps the unlinked body for the picker", () => {
-    render(
-      <ActiveTicketPanel
-        state={{ kind: "unlinked" }}
-        activeIssue={null}
-        issuesLoaded={true}
-        candidates={[issue]}
-        projectKey="CLPNSNS"
-        workspaceId="w1"
-        projectId="p1"
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /^link$/i }));
-    expect(screen.getByPlaceholderText(/search by key or summary/i)).toBeInTheDocument();
-  });
-
-  it("dismissed state: shows the eyebrow + a compact '+ Link ticket' resurface row", () => {
-    render(
+  it("dismissed state: returns null (component is not rendered by Companion when dismissed)", () => {
+    const { container } = render(
       <ActiveTicketPanel
         state={{ kind: "dismissed" }}
         activeIssue={null}
@@ -109,8 +88,8 @@ describe("ActiveTicketPanel", () => {
         projectId="p1"
       />,
     );
-    expect(screen.getByText(/active ticket/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /\+ link ticket/i })).toBeInTheDocument();
+    // Defensive early return — component renders nothing when not linked
+    expect(container.firstChild).toBeNull();
   });
 
   it("linked but activeIssue is null: shows error card with Unlink", async () => {
@@ -133,21 +112,21 @@ describe("ActiveTicketPanel", () => {
     });
   });
 
-  it("reloads workspaceStore after updateWorkspaceLink so the UI reflects the link without reload", async () => {
+  it("reloads workspaceStore after updateWorkspaceLink (via Unlink on error card)", async () => {
     render(
       <ActiveTicketPanel
-        state={{ kind: "unlinked" }}
+        state={{ kind: "linked", key: "CLPNSNS-X", source: "manual" }}
         activeIssue={null}
         issuesLoaded={true}
         candidates={[]}
-        projectKey={null}
+        projectKey="CLPNSNS"
         workspaceId="w1"
         projectId="p1"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /no ticket for this workspace/i }));
+    fireEvent.click(screen.getByRole("button", { name: /unlink/i }));
     await waitFor(() => {
-      expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, true);
+      expect(updateWorkspaceLinkMock).toHaveBeenCalledWith("w1", null, false);
       expect(loadWorkspacesMock).toHaveBeenCalledWith("p1");
     });
   });

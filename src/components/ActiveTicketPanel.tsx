@@ -34,20 +34,16 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
     if (activeIssue?.parentKey) void loadParent(activeIssue.parentKey);
   }, [activeIssue?.parentKey, loadParent]);
 
+  // Defensively return null for non-linked states — Companion should only
+  // render this component when state.kind === "linked", but guard here too.
+  if (state.kind !== "linked") return null;
+
   // Reload the workspaceStore so the Companion sees the fresh
   // `linkedIssueKey` / `issueLinkDismissed` without an app reload.
   async function reloadWorkspaces() {
     await useWorkspaceStore.getState().load(projectId);
   }
 
-  async function dismiss() {
-    await ipc.updateWorkspaceLink(workspaceId, null, true);
-    await reloadWorkspaces();
-  }
-  async function undismiss() {
-    await ipc.updateWorkspaceLink(workspaceId, null, false);
-    await reloadWorkspaces();
-  }
   async function unlink() {
     await ipc.updateWorkspaceLink(workspaceId, null, false);
     await reloadWorkspaces();
@@ -86,7 +82,7 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         </div>
       )}
 
-      {!collapsed && !picking && state.kind === "linked" && activeIssue && (
+      {!collapsed && !picking && activeIssue && (
         <div
           className="mt-2 rounded-r p-3"
           style={{ background: "var(--brass-ghost)", borderLeft: "1px solid var(--brass-dim)" }}
@@ -141,7 +137,7 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
         </div>
       )}
 
-      {!collapsed && !picking && state.kind === "linked" && !activeIssue && issuesLoaded && (
+      {!collapsed && !picking && !activeIssue && issuesLoaded && (
         <div
           className="mt-2 rounded-r p-3"
           style={{ background: "var(--brass-ghost)", borderLeft: "1px solid var(--brass-dim)" }}
@@ -158,40 +154,6 @@ export function ActiveTicketPanel({ state, activeIssue, issuesLoaded, candidates
               Unlink
             </button>
           </div>
-        </div>
-      )}
-
-      {!collapsed && !picking && state.kind === "unlinked" && (
-        <div className="mt-2 flex items-center gap-3 text-[12px] text-octo-sage">
-          <span>No ticket linked.</span>
-          <button
-            type="button"
-            aria-label="Link"
-            onClick={() => setPicking(true)}
-            className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass"
-          >
-            Link →
-          </button>
-          <button
-            type="button"
-            onClick={() => void dismiss()}
-            className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
-          >
-            No ticket for this workspace
-          </button>
-        </div>
-      )}
-
-      {!collapsed && !picking && state.kind === "dismissed" && (
-        <div className="mt-1">
-          <button
-            type="button"
-            aria-label="+ Link ticket"
-            onClick={() => void undismiss()}
-            className="font-mono text-[10px] tracking-[0.1em] text-octo-mute hover:text-octo-brass"
-          >
-            ↳ + Link ticket
-          </button>
         </div>
       )}
     </div>

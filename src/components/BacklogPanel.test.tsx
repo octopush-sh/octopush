@@ -172,12 +172,15 @@ describe("BacklogPanel", () => {
     expect(screen.getByText("queued")).toBeInTheDocument();
   });
 
-  it("when projectKey is null, shows 'Link project →' empty state", () => {
+  it("when projectKey is null, shows (no project) in eyebrow and no issue rows", () => {
     useIssuesStore.setState({
       issues: [], loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
     render(<BacklogPanel configured projectKey={null} activeKey={null} />);
-    expect(screen.getByText(/no jira project/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /link project/i })).toBeInTheDocument();
+    // Companion doesn't render BacklogPanel when projectKey is null, but if
+    // it is rendered defensively, it shows "(no project)" in the eyebrow
+    // and does not render any ticket rows or a "Link project" button.
+    expect(screen.getByText(/no project/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /link project/i })).not.toBeInTheDocument();
   });
 });

@@ -130,4 +130,26 @@ describe("ProjectContextMenu", () => {
       expect(onDismiss).toHaveBeenCalled();
     }
   });
+
+  it("renders Set Jira project key item and calls onSetJiraProjectKey when clicked", () => {
+    const onSetJiraProjectKey = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <ProjectContextMenu
+        {...baseProps}
+        onSetJiraProjectKey={onSetJiraProjectKey}
+        onDismiss={onDismiss}
+      />,
+    );
+    const item = screen.getByText(/Set Jira project key/);
+    expect(item).toBeInTheDocument();
+    fireEvent.click(item);
+    expect(onSetJiraProjectKey).toHaveBeenCalled();
+    expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it("does not render Set Jira project key item when prop is not provided", () => {
+    render(<ProjectContextMenu {...baseProps} />);
+    expect(screen.queryByText(/Set Jira project key/)).not.toBeInTheDocument();
+  });
 });

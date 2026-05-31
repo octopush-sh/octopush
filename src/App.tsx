@@ -12,6 +12,8 @@ import { WorkspaceCreator } from "./components/WorkspaceCreator";
 import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
 import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
+import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
+import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ProjectSwitcher } from "./components/ProjectSwitcher";
 import { ChatView } from "./components/ChatView";
@@ -45,6 +47,8 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
 import type { GitStatus, OpenPr, TintName } from "./lib/types";
+import { resolveLinkage } from "./lib/issueTrackerSelectors";
+import { useIssuesStore } from "./stores/issuesStore";
 
 interface ChatRef {
   id: string;
@@ -132,6 +136,10 @@ function App() {
   const [showAddProject, setShowAddProject] = useState(false);
   // Context menu: which workspace and where
   const [contextMenu, setContextMenu] = useState<{ workspaceId: string; x: number; y: number } | null>(null);
+  // Jira ticket picker modal (from workspace context menu)
+  const [jiraTicketPickerOpen, setJiraTicketPickerOpen] = useState<{ workspaceId: string; mode: "link" | "change" } | null>(null);
+  // Jira project key editor modal (from project context menu)
+  const [jiraProjectKeyEditorOpen, setJiraProjectKeyEditorOpen] = useState<{ projectId: string } | null>(null);
   // Pending delete confirmation
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   // Inline workspace creator shown from the empty-project state.
@@ -1254,7 +1262,6 @@ function App() {
             workspace={activeWorkspace ?? null}
             project={activeProject ?? null}
             issueTrackerConfigured={issueTrackerConfigured}
-            onLinkProject={() => setSettingsTab("integrations")}
           />
         </div>
         </div>
@@ -1326,6 +1333,10 @@ function App() {
             onClose={() => handleCloseProject(projectContextMenu.projectId)}
             onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
             onDismiss={() => setProjectContextMenu(null)}
+            onSetJiraProjectKey={() => {
+              setJiraProjectKeyEditorOpen({ projectId: projectContextMenu.projectId });
+              setProjectContextMenu(null);
+            }}
           />
         ) : null;
       })()}
@@ -1383,7 +1394,16 @@ function App() {
           ws = projectWs.find((w) => w.id === contextMenu.workspaceId);
           if (ws) break;
         }
-        return ws ? (
+        if (!ws) return null;
+        const wsBranch = ws.branch ?? "";
+        const wsLinkage = resolveLinkage(ws, wsBranch);
+        const wsLinkageKind: "linked" | "unlinked" | "dismissed" =
+          wsLinkage.kind === "linked"
+            ? "linked"
+            : wsLinkage.kind === "dismissed"
+            ? "dismissed"
+            : "unlinked";
+        return (
           <WorkspaceContextMenu
             x={contextMenu.x}
             y={contextMenu.y}
@@ -1397,8 +1417,27 @@ function App() {
               setDeletingWorkspaceId(contextMenu.workspaceId);
             }}
             onClose={() => setContextMenu(null)}
+            linkageKind={wsLinkageKind}
+            onLinkJira={() => {
+              setJiraTicketPickerOpen({ workspaceId: contextMenu.workspaceId, mode: "link" });
+              setContextMenu(null);
+            }}
+            onChangeJira={() => {
+              setJiraTicketPickerOpen({ workspaceId: contextMenu.workspaceId, mode: "change" });
+              setContextMenu(null);
+            }}
+            onUnlinkJira={async () => {
+              await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, false);
+              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              setContextMenu(null);
+            }}
+            onSkipJira={async () => {
+              await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, true);
+              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              setContextMenu(null);
+            }}
           />
-        ) : null;
+        );
       })()}
 
       {/* Delete confirmation modal */}
@@ -1446,6 +1485,54 @@ function App() {
           />
         </div>
       )}
+
+      {/* Jira ticket picker modal (link / change from workspace context menu) */}
+      {jiraTicketPickerOpen && (() => {
+        const { issues: allIssues } = useIssuesStore.getState();
+        // Find the workspace to get projectKey context
+        let pickerWs = null;
+        for (const projectWs of Object.values(workspacesByProjectId)) {
+          pickerWs = projectWs.find((w) => w.id === jiraTicketPickerOpen.workspaceId);
+          if (pickerWs) break;
+        }
+        const pickerProject = pickerWs
+          ? recentProjects.find((p) => p.id === pickerWs!.projectId) ?? (project?.id === pickerWs.projectId ? project : null)
+          : null;
+        const pickerProjectKey = pickerProject?.jiraProjectKey ?? null;
+        return (
+          <JiraTicketPickerModal
+            candidates={allIssues ?? []}
+            projectKey={pickerProjectKey}
+            title={jiraTicketPickerOpen.mode === "link" ? "Link Jira ticket" : "Change Jira ticket"}
+            onPick={async (key) => {
+              await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key, false);
+              await useWorkspaceStore.getState().load(activeProject?.id ?? "");
+              void useIssuesStore.getState().load();
+              setJiraTicketPickerOpen(null);
+            }}
+            onClose={() => setJiraTicketPickerOpen(null)}
+          />
+        );
+      })()}
+
+      {/* Jira project key editor modal (set project key from project context menu) */}
+      {jiraProjectKeyEditorOpen && (() => {
+        const proj = recentProjects.find((p) => p.id === jiraProjectKeyEditorOpen.projectId)
+          ?? (project?.id === jiraProjectKeyEditorOpen.projectId ? project : null);
+        if (!proj) return null;
+        return (
+          <JiraProjectKeyModal
+            initialValue={proj.jiraProjectKey ?? ""}
+            projectName={proj.name}
+            onSave={async (value) => {
+              await ipc.updateProjectJiraKey(jiraProjectKeyEditorOpen.projectId, value);
+              await loadRecentProjects();
+              setJiraProjectKeyEditorOpen(null);
+            }}
+            onClose={() => setJiraProjectKeyEditorOpen(null)}
+          />
+        );
+      })()}
 
       <ToastContainer />
       <UpdateNotifier />

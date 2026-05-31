@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Pencil, Trash2 } from "lucide-react";
+import { Pencil, Trash2, Link2, Link2Off } from "lucide-react";
 
 interface Props {
   x: number;
@@ -8,6 +8,12 @@ interface Props {
   onCustomize: () => void;
   onDelete: () => void;
   onClose: () => void;
+  /** Whether this workspace has a Jira ticket linked, is unlinked, or has been dismissed. */
+  linkageKind?: "linked" | "unlinked" | "dismissed";
+  onLinkJira?: () => void;
+  onChangeJira?: () => void;
+  onUnlinkJira?: () => void;
+  onSkipJira?: () => void;
 }
 
 export function WorkspaceContextMenu({
@@ -17,6 +23,11 @@ export function WorkspaceContextMenu({
   onCustomize,
   onDelete,
   onClose,
+  linkageKind,
+  onLinkJira,
+  onChangeJira,
+  onUnlinkJira,
+  onSkipJira,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -45,12 +56,14 @@ export function WorkspaceContextMenu({
     return () => window.removeEventListener("mousedown", onMouseDown, true);
   }, [onClose]);
 
+  const showJiraItems = linkageKind !== undefined;
+
   return (
     <div
       ref={ref}
       role="menu"
       aria-label="Workspace actions"
-      className="absolute z-50 w-[180px] rounded-md border border-octo-hairline bg-octo-panel shadow-2xl"
+      className="absolute z-50 w-[200px] rounded-md border border-octo-hairline bg-octo-panel shadow-2xl"
       style={{ left: x, top: y }}
     >
       <button
@@ -65,6 +78,72 @@ export function WorkspaceContextMenu({
         <Pencil size={12} className="shrink-0" />
         Customize…
       </button>
+
+      {showJiraItems && (
+        <>
+          <div className="h-px bg-octo-hairline" />
+
+          {(linkageKind === "unlinked" || linkageKind === "dismissed") && onLinkJira && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onLinkJira();
+                onClose();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+            >
+              <Link2 size={12} className="shrink-0" />
+              Link Jira ticket…
+            </button>
+          )}
+
+          {linkageKind === "linked" && onChangeJira && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onChangeJira();
+                onClose();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+            >
+              <Link2 size={12} className="shrink-0" />
+              Change Jira ticket…
+            </button>
+          )}
+
+          {linkageKind === "linked" && onUnlinkJira && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onUnlinkJira();
+                onClose();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+            >
+              <Link2Off size={12} className="shrink-0" />
+              Unlink Jira ticket
+            </button>
+          )}
+
+          {linkageKind !== "dismissed" && onSkipJira && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onSkipJira();
+                onClose();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+            >
+              <Link2Off size={12} className="shrink-0" />
+              Skip Jira here
+            </button>
+          )}
+        </>
+      )}
 
       <div className="h-px bg-octo-hairline" />
 

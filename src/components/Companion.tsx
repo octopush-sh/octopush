@@ -48,7 +48,6 @@ interface Props {
   workspace: Workspace | null;
   project: ProjectInfo | null;
   issueTrackerConfigured: boolean;
-  onLinkProject?: () => void;
 }
 
 export function Companion({
@@ -60,7 +59,6 @@ export function Companion({
   workspace,
   project,
   issueTrackerConfigured,
-  onLinkProject,
 }: Props) {
   const { issues } = useIssuesStore();
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
@@ -74,29 +72,37 @@ export function Companion({
     activeKey ? (issues ?? []).find((i) => i.key === activeKey) ?? null : null;
   const elsewhereCount = selectElsewhereCount(issues ?? [], projectKey);
 
+  // Gate: only show Jira panels when tracker is configured AND we have a
+  // resolved project key. If projectKey is null, the project is not linked to
+  // any Jira project — render nothing Jira-related.
+  const showJiraBlock = issueTrackerConfigured && workspace !== null && project !== null && projectKey !== null;
+
   return (
     <aside
       className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-xl border border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
-      {issueTrackerConfigured && workspace && (
+      {showJiraBlock && (
         <>
-          <ActiveTicketPanel
-            state={linkage}
-            activeIssue={activeIssue}
-            issuesLoaded={issues !== null}
-            candidates={issues ?? []}
-            projectKey={projectKey}
-            workspaceId={workspace.id}
-            projectId={workspace.projectId}
-          />
+          {linkage.kind === "linked" && (
+            <ActiveTicketPanel
+              state={linkage}
+              activeIssue={activeIssue}
+              issuesLoaded={issues !== null}
+              candidates={issues ?? []}
+              projectKey={projectKey}
+              workspaceId={workspace!.id}
+              projectId={workspace!.projectId}
+            />
+          )}
           <BacklogPanel
             configured={issueTrackerConfigured}
             projectKey={projectKey}
             activeKey={activeKey}
-            onLinkProject={onLinkProject}
           />
-          <ElsewhereFooter count={elsewhereCount} onOpen={() => setElsewhereOpen(true)} />
+          {elsewhereCount > 0 && (
+            <ElsewhereFooter count={elsewhereCount} onOpen={() => setElsewhereOpen(true)} />
+          )}
         </>
       )}
 

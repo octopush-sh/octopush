@@ -11,6 +11,8 @@ vi.mock("./ActiveTicketPanel",  () => ({ ActiveTicketPanel:  () => <div data-tes
 vi.mock("./BacklogPanel",       () => ({ BacklogPanel:       () => <div data-testid="backlog" /> }));
 vi.mock("./ElsewhereFooter",    () => ({ ElsewhereFooter:    () => <div data-testid="else" />  }));
 
+// Base props with a workspace whose branch encodes a Jira key so
+// resolveJiraProjectKey returns a non-null value → the Jira block renders.
 const baseProps = {
   workspaceId: "w1",
   contextProps: { tokensUsed: 0, tokensLimit: 0, unstaged: 0, toolCalls: 0 },
@@ -22,25 +24,42 @@ const baseProps = {
     createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
     linkedIssueKey: null, issueLinkDismissed: false,
   },
-  project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: null },
+  // jiraProjectKey drives resolveJiraProjectKey — set it so projectKey != null
+  project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: "CLPNSNS" },
 };
 
 describe("Companion cross-mode visibility of issue tracker block", () => {
-  it("renders ActiveTicketPanel + BacklogPanel in TALK", () => {
+  it("renders BacklogPanel in TALK when projectKey is resolved", () => {
     render(<Companion mode="talk" {...baseProps} />);
-    expect(screen.getByTestId("active")).toBeInTheDocument();
+    // BacklogPanel renders whenever projectKey != null (linked workspace shows ActiveTicketPanel too)
     expect(screen.getByTestId("backlog")).toBeInTheDocument();
   });
 
-  it("renders them in RUN", () => {
+  it("renders BacklogPanel in RUN when projectKey is resolved", () => {
     render(<Companion mode="run" {...baseProps} />);
-    expect(screen.getByTestId("active")).toBeInTheDocument();
     expect(screen.getByTestId("backlog")).toBeInTheDocument();
   });
 
-  it("renders them in REVIEW", () => {
+  it("renders BacklogPanel in REVIEW when projectKey is resolved", () => {
     render(<Companion mode="review" {...baseProps} fileTree={{ rootPath: "/", rootLabel: "/", changedPaths: new Set() }} />);
-    expect(screen.getByTestId("active")).toBeInTheDocument();
     expect(screen.getByTestId("backlog")).toBeInTheDocument();
+  });
+
+  it("hides all Jira panels when projectKey is null", () => {
+    const propsWithNoKey = {
+      ...baseProps,
+      // No jiraProjectKey and branch has no Jira key → projectKey resolves to null
+      workspace: {
+        ...baseProps.workspace,
+        branch: "main",
+        linkedIssueKey: null,
+        issueLinkDismissed: false,
+      },
+      project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: null },
+    };
+    render(<Companion mode="talk" {...propsWithNoKey} />);
+    expect(screen.queryByTestId("active")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("backlog")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("else")).not.toBeInTheDocument();
   });
 });

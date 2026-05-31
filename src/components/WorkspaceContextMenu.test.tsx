@@ -66,4 +66,77 @@ describe("WorkspaceContextMenu", () => {
     // Cleanup
     container.remove();
   });
+
+  describe("Jira linkage items", () => {
+    it("linkageKind=unlinked: shows Link Jira ticket and Skip Jira here", () => {
+      const onLinkJira = vi.fn();
+      const onSkipJira = vi.fn();
+      render(
+        <WorkspaceContextMenu
+          {...baseProps}
+          linkageKind="unlinked"
+          onLinkJira={onLinkJira}
+          onChangeJira={vi.fn()}
+          onUnlinkJira={vi.fn()}
+          onSkipJira={onSkipJira}
+        />,
+      );
+      expect(screen.getByText(/Link Jira ticket/)).toBeInTheDocument();
+      expect(screen.queryByText(/Change Jira ticket/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Unlink Jira ticket/)).not.toBeInTheDocument();
+      expect(screen.getByText(/Skip Jira here/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText(/Link Jira ticket/));
+      expect(onLinkJira).toHaveBeenCalled();
+    });
+
+    it("linkageKind=linked: shows Change + Unlink Jira ticket items", () => {
+      const onChangeJira = vi.fn();
+      const onUnlinkJira = vi.fn();
+      render(
+        <WorkspaceContextMenu
+          {...baseProps}
+          linkageKind="linked"
+          onLinkJira={vi.fn()}
+          onChangeJira={onChangeJira}
+          onUnlinkJira={onUnlinkJira}
+          onSkipJira={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/Link Jira ticket/)).not.toBeInTheDocument();
+      expect(screen.getByText(/Change Jira ticket/)).toBeInTheDocument();
+      expect(screen.getByText(/Unlink Jira ticket/)).toBeInTheDocument();
+      expect(screen.getByText(/Skip Jira here/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText(/Change Jira ticket/));
+      expect(onChangeJira).toHaveBeenCalled();
+
+      fireEvent.click(screen.getByText(/Unlink Jira ticket/));
+      expect(onUnlinkJira).toHaveBeenCalled();
+    });
+
+    it("linkageKind=dismissed: shows Link Jira ticket but not Skip Jira here", () => {
+      const onLinkJira = vi.fn();
+      render(
+        <WorkspaceContextMenu
+          {...baseProps}
+          linkageKind="dismissed"
+          onLinkJira={onLinkJira}
+          onChangeJira={vi.fn()}
+          onUnlinkJira={vi.fn()}
+          onSkipJira={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/Link Jira ticket/)).toBeInTheDocument();
+      // Skip Jira here is hidden when already dismissed
+      expect(screen.queryByText(/Skip Jira here/)).not.toBeInTheDocument();
+    });
+
+    it("no Jira items rendered when linkageKind is not provided", () => {
+      render(<WorkspaceContextMenu {...baseProps} />);
+      expect(screen.queryByText(/Link Jira ticket/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Change Jira ticket/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Skip Jira here/)).not.toBeInTheDocument();
+    });
+  });
 });
