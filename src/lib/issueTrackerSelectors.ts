@@ -81,3 +81,20 @@ export function selectElsewhereCount(
     (i) => !i.key.startsWith(prefix) && i.statusCategory === "inProgress",
   ).length;
 }
+
+/** Map an Issue to a Tailwind text-color class based on its issue type.
+ *  Locale-independent for Epic (hierarchyLevel) and Sub-task (boolean);
+ *  falls back to localized-name matching for Story / Bug / Task with
+ *  English + Spanish aliases. Unmapped types use brass (brand fallback).
+ *
+ *  Used by the ticket chip in `ContextHeader` to color each key in the
+ *  parent chain by its own type. */
+export function issueTypeToken(issue: Issue): string {
+  if (issue.hierarchyLevel === 1) return "text-state-purple";   // Epic
+  if (issue.subtask) return "text-state-blue";                  // Sub-task
+  const name = issue.issueType.toLowerCase();
+  if (name === "story" || name === "historia") return "text-octo-verdigris";
+  if (name === "bug" || name === "error" || name === "incidencia") return "text-octo-rouge";
+  if (name === "task" || name === "tarea") return "text-state-blue";
+  return "text-octo-brass";
+}
