@@ -5,7 +5,7 @@ import { useScratchpadStore } from "../stores/scratchpadStore";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { ipc } from "../lib/ipc";
-import { resolveLinkage } from "../lib/issueTrackerSelectors";
+import { resolveLinkage, issueTypeToken } from "../lib/issueTrackerSelectors";
 
 /** Resolve an issue by key — prefers the store, falls back to getIssue() once
  *  per key change. Returns null until an issue is found or the lookup fails. */
@@ -66,13 +66,21 @@ export function ContextHeader({
   const activeIssue = useActiveIssue(activeKey);
 
   const parents = useParentIssuesStore((s) => s.parents);
-  const loadParent = useParentIssuesStore((s) => s.loadParent);
+  const loadAncestors = useParentIssuesStore((s) => s.loadAncestors);
   useEffect(() => {
-    if (activeIssue?.parentKey) void loadParent(activeIssue.parentKey);
-  }, [activeIssue?.parentKey, loadParent]);
+    if (!activeIssue?.parentKey) return;
+    const depth = activeIssue.subtask ? 2 : 1;
+    void loadAncestors(activeIssue.parentKey, depth);
+  }, [activeIssue?.parentKey, activeIssue?.subtask, loadAncestors]);
 
-  const parentSummary =
-    activeIssue?.parentKey ? parents[activeIssue.parentKey]?.summary : undefined;
+  // Active ticket parent chain: [grandparent?, parent?] then activeIssue.
+  // Sub-tasks get 2 levels (depth 2); non-sub-tasks 1 level.
+  const parentIssue =
+    activeIssue?.parentKey ? parents[activeIssue.parentKey] : undefined;
+  const grandparentIssue =
+    activeIssue?.subtask && parentIssue?.parentKey
+      ? parents[parentIssue.parentKey]
+      : undefined;
 
   return (
     <div className="m-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
@@ -83,14 +91,32 @@ export function ContextHeader({
           title={
             `${activeIssue.key} · ${activeIssue.issueType.toUpperCase()}` +
             (activeIssue.priority ? ` · ${activeIssue.priority.toUpperCase()}` : "") +
-            (parentSummary ? ` · Epic: ${parentSummary}` : "") +
+            (parentIssue?.summary ? ` · Epic: ${parentIssue.summary}` : "") +
             ` · ${activeIssue.summary}`
           }
           onClick={() => { void ipc.openFileInSystem(activeIssue.url).catch(() => {}); }}
           className="-mx-1 flex min-w-0 flex-1 items-center gap-2.5 rounded px-1 transition hover:bg-[var(--brass-ghost)]"
         >
           <span className="text-octo-brass" aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>◈</span>
-          <span className="font-mono text-[12px] text-octo-brass">{activeIssue.key}</span>
+          {grandparentIssue && (
+            <>
+              <span className={`font-mono text-[12px] ${issueTypeToken(grandparentIssue)}`}>
+                {grandparentIssue.key}
+              </span>
+              <span className="font-mono text-[12px] text-octo-mute" aria-hidden>·</span>
+            </>
+          )}
+          {parentIssue && (
+            <>
+              <span className={`font-mono text-[12px] ${issueTypeToken(parentIssue)}`}>
+                {parentIssue.key}
+              </span>
+              <span className="font-mono text-[12px] text-octo-mute" aria-hidden>·</span>
+            </>
+          )}
+          <span className={`font-mono text-[12px] ${issueTypeToken(activeIssue)}`}>
+            {activeIssue.key}
+          </span>
           <span className={`font-mono text-[10px] uppercase tracking-[0.15em] ${STATUS_TOKEN[activeIssue.statusCategory]}`}>
             {activeIssue.statusName}
           </span>

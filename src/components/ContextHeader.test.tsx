@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ContextHeader } from "./ContextHeader";
 import { useIssuesStore } from "../stores/issuesStore";
+import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { ipc } from "../lib/ipc";
 import type { Workspace } from "../lib/types";
 
@@ -17,6 +18,7 @@ const baseProps = {};
 
 beforeEach(() => {
   useIssuesStore.setState({ issues: null, loading: false, error: null });
+  useParentIssuesStore.setState({ parents: {}, loading: {} });
 });
 
 function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
@@ -287,6 +289,131 @@ describe("ContextHeader", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /open ticket/i }));
     expect(openFileInSystemMock).toHaveBeenCalledWith("https://acme.atlassian.net/browse/CLPNSNS-92");
+  });
+
+  it("Story with Epic parent: chip shows EPIC-KEY (purple) · STORY-KEY (verdigris)", async () => {
+    const workspace = makeWorkspace({ branch: "feat/CLPNSNS-92" });
+    useIssuesStore.setState({
+      issues: [
+        {
+          key: "CLPNSNS-92", summary: "Story summary",
+          statusName: "In Progress", statusCategory: "inProgress",
+          issueType: "Story", priority: null,
+          url: "u", parentKey: "EPIC-50",
+          subtask: false, hierarchyLevel: 0,
+        },
+      ],
+      loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
+    });
+    useParentIssuesStore.setState({
+      parents: {
+        "EPIC-50": {
+          key: "EPIC-50", summary: "Epic summary",
+          statusName: "In Progress", statusCategory: "inProgress",
+          issueType: "Epic", priority: null, url: "u", parentKey: null,
+          subtask: false, hierarchyLevel: 1,
+        },
+      },
+      loading: {},
+    });
+
+    renderHeader({ workspace, issueTrackerConfigured: true });
+
+    const epicKey = await screen.findByText("EPIC-50");
+    expect(epicKey).toHaveClass("text-state-purple");
+    const storyKey = screen.getByText("CLPNSNS-92");
+    expect(storyKey).toHaveClass("text-octo-verdigris");
+  });
+
+  it("Sub-task with Story + Epic chain: chip shows all 3 keys colored per type", async () => {
+    const workspace = makeWorkspace({ branch: "main" });
+    useIssuesStore.setState({
+      issues: [
+        {
+          key: "CLPNSNS-92.1", summary: "Sub-task",
+          statusName: "To Do", statusCategory: "todo",
+          issueType: "Sub-task", priority: null,
+          url: "u", parentKey: "CLPNSNS-92",
+          subtask: true, hierarchyLevel: -1,
+        },
+      ],
+      loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
+    });
+    useParentIssuesStore.setState({
+      parents: {
+        "CLPNSNS-92": {
+          key: "CLPNSNS-92", summary: "Story",
+          statusName: "In Progress", statusCategory: "inProgress",
+          issueType: "Story", priority: null, url: "u", parentKey: "EPIC-50",
+          subtask: false, hierarchyLevel: 0,
+        },
+        "EPIC-50": {
+          key: "EPIC-50", summary: "Epic",
+          statusName: "In Progress", statusCategory: "inProgress",
+          issueType: "Epic", priority: null, url: "u", parentKey: null,
+          subtask: false, hierarchyLevel: 1,
+        },
+      },
+      loading: {},
+    });
+    const workspaceWithLink = { ...workspace, linkedIssueKey: "CLPNSNS-92.1" };
+    renderHeader({ workspace: workspaceWithLink, issueTrackerConfigured: true });
+
+    expect(await screen.findByText("EPIC-50")).toHaveClass("text-state-purple");
+    expect(screen.getByText("CLPNSNS-92")).toHaveClass("text-octo-verdigris");
+    expect(screen.getByText("CLPNSNS-92.1")).toHaveClass("text-state-blue");
+  });
+
+  it("Bug with Epic parent: ticket key uses rouge", async () => {
+    const workspace = makeWorkspace({ branch: "feat/CLPNSNS-101" });
+    useIssuesStore.setState({
+      issues: [
+        {
+          key: "CLPNSNS-101", summary: "Notif duplicada",
+          statusName: "Done", statusCategory: "done",
+          issueType: "Bug", priority: null,
+          url: "u", parentKey: "EPIC-50",
+          subtask: false, hierarchyLevel: 0,
+        },
+      ],
+      loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
+    });
+    useParentIssuesStore.setState({
+      parents: {
+        "EPIC-50": {
+          key: "EPIC-50", summary: "Epic",
+          statusName: "x", statusCategory: "inProgress",
+          issueType: "Epic", priority: null, url: "u", parentKey: null,
+          subtask: false, hierarchyLevel: 1,
+        },
+      },
+      loading: {},
+    });
+
+    renderHeader({ workspace, issueTrackerConfigured: true });
+
+    expect(await screen.findByText("CLPNSNS-101")).toHaveClass("text-octo-rouge");
+    expect(screen.getByText("EPIC-50")).toHaveClass("text-state-purple");
+  });
+
+  it("Unmapped issueType falls back to brass on the ticket key", async () => {
+    const workspace = makeWorkspace({ branch: "feat/SPIKE-1" });
+    useIssuesStore.setState({
+      issues: [
+        {
+          key: "SPIKE-1", summary: "Investigar perf",
+          statusName: "In Progress", statusCategory: "inProgress",
+          issueType: "Spike", priority: null,
+          url: "u", parentKey: null,
+          subtask: false, hierarchyLevel: 0,
+        },
+      ],
+      loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
+    });
+
+    renderHeader({ workspace, issueTrackerConfigured: true });
+
+    expect(await screen.findByText("SPIKE-1")).toHaveClass("text-octo-brass");
   });
 
   it("status text uses the correct token per statusCategory", async () => {
