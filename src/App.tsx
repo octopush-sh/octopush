@@ -15,6 +15,9 @@ import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
 import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { BacklogRowContextMenu } from "./components/BacklogRowContextMenu";
+import { ProjectPickerModal } from "./components/ProjectPickerModal";
+import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
 import { ProjectSwitcher } from "./components/ProjectSwitcher";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
@@ -46,9 +49,10 @@ import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
-import type { GitStatus, OpenPr, TintName } from "./lib/types";
+import type { GitStatus, OpenPr, TintName, Issue, ProjectInfo } from "./lib/types";
 import { resolveLinkage } from "./lib/issueTrackerSelectors";
 import { useIssuesStore } from "./stores/issuesStore";
+import { detectIssueKey } from "./lib/detectIssueKey";
 
 interface ChatRef {
   id: string;
@@ -151,6 +155,12 @@ function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
+
+  // ── Backlog ticket → create workspace orchestration ──
+  const [backlogTicketMenu, setBacklogTicketMenu] = useState<{ issue: Issue; x: number; y: number } | null>(null);
+  const [existingWsAlert, setExistingWsAlert] = useState<{ ticketKey: string; summary: string; existingName: string } | null>(null);
+  const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[] } | null>(null);
+  const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string } | null>(null);
 
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
@@ -932,6 +942,43 @@ function App() {
     }
   };
 
+  // ── Backlog ticket → create workspace orchestration ──
+  async function continueCreateForTicket(ticketKey: string, summary: string) {
+    const prefix = ticketKey.split("-")[0];
+    const candidates = recentProjects.filter((p) => p.jiraProjectKey === prefix);
+    if (candidates.length === 0) {
+      pushToast({
+        level: "error",
+        title: "No project linked",
+        body: `No Octopush Project is linked to "${prefix}". Right-click a project to set its Jira key.`,
+      });
+      return;
+    }
+    if (candidates.length === 1) {
+      setCreatorForTicket({
+        projectId: candidates[0].id,
+        projectPath: candidates[0].path,
+        initialTask: summary,
+        linkIssueKeyOnCreate: ticketKey,
+      });
+      return;
+    }
+    setProjectPickerForTicket({ ticketKey, summary, candidates });
+  }
+
+  async function startCreateForTicket(issue: Issue) {
+    setBacklogTicketMenu(null);
+    const allWorkspaces = Object.values(workspacesByProjectId).flat();
+    const existing = allWorkspaces.find(
+      (w) => w.linkedIssueKey === issue.key || detectIssueKey(w.branch ?? "") === issue.key
+    );
+    if (existing) {
+      setExistingWsAlert({ ticketKey: issue.key, summary: issue.summary, existingName: existing.name });
+      return;
+    }
+    await continueCreateForTicket(issue.key, issue.summary);
+  }
+
   // ── Render: pre-project views ──
   if (!project) {
     if (appView === "new-project") {
@@ -1262,6 +1309,7 @@ function App() {
             workspace={activeWorkspace ?? null}
             project={activeProject ?? null}
             issueTrackerConfigured={issueTrackerConfigured}
+            onBacklogTicketContextMenu={(issue, x, y) => setBacklogTicketMenu({ issue, x, y })}
           />
         </div>
         </div>
@@ -1532,6 +1580,67 @@ function App() {
             onClose={() => setJiraProjectKeyEditorOpen(null)}
           />
         );
+      })()}
+
+      {/* Backlog ticket context menu */}
+      {backlogTicketMenu && (
+        <BacklogRowContextMenu
+          x={backlogTicketMenu.x}
+          y={backlogTicketMenu.y}
+          onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
+          onClose={() => setBacklogTicketMenu(null)}
+        />
+      )}
+
+      {/* Existing workspace alert modal */}
+      {existingWsAlert && (
+        <ExistingWorkspaceAlertModal
+          ticketKey={existingWsAlert.ticketKey}
+          workspaceName={existingWsAlert.existingName}
+          onContinue={() => {
+            const { ticketKey, summary } = existingWsAlert;
+            setExistingWsAlert(null);
+            void continueCreateForTicket(ticketKey, summary);
+          }}
+          onCancel={() => setExistingWsAlert(null)}
+        />
+      )}
+
+      {/* Project picker modal (multiple projects match the Jira prefix) */}
+      {projectPickerForTicket && (
+        <ProjectPickerModal
+          candidates={projectPickerForTicket.candidates}
+          title="Select Octopush Project"
+          onPick={(projectId) => {
+            const picked = recentProjects.find((p) => p.id === projectId);
+            if (!picked) return;
+            setProjectPickerForTicket(null);
+            setCreatorForTicket({
+              projectId: picked.id,
+              projectPath: picked.path,
+              initialTask: projectPickerForTicket.summary,
+              linkIssueKeyOnCreate: projectPickerForTicket.ticketKey,
+            });
+          }}
+          onClose={() => setProjectPickerForTicket(null)}
+        />
+      )}
+
+      {/* Ticket-driven workspace creator (overlay, does not unmount canvas) */}
+      {creatorForTicket && (() => {
+        const targetProject = getProjectById(creatorForTicket.projectId);
+        return targetProject ? (
+          <div className="absolute inset-0 z-50 bg-octo-bg">
+            <WorkspaceCreator
+              projectId={targetProject.id}
+              projectPath={targetProject.path}
+              initialTask={creatorForTicket.initialTask}
+              linkIssueKeyOnCreate={creatorForTicket.linkIssueKeyOnCreate}
+              onCreated={() => setCreatorForTicket(null)}
+              onCancel={() => setCreatorForTicket(null)}
+            />
+          </div>
+        ) : null;
       })()}
 
       <ToastContainer />

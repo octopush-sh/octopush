@@ -183,4 +183,30 @@ describe("BacklogPanel", () => {
     expect(screen.getByText(/§ backlog/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /link project/i })).not.toBeInTheDocument();
   });
+
+  it("right-click on a ticket row calls onTicketContextMenu with the issue and coordinates", () => {
+    const issue = {
+      key: "CLPNSNS-77",
+      summary: "Right-click test",
+      statusName: "To Do",
+      statusCategory: "todo" as const,
+      issueType: "Task",
+      priority: null,
+      url: "https://example.atlassian.net/browse/CLPNSNS-77",
+      parentKey: null,
+    };
+    useIssuesStore.setState({ issues: [issue], loading: false, error: null });
+    const onTicketContextMenu = vi.fn();
+    render(
+      <BacklogPanel
+        configured
+        projectKey="CLPNSNS"
+        activeKey={null}
+        onTicketContextMenu={onTicketContextMenu}
+      />
+    );
+    const row = screen.getByText("CLPNSNS-77").closest("[role='button']") as HTMLElement;
+    fireEvent.contextMenu(row, { clientX: 150, clientY: 300 });
+    expect(onTicketContextMenu).toHaveBeenCalledWith(issue, 150, 300);
+  });
 });

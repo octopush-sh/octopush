@@ -17,9 +17,10 @@ interface Props {
    *  Kept optional here for backward-compat with tests that pass null. */
   projectKey?: string | null;
   activeKey: string | null;
+  onTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
 }
 
-export function BacklogPanel({ configured, projectKey = null, activeKey }: Props) {
+export function BacklogPanel({ configured, projectKey = null, activeKey, onTicketContextMenu }: Props) {
   const { issues, loading, error, load } = useIssuesStore();
   const [collapsed, setCollapsed] = useState(false);
 
@@ -90,6 +91,10 @@ export function BacklogPanel({ configured, projectKey = null, activeKey }: Props
                 type="button"
                 role="button"
                 onClick={() => ipc.openFileInSystem(it.url).catch(() => {})}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  onTicketContextMenu?.(it, e.clientX, e.clientY);
+                }}
                 className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
                 style={{ borderLeft: "1px solid transparent" }}
               >

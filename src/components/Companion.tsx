@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { WorkspaceMode } from "../lib/modes";
-import type { Budget, SpendSnapshot, ProjectInfo, Workspace } from "../lib/types";
+import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
@@ -48,6 +48,7 @@ interface Props {
   workspace: Workspace | null;
   project: ProjectInfo | null;
   issueTrackerConfigured: boolean;
+  onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
 }
 
 export function Companion({
@@ -59,6 +60,7 @@ export function Companion({
   workspace,
   project,
   issueTrackerConfigured,
+  onBacklogTicketContextMenu,
 }: Props) {
   const { issues } = useIssuesStore();
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
@@ -99,6 +101,7 @@ export function Companion({
             configured={issueTrackerConfigured}
             projectKey={projectKey}
             activeKey={activeKey}
+            onTicketContextMenu={onBacklogTicketContextMenu}
           />
           {elsewhereCount > 0 && (
             <ElsewhereFooter count={elsewhereCount} onOpen={() => setElsewhereOpen(true)} />

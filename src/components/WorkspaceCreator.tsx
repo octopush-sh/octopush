@@ -1,12 +1,17 @@
 import { useState } from "react";
 import { BrassRule } from "./BrassRule";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { ipc } from "../lib/ipc";
 
 interface Props {
   projectId: string;
   projectPath: string;
   onCreated: () => void;
   onCancel: () => void;
+  /** Pre-fill the task input with this value. */
+  initialTask?: string;
+  /** After successful creation, link this issue key to the new workspace. */
+  linkIssueKeyOnCreate?: string | null;
 }
 
 type Step = 1 | 2;
@@ -29,9 +34,9 @@ function slugify(text: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }: Props) {
+export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
   const [step, setStep] = useState<Step>(1);
-  const [task, setTask] = useState("");
+  const [task, setTask] = useState(initialTask ?? "");
   const [setupScript, setSetupScript] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +52,11 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel }
     setCreating(true);
     setError(null);
     try {
-      await create(projectId, projectPath, workspaceName, task.trim(), branch, "main", setupScript);
+      const newWs = await create(projectId, projectPath, workspaceName, task.trim(), branch, "main", setupScript);
+      if (linkIssueKeyOnCreate) {
+        await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate, false);
+        await useWorkspaceStore.getState().load(newWs.projectId);
+      }
       onCreated();
     } catch (e) {
       setError(String(e));
