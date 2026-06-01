@@ -40,6 +40,12 @@ pub fn issue_from_json(v: &serde_json::Value, base_url: &str) -> Issue {
     let f = &v["fields"];
     let status_name = f["status"]["name"].as_str().unwrap_or("").to_string();
     let cat_key = f["status"]["statusCategory"]["key"].as_str().unwrap_or("");
+    let subtask = f["issuetype"]["subtask"]
+        .as_bool()
+        .unwrap_or(false);
+    let hierarchy_level = f["issuetype"]["hierarchyLevel"]
+        .as_i64()
+        .unwrap_or(0) as i32;
     Issue {
         url: format!("{}/browse/{}", base_url.trim_end_matches('/'), key),
         key,
@@ -49,6 +55,8 @@ pub fn issue_from_json(v: &serde_json::Value, base_url: &str) -> Issue {
         issue_type: f["issuetype"]["name"].as_str().unwrap_or("").to_string(),
         priority: f["priority"]["name"].as_str().map(|s| s.to_string()),
         parent_key: f["parent"]["key"].as_str().map(|s| s.to_string()),
+        subtask,
+        hierarchy_level,
     }
 }
 
@@ -121,7 +129,7 @@ mod tests {
             "fields": {
                 "summary": "Login page",
                 "status": { "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
-                "issuetype": { "name": "Story" },
+                "issuetype": { "name": "Story", "subtask": false, "hierarchyLevel": 0 },
                 "priority": { "name": "High" },
                 "parent": { "key": "PROJ-100" }
             }
@@ -135,6 +143,8 @@ mod tests {
         assert_eq!(issue.priority.as_deref(), Some("High"));
         assert_eq!(issue.parent_key.as_deref(), Some("PROJ-100"));
         assert_eq!(issue.url, "https://acme.atlassian.net/browse/PROJ-123");
+        assert_eq!(issue.subtask, false);
+        assert_eq!(issue.hierarchy_level, 0);
     }
 
     #[test]
@@ -152,5 +162,39 @@ mod tests {
         assert_eq!(issue.priority, None);
         assert_eq!(issue.parent_key, None);
         assert_eq!(issue.url, "https://acme.atlassian.net/browse/X-1");
+    }
+
+    #[test]
+    fn maps_epic_issuetype_hierarchy() {
+        let raw = serde_json::json!({
+            "key": "EPIC-1",
+            "fields": {
+                "summary": "Epic summary",
+                "status": { "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                "issuetype": { "name": "Epic", "subtask": false, "hierarchyLevel": 1 },
+                "priority": null,
+                "parent": null
+            }
+        });
+        let issue = issue_from_json(&raw, "https://example.com/");
+        assert_eq!(issue.hierarchy_level, 1);
+        assert!(!issue.subtask);
+    }
+
+    #[test]
+    fn maps_subtask_issuetype() {
+        let raw = serde_json::json!({
+            "key": "SUB-1",
+            "fields": {
+                "summary": "Sub-task summary",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "issuetype": { "name": "Sub-task", "subtask": true, "hierarchyLevel": -1 },
+                "priority": null,
+                "parent": { "key": "STORY-1" }
+            }
+        });
+        let issue = issue_from_json(&raw, "https://example.com/");
+        assert_eq!(issue.hierarchy_level, -1);
+        assert!(issue.subtask);
     }
 }

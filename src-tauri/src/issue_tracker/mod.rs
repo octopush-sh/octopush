@@ -29,6 +29,8 @@ pub struct Issue {
     pub priority: Option<String>,
     pub url: String,
     pub parent_key: Option<String>,
+    pub subtask: bool,
+    pub hierarchy_level: i32,
 }
 
 /// Read capabilities v1 needs. Implemented per tracker (native async-in-trait;
