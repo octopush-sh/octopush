@@ -1,6 +1,6 @@
 {
   "name": "octopush",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "The IDE for Agentic Developers — eight arms, zero wasted tokens.",
   "private": true,
   "type": "module",
