@@ -60,3 +60,56 @@ describe("parentIssuesStore", () => {
     expect(mockIpc.getIssue).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("loadAncestors", () => {
+  it("loads parent only when depth === 1", async () => {
+    const parent = {
+      key: "STORY-1", summary: "story", statusName: "x", statusCategory: "todo" as const,
+      issueType: "Story", priority: null, url: "u", parentKey: "EPIC-1",
+      subtask: false, hierarchyLevel: 0,
+    };
+    mockIpc.getIssue.mockResolvedValueOnce(parent);
+
+    await useParentIssuesStore.getState().loadAncestors("STORY-1", 1);
+
+    expect(useParentIssuesStore.getState().parents["STORY-1"]).toEqual(parent);
+    expect(useParentIssuesStore.getState().parents["EPIC-1"]).toBeUndefined();
+    expect(mockIpc.getIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads parent + grandparent when depth === 2 and parent has parentKey", async () => {
+    const parent = {
+      key: "STORY-1", summary: "story", statusName: "x", statusCategory: "todo" as const,
+      issueType: "Story", priority: null, url: "u", parentKey: "EPIC-1",
+      subtask: false, hierarchyLevel: 0,
+    };
+    const grandparent = {
+      key: "EPIC-1", summary: "epic", statusName: "x", statusCategory: "inProgress" as const,
+      issueType: "Epic", priority: null, url: "u", parentKey: null,
+      subtask: false, hierarchyLevel: 1,
+    };
+    mockIpc.getIssue
+      .mockResolvedValueOnce(parent)
+      .mockResolvedValueOnce(grandparent);
+
+    await useParentIssuesStore.getState().loadAncestors("STORY-1", 2);
+
+    expect(useParentIssuesStore.getState().parents["STORY-1"]).toEqual(parent);
+    expect(useParentIssuesStore.getState().parents["EPIC-1"]).toEqual(grandparent);
+    expect(mockIpc.getIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops at parent when parent has no parentKey (no further lookup)", async () => {
+    const orphan = {
+      key: "ORPHAN-1", summary: "x", statusName: "x", statusCategory: "todo" as const,
+      issueType: "Story", priority: null, url: "u", parentKey: null,
+      subtask: false, hierarchyLevel: 0,
+    };
+    mockIpc.getIssue.mockResolvedValueOnce(orphan);
+
+    await useParentIssuesStore.getState().loadAncestors("ORPHAN-1", 2);
+
+    expect(useParentIssuesStore.getState().parents["ORPHAN-1"]).toEqual(orphan);
+    expect(mockIpc.getIssue).toHaveBeenCalledTimes(1);
+  });
+});
