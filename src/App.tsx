@@ -19,6 +19,7 @@ import { BacklogRowContextMenu } from "./components/BacklogRowContextMenu";
 import { ProjectPickerModal } from "./components/ProjectPickerModal";
 import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
 import { ProjectSwitcher } from "./components/ProjectSwitcher";
+import { EmptyProjectState } from "./components/EmptyProjectState";
 import { ChatView } from "./components/ChatView";
 import { ChangesPanel } from "./components/ChangesPanel";
 import { EditorPane } from "./components/EditorPane";
@@ -1330,10 +1331,6 @@ function App() {
                   <EmptyProjectState
                     projectName={project.name}
                     onCreateWorkspace={() => setShowInlineCreator(true)}
-                    onSwitchProject={() => {
-                      loadRecentProjects();
-                      setShowProjectSwitcher(true);
-                    }}
                   />
                 )}
               </div>
@@ -1734,47 +1731,6 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
       >
         Open terminal
       </button>
-    </div>
-  );
-}
-
-function EmptyProjectState({
-  projectName,
-  onCreateWorkspace,
-  onSwitchProject,
-}: {
-  projectName: string;
-  onCreateWorkspace: () => void;
-  onSwitchProject: () => void;
-}) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
-      <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
-        Project
-      </div>
-      <div className="font-serif text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
-        {projectName}
-      </div>
-      <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
-        No workspaces here yet. Workspaces are isolated git worktrees — one per task you're working on.
-      </p>
-      <div className="mt-2 flex items-center gap-3">
-        <button
-          type="button"
-          onClick={onCreateWorkspace}
-          className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition"
-          style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-        >
-          Create a workspace
-        </button>
-        <button
-          type="button"
-          onClick={onSwitchProject}
-          className="rounded-md px-3 py-2 text-[12px] text-octo-mute transition hover:text-octo-sage"
-        >
-          Switch project
-        </button>
-      </div>
     </div>
   );
 }
