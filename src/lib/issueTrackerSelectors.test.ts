@@ -42,6 +42,8 @@ function issue(key: string, statusCategory: Issue["statusCategory"] = "todo", pr
     priority,
     url: "https://x/browse/" + key,
     parentKey: null,
+    subtask: false,
+    hierarchyLevel: 0,
   };
 }
 

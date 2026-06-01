@@ -447,6 +447,8 @@ export interface Issue {
   priority: string | null;
   url: string;
   parentKey: string | null;
+  subtask: boolean;
+  hierarchyLevel: number;
 }
 
 export interface IssueTrackerConfig {

@@ -38,6 +38,8 @@ const issue: Issue = {
   priority: "High",
   url: "https://example.atlassian.net/browse/PROJ-42",
   parentKey: null,
+  subtask: false,
+  hierarchyLevel: 0,
 };
 
 describe("JiraTicketPickerModal", () => {

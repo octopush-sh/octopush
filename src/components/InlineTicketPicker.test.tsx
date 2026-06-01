@@ -16,6 +16,8 @@ function issue(key: string, summary: string, statusCategory: Issue["statusCatego
     statusName: statusCategory === "inProgress" ? "In Progress" : "To Do",
     statusCategory, issueType: "Story", priority: null,
     url: "https://x/browse/" + key, parentKey: null,
+    subtask: false,
+    hierarchyLevel: 0,
   };
 }
 

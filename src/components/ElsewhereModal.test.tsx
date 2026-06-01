@@ -16,9 +16,9 @@ beforeEach(() => {
 });
 
 const issues: Issue[] = [
-  { key: "A-1", summary: "a one", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/A-1", parentKey: null },
-  { key: "A-2", summary: "a two", statusName: "To Do",       statusCategory: "todo",       issueType: "Bug",   priority: null, url: "https://x/A-2", parentKey: null },
-  { key: "B-1", summary: "b one", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/B-1", parentKey: null },
+  { key: "A-1", summary: "a one", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/A-1", parentKey: null, subtask: false, hierarchyLevel: 0 },
+  { key: "A-2", summary: "a two", statusName: "To Do",       statusCategory: "todo",       issueType: "Bug",   priority: null, url: "https://x/A-2", parentKey: null, subtask: false, hierarchyLevel: 0 },
+  { key: "B-1", summary: "b one", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/B-1", parentKey: null, subtask: false, hierarchyLevel: 0 },
 ];
 
 describe("ElsewhereModal", () => {

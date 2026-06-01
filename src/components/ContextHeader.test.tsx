@@ -116,6 +116,8 @@ describe("ContextHeader", () => {
       priority: "High",
       url: "https://example.atlassian.net/browse/PROJ-123",
       parentKey: null,
+      subtask: false,
+      hierarchyLevel: 0,
     };
 
     it("renders the chip when key + issue present and tracker configured", () => {
@@ -165,7 +167,7 @@ describe("ContextHeader", () => {
       });
       useIssuesStore.setState({
         issues: [
-          { key: "FORCED-1", summary: "force", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/FORCED-1", parentKey: null },
+          { key: "FORCED-1", summary: "force", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "https://x/FORCED-1", parentKey: null, subtask: false, hierarchyLevel: 0 },
         ],
         loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
       });
@@ -209,6 +211,7 @@ describe("ContextHeader", () => {
           statusName: "In Progress", statusCategory: "inProgress",
           issueType: "Story", priority: "High",
           url: "https://x/browse/CLPNSNS-92", parentKey: null,
+          subtask: false, hierarchyLevel: 0,
         },
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -275,6 +278,7 @@ describe("ContextHeader", () => {
           statusName: "In Progress", statusCategory: "inProgress",
           issueType: "Story", priority: null,
           url: "https://acme.atlassian.net/browse/CLPNSNS-92", parentKey: null,
+          subtask: false, hierarchyLevel: 0,
         },
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -308,6 +312,7 @@ describe("ContextHeader", () => {
             statusCategory: category,
             issueType: "Story", priority: null,
             url: "https://x/CLPNSNS-92", parentKey: null,
+            subtask: false, hierarchyLevel: 0,
           },
         ],
         loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),

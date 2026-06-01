@@ -22,6 +22,8 @@ describe("parentIssuesStore", () => {
       priority: null,
       url: "https://x/browse/EPIC-1",
       parentKey: null,
+      subtask: false,
+      hierarchyLevel: 0,
     };
     mockIpc.getIssue.mockResolvedValue(issue);
 
@@ -52,6 +54,7 @@ describe("parentIssuesStore", () => {
     resolveOne({
       key: "E-1", summary: "x", statusName: "x", statusCategory: "todo",
       issueType: "Epic", priority: null, url: "u", parentKey: null,
+      subtask: false, hierarchyLevel: 0,
     });
     await Promise.all([p1, p2]);
     expect(mockIpc.getIssue).toHaveBeenCalledTimes(1);

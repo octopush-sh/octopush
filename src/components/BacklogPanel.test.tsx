@@ -64,6 +64,8 @@ describe("BacklogPanel", () => {
           priority: "High",
           url: "https://example.atlassian.net/browse/CLPNSNS-123",
           parentKey: null,
+          subtask: false,
+          hierarchyLevel: 0,
         },
       ],
     });
@@ -85,6 +87,8 @@ describe("BacklogPanel", () => {
           priority: "High",
           url: "u",
           parentKey: null,
+          subtask: false,
+          hierarchyLevel: 0,
         },
         {
           key: "CLPNSNS-456",
@@ -95,6 +99,8 @@ describe("BacklogPanel", () => {
           priority: null,
           url: "u2",
           parentKey: null,
+          subtask: false,
+          hierarchyLevel: 0,
         },
       ],
     });
@@ -119,6 +125,8 @@ describe("BacklogPanel", () => {
           priority: "High",
           url: "https://example.atlassian.net/browse/CLPNSNS-123",
           parentKey: null,
+          subtask: false,
+          hierarchyLevel: 0,
         },
       ],
     });
@@ -145,9 +153,9 @@ describe("BacklogPanel", () => {
   it("eyebrow shows project key + count when configured + projectKey set", () => {
     useIssuesStore.setState({
       issues: [
-        { key: "CLPNSNS-92", summary: "x", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null },
-        { key: "CLPNSNS-105", summary: "y", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null },
-        { key: "OTHER-1", summary: "z", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null },
+        { key: "CLPNSNS-92", summary: "x", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
+        { key: "CLPNSNS-105", summary: "y", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
+        { key: "OTHER-1", summary: "z", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
@@ -162,8 +170,8 @@ describe("BacklogPanel", () => {
   it("excludes the active key from the list", () => {
     useIssuesStore.setState({
       issues: [
-        { key: "CLPNSNS-92", summary: "active", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "u", parentKey: null },
-        { key: "CLPNSNS-105", summary: "queued", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null },
+        { key: "CLPNSNS-92", summary: "active", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: null, url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
+        { key: "CLPNSNS-105", summary: "queued", statusName: "To Do", statusCategory: "todo", issueType: "Story", priority: null, url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
@@ -194,6 +202,8 @@ describe("BacklogPanel", () => {
       priority: null,
       url: "https://example.atlassian.net/browse/CLPNSNS-77",
       parentKey: null,
+      subtask: false,
+      hierarchyLevel: 0,
     };
     useIssuesStore.setState({ issues: [issue], loading: false, error: null });
     const onTicketContextMenu = vi.fn();

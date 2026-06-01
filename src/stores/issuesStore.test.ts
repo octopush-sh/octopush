@@ -7,7 +7,7 @@ vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 const { useIssuesStore } = await import("./issuesStore");
 
 const ISSUES: Issue[] = [
-  { key: "PROJ-123", summary: "Login", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: "High", url: "u", parentKey: null },
+  { key: "PROJ-123", summary: "Login", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: "High", url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
 ];
 
 beforeEach(() => {
