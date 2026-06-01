@@ -124,6 +124,56 @@ function App() {
     return recentProjects.find(p => p.id === projectId) ?? null;
   }, [project, recentProjects]);
 
+  // ── Companion resize ─────────────────────────────────────────────
+  // The Companion's width persists in localStorage so a workspace's
+  // back-and-forth Talk → Run keeps the user's chosen width. Min/max
+  // bounds keep the layout sane: < 280 starves the active-ticket meta
+  // line; > 600 starves the canvas.
+  const COMPANION_DEFAULT_WIDTH = 312;
+  const COMPANION_MIN_WIDTH = 280;
+  const COMPANION_MAX_WIDTH = 600;
+  const [companionWidth, setCompanionWidth] = useState<number>(() => {
+    const stored = typeof window !== "undefined" ? localStorage.getItem("companionWidth") : null;
+    const parsed = stored ? parseInt(stored, 10) : NaN;
+    if (Number.isFinite(parsed)) {
+      return Math.max(COMPANION_MIN_WIDTH, Math.min(COMPANION_MAX_WIDTH, parsed));
+    }
+    return COMPANION_DEFAULT_WIDTH;
+  });
+  const [companionResizing, setCompanionResizing] = useState(false);
+  useEffect(() => {
+    localStorage.setItem("companionWidth", String(companionWidth));
+  }, [companionWidth]);
+  function startCompanionResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = companionWidth;
+    setCompanionResizing(true);
+    const onMove = (ev: MouseEvent) => {
+      // Companion is on the right; moving the cursor LEFT widens it.
+      const dx = startX - ev.clientX;
+      const next = Math.max(
+        COMPANION_MIN_WIDTH,
+        Math.min(COMPANION_MAX_WIDTH, startWidth + dx),
+      );
+      setCompanionWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setCompanionResizing(false);
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+  function resetCompanionWidth() {
+    setCompanionWidth(COMPANION_DEFAULT_WIDTH);
+  }
+
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [showPalette, setShowPalette] = useState(false);
@@ -1298,8 +1348,23 @@ function App() {
         {/* RIGHT COLUMN — Companion always mounted. When there's no active
             workspace the panel just shows empty/default data; the structure
             is preserved. The mode switcher now lives in the unified header
-            band above. */}
-        <div className="flex w-[312px] shrink-0 flex-col p-4 pl-0 pt-0">
+            band above. Resizable via the 4px handle on the left edge:
+            drag to widen/narrow, double-click to reset to default. */}
+        <div
+          className="relative flex shrink-0 flex-col p-4 pl-0 pt-0"
+          style={{ width: companionWidth }}
+        >
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize Companion"
+            title="Drag to resize · Double-click to reset"
+            onMouseDown={startCompanionResize}
+            onDoubleClick={resetCompanionWidth}
+            className={`absolute left-0 top-0 bottom-0 z-10 w-[4px] cursor-col-resize transition-colors hover:bg-octo-brass ${
+              companionResizing ? "bg-octo-brass" : "bg-transparent"
+            }`}
+          />
           <Companion
             mode={activeMode}
             workspaceId={activeWorkspaceId}

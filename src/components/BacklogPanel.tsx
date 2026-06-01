@@ -95,7 +95,7 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onTicke
                   e.preventDefault();
                   onTicketContextMenu?.(it, e.clientX, e.clientY);
                 }}
-                className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+                className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
                 style={{ borderLeft: "1px solid transparent" }}
               >
                 <span
