@@ -1115,11 +1115,6 @@ function App() {
             separate columns. */}
         {activeWorkspace && (
           <ContextHeader
-            projectName={project.name}
-            onOpenProjectSwitcher={() => {
-              loadRecentProjects();
-              setShowProjectSwitcher(true);
-            }}
             workspaceName={activeWorkspace.name}
             branch={activeWorkspace.branch}
             gitStatus={gitStatus}

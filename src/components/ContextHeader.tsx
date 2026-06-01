@@ -1,61 +1,54 @@
 import { useEffect, useState } from "react";
-import type { GitStatus, OpenPr, Issue, Workspace } from "../lib/types";
+import type { GitStatus, OpenPr, Issue, StatusCategory, Workspace } from "../lib/types";
 import { ScratchpadIcon } from "./ScratchpadIcon";
 import { useScratchpadStore } from "../stores/scratchpadStore";
 import { useIssuesStore } from "../stores/issuesStore";
+import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { ipc } from "../lib/ipc";
 import { resolveLinkage } from "../lib/issueTrackerSelectors";
 
 /** Resolve an issue by key — prefers the store, falls back to getIssue() once
  *  per key change. Returns null until an issue is found or the lookup fails. */
-function useActiveIssue(key: string | null | undefined): Issue | null {
+function useActiveIssue(key: string | null): Issue | null {
   const storeIssues = useIssuesStore((s) => s.issues);
   const [fallback, setFallback] = useState<Issue | null>(null);
-
-  // Reset fallback whenever the key changes.
   useEffect(() => {
     setFallback(null);
     if (!key) return;
-    // Try the store first; if found, no network call needed.
-    const found = storeIssues?.find((i) => i.key === key);
-    if (found) return;
-    // Single fallback network call.
-    ipc.getIssue(key).then(setFallback).catch(() => {});
+    const hit = (storeIssues ?? []).find((i) => i.key === key);
+    if (hit) return;
+    ipc.getIssue(key).then(setFallback).catch(() => setFallback(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
-
   if (!key) return null;
   return storeIssues?.find((i) => i.key === key) ?? fallback;
 }
 
+const STATUS_TOKEN: Record<StatusCategory, string> = {
+  inProgress: "text-octo-brass",
+  todo: "text-octo-mute",
+  done: "text-octo-verdigris",
+  unknown: "text-octo-sage",
+};
+
 interface Props {
-  projectName: string;
-  onOpenProjectSwitcher: () => void;
   workspaceName: string;
   branch: string;
   gitStatus: GitStatus | null;
-  /** Open PR for the current branch, if any. Renders a brass chip next to
-   *  the workspace status pill. */
   openPr?: OpenPr | null;
   /** Called with the PR's html_url when the chip is clicked. Typically
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
-  /** The active workspace. Used to derive the ticket chip via resolveLinkage
+  /** The active workspace. Used to derive the ticket via resolveLinkage
    *  (manual link wins over branch detection). */
   workspace?: Workspace | null;
-  /** Whether the issue tracker is configured. When false, no chip is shown
-   *  even if a key is present. */
+  /** Whether the issue tracker is configured. When false, no ticket is
+   *  shown even if a key is present — the degraded WORKSPACE block renders. */
   issueTrackerConfigured?: boolean;
-  /** Right-side slot — typically the mode switcher (TALK · RUN · REVIEW).
-   *  Lives inside ContextHeader so the entire top of the app reads as one
-   *  unified header band, rather than two floating cards in separate
-   *  columns. */
   rightSlot?: React.ReactNode;
 }
 
 export function ContextHeader({
-  projectName,
-  onOpenProjectSwitcher,
   workspaceName,
   branch,
   gitStatus,
@@ -68,34 +61,47 @@ export function ContextHeader({
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const toggleScratchpad = useScratchpadStore((s) => s.toggleOpen);
   const linkage = workspace ? resolveLinkage(workspace, branch) : { kind: "unlinked" as const };
-  const activeIssueKey =
+  const activeKey =
     linkage.kind === "linked" && issueTrackerConfigured ? linkage.key : null;
-  const activeIssue = useActiveIssue(activeIssueKey);
+  const activeIssue = useActiveIssue(activeKey);
+
+  const parents = useParentIssuesStore((s) => s.parents);
+  const loadParent = useParentIssuesStore((s) => s.loadParent);
+  useEffect(() => {
+    if (activeIssue?.parentKey) void loadParent(activeIssue.parentKey);
+  }, [activeIssue?.parentKey, loadParent]);
+
+  const parentSummary =
+    activeIssue?.parentKey ? parents[activeIssue.parentKey]?.summary : undefined;
 
   return (
     <div className="m-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
-      <div className="flex min-w-0 flex-col gap-0.5">
-        {/* Project chip — sits above the workspace row */}
+      {activeIssue ? (
         <button
           type="button"
-          onClick={onOpenProjectSwitcher}
-          aria-label="Switch project"
-          className="group flex w-fit items-center gap-1.5 rounded px-1 -mx-1 transition hover:bg-[var(--brass-ghost)]"
+          aria-label="Open ticket in Jira"
+          title={
+            `${activeIssue.key} · ${activeIssue.issueType.toUpperCase()}` +
+            (activeIssue.priority ? ` · ${activeIssue.priority.toUpperCase()}` : "") +
+            (parentSummary ? ` · Epic: ${parentSummary}` : "") +
+            ` · ${activeIssue.summary}`
+          }
+          onClick={() => { void ipc.openFileInSystem(activeIssue.url).catch(() => {}); }}
+          className="-mx-1 flex min-w-0 flex-1 items-center gap-2.5 rounded px-1 transition hover:bg-[var(--brass-ghost)]"
         >
-          <span className="font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
-            Project
+          <span className="text-octo-brass" aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>◈</span>
+          <span className="font-mono text-[12px] text-octo-brass">{activeIssue.key}</span>
+          <span className={`font-mono text-[10px] uppercase tracking-[0.15em] ${STATUS_TOKEN[activeIssue.statusCategory]}`}>
+            {activeIssue.statusName}
           </span>
-          <span className="font-serif text-[13px] leading-none text-octo-ivory">
-            {projectName}
-          </span>
-          <span className="font-mono text-[9px] text-octo-mute transition group-hover:text-octo-brass">
-            ▾
+          <span aria-hidden className="h-[14px] w-px bg-octo-hairline" />
+          <span className="min-w-0 truncate font-serif text-[15px] leading-tight text-octo-ivory">
+            {activeIssue.summary}
           </span>
         </button>
-
-        {/* Workspace row — primary identity */}
-        <div>
-          <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+      ) : (
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
             Workspace
           </div>
           <div
@@ -105,9 +111,9 @@ export function ContextHeader({
             {workspaceName}
           </div>
         </div>
-      </div>
+      )}
 
-      <div className="ml-auto flex items-center gap-4">
+      <div className="ml-auto flex flex-shrink-0 items-center gap-4">
         <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-octo-verdigris" aria-hidden />
           <span>↳ {branch}</span>
@@ -132,25 +138,6 @@ export function ContextHeader({
             <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>
               ↗
             </span>
-          </button>
-        )}
-
-        {activeIssue && (
-          <button
-            type="button"
-            onClick={() => ipc.openFileInSystem(activeIssue.url).catch(() => {})}
-            title={`${activeIssue.key} — ${activeIssue.summary}`}
-            className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass transition-colors"
-            style={{
-              background: "var(--brass-ghost)",
-              border: "1px solid var(--brass-dim)",
-            }}
-          >
-            <span className="text-octo-brass" aria-hidden style={{ fontSize: 11, lineHeight: 1 }}>
-              ◈
-            </span>
-            <span className="text-octo-brass">{activeIssue.key}</span>
-            <span className="text-octo-mute">· {activeIssue.statusName}</span>
           </button>
         )}
 
