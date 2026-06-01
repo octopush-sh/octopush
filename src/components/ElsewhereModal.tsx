@@ -4,7 +4,7 @@ import type { Issue, StatusCategory } from "../lib/types";
 
 const STATUS_DOT: Record<StatusCategory, string> = {
   todo: "text-octo-mute",
-  inProgress: "text-octo-brass",
+  inProgress: "text-state-blue",
   done: "text-octo-verdigris",
   unknown: "text-octo-sage",
 };

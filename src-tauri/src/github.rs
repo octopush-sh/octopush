@@ -67,6 +67,11 @@ pub fn pr_from_json(v: &serde_json::Value) -> Pr {
     let state = match (gh_state, is_draft, merged_at) {
         ("open", true, _) => PrState::Draft,
         ("open", false, _) => PrState::Open,
+        // The `gh` CLI returns `state="MERGED"` (normalized to lowercase by
+        // try_gh_cli) directly when a PR is merged. The REST API instead
+        // returns `state="closed"` + `merged_at: <timestamp>` for the same
+        // PR. Handle both shapes.
+        ("merged", _, _) => PrState::Merged,
         ("closed", _, Some(_)) => PrState::Merged,
         ("closed", _, None) => PrState::Closed,
         _ => PrState::Open,

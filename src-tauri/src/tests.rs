@@ -1500,4 +1500,18 @@ mod pr_state_tests {
         let pr = crate::github::pr_from_json(&raw);
         assert_eq!(pr.state, crate::github::PrState::Closed);
     }
+
+    #[test]
+    fn pr_state_merged_when_gh_cli_returns_merged_state_directly() {
+        // The gh CLI returns state="MERGED" (normalized to lowercase before
+        // calling pr_from_json) — distinct from the REST API which reports
+        // state="closed" + merged_at. This regression check ensures both
+        // shapes resolve to PrState::Merged.
+        let raw = serde_json::json!({
+            "number": 41, "html_url": "https://x/pr/41", "title": "Ship",
+            "state": "merged", "draft": false, "merged_at": "2026-05-30T15:00:00Z"
+        });
+        let pr = crate::github::pr_from_json(&raw);
+        assert_eq!(pr.state, crate::github::PrState::Merged);
+    }
 }

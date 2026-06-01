@@ -118,7 +118,12 @@ export function ContextHeader({
           title={
             `${activeIssue.key} · ${activeIssue.issueType.toUpperCase()}` +
             (activeIssue.priority ? ` · ${activeIssue.priority.toUpperCase()}` : "") +
-            (parentIssue?.summary ? ` · Epic: ${parentIssue.summary}` : "") +
+            (parentIssue?.summary
+              ? ` · ${parentIssue.issueType}: ${parentIssue.summary}`
+              : "") +
+            (grandparentIssue?.summary
+              ? ` · ${grandparentIssue.issueType}: ${grandparentIssue.summary}`
+              : "") +
             ` · ${activeIssue.summary}`
           }
           onClick={() => { void ipc.openFileInSystem(activeIssue.url).catch(() => {}); }}
