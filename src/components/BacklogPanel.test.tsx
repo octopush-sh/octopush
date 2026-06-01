@@ -73,7 +73,7 @@ describe("BacklogPanel", () => {
     expect(screen.getByText("In Progress")).toBeInTheDocument();
   });
 
-  it("excludes the active key row from the backlog (active ticket lives in ActiveTicketPanel)", () => {
+  it("excludes the active key row from the backlog (active ticket is shown in ContextHeader)", () => {
     useIssuesStore.setState({
       issues: [
         {
