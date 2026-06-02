@@ -536,21 +536,32 @@ function App() {
     [activeWorkspaceId],
   );
 
-  // Delete a non-primary chat (the primary chat's id === activeWorkspaceId
-  // and can't be removed — it's the workspace's canonical conversation).
-  // The list passes a `deletable: false` flag for it so the button never
-  // renders, but we re-check here as a defense and as a clear no-op.
+  // Delete any chat. There's no "primary" protection: just like Terminals,
+  // you can empty the History section and the workspace's init effect will
+  // re-seed a fresh chat the next time you re-enter the workspace.
   const handleDeleteChat = useCallback(
     (id: string) => {
-      if (!activeWorkspaceId || id === activeWorkspaceId) return;
+      if (!activeWorkspaceId) return;
       void ipc.deleteSession(id).catch(console.error);
+      let nextActive: string | undefined;
       setChatsPerWorkspace((p) => {
         const list = p[activeWorkspaceId] ?? [];
-        return { ...p, [activeWorkspaceId]: list.filter((c) => c.id !== id) };
+        const remaining = list.filter((c) => c.id !== id);
+        // If the list ends up empty we drop the workspace key so the init
+        // effect's "no entry yet" branch fires on next workspace activation
+        // and seeds a fresh primary conversation.
+        if (remaining.length === 0) {
+          const { [activeWorkspaceId]: _drop, ...rest } = p;
+          return rest;
+        }
+        nextActive = remaining[0]?.id;
+        return { ...p, [activeWorkspaceId]: remaining };
       });
       setActiveChatPerWorkspace((p) => {
         if (p[activeWorkspaceId] !== id) return p;
-        return { ...p, [activeWorkspaceId]: activeWorkspaceId };
+        if (nextActive) return { ...p, [activeWorkspaceId]: nextActive };
+        const { [activeWorkspaceId]: _drop, ...rest } = p;
+        return rest;
       });
     },
     [activeWorkspaceId],
@@ -756,14 +767,10 @@ function App() {
       // Derive its title + meta from those messages so the history row
       // becomes self-describing instead of the literal "Conversation · NOW".
       const chats = rawChats.map((c) => {
-        // Primary chat (id === workspace id) is non-deletable by design —
-        // it's the workspace's canonical conversation.
-        const deletable = c.id !== activeWorkspaceId;
-        if (c.id !== activeWorkspaceId) return { ...c, deletable };
+        if (c.id !== activeWorkspaceId) return c;
         const msgs = allChatMessages[c.id] ?? [];
         return {
           ...c,
-          deletable,
           title: deriveChatTitle(msgs),
           meta: deriveChatMeta(msgs, tickerNow),
         };

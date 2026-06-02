@@ -4,9 +4,6 @@ export interface CompanionHistoryChat {
   id: string;
   title: string;
   meta: string;
-  /** False marks the workspace's primary chat — it has no delete affordance.
-   *  Defaults to true (= deletable) so older call-sites still render normally. */
-  deletable?: boolean;
 }
 
 interface Props {
@@ -40,7 +37,7 @@ export function CompanionHistory({ chats, activeChatId, onSelectChat, onNewChat,
         )}
         {chats.map((c) => {
           const active = c.id === activeChatId;
-          const deletable = c.deletable !== false && !!onDeleteChat;
+          const deletable = !!onDeleteChat;
           return (
             <li key={c.id} className="group relative">
               <button
