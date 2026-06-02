@@ -311,8 +311,22 @@ function TicketRow({ row, onContextMenu }: RowProps) {
       <span className={`flex-shrink-0 font-mono text-[11px] ${issueTypeToken(row)}`}>
         {row.key}
       </span>
-      <span className="min-w-0 flex-1 truncate text-[12px] text-octo-sage">{row.summary}</span>
-      <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
+      {/* Summary's last ~24px fade out via mask-image so the text appears
+          to dissolve into the status pill instead of getting cut with an
+          ellipsis — the status itself stays pinned on the right (see
+          flex-shrink-0 below) and is always legible. */}
+      <span
+        className="min-w-0 flex-1 text-[12px] text-octo-sage"
+        style={{
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          maskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
+          WebkitMaskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
+        }}
+      >
+        {row.summary}
+      </span>
+      <span className="flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
         {row.statusName}
       </span>
     </button>
