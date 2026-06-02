@@ -225,11 +225,18 @@ export function WorkContextPanel({
         aria-hidden={collapsed}
         className="grid overflow-hidden transition-all duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
         style={{
+          // grid-cols forces the column to track the container width
+          // exactly. Without it, the implicit `minmax(auto, 1fr)` column
+          // sizes to the row's min-content (dot + key + status = ~180px
+          // of flex-shrink-0 children), and on narrow companion widths
+          // that overflows the panel — the status badge ends up clipped
+          // off the right edge.
+          gridTemplateColumns: "minmax(0, 1fr)",
           gridTemplateRows: collapsed ? "0fr" : "1fr",
           opacity: collapsed ? 0 : 1,
         }}
       >
-        <div className="min-h-0">
+        <div className="min-h-0 min-w-0">
           {!configured && (
             <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
           )}
