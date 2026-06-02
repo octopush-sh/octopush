@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
 import { useIssuesStore } from "../stores/issuesStore";
 import { ipc } from "../lib/ipc";
 import type { Issue, StatusCategory } from "../lib/types";
@@ -50,17 +51,19 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onTicke
               </>
             )}
           </span>
-          <span className="mr-1">{collapsed ? "▸" : "▾"}</span>
+          <span className="mr-1 flex items-center text-octo-mute">
+            {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+          </span>
         </button>
         {configured && !collapsed && (
           <button
             type="button"
             onClick={() => void load()}
-            className="font-mono text-[10px] text-octo-mute transition hover:text-octo-brass"
             title="Refresh backlog"
             aria-label="Refresh backlog"
+            className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
           >
-            ↺
+            <RotateCcw size={16} />
           </button>
         )}
       </div>

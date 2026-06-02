@@ -1,3 +1,5 @@
+import { Plus } from "lucide-react";
+
 export interface CompanionHistoryChat {
   id: string;
   title: string;
@@ -21,10 +23,11 @@ export function CompanionHistory({ chats, activeChatId, onSelectChat, onNewChat 
         <button
           type="button"
           onClick={onNewChat}
-          className="font-mono text-[10px] text-octo-mute transition hover:text-octo-brass"
+          aria-label="New chat"
           title="New chat"
+          className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
         >
-          +
+          <Plus size={16} />
         </button>
       </div>
       <ul className="mt-2 space-y-1">
