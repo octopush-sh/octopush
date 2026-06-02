@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, RotateCcw } from "lucide-react";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -126,24 +126,63 @@ export function WorkContextPanel({
     else if (activePill === "epic" && epicKey) void loadEpic(epicKey);
   }
 
+  // ── Gliding indicator for the pill nav ────────────────────────
+  // Measure the active pill's bounding box relative to its container
+  // and translate the brass-ghost rect underneath. Same motion family
+  // as the ModeSwitcher (280ms / ease) so the two tab strips read as
+  // siblings.
+  const navRef = useRef<HTMLDivElement | null>(null);
+  const pillRefs = useRef<Map<PillKey, HTMLButtonElement | null>>(new Map());
+  const [indicator, setIndicator] = useState<{ left: number; width: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const nav = navRef.current;
+    const pill = pillRefs.current.get(activePill);
+    if (!nav || !pill) {
+      setIndicator(null);
+      return;
+    }
+    const navRect = nav.getBoundingClientRect();
+    const pillRect = pill.getBoundingClientRect();
+    setIndicator({
+      left: pillRect.left - navRect.left + nav.scrollLeft,
+      width: pillRect.width,
+    });
+  }, [activePill, visiblePills.length, visiblePills.map((p) => `${p.key}:${p.count}`).join("|")]);
+
   return (
     <div className="border-b border-octo-hairline px-3 py-2">
       {/* ── Pill nav + refresh + chevron ─────────────────────────── */}
       <div className="flex items-center gap-1">
-        <div className="flex flex-1 items-center gap-1 overflow-x-auto" role="tablist" aria-label="Work context">
+        <div
+          ref={navRef}
+          role="tablist"
+          aria-label="Work context"
+          className="relative flex flex-1 items-center overflow-x-auto py-0.5"
+        >
+          {/* Gliding indicator. Hidden until the first measurement so it
+              never paints at the wrong (left=0) spot. */}
+          {indicator && (
+            <div
+              aria-hidden
+              className="absolute top-0 bottom-0 rounded-full border border-[var(--brass-dim)] bg-[var(--brass-ghost)] transition-[left,width] duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+              style={{ left: indicator.left, width: indicator.width }}
+            />
+          )}
           {visiblePills.map((p) => {
             const active = p.key === activePill;
             return (
               <button
                 key={p.key}
+                ref={(el) => { pillRefs.current.set(p.key, el); }}
                 type="button"
                 role="tab"
                 aria-selected={active}
                 onClick={() => setActivePill(p.key)}
-                className={`flex flex-shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.1em] transition-all duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
+                className={`relative z-10 flex flex-shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.1em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
                   active
-                    ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)] text-octo-brass"
-                    : "border-octo-hairline text-octo-mute hover:border-octo-mute hover:text-octo-sage"
+                    ? "text-octo-brass"
+                    : "text-octo-mute hover:text-octo-sage"
                 }`}
               >
                 {p.label}
