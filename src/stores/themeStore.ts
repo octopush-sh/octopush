@@ -37,6 +37,22 @@ export const useThemeStore = create<ThemeState>((set) => ({
   },
 }));
 
+/** Parse `#rrggbb` (with or without leading #) into an [r,g,b] tuple.
+ *  Returns null for malformed input so callers can fall back to a static
+ *  value rather than emit `rgba(NaN, NaN, NaN, …)`. */
+function hexToRgb(hex: string): [number, number, number] | null {
+  const m = hex.replace("#", "").match(/^([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function rgba(hex: string, alpha: number): string {
+  const c = hexToRgb(hex);
+  if (!c) return hex;
+  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${alpha})`;
+}
+
 function applyThemeToDom(t: ThemeConfig) {
   const root = document.documentElement;
 
@@ -53,6 +69,7 @@ function applyThemeToDom(t: ThemeConfig) {
   // New canonical semantic tokens — used by components from Phase 2 onward.
   // Map ThemeConfig fields to the new names.
   root.style.setProperty("--color-octo-onyx", t.bg);
+  root.style.setProperty("--color-octo-panel-2", t.panel2);
   root.style.setProperty("--color-octo-hairline", t.border);
   root.style.setProperty("--color-octo-brass", t.accent);
   root.style.setProperty("--color-octo-brass-hi", t.accentDim);
@@ -62,8 +79,19 @@ function applyThemeToDom(t: ThemeConfig) {
   root.style.setProperty("--color-octo-verdigris", t.success);
   root.style.setProperty("--color-octo-rouge", t.danger);
 
-  // panel-2 has no equivalent in ThemeConfig yet. Leave the static
-  // styles.css value alone — user themes won't customize it in Phase 1.
+  // Accent-derived alpha tokens. These were hardcoded to the brass
+  // colorway in styles.css; deriving them from the active accent makes
+  // hover/active surfaces follow the theme instead of staying brass
+  // regardless. Critical for the light theme — a faint brass tint over
+  // a cream bg would look brown-stained instead of subtly highlighted.
+  root.style.setProperty("--brass-faint", rgba(t.accent, 0.04));
+  root.style.setProperty("--brass-ghost", rgba(t.accent, 0.08));
+  root.style.setProperty("--brass-glow", rgba(t.accent, 0.12));
+  root.style.setProperty("--brass-dim", rgba(t.accent, 0.4));
+
+  // Danger-derived alpha tokens (rouge family) — same reason as above.
+  root.style.setProperty("--rouge-active-bg", rgba(t.danger, 0.1));
+  root.style.setProperty("--rouge-border", rgba(t.danger, 0.3));
 
   // Body bg for first paint before React mounts.
   document.body.style.backgroundColor = t.bg;

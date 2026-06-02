@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Atelier in Onyx & Brass: rounded-rect onyx field, brass § glyph. -->
+  <defs>
+    <linearGradient id="brassgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#e8c39a" />
+      <stop offset="55%"  stop-color="#d4a574" />
+      <stop offset="100%" stop-color="#b88a5c" />
+    </linearGradient>
+    <linearGradient id="onyxgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#181410" />
+      <stop offset="100%" stop-color="#0a0806" />
+    </linearGradient>
+    <!-- Subtle inner-hairline glow so the icon reads as engraved/inset
+         on light backgrounds (Finder list, light-mode dock). -->
+    <filter id="emboss" x="-5%" y="-5%" width="110%" height="110%">
+      <feGaussianBlur stdDeviation="1.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Onyx field, macOS-style rounded corners (~22.4% radius). -->
+  <rect x="0" y="0" width="1024" height="1024" rx="229" ry="229" fill="url(#onyxgrad)" />
+
+  <!-- Hairline interior border to telegraph the "atelier" frame. -->
+  <rect x="32" y="32" width="960" height="960" rx="200" ry="200"
+        fill="none" stroke="#2a2419" stroke-width="2" opacity="0.9" />
+
+  <!-- § glyph in Spectral Bold, centered. -->
+  <text x="512" y="512"
+        text-anchor="middle"
+        dominant-baseline="central"
+        font-family="Spectral, Georgia, serif"
+        font-weight="700"
+        font-size="720"
+        fill="url(#brassgrad)"
+        filter="url(#emboss)">§</text>
+</svg>

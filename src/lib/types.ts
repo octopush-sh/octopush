@@ -310,6 +310,10 @@ export interface ThemeConfig {
   name: string;
   bg: string;
   panel: string;
+  /** "Raised" surface — used for row hover, popovers, active selections.
+   *  For dark themes this is a step brighter than `panel`; for light
+   *  themes it can be a step darker, providing the same contrast cue. */
+  panel2: string;
   border: string;
   accent: string;
   accentDim: string;
