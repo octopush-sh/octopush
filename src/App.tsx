@@ -3,6 +3,7 @@ import { WelcomeScreen } from "./components/WelcomeScreen";
 import { NewProjectFlow } from "./components/NewProjectFlow";
 import { WorkspaceRail } from "./components/WorkspaceRail";
 import { PerfMonitorBar } from "./components/PerfMonitorBar";
+import { AppTopBar } from "./components/AppTopBar";
 import { usePerfStore } from "./stores/perfStore";
 import { ContextHeader } from "./components/ContextHeader";
 import { ModeSwitcher } from "./components/ModeSwitcher";
@@ -1092,6 +1093,7 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-octo-bg text-octo-ivory">
+      <AppTopBar />
       <div className="flex min-h-0 flex-1">
       <WorkspaceRail
         projects={projectGroups}
