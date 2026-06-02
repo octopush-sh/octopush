@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
+import { ChevronDown, RotateCcw } from "lucide-react";
 import { useIssuesStore } from "../stores/issuesStore";
 import { ipc } from "../lib/ipc";
 import type { Issue, StatusCategory } from "../lib/types";
@@ -34,11 +34,12 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onTicke
 
   return (
     <div className="border-b border-octo-hairline px-3 py-2">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-1">
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          className="flex flex-1 items-center justify-between font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute"
+          aria-expanded={!collapsed}
+          className="flex flex-1 items-center font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute"
         >
           <span>
             § Backlog
@@ -50,9 +51,6 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onTicke
                 {filtered.length}
               </>
             )}
-          </span>
-          <span className="mr-1 flex items-center text-octo-mute">
-            {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
           </span>
         </button>
         {configured && !collapsed && (
@@ -68,56 +66,84 @@ export function BacklogPanel({ configured, projectKey = null, activeKey, onTicke
             <RotateCcw size={16} className={loading ? "animate-spin" : ""} />
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          aria-label={collapsed ? "Expand backlog" : "Collapse backlog"}
+          title={collapsed ? "Expand backlog" : "Collapse backlog"}
+          className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+        >
+          <ChevronDown
+            size={16}
+            className={`transition-transform duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
+              collapsed ? "-rotate-90" : ""
+            }`}
+          />
+        </button>
       </div>
 
-      {!collapsed && !configured && (
-        <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
-      )}
-
-      {!collapsed && configured && projectKey != null && (
-        <>
-          {error && (
-            <p className="mt-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">
-              couldn't refresh
-            </p>
+      {/* Smooth expand/collapse via grid-template-rows trick — content
+          stays mounted; the wrapping row collapses to 0fr (height: 0)
+          and opacity fades. Timing matches the ModeSwitcher's gliding
+          indicator so motion across the Companion reads as one family. */}
+      <div
+        aria-hidden={collapsed}
+        className="grid overflow-hidden transition-all duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+        style={{
+          gridTemplateRows: collapsed ? "0fr" : "1fr",
+          opacity: collapsed ? 0 : 1,
+        }}
+      >
+        <div className="min-h-0">
+          {!configured && (
+            <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
           )}
-          {loading && !issues && (
-            <p className="mt-2 font-mono text-[10px] text-octo-mute">loading…</p>
+          {configured && projectKey != null && (
+            <>
+              {error && (
+                <p className="mt-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">
+                  couldn't refresh
+                </p>
+              )}
+              {loading && !issues && (
+                <p className="mt-2 font-mono text-[10px] text-octo-mute">loading…</p>
+              )}
+              {filtered.length === 0 && !loading && !error && (
+                <p className="mt-2 text-[12px] text-octo-verdigris">
+                  Backlog clear ✓
+                </p>
+              )}
+              <div className="mt-1">
+                {filtered.map((it) => (
+                  <button
+                    key={it.key}
+                    type="button"
+                    role="button"
+                    onClick={() => ipc.openFileInSystem(it.url).catch(() => {})}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      onTicketContextMenu?.(it, e.clientX, e.clientY);
+                    }}
+                    className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
+                    style={{ borderLeft: "1px solid transparent" }}
+                  >
+                    <span
+                      aria-label={it.statusCategory}
+                      className={`h-[6px] w-[6px] rounded-full ${STATUS_DOT_COLOR[it.statusCategory]}`}
+                      style={{ background: "currentColor" }}
+                    />
+                    <span className="flex-shrink-0 font-mono text-[11px] text-octo-ivory">{it.key}</span>
+                    <span className="min-w-0 flex-1 truncate text-[12px] text-octo-sage">{it.summary}</span>
+                    <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
+                      {it.statusName}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </>
           )}
-          {filtered.length === 0 && !loading && !error && (
-            <p className="mt-2 text-[12px] text-octo-verdigris">
-              Backlog clear ✓
-            </p>
-          )}
-          <div className="mt-1">
-            {filtered.map((it) => (
-              <button
-                key={it.key}
-                type="button"
-                role="button"
-                onClick={() => ipc.openFileInSystem(it.url).catch(() => {})}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  onTicketContextMenu?.(it, e.clientX, e.clientY);
-                }}
-                className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
-                style={{ borderLeft: "1px solid transparent" }}
-              >
-                <span
-                  aria-label={it.statusCategory}
-                  className={`h-[6px] w-[6px] rounded-full ${STATUS_DOT_COLOR[it.statusCategory]}`}
-                  style={{ background: "currentColor" }}
-                />
-                <span className="flex-shrink-0 font-mono text-[11px] text-octo-ivory">{it.key}</span>
-                <span className="min-w-0 flex-1 truncate text-[12px] text-octo-sage">{it.summary}</span>
-                <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
-                  {it.statusName}
-                </span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+        </div>
+      </div>
     </div>
   );
 }
