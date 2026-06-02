@@ -50,7 +50,7 @@ export function PerfMonitorBar({
   }, [open, workspacePath]);
 
   return (
-    <div className="relative flex h-[22px] w-full flex-shrink-0 items-center justify-end border-t border-octo-hairline bg-octo-panel px-3 font-mono text-[11px] text-octo-mute">
+    <div className="relative flex h-[28px] w-full flex-shrink-0 items-center justify-end border-t border-octo-hairline bg-octo-panel px-3 font-mono text-[11px] text-octo-mute">
       {onToggleRail && (
         <button
           type="button"
@@ -60,7 +60,7 @@ export function PerfMonitorBar({
           title={`${isRailCollapsed ? "Expand" : "Collapse"} workspace rail`}
           className="mr-auto flex items-center justify-center rounded p-0.5 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
         >
-          {isRailCollapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
+          {isRailCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
         </button>
       )}
       {!stats ? (
@@ -90,7 +90,7 @@ export function PerfMonitorBar({
             <span className="text-octo-mute">{open ? "▾" : "▸"}</span>
           </button>
           {open && (
-            <div className="absolute bottom-[26px] right-2 z-50 min-w-[220px] rounded-md border border-octo-hairline bg-octo-panel-2 p-2 shadow-lg">
+            <div className="absolute bottom-[32px] right-2 z-50 min-w-[220px] rounded-md border border-octo-hairline bg-octo-panel-2 p-2 shadow-lg">
               <PerfRow label="App" g={stats.app} />
               <PerfRow label="Daemon" g={stats.daemon} />
               {/* ── Workspace caches section ── */}
