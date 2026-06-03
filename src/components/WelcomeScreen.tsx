@@ -76,27 +76,29 @@ export function WelcomeScreen({ onNewProject }: Props) {
           "radial-gradient(ellipse at center top, rgba(212,165,116,0.06), transparent 55%), var(--color-octo-onyx)",
       }}
     >
-      {/* Mark */}
+      {/* Mark — § logomark matching the app icon. Same brass-on-onyx
+          treatment as the .icns, rendered as type so it sharps at every
+          DPI without a separate asset. */}
       <div
         aria-hidden
-        className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif text-[26px] text-octo-brass"
+        className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif text-[34px] font-bold leading-none text-octo-brass"
         style={{ border: "1px solid var(--brass-dim)" }}
       >
-        O
+        §
         <span
           className="absolute -inset-2 rounded-full"
           style={{ border: "1px solid rgba(212, 165, 116, 0.15)" }}
         />
       </div>
 
-      {/* Logo */}
+      {/* Wordmark */}
       <h1 className="mt-6 font-serif text-[32px] leading-[1.05] tracking-[-0.01em] text-octo-ivory">
-        Octopus<span className="px-1.5 text-octo-brass">&amp;</span>you
+        Octopush
       </h1>
 
       {/* Tagline */}
       <div className="mt-2 font-mono text-[10px] uppercase tracking-[0.35em] text-octo-mute">
-        eight arms · one mind
+        an atelier for agentic developers
       </div>
 
       {/* Brass rule */}
