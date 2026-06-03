@@ -1154,7 +1154,7 @@ function App() {
         isCollapsed={isRailCollapsed}
       />
 
-      <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="ml-4 flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* TOP HEADER BAND — spans the full main width and includes the mode
             switcher on its right, so the entire top of the app reads as one
             unified header card instead of two floating containers in
@@ -1381,7 +1381,7 @@ function App() {
             band above. Resizable via the 4px handle on the left edge:
             drag to widen/narrow, double-click to reset to default. */}
         <div
-          className="relative flex shrink-0 flex-col p-4 pl-0 pt-0"
+          className="relative flex shrink-0 flex-col p-4 pt-0"
           style={{ width: companionWidth }}
         >
           <div
