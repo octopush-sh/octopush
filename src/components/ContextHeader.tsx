@@ -88,7 +88,7 @@ export function ContextHeader({
       : undefined;
 
   return (
-    <div className="my-4 mr-4 flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-4 py-2">
+    <div className="my-4 mr-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
       {activeIssue ? (
         <div className="-mx-1 flex min-w-0 flex-1 items-center gap-2.5 rounded px-1">
           <span className="text-octo-brass" aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>◈</span>

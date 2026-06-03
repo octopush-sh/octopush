@@ -266,7 +266,7 @@ export function ChatView({
         )}
       </div>
 
-      <div className="border-t border-octo-hairline bg-octo-panel px-6 pb-0 pt-3">
+      <div className="rounded-md border-t border-octo-hairline bg-octo-panel px-6 pb-0 pt-3">
         {/* Model picker row — sits tight above the input box */}
         <div className="mb-2 flex items-center">
           <ModelPicker
@@ -279,7 +279,7 @@ export function ChatView({
         <div className="pb-4">
         <div
           className={clsx(
-            "rounded-xl border bg-octo-onyx transition-colors",
+            "rounded-md border bg-octo-onyx transition-colors",
             streaming
               ? "border-octo-hairline opacity-60"
               : "border-octo-hairline focus-within:border-octo-brass",

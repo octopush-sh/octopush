@@ -81,7 +81,7 @@ export function Companion({
 
   return (
     <aside
-      className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-xl border border-octo-hairline bg-octo-panel"
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
       <div className="flex items-center justify-center border-b border-octo-hairline px-3 py-2">
