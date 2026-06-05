@@ -1043,10 +1043,14 @@ pub async fn clone_project(
     // Insert into DB and return ProjectInfo.
     let id = uuid::Uuid::new_v4().to_string();
     let path_str = target_path.to_string_lossy().to_string();
-    state
-        .db
-        .lock()
-        .insert_project(&id, &target_name, &path_str)?;
+    {
+        let db = state.db.lock();
+        db.insert_project(&id, &target_name, &path_str)?;
+        // Auto-create a workspace for the cloned repo's default branch, so the
+        // user lands on a usable "main"/"master" workspace instead of the empty
+        // state — same as open_project/create_project.
+        ensure_main_workspace(&db, &id, &path_str)?;
+    }
 
     Ok(ProjectInfo {
         id,
