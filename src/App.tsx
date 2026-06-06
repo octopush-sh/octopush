@@ -1550,6 +1550,11 @@ function App() {
           recentProjects.find((p) => p.id === workspace.projectId) ??
           (project?.id === workspace.projectId ? project : null);
         const wsPath = workspace.worktreePath ?? proj?.path ?? "";
+        // Main worktree detection. The backend stores the main workspace's
+        // worktree_path equal to the project root (never null), so the second
+        // clause normally decides this; the null check is a defensive fallback.
+        // Note: this is a raw string compare — the backend canonicalizes paths,
+        // so a symlinked/non-canonical project path could in theory miss here.
         const isMain = !workspace.worktreePath || (!!proj && workspace.worktreePath === proj.path);
         const copy = async (text: string, label: string) => {
           setContextMenu(null);
@@ -1596,7 +1601,7 @@ function App() {
               setDeletingWorkspaceId(contextMenu.workspaceId);
             }}
             onClose={() => setContextMenu(null)}
-            linkageKind={wsLinkage.kind === "linked" ? "linked" : "unlinked"}
+            linkageKind={wsLinkage.kind}
             onLinkJira={() => {
               setJiraTicketPickerOpen({ workspaceId: contextMenu.workspaceId, mode: "link" });
               setContextMenu(null);
