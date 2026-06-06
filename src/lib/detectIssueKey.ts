@@ -6,3 +6,16 @@ export function detectIssueKey(branch: string): string | null {
   const m = branch.match(/(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+/);
   return m ? m[0] : null;
 }
+
+/** Like {@link detectIssueKey} but only returns a key that belongs to the
+ *  project's configured Jira key (e.g. "OCT" → accepts "OCT-12", rejects
+ *  "UTF-8"). Returns null when the project has no configured key, so we never
+ *  surface a guessed ticket we can't validate (C5). */
+export function detectIssueKeyForProject(
+  branch: string,
+  projectKey: string | null,
+): string | null {
+  if (!projectKey) return null;
+  const key = detectIssueKey(branch);
+  return key && key.startsWith(projectKey + "-") ? key : null;
+}
