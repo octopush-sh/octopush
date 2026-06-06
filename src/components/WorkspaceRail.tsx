@@ -34,6 +34,18 @@ interface Props {
   isCollapsed: boolean;
 }
 
+const COLLAPSE_KEY = "railProjectCollapsed";
+
+/** Per-project collapsed map from localStorage. Absent id ⇒ expanded (§4.6). */
+function loadCollapsedFromStorage(): Record<string, boolean> {
+  try {
+    const stored = localStorage.getItem(COLLAPSE_KEY);
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
 export function WorkspaceRail({
   projects,
   activeWorkspaceId,
@@ -47,6 +59,20 @@ export function WorkspaceRail({
   onReopenProject,
   isCollapsed,
 }: Props) {
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
+    loadCollapsedFromStorage,
+  );
+  const toggleProjectCollapsed = (projectId: string) => {
+    setCollapsedProjects((prev) => {
+      const next = { ...prev, [projectId]: !prev[projectId] };
+      try {
+        localStorage.setItem(COLLAPSE_KEY, JSON.stringify(next));
+      } catch (err) {
+        console.error("Failed to persist railProjectCollapsed:", err);
+      }
+      return next;
+    });
+  };
   return (
     <aside
       className={`flex h-full flex-col items-center border-r border-octo-hairline bg-octo-panel pb-3 pt-9 transition-all duration-[220ms] ${
@@ -78,16 +104,31 @@ export function WorkspaceRail({
                   <ProjectMark size={15} className="shrink-0" />
                   {project.name}
                 </div>
-                {onNewWorkspaceForProject && (
+                <div className="flex items-center gap-1">
+                  {onNewWorkspaceForProject && (
+                    <button
+                      type="button"
+                      onClick={() => onNewWorkspaceForProject(project.id)}
+                      title={`New workspace in ${project.name}`}
+                      className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 text-xs text-octo-mute hover:text-octo-brass"
+                    >
+                      +
+                    </button>
+                  )}
                   <button
                     type="button"
-                    onClick={() => onNewWorkspaceForProject(project.id)}
-                    title={`New workspace in ${project.name}`}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 text-xs text-octo-mute hover:text-octo-brass"
+                    onClick={() => toggleProjectCollapsed(project.id)}
+                    aria-expanded={!collapsedProjects[project.id]}
+                    aria-label={
+                      collapsedProjects[project.id]
+                        ? `Expand ${project.name}`
+                        : `Collapse ${project.name}`
+                    }
+                    className="flex items-center justify-center h-5 w-5 text-[10px] text-octo-mute hover:text-octo-brass transition"
                   >
-                    +
+                    <span aria-hidden="true">{collapsedProjects[project.id] ? "›" : "⌄"}</span>
                   </button>
-                )}
+                </div>
               </div>
             );
             })()}
@@ -100,7 +141,8 @@ export function WorkspaceRail({
             )}
 
             {/* Workspaces in this project */}
-            {(project?.workspaces || []).map((ws) => (
+            {(isCollapsed || !collapsedProjects[project.id]) &&
+              (project?.workspaces || []).map((ws) => (
               <WorkspaceRow
                 key={ws?.id || `ws-${projectIndex}`}
                 workspace={ws}

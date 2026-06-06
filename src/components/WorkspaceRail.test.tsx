@@ -42,7 +42,12 @@ describe("WorkspaceRail", () => {
         onCustomize={vi.fn()}
       />,
     );
-    expect(screen.getAllByRole("button")).toHaveLength(workspaces.length);
+    const workspaceButtons = screen
+      .getAllByRole("button")
+      .filter((b) =>
+        workspaces.some((ws) => ws.name === b.getAttribute("aria-label")),
+      );
+    expect(workspaceButtons).toHaveLength(workspaces.length);
   });
 
   it("renders the workspace monogram glyph", () => {
