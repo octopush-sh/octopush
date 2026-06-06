@@ -68,6 +68,8 @@ export function WorkspaceRail({
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
     loadCollapsedFromStorage,
   );
+  const [filter, setFilter] = useState("");
+  const q = filter.trim().toLowerCase();
   const toggleProjectCollapsed = (projectId: string) => {
     setCollapsedProjects((prev) => {
       const next = { ...prev, [projectId]: !prev[projectId] };
@@ -87,7 +89,29 @@ export function WorkspaceRail({
       aria-label="Workspaces"
     >
       <div className={`flex-1 flex flex-col w-full overflow-y-auto ${isCollapsed ? "gap-0.5" : "gap-2"}`}>
-        {(projects || []).map((project, projectIndex) => (
+        {!isCollapsed && (
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") setFilter(""); }}
+            placeholder="Filter projects & workspaces"
+            spellCheck={false}
+            aria-label="Filter the rail"
+            className="mx-3 mb-2 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
+          />
+        )}
+        {(projects || []).map((project, projectIndex) => {
+          const nameMatch = q === "" || project.name.toLowerCase().includes(q);
+          const visibleWs =
+            q === "" || nameMatch
+              ? (project?.workspaces || [])
+              : (project?.workspaces || []).filter((w) =>
+                  (w?.name ?? "").toLowerCase().includes(q),
+                );
+          // While filtering, hide projects with no hit and force-expand matches.
+          if (q !== "" && !nameMatch && visibleWs.length === 0) return null;
+          const projectExpanded = q !== "" ? true : !collapsedProjects[project.id];
+          return (
           <div key={project?.id || `project-${projectIndex}`} className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`} style={{ marginBottom: isCollapsed && projectIndex < projects.length - 1 ? '0.5rem' : !isCollapsed && projectIndex < projects.length - 1 ? '0.75rem' : '0' }}>
             {/* Project header (only when expanded) */}
             {!isCollapsed && project?.name && (() => {
@@ -172,8 +196,8 @@ export function WorkspaceRail({
             )}
 
             {/* Workspaces in this project */}
-            {(isCollapsed || !collapsedProjects[project.id]) &&
-              (project?.workspaces || []).map((ws) => (
+            {(isCollapsed || projectExpanded) &&
+              visibleWs.map((ws) => (
               <WorkspaceRow
                 key={ws?.id || `ws-${projectIndex}`}
                 workspace={ws}
@@ -198,14 +222,15 @@ export function WorkspaceRail({
 
             {/* Empty project (expanded rail, expanded project, no workspaces). */}
             {!isCollapsed &&
-              !collapsedProjects[project.id] &&
-              (project?.workspaces || []).length === 0 && (
+              projectExpanded &&
+              visibleWs.length === 0 && (
                 <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
                   No workspaces yet
                 </div>
               )}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Recently closed (expanded rail only) */}
