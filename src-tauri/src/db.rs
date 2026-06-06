@@ -177,6 +177,16 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN closed_at TEXT",
         )?;
+        // ── v4 organize: manual rail ordering. `pinned` floats a project to
+        // the top; `sort_order` is the manual position within its group.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN sort_order INTEGER",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -555,20 +565,23 @@ impl Db {
         Ok(())
     }
 
-    pub fn list_projects(&self) -> AppResult<Vec<(String, String, String, String, Option<String>)>> {
+    pub fn list_projects(
+        &self,
+    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key FROM projects \
-             WHERE closed_at IS NULL ORDER BY created_at ASC",
+            "SELECT id, name, path, last_opened, jira_project_key, pinned FROM projects \
+             WHERE closed_at IS NULL \
+             ORDER BY pinned DESC, sort_order IS NULL, sort_order ASC, created_at ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get_project(&self, project_id: &str) -> AppResult<Option<crate::commands::ProjectInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, jira_project_key FROM projects WHERE id = ?1",
+            "SELECT id, name, path, jira_project_key, pinned FROM projects WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![project_id], |r| {
@@ -577,6 +590,7 @@ impl Db {
                     name: r.get(1)?,
                     path: r.get(2)?,
                     jira_project_key: r.get(3)?,
+                    pinned: r.get::<_, i64>(4)? != 0,
                 })
             })
             .optional()?;
@@ -639,6 +653,24 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_project_pinned(&self, id: &str, pinned: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_project_order(&self, ids: &[String]) -> AppResult<()> {
+        for (idx, id) in ids.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE projects SET sort_order = ?1 WHERE id = ?2",
+                params![idx as i64, id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Soft-close: hide the project from the rail without deleting anything.
     pub fn close_project(&self, id: &str) -> AppResult<()> {
         self.conn.execute(
@@ -662,13 +694,13 @@ impl Db {
     /// newest first, capped at 10. Same tuple shape as `list_projects`.
     pub fn list_closed_projects(
         &self,
-    ) -> AppResult<Vec<(String, String, String, String, Option<String>)>> {
+    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key FROM projects \
+            "SELECT id, name, path, last_opened, jira_project_key, pinned FROM projects \
              WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 10",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }

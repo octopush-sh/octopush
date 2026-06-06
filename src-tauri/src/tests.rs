@@ -252,6 +252,31 @@ mod workspace_tests {
     }
 
     #[test]
+    fn pin_and_order_projects() {
+        let db = test_db();
+        db.insert_project("a", "A", "/tmp/octo-a").unwrap();
+        db.insert_project("b", "B", "/tmp/octo-b").unwrap();
+        db.insert_project("c", "C", "/tmp/octo-c").unwrap();
+
+        let ids: Vec<String> = db.list_projects().unwrap().into_iter().map(|t| t.0).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+
+        db.set_project_order(&["c".into(), "a".into(), "b".into()]).unwrap();
+        let ids: Vec<String> = db.list_projects().unwrap().into_iter().map(|t| t.0).collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+
+        db.set_project_pinned("b", true).unwrap();
+        let rows = db.list_projects().unwrap();
+        assert_eq!(rows[0].0, "b");
+        assert!(rows[0].5);
+        assert!(!rows[1].5);
+
+        db.set_project_pinned("b", false).unwrap();
+        let ids: Vec<String> = db.list_projects().unwrap().into_iter().map(|t| t.0).collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+    }
+
+    #[test]
     fn workspace_link_round_trip() {
         let db = test_db();
         db.insert_project("proj-link", "Test Project", "/tmp/proj-link")
