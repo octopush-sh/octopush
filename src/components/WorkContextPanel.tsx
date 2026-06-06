@@ -1,10 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, RotateCcw } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { ChevronDown, GitBranch, RotateCcw } from "lucide-react";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
-import type { Issue, LinkedIssueRef, StatusCategory } from "../lib/types";
+import type { Issue, LinkedIssueRef, StatusCategory, Workspace } from "../lib/types";
+import { detectIssueKey } from "../lib/detectIssueKey";
+import { TINTS } from "../lib/monogram";
 import {
   selectBacklog,
   selectBlocking,
@@ -57,6 +60,23 @@ export function WorkContextPanel({
   const parents = useParentIssuesStore((s) => s.parents);
   const loadAncestors = useParentIssuesStore((s) => s.loadAncestors);
 
+  // Workspaces of the current project, so each row can flag tickets that
+  // already have a workspace and offer a one-click jump to it.
+  const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const selectWorkspace = useWorkspaceStore((s) => s.select);
+
+  // issueKey → workspace. A ticket is "claimed" by a workspace via an explicit
+  // link (linkedIssueKey) or a branch whose name encodes the key — the same
+  // pairing App.tsx uses when linking. First match wins.
+  const workspaceByIssueKey = useMemo(() => {
+    const map = new Map<string, Workspace>();
+    for (const ws of workspaces) {
+      const key = ws.linkedIssueKey ?? detectIssueKey(ws.branch ?? "");
+      if (key && !map.has(key)) map.set(key, ws);
+    }
+    return map;
+  }, [workspaces]);
+
   const activeIssue = useActiveIssue(activeKey);
 
   // For sub-task active tickets we need the parent loaded to surface
@@ -80,12 +100,14 @@ export function WorkContextPanel({
     [activeIssue, parents],
   );
 
-  // Lazy-load the epic's open tickets the first time the Epic pill is
-  // selected — keeps the initial render cheap and avoids paying for a
-  // request the user may never look at.
+  // Load the epic's open tickets as soon as we can resolve the active
+  // ticket's epic. We can't lazy-load on pill-select like the other tabs:
+  // the Epic pill is hidden until its count is > 0, so without the data it
+  // would never become clickable (chicken-and-egg). loadEpic is idempotent
+  // and guards against duplicate requests.
   useEffect(() => {
-    if (activePill === "epic" && epicKey) void loadEpic(epicKey);
-  }, [activePill, epicKey, loadEpic]);
+    if (epicKey) void loadEpic(epicKey);
+  }, [epicKey, loadEpic]);
 
   const mineList     = useMemo(() => selectBacklog(issues ?? [], projectKey, activeKey), [issues, projectKey, activeKey]);
   const blockingList = useMemo(() => selectBlocking(activeIssue),                          [activeIssue]);
@@ -104,7 +126,15 @@ export function WorkContextPanel({
     { key: "blockedBy", label: "Blocked by",  count: blockedList.length,  rows: blockedList },
     { key: "epic",      label: "Epic",        count: epicList.length,     rows: epicList },
   ];
-  const visiblePills = allPills.filter((p) => p.key === "mine" || p.count > 0);
+  // Mine always shows. Epic shows whenever the active ticket has a resolvable
+  // epic — even with 0 siblings loaded yet — so it's visible while its tickets
+  // fetch; it only stays hidden once we know the epic has no other tickets.
+  // Every other pill shows only when it has rows.
+  const visiblePills = allPills.filter((p) => {
+    if (p.key === "mine") return true;
+    if (p.key === "epic") return !!epicKey && (p.count > 0 || !!epicLoadingByKey[epicKey]);
+    return p.count > 0;
+  });
 
   // If the previously-active pill just disappeared (e.g., a workspace
   // switch wiped its data), drop back to Mine so the body isn't empty.
@@ -258,6 +288,8 @@ export function WorkContextPanel({
                   <TicketRow
                     key={row.key}
                     row={row}
+                    workspace={workspaceByIssueKey.get(row.key)}
+                    onJump={selectWorkspace}
                     onContextMenu={
                       onTicketContextMenu && isFullIssue(row)
                         ? (x, y) => onTicketContextMenu(row, x, y)
@@ -290,15 +322,28 @@ function emptyCopy(pill: PillKey, subtaskLabel: string): string {
 
 interface RowProps {
   row: Issue | LinkedIssueRef;
+  /** The workspace that already owns this ticket, if any — surfaces the jump chip. */
+  workspace?: Workspace;
+  onJump?: (workspaceId: string) => void;
   onContextMenu?: (x: number, y: number) => void;
 }
 
-function TicketRow({ row, onContextMenu }: RowProps) {
+function TicketRow({ row, workspace, onJump, onContextMenu }: RowProps) {
+  const openTicket = () => ipc.openFileInSystem(row.url).catch(() => {});
   return (
-    <button
-      type="button"
+    // `group` so the jump chip can expand on row hover. Not a <button>: it now
+    // nests an interactive chip, and button-in-button is invalid HTML — so it's
+    // a div with the button role + keyboard activation.
+    <div
       role="button"
-      onClick={() => ipc.openFileInSystem(row.url).catch(() => {})}
+      tabIndex={0}
+      onClick={openTicket}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openTicket();
+        }
+      }}
       onContextMenu={
         onContextMenu
           ? (e) => {
@@ -307,7 +352,7 @@ function TicketRow({ row, onContextMenu }: RowProps) {
             }
           : undefined
       }
-      className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
+      className="group flex w-full cursor-pointer items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
       style={{ borderLeft: "1px solid transparent" }}
     >
       <span
@@ -333,9 +378,73 @@ function TicketRow({ row, onContextMenu }: RowProps) {
       >
         {row.summary}
       </span>
-      <span className="flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
+      {/* On rows that carry a jump chip, the status badge yields to the
+          expanding chip on hover so the summary keeps its room. */}
+      <span
+        className={`flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute ${
+          workspace && onJump ? "group-hover:hidden" : ""
+        }`}
+      >
         {row.statusName}
+      </span>
+      {workspace && onJump && <WorkspaceJumpChip workspace={workspace} onJump={onJump} />}
+    </div>
+  );
+}
+
+/** Marker on rows whose ticket already has a workspace. At rest it's a quiet
+ *  dot in the workspace's tint colour; on row hover it grows into a pill with
+ *  the workspace name. Clicking jumps to that workspace (stops the row's
+ *  open-in-Jira click). Combination of design proposals I (named chip) and
+ *  IV (workspace-tint identity). */
+function WorkspaceJumpChip({
+  workspace,
+  onJump,
+}: {
+  workspace: Workspace;
+  onJump: (workspaceId: string) => void;
+}) {
+  const tint = workspace.tint ?? "brass";
+  const accent = TINTS[tint].accent;
+  return (
+    <button
+      type="button"
+      title={`Jump to workspace · ${workspace.name}`}
+      aria-label={`Jump to workspace ${workspace.name}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        onJump(workspace.id);
+      }}
+      className="flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent p-0 transition-all duration-[200ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:brightness-110 group-hover:w-auto group-hover:justify-start group-hover:border-[color:var(--tint-bd)] group-hover:bg-[color:var(--tint-bg)] group-hover:px-[7px] group-hover:py-[2px]"
+      style={
+        {
+          color: accent,
+          // Expanded surface uses the tint at low alpha (same identity colour
+          // shown in the rail). Driven via CSS vars so the group-hover Tailwind
+          // utilities below can reference them.
+          "--tint-bg": hexToRgba(accent, 0.16),
+          "--tint-bd": hexToRgba(accent, 0.42),
+        } as CSSProperties
+      }
+    >
+      <span
+        className="h-[6px] w-[6px] flex-shrink-0 rounded-full"
+        style={{ background: accent }}
+      />
+      <GitBranch
+        size={11}
+        className="ml-0 w-0 opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:w-[11px] group-hover:opacity-100"
+      />
+      <span className="ml-0 max-w-0 overflow-hidden truncate font-mono text-[10px] leading-none opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:max-w-[120px] group-hover:opacity-100">
+        {workspace.name}
       </span>
     </button>
   );
+}
+
+/** `#rrggbb` → `rgba(r, g, b, a)`. Tints come from the monogram palette as
+ *  hex; the jump chip needs alpha variants for its hover surface. */
+function hexToRgba(hex: string, alpha: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
