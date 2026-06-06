@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { ChevronDown } from "lucide-react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import type { Workspace, ProjectInfo } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
@@ -126,7 +127,13 @@ export function WorkspaceRail({
                     }
                     className="flex items-center justify-center h-5 w-5 text-[10px] text-octo-mute hover:text-octo-brass transition"
                   >
-                    <span aria-hidden="true">{collapsedProjects[project.id] ? "›" : "⌄"}</span>
+                    <ChevronDown
+                      size={12}
+                      aria-hidden="true"
+                      className={`transition-transform duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
+                        collapsedProjects[project.id] ? "-rotate-90" : ""
+                      }`}
+                    />
                   </button>
                 </div>
               </div>

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ChevronDown } from "lucide-react";
 import { ProjectMark } from "./icons/ProjectMark";
 import type { ProjectInfo } from "../lib/types";
 
@@ -23,7 +24,13 @@ export function RecentlyClosedDrawer({ projects, onReopen }: Props) {
         className="flex w-full items-center justify-between px-3 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute transition hover:text-octo-sage"
       >
         <span>⟲ Recently closed · {projects.length}</span>
-        <span aria-hidden="true" className="text-[10px] leading-none">{open ? "⌄" : "›"}</span>
+        <ChevronDown
+          size={12}
+          aria-hidden="true"
+          className={`transition-transform duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
+            open ? "" : "-rotate-90"
+          }`}
+        />
       </button>
       {open && (
         <div id="recently-closed-panel" className="mt-1 flex flex-col">
