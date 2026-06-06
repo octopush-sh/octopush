@@ -1460,6 +1460,31 @@ mod provider_catalog_tests {
 }
 
 #[cfg(test)]
+mod editor_detection_tests {
+    #[test]
+    fn split_editor_command_parses_program_and_args() {
+        use crate::commands::split_editor_command;
+        assert_eq!(
+            split_editor_command("code"),
+            Some(("code".to_string(), vec![]))
+        );
+        assert_eq!(
+            split_editor_command("code -n"),
+            Some(("code".to_string(), vec!["-n".to_string()]))
+        );
+        assert_eq!(split_editor_command("   "), None);
+    }
+
+    #[test]
+    fn binary_on_path_finds_a_known_shell() {
+        use crate::commands::binary_on_path;
+        #[cfg(unix)]
+        assert!(binary_on_path("sh"));
+        assert!(!binary_on_path("definitely-not-a-real-binary-xyz"));
+    }
+}
+
+#[cfg(test)]
 mod pr_state_tests {
     #[test]
     fn pr_state_open_when_open_not_draft() {

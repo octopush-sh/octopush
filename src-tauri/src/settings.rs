@@ -34,6 +34,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub issue_tracker: Option<crate::issue_tracker::jira::JiraConfig>,
 
+    /// Optional override command for "Open in editor" (e.g. "code", "cursor").
+    /// When empty/None, the app autodetects an installed editor.
+    #[serde(default)]
+    pub editor_command: Option<String>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]

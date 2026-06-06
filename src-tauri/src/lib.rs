@@ -160,6 +160,9 @@ pub fn run() {
             // File operations
             commands::open_file_in_system,
             commands::reveal_in_finder,
+            commands::open_in_terminal,
+            commands::open_in_editor,
+            commands::detect_editors,
             // Clone
             commands::clone_project,
             // Budgets

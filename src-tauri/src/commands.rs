@@ -665,6 +665,141 @@ pub async fn reveal_in_finder(path: String) -> AppResult<()> {
     Ok(())
 }
 
+// ─── Editor detection + open in editor/terminal ───────────────────
+
+/// One detected editor available on the user's PATH.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorChoice {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+}
+
+/// (id, display name, CLI binary) for editors we know how to launch.
+const KNOWN_EDITORS: &[(&str, &str, &str)] = &[
+    ("vscode", "VS Code", "code"),
+    ("cursor", "Cursor", "cursor"),
+    ("zed", "Zed", "zed"),
+    ("sublime", "Sublime Text", "subl"),
+    ("intellij", "IntelliJ IDEA", "idea"),
+];
+
+/// True if `bin` is an executable found on PATH.
+pub(crate) fn binary_on_path(bin: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&paths) {
+        if dir.join(bin).is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        for ext in ["exe", "cmd", "bat"] {
+            if dir.join(format!("{bin}.{ext}")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Split an editor command string into (program, args). Returns None if empty.
+pub(crate) fn split_editor_command(cmd: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next()?.to_string();
+    let args = parts.map(|s| s.to_string()).collect();
+    Some((program, args))
+}
+
+/// Resolve which editor command to run: the configured override, else the
+/// first autodetected editor.
+fn resolve_editor_command() -> Option<String> {
+    if let Ok(settings) = crate::settings::load_settings() {
+        if let Some(cmd) = settings.editor_command {
+            let trimmed = cmd.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    KNOWN_EDITORS
+        .iter()
+        .find(|(_, _, cmd)| binary_on_path(cmd))
+        .map(|(_, _, cmd)| cmd.to_string())
+}
+
+#[tauri::command]
+pub async fn detect_editors() -> AppResult<Vec<EditorChoice>> {
+    Ok(KNOWN_EDITORS
+        .iter()
+        .filter(|(_, _, cmd)| binary_on_path(cmd))
+        .map(|(id, name, cmd)| EditorChoice {
+            id: id.to_string(),
+            name: name.to_string(),
+            command: cmd.to_string(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn open_in_editor(path: String) -> AppResult<()> {
+    let path = expand_tilde(&path);
+    if let Some(cmd) = resolve_editor_command() {
+        if let Some((program, args)) = split_editor_command(&cmd) {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg(&path)
+                .spawn()
+                .map_err(|e| AppError::Other(format!("Failed to open editor: {e}")))?;
+            return Ok(());
+        }
+    }
+    // No editor configured or detected — fall back to the OS default.
+    open_file_in_system(path).await
+}
+
+#[tauri::command]
+pub async fn open_in_terminal(path: String) -> AppResult<()> {
+    let path = expand_tilde(&path);
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg("Terminal")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| AppError::Other(format!("Failed to open terminal: {e}")))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(t) = std::env::var("TERMINAL") {
+            if !t.is_empty() {
+                candidates.push(t);
+            }
+        }
+        for t in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
+            candidates.push(t.to_string());
+        }
+        let mut spawned = false;
+        for t in candidates {
+            if std::process::Command::new(&t)
+                .current_dir(&path)
+                .spawn()
+                .is_ok()
+            {
+                spawned = true;
+                break;
+            }
+        }
+        if !spawned {
+            return Err(AppError::Other("No terminal emulator found".into()));
+        }
+    }
+    Ok(())
+}
+
 // ─── PTY daemon commands ──────────────────────────────────────────
 
 /// Describes a single PTY session known to the daemon.
