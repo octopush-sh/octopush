@@ -284,6 +284,8 @@ export interface AppSettings {
   lastPricingRefresh?: string | null;
   /** Optional "Open in editor" command override; empty/undefined → autodetect. */
   editorCommand?: string | null;
+  /** Jira/issue-tracker connection config (preserved across saves). */
+  issueTracker?: IssueTrackerConfig | null;
   /** @deprecated use providerKeys.anthropic */
   anthropicApiKey?: string | null;
   /** @deprecated use providerKeys.openai */
