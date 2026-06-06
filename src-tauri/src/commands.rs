@@ -721,6 +721,19 @@ pub async fn update_workspace_customization(
     )
 }
 
+#[tauri::command]
+pub async fn rename_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    name: String,
+) -> AppResult<()> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Other("Workspace name cannot be empty".into()));
+    }
+    state.db.lock().rename_workspace(&workspace_id, &name)
+}
+
 // ─── Chat commands ────────────────────────────────────────────────
 
 #[tauri::command]

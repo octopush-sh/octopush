@@ -233,6 +233,17 @@ mod workspace_tests {
     }
 
     #[test]
+    fn rename_workspace_updates_name() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-rn-p").unwrap();
+        db.insert_workspace("w1", "p", "old", "", "main", None, "")
+            .unwrap();
+        db.rename_workspace("w1", "new name").unwrap();
+        let rows = db.list_workspaces("p").unwrap();
+        assert_eq!(rows[0].name, "new name");
+    }
+
+    #[test]
     fn list_projects_is_stable_creation_order_not_recency() {
         let db = test_db();
         for id in ["proj-a", "proj-b", "proj-c"] {

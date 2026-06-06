@@ -815,6 +815,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn rename_workspace(&self, id: &str, name: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_workspace_customization(
         &self,
         workspace_id: &str,
