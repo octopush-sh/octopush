@@ -20,21 +20,27 @@ export function ArchivedWorkspacesModal({
 }: Props) {
   const [items, setItems] = useState<Workspace[] | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
+    setLoadError(false);
     ipc.listArchivedWorkspaces(projectId)
       .then((ws) => { if (alive) setItems(ws); })
-      .catch(() => { if (alive) setItems([]); });
+      .catch(() => { if (alive) { setItems([]); setLoadError(true); } });
     return () => { alive = false; };
   }, [projectId]);
 
   async function restore(w: Workspace) {
     setBusyId(w.id);
+    setActionError(null);
     try {
       await ipc.restoreWorkspace(w.id, projectPath, w.branch, w.worktreePath ?? null);
       setItems((prev) => (prev ?? []).filter((x) => x.id !== w.id));
       onRestored(projectId);
+    } catch (err) {
+      setActionError(`Couldn't restore "${w.name}": ${String(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -48,6 +54,10 @@ export function ArchivedWorkspacesModal({
       <div className="mt-3 max-h-[300px] overflow-y-auto">
         {items === null ? (
           <div className="py-4 text-center font-mono text-[11px] text-octo-mute">Loading…</div>
+        ) : loadError ? (
+          <div className="py-4 text-center font-mono text-[11px] text-octo-rouge">
+            Couldn't load archived workspaces
+          </div>
         ) : items.length === 0 ? (
           <div className="py-4 text-center font-mono text-[11px] text-octo-mute">No archived workspaces</div>
         ) : (
@@ -69,6 +79,9 @@ export function ArchivedWorkspacesModal({
           </ul>
         )}
       </div>
+      {actionError && (
+        <div className="mt-2 font-mono text-[10px] text-octo-rouge">{actionError}</div>
+      )}
       <div className="mt-4 flex justify-end">
         <button type="button" onClick={onClose} className="rounded-md px-3 py-1.5 font-sans text-[12px] text-octo-mute hover:text-octo-sage">
           Close
