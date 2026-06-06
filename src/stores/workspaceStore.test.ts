@@ -53,6 +53,7 @@ const mockIpc = {
   workspacesGitSummary: vi.fn(),
   archiveWorkspace: vi.fn(),
   renameWorkspace: vi.fn(),
+  openPrsForProject: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -69,6 +70,7 @@ function resetStore() {
     lastActiveByProject: {},
     workspacesByProjectId: {},
     gitSummaryByWs: {},
+    prByWs: {},
   });
   nextId = 0;
   useProjectStore.setState({ current: null, recent: [], closed: [], loading: false, error: null });
@@ -358,6 +360,41 @@ describe("workspaceStore — archive & rename", () => {
     expect(mockIpc.renameWorkspace).toHaveBeenCalledWith(a.id, "renamed");
     expect(s.workspaces[0].name).toBe("renamed");
     expect(s.workspacesByProjectId.p1[0].name).toBe("renamed");
+  });
+});
+
+describe("workspaceStore — prByWs", () => {
+  beforeEach(() => resetStore());
+
+  it("maps open PRs onto workspaces by branch (and null when none)", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    const b = makeWorkspace("p1", "beta");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a, b] } });
+    mockIpc.openPrsForProject.mockResolvedValueOnce([
+      { branch: a.branch, pr: { number: 1, title: "A", url: "u1", isDraft: false, state: "open" } },
+    ]);
+
+    await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+
+    const map = useWorkspaceStore.getState().prByWs;
+    expect(map[a.id]?.number).toBe(1);
+    expect(map[b.id]).toBeNull();
+    expect(mockIpc.openPrsForProject).toHaveBeenCalledWith("/repo/p1");
+  });
+
+  it("preserves prByWs entries from other projects", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [a] },
+      prByWs: { other: { number: 9, title: "O", url: "uo", isDraft: false, state: "open" } },
+    });
+    mockIpc.openPrsForProject.mockResolvedValueOnce([]);
+
+    await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+
+    const map = useWorkspaceStore.getState().prByWs;
+    expect(map.other).toBeDefined();
+    expect(map[a.id]).toBeNull();
   });
 });
 

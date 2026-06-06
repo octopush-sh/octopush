@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
-import type { Workspace, WorkspaceGitSummary } from "../lib/types";
+import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
 
 interface WorkspaceState {
   workspaces: Workspace[];
@@ -18,6 +18,8 @@ interface WorkspaceState {
   workspacesByProjectId: Record<string, Workspace[]>;
   /** Per-workspace git signal for the rail, keyed by workspace id. */
   gitSummaryByWs: Record<string, WorkspaceGitSummary>;
+  /** Open PR per workspace id (null = none), for the rail indicator. */
+  prByWs: Record<string, Pr | null>;
 
   load: (projectId: string) => Promise<void>;
   loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
@@ -40,6 +42,8 @@ interface WorkspaceState {
   pruneProject: (projectId: string) => void;
   /** Fetch + merge a project's per-workspace git summaries into the cache. */
   loadGitSummaries: (projectId: string) => Promise<void>;
+  /** Fetch a project's open PRs (gh batch) and map them onto its workspaces by branch. */
+  loadProjectPrs: (projectId: string, projectPath: string) => Promise<void>;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -63,6 +67,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   lastActiveByProject: loadLastActiveFromStorage(),
   workspacesByProjectId: {},
   gitSummaryByWs: {},
+  prByWs: {},
 
   load: async (projectId) => {
     set({ loading: true });
@@ -260,6 +265,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       });
     } catch {
       // Non-critical — the rail just shows no signal for this project.
+    }
+  },
+
+  loadProjectPrs: async (projectId, projectPath) => {
+    try {
+      const branchPrs = await ipc.openPrsForProject(projectPath);
+      const byBranch = new Map(branchPrs.map((bp) => [bp.branch, bp.pr]));
+      set((s) => {
+        const wss = s.workspacesByProjectId[projectId] ?? [];
+        const next = { ...s.prByWs };
+        for (const w of wss) next[w.id] = byBranch.get(w.branch) ?? null;
+        return { prByWs: next };
+      });
+    } catch {
+      // Non-critical — no PR indicators for this project.
     }
   },
 
