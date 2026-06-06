@@ -41,6 +41,8 @@ interface Props {
 
 const POLL_MS = 5_000;
 
+const MAX_VISIBLE_FILES = 200;
+
 export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
@@ -312,7 +314,7 @@ function Section({
         </div>
       ) : (
         <ul className="pb-2">
-          {files.map((file) => (
+          {files.slice(0, MAX_VISIBLE_FILES).map((file) => (
             <FileRow
               key={file.path}
               file={file}
@@ -322,6 +324,11 @@ function Section({
               toggleMode={toggleMode}
             />
           ))}
+          {files.length > MAX_VISIBLE_FILES && (
+            <div className="px-3 py-2 font-mono text-[11px] text-octo-mute">
+              +{files.length - MAX_VISIBLE_FILES} more changed files
+            </div>
+          )}
         </ul>
       )}
     </div>
