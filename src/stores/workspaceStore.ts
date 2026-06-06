@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
+import { useProjectStore } from "./projectStore";
 import type { Workspace } from "../lib/types";
 
 interface WorkspaceState {
@@ -28,6 +29,9 @@ interface WorkspaceState {
    */
   rememberActiveForProject: (projectId: string, workspaceId: string) => void;
   remove: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
+  /** Drop a whole project's workspaces from the rail map; clears the active
+   *  workspace too if it belonged to that project. Used on project close/delete. */
+  pruneProject: (projectId: string) => void;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -102,6 +106,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript) => {
     const ws = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript);
+    // Only the currently-open project owns the flat `workspaces`/`activeId`.
+    // Creating for any other project must not steal focus or corrupt that
+    // list — it just lands in the per-project map for the rail (C3).
+    const isActiveProject = useProjectStore.getState().current?.id === projectId;
     set((s) => {
       const updated = { ...s.lastActiveByProject, [projectId]: ws.id };
       try {
@@ -110,11 +118,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         console.error("Failed to persist lastActiveByProject:", err);
       }
       return {
-        // Append: new workspaces always sit at the end of their project's
-        // list (matching the backend's created_at ASC ordering). They still
-        // become active so the user lands on the freshly created workspace.
-        workspaces: [...s.workspaces, ws],
-        activeId: ws.id,
+        // New workspaces sit at the end of their project's list (matching the
+        // backend's created_at ASC ordering).
+        workspaces: isActiveProject ? [...s.workspaces, ws] : s.workspaces,
+        activeId: isActiveProject ? ws.id : s.activeId,
         lastActiveByProject: updated,
         workspacesByProjectId: {
           ...s.workspacesByProjectId,
@@ -177,6 +184,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       };
     });
   },
+
+  pruneProject: (projectId) =>
+    set((s) => {
+      const removed = s.workspacesByProjectId[projectId] ?? [];
+      const removedIds = new Set(removed.map((w) => w.id));
+      const { [projectId]: _dropped, ...restByProject } = s.workspacesByProjectId;
+      // If the active workspace belonged to the pruned project, the flat list
+      // is now that project's — clear it so the app falls to the empty state.
+      const activeWasPruned = !!s.activeId && removedIds.has(s.activeId);
+      return {
+        workspacesByProjectId: restByProject,
+        workspaces: activeWasPruned ? [] : s.workspaces,
+        activeId: activeWasPruned ? null : s.activeId,
+      };
+    }),
 
   updateCustomization: async (workspaceId, glyph, tint) => {
     await ipc.updateWorkspaceCustomization(workspaceId, glyph, tint as any);

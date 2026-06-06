@@ -11,7 +11,11 @@
  * 3. rememberActiveForProject() records + persists the per-project selection.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Workspace } from "../lib/types";
+import type { Workspace, ProjectInfo } from "../lib/types";
+
+function makeProject(id: string): ProjectInfo {
+  return { id, name: id.toUpperCase(), path: `/repo/${id}`, jiraProjectKey: null };
+}
 
 let nextId = 0;
 function makeWorkspace(projectId: string, name: string): Workspace {
@@ -51,6 +55,7 @@ const mockIpc = {
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useWorkspaceStore } = await import("./workspaceStore");
+const { useProjectStore } = await import("./projectStore");
 
 function resetStore() {
   useWorkspaceStore.setState({
@@ -62,6 +67,7 @@ function resetStore() {
     workspacesByProjectId: {},
   });
   nextId = 0;
+  useProjectStore.setState({ current: null, recent: [], closed: [], loading: false, error: null });
   vi.clearAllMocks();
   try {
     localStorage.clear();
@@ -143,13 +149,15 @@ describe("workspaceStore — load activation", () => {
   });
 });
 
-describe("workspaceStore — create", () => {
+describe("workspaceStore — create (project-aware, C3)", () => {
   beforeEach(() => resetStore());
 
-  it("appends the new workspace to the end and makes it active", async () => {
+  it("appends + activates when creating for the currently-open project", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
     const existing = makeWorkspace("proj-1", "alpha");
     useWorkspaceStore.setState({
       workspaces: [existing],
+      activeId: existing.id,
       workspacesByProjectId: { "proj-1": [existing] },
     });
     const created = makeWorkspace("proj-1", "beta");
@@ -160,14 +168,71 @@ describe("workspaceStore — create", () => {
       .create("proj-1", "/repo", "beta", "", created.branch, "main", "");
 
     const s = useWorkspaceStore.getState();
-    // New workspace is LAST, not first.
     expect(s.workspaces.map((w) => w.id)).toEqual([existing.id, created.id]);
     expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([
       existing.id,
       created.id,
     ]);
-    // ...but it becomes the active workspace.
     expect(s.activeId).toBe(created.id);
+  });
+
+  it("does NOT pollute the flat list or activeId when creating for a non-active project", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const activeWs = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [activeWs],
+      activeId: activeWs.id,
+      workspacesByProjectId: { "proj-1": [activeWs] },
+    });
+    const created = makeWorkspace("proj-2", "gamma");
+    mockIpc.createWorkspace.mockResolvedValueOnce(created);
+
+    await useWorkspaceStore
+      .getState()
+      .create("proj-2", "/repo2", "gamma", "", created.branch, "main", "");
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspaces.map((w) => w.id)).toEqual([activeWs.id]);
+    expect(s.activeId).toBe(activeWs.id);
+    expect(s.workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([created.id]);
+  });
+});
+
+describe("workspaceStore — pruneProject (C8)", () => {
+  beforeEach(() => resetStore());
+
+  it("removes the project's group and clears active when the pruned project was active", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a] },
+    });
+
+    useWorkspaceStore.getState().pruneProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspacesByProjectId["proj-1"]).toBeUndefined();
+    expect(s.workspaces).toEqual([]);
+    expect(s.activeId).toBeNull();
+  });
+
+  it("leaves the flat list + active intact when pruning a non-active project", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-2", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a], "proj-2": [b] },
+    });
+
+    useWorkspaceStore.getState().pruneProject("proj-2");
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspacesByProjectId["proj-2"]).toBeUndefined();
+    expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([a.id]);
+    expect(s.workspaces.map((w) => w.id)).toEqual([a.id]);
+    expect(s.activeId).toBe(a.id);
   });
 });
 
