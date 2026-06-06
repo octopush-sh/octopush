@@ -354,14 +354,18 @@ export function ModelsPane() {
       // Save the catalog first — it validates server-side and throws on invalid
       // input, so we don't write settings.json for a rejected catalog.
       await ipc.saveProviders(providers);
+      // Read-modify-write: save_settings overwrites the whole file, so we must
+      // merge onto the existing settings — otherwise we'd wipe gitCredentials,
+      // issueTracker, editorCommand, and lastPricingRefresh.
+      const current = await ipc.getSettings();
       await ipc.saveSettings({
+        ...current,
         providerKeys: Object.fromEntries(
           Object.entries(keys).filter(([, v]) => v && v.length > 0),
         ),
         providerBaseUrls: Object.fromEntries(
           Object.entries(baseUrls).filter(([, v]) => v && v.length > 0),
         ),
-        gitCredentials: {},
       });
       // Refresh models so the picker reflects edits
       await ipc.listModels?.();
