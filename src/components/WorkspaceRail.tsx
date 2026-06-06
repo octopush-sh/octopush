@@ -285,7 +285,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                       {...listeners}
                       aria-label={`Reorder ${project.name}`}
                       title="Drag to reorder"
-                      className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 cursor-grab text-octo-mute hover:text-octo-brass"
+                      className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 cursor-grab active:cursor-grabbing text-octo-mute hover:text-octo-brass focus-visible:text-octo-brass outline-none"
                     >
                       <GripVertical size={12} aria-hidden="true" />
                     </button>
