@@ -184,6 +184,15 @@ pub fn get_status(path: &Path) -> AppResult<GitStatus> {
     Ok(GitStatus { branch, changed_files, ahead, behind, has_upstream })
 }
 
+/// Compact git signal for the rail: `(dirty, ahead, behind)`.
+/// `dirty` is true when the worktree has any staged/unstaged/untracked change.
+/// Thin wrapper over [`get_status`]; lives here so it can be unit-tested
+/// against a temp repo without the Tauri command/DB layer.
+pub fn dirty_ahead_behind(path: &Path) -> AppResult<(bool, usize, usize)> {
+    let status = get_status(path)?;
+    Ok((!status.changed_files.is_empty(), status.ahead, status.behind))
+}
+
 /// Return (ahead, behind) commits relative to the configured upstream of
 /// HEAD. Returns None if no upstream is configured (e.g. a branch that has
 /// never been pushed) or the comparison cannot be computed.
@@ -350,4 +359,26 @@ pub fn get_diff_text(path: &Path) -> AppResult<String> {
         true
     }).map_err(|e| AppError::Other(format!("diff print: {e}")))?;
     Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn dirty_ahead_behind_reports_clean_then_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+
+        // Freshly initialized repo, no files → clean, no upstream → 0/0.
+        let (dirty, ahead, behind) = dirty_ahead_behind(dir.path()).unwrap();
+        assert!(!dirty, "empty repo should be clean");
+        assert_eq!((ahead, behind), (0, 0));
+
+        // An untracked file makes it dirty (get_status includes untracked).
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let (dirty2, _, _) = dirty_ahead_behind(dir.path()).unwrap();
+        assert!(dirty2, "untracked file should mark the worktree dirty");
+    }
 }
