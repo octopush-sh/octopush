@@ -734,7 +734,7 @@ impl Db {
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
-             FROM workspaces WHERE project_id = ?1 ORDER BY created_at ASC",
+             FROM workspaces WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
             Ok(WorkspaceRow {
@@ -802,6 +802,16 @@ impl Db {
 
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Mark a workspace archived (worktree removed, branch kept). The row
+    /// survives but is hidden from the rail.
+    pub fn archive_workspace(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 

@@ -662,6 +662,49 @@ pub async fn delete_workspace(
     Ok(())
 }
 
+// ─── Archive workspace ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn archive_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    project_path: String,
+    branch: String,
+    worktree_path: Option<String>,
+) -> AppResult<()> {
+    let project_path = expand_tilde(&project_path);
+    let project_path_abs = std::fs::canonicalize(&project_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
+
+    // The "main" workspace points at the project root itself. Never touch the
+    // disk for it — just flip the DB row to archived. (Unlike delete, archive
+    // always keeps the branch.)
+    let is_main_workspace = worktree_path
+        .as_deref()
+        .map(|wt| {
+            let wt_abs = std::fs::canonicalize(wt)
+                .unwrap_or_else(|_| std::path::PathBuf::from(wt));
+            wt_abs == project_path_abs
+        })
+        .unwrap_or(false);
+
+    if !is_main_workspace {
+        // Remove worktree directory
+        if let Some(wt) = &worktree_path {
+            let wt_path = std::path::Path::new(wt);
+            if wt_path.exists() {
+                let _ = std::fs::remove_dir_all(wt_path);
+            }
+        }
+        // Prune worktree ref — but KEEP the branch (this is the whole point of
+        // archive vs delete).
+        let _ = crate::git_ops::delete_worktree(std::path::Path::new(&project_path), &branch);
+    }
+    // Mark archived in DB (row survives, hidden from the rail)
+    state.db.lock().archive_workspace(&workspace_id)?;
+    Ok(())
+}
+
 // ─── Update workspace customization ──────────────────────────────
 
 #[tauri::command]

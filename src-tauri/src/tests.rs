@@ -214,6 +214,25 @@ mod workspace_tests {
     }
 
     #[test]
+    fn archive_hides_workspace_but_keeps_row() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-arch-p").unwrap();
+        db.insert_workspace("w1", "p", "ws", "", "main", None, "")
+            .unwrap();
+        db.insert_workspace("w2", "p", "ws", "", "feat/keep", None, "")
+            .unwrap();
+        assert_eq!(db.list_workspaces("p").unwrap().len(), 2);
+
+        db.archive_workspace("w1").unwrap();
+
+        let rows = db.list_workspaces("p").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "w2");
+        // The archived row still exists, just hidden from the rail.
+        assert!(db.get_workspace("w1").unwrap().is_some());
+    }
+
+    #[test]
     fn list_projects_is_stable_creation_order_not_recency() {
         let db = test_db();
         for id in ["proj-a", "proj-b", "proj-c"] {
