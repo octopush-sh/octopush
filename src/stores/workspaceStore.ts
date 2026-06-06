@@ -31,6 +31,10 @@ interface WorkspaceState {
    */
   rememberActiveForProject: (projectId: string, workspaceId: string) => void;
   remove: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
+  /** Archive a workspace (worktree removed, branch kept) — drops it from the rail. */
+  archive: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
+  /** Rename a workspace in the backend + both rail maps. */
+  rename: (workspaceId: string, name: string) => Promise<void>;
   /** Drop a whole project's workspaces from the rail map; clears the active
    *  workspace too if it belonged to that project. Used on project close/delete. */
   pruneProject: (projectId: string) => void;
@@ -188,6 +192,42 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         workspacesByProjectId: nextByProject,
         gitSummaryByWs: nextSummaries,
         activeId: s.activeId === workspaceId ? null : s.activeId,
+      };
+    });
+  },
+
+  archive: async (workspaceId, projectPath, branch, worktreePath) => {
+    await ipc.archiveWorkspace(workspaceId, projectPath, branch, worktreePath);
+    // Archived rows are excluded from list_workspaces, so drop locally like
+    // remove (also prune the git summary for hygiene).
+    set((s) => {
+      const nextByProject: Record<string, Workspace[]> = {};
+      for (const [pid, wss] of Object.entries(s.workspacesByProjectId)) {
+        nextByProject[pid] = wss.filter((w) => w.id !== workspaceId);
+      }
+      const { [workspaceId]: _dropped, ...nextSummaries } = s.gitSummaryByWs;
+      return {
+        workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
+        workspacesByProjectId: nextByProject,
+        gitSummaryByWs: nextSummaries,
+        activeId: s.activeId === workspaceId ? null : s.activeId,
+      };
+    });
+  },
+
+  rename: async (workspaceId, name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    await ipc.renameWorkspace(workspaceId, trimmed);
+    set((s) => {
+      const patch = (w: Workspace) => (w.id === workspaceId ? { ...w, name: trimmed } : w);
+      const nextByProject: Record<string, Workspace[]> = {};
+      for (const [pid, wss] of Object.entries(s.workspacesByProjectId)) {
+        nextByProject[pid] = wss.map(patch);
+      }
+      return {
+        workspaces: s.workspaces.map(patch),
+        workspacesByProjectId: nextByProject,
       };
     });
   },

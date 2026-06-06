@@ -51,6 +51,8 @@ const mockIpc = {
   createWorkspace: vi.fn(),
   updateWorkspaceCustomization: vi.fn(),
   workspacesGitSummary: vi.fn(),
+  archiveWorkspace: vi.fn(),
+  renameWorkspace: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -317,6 +319,45 @@ describe("workspaceStore — git summary cache", () => {
     await useWorkspaceStore.getState().remove(a.id, "/repo", a.branch, a.worktreePath);
 
     expect(useWorkspaceStore.getState().gitSummaryByWs[a.id]).toBeUndefined();
+  });
+});
+
+describe("workspaceStore — archive & rename", () => {
+  beforeEach(() => resetStore());
+
+  it("archive removes the workspace from the rail maps (like remove)", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    const b = makeWorkspace("p1", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [a, b],
+      activeId: a.id,
+      workspacesByProjectId: { p1: [a, b] },
+    });
+    mockIpc.archiveWorkspace.mockResolvedValueOnce(undefined);
+
+    await useWorkspaceStore.getState().archive(a.id, "/repo", a.branch, a.worktreePath);
+
+    const s = useWorkspaceStore.getState();
+    expect(mockIpc.archiveWorkspace).toHaveBeenCalledWith(a.id, "/repo", a.branch, a.worktreePath);
+    expect(s.workspacesByProjectId.p1.map((w) => w.id)).toEqual([b.id]);
+    expect(s.workspaces.map((w) => w.id)).toEqual([b.id]);
+    expect(s.activeId).toBeNull();
+  });
+
+  it("rename updates the name in both maps", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      workspacesByProjectId: { p1: [a] },
+    });
+    mockIpc.renameWorkspace.mockResolvedValueOnce(undefined);
+
+    await useWorkspaceStore.getState().rename(a.id, "renamed");
+
+    const s = useWorkspaceStore.getState();
+    expect(mockIpc.renameWorkspace).toHaveBeenCalledWith(a.id, "renamed");
+    expect(s.workspaces[0].name).toBe("renamed");
+    expect(s.workspacesByProjectId.p1[0].name).toBe("renamed");
   });
 });
 
