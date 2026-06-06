@@ -14,6 +14,7 @@ import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
 import { RenameDialog } from "./components/RenameDialog";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
 import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
+import { ArchivedWorkspacesModal } from "./components/ArchivedWorkspacesModal";
 import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -222,6 +223,7 @@ function App() {
   const [customizingProjectId, setCustomizingProjectId] = useState<string | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
+  const [archivedForProject, setArchivedForProject] = useState<{ id: string; name: string; path: string } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
 
@@ -1592,6 +1594,10 @@ function App() {
               setJiraProjectKeyEditorOpen({ projectId: projectContextMenu.projectId });
               setProjectContextMenu(null);
             }}
+            onViewArchived={() => {
+              setArchivedForProject({ id: proj.id, name: proj.name, path: proj.path });
+              setProjectContextMenu(null);
+            }}
             pinned={proj.pinned}
             canMoveUp={projectGroups.findIndex((g) => g.id === projectContextMenu.projectId) > 0}
             canMoveDown={(() => {
@@ -1626,6 +1632,23 @@ function App() {
           />
         );
       })()}
+
+      {archivedForProject && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/30 p-2"
+          onClick={() => setArchivedForProject(null)}
+        >
+          <div onClick={(e) => e.stopPropagation()}>
+            <ArchivedWorkspacesModal
+              projectId={archivedForProject.id}
+              projectName={archivedForProject.name}
+              projectPath={archivedForProject.path}
+              onRestored={(pid) => { void loadAllWorkspaces([pid]); }}
+              onClose={() => setArchivedForProject(null)}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Project customization menu */}
       {showProjectCustomizer && customizingProjectId && (() => {

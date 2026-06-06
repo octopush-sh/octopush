@@ -27,6 +27,7 @@ interface Props {
   onRename: () => void;
   onChangeTint: () => void;
   onSetJiraProjectKey?: () => void;
+  onViewArchived: () => void;
   pinned: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
@@ -56,6 +57,7 @@ export function ProjectContextMenu({
   onRename,
   onChangeTint,
   onSetJiraProjectKey,
+  onViewArchived,
   pinned,
   canMoveUp,
   canMoveDown,
@@ -110,6 +112,9 @@ export function ProjectContextMenu({
           <Link2 size={12} className="shrink-0" /> Set Jira project key…
         </button>
       )}
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onViewArchived)}>
+        <Archive size={12} className="shrink-0" /> Archived workspaces…
+      </button>
 
       <div className={SEP} />
 

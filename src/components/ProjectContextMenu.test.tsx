@@ -14,6 +14,7 @@ describe("ProjectContextMenu", () => {
     onOpenInTerminal: vi.fn(),
     onRename: vi.fn(),
     onChangeTint: vi.fn(),
+    onViewArchived: vi.fn(),
     pinned: false,
     canMoveUp: true,
     canMoveDown: true,
