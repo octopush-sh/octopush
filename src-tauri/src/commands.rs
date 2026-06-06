@@ -722,16 +722,26 @@ pub async fn restore_workspace(
     worktree_path: Option<String>,
 ) -> AppResult<()> {
     let project_path = expand_tilde(&project_path);
+    let project_path_abs = std::fs::canonicalize(&project_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
     // Recreate the worktree from the kept branch (create_worktree attaches to
     // the existing refs/heads/<branch>; it does NOT create a new branch), then
     // flip status back to active.
     if let Some(wt) = worktree_path {
         let wt = expand_tilde(&wt);
-        crate::git_ops::create_worktree(
-            std::path::Path::new(&project_path),
-            &branch,
-            std::path::Path::new(&wt),
-        )?;
+        // The "main" workspace points at the project root itself. Never recreate
+        // a worktree there — create_worktree self-heals by remove_dir_all'ing an
+        // existing target path, which would wipe the repo root. (Mirrors the
+        // is_main_workspace guard in archive_workspace/delete_workspace.)
+        let wt_abs = std::fs::canonicalize(&wt)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&wt));
+        if wt_abs != project_path_abs {
+            crate::git_ops::create_worktree(
+                std::path::Path::new(&project_path),
+                &branch,
+                std::path::Path::new(&wt),
+            )?;
+        }
     }
     state.db.lock().restore_workspace(&workspace_id)
 }
