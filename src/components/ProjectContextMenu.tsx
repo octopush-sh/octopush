@@ -8,6 +8,10 @@ import {
   Link2,
   Archive,
   Trash2,
+  Pin,
+  PinOff,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import { useMenuChrome } from "../lib/useMenuChrome";
 
@@ -23,6 +27,12 @@ interface Props {
   onRename: () => void;
   onChangeTint: () => void;
   onSetJiraProjectKey?: () => void;
+  pinned: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  onTogglePin: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
   onClose: () => void;
   onDelete: () => void;
   onDismiss: () => void;
@@ -46,6 +56,12 @@ export function ProjectContextMenu({
   onRename,
   onChangeTint,
   onSetJiraProjectKey,
+  pinned,
+  canMoveUp,
+  canMoveDown,
+  onTogglePin,
+  onMoveUp,
+  onMoveDown,
   onClose,
   onDelete,
   onDismiss,
@@ -97,11 +113,28 @@ export function ProjectContextMenu({
 
       <div className={SEP} />
 
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onTogglePin)}>
+        {pinned ? <PinOff size={12} className="shrink-0" /> : <Pin size={12} className="shrink-0" />}
+        {pinned ? "Unpin" : "Pin to top"}
+      </button>
+      {canMoveUp && (
+        <button type="button" role="menuitem" className={ITEM} onClick={run(onMoveUp)}>
+          <ChevronUp size={12} className="shrink-0" /> Move up
+        </button>
+      )}
+      {canMoveDown && (
+        <button type="button" role="menuitem" className={ITEM} onClick={run(onMoveDown)}>
+          <ChevronDown size={12} className="shrink-0" /> Move down
+        </button>
+      )}
+
+      <div className={SEP} />
+
       <button type="button" role="menuitem" className={DANGER} onClick={run(onClose)}>
         <Archive size={12} className="mt-0.5 shrink-0" />
         <span className="flex flex-col text-left">
           <span>Close project</span>
-          <span className="text-octo-mute">Removes it from the rail; folder stays on disk</span>
+          <span className="text-octo-mute">Restore it later from Recently closed</span>
         </span>
       </button>
       <button type="button" role="menuitem" className={DANGER} onClick={run(onDelete)}>

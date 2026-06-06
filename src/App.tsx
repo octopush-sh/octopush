@@ -122,6 +122,8 @@ function App() {
   const loadClosedProjects = useProjectStore((s) => s.loadClosed);
   const closeProjectAction = useProjectStore((s) => s.closeProject);
   const reopenProjectAction = useProjectStore((s) => s.reopenProject);
+  const setProjectPinnedAction = useProjectStore((s) => s.setPinned);
+  const setProjectOrderAction = useProjectStore((s) => s.setOrder);
   const openProject = useProjectStore((s) => s.open);
   const getLastOpenedPath = useProjectStore((s) => s.getLastOpenedPath);
   const saveLastOpenedPath = useProjectStore((s) => s.saveLastOpenedPath);
@@ -1565,6 +1567,34 @@ function App() {
             }}
             onSetJiraProjectKey={() => {
               setJiraProjectKeyEditorOpen({ projectId: projectContextMenu.projectId });
+              setProjectContextMenu(null);
+            }}
+            pinned={proj.pinned}
+            canMoveUp={projectGroups.findIndex((g) => g.id === projectContextMenu.projectId) > 0}
+            canMoveDown={(() => {
+              const i = projectGroups.findIndex((g) => g.id === projectContextMenu.projectId);
+              return i >= 0 && i < projectGroups.length - 1;
+            })()}
+            onTogglePin={() => {
+              void setProjectPinnedAction(projectContextMenu.projectId, !proj.pinned);
+              setProjectContextMenu(null);
+            }}
+            onMoveUp={() => {
+              const ids = projectGroups.map((g) => g.id);
+              const i = ids.indexOf(projectContextMenu.projectId);
+              if (i > 0) {
+                [ids[i - 1], ids[i]] = [ids[i], ids[i - 1]];
+                void setProjectOrderAction(ids);
+              }
+              setProjectContextMenu(null);
+            }}
+            onMoveDown={() => {
+              const ids = projectGroups.map((g) => g.id);
+              const i = ids.indexOf(projectContextMenu.projectId);
+              if (i >= 0 && i < ids.length - 1) {
+                [ids[i + 1], ids[i]] = [ids[i], ids[i + 1]];
+                void setProjectOrderAction(ids);
+              }
               setProjectContextMenu(null);
             }}
             onClose={() => handleCloseProject(projectContextMenu.projectId)}
