@@ -245,6 +245,7 @@ function App() {
 
   // Layout version (forces TerminalPane fit-resize when sidebar/companion toggle)
   const layoutVersionRef = useRef(0);
+  const gitSigRef = useRef<string>("");
   const [layoutVersion, setLayoutVersion] = useState(0);
   const bumpLayout = useCallback(() => {
     layoutVersionRef.current += 1;
@@ -462,33 +463,54 @@ function App() {
   // polling, the Review panel would show stale "Nothing to review" until the
   // user toggled workspaces. 3s is the sweet spot — fast enough to feel live,
   // not so often that we hammer git on huge repos.
+  // ── Mode helpers ──
+  const activeMode: WorkspaceMode =
+    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
+
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
     const path = ws?.worktreePath ?? project?.path;
     if (!path) {
       setGitStatus(null);
       setGitDiff("");
+      gitSigRef.current = "";
       return;
     }
     let cancelled = false;
-    const refresh = () => {
-      Promise.all([
-        ipc.getGitStatus(path),
-        ipc.getGitDiff(path).catch(() => ""),
-      ]).then(([s, d]) => {
-        if (!cancelled) {
-          setGitStatus(s);
-          setGitDiff(d);
-        }
-      }).catch(() => {});
+    const refresh = async () => {
+      try {
+        const [s, d] = await Promise.all([
+          ipc.getGitStatus(path),
+          ipc.getGitDiff(path).catch(() => ""),
+        ]);
+        if (cancelled) return;
+        // Only re-render when status/diff actually changed — otherwise the
+        // 3s poll re-renders every gitStatus subscriber with the full
+        // changed-files payload (laggy on repos with many changes).
+        const sig =
+          `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
+          `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}` +
+          `|${d.length}`;
+        if (sig === gitSigRef.current) return;
+        gitSigRef.current = sig;
+        setGitStatus(s);
+        setGitDiff(d);
+      } catch {
+        /* non-fatal */
+      }
     };
-    refresh();
-    const id = setInterval(refresh, 3_000);
+    refresh(); // immediate on workspace/mode change
+    // Live polling only where file changes matter (run/review); talk mode
+    // refreshes on window focus instead of a tight interval.
+    const id = activeMode !== "talk" ? setInterval(refresh, 3_000) : undefined;
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (id) clearInterval(id);
+      window.removeEventListener("focus", onFocus);
     };
-  }, [activeWorkspaceId, workspaces, project]);
+  }, [activeWorkspaceId, workspaces, project, activeMode]);
 
   // ── Open-PR fetch ──
   // Fetch once per workspace switch and then every 60s. GitHub's
@@ -519,10 +541,6 @@ function App() {
       clearInterval(id);
     };
   }, [activeWorkspaceId, workspaces, project]);
-
-  // ── Mode helpers ──
-  const activeMode: WorkspaceMode =
-    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
 
   // ── Focus → background stores ──
   // Mirror the active workspace + mode into the module-level `focus`
