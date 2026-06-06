@@ -569,6 +569,45 @@ pub async fn get_git_status(path: String) -> AppResult<crate::git_ops::GitStatus
     crate::git_ops::get_status(std::path::Path::new(&path))
 }
 
+/// Compact per-workspace git signal for the rail (one entry per worktree that
+/// exists and is a git repo). Workspaces whose worktree is missing/archived
+/// are omitted rather than erroring the whole batch.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitSummary {
+    pub workspace_id: String,
+    pub dirty: bool,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[tauri::command]
+pub async fn workspaces_git_summary(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Vec<WorkspaceGitSummary>> {
+    let rows = state.db.lock().list_workspaces(&project_id)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(wt) = row.worktree_path else { continue };
+        let path = std::path::Path::new(&wt);
+        if !crate::git_ops::is_git_repo(path) {
+            continue;
+        }
+        // A single unreadable worktree shouldn't sink the whole project's
+        // summary — default it to clean and keep going.
+        let (dirty, ahead, behind) =
+            crate::git_ops::dirty_ahead_behind(path).unwrap_or((false, 0, 0));
+        out.push(WorkspaceGitSummary {
+            workspace_id: row.id,
+            dirty,
+            ahead,
+            behind,
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 pub async fn get_git_diff(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);

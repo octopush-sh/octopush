@@ -155,6 +155,7 @@ pub fn run() {
             commands::update_workspace_link,
             commands::update_project_jira_key,
             commands::get_git_status,
+            commands::workspaces_git_summary,
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,
