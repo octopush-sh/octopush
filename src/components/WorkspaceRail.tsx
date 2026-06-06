@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { ChevronDown } from "lucide-react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
-import type { Workspace, ProjectInfo } from "../lib/types";
+import { detectIssueKeyForProject } from "../lib/detectIssueKey";
+import type { Workspace, ProjectInfo, WorkspaceGitSummary } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { ProjectMark } from "./icons/ProjectMark";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
@@ -11,6 +12,7 @@ export interface ProjectGroup {
   id: string;
   name: string;
   tint?: string;
+  jiraProjectKey?: string | null;
   workspaces: Workspace[];
 }
 
@@ -31,6 +33,8 @@ interface Props {
   closedProjects?: ProjectInfo[];
   /** Called when the user restores a closed project. */
   onReopenProject?: (projectId: string) => void;
+  /** Per-workspace git signal, keyed by workspace id (§4.2/§4.3). */
+  gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
 }
@@ -58,6 +62,7 @@ export function WorkspaceRail({
   onProjectContextMenu,
   closedProjects,
   onReopenProject,
+  gitSummaryByWs,
   isCollapsed,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
@@ -87,6 +92,9 @@ export function WorkspaceRail({
             {/* Project header (only when expanded) */}
             {!isCollapsed && project?.name && (() => {
               const tint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : TINTS.brass;
+              const dirtyCount = (project.workspaces || []).filter(
+                (w) => gitSummaryByWs?.[w.id]?.dirty,
+              ).length;
               return (
               <div
                 className="flex items-center justify-between gap-2 px-3 group"
@@ -106,6 +114,22 @@ export function WorkspaceRail({
                   {project.name}
                 </div>
                 <div className="flex items-center gap-1">
+                  {/* Git pulse: brass count when work is uncommitted, else a
+                      quiet verdigris all-clear dot (§4.2). */}
+                  {dirtyCount > 0 ? (
+                    <span
+                      className="flex items-center gap-1 font-mono text-[10px] text-octo-brass"
+                      title={`${dirtyCount} workspace${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
+                    >
+                      <span className="h-1.5 w-1.5 rounded-full bg-octo-brass" />
+                      {dirtyCount}
+                    </span>
+                  ) : (
+                    <span
+                      className="h-1.5 w-1.5 rounded-full bg-octo-verdigris opacity-40"
+                      title="All workspaces clean"
+                    />
+                  )}
                   {onNewWorkspaceForProject && (
                     <button
                       type="button"
@@ -155,6 +179,13 @@ export function WorkspaceRail({
                 workspace={ws}
                 active={ws?.id === activeWorkspaceId}
                 isCollapsed={isCollapsed}
+                ticketKey={
+                  ws?.linkedIssueKey ??
+                  detectIssueKeyForProject(ws?.branch ?? "", project.jiraProjectKey ?? null)
+                }
+                dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
+                ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
+                behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
                 onSelect={() => ws?.id && onSelect(ws.id)}
                 onCustomize={() => ws?.id && onCustomize(ws.id)}
                 onContextMenu={
@@ -206,6 +237,10 @@ interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
   isCollapsed: boolean;
+  ticketKey?: string | null;
+  dirty?: boolean;
+  ahead?: number;
+  behind?: number;
   onSelect: () => void;
   onCustomize: () => void;
   onContextMenu?: (x: number, y: number) => void;
@@ -215,6 +250,10 @@ function WorkspaceRow({
   workspace,
   active,
   isCollapsed,
+  ticketKey,
+  dirty,
+  ahead,
+  behind,
   onSelect,
   onCustomize,
   onContextMenu,
@@ -362,7 +401,24 @@ function WorkspaceRow({
         />
       </div>
 
-      {/* Active dot (6px, brass, visible only when active) */}
+      {/* Trailing signal: ticket key · ahead/behind · dirty · active (§4.3) */}
+      {ticketKey && (
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-sage">
+          {ticketKey}
+        </span>
+      )}
+      {!!ahead && (
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute">↑{ahead}</span>
+      )}
+      {!!behind && (
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute">↓{behind}</span>
+      )}
+      {dirty && !active && (
+        <div
+          className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-octo-brass"
+          title="Uncommitted changes"
+        />
+      )}
       {active && (
         <div className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-octo-brass" />
       )}
