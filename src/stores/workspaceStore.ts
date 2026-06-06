@@ -53,6 +53,17 @@ interface WorkspaceState {
 /** Project ids with an in-flight open-PR fetch — dedupes overlapping
  *  loadProjectPrs calls (each spawns a login-shell `gh` subprocess). */
 const prFetchInFlight = new Set<string>();
+/** Last successful-start timestamp per project — throttles loadProjectPrs so
+ *  the same project isn't re-fetched more than once per 15s (focus +
+ *  project-set + pin/reorder can all fire in quick succession). */
+const prFetchLastAt = new Map<string, number>();
+
+/** Test-only: clears the module-level PR-fetch dedup/throttle state so the
+ *  throttle Map doesn't leak across tests sharing a projectId. */
+export const __resetPrFetchThrottle = (): void => {
+  prFetchInFlight.clear();
+  prFetchLastAt.clear();
+};
 
 const loadLastActiveFromStorage = (): Record<string, string> => {
   try {
@@ -196,10 +207,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         nextByProject[pid] = wss.filter((w) => w.id !== workspaceId);
       }
       const { [workspaceId]: _droppedSummary, ...nextSummaries } = s.gitSummaryByWs;
+      const { [workspaceId]: _droppedPr, ...nextPrs } = s.prByWs;
       return {
         workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
         workspacesByProjectId: nextByProject,
         gitSummaryByWs: nextSummaries,
+        prByWs: nextPrs,
         activeId: s.activeId === workspaceId ? null : s.activeId,
       };
     });
@@ -215,10 +228,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         nextByProject[pid] = wss.filter((w) => w.id !== workspaceId);
       }
       const { [workspaceId]: _dropped, ...nextSummaries } = s.gitSummaryByWs;
+      const { [workspaceId]: _droppedPr, ...nextPrs } = s.prByWs;
       return {
         workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
         workspacesByProjectId: nextByProject,
         gitSummaryByWs: nextSummaries,
+        prByWs: nextPrs,
         activeId: s.activeId === workspaceId ? null : s.activeId,
       };
     });
@@ -251,11 +266,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const activeWasPruned = !!s.activeId && removedIds.has(s.activeId);
       const nextSummaries = { ...s.gitSummaryByWs };
       for (const id of removedIds) delete nextSummaries[id];
+      const nextPrs = { ...s.prByWs };
+      for (const id of removedIds) delete nextPrs[id];
       return {
         workspacesByProjectId: restByProject,
         workspaces: activeWasPruned ? [] : s.workspaces,
         activeId: activeWasPruned ? null : s.activeId,
         gitSummaryByWs: nextSummaries,
+        prByWs: nextPrs,
       };
     }),
 
@@ -274,6 +292,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   loadProjectPrs: async (projectId, projectPath) => {
     if (prFetchInFlight.has(projectId)) return;
+    const now = Date.now();
+    if (now - (prFetchLastAt.get(projectId) ?? 0) < 15_000) return;
+    prFetchLastAt.set(projectId, now);
     prFetchInFlight.add(projectId);
     try {
       const branchPrs = await ipc.openPrsForProject(projectPath);

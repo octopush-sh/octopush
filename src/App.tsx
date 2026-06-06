@@ -1086,6 +1086,9 @@ function App() {
 
       // Durably persist to the backend too (survives a localStorage clear).
       await ipc.updateProjectCustomization(customizingProjectId, name, tint);
+      // Refresh recentProjects so name-derived surfaces (archive modal title,
+      // context menus) reflect the new name immediately.
+      await loadRecentProjects();
       pushToast({ level: "success", title: "Project updated" });
     } catch (err) {
       pushToast({ level: "error", title: "Failed to update project", body: String(err) });
@@ -1657,7 +1660,12 @@ function App() {
               projectId={archivedForProject.id}
               projectName={archivedForProject.name}
               projectPath={archivedForProject.path}
-              onRestored={(pid) => { void loadAllWorkspaces([pid]); }}
+              onRestored={(pid) => {
+                void loadAllWorkspaces([pid]);
+                void loadGitSummaries(pid);
+                const p = recentProjects.find((x) => x.id === pid)?.path ?? (project?.id === pid ? project.path : undefined);
+                if (p) void loadProjectPrs(pid, p);
+              }}
               onClose={() => setArchivedForProject(null)}
             />
           </div>

@@ -58,7 +58,7 @@ const mockIpc = {
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
-const { useWorkspaceStore } = await import("./workspaceStore");
+const { useWorkspaceStore, __resetPrFetchThrottle } = await import("./workspaceStore");
 const { useProjectStore } = await import("./projectStore");
 
 function resetStore() {
@@ -72,6 +72,10 @@ function resetStore() {
     gitSummaryByWs: {},
     prByWs: {},
   });
+  // The PR-fetch dedup Set + throttle Map live at module scope and persist
+  // across tests; clear them so a shared projectId isn't throttled/blocked
+  // between tests that each call loadProjectPrs once.
+  __resetPrFetchThrottle();
   nextId = 0;
   useProjectStore.setState({ current: null, recent: [], closed: [], loading: false, error: null });
   vi.clearAllMocks();
