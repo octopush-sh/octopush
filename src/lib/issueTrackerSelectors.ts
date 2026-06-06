@@ -3,7 +3,6 @@ import { detectIssueKey } from "./detectIssueKey";
 
 export type LinkageState =
   | { kind: "linked"; key: string; source: "manual" | "detected" }
-  | { kind: "dismissed" }
   | { kind: "unlinked" };
 
 export function resolveLinkage(ws: Workspace, branch: string): LinkageState {
@@ -13,9 +12,6 @@ export function resolveLinkage(ws: Workspace, branch: string): LinkageState {
   const detected = detectIssueKey(branch);
   if (detected) {
     return { kind: "linked", key: detected, source: "detected" };
-  }
-  if (ws.issueLinkDismissed) {
-    return { kind: "dismissed" };
   }
   return { kind: "unlinked" };
 }

@@ -71,11 +71,11 @@ describe("resolveLinkage", () => {
     });
   });
 
-  it("dismissed only when no manual + no branch key", () => {
-    expect(resolveLinkage(ws({ issueLinkDismissed: true }), "main")).toEqual({ kind: "dismissed" });
+  it("unlinked when no manual + no branch key (issueLinkDismissed no longer matters)", () => {
+    expect(resolveLinkage(ws({ issueLinkDismissed: true }), "main")).toEqual({ kind: "unlinked" });
   });
 
-  it("dismissed is overridden by branch key (rename reactivates card)", () => {
+  it("branch key still detected regardless of issueLinkDismissed", () => {
     expect(
       resolveLinkage(ws({ issueLinkDismissed: true }), "feat/PROJ-7-go"),
     ).toEqual({ kind: "linked", key: "PROJ-7", source: "detected" });

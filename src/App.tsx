@@ -1536,26 +1536,57 @@ function App() {
 
       {/* Workspace context menu (right-click on monogram) */}
       {contextMenu && (() => {
-        // Search across all workspaces from all projects
         let ws = null;
         for (const projectWs of Object.values(workspacesByProjectId)) {
           ws = projectWs.find((w) => w.id === contextMenu.workspaceId);
           if (ws) break;
         }
         if (!ws) return null;
-        const wsBranch = ws.branch ?? "";
-        const wsLinkage = resolveLinkage(ws, wsBranch);
-        const wsLinkageKind: "linked" | "unlinked" | "dismissed" =
-          wsLinkage.kind === "linked"
-            ? "linked"
-            : wsLinkage.kind === "dismissed"
-            ? "dismissed"
-            : "unlinked";
+        const workspace = ws;
+        const wsBranch = workspace.branch ?? "";
+        const wsLinkage = resolveLinkage(workspace, wsBranch);
+        const ticketKey = wsLinkage.kind === "linked" ? wsLinkage.key : null;
+        const proj =
+          recentProjects.find((p) => p.id === workspace.projectId) ??
+          (project?.id === workspace.projectId ? project : null);
+        const wsPath = workspace.worktreePath ?? proj?.path ?? "";
+        const isMain = !workspace.worktreePath || (!!proj && workspace.worktreePath === proj.path);
+        const copy = async (text: string, label: string) => {
+          setContextMenu(null);
+          try {
+            await navigator.clipboard.writeText(text);
+            pushToast({ level: "success", title: label });
+          } catch (err) {
+            pushToast({ level: "error", title: "Copy failed", body: String(err) });
+          }
+        };
         return (
           <WorkspaceContextMenu
             x={contextMenu.x}
             y={contextMenu.y}
-            workspaceName={ws.name}
+            workspaceName={workspace.name}
+            ticketKey={ticketKey}
+            isMain={isMain}
+            onRevealInFinder={() => {
+              setContextMenu(null);
+              void ipc.revealInFinder(wsPath).catch((err) =>
+                pushToast({ level: "error", title: "Reveal failed", body: String(err) }),
+              );
+            }}
+            onCopyPath={() => void copy(wsPath, "Path copied")}
+            onCopyBranch={() => void copy(wsBranch, "Branch copied")}
+            onOpenInEditor={() => {
+              setContextMenu(null);
+              void ipc.openInEditor(wsPath).catch((err) =>
+                pushToast({ level: "error", title: "Open in editor failed", body: String(err) }),
+              );
+            }}
+            onOpenInTerminal={() => {
+              setContextMenu(null);
+              void ipc.openInTerminal(wsPath).catch((err) =>
+                pushToast({ level: "error", title: "Open in terminal failed", body: String(err) }),
+              );
+            }}
             onCustomize={() => {
               setContextMenu(null);
               setCustomizingWorkspaceId(contextMenu.workspaceId);
@@ -1565,7 +1596,7 @@ function App() {
               setDeletingWorkspaceId(contextMenu.workspaceId);
             }}
             onClose={() => setContextMenu(null)}
-            linkageKind={wsLinkageKind}
+            linkageKind={wsLinkage.kind === "linked" ? "linked" : "unlinked"}
             onLinkJira={() => {
               setJiraTicketPickerOpen({ workspaceId: contextMenu.workspaceId, mode: "link" });
               setContextMenu(null);
@@ -1576,12 +1607,7 @@ function App() {
             }}
             onUnlinkJira={async () => {
               await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, false);
-              await useWorkspaceStore.getState().load(ws.projectId);
-              setContextMenu(null);
-            }}
-            onSkipJira={async () => {
-              await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, true);
-              await useWorkspaceStore.getState().load(ws.projectId);
+              await useWorkspaceStore.getState().load(workspace.projectId);
               setContextMenu(null);
             }}
           />

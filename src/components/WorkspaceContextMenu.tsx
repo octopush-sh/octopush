@@ -1,25 +1,55 @@
-import { useEffect, useRef } from "react";
-import { Pencil, Trash2, Link2, Link2Off } from "lucide-react";
+import {
+  FolderOpen,
+  Copy,
+  GitBranch,
+  PanelsTopLeft,
+  SquareTerminal,
+  Pencil,
+  Link2,
+  Link2Off,
+  Trash2,
+} from "lucide-react";
+import { useMenuChrome } from "../lib/useMenuChrome";
 
 interface Props {
   x: number;
   y: number;
   workspaceName: string;
+  ticketKey?: string | null;
+  /** True for the project's main worktree — Delete is hidden (C6). */
+  isMain: boolean;
+  onRevealInFinder: () => void;
+  onCopyPath: () => void;
+  onCopyBranch: () => void;
+  onOpenInEditor: () => void;
+  onOpenInTerminal: () => void;
   onCustomize: () => void;
   onDelete: () => void;
+  /** Dismiss the menu. */
   onClose: () => void;
-  /** Whether this workspace has a Jira ticket linked, is unlinked, or has been dismissed. */
-  linkageKind?: "linked" | "unlinked" | "dismissed";
+  linkageKind?: "linked" | "unlinked";
   onLinkJira?: () => void;
   onChangeJira?: () => void;
   onUnlinkJira?: () => void;
-  onSkipJira?: () => void;
 }
+
+const ITEM =
+  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
+const DANGER =
+  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-rouge transition hover:bg-[var(--rouge-ghost,rgba(209,139,139,0.08))] hover:text-octo-rouge";
+const SEP = "h-px bg-octo-hairline";
 
 export function WorkspaceContextMenu({
   x,
   y,
-  workspaceName: _workspaceName,
+  workspaceName,
+  ticketKey,
+  isMain,
+  onRevealInFinder,
+  onCopyPath,
+  onCopyBranch,
+  onOpenInEditor,
+  onOpenInTerminal,
   onCustomize,
   onDelete,
   onClose,
@@ -27,138 +57,77 @@ export function WorkspaceContextMenu({
   onLinkJira,
   onChangeJira,
   onUnlinkJira,
-  onSkipJira,
 }: Props) {
-  const ref = useRef<HTMLDivElement>(null);
-
-  // Close on Escape
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  // Close on outside click (capture phase so it fires before bubbling)
-  useEffect(() => {
-    const onMouseDown = (e: MouseEvent) => {
-      // Ignore right-click (button 2) to allow context menu to fire
-      if (e.button === 2) return;
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        onClose();
-      }
-    };
-    window.addEventListener("mousedown", onMouseDown, true);
-    return () => window.removeEventListener("mousedown", onMouseDown, true);
-  }, [onClose]);
-
-  const showJiraItems = linkageKind !== undefined;
+  const { ref, pos } = useMenuChrome(x, y, onClose);
+  const run = (fn: () => void) => () => {
+    fn();
+    onClose();
+  };
 
   return (
     <div
       ref={ref}
       role="menu"
       aria-label="Workspace actions"
-      className="absolute z-50 w-[200px] rounded-md border border-octo-hairline bg-octo-panel shadow-2xl"
-      style={{ left: x, top: y }}
+      className="absolute z-50 w-[230px] rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
+      style={{ left: pos.left, top: pos.top }}
     >
-      <button
-        type="button"
-        role="menuitem"
-        onClick={() => {
-          onCustomize();
-          onClose();
-        }}
-        className="flex w-full items-center gap-2 rounded-t-md px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
-      >
-        <Pencil size={12} className="shrink-0" />
-        Customize…
+      <div className="truncate px-3 pb-1 pt-1 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+        {workspaceName}
+        {ticketKey ? ` · ${ticketKey}` : ""}
+      </div>
+
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onRevealInFinder)}>
+        <FolderOpen size={12} className="shrink-0" /> Reveal in Finder
+      </button>
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onCopyPath)}>
+        <Copy size={12} className="shrink-0" /> Copy path
+      </button>
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onCopyBranch)}>
+        <GitBranch size={12} className="shrink-0" /> Copy branch name
+      </button>
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onOpenInEditor)}>
+        <PanelsTopLeft size={12} className="shrink-0" /> Open in editor
+      </button>
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onOpenInTerminal)}>
+        <SquareTerminal size={12} className="shrink-0" /> Open in terminal
       </button>
 
-      {showJiraItems && (
+      <div className={SEP} />
+
+      <button type="button" role="menuitem" className={ITEM} onClick={run(onCustomize)}>
+        <Pencil size={12} className="shrink-0" /> Customize…
+      </button>
+
+      {linkageKind && (
         <>
-          <div className="h-px bg-octo-hairline" />
-
-          {(linkageKind === "unlinked" || linkageKind === "dismissed") && onLinkJira && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                onLinkJira();
-                onClose();
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
-            >
-              <Link2 size={12} className="shrink-0" />
-              Link Jira ticket…
+          <div className={SEP} />
+          {linkageKind === "unlinked" && onLinkJira && (
+            <button type="button" role="menuitem" className={ITEM} onClick={run(onLinkJira)}>
+              <Link2 size={12} className="shrink-0" /> Link Jira ticket…
             </button>
           )}
-
           {linkageKind === "linked" && onChangeJira && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                onChangeJira();
-                onClose();
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
-            >
-              <Link2 size={12} className="shrink-0" />
-              Change Jira ticket…
+            <button type="button" role="menuitem" className={ITEM} onClick={run(onChangeJira)}>
+              <Link2 size={12} className="shrink-0" /> Change Jira ticket…
             </button>
           )}
-
           {linkageKind === "linked" && onUnlinkJira && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                onUnlinkJira();
-                onClose();
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
-            >
-              <Link2Off size={12} className="shrink-0" />
-              Unlink Jira ticket
-            </button>
-          )}
-
-          {linkageKind !== "dismissed" && onSkipJira && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                onSkipJira();
-                onClose();
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
-            >
-              <Link2Off size={12} className="shrink-0" />
-              Skip Jira here
+            <button type="button" role="menuitem" className={ITEM} onClick={run(onUnlinkJira)}>
+              <Link2Off size={12} className="shrink-0" /> Unlink Jira ticket
             </button>
           )}
         </>
       )}
 
-      <div className="h-px bg-octo-hairline" />
-
-      <button
-        type="button"
-        role="menuitem"
-        onClick={() => {
-          onDelete();
-          onClose();
-        }}
-        className="flex w-full items-center gap-2 rounded-b-md px-3 py-2 font-mono text-[11px] text-octo-rouge transition hover:bg-[var(--rouge-ghost,rgba(209,139,139,0.08))] hover:text-octo-rouge"
-      >
-        <Trash2 size={12} className="shrink-0" />
-        Delete workspace
-      </button>
+      {!isMain && (
+        <>
+          <div className={SEP} />
+          <button type="button" role="menuitem" className={DANGER} onClick={run(onDelete)}>
+            <Trash2 size={12} className="shrink-0" /> Delete workspace…
+          </button>
+        </>
+      )}
     </div>
   );
 }
