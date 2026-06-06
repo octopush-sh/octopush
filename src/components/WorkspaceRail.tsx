@@ -104,18 +104,96 @@ export function WorkspaceRail({
           />
         )}
         {(projects || []).map((project, projectIndex) => {
-          const nameMatch = q === "" || (project?.name ?? "").toLowerCase().includes(q);
-          const visibleWs =
-            q === "" || nameMatch
-              ? (project?.workspaces || [])
-              : (project?.workspaces || []).filter((w) =>
-                  (w?.name ?? "").toLowerCase().includes(q),
-                );
-          // While filtering, hide projects with no hit and force-expand matches.
-          if (q !== "" && !nameMatch && visibleWs.length === 0) return null;
-          const projectExpanded = q !== "" ? true : !collapsedProjects[project.id];
+          // Hide projects with no filter hit (header name or any workspace).
+          if (q !== "") {
+            const nameMatch = (project?.name ?? "").toLowerCase().includes(q);
+            const anyWs = (project?.workspaces || []).some((w) =>
+              (w?.name ?? "").toLowerCase().includes(q),
+            );
+            if (!nameMatch && !anyWs) return null;
+          }
           return (
-          <div key={project?.id || `project-${projectIndex}`} className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`} style={{ marginBottom: isCollapsed && projectIndex < projects.length - 1 ? '0.5rem' : !isCollapsed && projectIndex < projects.length - 1 ? '0.75rem' : '0' }}>
+            <SortableProjectGroup
+              key={project?.id || `project-${projectIndex}`}
+              project={project}
+              projectIndex={projectIndex}
+              projectCount={projects.length}
+              isCollapsed={isCollapsed}
+              q={q}
+              collapsedProjects={collapsedProjects}
+              toggleProjectCollapsed={toggleProjectCollapsed}
+              activeWorkspaceId={activeWorkspaceId}
+              gitSummaryByWs={gitSummaryByWs}
+              prByWs={prByWs}
+              onSelect={onSelect}
+              onCustomize={onCustomize}
+              onContextMenu={onContextMenu}
+              onNewWorkspaceForProject={onNewWorkspaceForProject}
+              onProjectContextMenu={onProjectContextMenu}
+            />
+          );
+        })}
+      </div>
+
+      {/* Recently closed (expanded rail only) */}
+      {!isCollapsed && onReopenProject && (
+        <RecentlyClosedDrawer
+          projects={closedProjects ?? []}
+          onReopen={onReopenProject}
+        />
+      )}
+
+      {/* Add project button */}
+      {onAddProject && (
+        <button
+          type="button"
+          onClick={onAddProject}
+          className="w-full flex justify-center items-center gap-2 px-3 py-2 text-octo-mute hover:text-octo-brass transition font-mono text-sm"
+          title="Add project"
+          aria-label="Add project"
+        >
+          ◉ {!isCollapsed && "Add project"}
+        </button>
+      )}
+
+    </aside>
+  );
+}
+
+interface SortableProjectGroupProps {
+  project: ProjectGroup;
+  projectIndex: number;
+  projectCount: number;
+  isCollapsed: boolean;
+  q: string;
+  collapsedProjects: Record<string, boolean>;
+  toggleProjectCollapsed: (projectId: string) => void;
+  activeWorkspaceId: string | null;
+  gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
+  prByWs?: Record<string, Pr | null>;
+  onSelect: (id: string) => void;
+  onCustomize: (id: string) => void;
+  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  onNewWorkspaceForProject?: (projectId: string) => void;
+  onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+}
+
+function SortableProjectGroup(props: SortableProjectGroupProps) {
+  const {
+    project, projectIndex, projectCount, isCollapsed, q, collapsedProjects,
+    toggleProjectCollapsed, activeWorkspaceId, gitSummaryByWs, prByWs,
+    onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
+  } = props;
+
+  const nameMatch = q === "" || (project?.name ?? "").toLowerCase().includes(q);
+  const visibleWs =
+    q === "" || nameMatch
+      ? (project?.workspaces || [])
+      : (project?.workspaces || []).filter((w) => (w?.name ?? "").toLowerCase().includes(q));
+  const projectExpanded = q !== "" ? true : !collapsedProjects[project.id];
+
+  return (
+          <div className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`} style={{ marginBottom: isCollapsed && projectIndex < projectCount - 1 ? '0.5rem' : !isCollapsed && projectIndex < projectCount - 1 ? '0.75rem' : '0' }}>
             {/* Project header (only when expanded) */}
             {!isCollapsed && project?.name && (() => {
               const tint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : TINTS.brass;
@@ -245,32 +323,6 @@ export function WorkspaceRail({
                 </div>
               )}
           </div>
-          );
-        })}
-      </div>
-
-      {/* Recently closed (expanded rail only) */}
-      {!isCollapsed && onReopenProject && (
-        <RecentlyClosedDrawer
-          projects={closedProjects ?? []}
-          onReopen={onReopenProject}
-        />
-      )}
-
-      {/* Add project button */}
-      {onAddProject && (
-        <button
-          type="button"
-          onClick={onAddProject}
-          className="w-full flex justify-center items-center gap-2 px-3 py-2 text-octo-mute hover:text-octo-brass transition font-mono text-sm"
-          title="Add project"
-          aria-label="Add project"
-        >
-          ◉ {!isCollapsed && "Add project"}
-        </button>
-      )}
-
-    </aside>
   );
 }
 
