@@ -172,16 +172,14 @@ describe("WorkspaceRail", () => {
     );
 
     // Check that project headers are visible
-    expect(screen.getByText("— Frontend")).toBeInTheDocument();
-    expect(screen.getByText("— Backend")).toBeInTheDocument();
+    expect(screen.getByText("Frontend")).toBeInTheDocument();
+    expect(screen.getByText("Backend")).toBeInTheDocument();
 
-    // Check that they have correct classes
-    const headers = screen.getAllByText(/^— /);
-    headers.forEach((header) => {
-      expect(header).toHaveClass("font-mono");
-      expect(header).toHaveClass("uppercase");
-      expect(header.getAttribute("style")).toBeTruthy();
-    });
+    // Check that they have correct classes (the wrapper div carries font-mono, uppercase, and style)
+    const frontendHeader = screen.getByText("Frontend").closest("div[style]");
+    expect(frontendHeader).toHaveClass("font-mono");
+    expect(frontendHeader).toHaveClass("uppercase");
+    expect(frontendHeader?.getAttribute("style")).toBeTruthy();
   });
 
   it("should hide project headers when collapsed", () => {
@@ -203,8 +201,8 @@ describe("WorkspaceRail", () => {
       />,
     );
 
-    expect(screen.getByText("— Frontend")).toBeInTheDocument();
-    expect(screen.getByText("— Backend")).toBeInTheDocument();
+    expect(screen.getByText("Frontend")).toBeInTheDocument();
+    expect(screen.getByText("Backend")).toBeInTheDocument();
 
     rerender(
       <WorkspaceRail
@@ -216,8 +214,8 @@ describe("WorkspaceRail", () => {
       />,
     );
 
-    expect(screen.queryByText("— Frontend")).not.toBeInTheDocument();
-    expect(screen.queryByText("— Backend")).not.toBeInTheDocument();
+    expect(screen.queryByText("Frontend")).not.toBeInTheDocument();
+    expect(screen.queryByText("Backend")).not.toBeInTheDocument();
   });
 
   it("should show monograms in both expanded and collapsed modes", () => {

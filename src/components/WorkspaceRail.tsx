@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import type { Workspace } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { ProjectMark } from "./icons/ProjectMark";
 
 /** Hierarchical project/workspace structure for the rail. */
 export interface ProjectGroup {
@@ -63,10 +64,11 @@ export function WorkspaceRail({
                 }}
               >
                 <div
-                  className="font-mono text-[10px] uppercase tracking-[0.25em]"
+                  className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em]"
                   style={{ color: tint.accent }}
                 >
-                  — {project.name}
+                  <ProjectMark size={15} className="shrink-0" />
+                  {project.name}
                 </div>
                 {onNewWorkspaceForProject && (
                   <button
