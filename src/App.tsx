@@ -1225,6 +1225,7 @@ function App() {
         gitSummaryByWs={gitSummaryByWs}
         prByWs={prByWs}
         isCollapsed={isRailCollapsed}
+        onReorderProjects={(ids) => void setProjectOrderAction(ids)}
       />
 
       <main className="ml-4 flex min-w-0 flex-1 flex-col overflow-hidden">

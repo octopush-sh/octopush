@@ -1,5 +1,21 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, GripVertical } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
@@ -39,6 +55,8 @@ interface Props {
   prByWs?: Record<string, Pr | null>;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
+  /** Persist a new project order (ids top→bottom). */
+  onReorderProjects?: (ids: string[]) => void;
 }
 
 const COLLAPSE_KEY = "railProjectCollapsed";
@@ -67,6 +85,7 @@ export function WorkspaceRail({
   gitSummaryByWs,
   prByWs,
   isCollapsed,
+  onReorderProjects,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
     loadCollapsedFromStorage,
@@ -83,6 +102,23 @@ export function WorkspaceRail({
       }
       return next;
     });
+  };
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const dragEnabled = !isCollapsed && q === "" && !!onReorderProjects;
+  const handleDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (!over || active.id === over.id) return;
+    const ids = (projects || []).map((p) => p.id);
+    const from = ids.indexOf(String(active.id));
+    const to = ids.indexOf(String(over.id));
+    if (from < 0 || to < 0) return;
+    const next = [...ids];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    onReorderProjects?.(next);
   };
   return (
     <aside
@@ -103,36 +139,41 @@ export function WorkspaceRail({
             className="mx-3 mb-2 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
           />
         )}
-        {(projects || []).map((project, projectIndex) => {
-          // Hide projects with no filter hit (header name or any workspace).
-          if (q !== "") {
-            const nameMatch = (project?.name ?? "").toLowerCase().includes(q);
-            const anyWs = (project?.workspaces || []).some((w) =>
-              (w?.name ?? "").toLowerCase().includes(q),
-            );
-            if (!nameMatch && !anyWs) return null;
-          }
-          return (
-            <SortableProjectGroup
-              key={project?.id || `project-${projectIndex}`}
-              project={project}
-              projectIndex={projectIndex}
-              projectCount={projects.length}
-              isCollapsed={isCollapsed}
-              q={q}
-              collapsedProjects={collapsedProjects}
-              toggleProjectCollapsed={toggleProjectCollapsed}
-              activeWorkspaceId={activeWorkspaceId}
-              gitSummaryByWs={gitSummaryByWs}
-              prByWs={prByWs}
-              onSelect={onSelect}
-              onCustomize={onCustomize}
-              onContextMenu={onContextMenu}
-              onNewWorkspaceForProject={onNewWorkspaceForProject}
-              onProjectContextMenu={onProjectContextMenu}
-            />
-          );
-        })}
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <SortableContext items={(projects || []).map((p) => p.id)} strategy={verticalListSortingStrategy}>
+            {(projects || []).map((project, projectIndex) => {
+              // Hide projects with no filter hit (header name or any workspace).
+              if (q !== "") {
+                const nameMatch = (project?.name ?? "").toLowerCase().includes(q);
+                const anyWs = (project?.workspaces || []).some((w) =>
+                  (w?.name ?? "").toLowerCase().includes(q),
+                );
+                if (!nameMatch && !anyWs) return null;
+              }
+              return (
+                <SortableProjectGroup
+                  key={project?.id || `project-${projectIndex}`}
+                  project={project}
+                  projectIndex={projectIndex}
+                  projectCount={projects.length}
+                  isCollapsed={isCollapsed}
+                  q={q}
+                  collapsedProjects={collapsedProjects}
+                  toggleProjectCollapsed={toggleProjectCollapsed}
+                  activeWorkspaceId={activeWorkspaceId}
+                  gitSummaryByWs={gitSummaryByWs}
+                  prByWs={prByWs}
+                  onSelect={onSelect}
+                  onCustomize={onCustomize}
+                  onContextMenu={onContextMenu}
+                  onNewWorkspaceForProject={onNewWorkspaceForProject}
+                  onProjectContextMenu={onProjectContextMenu}
+                  dragEnabled={dragEnabled}
+                />
+              );
+            })}
+          </SortableContext>
+        </DndContext>
       </div>
 
       {/* Recently closed (expanded rail only) */}
@@ -176,6 +217,7 @@ interface SortableProjectGroupProps {
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
   onNewWorkspaceForProject?: (projectId: string) => void;
   onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+  dragEnabled: boolean;
 }
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
@@ -183,7 +225,11 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     project, projectIndex, projectCount, isCollapsed, q, collapsedProjects,
     toggleProjectCollapsed, activeWorkspaceId, gitSummaryByWs, prByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
+    dragEnabled,
   } = props;
+
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({ id: project.id, disabled: !dragEnabled });
 
   const nameMatch = q === "" || (project?.name ?? "").toLowerCase().includes(q);
   const visibleWs =
@@ -193,7 +239,16 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
   const projectExpanded = q !== "" ? true : !collapsedProjects[project.id];
 
   return (
-          <div className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`} style={{ marginBottom: isCollapsed && projectIndex < projectCount - 1 ? '0.5rem' : !isCollapsed && projectIndex < projectCount - 1 ? '0.75rem' : '0' }}>
+          <div
+            ref={setNodeRef}
+            className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`}
+            style={{
+              marginBottom: isCollapsed && projectIndex < projectCount - 1 ? "0.5rem" : !isCollapsed && projectIndex < projectCount - 1 ? "0.75rem" : "0",
+              transform: CSS.Transform.toString(transform),
+              transition,
+              opacity: isDragging ? 0.6 : undefined,
+            }}
+          >
             {/* Project header (only when expanded) */}
             {!isCollapsed && project?.name && (() => {
               const tint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : TINTS.brass;
@@ -222,6 +277,19 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                   {project.name}
                 </div>
                 <div className="flex items-center gap-1">
+                  {dragEnabled && (
+                    <button
+                      type="button"
+                      ref={setActivatorNodeRef}
+                      {...attributes}
+                      {...listeners}
+                      aria-label={`Reorder ${project.name}`}
+                      title="Drag to reorder"
+                      className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center h-5 w-5 cursor-grab text-octo-mute hover:text-octo-brass"
+                    >
+                      <GripVertical size={12} aria-hidden="true" />
+                    </button>
+                  )}
                   {/* Git pulse: brass count when work is uncommitted, else a
                       quiet verdigris all-clear dot (§4.2). */}
                   {dirtyCount > 0 ? (
