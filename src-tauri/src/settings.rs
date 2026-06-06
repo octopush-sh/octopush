@@ -123,8 +123,10 @@ pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig)
     save_settings(&settings)
 }
 
-/// Persist git credentials for a host.  Safe to call concurrently — the
-/// entire settings file is read, updated, then written atomically.
+/// Persist git credentials for a host.  NOTE: save_settings does a full-file
+/// overwrite (last-write-wins). Callers must read-modify-write to avoid
+/// clobbering fields they don't own. Not safe for concurrent writers, but the
+/// app is single-window so that's acceptable.
 pub fn save_git_credentials(host: &str, username: &str, token: &str) -> AppResult<()> {
     let mut settings = load_settings()?;
     settings.git_credentials.insert(
