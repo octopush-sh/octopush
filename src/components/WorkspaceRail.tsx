@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { ChevronDown } from "lucide-react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
-import type { Workspace, ProjectInfo, WorkspaceGitSummary } from "../lib/types";
+import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { ProjectMark } from "./icons/ProjectMark";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
@@ -35,6 +35,8 @@ interface Props {
   onReopenProject?: (projectId: string) => void;
   /** Per-workspace git signal, keyed by workspace id (§4.2/§4.3). */
   gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
+  /** Open PR per workspace id (null = none), for the PR indicator (§4.3). */
+  prByWs?: Record<string, Pr | null>;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
 }
@@ -63,6 +65,7 @@ export function WorkspaceRail({
   closedProjects,
   onReopenProject,
   gitSummaryByWs,
+  prByWs,
   isCollapsed,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
@@ -119,6 +122,9 @@ export function WorkspaceRail({
               const dirtyCount = (project.workspaces || []).filter(
                 (w) => gitSummaryByWs?.[w.id]?.dirty,
               ).length;
+              const openPrCount = (project.workspaces || []).filter(
+                (w) => prByWs?.[w.id],
+              ).length;
               return (
               <div
                 className="flex items-center justify-between gap-2 px-3 group"
@@ -153,6 +159,15 @@ export function WorkspaceRail({
                       className="h-1.5 w-1.5 rounded-full bg-octo-verdigris opacity-40"
                       title="All workspaces clean"
                     />
+                  )}
+                  {openPrCount > 0 && (
+                    <span
+                      className="flex items-center gap-1 font-mono text-[10px] text-octo-verdigris"
+                      title={`${openPrCount} open PR${openPrCount === 1 ? "" : "s"}`}
+                    >
+                      <span className="h-1.5 w-1.5 border border-octo-verdigris" />
+                      {openPrCount}
+                    </span>
                   )}
                   {onNewWorkspaceForProject && (
                     <button
@@ -210,6 +225,7 @@ export function WorkspaceRail({
                 dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
                 ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
                 behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
+                hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
                 onSelect={() => ws?.id && onSelect(ws.id)}
                 onCustomize={() => ws?.id && onCustomize(ws.id)}
                 onContextMenu={
@@ -266,6 +282,7 @@ interface WorkspaceRowProps {
   dirty?: boolean;
   ahead?: number;
   behind?: number;
+  hasOpenPr?: boolean;
   onSelect: () => void;
   onCustomize: () => void;
   onContextMenu?: (x: number, y: number) => void;
@@ -279,6 +296,7 @@ function WorkspaceRow({
   dirty,
   ahead,
   behind,
+  hasOpenPr,
   onSelect,
   onCustomize,
   onContextMenu,
@@ -437,6 +455,12 @@ function WorkspaceRow({
       )}
       {!!behind && (
         <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute">↓{behind}</span>
+      )}
+      {hasOpenPr && (
+        <span
+          className="h-1.5 w-1.5 flex-shrink-0 border border-octo-verdigris"
+          title="Open pull request"
+        />
       )}
       {dirty && !active && (
         <div
