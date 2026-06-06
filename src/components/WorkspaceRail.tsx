@@ -69,7 +69,7 @@ export function WorkspaceRail({
     loadCollapsedFromStorage,
   );
   const [filter, setFilter] = useState("");
-  const q = filter.trim().toLowerCase();
+  const q = isCollapsed ? "" : filter.trim().toLowerCase();
   const toggleProjectCollapsed = (projectId: string) => {
     setCollapsedProjects((prev) => {
       const next = { ...prev, [projectId]: !prev[projectId] };
@@ -101,7 +101,7 @@ export function WorkspaceRail({
           />
         )}
         {(projects || []).map((project, projectIndex) => {
-          const nameMatch = q === "" || project.name.toLowerCase().includes(q);
+          const nameMatch = q === "" || (project?.name ?? "").toLowerCase().includes(q);
           const visibleWs =
             q === "" || nameMatch
               ? (project?.workspaces || [])
