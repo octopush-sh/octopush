@@ -79,6 +79,8 @@ function App() {
     remove: removeWorkspace,
     workspacesByProjectId,
     pruneProject,
+    gitSummaryByWs,
+    loadGitSummaries,
   } = useWorkspaceStore();
 
   const [appView, setAppView] = useState<AppView>("project");
@@ -394,8 +396,23 @@ function App() {
     projectIds.add(project.id);
     recentProjects.forEach((p) => projectIds.add(p.id));
 
-    loadAllWorkspaces(Array.from(projectIds));
-  }, [project, recentProjects, loadAllWorkspaces]);
+    const ids = Array.from(projectIds);
+    loadAllWorkspaces(ids);
+    ids.forEach((id) => void loadGitSummaries(id));
+  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries]);
+
+  // Refresh the rail's git signal when the window regains focus — calm,
+  // event-driven (no polling). Summaries are cheap (local libgit2).
+  useEffect(() => {
+    const onFocus = () => {
+      const ids = new Set<string>();
+      if (project) ids.add(project.id);
+      recentProjects.forEach((p) => ids.add(p.id));
+      ids.forEach((id) => void loadGitSummaries(id));
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [project, recentProjects, loadGitSummaries]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
@@ -1150,10 +1167,17 @@ function App() {
     recentProjects.forEach((p) => pushProject(p.id, p.name));
     pushProject(project.id, project.name);
 
+    const jiraKeyById: Record<string, string | null> = {};
+    recentProjects.forEach((p) => {
+      jiraKeyById[p.id] = p.jiraProjectKey;
+    });
+    if (project) jiraKeyById[project.id] = project.jiraProjectKey;
+
     return ordered.map((p) => ({
       id: p.id,
       name: p.name,
       tint: p.tint,
+      jiraProjectKey: jiraKeyById[p.id] ?? null,
       workspaces: workspacesByProjectId[p.id] || [],
     }));
   })();
@@ -1179,6 +1203,7 @@ function App() {
         onProjectContextMenu={handleProjectContextMenu}
         closedProjects={closedProjects}
         onReopenProject={handleReopenProject}
+        gitSummaryByWs={gitSummaryByWs}
         isCollapsed={isRailCollapsed}
       />
 

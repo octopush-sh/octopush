@@ -24,6 +24,8 @@ import {
 import { ipc } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useProjectStore } from "../stores/projectStore";
 
 interface Props {
   projectPath: string;
@@ -111,6 +113,9 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
     setCommitting(true);
     try {
       const sha = await ipc.commitChanges(projectPath, commitMessage.trim());
+      // A commit changes the worktree's dirty state — refresh the rail signal.
+      const pid = useProjectStore.getState().current?.id;
+      if (pid) void useWorkspaceStore.getState().loadGitSummaries(pid);
       pushToast({ level: "success", title: "Committed", body: sha });
       setCommitMessage("");
       await refresh();
