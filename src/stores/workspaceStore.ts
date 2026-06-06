@@ -50,6 +50,10 @@ interface WorkspaceState {
 }
 
 // Restore lastActiveByProject from localStorage on module load
+/** Project ids with an in-flight open-PR fetch — dedupes overlapping
+ *  loadProjectPrs calls (each spawns a login-shell `gh` subprocess). */
+const prFetchInFlight = new Set<string>();
+
 const loadLastActiveFromStorage = (): Record<string, string> => {
   try {
     const stored = localStorage.getItem("lastActiveWorkspacePerProject");
@@ -269,6 +273,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   loadProjectPrs: async (projectId, projectPath) => {
+    if (prFetchInFlight.has(projectId)) return;
+    prFetchInFlight.add(projectId);
     try {
       const branchPrs = await ipc.openPrsForProject(projectPath);
       const byBranch = new Map(branchPrs.map((bp) => [bp.branch, bp.pr]));
@@ -280,6 +286,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       });
     } catch {
       // Non-critical — no PR indicators for this project.
+    } finally {
+      prFetchInFlight.delete(projectId);
     }
   },
 
