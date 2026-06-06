@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
-import type { Workspace } from "../lib/types";
+import type { Workspace, WorkspaceGitSummary } from "../lib/types";
 
 interface WorkspaceState {
   workspaces: Workspace[];
@@ -16,6 +16,8 @@ interface WorkspaceState {
   lastActiveByProject: Record<string, string>;
   /** Workspaces grouped by project ID for hierarchical display in the rail. */
   workspacesByProjectId: Record<string, Workspace[]>;
+  /** Per-workspace git signal for the rail, keyed by workspace id. */
+  gitSummaryByWs: Record<string, WorkspaceGitSummary>;
 
   load: (projectId: string) => Promise<void>;
   loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
@@ -32,6 +34,8 @@ interface WorkspaceState {
   /** Drop a whole project's workspaces from the rail map; clears the active
    *  workspace too if it belonged to that project. Used on project close/delete. */
   pruneProject: (projectId: string) => void;
+  /** Fetch + merge a project's per-workspace git summaries into the cache. */
+  loadGitSummaries: (projectId: string) => Promise<void>;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -54,6 +58,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   notifications: {},
   lastActiveByProject: loadLastActiveFromStorage(),
   workspacesByProjectId: {},
+  gitSummaryByWs: {},
 
   load: async (projectId) => {
     set({ loading: true });
@@ -177,9 +182,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       for (const [pid, wss] of Object.entries(s.workspacesByProjectId)) {
         nextByProject[pid] = wss.filter((w) => w.id !== workspaceId);
       }
+      const { [workspaceId]: _droppedSummary, ...nextSummaries } = s.gitSummaryByWs;
       return {
         workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
         workspacesByProjectId: nextByProject,
+        gitSummaryByWs: nextSummaries,
         activeId: s.activeId === workspaceId ? null : s.activeId,
       };
     });
@@ -199,6 +206,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         activeId: activeWasPruned ? null : s.activeId,
       };
     }),
+
+  loadGitSummaries: async (projectId) => {
+    try {
+      const summaries = await ipc.workspacesGitSummary(projectId);
+      set((s) => {
+        const next = { ...s.gitSummaryByWs };
+        for (const sum of summaries) next[sum.workspaceId] = sum;
+        return { gitSummaryByWs: next };
+      });
+    } catch {
+      // Non-critical — the rail just shows no signal for this project.
+    }
+  },
 
   updateCustomization: async (workspaceId, glyph, tint) => {
     await ipc.updateWorkspaceCustomization(workspaceId, glyph, tint as any);

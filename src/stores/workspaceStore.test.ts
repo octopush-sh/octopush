@@ -50,6 +50,7 @@ const mockIpc = {
     >(),
   createWorkspace: vi.fn(),
   updateWorkspaceCustomization: vi.fn(),
+  workspacesGitSummary: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -65,6 +66,7 @@ function resetStore() {
     notifications: {},
     lastActiveByProject: {},
     workspacesByProjectId: {},
+    gitSummaryByWs: {},
   });
   nextId = 0;
   useProjectStore.setState({ current: null, recent: [], closed: [], loading: false, error: null });
@@ -249,6 +251,52 @@ describe("workspaceStore — rememberActiveForProject", () => {
       localStorage.getItem("lastActiveWorkspacePerProject") || "{}",
     );
     expect(persisted["proj-9"]).toBe("ws-42");
+  });
+});
+
+describe("workspaceStore — git summary cache", () => {
+  beforeEach(() => resetStore());
+
+  it("merges fetched summaries into gitSummaryByWs keyed by workspace id", async () => {
+    mockIpc.workspacesGitSummary.mockResolvedValueOnce([
+      { workspaceId: "w1", dirty: true, ahead: 2, behind: 0 },
+      { workspaceId: "w2", dirty: false, ahead: 0, behind: 1 },
+    ]);
+
+    await useWorkspaceStore.getState().loadGitSummaries("proj-1");
+
+    const map = useWorkspaceStore.getState().gitSummaryByWs;
+    expect(map.w1).toEqual({ workspaceId: "w1", dirty: true, ahead: 2, behind: 0 });
+    expect(map.w2.behind).toBe(1);
+  });
+
+  it("preserves summaries from other projects when merging", async () => {
+    useWorkspaceStore.setState({
+      gitSummaryByWs: { other: { workspaceId: "other", dirty: true, ahead: 0, behind: 0 } },
+    });
+    mockIpc.workspacesGitSummary.mockResolvedValueOnce([
+      { workspaceId: "w1", dirty: false, ahead: 0, behind: 0 },
+    ]);
+
+    await useWorkspaceStore.getState().loadGitSummaries("proj-1");
+
+    const map = useWorkspaceStore.getState().gitSummaryByWs;
+    expect(map.other).toBeDefined();
+    expect(map.w1).toBeDefined();
+  });
+
+  it("drops a workspace's summary on remove", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      workspacesByProjectId: { "proj-1": [a] },
+      gitSummaryByWs: { [a.id]: { workspaceId: a.id, dirty: true, ahead: 0, behind: 0 } },
+    });
+    mockIpc.deleteWorkspace.mockResolvedValueOnce(undefined);
+
+    await useWorkspaceStore.getState().remove(a.id, "/repo", a.branch, a.worktreePath);
+
+    expect(useWorkspaceStore.getState().gitSummaryByWs[a.id]).toBeUndefined();
   });
 });
 
