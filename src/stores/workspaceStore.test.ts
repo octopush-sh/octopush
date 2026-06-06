@@ -236,6 +236,26 @@ describe("workspaceStore — pruneProject (C8)", () => {
     expect(s.workspaces.map((w) => w.id)).toEqual([a.id]);
     expect(s.activeId).toBe(a.id);
   });
+
+  it("drops git summaries for the pruned project's workspaces", () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-2", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a], "proj-2": [b] },
+      gitSummaryByWs: {
+        [a.id]: { workspaceId: a.id, dirty: true, ahead: 0, behind: 0 },
+        [b.id]: { workspaceId: b.id, dirty: false, ahead: 0, behind: 0 },
+      },
+    });
+
+    useWorkspaceStore.getState().pruneProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(s.gitSummaryByWs[a.id]).toBeUndefined(); // pruned project's summary gone
+    expect(s.gitSummaryByWs[b.id]).toBeDefined();   // other project's summary kept
+  });
 });
 
 describe("workspaceStore — rememberActiveForProject", () => {

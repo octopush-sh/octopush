@@ -200,10 +200,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // If the active workspace belonged to the pruned project, the flat list
       // is now that project's — clear it so the app falls to the empty state.
       const activeWasPruned = !!s.activeId && removedIds.has(s.activeId);
+      const nextSummaries = { ...s.gitSummaryByWs };
+      for (const id of removedIds) delete nextSummaries[id];
       return {
         workspacesByProjectId: restByProject,
         workspaces: activeWasPruned ? [] : s.workspaces,
         activeId: activeWasPruned ? null : s.activeId,
+        gitSummaryByWs: nextSummaries,
       };
     }),
 
