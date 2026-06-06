@@ -1465,28 +1465,60 @@ function App() {
 
       {/* Project context menu (right-click on project header) */}
       {projectContextMenu && (() => {
-        const proj = recentProjects.find(p => p.id === projectContextMenu.projectId);
-        return proj ? (
+        const proj =
+          recentProjects.find((p) => p.id === projectContextMenu.projectId) ??
+          (project?.id === projectContextMenu.projectId ? project : null);
+        if (!proj) return null;
+        const projPath = proj.path;
+        const copyPath = async () => {
+          setProjectContextMenu(null);
+          try {
+            await navigator.clipboard.writeText(projPath);
+            pushToast({ level: "success", title: "Path copied" });
+          } catch (err) {
+            pushToast({ level: "error", title: "Copy failed", body: String(err) });
+          }
+        };
+        return (
           <ProjectContextMenu
             projectId={projectContextMenu.projectId}
             projectName={proj.name}
             x={projectContextMenu.x}
             y={projectContextMenu.y}
+            onRevealInFinder={() => {
+              setProjectContextMenu(null);
+              void ipc.revealInFinder(projPath).catch((err) =>
+                pushToast({ level: "error", title: "Reveal failed", body: String(err) }),
+              );
+            }}
+            onCopyPath={() => void copyPath()}
+            onOpenInEditor={() => {
+              setProjectContextMenu(null);
+              void ipc.openInEditor(projPath).catch((err) =>
+                pushToast({ level: "error", title: "Open in editor failed", body: String(err) }),
+              );
+            }}
+            onOpenInTerminal={() => {
+              setProjectContextMenu(null);
+              void ipc.openInTerminal(projPath).catch((err) =>
+                pushToast({ level: "error", title: "Open in terminal failed", body: String(err) }),
+              );
+            }}
             onRename={() => handleRenameProject(projectContextMenu.projectId)}
             onChangeTint={() => {
               setCustomizingProjectId(projectContextMenu.projectId);
               setShowProjectCustomizer(true);
               setProjectContextMenu(null);
             }}
-            onClose={() => handleCloseProject(projectContextMenu.projectId)}
-            onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
-            onDismiss={() => setProjectContextMenu(null)}
             onSetJiraProjectKey={() => {
               setJiraProjectKeyEditorOpen({ projectId: projectContextMenu.projectId });
               setProjectContextMenu(null);
             }}
+            onClose={() => handleCloseProject(projectContextMenu.projectId)}
+            onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
+            onDismiss={() => setProjectContextMenu(null)}
           />
-        ) : null;
+        );
       })()}
 
       {/* Project customization menu */}

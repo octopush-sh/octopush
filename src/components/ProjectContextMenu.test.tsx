@@ -8,6 +8,10 @@ describe("ProjectContextMenu", () => {
     projectName: "My Project",
     x: 100,
     y: 200,
+    onRevealInFinder: vi.fn(),
+    onCopyPath: vi.fn(),
+    onOpenInEditor: vi.fn(),
+    onOpenInTerminal: vi.fn(),
     onRename: vi.fn(),
     onChangeTint: vi.fn(),
     onClose: vi.fn(),
@@ -15,40 +19,88 @@ describe("ProjectContextMenu", () => {
     onDismiss: vi.fn(),
   };
 
-  it("renders all menu items (active and disabled)", () => {
+  it("renders the project name header and reach-on-disk actions", () => {
     render(<ProjectContextMenu {...baseProps} />);
+    expect(screen.getByText("My Project")).toBeInTheDocument();
+    expect(screen.getByText(/Reveal in Finder/)).toBeInTheDocument();
+    expect(screen.getByText(/Copy path/)).toBeInTheDocument();
+    expect(screen.getByText(/Open in editor/)).toBeInTheDocument();
+    expect(screen.getByText(/Open in terminal/)).toBeInTheDocument();
     expect(screen.getByText(/Rename project/)).toBeInTheDocument();
     expect(screen.getByText(/Change tint/)).toBeInTheDocument();
-    expect(screen.getByText(/Project settings/)).toBeInTheDocument();
-    expect(screen.getByText(/Default agent model/)).toBeInTheDocument();
-    expect(screen.getByText(/Tool permissions/)).toBeInTheDocument();
-    expect(screen.getByText(/Workspace presets/)).toBeInTheDocument();
-    expect(screen.getByText(/Close project/)).toBeInTheDocument();
-    expect(screen.getByText(/Delete project from disk/)).toBeInTheDocument();
+    expect(screen.getByText("Close project")).toBeInTheDocument();
+    expect(screen.getByText(/Delete from disk/)).toBeInTheDocument();
   });
 
-  it("disabled items have 'Coming soon' title", () => {
+  it("does not render the dropped 'coming soon' stub items", () => {
     render(<ProjectContextMenu {...baseProps} />);
-    const projectSettingsBtn = screen.getByText(/Project settings/);
-    const agentModelBtn = screen.getByText(/Default agent model/);
-    const toolPermissionsBtn = screen.getByText(/Tool permissions/);
-    const presetsBtn = screen.getByText(/Workspace presets/);
+    expect(screen.queryByText(/Project settings/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Default agent model/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Tool permissions/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Workspace presets/)).not.toBeInTheDocument();
+  });
 
-    expect(projectSettingsBtn).toHaveAttribute("title", "Coming soon");
-    expect(agentModelBtn).toHaveAttribute("title", "Coming soon");
-    expect(toolPermissionsBtn).toHaveAttribute("title", "Coming soon");
-    expect(presetsBtn).toHaveAttribute("title", "Coming soon");
+  it("calls onRevealInFinder and onDismiss when Reveal in Finder is clicked", () => {
+    const onRevealInFinder = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <ProjectContextMenu
+        {...baseProps}
+        onRevealInFinder={onRevealInFinder}
+        onDismiss={onDismiss}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Reveal in Finder/));
+    expect(onRevealInFinder).toHaveBeenCalled();
+    expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it("calls onCopyPath and onDismiss when Copy path is clicked", () => {
+    const onCopyPath = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <ProjectContextMenu {...baseProps} onCopyPath={onCopyPath} onDismiss={onDismiss} />,
+    );
+    fireEvent.click(screen.getByText(/Copy path/));
+    expect(onCopyPath).toHaveBeenCalled();
+    expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it("calls onOpenInEditor and onDismiss when Open in editor is clicked", () => {
+    const onOpenInEditor = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <ProjectContextMenu
+        {...baseProps}
+        onOpenInEditor={onOpenInEditor}
+        onDismiss={onDismiss}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Open in editor/));
+    expect(onOpenInEditor).toHaveBeenCalled();
+    expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it("calls onOpenInTerminal and onDismiss when Open in terminal is clicked", () => {
+    const onOpenInTerminal = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <ProjectContextMenu
+        {...baseProps}
+        onOpenInTerminal={onOpenInTerminal}
+        onDismiss={onDismiss}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Open in terminal/));
+    expect(onOpenInTerminal).toHaveBeenCalled();
+    expect(onDismiss).toHaveBeenCalled();
   });
 
   it("calls onRename and onDismiss when Rename is clicked", () => {
     const onRename = vi.fn();
     const onDismiss = vi.fn();
     render(
-      <ProjectContextMenu
-        {...baseProps}
-        onRename={onRename}
-        onDismiss={onDismiss}
-      />,
+      <ProjectContextMenu {...baseProps} onRename={onRename} onDismiss={onDismiss} />,
     );
     fireEvent.click(screen.getByText(/Rename project/));
     expect(onRename).toHaveBeenCalled();
@@ -74,28 +126,20 @@ describe("ProjectContextMenu", () => {
     const onClose = vi.fn();
     const onDismiss = vi.fn();
     render(
-      <ProjectContextMenu
-        {...baseProps}
-        onClose={onClose}
-        onDismiss={onDismiss}
-      />,
+      <ProjectContextMenu {...baseProps} onClose={onClose} onDismiss={onDismiss} />,
     );
-    fireEvent.click(screen.getByText(/Close project/));
+    fireEvent.click(screen.getByText("Close project"));
     expect(onClose).toHaveBeenCalled();
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  it("calls onDelete and onDismiss when Delete is clicked", () => {
+  it("calls onDelete and onDismiss when Delete from disk is clicked", () => {
     const onDelete = vi.fn();
     const onDismiss = vi.fn();
     render(
-      <ProjectContextMenu
-        {...baseProps}
-        onDelete={onDelete}
-        onDismiss={onDismiss}
-      />,
+      <ProjectContextMenu {...baseProps} onDelete={onDelete} onDismiss={onDismiss} />,
     );
-    fireEvent.click(screen.getByText(/Delete project from disk/));
+    fireEvent.click(screen.getByText(/Delete from disk/));
     expect(onDelete).toHaveBeenCalled();
     expect(onDismiss).toHaveBeenCalled();
   });
@@ -117,18 +161,6 @@ describe("ProjectContextMenu", () => {
     expect(onDismiss).toHaveBeenCalled();
     // Cleanup
     container.remove();
-  });
-
-  it("calls onDismiss on mouseLeave", () => {
-    const onDismiss = vi.fn();
-    const { container } = render(
-      <ProjectContextMenu {...baseProps} onDismiss={onDismiss} />,
-    );
-    const menu = container.querySelector("[role='menu']");
-    if (menu) {
-      fireEvent.mouseLeave(menu);
-      expect(onDismiss).toHaveBeenCalled();
-    }
   });
 
   it("renders Set Jira project key item and calls onSetJiraProjectKey when clicked", () => {
