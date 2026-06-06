@@ -82,6 +82,16 @@ export function WorkspaceRail({
       aria-label="Workspaces"
     >
       <div className={`flex-1 flex flex-col w-full overflow-y-auto ${isCollapsed ? "gap-0.5" : "gap-2"}`}>
+        {!isCollapsed && (projects || []).length === 0 && (
+          <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+            <p className="font-serif text-[15px] leading-snug text-octo-sage">
+              No projects open yet.
+            </p>
+            <p className="font-mono text-[11px] text-octo-mute">
+              <span className="text-octo-brass">⟶</span> Add a project to begin.
+            </p>
+          </div>
+        )}
         {(projects || []).map((project, projectIndex) => (
           <div key={project?.id || `project-${projectIndex}`} className={`flex flex-col ${isCollapsed ? "gap-1" : "gap-1"}`} style={{ marginBottom: isCollapsed && projectIndex < projects.length - 1 ? '0.5rem' : !isCollapsed && projectIndex < projects.length - 1 ? '0.75rem' : '0' }}>
             {/* Project header (only when expanded) */}
@@ -164,6 +174,15 @@ export function WorkspaceRail({
                 }
               />
             ))}
+
+            {/* Empty project (expanded rail, expanded project, no workspaces). */}
+            {!isCollapsed &&
+              !collapsedProjects[project.id] &&
+              (project?.workspaces || []).length === 0 && (
+                <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
+                  No workspaces yet
+                </div>
+              )}
           </div>
         ))}
       </div>
