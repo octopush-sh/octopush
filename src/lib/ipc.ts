@@ -151,6 +151,9 @@ export const ipc = {
   reopenProject: (projectId: string) =>
     invoke<void>("reopen_project", { projectId }),
   listClosedProjects: () => invoke<ProjectInfo[]>("list_closed_projects"),
+  setProjectPinned: (projectId: string, pinned: boolean) =>
+    invoke<void>("set_project_pinned", { projectId, pinned }),
+  setProjectOrder: (ids: string[]) => invoke<void>("set_project_order", { ids }),
 
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
@@ -162,6 +165,10 @@ export const ipc = {
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),
   deleteWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
     invoke<void>("delete_workspace", { workspaceId, projectPath, branch, worktreePath }),
+  archiveWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
+    invoke<void>("archive_workspace", { workspaceId, projectPath, branch, worktreePath }),
+  renameWorkspace: (workspaceId: string, name: string) =>
+    invoke<void>("rename_workspace", { workspaceId, name }),
   updateWorkspaceCustomization: (
     workspaceId: string,
     glyph: string | null,

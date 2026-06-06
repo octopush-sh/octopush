@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ProjectInfo } from "../lib/types";
 
 function proj(id: string): ProjectInfo {
-  return { id, name: id.toUpperCase(), path: `/repo/${id}`, jiraProjectKey: null };
+  return { id, name: id.toUpperCase(), path: `/repo/${id}`, jiraProjectKey: null, pinned: false };
 }
 
 const mockIpc = {

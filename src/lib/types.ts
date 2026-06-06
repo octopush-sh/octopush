@@ -118,6 +118,7 @@ export interface ProjectInfo {
   name: string;
   path: string;
   jiraProjectKey: string | null;
+  pinned: boolean;
 }
 
 // ─── Workspaces ───────────────────────────────────────────────────

@@ -4,8 +4,8 @@ import { ProjectPickerModal } from "./ProjectPickerModal";
 import type { ProjectInfo } from "../lib/types";
 
 const candidates: ProjectInfo[] = [
-  { id: "p1", name: "Alpha Project", path: "/home/user/alpha", jiraProjectKey: "ALP" },
-  { id: "p2", name: "Beta Project", path: "/home/user/beta", jiraProjectKey: "BET" },
+  { id: "p1", name: "Alpha Project", path: "/home/user/alpha", jiraProjectKey: "ALP", pinned: false },
+  { id: "p2", name: "Beta Project", path: "/home/user/beta", jiraProjectKey: "BET", pinned: false },
 ];
 
 describe("ProjectPickerModal", () => {

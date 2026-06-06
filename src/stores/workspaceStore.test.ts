@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Workspace, ProjectInfo } from "../lib/types";
 
 function makeProject(id: string): ProjectInfo {
-  return { id, name: id.toUpperCase(), path: `/repo/${id}`, jiraProjectKey: null };
+  return { id, name: id.toUpperCase(), path: `/repo/${id}`, jiraProjectKey: null, pinned: false };
 }
 
 let nextId = 0;
