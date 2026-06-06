@@ -295,6 +295,14 @@ export interface EditorChoice {
   command: string;
 }
 
+/** Compact per-workspace git signal for the rail (from workspaces_git_summary). */
+export interface WorkspaceGitSummary {
+  workspaceId: string;
+  dirty: boolean;
+  ahead: number;
+  behind: number;
+}
+
 // ─── Usage breakdown (cloud vs local) ─────────────────────────────
 
 export interface UsageBreakdown {
