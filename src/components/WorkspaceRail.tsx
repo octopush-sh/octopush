@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { resolveMonogram, TINTS } from "../lib/monogram";
-import type { Workspace } from "../lib/types";
+import type { Workspace, ProjectInfo } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { ProjectMark } from "./icons/ProjectMark";
+import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
 
 /** Hierarchical project/workspace structure for the rail. */
 export interface ProjectGroup {
@@ -25,6 +26,10 @@ interface Props {
   onAddProject?: () => void;
   /** Called when user right-clicks on a project header. */
   onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+  /** Soft-closed projects, for the Recently-closed drawer (§4.4). */
+  closedProjects?: ProjectInfo[];
+  /** Called when the user restores a closed project. */
+  onReopenProject?: (projectId: string) => void;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
 }
@@ -38,6 +43,8 @@ export function WorkspaceRail({
   onNewWorkspaceForProject,
   onAddProject,
   onProjectContextMenu,
+  closedProjects,
+  onReopenProject,
   isCollapsed,
 }: Props) {
   return (
@@ -111,6 +118,14 @@ export function WorkspaceRail({
           </div>
         ))}
       </div>
+
+      {/* Recently closed (expanded rail only) */}
+      {!isCollapsed && onReopenProject && (
+        <RecentlyClosedDrawer
+          projects={closedProjects ?? []}
+          onReopen={onReopenProject}
+        />
+      )}
 
       {/* Add project button */}
       {onAddProject && (
