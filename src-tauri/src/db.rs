@@ -821,6 +821,43 @@ impl Db {
         Ok(())
     }
 
+    /// Un-archive a workspace (status back to active).
+    pub fn restore_workspace(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET status = 'active' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Archived workspaces for a project (status='archived'), newest first.
+    pub fn list_archived_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
+             FROM workspaces WHERE project_id = ?1 AND status = 'archived' ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok(WorkspaceRow {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                name: r.get(2)?,
+                task: r.get(3)?,
+                branch: r.get(4)?,
+                worktree_path: r.get(5)?,
+                setup_script: r.get(6)?,
+                status: r.get(7)?,
+                created_at: r.get(8)?,
+                last_active: r.get(9)?,
+                glyph: r.get(10)?,
+                tint: r.get(11)?,
+                test_command: r.get(12)?,
+                linked_issue_key: r.get(13)?,
+                issue_link_dismissed: r.get::<_, i64>(14)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn rename_workspace(&self, id: &str, name: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE workspaces SET name = ?1 WHERE id = ?2",

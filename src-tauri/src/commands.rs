@@ -705,6 +705,37 @@ pub async fn archive_workspace(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn list_archived_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Vec<crate::db::WorkspaceRow>> {
+    state.db.lock().list_archived_workspaces(&project_id)
+}
+
+#[tauri::command]
+pub async fn restore_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    project_path: String,
+    branch: String,
+    worktree_path: Option<String>,
+) -> AppResult<()> {
+    let project_path = expand_tilde(&project_path);
+    // Recreate the worktree from the kept branch (create_worktree attaches to
+    // the existing refs/heads/<branch>; it does NOT create a new branch), then
+    // flip status back to active.
+    if let Some(wt) = worktree_path {
+        let wt = expand_tilde(&wt);
+        crate::git_ops::create_worktree(
+            std::path::Path::new(&project_path),
+            &branch,
+            std::path::Path::new(&wt),
+        )?;
+    }
+    state.db.lock().restore_workspace(&workspace_id)
+}
+
 // ─── Update workspace customization ──────────────────────────────
 
 #[tauri::command]

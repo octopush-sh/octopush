@@ -154,6 +154,8 @@ pub fn run() {
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,
+            commands::list_archived_workspaces,
+            commands::restore_workspace,
             commands::update_workspace_customization,
             commands::rename_workspace,
             commands::update_workspace_link,

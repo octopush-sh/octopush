@@ -233,6 +233,23 @@ mod workspace_tests {
     }
 
     #[test]
+    fn archive_then_list_archived_and_restore() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-arch2-p").unwrap();
+        db.insert_workspace("w1", "p", "alpha", "", "feat/a", Some("/tmp/x/a"), "").unwrap();
+
+        db.archive_workspace("w1").unwrap();
+        assert!(db.list_workspaces("p").unwrap().is_empty());
+        let archived = db.list_archived_workspaces("p").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "w1");
+
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(db.list_workspaces("p").unwrap().len(), 1);
+        assert!(db.list_archived_workspaces("p").unwrap().is_empty());
+    }
+
+    #[test]
     fn rename_workspace_updates_name() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/octo-rn-p").unwrap();
