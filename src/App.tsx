@@ -83,6 +83,8 @@ function App() {
     pruneProject,
     gitSummaryByWs,
     loadGitSummaries,
+    prByWs,
+    loadProjectPrs,
   } = useWorkspaceStore();
 
   const [appView, setAppView] = useState<AppView>("project");
@@ -404,21 +406,31 @@ function App() {
 
     const ids = Array.from(projectIds);
     loadAllWorkspaces(ids);
-    ids.forEach((id) => void loadGitSummaries(id));
-  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries]);
+    const pathById = new Map<string, string>();
+    recentProjects.forEach((p) => pathById.set(p.id, p.path));
+    if (project) pathById.set(project.id, project.path);
+    ids.forEach((id) => {
+      void loadGitSummaries(id);
+      const p = pathById.get(id);
+      if (p) void loadProjectPrs(id, p);
+    });
+  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
   // Refresh the rail's git signal when the window regains focus — calm,
   // event-driven (no polling). Summaries are cheap (local libgit2).
   useEffect(() => {
     const onFocus = () => {
-      const ids = new Set<string>();
-      if (project) ids.add(project.id);
-      recentProjects.forEach((p) => ids.add(p.id));
-      ids.forEach((id) => void loadGitSummaries(id));
+      const byId = new Map<string, string>();
+      if (project) byId.set(project.id, project.path);
+      recentProjects.forEach((p) => byId.set(p.id, p.path));
+      byId.forEach((path, id) => {
+        void loadGitSummaries(id);
+        void loadProjectPrs(id, path);
+      });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, recentProjects, loadGitSummaries]);
+  }, [project, recentProjects, loadGitSummaries, loadProjectPrs]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
@@ -1211,6 +1223,7 @@ function App() {
         closedProjects={closedProjects}
         onReopenProject={handleReopenProject}
         gitSummaryByWs={gitSummaryByWs}
+        prByWs={prByWs}
         isCollapsed={isRailCollapsed}
       />
 
