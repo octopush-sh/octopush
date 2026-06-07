@@ -385,7 +385,16 @@ pub fn get_diff_text(path: &Path) -> AppResult<String> {
         if matches!(origin, '+' | '-' | ' ') {
             buf.push(origin as u8);
         }
-        buf.extend_from_slice(line.content());
+        // Bound the per-line append: a single newline-less line (minified
+        // bundle, one-line JSON) would otherwise blow past the cap in one call.
+        let remaining = MAX_DIFF_BYTES.saturating_sub(buf.len());
+        let content = line.content();
+        let take = remaining.min(content.len());
+        buf.extend_from_slice(&content[..take]);
+        if take < content.len() {
+            truncated = true;
+            return false; // stop: this line alone hit the cap
+        }
         true
     });
     if let Err(e) = print_result {
@@ -454,5 +463,19 @@ mod tests {
         let diff = get_diff_text(dir.path()).unwrap();
         assert!(diff.len() < 1_300_000, "diff should be capped near 1 MiB, got {}", diff.len());
         assert!(diff.contains("diff truncated"), "should carry the truncation marker");
+    }
+
+    #[test]
+    fn get_diff_text_caps_single_long_untracked_line() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        // 3 MiB on ONE line (no newlines) — e.g. a minified bundle.
+        let big = "x".repeat(3 * 1024 * 1024);
+        fs::write(dir.path().join("bundle.min.js"), &big).unwrap();
+
+        let diff = get_diff_text(dir.path()).unwrap();
+        assert!(diff.len() < 1_300_000, "single huge line must be capped, got {}", diff.len());
+        assert!(diff.contains("diff truncated"));
     }
 }
