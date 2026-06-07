@@ -45,6 +45,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
 function renderHeader(props: {
   workspace: Workspace;
   issueTrackerConfigured?: boolean;
+  jiraProjectKey?: string | null;
   pr?: Pr | null;
   onOpenPr?: (url: string) => void;
   openPr?: Pr | null; // legacy alias → forwarded as pr
@@ -58,6 +59,7 @@ function renderHeader(props: {
       gitStatus={null}
       workspace={props.workspace}
       issueTrackerConfigured={props.issueTrackerConfigured ?? false}
+      jiraProjectKey={props.jiraProjectKey ?? null}
       pr={prProp}
       onOpenPr={props.onOpenPr}
     />,
@@ -136,6 +138,7 @@ describe("ContextHeader", () => {
       renderHeader({
         workspace: makeWorkspace({ branch: "feat/PROJ-123-login" }),
         issueTrackerConfigured: true,
+        jiraProjectKey: "PROJ",
       });
       expect(screen.getByText("PROJ-123")).toBeInTheDocument();
       expect(screen.getByText(/In Progress/i)).toBeInTheDocument();
@@ -165,6 +168,7 @@ describe("ContextHeader", () => {
       renderHeader({
         workspace: makeWorkspace({ branch: "feat/PROJ-123-login" }),
         issueTrackerConfigured: true,
+        jiraProjectKey: "PROJ",
       });
       // No issue resolved synchronously → chip hidden
       expect(screen.queryByText("PROJ-123")).not.toBeInTheDocument();
@@ -227,7 +231,7 @@ describe("ContextHeader", () => {
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     expect(await screen.findByText("CLPNSNS-92")).toBeInTheDocument();
     expect(screen.getByText("In Progress")).toBeInTheDocument();
@@ -247,7 +251,7 @@ describe("ContextHeader", () => {
     useIssuesStore.setState({
       issues: null, loading: true, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     expect(screen.getByText(/^Workspace$/i)).toBeInTheDocument();
     expect(screen.getByText("ws-degraded")).toBeInTheDocument();
@@ -294,7 +298,7 @@ describe("ContextHeader", () => {
       ],
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     fireEvent.click(await screen.findByRole("button", { name: /open clpnsns-92/i }));
     expect(openFileInSystemMock).toHaveBeenCalledWith("https://acme.atlassian.net/browse/CLPNSNS-92");
@@ -330,7 +334,7 @@ describe("ContextHeader", () => {
       },
       loading: {},
     });
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     fireEvent.click(await screen.findByRole("button", { name: /open epic-50/i }));
     expect(openFileInSystemMock).toHaveBeenLastCalledWith("https://acme.atlassian.net/browse/EPIC-50");
@@ -365,7 +369,7 @@ describe("ContextHeader", () => {
       loading: {},
     });
 
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     const epicKey = await screen.findByText("EPIC-50");
     expect(epicKey).toHaveClass("text-state-purple");
@@ -438,7 +442,7 @@ describe("ContextHeader", () => {
       loading: {},
     });
 
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
 
     expect(await screen.findByText("CLPNSNS-101")).toHaveClass("text-octo-rouge");
     expect(screen.getByText("EPIC-50")).toHaveClass("text-state-purple");
@@ -459,7 +463,7 @@ describe("ContextHeader", () => {
       loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
     });
 
-    renderHeader({ workspace, issueTrackerConfigured: true });
+    renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "SPIKE" });
 
     expect(await screen.findByText("SPIKE-1")).toHaveClass("text-octo-brass");
   });
@@ -528,7 +532,7 @@ describe("ContextHeader", () => {
         ],
         loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
       });
-      const { unmount } = renderHeader({ workspace, issueTrackerConfigured: true });
+      const { unmount } = renderHeader({ workspace, issueTrackerConfigured: true, jiraProjectKey: "CLPNSNS" });
       const statusEl = await screen.findByText(
         category === "inProgress" ? "In Progress" : category === "done" ? "Done" : category === "todo" ? "To Do" : "Unknown",
       );

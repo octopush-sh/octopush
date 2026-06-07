@@ -3,7 +3,8 @@ import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/t
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
-import { resolveLinkage, issueTypeToken } from "../lib/issueTrackerSelectors";
+import { issueTypeToken } from "../lib/issueTrackerSelectors";
+import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -53,6 +54,10 @@ interface Props {
   /** Whether the issue tracker is configured. When false, no ticket is
    *  shown even if a key is present — the degraded WORKSPACE block renders. */
   issueTrackerConfigured?: boolean;
+  /** The active project's configured Jira key. A branch-DETECTED key must
+   *  match this prefix to surface a ticket (C5); a manual link still wins
+   *  regardless. */
+  jiraProjectKey?: string | null;
 }
 
 export function ContextHeader({
@@ -63,11 +68,13 @@ export function ContextHeader({
   onOpenPr,
   workspace = null,
   issueTrackerConfigured = false,
+  jiraProjectKey = null,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
-  const linkage = workspace ? resolveLinkage(workspace, branch) : { kind: "unlinked" as const };
-  const activeKey =
-    linkage.kind === "linked" && issueTrackerConfigured ? linkage.key : null;
+  const manualKey = workspace?.linkedIssueKey ?? null;
+  const detectedKey = detectIssueKeyForProject(branch, jiraProjectKey ?? null);
+  const resolvedKey = manualKey ?? detectedKey;
+  const activeKey = resolvedKey && issueTrackerConfigured ? resolvedKey : null;
   const activeIssue = useActiveIssue(activeKey);
 
   const parents = useParentIssuesStore((s) => s.parents);

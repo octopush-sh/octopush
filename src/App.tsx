@@ -1307,6 +1307,7 @@ function App() {
             onOpenPr={(url) => ipc.openFileInSystem(url)}
             workspace={activeWorkspace}
             issueTrackerConfigured={issueTrackerConfigured}
+            jiraProjectKey={activeProject?.jiraProjectKey ?? null}
           />
         )}
 
