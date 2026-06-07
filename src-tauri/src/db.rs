@@ -199,6 +199,8 @@ impl Db {
         )?;
         add_column_if_missing(
             &self.conn,
+            // Retained for non-destructive cleanup (Plan 13/T4): column is no longer
+            // read or written, but we keep it in place rather than dropping it.
             "ALTER TABLE workspaces ADD COLUMN issue_link_dismissed INTEGER NOT NULL DEFAULT 0",
         )?;
 
@@ -740,7 +742,7 @@ impl Db {
 
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
              FROM workspaces WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -759,7 +761,6 @@ impl Db {
                 tint: r.get(11)?,
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
-                issue_link_dismissed: r.get::<_, i64>(14)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -767,7 +768,7 @@ impl Db {
 
     pub fn get_workspace(&self, workspace_id: &str) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
              FROM workspaces WHERE id = ?1",
         )?;
         let row = stmt
@@ -787,7 +788,6 @@ impl Db {
                     tint: r.get(11)?,
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
-                    issue_link_dismissed: r.get::<_, i64>(14)? != 0,
                 })
             })
             .optional()?;
@@ -798,11 +798,10 @@ impl Db {
         &self,
         workspace_id: &str,
         linked_issue_key: Option<String>,
-        dismissed: bool,
     ) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE workspaces SET linked_issue_key = ?1, issue_link_dismissed = ?2 WHERE id = ?3",
-            rusqlite::params![linked_issue_key, dismissed as i64, workspace_id],
+            "UPDATE workspaces SET linked_issue_key = ?1 WHERE id = ?2",
+            rusqlite::params![linked_issue_key, workspace_id],
         )?;
         Ok(())
     }
@@ -834,7 +833,7 @@ impl Db {
     /// Archived workspaces for a project (status='archived'), newest first.
     pub fn list_archived_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, issue_link_dismissed
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
              FROM workspaces WHERE project_id = ?1 AND status = 'archived' ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -853,7 +852,6 @@ impl Db {
                 tint: r.get(11)?,
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
-                issue_link_dismissed: r.get::<_, i64>(14)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1296,7 +1294,6 @@ pub struct WorkspaceRow {
     pub tint: Option<String>,
     pub test_command: Option<String>,
     pub linked_issue_key: Option<String>,
-    pub issue_link_dismissed: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]

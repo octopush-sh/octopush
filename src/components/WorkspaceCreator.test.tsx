@@ -37,7 +37,6 @@ const mockWorkspace: Workspace = {
   tint: null,
   testCommand: null,
   linkedIssueKey: null,
-  issueLinkDismissed: false,
 };
 
 beforeEach(() => {
@@ -84,8 +83,7 @@ describe("WorkspaceCreator", () => {
     await waitFor(() => {
       expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).toHaveBeenCalledWith(
         "ws-new-1",
-        "PROJ-99",
-        false
+        "PROJ-99"
       );
     });
     expect(onCreated).toHaveBeenCalled();

@@ -37,7 +37,6 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
     tint: null,
     testCommand: null,
     linkedIssueKey: null,
-    issueLinkDismissed: false,
     ...overrides,
   };
 }
@@ -178,7 +177,6 @@ describe("ContextHeader", () => {
       const workspace = makeWorkspace({
         branch: "feat/IGNORED-9-foo",
         linkedIssueKey: "FORCED-1",
-        issueLinkDismissed: false,
       });
       useIssuesStore.setState({
         issues: [
@@ -190,21 +188,10 @@ describe("ContextHeader", () => {
       expect(await screen.findByText("FORCED-1")).toBeInTheDocument();
     });
 
-    it("hides the chip when the linkage is dismissed", () => {
+    it("hides the chip when the linkage is unlinked (no manual, no branch key)", () => {
       const workspace = makeWorkspace({
         branch: "main",
         linkedIssueKey: null,
-        issueLinkDismissed: true,
-      });
-      renderHeader({ workspace, issueTrackerConfigured: true });
-      expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
-    });
-
-    it("hides the chip when the linkage is unlinked (no manual, no branch key, not dismissed)", () => {
-      const workspace = makeWorkspace({
-        branch: "main",
-        linkedIssueKey: null,
-        issueLinkDismissed: false,
       });
       renderHeader({ workspace, issueTrackerConfigured: true });
       expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
@@ -217,7 +204,7 @@ describe("ContextHeader", () => {
       branch: "feat/CLPNSNS-92",
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-      linkedIssueKey: null, issueLinkDismissed: false,
+      linkedIssueKey: null,
     };
     useIssuesStore.setState({
       issues: [
@@ -246,7 +233,7 @@ describe("ContextHeader", () => {
       branch: "feat/CLPNSNS-92",
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-      linkedIssueKey: null, issueLinkDismissed: false,
+      linkedIssueKey: null,
     };
     useIssuesStore.setState({
       issues: null, loading: true, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -264,7 +251,7 @@ describe("ContextHeader", () => {
       branch: "main",
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-      linkedIssueKey: null, issueLinkDismissed: false,
+      linkedIssueKey: null,
     };
     useIssuesStore.setState({
       issues: [], loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -284,7 +271,7 @@ describe("ContextHeader", () => {
       branch: "feat/CLPNSNS-92",
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-      linkedIssueKey: null, issueLinkDismissed: false,
+      linkedIssueKey: null,
     };
     useIssuesStore.setState({
       issues: [
@@ -510,7 +497,7 @@ describe("ContextHeader", () => {
       branch: "feat/CLPNSNS-92",
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-      linkedIssueKey: null, issueLinkDismissed: false,
+      linkedIssueKey: null,
     };
     const cases: Array<["todo" | "inProgress" | "done" | "unknown", string]> = [
       ["inProgress", "text-state-blue"],   // changed from text-octo-brass

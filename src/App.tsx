@@ -1868,7 +1868,7 @@ function App() {
               setContextMenu(null);
             }}
             onUnlinkJira={async () => {
-              await ipc.updateWorkspaceLink(contextMenu.workspaceId, null, false);
+              await ipc.updateWorkspaceLink(contextMenu.workspaceId, null);
               await useWorkspaceStore.getState().load(workspace.projectId);
               setContextMenu(null);
             }}
@@ -1923,7 +1923,7 @@ function App() {
             projectKey={pickerProjectKey}
             title={jiraTicketPickerOpen.mode === "link" ? "Link Jira ticket" : "Change Jira ticket"}
             onPick={async (key) => {
-              await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key, false);
+              await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key);
               await useWorkspaceStore.getState().load(pickerWs!.projectId);
               void useIssuesStore.getState().load();
               setJiraTicketPickerOpen(null);

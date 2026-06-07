@@ -350,18 +350,16 @@ mod workspace_tests {
         db.insert_workspace("ws-link", "proj-link", "ws", "", "main", None, "")
             .unwrap();
 
-        // Set linked_issue_key and dismissed=false, then read back.
-        db.update_workspace_link("ws-link", Some("PROJ-42".into()), false)
+        // Set linked_issue_key, then read back.
+        db.update_workspace_link("ws-link", Some("PROJ-42".into()))
             .unwrap();
         let ws = db.get_workspace("ws-link").unwrap().unwrap();
         assert_eq!(ws.linked_issue_key.as_deref(), Some("PROJ-42"));
-        assert!(!ws.issue_link_dismissed);
 
-        // Clear link and set dismissed=true.
-        db.update_workspace_link("ws-link", None, true).unwrap();
+        // Clear link.
+        db.update_workspace_link("ws-link", None).unwrap();
         let ws = db.get_workspace("ws-link").unwrap().unwrap();
         assert_eq!(ws.linked_issue_key, None);
-        assert!(ws.issue_link_dismissed);
     }
 
     #[test]

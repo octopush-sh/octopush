@@ -556,9 +556,8 @@ pub async fn update_workspace_link(
     state: State<'_, AppState>,
     workspace_id: String,
     linked_issue_key: Option<String>,
-    dismissed: bool,
 ) -> AppResult<()> {
-    state.db.lock().update_workspace_link(&workspace_id, linked_issue_key, dismissed)
+    state.db.lock().update_workspace_link(&workspace_id, linked_issue_key)
 }
 
 #[tauri::command]

@@ -61,7 +61,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     }
     if (linkIssueKeyOnCreate) {
       try {
-        await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate, false);
+        await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
         await useWorkspaceStore.getState().load(newWs.projectId);
       } catch (e) {
         // Workspace was created OK but the Jira link did not persist. Keep the

@@ -33,7 +33,6 @@ function makeWorkspace(projectId: string, name: string): Workspace {
     glyph: null,
     tint: null,
     linkedIssueKey: null,
-    issueLinkDismissed: false,
   };
 }
 

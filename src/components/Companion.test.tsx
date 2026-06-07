@@ -21,7 +21,7 @@ const baseProps = {
     id: "w1", projectId: "p1", name: "x", task: "", branch: "feat/CLPNSNS-1",
     worktreePath: null, setupScript: "", status: "active",
     createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
-    linkedIssueKey: null, issueLinkDismissed: false,
+    linkedIssueKey: null,
   },
   // jiraProjectKey drives resolveJiraProjectKey — set it so projectKey != null
   project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: "CLPNSNS", pinned: false, tint: null },
@@ -52,7 +52,6 @@ describe("Companion cross-mode visibility of issue tracker block", () => {
         ...baseProps.workspace,
         branch: "main",
         linkedIssueKey: null,
-        issueLinkDismissed: false,
       },
       project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: null, pinned: false, tint: null },
     };

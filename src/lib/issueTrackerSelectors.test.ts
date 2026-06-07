@@ -29,7 +29,6 @@ function ws(overrides: Partial<Workspace> = {}): Workspace {
     tint: null,
     testCommand: null,
     linkedIssueKey: null,
-    issueLinkDismissed: false,
     ...overrides,
   };
 }
@@ -69,16 +68,6 @@ describe("resolveLinkage", () => {
     expect(resolveLinkage(ws(), "feat/PROJ-42-foo")).toEqual({
       kind: "linked", key: "PROJ-42", source: "detected",
     });
-  });
-
-  it("unlinked when no manual + no branch key (issueLinkDismissed no longer matters)", () => {
-    expect(resolveLinkage(ws({ issueLinkDismissed: true }), "main")).toEqual({ kind: "unlinked" });
-  });
-
-  it("branch key still detected regardless of issueLinkDismissed", () => {
-    expect(
-      resolveLinkage(ws({ issueLinkDismissed: true }), "feat/PROJ-7-go"),
-    ).toEqual({ kind: "linked", key: "PROJ-7", source: "detected" });
   });
 
   it("unlinked when nothing else applies", () => {

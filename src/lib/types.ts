@@ -141,7 +141,6 @@ export interface Workspace {
   tint: TintName | null;
   testCommand?: string | null;
   linkedIssueKey: string | null;
-  issueLinkDismissed: boolean;
 }
 
 // ─── File edits ───────────────────────────────────────────────────

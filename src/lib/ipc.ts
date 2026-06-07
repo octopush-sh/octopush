@@ -349,8 +349,8 @@ export const ipc = {
     invoke<IssueTrackerConfig | null>("get_issue_tracker_config"),
   saveIssueTrackerConfig: (config: IssueTrackerConfig) =>
     invoke<void>("save_issue_tracker_config", { config }),
-  updateWorkspaceLink: (workspaceId: string, linkedIssueKey: string | null, dismissed: boolean) =>
-    invoke<void>("update_workspace_link", { workspaceId, linkedIssueKey, dismissed }),
+  updateWorkspaceLink: (workspaceId: string, linkedIssueKey: string | null) =>
+    invoke<void>("update_workspace_link", { workspaceId, linkedIssueKey }),
   updateProjectJiraKey: (projectId: string, jiraProjectKey: string | null) =>
     invoke<void>("update_project_jira_key", { projectId, jiraProjectKey }),
 };
