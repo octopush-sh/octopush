@@ -618,14 +618,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn touch_project(&self, id: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE projects SET last_opened = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), id],
-        )?;
-        Ok(())
-    }
-
     pub fn get_project_by_path(&self, path: &str) -> AppResult<Option<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, path FROM projects WHERE path = ?1",

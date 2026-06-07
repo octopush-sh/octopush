@@ -270,7 +270,7 @@ mod workspace_tests {
         // "Open" the oldest project — under the old `last_opened DESC` ordering
         // this would hoist proj-a to the front. Creation-ascending must NOT move it.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        db.touch_project("proj-a").unwrap();
+        db.reopen_project("proj-a").unwrap();
 
         let projects = db.list_projects().unwrap();
         let ids: Vec<&str> = projects.iter().map(|p| p.0.as_str()).collect();
