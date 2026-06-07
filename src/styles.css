@@ -145,6 +145,40 @@
   animation: namefade-in 260ms ease-in-out forwards;
 }
 
+/* ── Motion · reusable entrance primitives ───────────────────────
+   The canonical way to reveal overlays, dialogs, menus, and panels.
+   Built on --ease-octo / --dur-* so everything reads as one family.
+   See CLAUDE.md (motion rule) + docs/design-system.md §6. */
+@keyframes octo-enter-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes octo-enter-pop {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes octo-enter-rise {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.octo-overlay-enter { animation: octo-enter-fade var(--dur-quick) var(--ease-octo) both; }
+.octo-modal-enter   { animation: octo-enter-pop var(--dur-standard) var(--ease-octo) both; }
+.octo-menu-enter    { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
+.octo-fade-in       { animation: octo-enter-fade var(--dur-quick) var(--ease-octo) both; }
+.octo-pop-in        { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
+.octo-rise-in       { animation: octo-enter-rise var(--dur-standard) var(--ease-octo) both; }
+
+/* Accessibility: honor reduced-motion — render final state instantly. */
+@media (prefers-reduced-motion: reduce) {
+  .octo-overlay-enter,
+  .octo-modal-enter,
+  .octo-menu-enter,
+  .octo-fade-in,
+  .octo-pop-in,
+  .octo-rise-in { animation: none !important; }
+}
+
 html,
 body,
 #root {

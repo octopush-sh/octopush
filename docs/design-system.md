@@ -165,6 +165,19 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 **Forbidden:** spring physics, bouncing, confetti, jittering icons, scale > 1.05, rotation animations.
 
+### Reusable entrance primitives (use these — don't hand-roll)
+
+| Class | Use for | Built from |
+|-------|---------|------------|
+| `.octo-overlay-enter` | modal/dialog backdrops (scrim fade) | fade · --dur-quick |
+| `.octo-modal-enter` | dialogs, popovers, sheets | fade+scale 0.97→1 · --dur-standard |
+| `.octo-menu-enter` | context menus | fade+scale 0.97→1 · --dur-quick |
+| `.octo-fade-in` | tab/mode content crossfade | fade · --dur-quick |
+| `.octo-pop-in` | status dots / small badges appearing | fade+scale · --dur-quick |
+| `.octo-rise-in` | list rows appearing | fade+rise 4px · --dur-standard |
+
+Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPanel`, the rail project collapse, the Recently-closed drawer). All entrance/collapse motion respects `prefers-reduced-motion`.
+
 ---
 
 ## 7. Common mistakes — DO NOT
