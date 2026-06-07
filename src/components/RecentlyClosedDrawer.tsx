@@ -32,8 +32,16 @@ export function RecentlyClosedDrawer({ projects, onReopen }: Props) {
           }`}
         />
       </button>
-      {open && (
-        <div id="recently-closed-panel" className="mt-1 flex flex-col">
+      <div
+        id="recently-closed-panel"
+        aria-hidden={!open}
+        className="grid overflow-hidden transition-all duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+        style={{
+          gridTemplateRows: open ? "1fr" : "0fr",
+          opacity: open ? 1 : 0,
+        }}
+      >
+        <div className="mt-1 flex min-h-0 flex-col overflow-hidden">
           {projects.map((p) => (
             <div key={p.id} className="group flex items-center gap-2 px-3 py-1.5">
               <ProjectMark size={13} className="shrink-0 opacity-50" />
@@ -51,7 +59,7 @@ export function RecentlyClosedDrawer({ projects, onReopen }: Props) {
             </div>
           ))}
         </div>
-      )}
+      </div>
     </div>
   );
 }
