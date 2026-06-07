@@ -218,7 +218,8 @@ export function ModelPicker({
         <div
           role="listbox"
           aria-label="Select model"
-          className="absolute bottom-full left-0 z-50 mb-2 min-w-[260px] rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
+          className="octo-menu-enter absolute bottom-full left-0 z-50 mb-2 min-w-[260px] rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
+          style={{ transformOrigin: "bottom left" }}
         >
           {providers.length === 0 ? (
             <div className="px-4 py-3 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">

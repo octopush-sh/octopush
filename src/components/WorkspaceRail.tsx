@@ -493,8 +493,8 @@ function WorkspaceRow({
             : workspace?.name || "Workspace"
         }
         aria-current={active ? "location" : undefined}
-        className={`octo-fade-in relative flex h-7 w-7 mx-auto items-center justify-center rounded-md border font-serif transition ${
-          showPulse ? "animate-attention-pulse" : ""
+        className={`relative flex h-7 w-7 mx-auto items-center justify-center rounded-md border font-serif transition ${
+          showPulse ? "animate-attention-pulse" : "octo-fade-in"
         }`}
         style={{
           color: tint?.accent || "var(--color-octo-onyx)",

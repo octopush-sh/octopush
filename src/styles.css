@@ -169,14 +169,17 @@
 .octo-pop-in        { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
 .octo-rise-in       { animation: octo-enter-rise var(--dur-standard) var(--ease-octo) both; }
 
-/* Accessibility: honor reduced-motion — render final state instantly. */
+/* Accessibility: honor reduced-motion — neutralize all motion app-wide
+   (entrance primitives, grid-rows collapses, glides, pulses). */
 @media (prefers-reduced-motion: reduce) {
-  .octo-overlay-enter,
-  .octo-modal-enter,
-  .octo-menu-enter,
-  .octo-fade-in,
-  .octo-pop-in,
-  .octo-rise-in { animation: none !important; }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html,
