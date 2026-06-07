@@ -481,9 +481,14 @@ function App() {
     let cancelled = false;
     const refresh = async () => {
       try {
+        // The diff is only consumed by the review panel (ChangesPanel /
+        // ReviewCanvas / EditorPane), which is hidden outside review mode, so
+        // skip the (non-trivial) diff build in talk/run. Entering review
+        // re-runs this effect (activeMode is a dep), fetching the diff then.
+        const needDiff = activeMode === "review";
         const [s, d] = await Promise.all([
           ipc.getGitStatus(path),
-          ipc.getGitDiff(path).catch(() => ""),
+          needDiff ? ipc.getGitDiff(path).catch(() => "") : Promise.resolve(""),
         ]);
         if (cancelled) return;
         // Status change-detection (file metadata). hasUpstream is intentionally
