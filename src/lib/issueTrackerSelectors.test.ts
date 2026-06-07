@@ -35,7 +35,7 @@ function ws(overrides: Partial<Workspace> = {}): Workspace {
 }
 
 function proj(overrides: Partial<ProjectInfo> = {}): ProjectInfo {
-  return { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: null, pinned: false, ...overrides };
+  return { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: null, pinned: false, tint: null, ...overrides };
 }
 
 function issue(

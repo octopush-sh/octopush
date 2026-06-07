@@ -305,6 +305,31 @@ function App() {
     })();
   }, [loadRecentProjects, loadClosedProjects, openProject, getLastOpenedPath]);
 
+  // One-time migration of legacy localStorage.projectCustomizations into the
+  // backend, so renames/tints survive a localStorage clear. Idempotent and
+  // guarded by a persisted flag.
+  const customizationsMigratedRef = useRef(false);
+  useEffect(() => {
+    if (customizationsMigratedRef.current) return;
+    customizationsMigratedRef.current = true;
+    if (localStorage.getItem("projectCustomizationsMigrated") === "1") return;
+    (async () => {
+      try {
+        const customizations = JSON.parse(localStorage.getItem("projectCustomizations") || "{}");
+        const entries = Object.entries(customizations) as Array<[string, { name?: string; tint?: string }]>;
+        for (const [id, c] of entries) {
+          if (c && (c.name || c.tint)) {
+            await ipc.updateProjectCustomization(id, c.name ?? null, c.tint ?? null);
+          }
+        }
+        localStorage.setItem("projectCustomizationsMigrated", "1");
+        if (entries.length > 0) await loadRecentProjects();
+      } catch {
+        /* non-critical */
+      }
+    })();
+  }, [loadRecentProjects]);
+
   // Performance monitor polling — runs for the whole app lifetime.
   useEffect(() => {
     usePerfStore.getState().start();
@@ -1206,13 +1231,22 @@ function App() {
     // just created this session). We deliberately do NOT hoist the active
     // project to the top — selecting a workspace must never reorder the rail,
     // and newly added projects stay at the end.
+    const byId: Record<string, { name: string; tint: string | null }> = {};
+    recentProjects.forEach((p) => { byId[p.id] = { name: p.name, tint: p.tint }; });
+    if (project) byId[project.id] = { name: project.name, tint: project.tint };
+
     const ordered: { id: string; name: string; tint?: string }[] = [];
     const seen = new Set<string>();
     const pushProject = (id: string, fallbackName: string) => {
       if (seen.has(id)) return;
       seen.add(id);
+      const backend = byId[id];
       const custom = customizations[id];
-      ordered.push({ id, name: custom?.name || fallbackName, tint: custom?.tint });
+      ordered.push({
+        id,
+        name: backend?.name || custom?.name || fallbackName,
+        tint: backend?.tint ?? custom?.tint,
+      });
     };
     recentProjects.forEach((p) => pushProject(p.id, p.name));
     pushProject(project.id, project.name);
