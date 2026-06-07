@@ -351,6 +351,12 @@ pub fn delete_branch(path: &Path, branch_name: &str) -> AppResult<()> {
 }
 
 pub fn get_diff_text(path: &Path) -> AppResult<String> {
+    /// Cap the Review diff payload. Beyond this, building/serializing/parsing/
+    /// rendering the diff blocks the UI (e.g. a worktree with a large untracked
+    /// folder synthesizes MBs of "new file" content). 1 MiB is far more than a
+    /// human reviews; the rest is truncated.
+    const MAX_DIFF_BYTES: usize = 1_048_576;
+
     let repo = open_repo(path)?;
     // Include untracked files (treat each as a synthesized "new file" diff)
     // and recurse into untracked directories. Without these flags, brand-new
@@ -360,10 +366,17 @@ pub fn get_diff_text(path: &Path) -> AppResult<String> {
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
-    let diff = repo.diff_index_to_workdir(None, Some(&mut opts))
+    let diff = repo
+        .diff_index_to_workdir(None, Some(&mut opts))
         .map_err(|e| AppError::Other(format!("diff: {e}")))?;
+
     let mut buf = Vec::new();
-    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+    let mut truncated = false;
+    let print_result = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        if buf.len() >= MAX_DIFF_BYTES {
+            truncated = true;
+            return false; // abort generation — stops reading remaining file content
+        }
         // libgit2 strips the leading `+`/`-`/` ` marker from `line.content()`
         // and exposes it separately as `line.origin()`. Re-emit the marker so
         // the resulting patch is a faithful unified diff that downstream
@@ -374,8 +387,20 @@ pub fn get_diff_text(path: &Path) -> AppResult<String> {
         }
         buf.extend_from_slice(line.content());
         true
-    }).map_err(|e| AppError::Other(format!("diff print: {e}")))?;
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    });
+    if let Err(e) = print_result {
+        // A `false` return from our callback aborts with GIT_EUSER; that's the
+        // intended truncation, not a real failure. Propagate any other error.
+        if !truncated {
+            return Err(AppError::Other(format!("diff print: {e}")));
+        }
+    }
+
+    let mut out = String::from_utf8_lossy(&buf).to_string();
+    if truncated {
+        out.push_str("\n... diff truncated (too large to display fully) ...\n");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -412,5 +437,22 @@ mod tests {
         assert!(is_dirty(dir.path()).unwrap(), "untracked dir marks dirty");
         let (dirty, _, _) = dirty_ahead_behind(dir.path()).unwrap();
         assert!(dirty);
+    }
+
+    #[test]
+    fn get_diff_text_caps_large_untracked_content() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        // 3 MiB of multi-line content. A real "large untracked folder" diff is
+        // many lines; libgit2 invokes the print callback per line, so the cap
+        // engages at a line boundary once the buffer fills.
+        let line = "x".repeat(63);
+        let big = format!("{line}\n").repeat(3 * 1024 * 1024 / 64);
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+
+        let diff = get_diff_text(dir.path()).unwrap();
+        assert!(diff.len() < 1_300_000, "diff should be capped near 1 MiB, got {}", diff.len());
+        assert!(diff.contains("diff truncated"), "should carry the truncation marker");
     }
 }
