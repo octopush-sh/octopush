@@ -133,7 +133,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
           </button>
         </div>
       ) : (
-        <div className="mt-3 flex w-72 items-center gap-2">
+        <div className="mt-3 flex w-72 items-center gap-2 octo-fade-in">
           <input
             autoFocus
             value={pathValue}
@@ -164,7 +164,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
       {/* Error */}
       {error && (
         <div
-          className="mt-4 max-w-md rounded-md px-3 py-2 text-[12px] text-octo-rouge"
+          className="mt-4 max-w-md rounded-md px-3 py-2 text-[12px] text-octo-rouge octo-fade-in"
           style={{ borderLeft: "1px solid var(--color-octo-rouge)", background: "rgba(209, 139, 139, 0.08)" }}
         >
           {error}
@@ -180,7 +180,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
 
       {/* Recent + Recently closed, stacked at the foot */}
       {(recent.length > 0 || closed.length > 0) && (
-        <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-5">
+        <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-5 octo-rise-in">
           {recent.length > 0 && (
             <div>
               <div className="mb-3 text-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
