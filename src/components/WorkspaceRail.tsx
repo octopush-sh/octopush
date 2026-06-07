@@ -493,7 +493,7 @@ function WorkspaceRow({
             : workspace?.name || "Workspace"
         }
         aria-current={active ? "location" : undefined}
-        className={`relative flex h-7 w-7 mx-auto items-center justify-center rounded-md border font-serif transition ${
+        className={`octo-fade-in relative flex h-7 w-7 mx-auto items-center justify-center rounded-md border font-serif transition ${
           showPulse ? "animate-attention-pulse" : ""
         }`}
         style={{
@@ -514,7 +514,7 @@ function WorkspaceRow({
   // Expanded mode
   return (
     <div
-      className={`group relative flex h-11 items-center gap-2 border-l-2 px-3 transition-all duration-[220ms] ${
+      className={`octo-fade-in group relative flex h-11 items-center gap-2 border-l-2 px-3 transition-all duration-[220ms] ${
         active ? "border-octo-brass bg-octo-panel-2" : "border-transparent hover:bg-octo-panel-2"
       }`}
       onContextMenu={handleContextMenu}
@@ -575,25 +575,25 @@ function WorkspaceRow({
 
       {/* Trailing signal: ticket key · ahead/behind · dirty · active (§4.3) */}
       {ticketKey && (
-        <span className="flex-shrink-0 font-mono text-[10px] text-octo-sage">
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-sage octo-pop-in">
           {ticketKey}
         </span>
       )}
       {!!ahead && (
-        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute">↑{ahead}</span>
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute octo-pop-in">↑{ahead}</span>
       )}
       {!!behind && (
-        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute">↓{behind}</span>
+        <span className="flex-shrink-0 font-mono text-[10px] text-octo-mute octo-pop-in">↓{behind}</span>
       )}
       {hasOpenPr && (
         <span
-          className="h-1.5 w-1.5 flex-shrink-0 border border-octo-verdigris"
+          className="h-1.5 w-1.5 flex-shrink-0 border border-octo-verdigris octo-pop-in"
           title="Open pull request"
         />
       )}
       {dirty && !active && (
         <div
-          className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-octo-brass"
+          className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-octo-brass octo-pop-in"
           title="Uncommitted changes"
         />
       )}
