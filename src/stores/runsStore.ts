@@ -75,7 +75,20 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   refreshDetail: async (runId) => {
     const detail = await ipc.getRun(runId);
-    set((s) => ({ detailByRun: { ...s.detailByRun, [runId]: detail } }));
+    set((s) => ({
+      detailByRun: { ...s.detailByRun, [runId]: detail },
+      ...(detail.run
+        ? {
+            runsByWs: {
+              ...s.runsByWs,
+              [detail.run.workspaceId]: replaceRunInList(
+                s.runsByWs[detail.run.workspaceId] ?? EMPTY_RUNS,
+                detail.run,
+              ),
+            },
+          }
+        : {}),
+    }));
   },
 
   begin: async (workspaceId, pipelineId, task, linkedIssueKey) => {

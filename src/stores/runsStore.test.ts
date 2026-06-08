@@ -75,4 +75,19 @@ describe("runsStore", () => {
     expect(d?.run?.costUsd).toBe(0.12);
     expect(d?.run?.baselineUsd).toBe(0.4);
   });
+
+  it("refreshDetail also syncs the run into runsByWs", async () => {
+    const updated = { ...RUN, status: "completed", costUsd: 0.3 };
+    (ipc.getRun as any).mockResolvedValue({ run: updated, stages: [STAGE] });
+    // Seed an existing list entry with the old run.
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, activeRunIdByWs: { w1: "r1" },
+      detailByRun: {}, selectedStageByRun: {},
+    });
+    await useRunsStore.getState().refreshDetail("r1");
+    expect(useRunsStore.getState().getDetail("r1")?.run?.status).toBe("completed");
+    // The list entry must be updated too (not stale).
+    expect(useRunsStore.getState().getRuns("w1")[0].status).toBe("completed");
+    expect(useRunsStore.getState().getRuns("w1")).toHaveLength(1);
+  });
 });
