@@ -1489,6 +1489,12 @@ impl Db {
         reference_model: Option<&str>,
         linked_issue_key: Option<&str>,
     ) -> AppResult<String> {
+        let stages = self.get_pipeline_stages(pipeline_id)?;
+        if stages.is_empty() {
+            return Err(crate::error::AppError::Other(format!(
+                "pipeline '{pipeline_id}' not found or has no stages"
+            )));
+        }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -1496,7 +1502,6 @@ impl Db {
              VALUES (?1,?2,?3,?4,'draft',?5,?6,?7)",
             params![id, workspace_id, pipeline_id, task, reference_model, linked_issue_key, now],
         )?;
-        let stages = self.get_pipeline_stages(pipeline_id)?;
         for s in &stages {
             let sid = Uuid::new_v4().to_string();
             self.conn.execute(
@@ -1670,7 +1675,8 @@ impl Db {
         }
         self.conn.execute(
             "UPDATE run_stages
-             SET status = 'pending', artifact = NULL, error = NULL, finished_at = NULL,
+             SET status = 'pending', artifact = NULL, error = NULL,
+                 started_at = NULL, finished_at = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],

@@ -1982,6 +1982,14 @@ mod run_crud_tests {
         db.set_run_status(&run_id, "completed", true).unwrap();
         assert_eq!(db.get_run(&run_id).unwrap().unwrap().status, "completed");
     }
+
+    #[test]
+    fn create_run_rejects_unknown_pipeline() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let err = db.create_run(&ws, "no-such-pipeline", "t", None, None);
+        assert!(err.is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2181,5 +2189,21 @@ mod orchestrator_tests {
         let status = orch.run_to_pause(&run_id).await.unwrap();
         assert_eq!(status, RunStatus::Paused);
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+    }
+
+    #[tokio::test]
+    async fn start_run_on_completed_run_is_noop() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter().find(|p| p.name == "Plan & review").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // Drive to completion (Plan & review: plan,critique no-cp; refine cp -> approve).
+        orch.run_to_pause(&run_id).await.unwrap();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
+        // Re-driving a completed run must be a no-op (still completed, no re-run).
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
     }
 }

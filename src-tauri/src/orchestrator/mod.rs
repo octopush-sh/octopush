@@ -101,11 +101,21 @@ impl Orchestrator {
         run: &crate::db::RunRow,
         stage: &RunStageRow,
     ) -> AppResult<StageStatus> {
+        let substrate = match AgentSubstrate::from_db(&stage.substrate) {
+            Some(s) => s,
+            None => {
+                self.db.lock().fail_run_stage(
+                    &stage.id,
+                    &format!("unknown substrate '{}'", stage.substrate),
+                )?;
+                return Ok(StageStatus::Failed);
+            }
+        };
         let spec = StageSpec {
             position: stage.position,
             role: stage.role.clone(),
             agent_model: stage.agent_model.clone(),
-            substrate: AgentSubstrate::from_db(&stage.substrate).unwrap_or(AgentSubstrate::Api),
+            substrate,
             checkpoint: stage.checkpoint,
             feedback: stage.feedback.clone(),
         };
@@ -240,6 +250,16 @@ impl Orchestrator {
     }
 
     async fn drive_inner(&self, run_id: &str) -> AppResult<RunStatus> {
+        let run0 = self
+            .db
+            .lock()
+            .get_run(run_id)?
+            .ok_or_else(|| AppError::Other("run not found".into()))?;
+        match run0.status.as_str() {
+            "completed" => return Ok(RunStatus::Completed),
+            "aborted" => return Ok(RunStatus::Aborted),
+            _ => {}
+        }
         self.db.lock().set_run_status(run_id, "running", false)?;
         self.emit_run_update(run_id);
 
