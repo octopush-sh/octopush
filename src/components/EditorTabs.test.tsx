@@ -65,4 +65,15 @@ describe("EditorTabs", () => {
     render(<EditorTabs workspaceId="ws-empty" />);
     expect(screen.queryByTestId(/^tab-/)).not.toBeInTheDocument();
   });
+
+  it("exposes the tablist/tab roles with aria-selected on the active tab", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    expect(screen.getByRole("tablist")).toBeInTheDocument();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    const active = tabs.find((t) => t.getAttribute("aria-selected") === "true");
+    expect(active).toBeTruthy();
+    expect(active).toHaveTextContent("foo.ts");
+  });
+
 });

@@ -15,6 +15,8 @@ export function EditorTabs({ workspaceId }: Props) {
 
   return (
     <div
+      role="tablist"
+      aria-label="Open files"
       className="flex overflow-x-auto border-b border-octo-hairline bg-octo-panel"
       style={{ scrollbarWidth: "none" }}
     >
@@ -26,15 +28,16 @@ export function EditorTabs({ workspaceId }: Props) {
         return (
           <div
             key={file.path}
+            role="tab"
+            aria-selected={isActive}
+            tabIndex={isActive ? 0 : -1}
             data-testid={`tab-${file.path}`}
-            className="group relative flex shrink-0 cursor-pointer items-center gap-1.5 px-3 py-2 transition-colors duration-[220ms]"
+            className="group relative flex shrink-0 cursor-pointer items-center gap-1.5 px-3 py-2 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             style={{
               borderBottom: isActive
                 ? "2px solid var(--color-octo-brass)"
                 : "2px solid transparent",
-              background: isActive
-                ? "rgba(212, 165, 116, 0.04)"
-                : "transparent",
+              background: isActive ? "var(--brass-faint)" : "transparent",
             }}
             onClick={() => setActive(workspaceId, file.path)}
           >
