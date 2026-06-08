@@ -127,6 +127,11 @@ impl Orchestrator {
         let input = self.previous_artifact(&run.id, stage.position, &run.task)?;
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
+        // Reset any prior live log for this stage (re-runs reuse the same id).
+        self.events.emit(
+            crate::orchestrator::cli_runner::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run.id, "stageId": stage.id, "reset": true }),
+        );
         self.emit_run_update(&run.id);
 
         // Build the context and run the agent. ANY hard error here (missing worktree,
@@ -138,6 +143,9 @@ impl Orchestrator {
                 workspace_path: self.workspace_path(run)?,
                 task: run.task.clone(),
                 client: self.client.clone(),
+                events: Arc::clone(&self.events),
+                run_id: run.id.clone(),
+                stage_id: stage.id.clone(),
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

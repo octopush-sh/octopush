@@ -9,6 +9,8 @@ import {
 } from "../lib/ipc";
 
 export const EMPTY_RUNS: Run[] = [];
+const EMPTY_LOG: string[] = [];
+const MAX_LOG_LINES = 200;
 
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
 
@@ -20,11 +22,16 @@ interface RunsState {
   activeRunIdByWs: Record<string, string | null>;
   detailByRun: Record<string, RunDetail>;
   selectedStageByRun: Record<string, string | null>;
+  /** Live progress lines per stage id, streamed from the CLI substrate. */
+  liveLogByStage: Record<string, string[]>;
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
   getDetail: (runId: string) => RunDetail | undefined;
   getSelectedStageId: (runId: string) => string | null;
+  getLiveLog: (stageId: string) => string;
+  appendLog: (stageId: string, line: string) => void;
+  clearLog: (stageId: string) => void;
 
   loadRuns: (workspaceId: string) => Promise<void>;
   refreshDetail: (runId: string) => Promise<void>;
@@ -61,11 +68,32 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   activeRunIdByWs: {},
   detailByRun: {},
   selectedStageByRun: {},
+  liveLogByStage: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
   getDetail: (runId) => get().detailByRun[runId],
   getSelectedStageId: (runId) => get().selectedStageByRun[runId] ?? null,
+  getLiveLog: (stageId) => (get().liveLogByStage[stageId] ?? EMPTY_LOG).join("\n"),
+
+  appendLog: (stageId, line) =>
+    set((s) => {
+      const prev = s.liveLogByStage[stageId] ?? EMPTY_LOG;
+      // O(1) append; bound to the most recent lines without re-splitting.
+      const next =
+        prev.length >= MAX_LOG_LINES
+          ? [...prev.slice(prev.length - MAX_LOG_LINES + 1), line]
+          : [...prev, line];
+      return { liveLogByStage: { ...s.liveLogByStage, [stageId]: next } };
+    }),
+
+  clearLog: (stageId) =>
+    set((s) => {
+      if (!s.liveLogByStage[stageId]) return {};
+      const next = { ...s.liveLogByStage };
+      delete next[stageId];
+      return { liveLogByStage: next };
+    }),
 
   loadRuns: async (workspaceId) => {
     const runs = await ipc.listRuns(workspaceId);
@@ -168,3 +196,11 @@ void listen<{ runId: string }>(RUN_EVENTS.checkpoint, (ev) => {
 void listen<{ runId: string; error: string }>(RUN_EVENTS.error, (ev) => {
   void useRunsStore.getState().refreshDetail(ev.payload.runId);
 });
+void listen<{ runId: string; stageId: string; line?: string; reset?: boolean }>(
+  RUN_EVENTS.log,
+  (ev) => {
+    const store = useRunsStore.getState();
+    if (ev.payload.reset) store.clearLog(ev.payload.stageId);
+    else if (ev.payload.line != null) store.appendLog(ev.payload.stageId, ev.payload.line);
+  },
+);

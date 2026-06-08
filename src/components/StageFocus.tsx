@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { RunStage } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
+import { useRunsStore } from "../stores/runsStore";
 import { labelForRole } from "./RunTrack";
 import { DiffViewer } from "./DiffViewer";
+
+const EMPTY_LINES: string[] = [];
 
 interface ParsedArtifact {
   kind: string;
@@ -18,6 +21,9 @@ interface Props {
 export function StageFocus({ stage, workspacePath }: Props) {
   const [diff, setDiff] = useState<string>("");
   const [diffLoading, setDiffLoading] = useState(false);
+  const liveLines = useRunsStore((s) => s.liveLogByStage[stage?.id ?? ""] ?? EMPTY_LINES);
+  const liveLog = useMemo(() => liveLines.join("\n"), [liveLines]);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const artifact = useMemo<ParsedArtifact | null>(() => {
     if (!stage?.artifact) return null;
@@ -43,6 +49,13 @@ export function StageFocus({ stage, workspacePath }: Props) {
     return () => { cancelled = true; };
   }, [stage?.id, stage?.status, artifact?.refsWorktree, workspacePath]);
 
+  // Keep the live log pinned to the newest activity while a stage runs.
+  useEffect(() => {
+    if (stage?.status === "running" && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [liveLog, stage?.status]);
+
   if (!stage) {
     return (
       <div className="flex flex-1 items-center justify-center text-octo-mute font-mono text-sm">
@@ -58,9 +71,20 @@ export function StageFocus({ stage, workspacePath }: Props) {
         <span>· {labelForRole(stage.role)} · {stage.agentModel}</span>
         <span className="ml-auto text-octo-brass">${stage.costUsd.toFixed(2)}</span>
       </div>
-      <div className="flex-1 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage whitespace-pre-wrap">
+      <div
+        ref={scrollRef}
+        className="chat-selectable flex-1 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage whitespace-pre-wrap"
+      >
         {stage.status === "failed" && stage.error ? (
-          <span className="text-octo-rouge">{stage.error}</span>
+          <>
+            <span className="text-octo-rouge">{stage.error}</span>
+            {liveLog && (
+              <>
+                {"\n\n"}
+                <span className="text-octo-mute">{liveLog}</span>
+              </>
+            )}
+          </>
         ) : artifact ? (
           <>
             {artifact.text || "(no output text)"}
@@ -72,7 +96,10 @@ export function StageFocus({ stage, workspacePath }: Props) {
               ))}
           </>
         ) : stage.status === "running" ? (
-          <span className="text-octo-brass">working…</span>
+          <>
+            {liveLog && <>{liveLog}{"\n"}</>}
+            <span className="text-octo-brass">working…</span>
+          </>
         ) : (
           <span className="text-octo-mute">No artifact yet.</span>
         )}
