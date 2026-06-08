@@ -37,7 +37,7 @@ Status Index → open that stream's spec/plan → branch `feat/review-g<N>-<slug
 |--------|--------|------|------|-------------|
 | G3 Diff Reading | done (merged to main, PR #6) | [design](../specs/2026-06-08-review-g3-diff-reading-design.md) | [plan](2026-06-08-review-g3-diff-reading.md) | merged |
 | G5 AI Review Intelligence | slice 1 done (merged to main, PR #12) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | [plan](2026-06-08-review-g5-ai-review-pass.md) | merged |
-| G1 Editor Engine | not started | — | — | — |
+| G1 Editor Engine | slice 1 done (merged to main, PR #13) | [design](../specs/2026-06-08-review-g1-editor-engine-design.md) | [plan](2026-06-08-review-g1-editor-engine.md) | merged |
 | G2 Editor Reliability | not started | — | — | — |
 | G4 Staging & Commit | not started | — | — | — |
 | G7 Git Operations Depth | not started | — | — | — |
@@ -61,6 +61,13 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **Shared `reqwest::Client`.** `ai_complete` builds a fresh client per call (full TLS handshake each review); ChatEngine already pools one — reuse via managed state for lower latency.
 - **Structured output.** The parser scrapes JSON from prose; the provider supports tool / JSON-schema calls for guaranteed shape. Consider a schema-call primitive instead of prose-scraping when reused.
 - **Persisted-model reconciliation.** `models[ws]` persists to localStorage; a now-retired model id would make `resolve_provider` error. Reconcile against the live ModelPicker catalog on load.
+
+**From G1 slice 1 (deferred — slices II/III + review notes):**
+- **Slice II — Navigation & ergonomics:** tab keyboard arrow-nav + truncation tooltip + drag-reorder (Slice I shipped only Tier-0 tab roles/aria/focus); editor command palette / shortcut-hints overlay; the full "Editor" settings tab UI; `cmdk` palette entries for the editor prefs/commands.
+- **Slice III — Intelligence:** language-aware autocomplete (`@codemirror/autocomplete`); minimap (third-party dep); AI ghost-text + explain-selection (reuses `ipc.aiComplete`); LSP.
+- **Per-tab state across Diff↔Editor toggle.** `EditorPane` only mounts under `viewMode === "editor"`, so toggling to Diff unmounts it and clears the per-tab `EditorState` cache — cursor/undo survive tab switches but not a Diff↔Editor round-trip. Lift the cache above the view-mode boundary if that round-trip preservation is wanted.
+- **Status-bar re-render.** `setPos` fires on every keystroke/selection move, re-rendering `EditorPane` + `EditorStatusBar` each time. Safe (no effect re-runs), but memoize if profiling shows jank on large files.
+- **`o` open-at-line** (handed off from G3) now has the editor scroll-to-line primitive available — wire it.
 
 ---
 
