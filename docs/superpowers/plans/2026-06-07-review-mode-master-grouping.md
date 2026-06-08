@@ -36,7 +36,7 @@ Status Index → open that stream's spec/plan → branch `feat/review-g<N>-<slug
 | Stream | Status | Spec | Plan | Impl branch |
 |--------|--------|------|------|-------------|
 | G3 Diff Reading | done (merged to main, PR #6) | [design](../specs/2026-06-08-review-g3-diff-reading-design.md) | [plan](2026-06-08-review-g3-diff-reading.md) | merged |
-| G5 AI Review Intelligence | planned (slice 1: primitive + AI Review Pass) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | [plan](2026-06-08-review-g5-ai-review-pass.md) | `feat/review-g5-ai` |
+| G5 AI Review Intelligence | slice 1 done (merged to main, PR #12) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | [plan](2026-06-08-review-g5-ai-review-pass.md) | merged |
 | G1 Editor Engine | not started | — | — | — |
 | G2 Editor Reliability | not started | — | — | — |
 | G4 Staging & Commit | not started | — | — | — |
@@ -52,6 +52,15 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **`c` (focus commit) and `/` (focus filter) keys** dispatch `onFocusCommit`/`onFocusFilter` but App.tsx leaves them unwired (they'd focus ChangesPanel, which G3 must not touch) → **G4** wires them. Cheatsheet currently omits `c` to avoid advertising a dead key.
 - **`o` open-at-line** opens the file but not at the hunk's first changed line (needs editor scroll-to-line) → **G1**.
 - **Line/hunk anchor selection interaction** (shift-click/drag on line numbers + highlight): the `DiffAnchor` type + `anchorSlot` render-prop are shipped and inert; the selection UI + AI actions land with **G5**.
+
+**From G5 slice 1 (deferred after the merge code-review — none blocking):**
+- **Line-precise jump.** Finding cards pass `onJump(file, line)` but `App.navigateToFile(file, "diff")` drops the line (the diff has only a per-file anchor today). Needs the G3/G1 diff line-anchor before the line can be honored.
+- **`gitDiff` workspace mis-attribution race.** App's single `gitDiff` lags `activeWorkspaceId` on switch; a review triggered in that sub-second window stamps the old diff under the new workspace (self-flags as stale immediately after). A synchronous clear would flash the main diff view — proper fix is a workspace-tagged diff (`{workspaceId, text}`) or store-backed diff with a real change token.
+- **`ai_complete` is a one-shot primitive** (single user-text message, `tools:[]`, no streaming, no history). Fine for the review pass; when G1/G4 need tool calls / multi-turn / streaming, extend it (or add a sibling) against `LlmRequest` rather than forcing the String-only shape.
+- **No DB token recording.** `ai_complete` computes cost but writes no `token_events` row (and drops `cache_read`/`cache_creation`), so Usage dashboards under-report AI-review spend. The command currently has no db handle — wire it via TokenEngine when cost-accounting matters.
+- **Shared `reqwest::Client`.** `ai_complete` builds a fresh client per call (full TLS handshake each review); ChatEngine already pools one — reuse via managed state for lower latency.
+- **Structured output.** The parser scrapes JSON from prose; the provider supports tool / JSON-schema calls for guaranteed shape. Consider a schema-call primitive instead of prose-scraping when reused.
+- **Persisted-model reconciliation.** `models[ws]` persists to localStorage; a now-retired model id would make `resolve_provider` error. Reconcile against the live ModelPicker catalog on load.
 
 ---
 
