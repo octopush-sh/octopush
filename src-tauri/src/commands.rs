@@ -618,9 +618,9 @@ pub async fn workspaces_git_summary(
 }
 
 #[tauri::command]
-pub async fn get_git_diff(path: String) -> AppResult<String> {
+pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);
-    crate::git_ops::get_diff_text(std::path::Path::new(&path))
+    crate::git_ops::get_diff_text(std::path::Path::new(&path), ignore_whitespace.unwrap_or(false))
 }
 
 // ─── Delete workspace ────────────────────────────────────────────
@@ -2016,6 +2016,32 @@ pub async fn revert_hunk(workspace_path: String, hunk_text: String) -> AppResult
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Other(format!("git apply --reverse failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Apply a unified-diff hunk (re-apply a previously reverted change).
+#[tauri::command]
+pub async fn apply_hunk(workspace_path: String, hunk_text: String) -> AppResult<()> {
+    use std::io::Write as _;
+    use tempfile::NamedTempFile;
+
+    let workspace_path = expand_tilde(&workspace_path);
+    let mut tmp = NamedTempFile::new()
+        .map_err(|e| AppError::Other(format!("failed to create tempfile: {e}")))?;
+    tmp.write_all(hunk_text.as_bytes())
+        .map_err(|e| AppError::Other(format!("failed to write hunk: {e}")))?;
+    tmp.flush()
+        .map_err(|e| AppError::Other(format!("failed to flush hunk: {e}")))?;
+
+    let output = std::process::Command::new("git")
+        .args(["apply", "-p1", tmp.path().to_str().unwrap_or("")])
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git apply: {e}")))?;
+
+    if !output.status.success() {
+        return Err(AppError::Other(format!("git apply failed: {}", String::from_utf8_lossy(&output.stderr))));
     }
     Ok(())
 }

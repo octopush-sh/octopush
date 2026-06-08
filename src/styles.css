@@ -42,12 +42,17 @@
 
 /* ── Brass alpha utilities — not Tailwind-class-generated, used directly ── */
 :root {
-  --brass-dim:   rgba(212, 165, 116, 0.4);
-  --brass-ghost: rgba(212, 165, 116, 0.08);
-  --brass-faint: rgba(212, 165, 116, 0.04);
+  --brass-dim:      rgba(212, 165, 116, 0.4);
+  --brass-ghost:    rgba(212, 165, 116, 0.08);
+  --brass-faint:    rgba(212, 165, 116, 0.04);
   /* One step brighter than `--brass-ghost`, used for keyboard-driven row
      highlights that need to stand out against a brass-ghost surface. */
-  --brass-glow:  rgba(212, 165, 116, 0.12);
+  --brass-glow:     rgba(212, 165, 116, 0.12);
+  /* Hunk rail left-border accent — between glow and dim in presence */
+  --brass-rule-dim: rgba(212, 165, 116, 0.18);
+
+  /* Onyx overlay — used for sticky rail backdrops that must be semi-transparent */
+  --onyx-40:        rgba(12, 10, 8, 0.4);
 
   /* State color alpha utilities */
   --state-blue-dim:     rgba(122, 156, 184, 0.4);
@@ -55,8 +60,14 @@
   --state-purple-dim:   rgba(168, 136, 184, 0.4);
   --state-purple-ghost: rgba(168, 136, 184, 0.1);
 
+  /* Verdigris (addition) alpha utility */
+  --verdigris-ghost:   rgba(143, 201, 168, 0.08);
+  /* Stronger fill for word-diff spans — must stand out against the row's ghost tint */
+  --verdigris-strong:  rgba(143, 201, 168, 0.30);
+
   /* Rouge (destructive) alpha utilities */
   --rouge-ghost:       rgba(209, 139, 139, 0.08);
+  --rouge-strong:      rgba(209, 139, 139, 0.28);
   --rouge-active-bg:   rgba(209, 139, 139, 0.1);
   --rouge-disabled-bg: rgba(209, 139, 139, 0.05);
   --rouge-border:      rgba(209, 139, 139, 0.3);
@@ -68,6 +79,22 @@
   --dur-slow:     320ms;
   --dur-reveal:   600ms;
 }
+
+/* ── Diff syntax token classes — used by diffHighlight.ts ───────
+   Colors mirror the atelierTheme palette via design tokens.
+   class-only approach keeps inline-style out of diff DOM nodes.   */
+.tok-kw   { color: var(--color-octo-brass); }
+.tok-str  { color: var(--color-octo-sage);  }
+.tok-num  { color: var(--color-octo-rouge); }
+.tok-cmt  { color: var(--color-octo-mute);  }
+.tok-type { color: var(--color-octo-brass); }
+.tok-fn   { color: var(--color-octo-ivory); }
+.tok-op   { color: var(--color-octo-sage);  }
+.tok-var  { color: var(--color-octo-ivory); }
+
+/* ── Word-diff inline segments ───────────────────────────────── */
+.wd-add { background: var(--verdigris-strong); border-radius: 2px; }
+.wd-del { background: var(--rouge-strong); border-radius: 2px; }
 
 /* ── Motion · Phase 7 signature animations ───────────────────── */
 

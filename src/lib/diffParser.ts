@@ -4,7 +4,20 @@
  * for the Review canvas Accept/Reject UI.
  */
 
+import { wordDiff, type WordSegment } from "./wordDiff";
+
 // ─── Full diff parse (for Review canvas) ──────────────────────────
+
+export type DiffRowKind = "context" | "add" | "del";
+
+export interface DiffRow {
+  kind: DiffRowKind;
+  /** Line content WITHOUT the +/-/space sign. */
+  text: string;
+  oldLine: number | null;
+  newLine: number | null;
+  segments?: WordSegment[];
+}
 
 export interface DiffHunk {
   /** The @@ header line. */
@@ -17,6 +30,8 @@ export interface DiffHunk {
   additions: number;
   /** Number of removed lines. */
   deletions: number;
+  /** Structured rows with line numbers and optional word-diff segments. */
+  rows: DiffRow[];
 }
 
 export interface DiffFile {
@@ -87,6 +102,53 @@ export function parseFullDiff(diff: string): DiffFile[] {
   });
 }
 
+// ─── Row helpers ──────────────────────────────────────────────────
+
+function parseHunkHeader(header: string): { oldStart: number; newStart: number } {
+  const m = header.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+  return { oldStart: m ? parseInt(m[1], 10) : 1, newStart: m ? parseInt(m[2], 10) : 1 };
+}
+
+function pairReplaceBlocks(rows: DiffRow[]): void {
+  let i = 0;
+  while (i < rows.length) {
+    if (rows[i].kind === "del") {
+      let d = i; while (d < rows.length && rows[d].kind === "del") d++;
+      let a = d; while (a < rows.length && rows[a].kind === "add") a++;
+      const dels = rows.slice(i, d), adds = rows.slice(d, a);
+      const pairs = Math.min(dels.length, adds.length);
+      for (let k = 0; k < pairs; k++) {
+        const wd = wordDiff(dels[k].text, adds[k].text);
+        dels[k].segments = wd.old;
+        adds[k].segments = wd.new;
+      }
+      i = a;
+    } else {
+      i++;
+    }
+  }
+}
+
+function buildRows(lines: string[]): DiffRow[] {
+  const header = lines[0] ?? "";
+  const { oldStart, newStart } = parseHunkHeader(header);
+  let oldN = oldStart, newN = newStart;
+  const rows: DiffRow[] = [];
+  for (const line of lines.slice(1)) {
+    if (line === "") continue; // artifact of trailing newline in split
+    if (line.startsWith("\\")) continue; // "\ No newline at end of file"
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      rows.push({ kind: "add", text: line.slice(1), oldLine: null, newLine: newN++ });
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      rows.push({ kind: "del", text: line.slice(1), oldLine: oldN++, newLine: null });
+    } else {
+      rows.push({ kind: "context", text: line.startsWith(" ") ? line.slice(1) : line, oldLine: oldN++, newLine: newN++ });
+    }
+  }
+  pairReplaceBlocks(rows);
+  return rows;
+}
+
 /**
  * Build a DiffHunk from the raw lines of a single hunk block.
  * Prepends the file header lines so `git apply` can locate the file.
@@ -104,7 +166,7 @@ function buildHunk(lines: string[], fileHeaderLines: string[]): DiffHunk {
   // rawText includes the file headers so git apply knows which file to patch.
   const rawText = [...fileHeaderLines, ...lines].join("\n") + "\n";
 
-  return { header, lines, rawText, additions, deletions };
+  return { header, lines, rawText, additions, deletions, rows: buildRows(lines) };
 }
 
 // ─── Per-file gutter markers (existing API) ────────────────────────
@@ -114,6 +176,8 @@ export interface DiffLineMarker {
   line: number;
   /** "added" = this line was inserted; "removed-after" = deletions preceded this line. */
   kind: "added" | "removed-after";
+  /** For "removed-after": number of consecutive lines that were deleted. */
+  count?: number;
 }
 
 /**
@@ -152,6 +216,11 @@ export function parseDiffForFile(diff: string, relPath: string): DiffLineMarker[
     // Hunk header: @@ -old_start,old_count +new_start,new_count @@
     const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunkMatch) {
+      // Flush deletions trailing the PREVIOUS hunk before resetting position,
+      // otherwise a non-final hunk ending in removals loses its gutter marker.
+      if (pendingRemovals > 0) {
+        markers.push({ line: newLine + 1, kind: "removed-after", count: pendingRemovals });
+      }
       newLine = parseInt(hunkMatch[1], 10) - 1; // will be incremented on first context/+ line
       pendingRemovals = 0;
       inHunk = true;
@@ -163,7 +232,7 @@ export function parseDiffForFile(diff: string, relPath: string): DiffLineMarker[
     if (line.startsWith("+") && !line.startsWith("+++")) {
       // Flush any pending removals: they happened just before this new line.
       if (pendingRemovals > 0) {
-        markers.push({ line: newLine + 1, kind: "removed-after" });
+        markers.push({ line: newLine + 1, kind: "removed-after", count: pendingRemovals });
         pendingRemovals = 0;
       }
       newLine++;
@@ -173,7 +242,7 @@ export function parseDiffForFile(diff: string, relPath: string): DiffLineMarker[
     } else if (!line.startsWith("\\")) {
       // Context line (or blank): flush pending removals first.
       if (pendingRemovals > 0) {
-        markers.push({ line: newLine + 1, kind: "removed-after" });
+        markers.push({ line: newLine + 1, kind: "removed-after", count: pendingRemovals });
         pendingRemovals = 0;
       }
       newLine++;
@@ -182,7 +251,7 @@ export function parseDiffForFile(diff: string, relPath: string): DiffLineMarker[
 
   // Flush any removals at the end of a hunk.
   if (pendingRemovals > 0) {
-    markers.push({ line: newLine + 1, kind: "removed-after" });
+    markers.push({ line: newLine + 1, kind: "removed-after", count: pendingRemovals });
   }
 
   return markers;

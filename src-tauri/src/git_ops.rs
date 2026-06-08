@@ -350,7 +350,7 @@ pub fn delete_branch(path: &Path, branch_name: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub fn get_diff_text(path: &Path) -> AppResult<String> {
+pub fn get_diff_text(path: &Path, ignore_whitespace: bool) -> AppResult<String> {
     /// Cap the Review diff payload. Beyond this, building/serializing/parsing/
     /// rendering the diff blocks the UI (e.g. a worktree with a large untracked
     /// folder synthesizes MBs of "new file" content). 1 MiB is far more than a
@@ -366,6 +366,9 @@ pub fn get_diff_text(path: &Path) -> AppResult<String> {
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
+    if ignore_whitespace {
+        opts.ignore_whitespace(true);
+    }
     let diff = repo
         .diff_index_to_workdir(None, Some(&mut opts))
         .map_err(|e| AppError::Other(format!("diff: {e}")))?;
@@ -460,7 +463,7 @@ mod tests {
         let big = format!("{line}\n").repeat(3 * 1024 * 1024 / 64);
         fs::write(dir.path().join("big.txt"), &big).unwrap();
 
-        let diff = get_diff_text(dir.path()).unwrap();
+        let diff = get_diff_text(dir.path(), false).unwrap();
         assert!(diff.len() < 1_300_000, "diff should be capped near 1 MiB, got {}", diff.len());
         assert!(diff.contains("diff truncated"), "should carry the truncation marker");
     }
@@ -474,7 +477,7 @@ mod tests {
         let big = "x".repeat(3 * 1024 * 1024);
         fs::write(dir.path().join("bundle.min.js"), &big).unwrap();
 
-        let diff = get_diff_text(dir.path()).unwrap();
+        let diff = get_diff_text(dir.path(), false).unwrap();
         assert!(diff.len() < 1_300_000, "single huge line must be capped, got {}", diff.len());
         assert!(diff.contains("diff truncated"));
     }

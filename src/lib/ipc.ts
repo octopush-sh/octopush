@@ -259,7 +259,8 @@ export const ipc = {
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
-  getGitDiff: (path: string) => invoke<string>("get_git_diff", { path }),
+  getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
+    invoke<string>("get_git_diff", { path, ignoreWhitespace }),
 
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
@@ -322,6 +323,9 @@ export const ipc = {
   // ─── Hunk operations ──────────────────────────────────────────
   revertHunk: (workspacePath: string, hunkText: string) =>
     invoke<void>("revert_hunk", { workspacePath, hunkText }),
+
+  applyHunk: (workspacePath: string, hunkText: string) =>
+    invoke<void>("apply_hunk", { workspacePath, hunkText }),
 
   stageHunk: (workspacePath: string, hunkText: string) =>
     invoke<void>("stage_hunk", { workspacePath, hunkText }),

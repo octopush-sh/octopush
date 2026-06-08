@@ -1664,6 +1664,22 @@ mod pr_state_tests {
         assert_eq!(out[0].pr.number, 7);
         assert_eq!(out[1].branch, "feat/b");
     }
+
+    #[test]
+    fn apply_hunk_restores_a_reverted_change() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        std::process::Command::new("git").args(["add","."]).current_dir(dir.path()).output().unwrap();
+        std::process::Command::new("git").args(["-c","user.email=t@t","-c","user.name=t","commit","-m","x"]).current_dir(dir.path()).output().unwrap();
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let diff = crate::git_ops::get_diff_text(dir.path(), false).unwrap();
+        tauri::async_runtime::block_on(crate::commands::revert_hunk(dir.path().to_string_lossy().into(), diff.clone())).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+        tauri::async_runtime::block_on(crate::commands::apply_hunk(dir.path().to_string_lossy().into(), diff)).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two\n");
+    }
 }
 
 #[cfg(test)]

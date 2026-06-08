@@ -1,27 +1,29 @@
 /**
  * ReviewCanvas — diff-first canvas for the Review mode.
  *
- * Renders hunks as Accept/Reject/Why? cards. Includes a toolbar with
- * Diff/Editor toggle, test runner, and Accept-all button.
+ * Hosts the toolbar (Diff/Editor toggle, Inline/Split + whitespace toggles,
+ * test runner, Accept-all), the DiffView, the reject-undo bar, and a
+ * canvas-level "Why?" agent-origin drawer.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
-  CheckCircle,
-  XCircle,
-  HelpCircle,
-  ChevronRight,
-  X,
   Play,
   Loader2,
   PenLine,
   LayoutList,
   CheckSquare,
+  Columns2,
+  AlignJustify,
+  X,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
-import { parseFullDiff, type DiffFile, type DiffHunk } from "../lib/diffParser";
-import { diffLineStyle } from "../lib/diffLineStyle";
+import { pushToast } from "./Toasts";
+import { parseFullDiff } from "../lib/diffParser";
 import type { ChatMessage, FileEdit, GitStatus, TestRunResult } from "../lib/types";
+import { useReviewPrefs } from "../stores/reviewPrefsStore";
+import { DiffView } from "./review/DiffView";
+import { TestDrawer } from "./review/TestDrawer";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -43,316 +45,13 @@ interface Props {
    *  message links) can deep-link straight into Diff or Editor view. */
   viewMode?: ReviewViewMode;
   onViewModeChange?: (next: ReviewViewMode) => void;
-}
-
-// ─── Hunk card ─────────────────────────────────────────────────────
-
-interface HunkCardProps {
-  file: DiffFile;
-  hunk: DiffHunk;
-  workspacePath: string;
-  workspaceId: string;
-  fileEdits: FileEdit[];
-  onAccepted: () => void;
-  onRejected: () => void;
-}
-
-function HunkCard({
-  file,
-  hunk,
-  workspacePath,
-  workspaceId,
-  fileEdits,
-  onAccepted,
-  onRejected,
-}: HunkCardProps) {
-  const [status, setStatus] = useState<"idle" | "accepting" | "rejecting" | "accepted" | "rejected">("idle");
-  const [whyOpen, setWhyOpen] = useState(false);
-  const [whyMessage, setWhyMessage] = useState<ChatMessage | null>(null);
-  const [whyLoading, setWhyLoading] = useState(false);
-  const [whyError, setWhyError] = useState<string | null>(null);
-
-  async function handleAccept() {
-    setStatus("accepting");
-    try {
-      await ipc.stageHunk(workspacePath, hunk.rawText);
-      setStatus("accepted");
-      onAccepted();
-    } catch (e) {
-      console.error("stage hunk failed:", e);
-      setStatus("idle");
-    }
-  }
-
-  async function handleReject() {
-    setStatus("rejecting");
-    try {
-      await ipc.revertHunk(workspacePath, hunk.rawText);
-      setStatus("rejected");
-      setTimeout(onRejected, 400); // brief delay so user sees the state change
-    } catch (e) {
-      console.error("revert hunk failed:", e);
-      setStatus("idle");
-    }
-  }
-
-  async function handleWhy() {
-    setWhyOpen(true);
-    if (whyMessage || whyLoading) return;
-    setWhyLoading(true);
-    setWhyError(null);
-    try {
-      const edits = await ipc.listFileEdits(workspaceId);
-      const relevant = edits.find((e) => e.filePath === file.filePath || file.filePath.endsWith(e.filePath));
-      if (relevant?.messageId != null) {
-        const msg = await ipc.getMessage(relevant.messageId);
-        setWhyMessage(msg);
-      } else {
-        // Try to find in already-loaded fileEdits prop
-        const fromProp = fileEdits.find(
-          (e) => e.filePath === file.filePath || file.filePath.endsWith(e.filePath),
-        );
-        if (fromProp?.messageId != null) {
-          const msg = await ipc.getMessage(fromProp.messageId);
-          setWhyMessage(msg);
-        } else {
-          setWhyError(
-            "This change isn't linked to an agent turn — likely a manual edit (or made before agent-edit tracking landed).",
-          );
-        }
-      }
-    } catch (e) {
-      setWhyError(String(e));
-    } finally {
-      setWhyLoading(false);
-    }
-  }
-
-  if (status === "rejected") return null;
-
-  const isAccepted = status === "accepted";
-
-  // Skip the @@ header line — it's already rendered in the card header.
-  const bodyLines = hunk.lines.length > 0 && hunk.lines[0].startsWith("@@")
-    ? hunk.lines.slice(1)
-    : hunk.lines;
-
-  return (
-    <div
-      className={[
-        "overflow-hidden rounded-md border transition-all duration-200",
-        isAccepted
-          ? "border-octo-hairline bg-octo-panel/40 opacity-60"
-          : "border-octo-hairline bg-octo-panel",
-      ].join(" ")}
-    >
-      {/* Hunk header */}
-      <div className="flex items-center gap-2 border-b border-octo-hairline bg-octo-onyx/40 px-3 py-1.5">
-        <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
-          {formatHunkRange(hunk.header)}
-        </span>
-        <span className="ml-auto flex items-center gap-2 font-mono text-[10px]">
-          {hunk.additions > 0 && (
-            <span className="text-octo-verdigris">+{hunk.additions}</span>
-          )}
-          {hunk.deletions > 0 && (
-            <span className="text-octo-rouge">−{hunk.deletions}</span>
-          )}
-          {isAccepted && (
-            <span
-              className="rounded-sm px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.18em] text-octo-brass"
-              style={{ background: "var(--brass-ghost)" }}
-            >
-              Staged
-            </span>
-          )}
-        </span>
-      </div>
-
-      {/* Diff lines */}
-      <div className="overflow-x-auto">
-        <pre className="px-0 font-mono text-[11.5px] leading-[1.55]">
-          {bodyLines.map((line, i) => (
-            <DiffLine key={i} line={line} />
-          ))}
-        </pre>
-      </div>
-
-      {/* Action bar */}
-      {!isAccepted && (
-        <div className="flex items-center justify-end gap-1 border-t border-octo-hairline bg-octo-onyx/30 px-3 py-2">
-          {/* Why? — tertiary, mute */}
-          <button
-            onClick={handleWhy}
-            disabled={whyLoading}
-            className="flex items-center gap-1 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
-          >
-            <HelpCircle size={11} />
-            Why?
-          </button>
-          <span className="mx-1 h-3 w-px bg-octo-hairline" aria-hidden />
-          {/* Reject — secondary, rouge-dimmed */}
-          <button
-            onClick={handleReject}
-            disabled={status === "rejecting" || status === "accepting"}
-            className="flex items-center gap-1 rounded px-2.5 py-1 text-[11px] text-octo-sage transition-colors hover:bg-octo-rouge/10 hover:text-octo-rouge disabled:opacity-40"
-            style={{ border: "1px solid transparent" }}
-          >
-            {status === "rejecting" ? (
-              <Loader2 size={12} className="animate-spin" />
-            ) : (
-              <XCircle size={12} />
-            )}
-            Reject
-          </button>
-          {/* Accept — primary, brass-solid */}
-          <button
-            onClick={handleAccept}
-            disabled={status === "rejecting" || status === "accepting"}
-            className="flex items-center gap-1.5 rounded px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors disabled:opacity-40"
-            style={{
-              background: "var(--brass-ghost)",
-              border: "1px solid var(--brass-dim)",
-            }}
-          >
-            {status === "accepting" ? (
-              <Loader2 size={12} className="animate-spin" />
-            ) : (
-              <CheckCircle size={12} />
-            )}
-            Accept
-          </button>
-        </div>
-      )}
-
-      {/* Why? drawer */}
-      {whyOpen && (
-        <div className="border-t border-octo-hairline bg-octo-onyx/60 px-3 py-3">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-octo-brass">
-              § Agent origin
-            </span>
-            <button
-              onClick={() => setWhyOpen(false)}
-              aria-label="Close"
-              className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
-            >
-              <X size={14} />
-            </button>
-          </div>
-          {whyLoading && (
-            <div className="flex items-center gap-2 text-[11px] text-octo-sage">
-              <Loader2 size={12} className="animate-spin" />
-              Looking up agent message…
-            </div>
-          )}
-          {whyError && (
-            <p className="font-serif text-[12px] leading-[1.5] text-octo-sage">
-              {whyError}
-            </p>
-          )}
-          {whyMessage && (
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
-                <span className="text-octo-brass">{whyMessage.role}</span>
-                <span>·</span>
-                <span>{new Date(whyMessage.createdAt).toLocaleTimeString()}</span>
-                {whyMessage.model && (
-                  <>
-                    <span>·</span>
-                    <span>{whyMessage.model}</span>
-                  </>
-                )}
-              </div>
-              <p className="max-h-32 overflow-y-auto whitespace-pre-wrap text-[12px] leading-[1.55] text-octo-ivory">
-                {whyMessage.content.length > 800
-                  ? whyMessage.content.slice(0, 800) + "…"
-                  : whyMessage.content}
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Strip the trailing function-context from `@@ -X,Y +A,B @@ extra` for a
- *  cleaner hunk label, e.g. "lines 12–18 → 12–22". */
-function formatHunkRange(header: string): string {
-  const m = header.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-  if (!m) return header;
-  const [, oldStart, oldCount, newStart, newCount] = m;
-  const oldEnd = parseInt(oldStart, 10) + (parseInt(oldCount || "1", 10) - 1);
-  const newEnd = parseInt(newStart, 10) + (parseInt(newCount || "1", 10) - 1);
-  return `lines ${oldStart}–${oldEnd} → ${newStart}–${newEnd}`;
-}
-
-// ─── Diff line ─────────────────────────────────────────────────────
-
-function DiffLine({ line }: { line: string }) {
-  const { className, background } = diffLineStyle(line);
-  return (
-    <div
-      className={`px-3 ${className}`}
-      style={background ? { background } : undefined}
-    >
-      {line}
-    </div>
-  );
-}
-
-// ─── Test drawer ───────────────────────────────────────────────────
-
-function TestDrawer({
-  result,
-  onClose,
-}: {
-  result: TestRunResult;
-  onClose: () => void;
-}) {
-  const isPass = result.exitCode === 0;
-
-  return (
-    <div className="border-t border-octo-hairline bg-octo-bg">
-      <div className="flex items-center gap-2 px-4 py-2">
-        <span className="font-mono text-xs font-semibold text-octo-text">Test output</span>
-        <span
-          className={[
-            "ml-1 rounded px-2 py-0.5 font-mono text-[10px] font-semibold",
-            isPass
-              ? "bg-octo-success/20 text-octo-success"
-              : "bg-octo-danger/20 text-octo-danger",
-          ].join(" ")}
-        >
-          exit {result.exitCode}
-        </span>
-        <button
-          onClick={onClose}
-          aria-label="Dismiss"
-          className="ml-auto flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage"
-          title="Dismiss (Esc)"
-        >
-          <X size={14} />
-        </button>
-      </div>
-      <div className="max-h-56 overflow-y-auto px-4 pb-3">
-        {result.stdout && (
-          <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-octo-text">
-            {result.stdout}
-          </pre>
-        )}
-        {result.stderr && (
-          <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-octo-danger/80">
-            {result.stderr}
-          </pre>
-        )}
-        {!result.stdout && !result.stderr && (
-          <p className="text-xs text-octo-textMuted">(no output)</p>
-        )}
-      </div>
-    </div>
-  );
+  /** Open a file in the editor at a given line (line is best-effort). */
+  onOpenFileAtLine?: (filePath: string, line: number) => void;
+  /** A file's "viewed" state toggled in the diff. */
+  onViewedChange?: (filePath: string, viewed: boolean) => void;
+  /** Keyboard request to focus the filter / commit affordances. */
+  onFocusFilter?: () => void;
+  onFocusCommit?: () => void;
 }
 
 // ─── ReviewCanvas ──────────────────────────────────────────────────
@@ -367,6 +66,10 @@ export function ReviewCanvas({
   children,
   viewMode: viewModeProp,
   onViewModeChange,
+  onOpenFileAtLine,
+  onViewedChange,
+  onFocusFilter,
+  onFocusCommit,
 }: Props) {
   const [viewModeState, setViewModeState] = useState<ReviewViewMode>("diff");
   const viewMode = viewModeProp ?? viewModeState;
@@ -376,6 +79,15 @@ export function ReviewCanvas({
   };
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
 
+  const { readingMode, ignoreWhitespace, setReadingMode, setIgnoreWhitespace } =
+    useReviewPrefs();
+
+  // Reject-undo inline bar (error=true when applyHunk couldn't restore the change)
+  const [undo, setUndo] = useState<{ rawText: string; error?: boolean } | null>(null);
+
+  // Why? drawer (canvas-level, keyed by file path)
+  const [whyFile, setWhyFile] = useState<string | null>(null);
+
   // Test runner state
   const [testCommand, setTestCommand] = useState<string>("");
   const [testCommandEditing, setTestCommandEditing] = useState(false);
@@ -383,8 +95,9 @@ export function ReviewCanvas({
   const [testResult, setTestResult] = useState<TestRunResult | null>(null);
   const testInputRef = useRef<HTMLInputElement>(null);
 
-  // Parse diff
-  const diffFiles = parseFullDiff(gitDiff);
+  // Parse diff — memoized so the per-hunk word-diff LCS only runs when the
+  // diff string actually changes, not on every unrelated re-render.
+  const diffFiles = useMemo(() => parseFullDiff(gitDiff), [gitDiff]);
 
   // Load file edits for this workspace
   useEffect(() => {
@@ -403,14 +116,23 @@ export function ReviewCanvas({
     }).catch(() => {});
   }, [workspacePath, initialTestCommand]);
 
-  // Dismiss test drawer on Esc
+  // Dismiss test drawer on Esc — but let the Why? drawer take precedence when
+  // it's open, so a single Esc closes only the topmost surface.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setTestResult(null);
+      if (e.key === "Escape" && !whyFile) setTestResult(null);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [whyFile]);
+
+  // Auto-clear the reject-undo bar after 6s — but keep the error message
+  // visible until the user dismisses it (don't let a failed undo vanish).
+  useEffect(() => {
+    if (!undo || undo.error) return;
+    const id = setTimeout(() => setUndo(null), 6_000);
+    return () => clearTimeout(id);
+  }, [undo]);
 
   const handleTestCommandBlur = useCallback(async () => {
     setTestCommandEditing(false);
@@ -446,24 +168,46 @@ export function ReviewCanvas({
     }
   }
 
+  // ── Hunk actions (wired into DiffView) ──
+  const accept = async (filePath: string, hunkIdx: number) => {
+    const hunk = diffFiles.find((f) => f.filePath === filePath)?.hunks[hunkIdx];
+    if (!hunk) return;
+    try {
+      await ipc.stageHunk(workspacePath, hunk.rawText);
+      onDiffChange?.();
+    } catch (e) {
+      console.error("stage hunk failed:", e);
+      pushToast({ level: "error", title: "Couldn't accept hunk", body: String(e) });
+    }
+  };
+
+  const reject = async (filePath: string, hunkIdx: number) => {
+    const hunk = diffFiles.find((f) => f.filePath === filePath)?.hunks[hunkIdx];
+    if (!hunk) return;
+    try {
+      await ipc.revertHunk(workspacePath, hunk.rawText);
+      setUndo({ rawText: hunk.rawText });
+      onDiffChange?.();
+    } catch (e) {
+      console.error("revert hunk failed:", e);
+      pushToast({ level: "error", title: "Couldn't reject hunk", body: String(e) });
+    }
+  };
+
   const fileCount = gitStatus?.changedFiles.length ?? 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {/* ── Toolbar ─────────────────────────────────────────────── */}
-      {/* Same height as the left rail's CHANGES eyebrow and the right
-          rail's FILES eyebrow — the three form one continuous rhythm
-          row across the three columns. No floating stats on the left:
-          file count lives in the workspace header, +/- line totals live
-          in the CHANGES rail. */}
       <header className="flex h-11 shrink-0 items-center gap-3 border-b border-octo-hairline bg-octo-panel px-4">
         <div className="ml-auto flex items-center gap-2">
           {/* View toggle */}
           <div className="flex items-center rounded-md border border-octo-hairline overflow-hidden">
             <button
               onClick={() => setViewMode("diff")}
+              aria-label="Diff view"
               className={[
-                "flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors",
+                "flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
                 viewMode === "diff"
                   ? "text-octo-brass"
                   : "text-octo-mute hover:text-octo-sage",
@@ -479,8 +223,9 @@ export function ReviewCanvas({
             </button>
             <button
               onClick={() => setViewMode("editor")}
+              aria-label="Editor view"
               className={[
-                "flex items-center gap-1 border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors",
+                "flex items-center gap-1 border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
                 viewMode === "editor"
                   ? "text-octo-brass"
                   : "text-octo-mute hover:text-octo-sage",
@@ -495,6 +240,70 @@ export function ReviewCanvas({
               Editor
             </button>
           </div>
+
+          {/* Reading mode + whitespace — only meaningful in Diff view */}
+          {viewMode === "diff" && (
+            <>
+              {/* Inline / Split segmented control */}
+              <div className="flex items-center rounded-md border border-octo-hairline overflow-hidden">
+                <button
+                  onClick={() => setReadingMode("inline")}
+                  aria-label="Inline"
+                  className={[
+                    "flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
+                    readingMode === "inline"
+                      ? "text-octo-brass"
+                      : "text-octo-mute hover:text-octo-sage",
+                  ].join(" ")}
+                  style={
+                    readingMode === "inline"
+                      ? { background: "var(--brass-ghost)" }
+                      : undefined
+                  }
+                >
+                  <AlignJustify size={12} />
+                  Inline
+                </button>
+                <button
+                  onClick={() => setReadingMode("sbs")}
+                  aria-label="Side by side"
+                  className={[
+                    "flex items-center gap-1 border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
+                    readingMode === "sbs"
+                      ? "text-octo-brass"
+                      : "text-octo-mute hover:text-octo-sage",
+                  ].join(" ")}
+                  style={
+                    readingMode === "sbs"
+                      ? { background: "var(--brass-ghost)" }
+                      : undefined
+                  }
+                >
+                  <Columns2 size={12} />
+                  Split
+                </button>
+              </div>
+
+              {/* Whitespace toggle */}
+              <button
+                onClick={() => setIgnoreWhitespace(!ignoreWhitespace)}
+                aria-label="Ignore whitespace"
+                className={[
+                  "flex items-center gap-1 rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
+                  ignoreWhitespace
+                    ? "text-octo-brass"
+                    : "text-octo-mute hover:text-octo-sage",
+                ].join(" ")}
+                style={
+                  ignoreWhitespace
+                    ? { background: "var(--brass-ghost)" }
+                    : undefined
+                }
+              >
+                ±WS
+              </button>
+            </>
+          )}
 
           {/* Test runner */}
           <div className="flex items-center gap-0.5 rounded-md border border-octo-hairline pl-2 pr-1">
@@ -520,8 +329,9 @@ export function ReviewCanvas({
             ) : (
               <button
                 onClick={() => setTestCommandEditing(true)}
+                aria-label="Edit test command"
                 className={[
-                  "px-2 py-1 transition-colors",
+                  "px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
                   testCommand
                     ? "font-mono text-[11px] text-octo-sage hover:text-octo-ivory"
                     : "font-serif text-[11px] text-octo-mute hover:text-octo-sage",
@@ -534,7 +344,8 @@ export function ReviewCanvas({
             <button
               onClick={handleRunTests}
               disabled={!testCommand.trim() || testRunning}
-              className="flex items-center gap-1 rounded px-2 py-1 text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-brass disabled:opacity-30"
+              aria-label="Run tests"
+              className="flex items-center gap-1 rounded px-2 py-1 text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-brass disabled:opacity-30 focus-visible:ring-1 focus-visible:ring-octo-brass"
               title="Run tests"
             >
               {testRunning ? (
@@ -549,7 +360,8 @@ export function ReviewCanvas({
           {fileCount > 0 && viewMode === "diff" && (
             <button
               onClick={handleAcceptAll}
-              className="flex items-center gap-1.5 rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors"
+              aria-label="Accept all changes"
+              className="flex items-center gap-1.5 rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass"
               style={{
                 background: "var(--brass-ghost)",
                 border: "1px solid var(--brass-dim)",
@@ -567,28 +379,25 @@ export function ReviewCanvas({
       <div className="relative min-h-0 flex-1">
         {/* Diff view */}
         {viewMode === "diff" && (
-          <div className="absolute inset-0 overflow-y-auto">
-            {diffFiles.length === 0 ? (
-              <EmptyDiffState
-                stagedCount={
-                  gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0
-                }
-              />
-            ) : (
-              <div className="space-y-6 px-4 py-4">
-                {diffFiles.map((file) => (
-                  <FileDiffSection
-                    key={file.filePath}
-                    file={file}
-                    workspacePath={workspacePath}
-                    workspaceId={workspaceId}
-                    fileEdits={fileEdits}
-                    onDiffChange={onDiffChange}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          <DiffView
+            files={diffFiles}
+            workspacePath={workspacePath}
+            stagedCount={
+              gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0
+            }
+            onAccept={accept}
+            onReject={reject}
+            onWhy={(filePath) => {
+              // Refresh the edit→message links each time so the drawer reflects
+              // edits the agent made after this canvas mounted (not a stale snapshot).
+              ipc.listFileEdits(workspaceId).then(setFileEdits).catch(() => {});
+              setWhyFile(filePath);
+            }}
+            onOpen={(filePath, line) => onOpenFileAtLine?.(filePath, line)}
+            onViewedChange={onViewedChange}
+            onFocusCommit={onFocusCommit}
+            onFocusFilter={onFocusFilter}
+          />
         )}
 
         {/* Editor mode — render children (EditorTabs + EditorPane) */}
@@ -596,6 +405,51 @@ export function ReviewCanvas({
           <div className="absolute inset-0 flex flex-col">{children}</div>
         )}
       </div>
+
+      {/* ── Why? drawer (agent origin) ───────────────────────────── */}
+      {whyFile && (
+        <WhyDrawer
+          filePath={whyFile}
+          fileEdits={fileEdits}
+          onClose={() => setWhyFile(null)}
+        />
+      )}
+
+      {/* ── Reject-undo bar ──────────────────────────────────────── */}
+      {undo && (
+        <div className="octo-rise-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2 font-mono text-[11px] text-octo-sage">
+          {undo.error ? (
+            <span className="text-octo-rouge">Couldn&apos;t undo automatically — the file changed since the hunk was rejected.</span>
+          ) : (
+            <>
+              <span>Hunk rejected.</span>
+              <button
+                onClick={async () => {
+                  try {
+                    await ipc.applyHunk(workspacePath, undo.rawText);
+                    onDiffChange?.();
+                    setUndo(null);
+                  } catch (e) {
+                    console.error("undo (apply_hunk) failed:", e);
+                    setUndo((u) => (u ? { ...u, error: true } : null));
+                  }
+                }}
+                className="rounded px-2 py-0.5 text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                Undo
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => setUndo(null)}
+            aria-label="Dismiss"
+            className="ml-auto text-octo-mute hover:text-octo-sage focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* ── Test result drawer ───────────────────────────────────── */}
       {testResult && (
@@ -607,105 +461,106 @@ export function ReviewCanvas({
   );
 }
 
-// ─── File diff section ─────────────────────────────────────────────
+// ─── Why? drawer (agent origin) ────────────────────────────────────
 
-interface FileDiffSectionProps {
-  file: DiffFile;
-  workspacePath: string;
-  workspaceId: string;
+interface WhyDrawerProps {
+  filePath: string;
   fileEdits: FileEdit[];
-  onDiffChange?: () => void;
+  onClose: () => void;
 }
 
-function FileDiffSection({
-  file,
-  workspacePath,
-  workspaceId,
-  fileEdits,
-  onDiffChange,
-}: FileDiffSectionProps) {
-  const [visibleHunks, setVisibleHunks] = useState(() => file.hunks.map((_, i) => i));
+function WhyDrawer({ filePath, fileEdits, onClose }: WhyDrawerProps) {
+  const [message, setMessage] = useState<ChatMessage | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  function removeHunk(idx: number) {
-    setVisibleHunks((prev) => prev.filter((i) => i !== idx));
-    onDiffChange?.();
-  }
+  // Esc to close
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
-  if (visibleHunks.length === 0) return null;
-
-  const typeLabel =
-    file.changeType === "new"
-      ? "NEW"
-      : file.changeType === "deleted"
-        ? "DELETED"
-        : "MODIFIED";
-
-  const typeColor =
-    file.changeType === "new"
-      ? "text-octo-verdigris"
-      : file.changeType === "deleted"
-        ? "text-octo-rouge"
-        : "text-octo-brass";
+  // Look up the agent message that produced this file's edit.
+  useEffect(() => {
+    let cancelled = false;
+    setMessage(null);
+    setError(null);
+    setLoading(true);
+    const edit = fileEdits.find(
+      (e) => e.filePath === filePath || filePath.endsWith(e.filePath),
+    );
+    if (edit?.messageId == null) {
+      setError(
+        "This change isn't linked to an agent turn — likely a manual edit (or made before agent-edit tracking landed).",
+      );
+      setLoading(false);
+      return;
+    }
+    ipc
+      .getMessage(edit.messageId)
+      .then((msg) => {
+        if (!cancelled) setMessage(msg);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath, fileEdits]);
 
   return (
-    <div
-      className="space-y-3 scroll-mt-4"
-      id={`review-file-${encodeURIComponent(file.filePath)}`}
-    >
-      {/* File header */}
-      <div className="flex items-center gap-2 border-b border-octo-hairline pb-1.5">
-        <span
-          className={`font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
+    <div className="octo-fade-in shrink-0 border-t border-octo-hairline bg-octo-onyx/60 px-4 py-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-octo-brass">
+          § Agent origin
+        </span>
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-octo-panel-2 hover:text-octo-sage focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
-          {typeLabel}
-        </span>
-        <span className="text-octo-hairline">·</span>
-        <span className="font-mono text-[12.5px] text-octo-ivory">
-          {file.filePath}
-        </span>
-        <ChevronRight size={11} className="text-octo-mute" />
-        <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
-          {visibleHunks.length} hunk{visibleHunks.length !== 1 ? "s" : ""}
-        </span>
+          <X size={14} />
+        </button>
       </div>
-
-      {/* Hunk cards */}
-      <div className="space-y-3">
-        {visibleHunks.map((hunkIdx) => (
-          <HunkCard
-            key={hunkIdx}
-            file={file}
-            hunk={file.hunks[hunkIdx]}
-            workspacePath={workspacePath}
-            workspaceId={workspaceId}
-            fileEdits={fileEdits}
-            onAccepted={() => onDiffChange?.()}
-            onRejected={() => removeHunk(hunkIdx)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── Empty state ───────────────────────────────────────────────────
-
-function EmptyDiffState({ stagedCount }: { stagedCount: number }) {
-  const hasStaged = stagedCount > 0;
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
-      <CheckCircle size={24} className="text-octo-brass opacity-60" />
-      <div className="font-serif text-[20px] leading-tight tracking-[-0.005em] text-octo-ivory">
-        {hasStaged
-          ? `${stagedCount} file${stagedCount !== 1 ? "s" : ""} staged.`
-          : "Nothing to review."}
-      </div>
-      <p className="max-w-xs text-[12px] leading-[1.6] text-octo-sage">
-        {hasStaged
-          ? "Write a commit message in the Changes rail and commit when you're ready."
-          : "When the agent edits files in this workspace, the diff will appear here for hunk-by-hunk approval."}
-      </p>
-      <div className="h-px w-7 bg-octo-brass/60" aria-hidden />
+      <div className="mb-1.5 font-mono text-[10px] text-octo-mute">{filePath}</div>
+      {loading && (
+        <div className="flex items-center gap-2 text-[11px] text-octo-sage">
+          <Loader2 size={12} className="animate-spin" />
+          Looking up agent message…
+        </div>
+      )}
+      {error && (
+        <p className="font-serif text-[12px] leading-[1.5] text-octo-sage">
+          {error}
+        </p>
+      )}
+      {message && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+            <span className="text-octo-brass">{message.role}</span>
+            <span>·</span>
+            <span>{new Date(message.createdAt).toLocaleTimeString()}</span>
+            {message.model && (
+              <>
+                <span>·</span>
+                <span>{message.model}</span>
+              </>
+            )}
+          </div>
+          <p className="max-h-32 overflow-y-auto whitespace-pre-wrap text-[12px] leading-[1.55] text-octo-ivory">
+            {message.content.length > 800
+              ? message.content.slice(0, 800) + "…"
+              : message.content}
+          </p>
+        </div>
+      )}
     </div>
   );
 }

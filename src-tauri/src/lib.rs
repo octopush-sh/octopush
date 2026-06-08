@@ -223,6 +223,7 @@ pub fn run() {
             commands::get_message,
             // Hunk operations
             commands::revert_hunk,
+            commands::apply_hunk,
             commands::stage_hunk,
             commands::stage_all_changes,
             // Stage / commit / push flow

@@ -30,6 +30,7 @@ import { EditorTabs } from "./components/EditorTabs";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
 import { ModeOverlay } from "./components/ModeOverlay";
+import { useReviewPrefs } from "./stores/reviewPrefsStore";
 import { CanvasSplit } from "./components/CanvasSplit";
 import { useEditorStore } from "./stores/editorStore";
 import { useAttentionStore } from "./stores/attentionStore";
@@ -495,6 +496,10 @@ function App() {
   const activeMode: WorkspaceMode =
     (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
 
+  // Review whitespace pref — when it flips, the review diff is re-fetched
+  // (the effect below depends on it) so the canvas honours the toggle.
+  const ignoreWs = useReviewPrefs((s) => s.ignoreWhitespace);
+
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
     const path = ws?.worktreePath ?? project?.path;
@@ -515,7 +520,7 @@ function App() {
         const needDiff = activeMode === "review";
         const [s, d] = await Promise.all([
           ipc.getGitStatus(path),
-          needDiff ? ipc.getGitDiff(path).catch(() => "") : Promise.resolve(""),
+          needDiff ? ipc.getGitDiff(path, ignoreWs).catch(() => "") : Promise.resolve(""),
         ]);
         if (cancelled) return;
         // Status change-detection (file metadata). hasUpstream is intentionally
@@ -550,7 +555,7 @@ function App() {
       if (id) clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [activeWorkspaceId, workspaces, project, activeMode]);
+  }, [activeWorkspaceId, workspaces, project, activeMode, ignoreWs]);
 
   // ── Open-PR fetch ──
   // Fetch once per workspace switch and then every 60s. GitHub's
@@ -1407,7 +1412,7 @@ function App() {
                           const path = activeWorkspace.worktreePath || project.path;
                           Promise.all([
                             ipc.getGitStatus(path),
-                            ipc.getGitDiff(path).catch(() => ""),
+                            ipc.getGitDiff(path, ignoreWs).catch(() => ""),
                           ])
                             .then(([s, d]) => {
                               setGitStatus(s);
@@ -1427,12 +1432,13 @@ function App() {
                         gitDiff={gitDiff}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}
+                        onOpenFileAtLine={(p) => navigateToFile(p, "editor")}
                         onDiffChange={() => {
                           // Re-fetch git status + diff after a hunk action
                           const path = activeWorkspace.worktreePath || project.path;
                           Promise.all([
                             ipc.getGitStatus(path),
-                            ipc.getGitDiff(path).catch(() => ""),
+                            ipc.getGitDiff(path, ignoreWs).catch(() => ""),
                           ])
                             .then(([s, d]) => {
                               setGitStatus(s);
