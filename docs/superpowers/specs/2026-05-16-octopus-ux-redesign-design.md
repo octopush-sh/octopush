@@ -11,7 +11,7 @@
 Replace Octopus's generic "AI dev tool" aesthetic (dark zinc + purple accent + Cursor/Linear-adjacent layout) with a **distinctive premium identity** built on three commitments:
 
 1. **Aesthetic:** *Nocturne Luxe · Onyx & Brass* — warm onyx black (#0c0a08), a single brass accent (#d4a574), Spectral italic serif for display, system sans for body, JetBrains Mono for meta. Premium and tactile, not utilitarian.
-2. **Architecture:** *Atelier* — kills the duplicate workspace sidebar + workspace bar of the current app. Replaces it with a slim icon rail, a floating context header, three intent-based **modes (Talk / Run / Review)** that replace tabs, and a permanent **Companion** panel on the right with live context.
+2. **Architecture:** *Atelier* — kills the duplicate workspace sidebar + workspace bar of the current app. Replaces it with a slim icon rail, a floating context header, four intent-based **modes (Talk / Run / Review / Direct)** that replace tabs, and a permanent **Companion** panel on the right with live context. The first three modes form the foundational trinity; Direct is the optional 4th mode for multi-agent pipeline orchestration.
 3. **Personality:** Editorial signature details — italic-serif CTAs, brass rules that grow on key moments, `§` glyphs for tool calls, roman numerals in wizards, the brass `⟶` for prompts.
 
 The result should feel closer to a beautifully bound notebook than to a productivity tool. The user has explicitly said the current onboarding feels too similar to Superset; this redesign aims to be unmistakably itself.
@@ -120,8 +120,8 @@ The Rail spans full height on the left (48px). The Companion spans full height o
 |------------------|-------|---------|
 | **Rail**         | 48px  | Workspace monograms (italic-serif initial in brass-ghost square). Always visible. Single column. |
 | **ContextHeader**| flex  | Floating card. Shows workspace name (italic serif), branch, git status. The "you are here" anchor. |
-| **Modes**        | auto  | Top-right. Three pills: Talk / Run / Review. Switches the **Canvas** without disturbing rest. |
-| **Canvas**       | flex  | The active mode's content. Talk = chat. Run = terminal. Review = diff. |
+| **Modes**        | auto  | Top-right. Four pills: Talk / Run / Review / Direct. Switches the **Canvas** without disturbing rest. |
+| **Canvas**       | flex  | The active mode's content. Talk = chat. Run = terminal. Review = diff. Direct = pipeline track + focus pane. |
 | **Companion**    | 280px | Right side, permanent. Content per mode: context+history (Talk), terminals+shortcuts (Run), changed files (Review). |
 | **Input bar**    | flex  | Below canvas. Italic-serif placeholder. ⌘K affordance. |
 
@@ -132,6 +132,7 @@ Modes are **not tabs** — tabs imply parallel documents; modes are intents on t
 - **Talk mode** — conversational interaction with the agent. Canvas = chat timeline. Companion = `Context` (tokens, files in flight, tool calls) + `History` (past threads in this workspace).
 - **Run mode** — terminal-centric. Canvas = active terminal in a hairline-bordered card. Companion = `Terminals` (list of running shells) + `Quick` (kbd shortcuts for common commands).
 - **Review mode** — git diff. Canvas = file diff with line numbers. Companion = `Changed · N` (file list with +/− stats) + commit actions. Input bar prompts: *"Write a commit message"*.
+- **Direct mode** — conductor altitude: the developer defines a **pipeline** of AI agents across the SDLC (plan → implement → review → test), assigns each stage its model and substrate, and Octopush orchestrates them with **checkpoints** between stages. A live **cost-vs-baseline savings meter** shows the delta versus running every stage on the most expensive model. Direct is per-workspace and entirely optional — the Talk/Run/Review trinity remains first-class. Adding a 4th mode is a deliberate spec-level extension of the original three-mode architecture, not a replacement of it. Canvas = a horizontal **assembly-line track** (stages labeled with roman numerals, substrate pills in `API` blue / `CLI` purple, per-stage cost, `⟜` checkpoint gates and `⟶` connectors) + a **focus pane** (the selected stage's artifact and the worktree diff for code stages). Companion = a **Runs** list (past and current pipeline runs) + the read-only Jira context for the workspace. See [`docs/superpowers/specs/2026-06-07-direct-mode-agent-orchestration-design.md`](2026-06-07-direct-mode-agent-orchestration-design.md) for the full design.
 
 Switching modes glides the brass indicator pill 320ms ease-in-out and cross-fades the canvas. The header and companion shift content but don't re-mount.
 
@@ -193,6 +194,7 @@ Storage: extend the `Workspace` type with optional `glyph?: string` and `tint?: 
 | `⌘⇧1`          | Switch to **Talk** mode                            | New in this redesign. |
 | `⌘⇧2`          | Switch to **Run** mode                             | |
 | `⌘⇧3`          | Switch to **Review** mode                          | |
+| `⌘⇧D`          | Switch to **Direct** mode                          | Added with the 4th-mode extension. |
 | `⌘N`           | Create new workspace                               | Unchanged. |
 | `⌘K`           | Open command palette                               | Unchanged. |
 | `⌘,`           | Open Settings                                      | New (replaces opening the dialog). |
@@ -254,19 +256,28 @@ The reference application of the Atelier architecture.
 - Companion shows `Changed · N` (each file as a row, `+x −y` stats in mute) + commit shortcut row.
 - Input bar text: *"Write a commit message"*.
 
-### 4.6 New Workspace flow
+### 4.6 Workspace · Direct
+
+- Same chrome (rail / header / modes / companion / input).
+- **Setup state** (no active run): a centered prompt in the canvas — italic-serif *"Design your pipeline"* — with a task-description input, a template picker (blank / plan-implement-review / full-SDLC), and a per-stage model/substrate picker. Each stage row shows a roman numeral, a substrate pill (`API` in `--color-octo-state-blue` / `CLI` in `--color-octo-state-purple`), the assigned model in mono, and a cost estimate. A brass-rule separates the stage list from the run estimate at the bottom.
+- **Run state**: the canvas splits into the assembly-line **track** (top, scrollable horizontally) and the **focus pane** (bottom). The track renders stages left-to-right: roman-numeral header, substrate pill, per-stage cost, status (idle / running / done / failed). Stages connect via `⟶` in brass; a `⟜` checkpoint gate between stages pauses the run for approve/reject. The focus pane shows the selected stage's artifact (markdown plan, code diff, test output) and the live worktree diff for code stages.
+- **Companion**: `Runs` (list of past and current pipeline runs with status and total cost) + the read-only Jira context panel (linked tickets for the workspace).
+- **Cost meter**: a persistent strip at the bottom of the canvas during a run — `spent: $0.014 · saved vs. all-premium: $0.089` in mono brass, updated live.
+- Input bar is hidden during an active run; the checkpoint bar (approve / reject / abort, ghost buttons) takes its place at each `⟜` gate.
+
+### 4.7 New Workspace flow
 
 Two-pane layout (separate from the Atelier shell — this is a focused creation flow):
 - Left pane (220px, panel bg): step index. Three steps: `I. Name & intent`, `II. Branch from…`, `III. Open with…`. Active step in italic serif + brass numeral.
 - Right pane: current step's question in italic serif (e.g., *"Where do we branch from?"*) + descriptive paragraph + field(s) with mono labels. Primary CTA bottom-left. Keyboard hint *"← BACK · ↵ CONTINUE"* bottom-right.
 
-### 4.7 Settings (full-screen section, not modal)
+### 4.8 Settings (full-screen section, not modal)
 
 - Title bar at top with mono brass `PREFERENCES` eyebrow + workspace name in italic serif.
 - Left nav: `General`, `Models & Providers`, `Appearance`, `Workspaces`, `Shortcuts`, `Privacy`. Active item in italic serif + brass-ghost background.
 - Right pane: section header in mono brass uppercase, then field rows separated by dashed hairlines. Each provider row shows status in brass for "Connected", mute for "Add key".
 
-### 4.8 Command Palette (⌘K)
+### 4.9 Command Palette (⌘K)
 
 - Floating panel centered, ~60% width, brass-dim border with a subtle 6px brass glow (`box-shadow: 0 0 0 6px rgba(212,165,116,0.04)`).
 - Search row at top: mono brass `⌘K` prompt + italic-serif query text + mono `ESC` kbd on the right.
@@ -408,7 +419,7 @@ The redesign is complete when:
 - The current `ProjectSidebar`, `WorkspaceBar`, `TokenDashboard` components are deleted.
 - `App.tsx` no longer carries `tabsPerWorkspace`, `viewPerWorkspace`, or `activeView` state.
 - A new user opening Octopus for the first time sees: Welcome → New Project wizard → New Workspace wizard → Workspace · Talk mode — all in Onyx & Brass with italic-serif voice.
-- The 8 reference screens (Welcome, New Project, Workspace · Talk/Run/Review, New Workspace flow, Settings, Command Palette) match the approved mockups within reasonable fidelity.
+- The 9 reference screens (Welcome, New Project, Workspace · Talk/Run/Review/Direct, New Workspace flow, Settings, Command Palette) match the approved mockups within reasonable fidelity.
 - `npm run typecheck` and `cargo test` pass.
 - No `console.log` or `debug:` artifacts remain in the modified components.
 

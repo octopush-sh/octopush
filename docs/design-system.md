@@ -138,10 +138,12 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 | Detail        | Where to use                                                        |
 |---------------|---------------------------------------------------------------------|
 | `&` in brass  | "Octopus & you" branding moments (welcome, about)                   |
-| `⟶` in brass | Terminal prompt, command palette prompt, input nudges               |
-| `§` in brass  | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`                     |
-| Roman numerals| Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.            |
+| `⟶` in brass | Terminal prompt, command palette prompt, input nudges; also the Direct run-track stage connector |
+| `§` in brass  | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; also Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER` |
+| Roman numerals| Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; also Direct run-track stage numbers |
 | Italic phrases| CTAs and placeholders are **phrases in Spectral italic**, not labels|
+| `⟜` in brass | Direct run-track checkpoint gate — pauses the pipeline for human approval |
+| Substrate pills | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
 
 ---
 
@@ -212,12 +214,55 @@ Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPan
 |---------------|-------|-------|
 | Rail          | 48px  | Workspace monograms (italic serif, brass on active), brass vertical indicator. |
 | ContextHeader | flex  | Floating card. Workspace name in italic serif + branch in mono. |
-| ModeSwitcher  | auto  | Top right. Brass-ghost pill on active mode, brass indicator glides. |
-| Canvas        | flex  | Active mode content (chat / terminal / diff). |
-| Companion     | 280px | Per-mode panels: Context+History · Terminals+Quick · Changed+commit. |
+| ModeSwitcher  | auto  | Top right. Brass-ghost pill on active mode, brass indicator glides. Four modes: Talk / Run / Review / Direct. |
+| Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
+| Companion     | 280px | Per-mode panels: Context+History · Terminals+Quick · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Italic-serif placeholder, ⌘K kbd hint. |
 
+**Mode canvases at a glance:**
+- **Talk** — chat timeline. Companion: Context + History.
+- **Run** — terminal card. Companion: Terminals + Quick.
+- **Review** — unified diff. Companion: Changed + commit.
+- **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
+
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
+
+### Direct mode — canvas patterns
+
+Direct introduces a set of new visual patterns. Use them only in Direct mode; don't migrate them into other surfaces.
+
+**Substrate pills** — identify the execution substrate of each pipeline stage.
+
+| Pill label | Color token | Use |
+|------------|-------------|-----|
+| `API`      | `--color-octo-state-blue` | Stage runs via the Claude API directly |
+| `CLI`      | `--color-octo-state-purple` | Stage runs via Claude Code CLI in the worktree |
+
+Pills share the same geometry as the existing status pills (mono uppercase, `sm` radius, dot icon omitted here — substrate is the identity). Never use these two colors outside Direct mode substrate pills.
+
+**Run track** — the horizontal stage list across the canvas top.
+
+- Each stage: roman numeral header (`I`, `II`, `III` …) in brass mono, substrate pill, model name in mono mute, per-stage cost in mono mute.
+- Stages connect left-to-right with `⟶` in brass (connector) or `⟜` in brass (checkpoint gate — pauses for human approval).
+- A running stage shows a verdigris status dot and a live cost ticker. A failed stage shows a rouge dot.
+- The track scrolls horizontally when stages overflow the canvas width; the focus pane below is always visible.
+
+**Focus pane** — the lower half of the Direct canvas.
+
+- Shows the selected stage's artifact: a markdown plan, a code diff, or a test result.
+- Header: `§ ROLE` (e.g., `§ PLANNER`, `§ IMPLEMENTER`) in brass mono — the same `§` signature as tool call cards.
+- For code stages, the worktree diff is embedded beneath the artifact using the same diff styling as Review mode (`--verdigris` adds / `--rouge` dels).
+
+**Checkpoint bar** — replaces the input bar when the run is paused at a `⟜` gate.
+
+- Three ghost buttons in a hairline-bordered strip: `Approve`, `Reject`, `Abort`. No italic-serif phrases here — these are consequential decisions that need clarity.
+- Approve continues the run; Reject re-queues the stage; Abort terminates the pipeline.
+
+**Cost meter** — a single-line strip at the bottom of the canvas during a run.
+
+- Format: `spent: $0.014 · saved vs. all-premium: $0.089` in JetBrains Mono, `text-octo-brass` for the values, `text-octo-mute` for the labels.
+- Updated live; no animation on the numbers (functional indicator — per motion §5.3: no motion on live counters).
+- Visually matches the status bar aesthetic (calm, single-line, panel bg).
 
 ### Status bar (bottom)
 
