@@ -1983,3 +1983,150 @@ mod run_crud_tests {
         assert_eq!(db.get_run(&run_id).unwrap().unwrap().status, "completed");
     }
 }
+
+#[cfg(test)]
+mod orchestrator_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    struct CollectingSink {
+        events: Mutex<Vec<String>>,
+    }
+    impl EventSink for CollectingSink {
+        fn emit(&self, event: &str, _payload: Value) {
+            self.events.lock().push(event.to_string());
+        }
+    }
+
+    /// A runner that always succeeds with a canned artifact.
+    struct MockRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for MockRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageArtifact,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cost_usd: 0.01,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+            })
+        }
+    }
+
+    fn db_with_workspace() -> (Arc<Mutex<Db>>, String) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        (Arc::new(Mutex::new(db)), "w1".to_string())
+    }
+
+    #[tokio::test]
+    async fn run_pauses_at_first_checkpoint_then_completes() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "build it", None, None).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(MockRunner),
+        );
+
+        // Drive to the first pause. Feature Factory: plan(no cp), plan_review(no cp),
+        // implement(cp) -> should pause after implement.
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done");           // plan
+        assert_eq!(stages[1].status, "done");           // plan_review
+        assert_eq!(stages[2].status, "awaiting_checkpoint"); // implement
+        assert_eq!(stages[3].status, "pending");        // code_review
+
+        // Approve the implement checkpoint -> runs code_review, pauses there (cp on).
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Approve)
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[2].status, "done");
+        assert_eq!(stages[3].status, "awaiting_checkpoint"); // code_review
+
+        // Approve code_review -> test pauses (cp on).
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        // Approve test (last stage) -> completed.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
+
+        // Cost accumulated across 5 stages * 0.01.
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!((run.cost_usd - 0.05).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn reject_reruns_same_stage() {
+        let (db, ws) = db_with_workspace();
+        let pr = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Plan & review").unwrap();
+        let run_id = db.lock().create_run(&ws, &pr.id, "think", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // plan(no cp), critique(no cp), refine(cp) -> pause at refine.
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        // Reject refine with feedback -> it returns to pending, then re-runs and pauses again.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
+            feedback: Some("tighten it".into()),
+            model_override: None,
+        }).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[2].role, "refine");
+        assert_eq!(stages[2].status, "awaiting_checkpoint"); // re-ran, awaiting again
+        assert_eq!(stages[2].feedback.as_deref(), Some("tighten it"));
+    }
+
+    #[tokio::test]
+    async fn abort_stops_the_run() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        orch.run_to_pause(&run_id).await.unwrap();
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Abort).await.unwrap();
+        assert_eq!(status, RunStatus::Aborted);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "aborted");
+    }
+}

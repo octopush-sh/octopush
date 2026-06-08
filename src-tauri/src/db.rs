@@ -43,6 +43,19 @@ impl Db {
         &self.conn
     }
 
+    /// The worktree path for a workspace (None if not yet created).
+    pub fn conn_ref_path(&self, workspace_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT worktree_path FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(Into::into)
+    }
+
     pub fn default_path() -> PathBuf {
         let base = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
