@@ -36,7 +36,7 @@ Status Index → open that stream's spec/plan → branch `feat/review-g<N>-<slug
 | Stream | Status | Spec | Plan | Impl branch |
 |--------|--------|------|------|-------------|
 | G3 Diff Reading | done (merged to main, PR #6) | [design](../specs/2026-06-08-review-g3-diff-reading-design.md) | [plan](2026-06-08-review-g3-diff-reading.md) | merged |
-| G5 AI Review Intelligence | spec'd (slice 1: primitive + AI Review Pass) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | — | `feat/review-g5-ai` |
+| G5 AI Review Intelligence | planned (slice 1: primitive + AI Review Pass) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | [plan](2026-06-08-review-g5-ai-review-pass.md) | `feat/review-g5-ai` |
 | G1 Editor Engine | not started | — | — | — |
 | G2 Editor Reliability | not started | — | — | — |
 | G4 Staging & Commit | not started | — | — | — |
