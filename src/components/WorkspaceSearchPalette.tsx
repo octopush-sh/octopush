@@ -17,6 +17,7 @@ import { Command } from "cmdk";
 import { useEffect, useRef, useState } from "react";
 import { ipc } from "../lib/ipc";
 import type { SearchHit } from "../lib/types";
+import { ModalShell } from "./ModalShell";
 
 type Mode = "files" | "text";
 
@@ -112,12 +113,7 @@ export function WorkspaceSearchPalette({
   if (!open) return null;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
-      return;
-    }
+    // Escape is handled by ModalShell; Tab toggles files/text mode.
     if (e.key === "Tab") {
       e.preventDefault();
       setMode((m) => (m === "files" ? "text" : "files"));
@@ -125,15 +121,10 @@ export function WorkspaceSearchPalette({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[14vh] octo-overlay-enter"
-      style={{ background: "rgba(12, 10, 8, 0.55)", backdropFilter: "blur(4px)" }}
-      onClick={onClose}
-      onKeyDown={handleKeyDown}
-    >
+    <ModalShell onClose={onClose} align="top" topOffset="pt-[14vh]" ariaLabel="Search workspace">
       <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[640px] rounded-xl bg-octo-panel octo-modal-enter"
+        onKeyDown={handleKeyDown}
+        className="w-[640px] rounded-xl bg-octo-panel"
         style={{
           border: "1px solid var(--brass-dim)",
           boxShadow:
@@ -220,7 +211,7 @@ export function WorkspaceSearchPalette({
           </Command.List>
         </Command>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 

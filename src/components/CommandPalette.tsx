@@ -6,6 +6,7 @@ import { pushToast } from "./Toasts";
 import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { useThemeStore } from "../stores/themeStore";
 import { useUpdaterStore } from "../stores/updaterStore";
+import { ModalShell } from "./ModalShell";
 
 interface Props {
   open: boolean;
@@ -46,21 +47,9 @@ export function CommandPalette({
   const activeSession = sessions.find((s) => s.id === activeId);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[18vh] octo-overlay-enter"
-      style={{ background: "rgba(12, 10, 8, 0.55)", backdropFilter: "blur(4px)" }}
-      onClick={onClose}
-      onKeyDown={(e) => {
-        if (e.key === "Escape") {
-          e.preventDefault();
-          e.stopPropagation();
-          onClose();
-        }
-      }}
-    >
+    <ModalShell onClose={onClose} align="top" topOffset="pt-[18vh]" ariaLabel="Command palette">
       <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[560px] rounded-xl bg-octo-panel octo-modal-enter"
+        className="w-[560px] rounded-xl bg-octo-panel"
         style={{
           border: "1px solid var(--brass-dim)",
           boxShadow:
@@ -256,7 +245,7 @@ export function CommandPalette({
           </Command.List>
         </Command>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
