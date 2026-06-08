@@ -2360,4 +2360,18 @@ mod cli_path_tests {
 
         assert!(resolve_executable("does-not-exist-xyz", &path_env).is_none());
     }
+
+    #[test]
+    fn parse_env0_splits_pairs_skips_dir_vars_and_keeps_multiline() {
+        use crate::orchestrator::cli_runner::parse_env0;
+        let raw = b"PATH=/a:/b\0ANTHROPIC_AUTH_TOKEN=sk-secret\0PWD=/should/skip\0MULTI=line1\nline2\0BAD_NO_EQUALS\0ANTHROPIC_BASE_URL=https://litellm.example/v1\0";
+        let pairs = parse_env0(raw);
+        let get = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("PATH").as_deref(), Some("/a:/b"));
+        assert_eq!(get("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("sk-secret"));
+        assert_eq!(get("ANTHROPIC_BASE_URL").as_deref(), Some("https://litellm.example/v1"));
+        assert_eq!(get("MULTI").as_deref(), Some("line1\nline2"));   // multiline preserved
+        assert_eq!(get("PWD"), None);                                 // cwd vars skipped
+        assert!(pairs.iter().all(|(k, _)| k != "BAD_NO_EQUALS"));     // malformed skipped
+    }
 }

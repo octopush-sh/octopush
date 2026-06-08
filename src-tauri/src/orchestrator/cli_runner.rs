@@ -93,28 +93,56 @@ fn default_bin_dirs() -> Vec<String> {
     v
 }
 
-/// The PATH to use when spawning user CLIs from the (often GUI-launched) app:
-/// the login shell's PATH (it sources the user's rc files), merged with the
-/// inherited PATH and common fallbacks. Captured once. Mirrors how the git/gh
-/// commands run under `$SHELL -lc` to pick up the user's real PATH.
-fn resolved_cli_path() -> &'static str {
-    static CACHE: OnceLock<String> = OnceLock::new();
+/// Parse `env -0` (null-delimited KEY=VALUE) output into pairs. Skips cwd/shell
+/// bookkeeping vars (`current_dir` governs the working directory) and malformed
+/// entries. Multi-line values survive because records are null-delimited.
+pub fn parse_env0(stdout: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for chunk in stdout.split(|b| *b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(chunk);
+        if let Some((k, v)) = s.split_once('=') {
+            if matches!(k, "PWD" | "OLDPWD" | "SHLVL" | "_") {
+                continue;
+            }
+            pairs.push((k.to_string(), v.to_string()));
+        }
+    }
+    pairs
+}
+
+/// The user's full login+interactive shell environment, captured once. A GUI app
+/// (Finder/Dock) starts from launchd's minimal env and never sources ~/.zshrc, so
+/// it lacks both the user's PATH AND their exported config — e.g.
+/// ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN for a LiteLLM/Bedrock proxy. RUN-mode
+/// terminals work because the PTY runs a login shell that sources the rc files;
+/// the CLI stage must inherit the same environment.
+fn login_shell_env() -> &'static [(String, String)] {
+    static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        // `-lic`: login + interactive + command, so rc files that add to PATH
-        // (e.g. ~/.zshrc) are sourced. `-c` makes it run and exit immediately.
-        let login = std::process::Command::new(&shell)
-            .args(["-lic", "printf %s \"$PATH\""])
+        std::process::Command::new(&shell)
+            .args(["-lic", "env -0"])
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let inherited = std::env::var("PATH").unwrap_or_default();
-        let defaults = default_bin_dirs().join(":");
-        merge_path_dirs(&[login.as_str(), inherited.as_str(), defaults.as_str()])
+            .map(|o| parse_env0(&o.stdout))
+            .unwrap_or_default()
     })
-    .as_str()
+}
+
+/// The effective PATH for spawning user CLIs: login-shell PATH ∪ inherited ∪ common dirs.
+fn resolved_cli_path() -> String {
+    let login_path = login_shell_env()
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let defaults = default_bin_dirs().join(":");
+    merge_path_dirs(&[login_path, &inherited, &defaults])
 }
 
 /// Parse `claude -p --output-format json` stdout into a `StageOutcome`.
@@ -203,19 +231,23 @@ impl AgentRunner for CliRunner {
         let args = build_cli_args(&stage.agent_model, &system);
 
         let path_env = resolved_cli_path();
-        let program: std::ffi::OsString = resolve_executable("claude", path_env)
+        let program: std::ffi::OsString = resolve_executable("claude", &path_env)
             .map(Into::into)
             .unwrap_or_else(|| "claude".into());
-        let mut child = match tokio::process::Command::new(&program)
+        let mut command = tokio::process::Command::new(&program);
+        command
             .args(&args)
-            .current_dir(&ctx.workspace_path)
-            .env("PATH", path_env)
+            .current_dir(&ctx.workspace_path);
+        for (k, v) in login_shell_env() {
+            command.env(k, v);
+        }
+        command
+            .env("PATH", &path_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(failed_stage(
