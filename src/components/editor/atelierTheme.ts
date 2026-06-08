@@ -87,6 +87,65 @@ const atelierEditorTheme = EditorView.theme(
       color: IVORY,
     },
 
+    // ── Search / go-to-line panel (Atelier) ─────────────────────────
+    ".cm-panels": {
+      backgroundColor: PANEL,
+      color: IVORY,
+      borderTop: `1px solid ${HAIRLINE}`,
+    },
+    ".cm-panels.cm-panels-top": {
+      borderBottom: `1px solid ${HAIRLINE}`,
+      borderTop: "none",
+    },
+    ".cm-panel.cm-search": {
+      padding: "6px 8px",
+      fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace',
+      fontSize: "11px",
+    },
+    ".cm-panel.cm-search input, .cm-panel.cm-search input[type=text]": {
+      backgroundColor: ONYX,
+      color: IVORY,
+      border: `1px solid ${HAIRLINE}`,
+      borderRadius: "4px",
+      padding: "2px 6px",
+      outline: "none",
+    },
+    ".cm-panel.cm-search input:focus": {
+      borderColor: BRASS,
+    },
+    ".cm-panel.cm-search .cm-button": {
+      backgroundColor: "transparent",
+      backgroundImage: "none",
+      color: SAGE,
+      border: `1px solid ${HAIRLINE}`,
+      borderRadius: "4px",
+      padding: "2px 8px",
+    },
+    ".cm-panel.cm-search .cm-button:hover": {
+      color: IVORY,
+      borderColor: BRASS,
+    },
+    ".cm-panel.cm-search label": {
+      color: MUTE,
+      fontSize: "11px",
+    },
+    ".cm-panel.cm-search .cm-textfield:focus": {
+      borderColor: BRASS,
+    },
+    ".cm-searchMatch": {
+      backgroundColor: BRASS_GHOST,
+      outline: `1px solid ${HAIRLINE}`,
+    },
+    ".cm-searchMatch-selected": {
+      backgroundColor: "rgba(212, 165, 116, 0.22)",
+    },
+    ".cm-panel button[name=close]": {
+      color: MUTE,
+    },
+    ".cm-panel button[name=close]:hover": {
+      color: IVORY,
+    },
+
     ".cm-scroller": {
       fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace',
     },
