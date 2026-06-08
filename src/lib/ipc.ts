@@ -474,5 +474,6 @@ export const RUN_EVENTS = {
   stageUpdate: "run://stage-update",
   cost: "run://cost",
   checkpoint: "run://checkpoint",
+  /** Reserved/planned — not yet emitted by the backend (see spec §5.4). */
   log: "run://log",
 } as const;
