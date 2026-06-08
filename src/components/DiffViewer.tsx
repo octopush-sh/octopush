@@ -7,6 +7,7 @@
 
 import { useMemo } from "react";
 import { parseFullDiff } from "../lib/diffParser";
+import { diffLineStyle } from "../lib/diffLineStyle";
 
 interface Props {
   diff: string;
@@ -68,38 +69,12 @@ export function DiffViewer({ diff }: Props) {
                   {/* Diff lines */}
                   <pre className="px-0 font-mono text-[11.5px] leading-[1.55]">
                     {bodyLines.map((line, lineIdx) => {
-                      if (
-                        line.startsWith("+") &&
-                        !line.startsWith("+++")
-                      ) {
-                        return (
-                          <div
-                            key={lineIdx}
-                            className="whitespace-pre px-3 text-octo-verdigris"
-                            style={{ background: "rgba(143, 201, 168, 0.08)" }}
-                          >
-                            {line}
-                          </div>
-                        );
-                      }
-                      if (
-                        line.startsWith("-") &&
-                        !line.startsWith("---")
-                      ) {
-                        return (
-                          <div
-                            key={lineIdx}
-                            className="whitespace-pre px-3 text-octo-rouge"
-                            style={{ background: "rgba(209, 139, 139, 0.08)" }}
-                          >
-                            {line}
-                          </div>
-                        );
-                      }
+                      const { className, background } = diffLineStyle(line);
                       return (
                         <div
                           key={lineIdx}
-                          className="whitespace-pre px-3 text-octo-sage"
+                          className={`whitespace-pre px-3 ${className}`}
+                          style={background ? { background } : undefined}
                         >
                           {line}
                         </div>

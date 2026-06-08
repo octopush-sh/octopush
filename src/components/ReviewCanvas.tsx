@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { parseFullDiff, type DiffFile, type DiffHunk } from "../lib/diffParser";
+import { diffLineStyle } from "../lib/diffLineStyle";
 import type { ChatMessage, FileEdit, GitStatus, TestRunResult } from "../lib/types";
 
 // ─── Types ─────────────────────────────────────────────────────────
@@ -290,27 +291,15 @@ function formatHunkRange(header: string): string {
 // ─── Diff line ─────────────────────────────────────────────────────
 
 function DiffLine({ line }: { line: string }) {
-  if (line.startsWith("+") && !line.startsWith("+++")) {
-    return (
-      <div
-        className="px-3 text-octo-verdigris"
-        style={{ background: "rgba(143, 201, 168, 0.08)" }}
-      >
-        {line}
-      </div>
-    );
-  }
-  if (line.startsWith("-") && !line.startsWith("---")) {
-    return (
-      <div
-        className="px-3 text-octo-rouge"
-        style={{ background: "rgba(209, 139, 139, 0.08)" }}
-      >
-        {line}
-      </div>
-    );
-  }
-  return <div className="px-3 text-octo-sage">{line}</div>;
+  const { className, background } = diffLineStyle(line);
+  return (
+    <div
+      className={`px-3 ${className}`}
+      style={background ? { background } : undefined}
+    >
+      {line}
+    </div>
+  );
 }
 
 // ─── Test drawer ───────────────────────────────────────────────────
