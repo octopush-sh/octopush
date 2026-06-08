@@ -54,3 +54,6 @@ octopus.db-journal
 # Claude Code local state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Superpowers brainstorm scratch (visual companion mockups)
+.superpowers/
