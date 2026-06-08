@@ -17,6 +17,7 @@ import {
 } from "../lib/settingsTabs";
 import type { Budget, BudgetPeriod, BudgetScope, EditorChoice, ModelInfo, ProjectInfo, ProviderConfig, UsageBreakdown } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ModalShell } from "./ModalShell";
 import { pushToast } from "./Toasts";
 
 interface Props {
@@ -1405,14 +1406,8 @@ function BudgetsSection({
 
       {/* Add budget modal */}
       {showAdd && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-          onClick={() => setShowAdd(false)}
-        >
-          <div
-            className="w-[360px] rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
+        <ModalShell onClose={() => setShowAdd(false)} ariaLabel="Add budget">
+          <div className="w-[360px] rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl">
             <div className="mb-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
               Add Budget
             </div>
@@ -1486,7 +1481,7 @@ function BudgetsSection({
               </button>
             </div>
           </div>
-        </div>
+        </ModalShell>
       )}
     </div>
   );
