@@ -138,6 +138,9 @@ impl Orchestrator {
                 workspace_path: self.workspace_path(run)?,
                 task: run.task.clone(),
                 client: self.client.clone(),
+                events: Arc::clone(&self.events),
+                run_id: run.id.clone(),
+                stage_id: stage.id.clone(),
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

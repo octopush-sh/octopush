@@ -10,13 +10,17 @@ use crate::error::{AppError, AppResult};
 use crate::orchestrator::runner::{artifact_kind_for, system_prompt_for, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 const MAX_CLI_TURNS: u32 = 30;
 const CLI_TIMEOUT_SECS: u64 = 900; // 15-minute wall-clock backstop for a hung CLI
+
+/// Frontend event for live per-stage progress lines (mirrors `RUN_EVENTS.log`).
+const RUN_LOG_EVENT: &str = "run://log";
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -145,9 +149,9 @@ fn resolved_cli_path() -> String {
     merge_path_dirs(&[login_path, &inherited, &defaults])
 }
 
-/// Parse `claude -p --output-format json` stdout into a `StageOutcome`.
+/// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
 /// A non-zero exit OR `is_error: true` produces a Failed outcome. Returns
-/// `Err` only when the output isn't parseable at all.
+/// `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
     exit_success: bool,
@@ -198,12 +202,16 @@ pub fn parse_cli_result(
 }
 
 /// Build the argv (after the program name) for a headless `claude -p` run.
-/// The user prompt is supplied via stdin, not as an arg.
+/// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
+/// (`stream-json` requires `--verbose`) so the stage emits live progress and a
+/// chatty/debug stdout can't break result parsing — each line is parsed
+/// independently and non-JSON log lines are simply skipped.
 pub fn build_cli_args(model: &str, system_prompt: &str) -> Vec<String> {
     vec![
         "-p".to_string(),
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
         "--model".to_string(),
         model.to_string(),
         "--append-system-prompt".to_string(),
@@ -213,6 +221,61 @@ pub fn build_cli_args(model: &str, system_prompt: &str) -> Vec<String> {
         "--max-turns".to_string(),
         MAX_CLI_TURNS.to_string(),
     ]
+}
+
+/// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
+/// text, cost, usage, and `is_error`). Parsed via [`parse_cli_result`].
+pub fn is_result_event(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("result")
+}
+
+/// Render a streaming NDJSON event into a concise human-readable progress line,
+/// or `None` for events that carry no user-facing progress (system init, tool
+/// results, the final result). `assistant` events surface the model's text and
+/// each tool call as `§ TOOL_NAME <hint>`.
+pub fn render_stream_event(v: &Value) -> Option<String> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let content = v.get("message")?.get("content")?.as_array()?;
+    let mut parts: Vec<String> = Vec::new();
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                // First string argument (path/command/pattern) as a one-line hint.
+                let hint = block
+                    .get("input")
+                    .and_then(Value::as_object)
+                    .and_then(|o| o.values().find_map(Value::as_str))
+                    .map(|s| {
+                        let first = s.lines().next().unwrap_or(s);
+                        let clipped: String = first.chars().take(80).collect();
+                        if first.chars().count() > 80 {
+                            format!("{clipped}…")
+                        } else {
+                            clipped
+                        }
+                    })
+                    .unwrap_or_default();
+                parts.push(format!("§ {name} {hint}").trim_end().to_string());
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
 }
 
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
@@ -264,14 +327,56 @@ impl AgentRunner for CliRunner {
             // drop closes stdin
         }
 
-        let output = match tokio::time::timeout(
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // Drain stderr concurrently: a chatty proxy/debug log can fill the pipe
+        // buffer and block the child if we only ever read stdout.
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = tokio::io::BufReader::new(stderr).read_to_string(&mut buf).await;
+            buf
+        });
+
+        // Stream stdout line-by-line: emit live progress per NDJSON event and
+        // keep the final `result` event. Non-JSON lines (debug logs) are skipped,
+        // so a noisy stdout can't break result parsing.
+        let read_loop = async {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            let mut result_line: Option<String> = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                if is_result_event(&value) {
+                    result_line = Some(trimmed.to_string());
+                }
+                if let Some(rendered) = render_stream_event(&value) {
+                    ctx.events.emit(
+                        RUN_LOG_EVENT,
+                        serde_json::json!({
+                            "runId": ctx.run_id,
+                            "stageId": ctx.stage_id,
+                            "line": rendered,
+                        }),
+                    );
+                }
+            }
+            result_line
+        };
+
+        let result_line = match tokio::time::timeout(
             std::time::Duration::from_secs(CLI_TIMEOUT_SECS),
-            child.wait_with_output(),
+            read_loop,
         )
         .await
         {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Ok(failed_stage(&format!("claude process error: {e}"))),
+            Ok(line) => line,
+            // child is dropped on return → kill_on_drop terminates the process.
             Err(_) => {
                 return Ok(failed_stage(
                     "claude stage timed out (no result within 15 minutes)",
@@ -279,17 +384,30 @@ impl AgentRunner for CliRunner {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        match parse_cli_result(&stdout, output.status.success(), &stage.role) {
-            Ok(outcome) => Ok(outcome),
-            Err(_) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let detail = if !stderr.trim().is_empty() {
-                    stderr.chars().take(400).collect::<String>()
+        let exit_success = child.wait().await.map(|s| s.success()).unwrap_or(false);
+        let stderr_out = stderr_task.await.unwrap_or_default();
+
+        match result_line {
+            Some(line) => match parse_cli_result(&line, exit_success, &stage.role) {
+                Ok(outcome) => Ok(outcome),
+                Err(_) => {
+                    let detail = if !stderr_out.trim().is_empty() {
+                        stderr_out.chars().take(400).collect::<String>()
+                    } else {
+                        line.chars().take(400).collect::<String>()
+                    };
+                    Ok(failed_stage(&format!(
+                        "claude produced no parseable result: {detail}"
+                    )))
+                }
+            },
+            None => {
+                let detail = if !stderr_out.trim().is_empty() {
+                    stderr_out.chars().take(400).collect::<String>()
                 } else {
-                    stdout.chars().take(400).collect::<String>()
+                    "claude emitted no result event".to_string()
                 };
-                Ok(failed_stage(&format!("claude produced no parseable result: {detail}")))
+                Ok(failed_stage(&format!("claude produced no result: {detail}")))
             }
         }
     }

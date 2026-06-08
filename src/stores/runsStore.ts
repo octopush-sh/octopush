@@ -20,11 +20,15 @@ interface RunsState {
   activeRunIdByWs: Record<string, string | null>;
   detailByRun: Record<string, RunDetail>;
   selectedStageByRun: Record<string, string | null>;
+  /** Live progress text per stage id, streamed from the CLI substrate. */
+  liveLogByStage: Record<string, string>;
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
   getDetail: (runId: string) => RunDetail | undefined;
   getSelectedStageId: (runId: string) => string | null;
+  getLiveLog: (stageId: string) => string;
+  appendLog: (stageId: string, line: string) => void;
 
   loadRuns: (workspaceId: string) => Promise<void>;
   refreshDetail: (runId: string) => Promise<void>;
@@ -61,11 +65,24 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   activeRunIdByWs: {},
   detailByRun: {},
   selectedStageByRun: {},
+  liveLogByStage: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
   getDetail: (runId) => get().detailByRun[runId],
   getSelectedStageId: (runId) => get().selectedStageByRun[runId] ?? null,
+  getLiveLog: (stageId) => get().liveLogByStage[stageId] ?? "",
+
+  appendLog: (stageId, line) =>
+    set((s) => {
+      const prev = s.liveLogByStage[stageId] ?? "";
+      const combined = prev ? `${prev}\n${line}` : line;
+      // Keep the buffer bounded — show the most recent activity.
+      const lines = combined.split("\n");
+      const capped =
+        lines.length > 200 ? lines.slice(lines.length - 200).join("\n") : combined;
+      return { liveLogByStage: { ...s.liveLogByStage, [stageId]: capped } };
+    }),
 
   loadRuns: async (workspaceId) => {
     const runs = await ipc.listRuns(workspaceId);
@@ -167,4 +184,7 @@ void listen<{ runId: string }>(RUN_EVENTS.checkpoint, (ev) => {
 });
 void listen<{ runId: string; error: string }>(RUN_EVENTS.error, (ev) => {
   void useRunsStore.getState().refreshDetail(ev.payload.runId);
+});
+void listen<{ runId: string; stageId: string; line: string }>(RUN_EVENTS.log, (ev) => {
+  useRunsStore.getState().appendLog(ev.payload.stageId, ev.payload.line);
 });

@@ -3,8 +3,10 @@
 use crate::chat_engine::resolve_provider;
 use crate::error::AppResult;
 use crate::orchestrator::agentic::run_agentic_loop;
+use crate::orchestrator::events::EventSink;
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_STAGE_ITERATIONS: usize = 25;
 
@@ -14,6 +16,10 @@ pub struct StageContext {
     /// The original run task (seed for stage 1, context for later stages).
     pub task: String,
     pub client: reqwest::Client,
+    /// Sink for live progress events (e.g. the CLI substrate streams its output).
+    pub events: Arc<dyn EventSink>,
+    pub run_id: String,
+    pub stage_id: String,
 }
 
 /// Uniform execution contract — both API and (future) CLI substrates implement it.

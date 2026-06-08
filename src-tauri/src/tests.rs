@@ -2299,7 +2299,9 @@ mod cli_args_tests {
         let args = build_cli_args("claude-sonnet-4-6", "You are a planner.");
         assert!(args.contains(&"-p".to_string()));
         let i = args.iter().position(|a| a == "--output-format").unwrap();
-        assert_eq!(args[i + 1], "json");
+        assert_eq!(args[i + 1], "stream-json");
+        // stream-json requires --verbose, else claude refuses to start.
+        assert!(args.contains(&"--verbose".to_string()));
         let m = args.iter().position(|a| a == "--model").unwrap();
         assert_eq!(args[m + 1], "claude-sonnet-4-6");
         let s = args.iter().position(|a| a == "--append-system-prompt").unwrap();
@@ -2307,6 +2309,56 @@ mod cli_args_tests {
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(args.contains(&"bypassPermissions".to_string()));
         assert!(args.contains(&"--max-turns".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod cli_stream_tests {
+    use crate::orchestrator::cli_runner::{is_result_event, render_stream_event};
+    use serde_json::json;
+
+    #[test]
+    fn result_event_is_detected_and_not_rendered_as_progress() {
+        let v = json!({"type":"result","subtype":"success","result":"done","is_error":false});
+        assert!(is_result_event(&v));
+        // The result text is the artifact, not a progress line.
+        assert_eq!(render_stream_event(&v), None);
+    }
+
+    #[test]
+    fn assistant_text_block_renders_as_a_progress_line() {
+        let v = json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":"  Reading the codebase.  "}]}
+        });
+        assert!(!is_result_event(&v));
+        assert_eq!(render_stream_event(&v).as_deref(), Some("Reading the codebase."));
+    }
+
+    #[test]
+    fn assistant_tool_use_renders_with_glyph_name_and_hint() {
+        let v = json!({
+            "type":"assistant",
+            "message":{"content":[
+                {"type":"tool_use","name":"Edit","input":{"file_path":"src/lib.rs","old":"a"}}
+            ]}
+        });
+        assert_eq!(render_stream_event(&v).as_deref(), Some("§ Edit src/lib.rs"));
+    }
+
+    #[test]
+    fn system_and_user_events_produce_no_progress_line() {
+        assert_eq!(render_stream_event(&json!({"type":"system","subtype":"init"})), None);
+        assert_eq!(
+            render_stream_event(&json!({"type":"user","message":{"content":[]}})),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_assistant_content_yields_nothing() {
+        let v = json!({"type":"assistant","message":{"content":[]}});
+        assert_eq!(render_stream_event(&v), None);
     }
 }
 
