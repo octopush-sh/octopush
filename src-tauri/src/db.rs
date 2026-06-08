@@ -1458,6 +1458,16 @@ impl Db {
                     ("refine", "claude-sonnet-4-6", "api", true),
                 ],
             ),
+            (
+                "Claude Code build",
+                "Plan via API, then implement, review, and test with Claude Code (CLI).",
+                &[
+                    ("plan", "claude-haiku-4-5", "api", false),
+                    ("implement", "claude-sonnet-4-6", "cli", true),
+                    ("code_review", "claude-haiku-4-5", "cli", true),
+                    ("test", "claude-haiku-4-5", "cli", true),
+                ],
+            ),
         ];
 
         for (name, desc, stages) in defs {

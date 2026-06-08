@@ -1894,7 +1894,7 @@ mod pipeline_crud_tests {
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 3);
+        assert_eq!(pipelines.len(), 4);
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();
@@ -2205,5 +2205,100 @@ mod orchestrator_tests {
         // Re-driving a completed run must be a no-op (still completed, no re-run).
         let status = orch.run_to_pause(&run_id).await.unwrap();
         assert_eq!(status, RunStatus::Completed);
+    }
+}
+
+#[cfg(test)]
+mod cli_runner_tests {
+    use crate::orchestrator::cli_runner::parse_cli_result;
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
+
+    const SUCCESS: &str = r#"{
+        "type":"result","subtype":"success","is_error":false,
+        "result":"Implemented the feature.","total_cost_usd":0.0123,
+        "usage":{"input_tokens":1200,"output_tokens":340,
+                 "cache_read_input_tokens":800,"cache_creation_input_tokens":100}
+    }"#;
+
+    const ERRORED: &str = r#"{
+        "type":"result","subtype":"error_max_budget_usd","is_error":true,
+        "result":"Budget exceeded.","total_cost_usd":5.0,
+        "usage":{"input_tokens":10,"output_tokens":0,
+                 "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+    }"#;
+
+    #[test]
+    fn parses_success_into_done_outcome() {
+        let outcome = parse_cli_result(SUCCESS, true, "implement").unwrap();
+        assert_eq!(outcome.status, StageStatus::Done);
+        assert_eq!(outcome.artifact.text, "Implemented the feature.");
+        assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
+        assert!(outcome.artifact.refs_worktree);
+        assert_eq!(outcome.input_tokens, 1200);
+        assert_eq!(outcome.output_tokens, 340);
+        assert!((outcome.cost_usd - 0.0123).abs() < 1e-9);
+        assert!(outcome.error.is_none());
+    }
+
+    #[test]
+    fn is_error_flag_yields_failed_outcome() {
+        let outcome = parse_cli_result(ERRORED, true, "implement").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed);
+        assert_eq!(outcome.error.as_deref(), Some("Budget exceeded."));
+    }
+
+    #[test]
+    fn nonzero_exit_yields_failed_even_if_json_ok() {
+        let outcome = parse_cli_result(SUCCESS, false, "plan").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed);
+    }
+
+    #[test]
+    fn unparseable_output_is_an_error() {
+        assert!(parse_cli_result("not json", true, "plan").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cli_args_tests {
+    use crate::orchestrator::cli_runner::build_cli_args;
+
+    #[test]
+    fn args_include_model_format_and_permission() {
+        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.");
+        assert!(args.contains(&"-p".to_string()));
+        let i = args.iter().position(|a| a == "--output-format").unwrap();
+        assert_eq!(args[i + 1], "json");
+        let m = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[m + 1], "claude-sonnet-4-6");
+        let s = args.iter().position(|a| a == "--append-system-prompt").unwrap();
+        assert_eq!(args[s + 1], "You are a planner.");
+        assert!(args.contains(&"--permission-mode".to_string()));
+        assert!(args.contains(&"bypassPermissions".to_string()));
+        assert!(args.contains(&"--max-turns".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod cli_template_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn seeds_a_cli_pipeline() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let p = db.list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Claude Code build").expect("CLI template seeded");
+        let stages = db.get_pipeline_stages(&p.id).unwrap();
+        let implement = stages.iter().find(|s| s.role == "implement").unwrap();
+        assert_eq!(implement.substrate, "cli");
+        assert!(implement.agent_model.contains("claude") || implement.agent_model == "sonnet");
+        assert!(implement.checkpoint);
     }
 }

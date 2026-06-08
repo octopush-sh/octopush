@@ -1,7 +1,7 @@
 //! The `AgentRunner` abstraction and its API-substrate implementation.
 
 use crate::chat_engine::resolve_provider;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::orchestrator::agentic::run_agentic_loop;
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use std::path::PathBuf;
@@ -155,22 +155,5 @@ impl AgentRunner for ApiRunner {
                 error: Some(e.to_string()),
             }),
         }
-    }
-}
-
-/// Placeholder for the CLI substrate — implemented in Plan 2 (Phase C).
-pub struct CliRunnerUnavailable;
-
-#[async_trait::async_trait]
-impl AgentRunner for CliRunnerUnavailable {
-    async fn run(
-        &self,
-        _stage: &StageSpec,
-        _input: &StageArtifact,
-        _ctx: &StageContext,
-    ) -> AppResult<StageOutcome> {
-        Err(AppError::Other(
-            "CLI substrate is not available yet (coming in a later phase)".into(),
-        ))
     }
 }
