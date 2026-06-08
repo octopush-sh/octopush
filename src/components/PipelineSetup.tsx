@@ -12,6 +12,7 @@ export function PipelineSetup({ defaultTask, onBegin }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
+  const error = usePipelineStore((s) => s.error);
 
   const [task, setTask] = useState(defaultTask);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -42,23 +43,38 @@ export function PipelineSetup({ defaultTask, onBegin }: Props) {
       />
 
       <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-brass">II · Choose a pipeline</p>
-      <div className="mb-6 flex gap-2.5">
-        {pipelines.map((p) => (
+      {loaded && pipelines.length === 0 ? (
+        <div className="mb-6 rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-5 text-center">
+          <p className="mb-3 font-mono text-xs text-octo-rouge">
+            {error ? `Couldn't load pipelines: ${error}` : "No pipelines available."}
+          </p>
           <button
-            key={p.pipeline.id}
             type="button"
-            onClick={() => setSelectedId(p.pipeline.id)}
-            className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
-              p.pipeline.id === selectedId
-                ? "border-octo-brass bg-[var(--brass-ghost)]"
-                : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
-            }`}
+            onClick={() => void load()}
+            className="rounded-md border border-octo-brass px-3 py-1.5 font-mono text-xs text-octo-brass"
           >
-            <h3 className="mb-1 font-serif text-[15px] text-octo-ivory">{p.pipeline.name}</h3>
-            <p className="m-0 text-[11px] text-octo-sage">{p.pipeline.description}</p>
+            Retry
           </button>
-        ))}
-      </div>
+        </div>
+      ) : (
+        <div className="mb-6 flex gap-2.5">
+          {pipelines.map((p) => (
+            <button
+              key={p.pipeline.id}
+              type="button"
+              onClick={() => setSelectedId(p.pipeline.id)}
+              className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
+                p.pipeline.id === selectedId
+                  ? "border-octo-brass bg-[var(--brass-ghost)]"
+                  : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
+              }`}
+            >
+              <h3 className="mb-1 font-serif text-[15px] text-octo-ivory">{p.pipeline.name}</h3>
+              <p className="m-0 text-[11px] text-octo-sage">{p.pipeline.description}</p>
+            </button>
+          ))}
+        </div>
+      )}
 
       {selected && (
         <>

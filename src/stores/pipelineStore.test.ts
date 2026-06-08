@@ -20,7 +20,7 @@ const SAMPLE = [
 
 describe("pipelineStore", () => {
   beforeEach(() => {
-    usePipelineStore.setState({ pipelines: [], loaded: false });
+    usePipelineStore.setState({ pipelines: [], loaded: false, error: null });
     vi.clearAllMocks();
   });
 
@@ -32,10 +32,11 @@ describe("pipelineStore", () => {
     expect(usePipelineStore.getState().loaded).toBe(true);
   });
 
-  it("getById returns the matching pipeline or undefined", async () => {
-    (ipc.listPipelines as any).mockResolvedValue(SAMPLE);
+  it("records an error message when loading fails", async () => {
+    (ipc.listPipelines as any).mockRejectedValue(new Error("boom"));
     await usePipelineStore.getState().load();
-    expect(usePipelineStore.getState().getById("p1")?.pipeline.name).toBe("Feature Factory");
-    expect(usePipelineStore.getState().getById("nope")).toBeUndefined();
+    expect(usePipelineStore.getState().loaded).toBe(true);
+    expect(usePipelineStore.getState().error).toBe("boom");
+    expect(usePipelineStore.getState().pipelines).toHaveLength(0);
   });
 });

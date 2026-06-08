@@ -4,21 +4,20 @@ import { ipc, type PipelineWithStages } from "../lib/ipc";
 interface PipelineState {
   pipelines: PipelineWithStages[];
   loaded: boolean;
+  error: string | null;
   load: () => Promise<void>;
-  getById: (pipelineId: string) => PipelineWithStages | undefined;
 }
 
-export const usePipelineStore = create<PipelineState>((set, get) => ({
+export const usePipelineStore = create<PipelineState>((set) => ({
   pipelines: [],
   loaded: false,
+  error: null,
   load: async () => {
     try {
       const pipelines = await ipc.listPipelines();
-      set({ pipelines, loaded: true });
-    } catch {
-      set({ loaded: true });
+      set({ pipelines, loaded: true, error: null });
+    } catch (e) {
+      set({ loaded: true, error: e instanceof Error ? e.message : String(e) });
     }
   },
-  getById: (pipelineId) =>
-    get().pipelines.find((p) => p.pipeline.id === pipelineId),
 }));
