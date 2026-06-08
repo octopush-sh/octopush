@@ -2,6 +2,7 @@
 
 use crate::context_guard::ContextGuard;
 use crate::error::{AppError, AppResult};
+use crate::providers::{LlmContent, LlmMessage, LlmRequest, LlmRole};
 use crate::orchestrator::types::CheckpointAction;
 use crate::orchestrator::Orchestrator;
 use crate::pty_manager::SpawnOptions;
@@ -2772,6 +2773,50 @@ pub async fn get_workspace_cache_sizes(workspace_path: String) -> crate::perf::W
     }
 }
 
+// ─── AI primitive ─────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiCompleteResult {
+    pub text: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Pure request builder — one user/text message, no tools. Unit-testable.
+pub fn build_ai_request(model: &str, system: String, prompt: String, max_tokens: u32) -> LlmRequest {
+    LlmRequest {
+        model: model.to_string(),
+        max_tokens,
+        system,
+        messages: vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(prompt) }],
+        tools: vec![],
+    }
+}
+
+/// Generic one-shot model call — the shared G5 AI primitive. Returns text +
+/// token counts + computed cost. Does NOT record to the token DB in slice 1.
+#[tauri::command]
+pub async fn ai_complete(
+    model: String,
+    system: String,
+    prompt: String,
+    max_tokens: Option<u32>,
+) -> AppResult<AiCompleteResult> {
+    let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&model)?;
+    let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192));
+    let client = reqwest::Client::new();
+    let resp = provider.complete(&api_base, api_key.as_deref(), &req, &client).await?;
+    let cost = crate::token_engine::compute_cost(&model, resp.input_tokens, resp.output_tokens, 0, 0);
+    Ok(AiCompleteResult {
+        text: resp.text,
+        input_tokens: resp.input_tokens,
+        output_tokens: resp.output_tokens,
+        cost_usd: cost,
+    })
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.
@@ -2786,5 +2831,25 @@ fn expand_tilde(path: &str) -> String {
             .unwrap_or_else(|| path.to_string())
     } else {
         path.to_string()
+    }
+}
+
+#[cfg(test)]
+mod ai_complete_tests {
+    use crate::providers::{LlmContent, LlmRole};
+
+    #[test]
+    fn build_ai_request_makes_one_user_text_message_no_tools() {
+        let req = super::build_ai_request("claude-sonnet-4-6", "SYS".into(), "PROMPT".into(), 8192);
+        assert_eq!(req.model, "claude-sonnet-4-6");
+        assert_eq!(req.max_tokens, 8192);
+        assert_eq!(req.system, "SYS");
+        assert_eq!(req.tools.len(), 0);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, LlmRole::User);
+        match &req.messages[0].content {
+            LlmContent::Text(t) => assert_eq!(t, "PROMPT"),
+            _ => panic!("expected Text content"),
+        }
     }
 }

@@ -5,6 +5,7 @@ import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionFileTree } from "./CompanionFileTree";
+import { AiReviewPanel } from "./review/AiReviewPanel";
 import { CompanionRuns } from "./CompanionRuns";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
@@ -48,6 +49,8 @@ interface Props {
   issueTrackerConfigured: boolean;
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
   onModeChange: (next: WorkspaceMode) => void;
+  reviewGitDiff?: string;
+  onJumpToFile?: (file: string, line: number | null) => void;
 }
 
 export function Companion({
@@ -61,6 +64,8 @@ export function Companion({
   issueTrackerConfigured,
   onBacklogTicketContextMenu,
   onModeChange,
+  reviewGitDiff,
+  onJumpToFile,
 }: Props) {
   const { issues } = useIssuesStore();
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
@@ -124,7 +129,18 @@ export function Companion({
             <CompanionTerminals workspaceId={workspaceId} />
           </div>
         )}
-        {mode === "review" && fileTree && <CompanionFileTree {...fileTree} />}
+        {mode === "review" && (
+          <div className="flex min-h-0 flex-1 flex-col">
+            {workspaceId && reviewGitDiff !== undefined && (
+              <AiReviewPanel
+                workspaceId={workspaceId}
+                gitDiff={reviewGitDiff}
+                onJump={onJumpToFile ?? (() => {})}
+              />
+            )}
+            {fileTree && <CompanionFileTree {...fileTree} />}
+          </div>
+        )}
         {mode === "direct" && workspaceId && (
           <CompanionRuns workspaceId={workspaceId} />
         )}

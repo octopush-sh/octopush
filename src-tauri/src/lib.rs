@@ -247,6 +247,8 @@ pub fn run() {
             commands::list_issues_in_epic,
             commands::get_issue_tracker_config,
             commands::save_issue_tracker_config,
+            // AI primitive (G5)
+            commands::ai_complete,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.

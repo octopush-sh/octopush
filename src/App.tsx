@@ -1553,6 +1553,8 @@ function App() {
             issueTrackerConfigured={issueTrackerConfigured}
             onBacklogTicketContextMenu={(issue, x, y) => setBacklogTicketMenu({ issue, x, y })}
             onModeChange={setMode}
+            reviewGitDiff={gitDiff}
+            onJumpToFile={(file) => navigateToFile(file, "diff")}
           />
         </div>
         </div>

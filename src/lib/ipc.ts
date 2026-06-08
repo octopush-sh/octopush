@@ -474,6 +474,13 @@ export const ipc = {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
+
+  // ─── AI primitive (G5) ────────────────────────────────────────
+  aiComplete: (model: string, system: string, prompt: string, maxTokens?: number) =>
+    invoke<{ text: string; inputTokens: number; outputTokens: number; costUsd: number }>(
+      "ai_complete",
+      { model, system, prompt, maxTokens: maxTokens ?? null },
+    ),
 };
 
 /** Tauri event names emitted by the orchestrator. */
