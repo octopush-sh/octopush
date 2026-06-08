@@ -288,6 +288,7 @@ export function ReviewCanvas({
               <button
                 onClick={() => setIgnoreWhitespace(!ignoreWhitespace)}
                 aria-label="Ignore whitespace"
+                title="Hide whitespace-only changes (re-indents, trailing spaces, blank lines)"
                 className={[
                   "flex items-center gap-1 rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass",
                   ignoreWhitespace
