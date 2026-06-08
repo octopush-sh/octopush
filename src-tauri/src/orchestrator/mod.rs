@@ -13,7 +13,8 @@ pub use types::*;
 use crate::db::{Db, RunStageRow};
 use crate::error::{AppError, AppResult};
 use crate::orchestrator::events::EventSink;
-use crate::orchestrator::runner::{AgentRunner, ApiRunner, CliRunnerUnavailable, StageContext};
+use crate::orchestrator::cli_runner::CliRunner;
+use crate::orchestrator::runner::{ApiRunner, AgentRunner, StageContext};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +63,7 @@ impl Orchestrator {
         }
         match substrate {
             AgentSubstrate::Api => Box::new(ApiRunner),
-            AgentSubstrate::Cli => Box::new(CliRunnerUnavailable),
+            AgentSubstrate::Cli => Box::new(CliRunner),
         }
     }
 

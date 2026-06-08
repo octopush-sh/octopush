@@ -157,20 +157,3 @@ impl AgentRunner for ApiRunner {
         }
     }
 }
-
-/// Placeholder for the CLI substrate — implemented in Plan 2 (Phase C).
-pub struct CliRunnerUnavailable;
-
-#[async_trait::async_trait]
-impl AgentRunner for CliRunnerUnavailable {
-    async fn run(
-        &self,
-        _stage: &StageSpec,
-        _input: &StageArtifact,
-        _ctx: &StageContext,
-    ) -> AppResult<StageOutcome> {
-        Err(AppError::Other(
-            "CLI substrate is not available yet (coming in a later phase)".into(),
-        ))
-    }
-}
