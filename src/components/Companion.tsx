@@ -5,6 +5,7 @@ import { CompanionContext } from "./CompanionContext";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionFileTree } from "./CompanionFileTree";
+import { CompanionRuns } from "./CompanionRuns";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
@@ -124,6 +125,9 @@ export function Companion({
           </div>
         )}
         {mode === "review" && fileTree && <CompanionFileTree {...fileTree} />}
+        {mode === "direct" && workspaceId && (
+          <CompanionRuns workspaceId={workspaceId} />
+        )}
       </div>
 
       {elsewhereOpen && (
