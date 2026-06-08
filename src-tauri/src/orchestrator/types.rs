@@ -135,6 +135,7 @@ pub struct StageSpec {
 
 /// A single tool invocation, captured for the run-event log.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCallLog {
     pub name: String,
     pub input: serde_json::Value,
