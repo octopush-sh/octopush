@@ -1713,3 +1713,82 @@ mod orchestrator_types_tests {
         assert_eq!(AgentSubstrate::from_db("cli"), Some(AgentSubstrate::Cli));
     }
 }
+
+#[cfg(test)]
+mod agentic_loop_tests {
+    use crate::orchestrator::agentic::run_agentic_loop;
+    use crate::providers::{
+        LlmProvider, LlmRequest, LlmResponse, LlmStopReason, LlmToolUse,
+    };
+    use parking_lot::Mutex;
+
+    /// A provider that returns a scripted sequence of responses.
+    struct ScriptedProvider {
+        responses: Mutex<Vec<LlmResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn complete(
+            &self,
+            _api_base: &str,
+            _api_key: Option<&str>,
+            _req: &LlmRequest,
+            _client: &reqwest::Client,
+        ) -> crate::error::AppResult<LlmResponse> {
+            Ok(self.responses.lock().remove(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_tool_then_returns_final_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 1st response: call list_files. 2nd: final text, end turn.
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    text: String::new(),
+                    tool_uses: vec![LlmToolUse {
+                        id: "t1".into(),
+                        name: "list_files".into(),
+                        input: serde_json::json!({ "path": "." }),
+                    }],
+                    stop_reason: LlmStopReason::ToolUse,
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                LlmResponse {
+                    text: "All done.".into(),
+                    tool_uses: vec![],
+                    stop_reason: LlmStopReason::EndTurn,
+                    input_tokens: 50,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+            ]),
+        };
+        let client = reqwest::Client::new();
+        let result = run_agentic_loop(
+            &provider,
+            "http://unused",
+            None,
+            &client,
+            "test-model",
+            "you are a test",
+            "do something",
+            tmp.path(),
+            25,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "All done.");
+        assert_eq!(result.input_tokens, 150);
+        assert_eq!(result.output_tokens, 15);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "list_files");
+    }
+}
