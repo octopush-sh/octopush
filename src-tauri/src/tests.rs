@@ -1894,7 +1894,7 @@ mod pipeline_crud_tests {
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 3);
+        assert_eq!(pipelines.len(), 4);
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();
@@ -2276,5 +2276,29 @@ mod cli_args_tests {
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(args.contains(&"bypassPermissions".to_string()));
         assert!(args.contains(&"--max-turns".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod cli_template_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn seeds_a_cli_pipeline() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let p = db.list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Claude Code build").expect("CLI template seeded");
+        let stages = db.get_pipeline_stages(&p.id).unwrap();
+        let implement = stages.iter().find(|s| s.role == "implement").unwrap();
+        assert_eq!(implement.substrate, "cli");
+        assert!(implement.agent_model.contains("claude") || implement.agent_model == "sonnet");
+        assert!(implement.checkpoint);
     }
 }
