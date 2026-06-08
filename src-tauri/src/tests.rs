@@ -1877,3 +1877,34 @@ mod direct_schema_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pipeline_crud_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn seed_is_idempotent_and_lists_three() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
+        let pipelines = db.list_pipelines().unwrap();
+        assert_eq!(pipelines.len(), 3);
+
+        let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
+        let stages = db.get_pipeline_stages(&feature.id).unwrap();
+        assert_eq!(stages.len(), 5);
+        assert_eq!(stages[0].position, 0);
+        assert_eq!(stages[0].role, "plan");
+        // implement/code_review/test default to checkpoint=on, plan/plan_review off.
+        let implement = stages.iter().find(|s| s.role == "implement").unwrap();
+        assert!(implement.checkpoint);
+        let plan = stages.iter().find(|s| s.role == "plan").unwrap();
+        assert!(!plan.checkpoint);
+    }
+}

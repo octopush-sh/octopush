@@ -6,6 +6,7 @@ use crate::token_engine::{CostEntry, TokenEvent, TokenReport, TrendPoint};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Idempotently add a SQLite column. SQLite has no `ADD COLUMN IF NOT EXISTS`,
 /// so we run the ALTER and ignore the specific "duplicate column name" error.
@@ -1338,6 +1339,130 @@ impl Db {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ─── Pipelines ────────────────────────────────────────────────
+
+    pub fn list_pipelines(&self) -> AppResult<Vec<PipelineRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, is_builtin, created_at FROM pipelines ORDER BY is_builtin DESC, name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PipelineRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                is_builtin: r.get::<_, i64>(3)? != 0,
+                created_at: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_pipeline_stages(&self, pipeline_id: &str) -> AppResult<Vec<PipelineStageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint
+             FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![pipeline_id], |r| {
+            Ok(PipelineStageRow {
+                id: r.get(0)?,
+                pipeline_id: r.get(1)?,
+                position: r.get(2)?,
+                role: r.get(3)?,
+                agent_model: r.get(4)?,
+                substrate: r.get(5)?,
+                checkpoint: r.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn insert_pipeline(
+        &self,
+        name: &str,
+        description: &str,
+        is_builtin: bool,
+    ) -> AppResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO pipelines (id, name, description, is_builtin, created_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![id, name, description, is_builtin as i64, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn insert_pipeline_stage(
+        &self,
+        pipeline_id: &str,
+        position: i64,
+        role: &str,
+        agent_model: &str,
+        substrate: &str,
+        checkpoint: bool,
+    ) -> AppResult<String> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO pipeline_stages (id, pipeline_id, position, role, agent_model, substrate, checkpoint)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id, pipeline_id, position, role, agent_model, substrate, checkpoint as i64],
+        )?;
+        Ok(id)
+    }
+
+    /// Insert the three curated pipelines if they are not already present.
+    /// Idempotent: keyed on the builtin name.
+    pub fn seed_builtin_pipelines(&self) -> AppResult<()> {
+        // (name, description, [(role, model, substrate, checkpoint)])
+        let defs: &[(&str, &str, &[(&str, &str, &str, bool)])] = &[
+            (
+                "Feature Factory",
+                "Full build: plan, review, implement, review, test.",
+                &[
+                    ("plan", "claude-haiku-4-5", "api", false),
+                    ("plan_review", "claude-haiku-4-5", "api", false),
+                    ("implement", "claude-sonnet-4-6", "api", true),
+                    ("code_review", "claude-haiku-4-5", "api", true),
+                    ("test", "claude-haiku-4-5", "api", true),
+                ],
+            ),
+            (
+                "Bugfix relay",
+                "Reproduce, fix, verify. Lean and fast.",
+                &[
+                    ("repro", "claude-haiku-4-5", "api", false),
+                    ("fix", "claude-sonnet-4-6", "api", true),
+                    ("verify", "claude-haiku-4-5", "api", true),
+                ],
+            ),
+            (
+                "Plan & review",
+                "Thinking only — no code is written.",
+                &[
+                    ("plan", "claude-sonnet-4-6", "api", false),
+                    ("critique", "claude-haiku-4-5", "api", false),
+                    ("refine", "claude-sonnet-4-6", "api", true),
+                ],
+            ),
+        ];
+
+        for (name, desc, stages) in defs {
+            let exists: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pipelines WHERE name = ?1 AND is_builtin = 1",
+                params![name],
+                |r| r.get(0),
+            )?;
+            if exists > 0 {
+                continue;
+            }
+            let pid = self.insert_pipeline(name, desc, true)?;
+            for (i, (role, model, substrate, checkpoint)) in stages.iter().enumerate() {
+                self.insert_pipeline_stage(&pid, i as i64, role, model, substrate, *checkpoint)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1412,6 +1537,28 @@ pub struct UsageBreakdown {
     pub cloud_tokens: i64,
     pub local_tokens: i64,
     pub estimated_local_savings_usd: f64,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineRow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub is_builtin: bool,
+    pub created_at: String,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineStageRow {
+    pub id: String,
+    pub pipeline_id: String,
+    pub position: i64,
+    pub role: String,
+    pub agent_model: String,
+    pub substrate: String,
+    pub checkpoint: bool,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {
