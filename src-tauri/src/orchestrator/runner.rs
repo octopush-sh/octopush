@@ -1,7 +1,7 @@
 //! The `AgentRunner` abstraction and its API-substrate implementation.
 
 use crate::chat_engine::resolve_provider;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::orchestrator::agentic::run_agentic_loop;
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use std::path::PathBuf;
