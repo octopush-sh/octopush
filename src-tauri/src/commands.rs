@@ -2,16 +2,19 @@
 
 use crate::context_guard::ContextGuard;
 use crate::error::{AppError, AppResult};
+use crate::orchestrator::types::CheckpointAction;
+use crate::orchestrator::Orchestrator;
 use crate::pty_manager::SpawnOptions;
 use crate::session::{CreateSessionArgs, Session, SessionStatus};
 use crate::state::AppState;
 use crate::token_engine::{BudgetStatus, TokenEvent, TokenReport};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 // ─── Session commands ─────────────────────────────────────────────
 
@@ -794,6 +797,139 @@ pub async fn list_chat_messages(
     workspace_id: String,
 ) -> AppResult<Vec<crate::db::ChatMessageRow>> {
     state.db.lock().list_chat_messages(&workspace_id)
+}
+
+// ─── Direct-mode orchestration commands ──────────────────────────
+
+#[tauri::command]
+pub async fn list_pipelines(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<serde_json::Value>> {
+    let db = state.db.lock();
+    let pipelines = db.list_pipelines()?;
+    let mut out = Vec::new();
+    for p in pipelines {
+        let stages = db.get_pipeline_stages(&p.id)?;
+        out.push(serde_json::json!({ "pipeline": p, "stages": stages }));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn get_pipeline(
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<serde_json::Value> {
+    let db = state.db.lock();
+    let stages = db.get_pipeline_stages(&pipeline_id)?;
+    Ok(serde_json::json!({ "stages": stages }))
+}
+
+#[tauri::command]
+pub async fn create_run(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    pipeline_id: String,
+    task: String,
+    reference_model: Option<String>,
+    linked_issue_key: Option<String>,
+) -> AppResult<String> {
+    state.db.lock().create_run(
+        &workspace_id,
+        &pipeline_id,
+        &task,
+        reference_model.as_deref(),
+        linked_issue_key.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn start_run(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+) -> AppResult<()> {
+    Arc::clone(&*orch).start_run(run_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> AppResult<serde_json::Value> {
+    let db = state.db.lock();
+    let run = db.get_run(&run_id)?;
+    let stages = db.list_run_stages(&run_id)?;
+    Ok(serde_json::json!({ "run": run, "stages": stages }))
+}
+
+#[tauri::command]
+pub async fn list_runs(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Vec<crate::db::RunRow>> {
+    state.db.lock().list_runs(&workspace_id)
+}
+
+#[tauri::command]
+pub async fn resolve_checkpoint(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+    action: String,
+    feedback: Option<String>,
+    model_override: Option<String>,
+) -> AppResult<()> {
+    let action = match action.as_str() {
+        "approve" => CheckpointAction::Approve,
+        "edit" => CheckpointAction::Edit,
+        "abort" => CheckpointAction::Abort,
+        "reject" => CheckpointAction::Reject { feedback, model_override },
+        other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
+    };
+    // Drive in the background; the frontend reacts to run:// events.
+    Arc::clone(&*orch).spawn_resolve_checkpoint(run_id, action);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn abort_run(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+) -> AppResult<()> {
+    Arc::clone(&*orch).abort_run(&run_id).await
+}
+
+#[tauri::command]
+pub async fn estimate_run_cost(
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<serde_json::Value> {
+    // Heuristic per-role token estimate (refined later from history).
+    fn est_tokens(role: &str) -> (u64, u64) {
+        match role {
+            "implement" | "fix" => (12_000, 6_000),
+            "plan" | "refine" => (4_000, 1_500),
+            "code_review" | "plan_review" | "critique" | "verify" | "repro" => (8_000, 1_000),
+            "test" => (6_000, 2_000),
+            _ => (4_000, 1_000),
+        }
+    }
+    let db = state.db.lock();
+    let stages = db.get_pipeline_stages(&pipeline_id)?;
+    let reference = crate::orchestrator::cost::pick_reference_model();
+    let mut cost = 0.0;
+    let mut baseline = 0.0;
+    for s in &stages {
+        let (i, o) = est_tokens(&s.role);
+        cost += crate::orchestrator::cost::stage_cost(&s.agent_model, i, o, 0, 0);
+        if let Some(ref_model) = &reference {
+            baseline += crate::orchestrator::cost::baseline_cost(ref_model, i, o);
+        }
+    }
+    if reference.is_none() || baseline < cost {
+        baseline = cost;
+    }
+    Ok(serde_json::json!({ "estimateUsd": cost, "baselineUsd": baseline }))
 }
 
 // ─── File operations ──────────────────────────────────────────────

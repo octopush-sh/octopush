@@ -153,7 +153,7 @@ fn tool_definitions() -> serde_json::Value {
 
 // ─── Tool execution ───────────────────────────────────────────────
 
-fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json::Value) -> String {
+pub(crate) fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json::Value) -> String {
     match name {
         "run_command" => {
             let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -248,7 +248,7 @@ fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json::Value) ->
 // ─── Provider helpers ─────────────────────────────────────────────
 
 /// Build the static tool list as normalized `LlmTool[]`.
-fn build_llm_tools() -> Vec<LlmTool> {
+pub(crate) fn build_llm_tools() -> Vec<LlmTool> {
     let defs = tool_definitions();
     let arr = defs.as_array().cloned().unwrap_or_default();
     arr.into_iter().map(|t| LlmTool {
@@ -260,7 +260,7 @@ fn build_llm_tools() -> Vec<LlmTool> {
 
 /// Resolve which provider implementation handles this model.
 /// Returns `(provider_impl, api_base, optional_api_key)`.
-fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, String, Option<String>)> {
+pub(crate) fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, String, Option<String>)> {
     let router = ProviderRouter::load()?;
     let (provider_cfg, _model_info) = router.find_model(model)
         .ok_or_else(|| AppError::Other(format!(

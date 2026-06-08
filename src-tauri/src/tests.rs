@@ -1665,3 +1665,545 @@ mod pr_state_tests {
         assert_eq!(out[1].branch, "feat/b");
     }
 }
+
+#[cfg(test)]
+mod orchestrator_types_tests {
+    use crate::orchestrator::types::*;
+
+    #[test]
+    fn status_strings_round_trip() {
+        for s in [
+            StageStatus::Pending,
+            StageStatus::Running,
+            StageStatus::AwaitingCheckpoint,
+            StageStatus::Done,
+            StageStatus::Failed,
+        ] {
+            assert_eq!(StageStatus::from_db(s.as_db()), Some(s.clone()));
+        }
+        for s in [
+            RunStatus::Draft,
+            RunStatus::Running,
+            RunStatus::Paused,
+            RunStatus::Completed,
+            RunStatus::Aborted,
+            RunStatus::Failed,
+        ] {
+            assert_eq!(RunStatus::from_db(s.as_db()), Some(s.clone()));
+        }
+        assert_eq!(StageStatus::from_db("nonsense"), None);
+    }
+
+    #[test]
+    fn artifact_serializes_camel_case() {
+        let a = StageArtifact {
+            kind: ArtifactKind::Plan,
+            text: "do the thing".into(),
+            payload: None,
+            refs_worktree: false,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"kind\":\"plan\""));
+        assert!(json.contains("\"refsWorktree\":false"));
+    }
+
+    #[test]
+    fn substrate_strings() {
+        assert_eq!(AgentSubstrate::Api.as_db(), "api");
+        assert_eq!(AgentSubstrate::from_db("cli"), Some(AgentSubstrate::Cli));
+    }
+}
+
+#[cfg(test)]
+mod agentic_loop_tests {
+    use crate::orchestrator::agentic::run_agentic_loop;
+    use crate::providers::{
+        LlmProvider, LlmRequest, LlmResponse, LlmStopReason, LlmToolUse,
+    };
+    use parking_lot::Mutex;
+
+    /// A provider that returns a scripted sequence of responses.
+    struct ScriptedProvider {
+        responses: Mutex<Vec<LlmResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn complete(
+            &self,
+            _api_base: &str,
+            _api_key: Option<&str>,
+            _req: &LlmRequest,
+            _client: &reqwest::Client,
+        ) -> crate::error::AppResult<LlmResponse> {
+            Ok(self.responses.lock().remove(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_tool_then_returns_final_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 1st response: call list_files. 2nd: final text, end turn.
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    text: String::new(),
+                    tool_uses: vec![LlmToolUse {
+                        id: "t1".into(),
+                        name: "list_files".into(),
+                        input: serde_json::json!({ "path": "." }),
+                    }],
+                    stop_reason: LlmStopReason::ToolUse,
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                LlmResponse {
+                    text: "All done.".into(),
+                    tool_uses: vec![],
+                    stop_reason: LlmStopReason::EndTurn,
+                    input_tokens: 50,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+            ]),
+        };
+        let client = reqwest::Client::new();
+        let result = run_agentic_loop(
+            &provider,
+            "http://unused",
+            None,
+            &client,
+            "test-model",
+            "you are a test",
+            "do something",
+            tmp.path(),
+            25,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "All done.");
+        assert_eq!(result.input_tokens, 150);
+        assert_eq!(result.output_tokens, 15);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "list_files");
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use crate::orchestrator::cost::{baseline_cost, stage_cost};
+
+    #[test]
+    fn stage_cost_matches_token_engine() {
+        // claude-opus-4-6: $15/M input, $75/M output.
+        let c = stage_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
+        assert!((c - (15.0 + 7.5)).abs() < 0.01);
+    }
+
+    #[test]
+    fn baseline_uses_reference_prices_on_actual_tokens() {
+        // Same tokens, premium reference model → baseline >= actual for a cheaper model.
+        let actual = stage_cost("claude-haiku-4-5", 1_000_000, 100_000, 0, 0);
+        let base = baseline_cost("claude-opus-4-6", 1_000_000, 100_000);
+        assert!(base > actual);
+    }
+}
+
+#[cfg(test)]
+mod runner_helpers_tests {
+    use crate::orchestrator::runner::{artifact_kind_for, system_prompt_for, user_input_for};
+    use crate::orchestrator::types::{ArtifactKind, StageArtifact};
+
+    #[test]
+    fn role_maps_to_artifact_kind() {
+        assert_eq!(artifact_kind_for("plan"), ArtifactKind::Plan);
+        assert_eq!(artifact_kind_for("plan_review"), ArtifactKind::Review);
+        assert_eq!(artifact_kind_for("code_review"), ArtifactKind::Review);
+        assert_eq!(artifact_kind_for("implement"), ArtifactKind::Diff);
+        assert_eq!(artifact_kind_for("test"), ArtifactKind::Tests);
+        assert_eq!(artifact_kind_for("anything-else"), ArtifactKind::Note);
+    }
+
+    #[test]
+    fn system_prompt_is_role_specific() {
+        assert!(system_prompt_for("plan").to_lowercase().contains("plan"));
+        assert!(system_prompt_for("implement").to_lowercase().contains("implement"));
+    }
+
+    #[test]
+    fn user_input_includes_task_and_prior_artifact() {
+        let prior = StageArtifact {
+            kind: ArtifactKind::Plan,
+            text: "Step 1: do X".into(),
+            payload: None,
+            refs_worktree: false,
+        };
+        let input = user_input_for("implement", "Build feature Y", &prior, None);
+        assert!(input.contains("Build feature Y"));
+        assert!(input.contains("Step 1: do X"));
+
+        let with_fb = user_input_for("implement", "Build Y", &prior, Some("be more careful"));
+        assert!(with_fb.contains("be more careful"));
+    }
+}
+
+#[cfg(test)]
+mod direct_schema_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn new_tables_exist() {
+        let db = test_db();
+        let conn = db.conn_ref();
+        for table in ["pipelines", "pipeline_stages", "runs", "run_stages", "run_events"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table {table} should exist");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_crud_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn seed_is_idempotent_and_lists_three() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
+        let pipelines = db.list_pipelines().unwrap();
+        assert_eq!(pipelines.len(), 3);
+
+        let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
+        let stages = db.get_pipeline_stages(&feature.id).unwrap();
+        assert_eq!(stages.len(), 5);
+        assert_eq!(stages[0].position, 0);
+        assert_eq!(stages[0].role, "plan");
+        // implement/code_review/test default to checkpoint=on, plan/plan_review off.
+        let implement = stages.iter().find(|s| s.role == "implement").unwrap();
+        assert!(implement.checkpoint);
+        let plan = stages.iter().find(|s| s.role == "plan").unwrap();
+        assert!(!plan.checkpoint);
+    }
+}
+
+#[cfg(test)]
+mod run_crud_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    // Minimal project+workspace so the runs FK is satisfied.
+    fn seed_workspace(db: &Db) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref()
+            .execute(
+                "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+                [&now],
+            )
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active)
+                 VALUES ('w1','p1','W','main',?1,?1)",
+                [&now],
+            )
+            .unwrap();
+        "w1".to_string()
+    }
+
+    #[test]
+    fn create_run_copies_stages_and_lists() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        db.seed_builtin_pipelines().unwrap();
+        let pipelines = db.list_pipelines().unwrap();
+        let ff = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
+
+        let run_id = db
+            .create_run(&ws, &ff.id, "build the thing", Some("claude-opus-4-6"), None)
+            .unwrap();
+
+        let run = db.get_run(&run_id).unwrap().unwrap();
+        assert_eq!(run.status, "draft");
+        assert_eq!(run.task, "build the thing");
+
+        let stages = db.list_run_stages(&run_id).unwrap();
+        assert_eq!(stages.len(), 5);
+        assert_eq!(stages[0].status, "pending");
+
+        let runs = db.list_runs(&ws).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn complete_stage_persists_outcome_and_status() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        db.seed_builtin_pipelines().unwrap();
+        let ff = db.list_pipelines().unwrap().into_iter().find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.create_run(&ws, &ff.id, "t", None, None).unwrap();
+        let stages = db.list_run_stages(&run_id).unwrap();
+        let first = &stages[0];
+
+        db.complete_run_stage(&first.id, "done", 100, 20, 0.5, Some("{\"kind\":\"plan\",\"text\":\"x\"}"))
+            .unwrap();
+        let reloaded = db.list_run_stages(&run_id).unwrap();
+        assert_eq!(reloaded[0].status, "done");
+        assert_eq!(reloaded[0].input_tokens, 100);
+        assert!((reloaded[0].cost_usd - 0.5).abs() < 1e-9);
+
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        assert_eq!(db.get_run(&run_id).unwrap().unwrap().status, "completed");
+    }
+
+    #[test]
+    fn create_run_rejects_unknown_pipeline() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let err = db.create_run(&ws, "no-such-pipeline", "t", None, None);
+        assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    struct CollectingSink {
+        events: Mutex<Vec<String>>,
+    }
+    impl EventSink for CollectingSink {
+        fn emit(&self, event: &str, _payload: Value) {
+            self.events.lock().push(event.to_string());
+        }
+    }
+
+    /// A runner that always succeeds with a canned artifact.
+    struct MockRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for MockRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageArtifact,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cost_usd: 0.01,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+            })
+        }
+    }
+
+    fn db_with_workspace() -> (Arc<Mutex<Db>>, String) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        (Arc::new(Mutex::new(db)), "w1".to_string())
+    }
+
+    #[tokio::test]
+    async fn run_pauses_at_first_checkpoint_then_completes() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "build it", None, None).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(MockRunner),
+        );
+
+        // Drive to the first pause. Feature Factory: plan(no cp), plan_review(no cp),
+        // implement(cp) -> should pause after implement.
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done");           // plan
+        assert_eq!(stages[1].status, "done");           // plan_review
+        assert_eq!(stages[2].status, "awaiting_checkpoint"); // implement
+        assert_eq!(stages[3].status, "pending");        // code_review
+
+        // Approve the implement checkpoint -> runs code_review, pauses there (cp on).
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Approve)
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[2].status, "done");
+        assert_eq!(stages[3].status, "awaiting_checkpoint"); // code_review
+
+        // Approve code_review -> test pauses (cp on).
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        // Approve test (last stage) -> completed.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
+
+        // Cost accumulated across 5 stages * 0.01.
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!((run.cost_usd - 0.05).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn reject_reruns_same_stage() {
+        let (db, ws) = db_with_workspace();
+        let pr = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Plan & review").unwrap();
+        let run_id = db.lock().create_run(&ws, &pr.id, "think", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // plan(no cp), critique(no cp), refine(cp) -> pause at refine.
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        // Reject refine with feedback -> it returns to pending, then re-runs and pauses again.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
+            feedback: Some("tighten it".into()),
+            model_override: None,
+        }).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[2].role, "refine");
+        assert_eq!(stages[2].status, "awaiting_checkpoint"); // re-ran, awaiting again
+        assert_eq!(stages[2].feedback.as_deref(), Some("tighten it"));
+    }
+
+    #[tokio::test]
+    async fn abort_stops_the_run() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        orch.run_to_pause(&run_id).await.unwrap();
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Abort).await.unwrap();
+        assert_eq!(status, RunStatus::Aborted);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "aborted");
+    }
+
+    /// A runner that always returns a hard Err (simulates CliRunnerUnavailable / unresolved model).
+    struct FailingRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for FailingRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageArtifact,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Err(crate::error::AppError::Other("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_runner_error_converges_to_failed_and_paused() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(FailingRunner));
+
+        // The first stage's runner errors hard. The run must NOT bubble an Err; it must
+        // pause with the stage marked failed (recoverable), never stuck in "running".
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "failed");
+        assert!(stages[0].error.is_some());
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+    }
+
+    #[tokio::test]
+    async fn redriving_a_paused_run_keeps_it_paused() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // First drive: pauses at the implement checkpoint, run status = paused.
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+
+        // Re-drive without resolving the checkpoint (simulates start_run on a paused run).
+        // It must return Paused AND leave the persisted run status as "paused", not "running".
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+    }
+
+    #[tokio::test]
+    async fn start_run_on_completed_run_is_noop() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter().find(|p| p.name == "Plan & review").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // Drive to completion (Plan & review: plan,critique no-cp; refine cp -> approve).
+        orch.run_to_pause(&run_id).await.unwrap();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
+        // Re-driving a completed run must be a no-op (still completed, no re-run).
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+    }
+}

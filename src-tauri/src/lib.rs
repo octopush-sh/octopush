@@ -23,6 +23,7 @@ pub mod token_engine;
 pub mod perf;
 pub mod issue_tracker;
 pub mod github;
+pub mod orchestrator;
 
 #[cfg(test)]
 mod tests;
@@ -166,6 +167,16 @@ pub fn run() {
             // Chat
             commands::send_chat_message,
             commands::list_chat_messages,
+            // Direct mode (orchestration)
+            commands::list_pipelines,
+            commands::get_pipeline,
+            commands::create_run,
+            commands::start_run,
+            commands::get_run,
+            commands::list_runs,
+            commands::resolve_checkpoint,
+            commands::abort_run,
+            commands::estimate_run_cost,
             // File operations
             commands::open_file_in_system,
             commands::reveal_in_finder,
@@ -240,6 +251,23 @@ pub fn run() {
             // Restore sessions that were active when the app last closed.
             let state = app.state::<AppState>();
             restore_active_sessions(app.handle().clone(), &state);
+
+            // Direct-mode orchestrator: seed builtin pipelines + register engine.
+            {
+                let st = app.state::<AppState>();
+                if let Err(e) = st.db.lock().seed_builtin_pipelines() {
+                    tracing::error!(error = %e, "failed to seed builtin pipelines");
+                }
+                let sink = std::sync::Arc::new(orchestrator::events::TauriEventSink {
+                    app: app.handle().clone(),
+                });
+                let orch = std::sync::Arc::new(orchestrator::Orchestrator::new(
+                    std::sync::Arc::clone(&st.db),
+                    sink,
+                ));
+                app.manage(orch);
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

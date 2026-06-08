@@ -1,5 +1,70 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopus core.
 
+// ─── Direct mode (orchestration) — types ──────────────────────────────────
+
+export type AgentSubstrate = "api" | "cli";
+export type RunStatus =
+  | "draft" | "running" | "paused" | "completed" | "aborted" | "failed";
+export type RunStageStatus =
+  | "pending" | "running" | "awaiting_checkpoint" | "done" | "failed";
+
+export interface PipelineStage {
+  id: string;
+  pipelineId: string;
+  position: number;
+  role: string;
+  agentModel: string;
+  substrate: AgentSubstrate;
+  checkpoint: boolean;
+}
+export interface Pipeline {
+  id: string;
+  name: string;
+  description: string;
+  isBuiltin: boolean;
+  createdAt: string;
+}
+export interface PipelineWithStages {
+  pipeline: Pipeline;
+  stages: PipelineStage[];
+}
+export interface Run {
+  id: string;
+  workspaceId: string;
+  pipelineId: string;
+  task: string;
+  status: RunStatus;
+  costUsd: number;
+  baselineUsd: number;
+  referenceModel: string | null;
+  linkedIssueKey: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+}
+export interface RunStage {
+  id: string;
+  runId: string;
+  position: number;
+  role: string;
+  agentModel: string;
+  substrate: AgentSubstrate;
+  checkpoint: boolean;
+  status: RunStageStatus;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  artifact: string | null;
+  feedback: string | null;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+export interface RunDetail {
+  run: Run | null;
+  stages: RunStage[];
+}
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort";
+
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
@@ -353,4 +418,63 @@ export const ipc = {
     invoke<void>("update_workspace_link", { workspaceId, linkedIssueKey }),
   updateProjectJiraKey: (projectId: string, jiraProjectKey: string | null) =>
     invoke<void>("update_project_jira_key", { projectId, jiraProjectKey }),
+
+  // ─── Direct mode (orchestration) ──────────────────────────────────
+  listPipelines: () =>
+    invoke<PipelineWithStages[]>("list_pipelines"),
+
+  createRun: (
+    workspaceId: string,
+    pipelineId: string,
+    task: string,
+    referenceModel?: string,
+    linkedIssueKey?: string,
+  ) =>
+    invoke<string>("create_run", {
+      workspaceId,
+      pipelineId,
+      task,
+      referenceModel: referenceModel ?? null,
+      linkedIssueKey: linkedIssueKey ?? null,
+    }),
+
+  startRun: (runId: string) =>
+    invoke<void>("start_run", { runId }),
+
+  getRun: (runId: string) =>
+    invoke<RunDetail>("get_run", { runId }),
+
+  listRuns: (workspaceId: string) =>
+    invoke<Run[]>("list_runs", { workspaceId }),
+
+  resolveCheckpoint: (
+    runId: string,
+    action: CheckpointActionName,
+    feedback?: string,
+    modelOverride?: string,
+  ) =>
+    invoke<void>("resolve_checkpoint", {
+      runId,
+      action,
+      feedback: feedback ?? null,
+      modelOverride: modelOverride ?? null,
+    }),
+
+  abortRun: (runId: string) =>
+    invoke<void>("abort_run", { runId }),
+
+  estimateRunCost: (pipelineId: string) =>
+    invoke<{ estimateUsd: number; baselineUsd: number }>("estimate_run_cost", {
+      pipelineId,
+    }),
 };
+
+/** Tauri event names emitted by the orchestrator. */
+export const RUN_EVENTS = {
+  stageUpdate: "run://stage-update",
+  cost: "run://cost",
+  checkpoint: "run://checkpoint",
+  error: "run://error",
+  /** Reserved/planned — not yet emitted by the backend (see spec §5.4). */
+  log: "run://log",
+} as const;
