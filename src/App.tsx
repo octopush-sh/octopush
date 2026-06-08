@@ -689,6 +689,13 @@ function App() {
         return;
       }
 
+      // ⌘⇧D → switch to Direct mode
+      if (mod && e.shiftKey && (e.key === "D" || e.key === "d")) {
+        e.preventDefault();
+        setMode("direct");
+        return;
+      }
+
       // ⌘N → new workspace
       if (mod && !e.shiftKey && e.key === "n") {
         e.preventDefault();

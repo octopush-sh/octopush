@@ -1,23 +1,17 @@
-// Workspace mode — what the canvas is showing right now.
-// Modes replace the previous tab system. Only one mode is active per workspace.
+export type WorkspaceMode = "talk" | "run" | "review" | "direct";
 
-export type WorkspaceMode = "talk" | "run" | "review";
-
-// Visual rendering order in the ModeSwitcher. RUN sits leftmost because it's
-// the most-used mode (terminals + companion backlog) — TALK and REVIEW take
-// the inner positions. Keyboard shortcuts (MODE_SHORTCUTS) stay mapped to the
-// modes by intent, not by position.
-export const MODES: WorkspaceMode[] = ["run", "talk", "review"];
+export const MODES: WorkspaceMode[] = ["run", "talk", "review", "direct"];
 
 export const MODE_LABELS: Record<WorkspaceMode, string> = {
   talk: "Talk",
   run: "Run",
   review: "Review",
+  direct: "Direct",
 };
 
-/** Keyboard shortcut letter shown in tooltips. Mapping: ⌘⇧1/2/3 → talk/run/review. */
 export const MODE_SHORTCUTS: Record<WorkspaceMode, string> = {
   talk: "⌘⇧1",
   run: "⌘⇧2",
   review: "⌘⇧3",
+  direct: "⌘⇧D",
 };
