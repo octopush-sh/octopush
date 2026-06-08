@@ -479,7 +479,7 @@ export const ipc = {
   aiComplete: (model: string, system: string, prompt: string, maxTokens?: number) =>
     invoke<{ text: string; inputTokens: number; outputTokens: number; costUsd: number }>(
       "ai_complete",
-      { model, system, prompt, maxTokens },
+      { model, system, prompt, maxTokens: maxTokens ?? null },
     ),
 };
 

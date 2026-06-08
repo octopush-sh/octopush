@@ -50,6 +50,15 @@ describe("parseAiReview", () => {
     const r = parseAiReview("noise } " + obj + " more {");
     expect(r.summary).toBe("uses a map {k:v} literal");
   });
+  it("parses fenced JSON whose string values contain ``` fences", () => {
+    const tricky = JSON.stringify({
+      summary: "s",
+      findings: [{ severity: "low", category: "style", title: "t", detail: "use ```json fences```", file: null, line: null }],
+    });
+    const r = parseAiReview("```json\n" + tricky + "\n```");
+    expect(r.findings).toHaveLength(1);
+    expect(r.findings[0].detail).toBe("use ```json fences```");
+  });
 });
 
 describe("buildReviewPrompt", () => {

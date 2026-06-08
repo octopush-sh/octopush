@@ -10,7 +10,7 @@ const okJson = JSON.stringify({ summary: "s", findings: [{ severity: "high", cat
 
 beforeEach(() => {
   localStorage.clear();
-  useAiReview.setState({ models: {}, reviews: {} });
+  useAiReview.setState({ models: {}, reviews: {}, runGen: {} });
   (ipc.aiComplete as any).mockReset();
 });
 
@@ -42,5 +42,20 @@ describe("aiReviewStore", () => {
   });
   it("diffHash changes with the diff (freshness)", () => {
     expect(diffHash("a")).not.toBe(diffHash("b"));
+  });
+  it("a stale run does not overwrite a newer run's result", async () => {
+    const stale = JSON.stringify({ summary: "stale", findings: [] });
+    const fresh = JSON.stringify({ summary: "fresh", findings: [] });
+    let releaseStale!: (v: any) => void;
+    const stalePromise = new Promise((res) => { releaseStale = res; });
+    (ipc.aiComplete as any)
+      .mockReturnValueOnce(stalePromise)                                   // first (stale) run — held open
+      .mockResolvedValueOnce({ text: fresh, inputTokens: 1, outputTokens: 1, costUsd: 0 }); // second (fresh) run
+    const p1 = useAiReview.getState().run("w1", "DIFF_A"); // gen 1, pending
+    await useAiReview.getState().run("w1", "DIFF_B");      // gen 2, resolves and writes "fresh"
+    expect(useAiReview.getState().reviewFor("w1").result?.summary).toBe("fresh");
+    releaseStale({ text: stale, inputTokens: 1, outputTokens: 1, costUsd: 0 }); // stale resolves last
+    await p1;
+    expect(useAiReview.getState().reviewFor("w1").result?.summary).toBe("fresh"); // not overwritten
   });
 });

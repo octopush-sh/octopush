@@ -11,9 +11,8 @@ export interface WsReview {
   result: AiReviewResult | null;
   diffHash: string | null;
   error: string | null;
-  rawText: string | null;
 }
-const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null, rawText: null };
+const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null };
 
 /** Stable FNV-1a hash of the diff string — used to detect "diff changed". */
 export function diffHash(s: string): string {
@@ -26,8 +25,9 @@ export function diffHash(s: string): string {
 }
 
 interface State {
-  models: Record<string, string>;     // persisted (per workspace)
-  reviews: Record<string, WsReview>;  // ephemeral
+  models: Record<string, string>;       // persisted (per workspace)
+  reviews: Record<string, WsReview>;    // ephemeral
+  runGen: Record<string, number>;       // ephemeral — per-ws run generation
   modelFor: (ws: string) => string;
   reviewFor: (ws: string) => WsReview;
   setModel: (ws: string, model: string) => void;
@@ -40,6 +40,7 @@ export const useAiReview = create<State>()(
     (set, get) => ({
       models: {},
       reviews: {},
+      runGen: {},
       modelFor: (ws) => get().models[ws] ?? DEFAULT_MODEL,
       reviewFor: (ws) => get().reviews[ws] ?? EMPTY,
       setModel: (ws, model) => set((s) => ({ models: { ...s.models, [ws]: model } })),
@@ -47,16 +48,22 @@ export const useAiReview = create<State>()(
         set((s) => ({ reviews: { ...s.reviews, [ws]: { ...(s.reviews[ws] ?? EMPTY), error: null } } })),
       run: async (ws, gitDiff) => {
         const model = get().modelFor(ws);
-        set((s) => ({ reviews: { ...s.reviews, [ws]: { ...EMPTY, status: "running" } } }));
+        const gen = (get().runGen[ws] ?? 0) + 1;
+        set((s) => ({
+          runGen: { ...s.runGen, [ws]: gen },
+          reviews: { ...s.reviews, [ws]: { ...EMPTY, status: "running" } },
+        }));
         try {
           const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(gitDiff));
+          if (get().runGen[ws] !== gen) return; // a newer run superseded this one
           const result = parseAiReview(res.text);
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null, rawText: res.text } },
+            reviews: { ...s.reviews, [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null } },
           }));
         } catch (e) {
+          if (get().runGen[ws] !== gen) return;
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "error", result: null, diffHash: null, error: String(e), rawText: null } },
+            reviews: { ...s.reviews, [ws]: { status: "error", result: null, diffHash: null, error: e instanceof Error ? e.message : String(e) } },
           }));
         }
       },

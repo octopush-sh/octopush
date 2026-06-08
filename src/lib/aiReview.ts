@@ -82,10 +82,7 @@ function extractJsonObject(s: string): Record<string, unknown> | null {
  *  object, validates shape, drops invalid findings. Throws if no parseable
  *  object is present. */
 export function parseAiReview(text: string): AiReviewResult {
-  let s = text.trim();
-  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) s = fence[1].trim();
-  const obj = extractJsonObject(s);
+  const obj = extractJsonObject(text.trim());
   if (!obj) {
     throw new Error("AI review returned no JSON object");
   }

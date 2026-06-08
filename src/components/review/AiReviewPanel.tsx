@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { useAiReview, diffHash } from "../../stores/aiReviewStore";
 import { AiFindingCard } from "./AiFindingCard";
@@ -20,7 +20,8 @@ export function AiReviewPanel({
   const run = useAiReview((s) => s.run);
 
   const hasDiff = gitDiff.trim().length > 0;
-  const stale = review.status === "done" && review.diffHash !== diffHash(gitDiff);
+  const dh = useMemo(() => diffHash(gitDiff), [gitDiff]);
+  const stale = review.status === "done" && review.diffHash !== dh;
 
   const start = () => {
     if (!hasDiff) return;
