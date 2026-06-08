@@ -120,6 +120,8 @@ impl AgentRunner for ApiRunner {
                     &stage.agent_model,
                     r.input_tokens,
                     r.output_tokens,
+                    r.cache_read_tokens,
+                    r.cache_creation_tokens,
                 );
                 let kind = artifact_kind_for(&stage.role);
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);

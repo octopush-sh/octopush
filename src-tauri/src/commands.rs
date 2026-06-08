@@ -927,7 +927,7 @@ pub async fn estimate_run_cost(
     let mut baseline = 0.0;
     for s in &stages {
         let (i, o) = est_tokens(&s.role);
-        cost += crate::orchestrator::cost::stage_cost(&s.agent_model, i, o);
+        cost += crate::orchestrator::cost::stage_cost(&s.agent_model, i, o, 0, 0);
         if let Some(ref_model) = &reference {
             baseline += crate::orchestrator::cost::baseline_cost(ref_model, i, o);
         }

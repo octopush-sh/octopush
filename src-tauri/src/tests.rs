@@ -1800,14 +1800,14 @@ mod cost_tests {
     #[test]
     fn stage_cost_matches_token_engine() {
         // claude-opus-4-6: $15/M input, $75/M output.
-        let c = stage_cost("claude-opus-4-6", 1_000_000, 100_000);
+        let c = stage_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
         assert!((c - (15.0 + 7.5)).abs() < 0.01);
     }
 
     #[test]
     fn baseline_uses_reference_prices_on_actual_tokens() {
         // Same tokens, premium reference model → baseline >= actual for a cheaper model.
-        let actual = stage_cost("claude-haiku-4-5", 1_000_000, 100_000);
+        let actual = stage_cost("claude-haiku-4-5", 1_000_000, 100_000, 0, 0);
         let base = baseline_cost("claude-opus-4-6", 1_000_000, 100_000);
         assert!(base > actual);
     }

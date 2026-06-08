@@ -3,11 +3,19 @@
 use crate::provider_router::ProviderRouter;
 
 /// Actual cost of a stage given its model and token counts.
-pub fn stage_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    crate::token_engine::compute_cost(model, input_tokens, output_tokens, 0, 0)
+pub fn stage_cost(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+) -> f64 {
+    crate::token_engine::compute_cost(model, input_tokens, output_tokens, cache_read, cache_creation)
 }
 
 /// Baseline cost: the same token counts priced at the reference (premium) model.
+/// Cache tokens are NOT re-priced here — run_stages only persists input/output, so
+/// the baseline re-prices the stored input/output counts.
 pub fn baseline_cost(reference_model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
     crate::token_engine::compute_cost(reference_model, input_tokens, output_tokens, 0, 0)
 }
