@@ -266,3 +266,33 @@ describe("ModelPicker", () => {
     expect(screen.getAllByText(/\$\d+\/\$\d+ · \d+k ctx/i).length).toBeGreaterThan(0);
   });
 });
+
+describe("ModelPicker dropdown escapes clipping containers", () => {
+  it("renders the open panel OUTSIDE the overflow-clipped container (portal)", async () => {
+    listProvidersMock.mockResolvedValueOnce([
+      {
+        name: "anthropic",
+        enabled: true,
+        models: [
+          {
+            id: "m1", displayName: "Model One",
+            inputCostPerM: 1, outputCostPerM: 2,
+            cacheReadCostPerM: 0, cacheCreationCostPerM: 0,
+            maxContext: 200000, supportsVision: false, supportsTools: true, tags: [],
+          },
+        ],
+      },
+    ]);
+    render(
+      <div data-testid="clip" style={{ overflow: "hidden" }}>
+        <ModelPicker activeModel="m1" onSelectModel={() => {}} />
+      </div>,
+    );
+    const chip = await screen.findByRole("button", { name: /Model One/i });
+    fireEvent.click(chip);
+    const listbox = await screen.findByRole("listbox");
+    const clip = screen.getByTestId("clip");
+    // The dropdown must NOT be nested inside the overflow-clipped container.
+    expect(clip.contains(listbox)).toBe(false);
+  });
+});

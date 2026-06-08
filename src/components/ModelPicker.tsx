@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
 import type { ModelInfo, ProviderConfig } from "../lib/types";
@@ -72,12 +73,46 @@ export function ModelPicker({
   const [open, setOpen] = useState(false);
   const [recents, setRecents] = useState<string[]>(() => loadRecents());
   const containerRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{
+    left: number; top?: number; bottom?: number; maxHeight: number;
+    placement: "below" | "above";
+  } | null>(null);
 
   useEffect(() => {
     ipc.listProviders().then((provs) => {
       setProviders(provs.filter((p) => p.enabled && p.models.length > 0));
     });
   }, []);
+
+  const PANEL_MIN_W = 260;
+  const updatePosition = useCallback(() => {
+    const el = buttonRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const gap = 6, margin = 8;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const spaceBelow = vh - rect.bottom - gap - margin;
+    const spaceAbove = rect.top - gap - margin;
+    const left = Math.min(Math.max(margin, rect.left), Math.max(margin, vw - PANEL_MIN_W - margin));
+    if (spaceBelow >= 260 || spaceBelow >= spaceAbove) {
+      setPos({ left, top: rect.bottom + gap, maxHeight: Math.max(140, spaceBelow), placement: "below" });
+    } else {
+      setPos({ left, bottom: vh - rect.top + gap, maxHeight: Math.max(140, spaceAbove), placement: "above" });
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePosition();
+    window.addEventListener("scroll", updatePosition, true);
+    window.addEventListener("resize", updatePosition);
+    return () => {
+      window.removeEventListener("scroll", updatePosition, true);
+      window.removeEventListener("resize", updatePosition);
+    };
+  }, [open, updatePosition]);
 
   // Build a lookup of every available model so the Recents row knows the
   // displayName + provider for an id pulled out of localStorage.
@@ -158,9 +193,10 @@ export function ModelPicker({
   useEffect(() => {
     if (!open) return;
     function handlePointerDown(e: PointerEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      const t = e.target as Node;
+      if (containerRef.current?.contains(t)) return;
+      if (panelRef.current?.contains(t)) return;
+      setOpen(false);
     }
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
@@ -196,6 +232,7 @@ export function ModelPicker({
     <div ref={containerRef} className="relative flex items-center gap-2">
       {/* Chip button */}
       <button
+        ref={buttonRef}
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -220,134 +257,146 @@ export function ModelPicker({
         </span>
       </button>
 
-      {/* Dropdown panel */}
-      {open && (
-        <div
-          role="listbox"
-          aria-label="Select model"
-          className="octo-menu-enter absolute bottom-full left-0 z-50 mb-2 min-w-[260px] rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
-          style={{ transformOrigin: "bottom left" }}
-        >
-          {providers.length === 0 ? (
-            <div className="px-4 py-3 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">
-              No models configured
-            </div>
-          ) : (
-            <div className="py-2">
-              {/* Filter strip — currently just a Local-only toggle. Filters
-                  apply to the per-provider list at the bottom; pinned
-                  sections (Recommended, Recents) are always shown so the
-                  user doesn't lose access to their go-to picks. */}
-              <div className="flex items-center justify-end px-3 pb-1.5">
-                <button
-                  type="button"
-                  onClick={() => setLocalOnly((v) => !v)}
-                  aria-pressed={localOnly}
-                  className={clsx(
-                    "rounded-sm px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.25em] transition-colors",
-                    localOnly
-                      ? "text-octo-brass"
-                      : "text-octo-mute hover:text-octo-sage",
-                  )}
-                  style={
-                    localOnly
-                      ? {
-                          background: "var(--brass-ghost)",
-                          border: "1px solid var(--brass-dim)",
-                        }
-                      : { border: "1px solid var(--color-octo-hairline)" }
-                  }
-                >
-                  Local only
-                </button>
+      {/* Dropdown panel — rendered via a portal to document.body so it
+          escapes any overflow-clipped or transform ancestors (e.g. the
+          PipelineSetup scroll container). Position is computed from the
+          button's bounding rect and kept in sync via scroll/resize events. */}
+      {open && pos &&
+        createPortal(
+          <div
+            ref={panelRef}
+            role="listbox"
+            aria-label="Select model"
+            className="octo-menu-enter fixed z-[60] min-w-[260px] overflow-y-auto rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
+            style={{
+              left: pos.left,
+              top: pos.top,
+              bottom: pos.bottom,
+              maxHeight: pos.maxHeight,
+              transformOrigin: pos.placement === "below" ? "top left" : "bottom left",
+            }}
+          >
+            {providers.length === 0 ? (
+              <div className="px-4 py-3 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">
+                No models configured
               </div>
-
-              {/* Recommended — intent-based picks. Three rows max, each
-                  prefaced by the intent (italic-serif) and showing the
-                  matching model row. Always visible regardless of filters. */}
-              {recommendations.length > 0 && (
-                <>
-                  <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-                    Recommended
-                  </div>
-                  {recommendations.map(({ intent, entry }) => (
-                    <div
-                      key={`rec-${intent}`}
-                      className="flex items-center gap-1.5"
-                    >
-                      <span className="w-[68px] shrink-0 pl-3 font-serif text-[10px] text-octo-sage">
-                        {intent}
-                      </span>
-                      <div className="flex-1">
-                        <ModelRow
-                          model={entry.model}
-                          providerName={entry.providerName}
-                          isActive={activeModel === entry.model.id}
-                          onClick={() => handleSelect(entry.model.id)}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                  <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
-                </>
-              )}
-
-              {/* Recents — last 3 selected models, pinned at the top so the
-                  user can flip between the ones they actually use without
-                  scanning every provider. */}
-              {recentEntries.length > 0 && (
-                <>
-                  <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-                    Recents
-                  </div>
-                  {recentEntries.map(({ model, providerName }) => (
-                    <ModelRow
-                      key={`recent-${model.id}`}
-                      model={model}
-                      providerName={providerName}
-                      isActive={activeModel === model.id}
-                      onClick={() => handleSelect(model.id)}
-                    />
-                  ))}
-                  <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
-                </>
-              )}
-
-              {visibleProviders.length === 0 ? (
-                <div className="px-3 py-2 font-serif text-[11px] text-octo-mute">
-                  No models match the current filter.
-                </div>
-              ) : (
-                visibleProviders.map((provider, idx) => (
-                  <div key={provider.name}>
-                    {idx > 0 && (
-                      <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+            ) : (
+              <div className="py-2">
+                {/* Filter strip — currently just a Local-only toggle. Filters
+                    apply to the per-provider list at the bottom; pinned
+                    sections (Recommended, Recents) are always shown so the
+                    user doesn't lose access to their go-to picks. */}
+                <div className="flex items-center justify-end px-3 pb-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setLocalOnly((v) => !v)}
+                    aria-pressed={localOnly}
+                    className={clsx(
+                      "rounded-sm px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.25em] transition-colors",
+                      localOnly
+                        ? "text-octo-brass"
+                        : "text-octo-mute hover:text-octo-sage",
                     )}
+                    style={
+                      localOnly
+                        ? {
+                            background: "var(--brass-ghost)",
+                            border: "1px solid var(--brass-dim)",
+                          }
+                        : { border: "1px solid var(--color-octo-hairline)" }
+                    }
+                  >
+                    Local only
+                  </button>
+                </div>
 
-                    {/* Provider eyebrow */}
-                    <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
-                      {provider.name === "ollama"
-                        ? "OLLAMA · local"
-                        : provider.name.toUpperCase()}
+                {/* Recommended — intent-based picks. Three rows max, each
+                    prefaced by the intent (italic-serif) and showing the
+                    matching model row. Always visible regardless of filters. */}
+                {recommendations.length > 0 && (
+                  <>
+                    <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+                      Recommended
                     </div>
+                    {recommendations.map(({ intent, entry }) => (
+                      <div
+                        key={`rec-${intent}`}
+                        className="flex items-center gap-1.5"
+                      >
+                        <span className="w-[68px] shrink-0 pl-3 font-serif text-[10px] text-octo-sage">
+                          {intent}
+                        </span>
+                        <div className="flex-1">
+                          <ModelRow
+                            model={entry.model}
+                            providerName={entry.providerName}
+                            isActive={activeModel === entry.model.id}
+                            onClick={() => handleSelect(entry.model.id)}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                    <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                  </>
+                )}
 
-                    {/* Model rows */}
-                    {provider.models.map((model) => (
+                {/* Recents — last 3 selected models, pinned at the top so the
+                    user can flip between the ones they actually use without
+                    scanning every provider. */}
+                {recentEntries.length > 0 && (
+                  <>
+                    <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+                      Recents
+                    </div>
+                    {recentEntries.map(({ model, providerName }) => (
                       <ModelRow
-                        key={model.id}
+                        key={`recent-${model.id}`}
                         model={model}
-                        providerName={provider.name}
+                        providerName={providerName}
                         isActive={activeModel === model.id}
                         onClick={() => handleSelect(model.id)}
-                        />
+                      />
                     ))}
+                    <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                  </>
+                )}
+
+                {visibleProviders.length === 0 ? (
+                  <div className="px-3 py-2 font-serif text-[11px] text-octo-mute">
+                    No models match the current filter.
                   </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
-      )}
+                ) : (
+                  visibleProviders.map((provider, idx) => (
+                    <div key={provider.name}>
+                      {idx > 0 && (
+                        <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                      )}
+
+                      {/* Provider eyebrow */}
+                      <div className="px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+                        {provider.name === "ollama"
+                          ? "OLLAMA · local"
+                          : provider.name.toUpperCase()}
+                      </div>
+
+                      {/* Model rows */}
+                      {provider.models.map((model) => (
+                        <ModelRow
+                          key={model.id}
+                          model={model}
+                          providerName={provider.name}
+                          isActive={activeModel === model.id}
+                          onClick={() => handleSelect(model.id)}
+                        />
+                      ))}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>,
+          document.body,
+        )}
 
     </div>
   );
