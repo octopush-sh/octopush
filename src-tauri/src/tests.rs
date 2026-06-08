@@ -2162,4 +2162,24 @@ mod orchestrator_tests {
         assert!(stages[0].error.is_some());
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
     }
+
+    #[tokio::test]
+    async fn redriving_a_paused_run_keeps_it_paused() {
+        let (db, ws) = db_with_workspace();
+        let ff = db.lock().list_pipelines().unwrap().into_iter()
+            .find(|p| p.name == "Feature Factory").unwrap();
+        let run_id = db.lock().create_run(&ws, &ff.id, "x", None, None).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // First drive: pauses at the implement checkpoint, run status = paused.
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+
+        // Re-drive without resolving the checkpoint (simulates start_run on a paused run).
+        // It must return Paused AND leave the persisted run status as "paused", not "running".
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+    }
 }

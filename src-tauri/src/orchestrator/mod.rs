@@ -259,8 +259,12 @@ impl Orchestrator {
                 self.emit_run_update(run_id);
                 return Ok(RunStatus::Completed);
             };
-            // Only "pending" stages run; anything else means we're blocked.
+            // Only "pending" stages run; anything else (awaiting_checkpoint / failed)
+            // means we're already blocked — restore the persisted paused status, since
+            // entry set it to "running".
             if stage.status != "pending" {
+                self.db.lock().set_run_status(run_id, "paused", false)?;
+                self.emit_run_update(run_id);
                 return Ok(RunStatus::Paused);
             }
 
