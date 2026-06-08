@@ -15,6 +15,7 @@ import { RenameDialog } from "./components/RenameDialog";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
 import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
 import { ArchivedWorkspacesModal } from "./components/ArchivedWorkspacesModal";
+import { ModalShell } from "./components/ModalShell";
 import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -1576,23 +1577,18 @@ function App() {
       )}
 
       {renamingWorkspace && (
-        <div
-          className="absolute inset-0 z-50 flex items-center justify-center bg-black/30 p-2 octo-overlay-enter"
-          onClick={() => setRenamingWorkspace(null)}
-        >
-          <div className="octo-modal-enter" onClick={(e) => e.stopPropagation()}>
-            <RenameDialog
-              title="Rename workspace"
-              label="Name"
-              initialValue={renamingWorkspace.name}
-              onSubmit={(name) => {
-                void useWorkspaceStore.getState().rename(renamingWorkspace.id, name);
-                setRenamingWorkspace(null);
-              }}
-              onCancel={() => setRenamingWorkspace(null)}
-            />
-          </div>
-        </div>
+        <ModalShell onClose={() => setRenamingWorkspace(null)} ariaLabel="Rename workspace">
+          <RenameDialog
+            title="Rename workspace"
+            label="Name"
+            initialValue={renamingWorkspace.name}
+            onSubmit={(name) => {
+              void useWorkspaceStore.getState().rename(renamingWorkspace.id, name);
+              setRenamingWorkspace(null);
+            }}
+            onCancel={() => setRenamingWorkspace(null)}
+          />
+        </ModalShell>
       )}
 
       <CommandPalette
@@ -1713,25 +1709,20 @@ function App() {
       })()}
 
       {archivedForProject && (
-        <div
-          className="absolute inset-0 z-50 flex items-center justify-center bg-black/30 p-2 octo-overlay-enter"
-          onClick={() => setArchivedForProject(null)}
-        >
-          <div className="octo-modal-enter" onClick={(e) => e.stopPropagation()}>
-            <ArchivedWorkspacesModal
-              projectId={archivedForProject.id}
-              projectName={archivedForProject.name}
-              projectPath={archivedForProject.path}
-              onRestored={(pid) => {
-                void loadAllWorkspaces([pid]);
-                void loadGitSummaries(pid);
-                const p = recentProjects.find((x) => x.id === pid)?.path ?? (project?.id === pid ? project.path : undefined);
-                if (p) void loadProjectPrs(pid, p);
-              }}
-              onClose={() => setArchivedForProject(null)}
-            />
-          </div>
-        </div>
+        <ModalShell onClose={() => setArchivedForProject(null)} ariaLabel="Archived workspaces">
+          <ArchivedWorkspacesModal
+            projectId={archivedForProject.id}
+            projectName={archivedForProject.name}
+            projectPath={archivedForProject.path}
+            onRestored={(pid) => {
+              void loadAllWorkspaces([pid]);
+              void loadGitSummaries(pid);
+              const p = recentProjects.find((x) => x.id === pid)?.path ?? (project?.id === pid ? project.path : undefined);
+              if (p) void loadProjectPrs(pid, p);
+            }}
+            onClose={() => setArchivedForProject(null)}
+          />
+        </ModalShell>
       )}
 
       {/* Project customization menu */}
