@@ -5,28 +5,47 @@ import { render, screen } from "@testing-library/react";
 vi.mock("@codemirror/view", () => {
   class EditorViewMock {
     dom = document.createElement("div");
+    state = { doc: { toString: () => "" }, selection: { main: { head: 0 } } };
     destroy = vi.fn();
     dispatch = vi.fn();
+    setState = vi.fn();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     constructor(_config: any) {}
     static updateListener = { of: vi.fn(() => ({})) };
     static theme = vi.fn(() => ({}));
+    static lineWrapping = {};
   }
-
   return {
     EditorView: EditorViewMock,
     lineNumbers: vi.fn(() => ({})),
     highlightActiveLineGutter: vi.fn(() => ({})),
     highlightActiveLine: vi.fn(() => ({})),
     drawSelection: vi.fn(() => ({})),
+    rectangularSelection: vi.fn(() => ({})),
+    crosshairCursor: vi.fn(() => ({})),
     keymap: { of: vi.fn(() => ({})) },
   };
 });
 
-vi.mock("@codemirror/state", () => ({
-  EditorState: {
-    create: vi.fn().mockReturnValue({ doc: { toString: () => "" } }),
-  },
+vi.mock("@codemirror/state", () => {
+  class CompartmentMock {
+    of = vi.fn(() => ({}));
+    reconfigure = vi.fn(() => ({}));
+  }
+  return {
+    EditorState: {
+      create: vi.fn().mockReturnValue({ doc: { toString: () => "" } }),
+      tabSize: { of: vi.fn(() => ({})) },
+    },
+    Compartment: CompartmentMock,
+    EditorSelection: { range: vi.fn(() => ({})), create: vi.fn(() => ({})) },
+  };
+});
+
+vi.mock("@codemirror/search", () => ({
+  search: vi.fn(() => ({})),
+  searchKeymap: [],
+  gotoLine: vi.fn(() => true),
 }));
 
 vi.mock("@codemirror/commands", () => ({
@@ -40,6 +59,21 @@ vi.mock("@codemirror/language", () => ({
   indentOnInput: vi.fn(() => ({})),
   bracketMatching: vi.fn(() => ({})),
   foldGutter: vi.fn(() => ({})),
+  indentUnit: { of: vi.fn(() => ({})) },
+}));
+
+vi.mock("./editor/multiCursor", () => ({
+  selectAllOccurrences: vi.fn(() => true),
+}));
+
+vi.mock("../stores/editorPrefsStore", () => ({
+  useEditorPrefs: vi.fn((selector: (s: unknown) => unknown) =>
+    selector({ wrap: false, fontSize: 13, tabWidth: 2, lineNumbers: true }),
+  ),
+}));
+
+vi.mock("./EditorStatusBar", () => ({
+  EditorStatusBar: () => <div data-testid="status-bar" />,
 }));
 
 vi.mock("@codemirror/lang-javascript", () => ({

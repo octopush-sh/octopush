@@ -1,8 +1,12 @@
-import { useEffect, useRef } from "react";
-import { EditorView, lineNumbers, highlightActiveLineGutter, drawSelection, keymap, highlightActiveLine } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { useEffect, useRef, useState } from "react";
+import {
+  EditorView, lineNumbers, highlightActiveLineGutter, drawSelection, keymap,
+  highlightActiveLine, rectangularSelection, crosshairCursor,
+} from "@codemirror/view";
+import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirror/commands";
-import { indentOnInput, bracketMatching, foldGutter } from "@codemirror/language";
+import { indentOnInput, bracketMatching, foldGutter, indentUnit } from "@codemirror/language";
+import { search, searchKeymap } from "@codemirror/search";
 import { javascript } from "@codemirror/lang-javascript";
 import { rust } from "@codemirror/lang-rust";
 import { python } from "@codemirror/lang-python";
@@ -15,8 +19,11 @@ import { xml } from "@codemirror/lang-xml";
 import { yaml } from "@codemirror/lang-yaml";
 import { atelierTheme } from "./editor/atelierTheme";
 import { diffGutter } from "./editor/diffGutter";
+import { selectAllOccurrences } from "./editor/multiCursor";
 import { parseDiffForFile } from "../lib/diffParser";
 import { useEditorStore } from "../stores/editorStore";
+import { useEditorPrefs } from "../stores/editorPrefsStore";
+import { EditorStatusBar } from "./EditorStatusBar";
 
 interface Props {
   workspaceId: string;
@@ -24,7 +31,6 @@ interface Props {
   diffText: string;
 }
 
-/** Returns the CodeMirror language extension for a given lang id. */
 function langExtension(lang: string) {
   switch (lang) {
     case "javascript": return javascript({ typescript: true, jsx: true });
@@ -41,102 +47,184 @@ function langExtension(lang: string) {
   }
 }
 
+// ── Live-reconfigurable preference compartments (module-level, stable) ──
+const wrapComp = new Compartment();
+const lineNumComp = new Compartment();
+const tabComp = new Compartment();
+const fontComp = new Compartment();
+
+interface Prefs { wrap: boolean; fontSize: number; tabWidth: number; lineNumbers: boolean; }
+
+const wrapValue = (p: Prefs) => (p.wrap ? EditorView.lineWrapping : []);
+const lineNumValue = (p: Prefs) =>
+  p.lineNumbers ? [lineNumbers(), foldGutter(), highlightActiveLineGutter()] : [];
+const tabValue = (p: Prefs) => [EditorState.tabSize.of(p.tabWidth), indentUnit.of(" ".repeat(p.tabWidth))];
+const fontValue = (p: Prefs) =>
+  EditorView.theme({ "&": { fontSize: `${p.fontSize}px` }, ".cm-content": { fontSize: `${p.fontSize}px` } });
+
+function buildState(opts: {
+  doc: string; lang: string; markers: ReturnType<typeof parseDiffForFile>;
+  prefs: Prefs; onSave: () => void;
+  onUpdate: (u: { docChanged: boolean; doc: string; line: number; col: number; selections: number }) => void;
+}) {
+  const { doc, lang, markers, prefs, onSave, onUpdate } = opts;
+  return EditorState.create({
+    doc,
+    extensions: [
+      lineNumComp.of(lineNumValue(prefs)),
+      highlightActiveLine(),
+      drawSelection(),
+      rectangularSelection(),
+      crosshairCursor(),
+      history(),
+      indentOnInput(),
+      bracketMatching(),
+      tabComp.of(tabValue(prefs)),
+      wrapComp.of(wrapValue(prefs)),
+      fontComp.of(fontValue(prefs)),
+      search({ top: true }),
+      keymap.of([
+        { key: "Mod-s", run: () => { onSave(); return true; } },
+        { key: "Mod-Shift-l", run: selectAllOccurrences },
+        indentWithTab,
+        ...searchKeymap,
+        ...defaultKeymap,
+        ...historyKeymap,
+      ]),
+      langExtension(lang),
+      atelierTheme,
+      diffGutter(markers),
+      EditorView.updateListener.of((update) => {
+        const head = update.state.selection.main.head;
+        const lineObj = update.state.doc.lineAt(head);
+        onUpdate({
+          docChanged: update.docChanged,
+          doc: update.state.doc.toString(),
+          line: lineObj.number,
+          col: head - lineObj.from + 1,
+          selections: update.state.selection.ranges.length,
+        });
+      }),
+    ],
+  });
+}
+
 export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const activePath = useEditorStore((s) => s.getActivePath(workspaceId));
   const files = useEditorStore((s) => s.getFiles(workspaceId));
   const setContent = useEditorStore((s) => s.setContent);
   const saveActive = useEditorStore((s) => s.saveActive);
 
-  const activeFile = activePath
-    ? files.find((f) => f.path === activePath) ?? null
-    : null;
+  const wrap = useEditorPrefs((s) => s.wrap);
+  const fontSize = useEditorPrefs((s) => s.fontSize);
+  const tabWidth = useEditorPrefs((s) => s.tabWidth);
+  const lineNumbersPref = useEditorPrefs((s) => s.lineNumbers);
+  const prefs: Prefs = { wrap, fontSize, tabWidth, lineNumbers: lineNumbersPref };
+
+  const activeFile = activePath ? files.find((f) => f.path === activePath) ?? null : null;
 
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const stateCache = useRef<Map<string, EditorState>>(new Map());
+  const lastPathRef = useRef<string | null>(null);
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
 
-  useEffect(() => {
-    if (!activeFile || !hostRef.current) return;
+  const [pos, setPos] = useState({ line: 1, col: 1, selections: 1 });
 
-    // Compute diff markers for this file.
-    const relPath = activeFile.path.startsWith(workspacePath + "/")
-      ? activeFile.path.slice(workspacePath.length + 1)
-      : activeFile.path;
+  const freshState = (file: { path: string; content: string; lang: string }) => {
+    const relPath = file.path.startsWith(workspacePath + "/")
+      ? file.path.slice(workspacePath.length + 1) : file.path;
     const markers = parseDiffForFile(diffText, relPath);
-
-    const state = EditorState.create({
-      doc: activeFile.content,
-      extensions: [
-        // Base extensions
-        lineNumbers(),
-        foldGutter(),
-        highlightActiveLineGutter(),
-        highlightActiveLine(),
-        drawSelection(),
-        history(),
-        indentOnInput(),
-        bracketMatching(),
-        // Keymaps
-        keymap.of([
-          {
-            key: "Mod-s",
-            run: () => {
-              saveActive(workspaceId).catch(console.error);
-              return true;
-            },
-          },
-          indentWithTab,
-          ...defaultKeymap,
-          ...historyKeymap,
-        ]),
-        // Language
-        langExtension(activeFile.lang),
-        // Theme
-        atelierTheme,
-        // Diff gutter
-        diffGutter(markers),
-        // Change listener — sync content to store
-        EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
-            setContent(workspaceId, activeFile.path, update.state.doc.toString());
-          }
-        }),
-      ],
+    return buildState({
+      doc: file.content, lang: file.lang, markers, prefs: prefsRef.current,
+      onSave: () => saveActive(workspaceId).catch(console.error),
+      onUpdate: (u) => {
+        if (u.docChanged) setContent(workspaceId, file.path, u.doc);
+        setPos({ line: u.line, col: u.col, selections: u.selections });
+      },
     });
+  };
 
-    const view = new EditorView({
-      state,
-      parent: hostRef.current,
-    });
-
+  // Create the view once; destroy on unmount.
+  useEffect(() => {
+    if (!hostRef.current || viewRef.current) return;
+    const view = new EditorView({ parent: hostRef.current });
     viewRef.current = view;
+    return () => { view.destroy(); viewRef.current = null; stateCache.current.clear(); lastPathRef.current = null; };
+  }, []);
 
-    return () => {
-      view.destroy();
-      viewRef.current = null;
-    };
-    // Re-create the editor only when the active file PATH changes (not on every
-    // content change — that would reset the cursor and undo history).
+  // Swap the document state when the active file changes; preserve per-tab state.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !activeFile) return;
+
+    const prevPath = lastPathRef.current;
+    if (prevPath && prevPath !== activeFile.path) {
+      stateCache.current.set(prevPath, view.state);
+    }
+
+    const cached = stateCache.current.get(activeFile.path);
+    const next = cached ?? freshState(activeFile);
+    view.setState(next);
+    view.dispatch({ effects: [
+      wrapComp.reconfigure(wrapValue(prefsRef.current)),
+      lineNumComp.reconfigure(lineNumValue(prefsRef.current)),
+      tabComp.reconfigure(tabValue(prefsRef.current)),
+      fontComp.reconfigure(fontValue(prefsRef.current)),
+    ]});
+    lastPathRef.current = activeFile.path;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath, workspaceId]);
 
-  if (!activeFile) {
-    return (
-      <div className="flex h-full w-full items-center justify-center">
-        <span className="font-serif text-[15px] text-octo-mute">
-          Select a file from the tree to begin.
-        </span>
-      </div>
-    );
-  }
+  // Evict cache entries for files that are no longer open.
+  useEffect(() => {
+    const open = new Set(files.map((f) => f.path));
+    for (const p of stateCache.current.keys()) if (!open.has(p)) stateCache.current.delete(p);
+  }, [files]);
 
+  // Reconfigure compartments live when prefs change.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: [
+      wrapComp.reconfigure(wrapValue(prefs)),
+      lineNumComp.reconfigure(lineNumValue(prefs)),
+      tabComp.reconfigure(tabValue(prefs)),
+      fontComp.reconfigure(fontValue(prefs)),
+    ]});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wrap, fontSize, tabWidth, lineNumbersPref]);
+
+  // IMPORTANT: the host is mounted UNCONDITIONALLY so the view-once effect (deps
+  // `[]`) always finds `hostRef.current`. The empty-state message is an overlay,
+  // not an early return — an early return would unmount the host on the
+  // null→active transition and the `[]` effect would never create the view.
   return (
     <div className="chat-selectable flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div
-        ref={hostRef}
-        data-testid="editor-host"
-        className="min-h-0 flex-1 overflow-auto"
-        style={{ background: "var(--color-octo-onyx)" }}
-      />
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={hostRef}
+          data-testid="editor-host"
+          className="absolute inset-0 overflow-auto"
+          style={{ background: "var(--color-octo-onyx)" }}
+        />
+        {!activeFile && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span className="font-serif text-[15px] text-octo-mute">
+              Select a file from the tree to begin.
+            </span>
+          </div>
+        )}
+      </div>
+      {activeFile && (
+        <EditorStatusBar
+          line={pos.line}
+          col={pos.col}
+          selectionCount={pos.selections}
+          lang={activeFile.lang}
+        />
+      )}
     </div>
   );
 }
