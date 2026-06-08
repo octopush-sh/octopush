@@ -17,6 +17,7 @@ interface Props {
 
 export function StageFocus({ stage, workspacePath }: Props) {
   const [diff, setDiff] = useState<string>("");
+  const [diffLoading, setDiffLoading] = useState(false);
 
   const artifact = useMemo<ParsedArtifact | null>(() => {
     if (!stage?.artifact) return null;
@@ -30,12 +31,17 @@ export function StageFocus({ stage, workspacePath }: Props) {
   useEffect(() => {
     let cancelled = false;
     if (stage && artifact?.refsWorktree && workspacePath) {
-      ipc.getGitDiff(workspacePath).then((d) => { if (!cancelled) setDiff(d); }).catch(() => {});
+      setDiff("");
+      setDiffLoading(true);
+      ipc.getGitDiff(workspacePath)
+        .then((d) => { if (!cancelled) { setDiff(d); setDiffLoading(false); } })
+        .catch(() => { if (!cancelled) { setDiff(""); setDiffLoading(false); } });
     } else {
       setDiff("");
+      setDiffLoading(false);
     }
     return () => { cancelled = true; };
-  }, [stage?.id, artifact?.refsWorktree, workspacePath]);
+  }, [stage?.id, stage?.status, artifact?.refsWorktree, workspacePath]);
 
   if (!stage) {
     return (
@@ -58,7 +64,12 @@ export function StageFocus({ stage, workspacePath }: Props) {
         ) : artifact ? (
           <>
             {artifact.text || "(no output text)"}
-            {artifact.refsWorktree && <DiffViewer diff={diff} />}
+            {artifact.refsWorktree &&
+              (diffLoading ? (
+                <div className="p-4 font-mono text-xs text-octo-mute">Loading diff…</div>
+              ) : (
+                <DiffViewer diff={diff} />
+              ))}
           </>
         ) : stage.status === "running" ? (
           <span className="text-octo-brass">working…</span>
