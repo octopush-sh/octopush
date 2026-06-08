@@ -1,14 +1,7 @@
 import type { Run, RunStage } from "../lib/ipc";
+import { stageStatusMeta } from "../lib/runStatus";
 
 const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
-
-function statusColor(status: string): string {
-  if (status === "done") return "text-octo-verdigris";
-  if (status === "running") return "text-octo-brass";
-  if (status === "failed") return "text-octo-rouge";
-  if (status === "awaiting_checkpoint") return "text-octo-brass";
-  return "text-octo-mute";
-}
 
 interface Props {
   run: Run;
@@ -47,8 +40,8 @@ export function RunTrack({ run, stages, selectedStageId, onSelectStage }: Props)
             >
               <span className="font-mono text-[10px] text-octo-brass">
                 {ROMAN[i] ?? i + 1}{" "}
-                <span className={statusColor(s.status)}>
-                  {s.status === "running" ? "● running" : s.status === "done" ? "✓" : s.status === "failed" ? "✕ failed" : s.status === "awaiting_checkpoint" ? "◆ review" : "pending"}
+                <span className={stageStatusMeta(s.status).className}>
+                  {stageStatusMeta(s.status).label}
                 </span>
               </span>
               <span className="font-serif text-sm text-octo-ivory">{labelForRole(s.role)}</span>
