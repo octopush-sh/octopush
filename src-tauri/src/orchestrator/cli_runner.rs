@@ -14,6 +14,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 
 const MAX_CLI_TURNS: u32 = 30;
+const CLI_TIMEOUT_SECS: u64 = 900; // 15-minute wall-clock backstop for a hung CLI
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -130,6 +131,7 @@ impl AgentRunner for CliRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
@@ -146,9 +148,19 @@ impl AgentRunner for CliRunner {
             // drop closes stdin
         }
 
-        let output = match child.wait_with_output().await {
-            Ok(o) => o,
-            Err(e) => return Ok(failed_stage(&format!("claude process error: {e}"))),
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(CLI_TIMEOUT_SECS),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Ok(failed_stage(&format!("claude process error: {e}"))),
+            Err(_) => {
+                return Ok(failed_stage(
+                    "claude stage timed out (no result within 15 minutes)",
+                ))
+            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
