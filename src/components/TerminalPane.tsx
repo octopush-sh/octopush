@@ -151,6 +151,39 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
 
+    // ── Clipboard bridge ──────────────────────────────────────────────
+    // xterm paints its OWN selection (not a native DOM range), so the
+    // browser's Cmd-C and right-click "copy" never see the selected text —
+    // Cmd-C copies nothing and right-click copies only the word under the
+    // pointer. Bridge `term.getSelection()` to the system clipboard on
+    // Cmd-C / Ctrl-Shift-C and on right-click-with-a-selection.
+    if (typeof term.attachCustomKeyEventHandler === "function") {
+      term.attachCustomKeyEventHandler((e) => {
+        if (
+          e.type === "keydown" &&
+          (e.key === "c" || e.key === "C") &&
+          (e.metaKey || (e.ctrlKey && e.shiftKey))
+        ) {
+          const sel = term.getSelection();
+          if (sel) {
+            void navigator.clipboard?.writeText(sel);
+            e.preventDefault();
+            return false; // handled — don't forward Cmd-C to the PTY
+          }
+        }
+        return true;
+      });
+    }
+    const copyEl = containerRef.current;
+    const onContextMenu = (e: MouseEvent) => {
+      const sel = term.getSelection?.();
+      if (sel) {
+        void navigator.clipboard?.writeText(sel);
+        e.preventDefault(); // suppress the native "copy word under cursor"
+      }
+    };
+    copyEl.addEventListener("contextmenu", onContextMenu);
+
     // File-path link provider — scans each rendered terminal line for
     // path-shaped tokens (anything with at least one slash + a short
     // extension) and turns them into clickable links. Excludes URL
@@ -376,6 +409,7 @@ export function TerminalPane({
       unlistenExit?.();
       unlistenReattached?.();
       unlistenAttention?.();
+      copyEl.removeEventListener("contextmenu", onContextMenu);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
