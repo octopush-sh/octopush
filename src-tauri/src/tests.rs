@@ -2578,3 +2578,72 @@ mod cli_path_tests {
         assert!(pairs.iter().all(|(k, _)| k != "BAD_NO_EQUALS"));     // malformed skipped
     }
 }
+
+#[cfg(test)]
+mod file_io_checked_tests {
+    use crate::commands::{read_file_checked_inner, write_file_inner, FileReadResult};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn temp_with_bytes(bytes: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn reads_utf8_text() {
+        let f = temp_with_bytes(b"hello world");
+        match read_file_checked_inner(f.path().to_str().unwrap(), 1_000_000).unwrap() {
+            FileReadResult::Text { content, size, mtime } => {
+                assert_eq!(content, "hello world");
+                assert_eq!(size, 11);
+                assert!(mtime > 0, "mtime should be a positive epoch-millis value");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detects_binary_via_nul_byte() {
+        let f = temp_with_bytes(b"PK\x03\x04\x00\x00binary");
+        match read_file_checked_inner(f.path().to_str().unwrap(), 1_000_000).unwrap() {
+            FileReadResult::Binary { size, .. } => assert!(size > 0),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detects_unsupported_encoding() {
+        let f = temp_with_bytes(&[0xff, 0xfe, 0x41, 0x42]);
+        match read_file_checked_inner(f.path().to_str().unwrap(), 1_000_000).unwrap() {
+            FileReadResult::UnsupportedEncoding { size, .. } => assert_eq!(size, 4),
+            other => panic!("expected UnsupportedEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flags_too_large() {
+        let f = temp_with_bytes(b"0123456789");
+        match read_file_checked_inner(f.path().to_str().unwrap(), 4).unwrap() {
+            FileReadResult::TooLarge { size } => assert_eq!(size, 10),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serializes_kind_tag_as_camel_case() {
+        let v = serde_json::to_value(FileReadResult::TooLarge { size: 9 }).unwrap();
+        assert_eq!(v["kind"], "tooLarge");
+        assert_eq!(v["size"], 9);
+    }
+
+    #[test]
+    fn write_returns_mtime_and_persists() {
+        let f = NamedTempFile::new().unwrap();
+        let res = write_file_inner(f.path().to_str().unwrap(), "saved").unwrap();
+        assert!(res.mtime > 0);
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "saved");
+    }
+}

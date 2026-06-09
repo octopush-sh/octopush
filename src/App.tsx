@@ -19,6 +19,7 @@ import { ModalShell } from "./components/ModalShell";
 import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { formatBytes } from "./lib/formatBytes";
 import { BacklogRowContextMenu } from "./components/BacklogRowContextMenu";
 import { ProjectPickerModal } from "./components/ProjectPickerModal";
 import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
@@ -908,6 +909,21 @@ function App() {
 
   const openFileInEditor = useEditorStore((s) => s.openFile);
 
+  // Large-file confirm dialog state
+  const [largeFile, setLargeFile] = useState<{ size: number; path: string } | null>(null);
+  const largeFileResolver = useRef<((ok: boolean) => void) | null>(null);
+  const confirmLargeFile = useCallback((size: number, path: string) => {
+    return new Promise<boolean>((resolve) => {
+      largeFileResolver.current = resolve;
+      setLargeFile({ size, path });
+    });
+  }, []);
+  const resolveLargeFile = useCallback((ok: boolean) => {
+    largeFileResolver.current?.(ok);
+    largeFileResolver.current = null;
+    setLargeFile(null);
+  }, []);
+
   // Lifted from ReviewCanvas so any surface (terminal, chat link, FILES tree,
   // CHANGES rail) can deep-link straight into either the diff or the editor.
   const [reviewViewMode, setReviewViewMode] = useState<ReviewViewMode>("diff");
@@ -932,7 +948,7 @@ function App() {
       setReviewViewMode(view);
 
       if (view === "editor") {
-        openFileInEditor(activeWorkspace.id, absolute).catch((e) =>
+        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile).catch((e) =>
           pushToast({
             level: "error",
             title: "Could not open file",
@@ -950,7 +966,7 @@ function App() {
         });
       }
     },
-    [activeWorkspace, project, openFileInEditor, setMode],
+    [activeWorkspace, project, openFileInEditor, setMode, confirmLargeFile],
   );
 
   const fileTreeProps = useMemo(() => {
@@ -1876,6 +1892,18 @@ function App() {
           />
         );
       })()}
+
+      {/* Large-file confirmation dialog */}
+      {largeFile && (
+        <ConfirmDialog
+          title="Large file"
+          body={`${largeFile.path.split("/").pop()} is ${formatBytes(largeFile.size)}. Opening large files can make the editor slow. Open anyway?`}
+          destructiveLabel="Open anyway"
+          cancelLabel="Cancel"
+          onConfirm={() => resolveLargeFile(true)}
+          onCancel={() => resolveLargeFile(false)}
+        />
+      )}
 
       {/* Delete confirmation modal */}
       {deletingWorkspaceId && (() => {

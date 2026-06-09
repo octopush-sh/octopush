@@ -65,6 +65,12 @@ export interface RunDetail {
 }
 export type CheckpointActionName = "approve" | "reject" | "edit" | "abort";
 
+export type FileReadResult =
+  | { kind: "text"; content: string; size: number; mtime: number }
+  | { kind: "binary"; size: number; mtime: number }
+  | { kind: "unsupportedEncoding"; size: number; mtime: number }
+  | { kind: "tooLarge"; size: number };
+
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
@@ -269,7 +275,10 @@ export const ipc = {
   openInEditor: (path: string) => invoke<void>("open_in_editor", { path }),
   detectEditors: () => invoke<EditorChoice[]>("detect_editors"),
   readFile: (path: string) => invoke<string>("read_file", { path }),
-  writeFile: (path: string, content: string) => invoke<void>("write_file", { path, content }),
+  readFileChecked: (path: string, maxBytes?: number) =>
+    invoke<FileReadResult>("read_file_checked", { path, maxBytes }),
+  writeFile: (path: string, content: string) =>
+    invoke<{ mtime: number }>("write_file", { path, content }),
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string) => invoke<DirectoryEntry[]>("read_directory", { path }),

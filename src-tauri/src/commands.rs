@@ -1957,6 +1957,61 @@ pub async fn read_directory(path: String) -> AppResult<Vec<DirectoryEntry>> {
 
 // ─── File I/O ─────────────────────────────────────────────────────
 
+const BINARY_SNIFF_BYTES: usize = 8192;
+/// Hard cap above which `read_file_checked` refuses to load (avoids OOM).
+const READ_CAP_BYTES: u64 = 50 * 1024 * 1024;
+
+/// File modification time as epoch milliseconds, or 0 if unavailable.
+fn mtime_millis(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FileReadResult {
+    Text { content: String, size: u64, mtime: i64 },
+    Binary { size: u64, mtime: i64 },
+    UnsupportedEncoding { size: u64, mtime: i64 },
+    TooLarge { size: u64 },
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteResult {
+    pub mtime: i64,
+}
+
+/// Sync core of `read_file_checked` (testable without a tokio runtime).
+pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<FileReadResult> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    let size = meta.len();
+    let mtime = mtime_millis(&meta);
+    if size > max_bytes {
+        return Ok(FileReadResult::TooLarge { size });
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+        return Ok(FileReadResult::Binary { size, mtime });
+    }
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(FileReadResult::Text { content, size, mtime }),
+        Err(_) => Ok(FileReadResult::UnsupportedEncoding { size, mtime }),
+    }
+}
+
+#[tauri::command]
+pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResult<FileReadResult> {
+    let path = expand_tilde(&path);
+    read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
+}
+
+/// Kept for any non-editor callers that want a plain string read.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);
@@ -1964,11 +2019,18 @@ pub async fn read_file(path: String) -> AppResult<String> {
         .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
 }
 
+/// Sync core of `write_file` (testable; returns the post-write mtime).
+pub(crate) fn write_file_inner(path: &str, content: &str) -> AppResult<WriteResult> {
+    std::fs::write(path, content)
+        .map_err(|e| AppError::Other(format!("write_file({path}): {e}")))?;
+    let mtime = std::fs::metadata(path).map(|m| mtime_millis(&m)).unwrap_or(0);
+    Ok(WriteResult { mtime })
+}
+
 #[tauri::command]
-pub async fn write_file(path: String, content: String) -> AppResult<()> {
+pub async fn write_file(path: String, content: String) -> AppResult<WriteResult> {
     let path = expand_tilde(&path);
-    std::fs::write(&path, content)
-        .map_err(|e| AppError::Other(format!("write_file({}): {e}", path)))
+    write_file_inner(&path, &content)
 }
 
 // ─── File edits (Review canvas) ───────────────────────────────────

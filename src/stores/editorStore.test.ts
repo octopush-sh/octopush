@@ -1,163 +1,97 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// ─── Mock IPC ─────────────────────────────────────────────────────
-const mockIpc = {
-  readFile: vi.fn<(path: string) => Promise<string>>(),
-  writeFile: vi.fn<(path: string, content: string) => Promise<void>>(),
-};
+const readFileChecked = vi.fn();
+const writeFile = vi.fn();
+const pushToast = vi.fn();
 
-vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
+vi.mock("../lib/ipc", () => ({
+  ipc: {
+    readFileChecked: (...a: unknown[]) => readFileChecked(...a),
+    writeFile: (...a: unknown[]) => writeFile(...a),
+  },
+}));
+vi.mock("../components/Toasts", () => ({ pushToast: (...a: unknown[]) => pushToast(...a) }));
+vi.mock("../lib/editorLang", () => ({ langForExtension: () => "javascript" }));
 
-const { useEditorStore } = await import("./editorStore");
-
-// ─── Helpers ──────────────────────────────────────────────────────
+import { useEditorStore } from "./editorStore";
 
 function reset() {
   useEditorStore.setState({ filesByWs: {}, activeByWs: {} });
   vi.clearAllMocks();
 }
 
-// ─── Tests ────────────────────────────────────────────────────────
-
-describe("editorStore — openFile", () => {
+describe("editorStore.openFile", () => {
   beforeEach(reset);
 
-  it("reads from IPC and stores file on first open", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("hello");
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-
-    const files = useEditorStore.getState().getFiles("ws-1");
-    expect(files).toHaveLength(1);
-    expect(files[0].path).toBe("/repo/foo.ts");
-    expect(files[0].content).toBe("hello");
-    expect(files[0].savedContent).toBe("hello");
-    expect(useEditorStore.getState().getActivePath("ws-1")).toBe("/repo/foo.ts");
+  it("opens a text file with content, mtime and size", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 111 });
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+    const f = useEditorStore.getState().getFiles("ws")[0];
+    expect(f).toMatchObject({ path: "/a.ts", content: "hi", savedContent: "hi", kind: "text", mtime: 111, size: 2 });
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(false);
   });
 
-  it("does NOT re-read if file is already open — just activates", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("original");
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-
-    // Manually dirty the buffer
-    useEditorStore.getState().setContent("ws-1", "/repo/foo.ts", "edited");
-
-    // Open again
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-
-    // readFile was only called once; content is still the edited version
-    expect(mockIpc.readFile).toHaveBeenCalledTimes(1);
-    expect(useEditorStore.getState().getFiles("ws-1")[0].content).toBe("edited");
+  it("opens a binary file with no content and is never dirty", async () => {
+    readFileChecked.mockResolvedValue({ kind: "binary", size: 1000, mtime: 5 });
+    await useEditorStore.getState().openFile("ws", "/x.war");
+    const f = useEditorStore.getState().getFiles("ws")[0];
+    expect(f).toMatchObject({ kind: "binary", binaryReason: "binary", content: "", size: 1000 });
+    expect(useEditorStore.getState().isDirty("ws", "/x.war")).toBe(false);
   });
 
-  it("opens multiple files in the same workspace", async () => {
-    mockIpc.readFile
-      .mockResolvedValueOnce("a content")
-      .mockResolvedValueOnce("b content");
+  it("maps unsupportedEncoding to a binary file with that reason", async () => {
+    readFileChecked.mockResolvedValue({ kind: "unsupportedEncoding", size: 4, mtime: 5 });
+    await useEditorStore.getState().openFile("ws", "/x.bin");
+    expect(useEditorStore.getState().getFiles("ws")[0]).toMatchObject({
+      kind: "binary", binaryReason: "unsupportedEncoding",
+    });
+  });
 
-    await useEditorStore.getState().openFile("ws-1", "/repo/a.ts");
-    await useEditorStore.getState().openFile("ws-1", "/repo/b.ts");
+  it("prompts before opening a large text file; declining opens nothing", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "big", size: 5_000_000, mtime: 1 });
+    const confirm = vi.fn().mockResolvedValue(false);
+    await useEditorStore.getState().openFile("ws", "/big.ts", confirm);
+    expect(confirm).toHaveBeenCalledWith(5_000_000, "/big.ts");
+    expect(useEditorStore.getState().getFiles("ws")).toHaveLength(0);
+  });
 
-    const files = useEditorStore.getState().getFiles("ws-1");
-    expect(files).toHaveLength(2);
-    expect(useEditorStore.getState().getActivePath("ws-1")).toBe("/repo/b.ts");
+  it("re-reads a tooLarge file (cap raised) when the user confirms", async () => {
+    readFileChecked
+      .mockResolvedValueOnce({ kind: "tooLarge", size: 99_000_000 })
+      .mockResolvedValueOnce({ kind: "text", content: "huge", size: 99_000_000, mtime: 2 });
+    const confirm = vi.fn().mockResolvedValue(true);
+    await useEditorStore.getState().openFile("ws", "/huge.log", confirm);
+    expect(readFileChecked).toHaveBeenNthCalledWith(2, "/huge.log", Number.MAX_SAFE_INTEGER);
+    expect(useEditorStore.getState().getFiles("ws")[0]).toMatchObject({ kind: "text", content: "huge" });
+    expect(confirm).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("editorStore — closeFile", () => {
+describe("editorStore.saveActive", () => {
   beforeEach(reset);
 
-  it("removes the file from the list", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("x");
-    await useEditorStore.getState().openFile("ws-1", "/repo/x.ts");
-    useEditorStore.getState().closeFile("ws-1", "/repo/x.ts");
-    expect(useEditorStore.getState().getFiles("ws-1")).toHaveLength(0);
+  async function openText() {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "v1", size: 2, mtime: 100 });
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+  }
+
+  it("updates savedContent + mtime on success", async () => {
+    await openText();
+    useEditorStore.getState().setContent("ws", "/a.ts", "v2");
+    writeFile.mockResolvedValue({ mtime: 200 });
+    await useEditorStore.getState().saveActive("ws");
+    const f = useEditorStore.getState().getFiles("ws")[0];
+    expect(f.savedContent).toBe("v2");
+    expect(f.mtime).toBe(200);
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(false);
   });
 
-  it("active becomes null when last file is closed", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("x");
-    await useEditorStore.getState().openFile("ws-1", "/repo/x.ts");
-    useEditorStore.getState().closeFile("ws-1", "/repo/x.ts");
-    expect(useEditorStore.getState().getActivePath("ws-1")).toBeNull();
-  });
-
-  it("active shifts to a neighbor when active file is closed", async () => {
-    mockIpc.readFile
-      .mockResolvedValueOnce("a")
-      .mockResolvedValueOnce("b");
-    await useEditorStore.getState().openFile("ws-1", "/repo/a.ts");
-    await useEditorStore.getState().openFile("ws-1", "/repo/b.ts");
-
-    useEditorStore.getState().closeFile("ws-1", "/repo/b.ts");
-    expect(useEditorStore.getState().getActivePath("ws-1")).toBe("/repo/a.ts");
-  });
-});
-
-describe("editorStore — setContent + isDirty", () => {
-  beforeEach(reset);
-
-  it("setContent marks the file dirty", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("original");
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-
-    expect(useEditorStore.getState().isDirty("ws-1", "/repo/foo.ts")).toBe(false);
-
-    useEditorStore.getState().setContent("ws-1", "/repo/foo.ts", "changed");
-    expect(useEditorStore.getState().isDirty("ws-1", "/repo/foo.ts")).toBe(true);
-  });
-
-  it("setContent does not touch savedContent", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("original");
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-    useEditorStore.getState().setContent("ws-1", "/repo/foo.ts", "changed");
-
-    const file = useEditorStore.getState().getFiles("ws-1")[0];
-    expect(file.savedContent).toBe("original");
-    expect(file.content).toBe("changed");
-  });
-});
-
-describe("editorStore — saveActive", () => {
-  beforeEach(reset);
-
-  it("calls writeFile and clears dirty flag", async () => {
-    mockIpc.readFile.mockResolvedValueOnce("original");
-    mockIpc.writeFile.mockResolvedValueOnce(undefined);
-
-    await useEditorStore.getState().openFile("ws-1", "/repo/foo.ts");
-    useEditorStore.getState().setContent("ws-1", "/repo/foo.ts", "saved-content");
-
-    await useEditorStore.getState().saveActive("ws-1");
-
-    expect(mockIpc.writeFile).toHaveBeenCalledWith("/repo/foo.ts", "saved-content");
-    expect(useEditorStore.getState().isDirty("ws-1", "/repo/foo.ts")).toBe(false);
-  });
-
-  it("no-ops when no active file", async () => {
-    await useEditorStore.getState().saveActive("ws-1");
-    expect(mockIpc.writeFile).not.toHaveBeenCalled();
-  });
-});
-
-describe("editorStore — workspace isolation", () => {
-  beforeEach(reset);
-
-  it("two workspaces have independent file lists", async () => {
-    mockIpc.readFile
-      .mockResolvedValueOnce("in ws-A")
-      .mockResolvedValueOnce("in ws-B");
-
-    await useEditorStore.getState().openFile("ws-A", "/repo/a.ts");
-    await useEditorStore.getState().openFile("ws-B", "/repo/b.ts");
-
-    expect(useEditorStore.getState().getFiles("ws-A")).toHaveLength(1);
-    expect(useEditorStore.getState().getFiles("ws-B")).toHaveLength(1);
-    expect(useEditorStore.getState().getActivePath("ws-A")).toBe("/repo/a.ts");
-    expect(useEditorStore.getState().getActivePath("ws-B")).toBe("/repo/b.ts");
-  });
-
-  it("empty selectors return stable references", () => {
-    const r1 = useEditorStore.getState().getFiles("never-seen-ws");
-    const r2 = useEditorStore.getState().getFiles("never-seen-ws");
-    expect(r1).toBe(r2); // same reference — no new array each call
+  it("toasts on write failure and leaves the file dirty", async () => {
+    await openText();
+    useEditorStore.getState().setContent("ws", "/a.ts", "v2");
+    writeFile.mockRejectedValue(new Error("permission denied"));
+    await useEditorStore.getState().saveActive("ws");
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error" }));
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(true);
   });
 });

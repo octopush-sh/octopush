@@ -217,6 +217,7 @@ pub fn run() {
             commands::read_directory,
             // File I/O
             commands::read_file,
+            commands::read_file_checked,
             commands::write_file,
             // File edits (Review canvas)
             commands::list_file_edits,
