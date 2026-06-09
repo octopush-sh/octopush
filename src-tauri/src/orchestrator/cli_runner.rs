@@ -7,7 +7,7 @@
 //! human control point.
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::runner::{artifact_kind_for, system_prompt_for, user_input_for, AgentRunner, StageContext};
+use crate::orchestrator::runner::{artifact_kind_for, parse_verdict, system_prompt_for, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
 use serde_json::Value;
@@ -185,6 +185,7 @@ pub fn parse_cli_result(
             } else {
                 parsed.result.clone()
             }),
+            verdict: None,
         });
     }
 
@@ -193,7 +194,7 @@ pub fn parse_cli_result(
     Ok(StageOutcome {
         artifact: StageArtifact {
             kind,
-            text: parsed.result,
+            text: parsed.result.clone(),
             payload: None,
             refs_worktree,
         },
@@ -203,6 +204,7 @@ pub fn parse_cli_result(
         status: StageStatus::Done,
         tool_calls: vec![],
         error: None,
+        verdict: parse_verdict(&parsed.result),
     })
 }
 
@@ -462,5 +464,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         status: StageStatus::Failed,
         tool_calls: vec![],
         error: Some(msg.to_string()),
+        verdict: None,
     }
 }

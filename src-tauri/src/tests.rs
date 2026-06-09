@@ -2161,6 +2161,7 @@ mod orchestrator_tests {
                 status: StageStatus::Done,
                 tool_calls: vec![],
                 error: None,
+                verdict: None,
             })
         }
     }
@@ -2565,6 +2566,25 @@ mod cli_template_tests {
         assert_eq!(implement.substrate, "cli");
         assert!(implement.agent_model.contains("claude") || implement.agent_model == "sonnet");
         assert!(implement.checkpoint);
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use crate::orchestrator::runner::parse_verdict;
+    use crate::orchestrator::types::ReviewVerdict;
+
+    #[test]
+    fn parses_pass_and_changes_and_handles_noise() {
+        assert_eq!(parse_verdict("looks good\nVERDICT: PASS"), Some(ReviewVerdict::Pass));
+        assert_eq!(parse_verdict("issues found\nVERDICT: CHANGES_REQUESTED\n"), Some(ReviewVerdict::ChangesRequested));
+        // last verdict line wins
+        assert_eq!(parse_verdict("VERDICT: PASS\n...\nVERDICT: CHANGES_REQUESTED"), Some(ReviewVerdict::ChangesRequested));
+        // case/space tolerant
+        assert_eq!(parse_verdict("  verdict:  pass  "), Some(ReviewVerdict::Pass));
+        // missing / malformed → None (caller gates)
+        assert_eq!(parse_verdict("no verdict here"), None);
+        assert_eq!(parse_verdict("VERDICT: maybe"), None);
     }
 }
 

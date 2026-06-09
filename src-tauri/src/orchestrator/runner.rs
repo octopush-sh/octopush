@@ -105,6 +105,25 @@ pub fn user_input_for(
     s
 }
 
+/// Parse the LAST `VERDICT: PASS|CHANGES_REQUESTED` line from a review stage's
+/// output (case/space tolerant). `None` when absent or malformed — the caller
+/// then falls back to a gated checkpoint rather than looping blindly.
+pub fn parse_verdict(text: &str) -> Option<crate::orchestrator::types::ReviewVerdict> {
+    use crate::orchestrator::types::ReviewVerdict;
+    let mut found = None;
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("VERDICT:").or_else(|| l.strip_prefix("verdict:")) {
+            match rest.trim().to_ascii_uppercase().as_str() {
+                "PASS" => found = Some(ReviewVerdict::Pass),
+                "CHANGES_REQUESTED" => found = Some(ReviewVerdict::ChangesRequested),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
 /// The API substrate: runs a stage through the in-app LLM tool-loop.
 pub struct ApiRunner;
 
@@ -147,7 +166,7 @@ impl AgentRunner for ApiRunner {
                 Ok(StageOutcome {
                     artifact: StageArtifact {
                         kind,
-                        text: r.text,
+                        text: r.text.clone(),
                         payload: None,
                         refs_worktree,
                     },
@@ -157,6 +176,7 @@ impl AgentRunner for ApiRunner {
                     status: StageStatus::Done,
                     tool_calls: r.tool_calls,
                     error: None,
+                    verdict: parse_verdict(&r.text),
                 })
             }
             Err(e) => Ok(StageOutcome {
@@ -172,6 +192,7 @@ impl AgentRunner for ApiRunner {
                 status: StageStatus::Failed,
                 tool_calls: vec![],
                 error: Some(e.to_string()),
+                verdict: None,
             }),
         }
     }

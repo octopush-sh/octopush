@@ -54,6 +54,14 @@ impl AgentSubstrate {
     }
 }
 
+/// A review stage's structured pass/changes-requested signal (auto mode).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewVerdict {
+    Pass,
+    ChangesRequested,
+}
+
 /// How a review stage's loop-back behaves. Persisted as text in
 /// `*_stages.loop_mode`; absent/unknown ⇒ no loop (linear).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -185,6 +193,8 @@ pub struct StageOutcome {
     pub tool_calls: Vec<ToolCallLog>,
     /// Present when `status == Failed`.
     pub error: Option<String>,
+    /// Parsed `VERDICT:` sentinel from a review stage's output (auto mode only).
+    pub verdict: Option<ReviewVerdict>,
 }
 
 /// What the user chose at a checkpoint.
