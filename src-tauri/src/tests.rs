@@ -2977,3 +2977,39 @@ mod live_tests {
         assert!(!looks_like_error("  \n42 lines changed"));
     }
 }
+
+#[cfg(test)]
+mod g7_git_tests {
+    use crate::git_ops::get_status;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn get_status_reports_conflicted_files() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "t@t.dev"]);
+        git(p, &["config", "user.name", "T"]);
+        std::fs::write(p.join("a.txt"), "base\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        git(p, &["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("a.txt"), "feature\n").unwrap();
+        git(p, &["commit", "-qam", "feature"]);
+        git(p, &["checkout", "-q", "-"]); // back to base branch (portable, no name assumption)
+        std::fs::write(p.join("a.txt"), "main\n").unwrap();
+        git(p, &["commit", "-qam", "main"]);
+        let _ = Command::new("git").args(["merge", "feature"]).current_dir(p).output().unwrap();
+
+        let st = get_status(p).unwrap();
+        assert!(st.conflicted >= 1, "expected a conflicted file, got {}", st.conflicted);
+        assert!(st.changed_files.iter().any(|f| f.path == "a.txt" && f.conflicted),
+            "a.txt should be marked conflicted");
+    }
+}

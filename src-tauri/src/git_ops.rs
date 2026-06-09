@@ -16,6 +16,11 @@ pub struct GitStatus {
     /// `false` means the branch has never been pushed — Publish needs to
     /// `--set-upstream` to create it.
     pub has_upstream: bool,
+    /// Count of files with an unresolved merge conflict.
+    pub conflicted: usize,
+    /// False when ahead/behind couldn't be computed in time (huge-graph timeout);
+    /// the UI hides the ↑/↓ badge rather than showing a misleading 0.
+    pub ahead_behind_known: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -27,6 +32,30 @@ pub struct FileChange {
     pub staged: bool,
     /// The file has unstaged worktree modifications.
     pub unstaged: bool,
+    /// The file is in an unresolved merge-conflict (unmerged index) state.
+    pub conflicted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullOutcome { pub kind: PullKind, pub output: String }
+
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum PullKind { Ok, Diverged, Conflict, Error }
+
+/// Classify a `git pull` result from its exit success + combined output. Pure.
+pub fn classify_pull(success: bool, combined: &str) -> PullKind {
+    let s = combined.to_lowercase();
+    if success {
+        PullKind::Ok
+    } else if s.contains("not possible to fast-forward") || s.contains("divergent") || s.contains("have diverged") {
+        PullKind::Diverged
+    } else if s.contains("conflict") || s.contains("automatic merge failed") || s.contains("could not apply") {
+        PullKind::Conflict
+    } else {
+        PullKind::Error
+    }
 }
 
 pub fn init_repo(path: &Path) -> AppResult<()> {
@@ -147,7 +176,10 @@ pub fn ensure_initial_commit(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-pub fn get_status(path: &Path) -> AppResult<GitStatus> {
+/// Branch + changed files (incl. conflict flag) + cheap has_upstream. Does NOT do the
+/// (potentially slow) ahead/behind graph walk — that's `ahead_behind`, timed at the
+/// command layer.
+pub fn status_files(path: &Path) -> AppResult<GitStatus> {
     let repo = open_repo(path)?;
     let branch = current_branch(&repo);
     let mut opts = StatusOptions::new();
@@ -157,31 +189,48 @@ pub fn get_status(path: &Path) -> AppResult<GitStatus> {
     let changed_files: Vec<FileChange> = statuses.iter().map(|entry| {
         let path = entry.path().unwrap_or("").to_string();
         let st = entry.status();
+        let conflicted = st.is_conflicted();
         let staged =
             st.is_index_new() || st.is_index_modified() || st.is_index_deleted()
             || st.is_index_renamed() || st.is_index_typechange();
         let unstaged =
             st.is_wt_new() || st.is_wt_modified() || st.is_wt_deleted()
             || st.is_wt_renamed() || st.is_wt_typechange();
-        let status = if st.is_index_new() || st.is_wt_new() { "new" }
+        let status = if conflicted { "conflicted" }
+            else if st.is_index_new() || st.is_wt_new() { "new" }
             else if st.is_index_modified() || st.is_wt_modified() { "modified" }
             else if st.is_index_deleted() || st.is_wt_deleted() { "deleted" }
             else if st.is_index_renamed() || st.is_wt_renamed() { "renamed" }
             else { "unknown" };
-        FileChange {
-            path,
-            status: status.to_string(),
-            staged,
-            unstaged,
-        }
+        FileChange { path, status: status.to_string(), staged, unstaged, conflicted }
     }).collect();
+    let conflicted = changed_files.iter().filter(|f| f.conflicted).count();
+    let has_upstream = repo
+        .head().ok()
+        .and_then(|h| h.shorthand().map(|s| s.to_string()))
+        .and_then(|name| repo.find_branch(&name, git2::BranchType::Local).ok())
+        .map(|b| b.upstream().is_ok())
+        .unwrap_or(false);
+    Ok(GitStatus {
+        branch, changed_files, ahead: 0, behind: 0, has_upstream, conflicted,
+        ahead_behind_known: false,
+    })
+}
 
-    // Compute ahead/behind against the upstream tracking branch, if any.
-    let upstream = upstream_ahead_behind(&repo);
-    let has_upstream = upstream.is_some();
-    let (ahead, behind) = upstream.unwrap_or((0, 0));
+/// Ahead/behind vs the upstream (the slow graph walk). None if no upstream / can't compute.
+pub fn ahead_behind(path: &Path) -> Option<(usize, usize)> {
+    let repo = open_repo(path).ok()?;
+    upstream_ahead_behind(&repo)
+}
 
-    Ok(GitStatus { branch, changed_files, ahead, behind, has_upstream })
+/// Fully-computed status (files + ahead/behind), synchronous. Convenience for tests/non-command callers.
+pub fn get_status(path: &Path) -> AppResult<GitStatus> {
+    let mut s = status_files(path)?;
+    if let Some((a, b)) = ahead_behind(path) {
+        s.ahead = a; s.behind = b;
+    }
+    s.ahead_behind_known = true;
+    Ok(s)
 }
 
 /// Compact git signal for the rail: `(dirty, ahead, behind)`.
@@ -563,5 +612,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).unwrap();
         assert!(last_commit(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn classify_pull_distinguishes_outcomes() {
+        use super::{classify_pull, PullKind};
+        assert_eq!(classify_pull(true, "Already up to date."), PullKind::Ok);
+        assert_eq!(classify_pull(false, "fatal: Not possible to fast-forward, aborting."), PullKind::Diverged);
+        assert_eq!(classify_pull(false, "hint: You have divergent branches"), PullKind::Diverged);
+        assert_eq!(classify_pull(false, "CONFLICT (content): Merge conflict in a.txt"), PullKind::Conflict);
+        assert_eq!(classify_pull(false, "error: Automatic merge failed"), PullKind::Conflict);
+        assert_eq!(classify_pull(false, "fatal: couldn't find remote ref"), PullKind::Error);
     }
 }
