@@ -19,13 +19,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 const MAX_CLI_TURNS: u32 = 30;
 const CLI_TIMEOUT_SECS: u64 = 900; // 15-minute wall-clock backstop for a hung CLI
 
-/// Frontend event for live per-stage progress lines (mirrors `RUN_EVENTS.log`).
-pub(crate) const RUN_LOG_EVENT: &str = "run://log";
-
-/// Preferred tool-input keys to surface as the one-line progress hint, in
-/// priority order — JSON object iteration order is not meaningful, so we pick
-/// the most descriptive argument explicitly before falling back to any string.
-const TOOL_HINT_KEYS: &[&str] = &["command", "file_path", "path", "pattern", "query", "url", "prompt"];
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -236,59 +229,6 @@ pub fn is_result_event(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("result")
 }
 
-/// Render a streaming NDJSON event into a concise human-readable progress line,
-/// or `None` for events that carry no user-facing progress (system init, tool
-/// results, the final result). `assistant` events surface the model's text and
-/// each tool call as `§ TOOL_NAME <hint>`.
-pub fn render_stream_event(v: &Value) -> Option<String> {
-    if v.get("type").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-    let content = v.get("message")?.get("content")?.as_array()?;
-    let mut parts: Vec<String> = Vec::new();
-    for block in content {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(t) = block.get("text").and_then(Value::as_str) {
-                    let t = t.trim();
-                    if !t.is_empty() {
-                        parts.push(t.to_string());
-                    }
-                }
-            }
-            Some("tool_use") => {
-                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                // A descriptive argument (path/command/pattern) as a one-line hint.
-                let hint = block
-                    .get("input")
-                    .and_then(Value::as_object)
-                    .and_then(|o| {
-                        TOOL_HINT_KEYS
-                            .iter()
-                            .find_map(|k| o.get(*k).and_then(Value::as_str))
-                            .or_else(|| o.values().find_map(Value::as_str))
-                    })
-                    .map(|s| {
-                        let first = s.lines().next().unwrap_or(s);
-                        let clipped: String = first.chars().take(80).collect();
-                        if first.chars().count() > 80 {
-                            format!("{clipped}…")
-                        } else {
-                            clipped
-                        }
-                    })
-                    .unwrap_or_default();
-                parts.push(format!("§ {name} {hint}").trim_end().to_string());
-            }
-            _ => {}
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
-}
 
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
 pub struct CliRunner;
@@ -357,6 +297,9 @@ impl AgentRunner for CliRunner {
         // UTF-8-only line reader would abort the whole stream on the first bad
         // byte (losing the result event). A bounded tail of recent lines is kept
         // for diagnostics when no result event ever arrives.
+        let emitter = crate::orchestrator::live::LiveEmitter::new(
+            ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
+        );
         let read_loop = async {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut result_line: Option<String> = None;
@@ -384,15 +327,8 @@ impl AgentRunner for CliRunner {
                 if is_result_event(&value) {
                     result_line = Some(trimmed.to_string());
                 }
-                if let Some(rendered) = render_stream_event(&value) {
-                    ctx.events.emit(
-                        RUN_LOG_EVENT,
-                        serde_json::json!({
-                            "runId": ctx.run_id,
-                            "stageId": ctx.stage_id,
-                            "line": rendered,
-                        }),
-                    );
+                for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
+                    emitter.emit_raw_entry(entry);
                 }
             }
             (result_line, tail)

@@ -2565,64 +2565,28 @@ mod cli_args_tests {
 
 #[cfg(test)]
 mod cli_stream_tests {
-    use crate::orchestrator::cli_runner::{is_result_event, render_stream_event};
+    use crate::orchestrator::cli_runner::is_result_event;
     use serde_json::json;
 
     #[test]
-    fn result_event_is_detected_and_not_rendered_as_progress() {
+    fn result_event_is_detected() {
         let v = json!({"type":"result","subtype":"success","result":"done","is_error":false});
         assert!(is_result_event(&v));
-        // The result text is the artifact, not a progress line.
-        assert_eq!(render_stream_event(&v), None);
     }
 
     #[test]
-    fn assistant_text_block_renders_as_a_progress_line() {
+    fn non_result_event_is_not_detected() {
         let v = json!({
             "type":"assistant",
             "message":{"content":[{"type":"text","text":"  Reading the codebase.  "}]}
         });
         assert!(!is_result_event(&v));
-        assert_eq!(render_stream_event(&v).as_deref(), Some("Reading the codebase."));
     }
 
     #[test]
-    fn assistant_tool_use_renders_with_glyph_name_and_hint() {
-        let v = json!({
-            "type":"assistant",
-            "message":{"content":[
-                {"type":"tool_use","name":"Edit","input":{"file_path":"src/lib.rs","old":"a"}}
-            ]}
-        });
-        assert_eq!(render_stream_event(&v).as_deref(), Some("§ Edit src/lib.rs"));
-    }
-
-    #[test]
-    fn tool_use_hint_prefers_a_descriptive_key_over_map_order() {
-        // `content` sorts before `file_path` alphabetically; the hint must still
-        // surface the path, not the (possibly huge) file body.
-        let v = json!({
-            "type":"assistant",
-            "message":{"content":[
-                {"type":"tool_use","name":"Write","input":{"content":"AAAA","file_path":"src/x.rs"}}
-            ]}
-        });
-        assert_eq!(render_stream_event(&v).as_deref(), Some("§ Write src/x.rs"));
-    }
-
-    #[test]
-    fn system_and_user_events_produce_no_progress_line() {
-        assert_eq!(render_stream_event(&json!({"type":"system","subtype":"init"})), None);
-        assert_eq!(
-            render_stream_event(&json!({"type":"user","message":{"content":[]}})),
-            None
-        );
-    }
-
-    #[test]
-    fn empty_assistant_content_yields_nothing() {
-        let v = json!({"type":"assistant","message":{"content":[]}});
-        assert_eq!(render_stream_event(&v), None);
+    fn system_and_user_events_are_not_result() {
+        assert!(!is_result_event(&json!({"type":"system","subtype":"init"})));
+        assert!(!is_result_event(&json!({"type":"user","message":{"content":[]}})));
     }
 }
 
@@ -2971,5 +2935,17 @@ mod live_tests {
         // result/system → none
         assert!(entries_from_stream_event(&json!({"type":"result","subtype":"success"})).is_empty());
         assert!(entries_from_stream_event(&json!({"type":"system","subtype":"init"})).is_empty());
+    }
+
+    #[test]
+    fn cli_stream_tool_result_reflects_is_error() {
+        let err = serde_json::json!({"type":"user","message":{"content":[
+            {"type":"tool_result","is_error":true,"content":"boom: file not found"}
+        ]}});
+        let es = crate::orchestrator::live::entries_from_stream_event(&err);
+        assert_eq!(es.len(), 1);
+        assert_eq!(es[0]["kind"], "tool_result");
+        assert_eq!(es[0]["ok"], false);
+        assert_eq!(es[0]["detail"], "boom: file not found");
     }
 }
