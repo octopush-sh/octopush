@@ -105,6 +105,21 @@ pub fn user_input_for(
     s
 }
 
+const VERDICT_INSTRUCTION: &str = "\n\nThis is an automated review. After your findings, end your \
+    response with EXACTLY ONE line, on its own line: `VERDICT: PASS` if the changes are acceptable, \
+    or `VERDICT: CHANGES_REQUESTED` if they must be revised. Emit nothing after that line.";
+
+/// `system_prompt_for(role)` plus the auto-mode verdict instruction when this is
+/// an auto-loop stage.
+pub fn system_prompt_with_loop(role: &str, loop_mode: Option<crate::orchestrator::types::LoopMode>) -> String {
+    let base = system_prompt_for(role);
+    if matches!(loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)) {
+        format!("{base}{VERDICT_INSTRUCTION}")
+    } else {
+        base
+    }
+}
+
 /// Parse the LAST `VERDICT: PASS|CHANGES_REQUESTED` line from a review stage's
 /// output (case/space tolerant). `None` when absent or malformed — the caller
 /// then falls back to a gated checkpoint rather than looping blindly.
@@ -136,7 +151,7 @@ impl AgentRunner for ApiRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
-        let system = system_prompt_for(&stage.role);
+        let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
         let result = run_agentic_loop(

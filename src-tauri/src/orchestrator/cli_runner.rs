@@ -7,7 +7,7 @@
 //! human control point.
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::runner::{artifact_kind_for, parse_verdict, system_prompt_for, user_input_for, AgentRunner, StageContext};
+use crate::orchestrator::runner::{artifact_kind_for, parse_verdict, system_prompt_with_loop, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
 use serde_json::Value;
@@ -301,7 +301,7 @@ impl AgentRunner for CliRunner {
         input: &StageArtifact,
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
-        let system = system_prompt_for(&stage.role);
+        let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
         let args = build_cli_args(&stage.agent_model, &system);
 

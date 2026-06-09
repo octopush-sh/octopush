@@ -1862,6 +1862,18 @@ mod runner_helpers_tests {
     }
 
     #[test]
+    fn auto_review_prompt_requests_a_verdict() {
+        use crate::orchestrator::runner::system_prompt_with_loop;
+        use crate::orchestrator::types::LoopMode;
+        let auto = system_prompt_with_loop("code_review", Some(LoopMode::Auto));
+        assert!(auto.contains("VERDICT:"));
+        let gated = system_prompt_with_loop("code_review", Some(LoopMode::Gated));
+        assert!(!gated.contains("VERDICT:"));
+        let plain = system_prompt_with_loop("implement", None);
+        assert!(!plain.contains("VERDICT:"));
+    }
+
+    #[test]
     fn user_input_includes_task_and_prior_artifact() {
         let prior = StageArtifact {
             kind: ArtifactKind::Plan,
