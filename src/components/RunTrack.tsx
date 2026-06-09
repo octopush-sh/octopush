@@ -1,5 +1,7 @@
-import type { Run, RunStage } from "../lib/ipc";
+import type { LiveEntry, Run, RunStage } from "../lib/ipc";
 import { stageStatusMeta } from "../lib/runStatus";
+import { useRunsStore } from "../stores/runsStore";
+import { useElapsed } from "../hooks/useElapsed";
 
 const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 
@@ -8,6 +10,25 @@ interface Props {
   stages: RunStage[];
   selectedStageId: string | null;
   onSelectStage: (stageId: string) => void;
+}
+
+const EMPTY_ENTRIES: LiveEntry[] = [];
+
+/** One-line "current activity" from the most recent meaningful live entry. */
+function lastActivity(entries: LiveEntry[]): string {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.kind === "tool") return `§ ${e.tool}${e.hint ? " " + e.hint : ""}`;
+    if (e.kind === "text") return e.text.split("\n")[0].slice(0, 60);
+    if (e.kind === "notice") return e.text;
+  }
+  return "";
+}
+
+/** The latest verdict notice (for a finished review), or "". */
+function lastNotice(entries: LiveEntry[]): string {
+  for (let i = entries.length - 1; i >= 0; i--) if (entries[i].kind === "notice") return (entries[i] as { text: string }).text;
+  return "";
 }
 
 export function RunTrack({ run: _run, stages, selectedStageId, onSelectStage }: Props) {
@@ -26,34 +47,55 @@ export function RunTrack({ run: _run, stages, selectedStageId, onSelectStage }: 
                 {stages[i - 1].checkpoint ? "⟜" : "⟶"}
               </div>
             )}
-            <button
-              type="button"
-              onClick={() => onSelectStage(s.id)}
-              className={`flex min-w-0 flex-1 flex-col gap-1 rounded-lg border px-3 py-2 text-left transition-colors octo-rise-in ${
-                s.id === selectedStageId
-                  ? "border-octo-brass bg-[var(--brass-ghost)]"
-                  : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
-              }`}
-            >
-              <span className="font-mono text-[10px] text-octo-brass">
-                {ROMAN[i] ?? i + 1}{" "}
-                <span className={stageStatusMeta(s.status).className}>
-                  {stageStatusMeta(s.status).label}
-                </span>
-              </span>
-              <span className="font-serif text-sm text-octo-ivory">{labelForRole(s.role)}</span>
-              <span className="flex items-center gap-2 font-mono text-[9px] text-octo-sage">
-                {s.agentModel}
-                <SubstratePill substrate={s.substrate} />
-              </span>
-              <span className="mt-auto font-mono text-[10px] text-octo-mute">
-                ${s.costUsd.toFixed(2)}
-              </span>
-            </button>
+            <StageCard
+              stage={s}
+              index={i}
+              selected={s.id === selectedStageId}
+              onSelect={() => onSelectStage(s.id)}
+            />
           </div>
         ))}
       </div>
     </div>
+  );
+}
+
+function StageCard({ stage: s, index, selected, onSelect }: {
+  stage: RunStage; index: number; selected: boolean; onSelect: () => void;
+}) {
+  const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
+  const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
+  const running = s.status === "running";
+  const activity = running ? lastActivity(entries) : "";
+  const verdict = s.status === "done" ? lastNotice(entries) : "";
+  const meta = stageStatusMeta(s.status);
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`relative flex min-w-0 flex-1 flex-col gap-1 rounded-lg border px-3 py-2 text-left transition-colors octo-rise-in ${
+        running ? "octo-stage-pulse " : ""
+      }${selected ? "border-octo-brass bg-[var(--brass-ghost)]" : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"}`}
+    >
+      {running && elapsed && (
+        <span className="absolute right-3 top-2 font-mono text-[10px] text-octo-brass">{elapsed}</span>
+      )}
+      <span className="font-mono text-[10px] text-octo-brass">
+        {ROMAN[index] ?? index + 1} <span className={meta.className}>{meta.label}</span>
+      </span>
+      <span className="font-serif text-sm text-octo-ivory">{labelForRole(s.role)}</span>
+      <span className="flex items-center gap-2 font-mono text-[9px] text-octo-sage">
+        {s.agentModel}
+        <SubstratePill substrate={s.substrate} />
+      </span>
+      {running && activity ? (
+        <span className="mt-auto truncate font-mono text-[10px] text-octo-brass">{activity}</span>
+      ) : verdict ? (
+        <span className="mt-auto truncate font-mono text-[10px] text-octo-verdigris">{verdict}</span>
+      ) : (
+        <span className="mt-auto font-mono text-[10px] text-octo-mute">${s.costUsd.toFixed(2)}</span>
+      )}
+    </button>
   );
 }
 
