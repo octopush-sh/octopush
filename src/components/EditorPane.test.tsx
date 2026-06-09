@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 
+// Shared ref so tests can reach the live EditorView mock instance.
+const hoisted = vi.hoisted(() => ({ lastView: null as unknown as { setState: ReturnType<typeof vi.fn> } | null }));
+
 // ─── Mock CodeMirror (JSDOM can't run it) ─────────────────────────
 vi.mock("@codemirror/view", () => {
   class EditorViewMock {
@@ -10,7 +13,7 @@ vi.mock("@codemirror/view", () => {
     dispatch = vi.fn();
     setState = vi.fn();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    constructor(_config: any) {}
+    constructor(_config: any) { hoisted.lastView = this; }
     static updateListener = { of: vi.fn(() => ({})) };
     static theme = vi.fn(() => ({}));
     static lineWrapping = {};
@@ -141,5 +144,27 @@ describe("EditorPane", () => {
       />,
     );
     expect(screen.getByTestId("editor-host")).toBeInTheDocument();
+  });
+
+  it("clears the editor view when the last tab closes (no stale content behind overlay)", () => {
+    // Start with an active file, then re-render with no active file —
+    // the same persistent view must be cleared so the previous file's
+    // content does not linger behind the empty-state overlay.
+    const { rerender } = render(
+      <EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />,
+    );
+    const view = hoisted.lastView!;
+    expect(view).toBeTruthy();
+    const callsBefore = view.setState.mock.calls.length;
+
+    rerender(
+      <EditorPane workspaceId="ws-no-active" workspacePath="/repo" diffText="" />,
+    );
+
+    expect(
+      screen.getByText("Select a file from the tree to begin."),
+    ).toBeInTheDocument();
+    // The swap effect cleared the view (an extra setState after the close).
+    expect(view.setState.mock.calls.length).toBeGreaterThan(callsBefore);
   });
 });

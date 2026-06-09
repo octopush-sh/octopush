@@ -160,7 +160,15 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   // Swap the document state when the active file changes; preserve per-tab state.
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || !activeFile) return;
+    if (!view) return;
+
+    // No active file (e.g. the last tab was just closed): clear the view so the
+    // previous file's content doesn't linger behind the empty-state overlay.
+    if (!activeFile) {
+      view.setState(EditorState.create({ doc: "" }));
+      lastPathRef.current = null;
+      return;
+    }
 
     const prevPath = lastPathRef.current;
     if (prevPath && prevPath !== activeFile.path) {
