@@ -6,8 +6,8 @@ import type { OpenFile } from "../stores/editorStore";
 // ─── Mock the editorStore ─────────────────────────────────────────
 
 const mockFiles: OpenFile[] = [
-  { path: "/repo/foo.ts", content: "abc", savedContent: "abc", lang: "javascript" },
-  { path: "/repo/bar.ts", content: "edited", savedContent: "original", lang: "javascript" },
+  { path: "/repo/foo.ts", content: "abc", savedContent: "abc", lang: "javascript", kind: "text", mtime: 0, size: 0 },
+  { path: "/repo/bar.ts", content: "edited", savedContent: "original", lang: "javascript", kind: "text", mtime: 0, size: 0 },
 ];
 
 const mockSetActive = vi.fn();
