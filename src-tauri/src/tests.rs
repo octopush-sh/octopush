@@ -2323,6 +2323,41 @@ mod orchestrator_tests {
         assert_eq!(stages[0].status, "done");                  // implement
         assert_eq!(stages[1].status, "awaiting_checkpoint");   // code_review parked (gated loop)
     }
+
+    #[tokio::test]
+    async fn send_back_resets_range_increments_and_retires_cost() {
+        let (orch, run_id, db) = looped_run(2);
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        let before = db.lock().list_run_stages(&run_id).unwrap();
+        let review_id = before[1].id.clone();
+        let spent_before = db.lock().get_run(&run_id).unwrap().unwrap().cost_usd;
+
+        let status = orch.resolve_checkpoint(
+            &run_id,
+            CheckpointAction::SendBack { feedback: Some("fix the bug".into()) },
+        ).await.unwrap();
+
+        let after = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(after[1].status, "awaiting_checkpoint");
+        let review = after.iter().find(|s| s.id == review_id).unwrap();
+        assert_eq!(review.loop_iterations, 1);
+        assert_eq!(after[0].feedback.as_deref(), Some("fix the bug"));
+        let spent_after = db.lock().get_run(&run_id).unwrap().unwrap().cost_usd;
+        assert!(spent_after + 1e-9 >= spent_before);
+    }
+
+    #[tokio::test]
+    async fn send_back_at_cap_does_not_loop() {
+        let (orch, run_id, db) = looped_run(1);
+        orch.run_to_pause(&run_id).await.unwrap();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert_eq!(status, RunStatus::Completed);
+    }
 }
 
 #[cfg(test)]

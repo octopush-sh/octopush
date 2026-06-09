@@ -392,6 +392,35 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
+            CheckpointAction::SendBack { feedback } => {
+                if let Some(review) = &blocked {
+                    let target = review.loop_target_position;
+                    let at_cap = review.loop_iterations >= review.loop_max_iterations;
+                    match (target, at_cap) {
+                        (Some(target_pos), false) => {
+                            // Retire the cost of every stage we're about to reset,
+                            // then reset the contiguous [target..=review] range to pending.
+                            for s in &stages {
+                                if s.position >= target_pos && s.position <= review.position {
+                                    self.db.lock().retire_stage_cost(
+                                        run_id, s.cost_usd, s.input_tokens, s.output_tokens,
+                                    )?;
+                                    // Inject the reviewer feedback onto the target stage only.
+                                    let fb = if s.position == target_pos { feedback.as_deref() } else { None };
+                                    self.db.lock().reset_run_stage(&s.id, None, fb)?;
+                                }
+                            }
+                            self.db.lock().increment_loop_iteration(&review.id)?;
+                            self.recompute_run_cost(run_id)?;
+                        }
+                        // No loop target, or cap reached → accept the review and move on
+                        // (same effect as Approve).
+                        _ => {
+                            self.db.lock().set_run_stage_status(&review.id, "done")?;
+                        }
+                    }
+                }
+            }
         }
 
         self.run_to_pause(run_id).await

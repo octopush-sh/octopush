@@ -195,6 +195,11 @@ pub enum CheckpointAction {
         feedback: Option<String>,
         model_override: Option<String>,
     },
+    /// Route work back to the review stage's `loop_target` (re-run the target +
+    /// intervening stages with the reviewer's findings), bounded by the cap.
+    SendBack {
+        feedback: Option<String>,
+    },
     /// Artifact was edited out-of-band; continue.
     Edit,
     Abort,
