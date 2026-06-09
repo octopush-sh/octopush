@@ -1549,9 +1549,12 @@ impl Db {
                 .unwrap_or(s.agent_model.as_str());
             let sid = Uuid::new_v4().to_string();
             self.conn.execute(
-                "INSERT INTO run_stages (id, run_id, position, role, agent_model, substrate, checkpoint, status)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending')",
-                params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64],
+                "INSERT INTO run_stages
+                    (id, run_id, position, role, agent_model, substrate, checkpoint, status,
+                     loop_target_position, loop_max_iterations, loop_mode)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10)",
+                params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
+                        s.loop_target_position, s.loop_max_iterations, s.loop_mode],
             )?;
         }
         Ok(id)
@@ -1583,7 +1586,8 @@ impl Db {
     pub fn list_run_stages(&self, run_id: &str) -> AppResult<Vec<RunStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
-                    input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at
+                    input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
+                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1604,6 +1608,10 @@ impl Db {
                 error: r.get(13)?,
                 started_at: r.get(14)?,
                 finished_at: r.get(15)?,
+                loop_target_position: r.get(16)?,
+                loop_max_iterations: r.get(17)?,
+                loop_mode: r.get(18)?,
+                loop_iterations: r.get(19)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1704,6 +1712,15 @@ impl Db {
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],
+        )?;
+        Ok(())
+    }
+
+    /// Bump the loop-back counter on a review stage that triggered a loop.
+    pub fn increment_loop_iteration(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET loop_iterations = loop_iterations + 1 WHERE id = ?1",
+            params![stage_id],
         )?;
         Ok(())
     }
@@ -1877,6 +1894,10 @@ pub struct RunStageRow {
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    pub loop_target_position: Option<i64>,
+    pub loop_max_iterations: i64,
+    pub loop_mode: Option<String>,
+    pub loop_iterations: i64,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {

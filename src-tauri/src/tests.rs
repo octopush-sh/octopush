@@ -2047,6 +2047,26 @@ mod run_crud_tests {
         assert_eq!(stages[1].loop_max_iterations, 2);
         assert_eq!(stages[1].loop_mode.as_deref(), Some("gated"));
     }
+
+    #[test]
+    fn create_run_copies_loop_config_and_counter_increments() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated")).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let stages = db.list_run_stages(&run).unwrap();
+        assert_eq!(stages[1].loop_target_position, Some(0));
+        assert_eq!(stages[1].loop_max_iterations, 2);
+        assert_eq!(stages[1].loop_mode.as_deref(), Some("gated"));
+        assert_eq!(stages[1].loop_iterations, 0);
+
+        db.increment_loop_iteration(&stages[1].id).unwrap();
+        let after = db.list_run_stages(&run).unwrap();
+        assert_eq!(after[1].loop_iterations, 1);
+    }
 }
 
 #[cfg(test)]
