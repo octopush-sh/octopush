@@ -39,7 +39,7 @@ Status Index → open that stream's spec/plan → branch `feat/review-g<N>-<slug
 | G5 AI Review Intelligence | slice 1 done (merged to main, PR #12) | [design](../specs/2026-06-08-review-g5-ai-review-pass-design.md) | [plan](2026-06-08-review-g5-ai-review-pass.md) | merged |
 | G1 Editor Engine | slice 1 done (merged to main, PR #13) | [design](../specs/2026-06-08-review-g1-editor-engine-design.md) | [plan](2026-06-08-review-g1-editor-engine.md) | merged |
 | G2 Editor Reliability | slice 1 done (merged to main, PR #18) | [design](../specs/2026-06-09-review-g2-editor-reliability-design.md) | [plan](2026-06-09-review-g2-editor-reliability.md) | merged |
-| G4 Staging & Commit | not started | — | — | — |
+| G4 Staging & Commit | slice 1 done (merged to main, PR #20) | [design](../specs/2026-06-09-review-g4-staging-commit-design.md) | [plan](2026-06-09-review-g4-staging-commit.md) | merged |
 | G7 Git Operations Depth | not started | — | — | — |
 | G6 File Explorer | not started | — | — | — |
 
@@ -73,6 +73,11 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **Slice II — External-change safety:** standalone `file_meta` (size+mtime) command; on window-focus and before-save, compare disk `mtime` vs the tracked `OpenFile.mtime` (Slice 1 already captures + refreshes it on save); if an agent/another app changed the file under the user, show a reload-or-overwrite `ConfirmDialog`. The scariest agentic-IDE gap. (Agents write directly via the chat tool executor `std::fs::write`, never notifying the editor.)
 - **Slice III — Auto-save (optional):** `autoSave` toggle in `editorPrefsStore` + debounced save.
 - **Process lesson:** the stream's explore must grep for an EXISTING util before a plan says "create" one. `formatBytes` already existed (used by `PerfMonitorBar`); G2 recreated it and broke 4 tests before reverting to reuse. Check `src/lib/*` for collisions during explore.
+
+**From G4 slice 1 (deferred — slice II/III + review debt):**
+- **Slice II — Unified staging model + staged dimming:** make the Review diff include staged changes (the `get_staged_diff` command shipped in G4-s1 is the building block) so an accepted hunk *dims in place* via the `HunkRail.staged` hook instead of vanishing; reconcile the per-file toggle with G3's per-hunk Accept into one mental model; discard-hunk; wire the **`/` file-filter** (G4-s1 wired only `c`); rename-display polish.
+- **Slice III — Per-line staging** (`git add -p` granularity).
+- **Review debt (optional, non-blocking):** extract a shared `git_commit_via_login_shell` helper (`amend_commit` duplicates `commit_changes`); a single shared `DEFAULT_MODEL` constant (the `"claude-sonnet-4-6"` literal is repeated in aiReviewStore/chatStore/ChangesPanel); symlink-hardening of `discard_file_inner`'s containment guard.
 
 ---
 
