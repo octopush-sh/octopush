@@ -2851,3 +2851,69 @@ mod g4_staging_tests {
         assert!(!dir.path().join("feature").exists(), "untracked dir should be removed");
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::live::{entries_from_stream_event, summarize, tool_hint, LiveEmitter};
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+
+    struct Recorder { events: Mutex<Vec<(String, Value)>> }
+    impl EventSink for Recorder {
+        fn emit(&self, event: &str, payload: Value) { self.events.lock().push((event.to_string(), payload)); }
+    }
+
+    #[test]
+    fn live_emitter_emits_structured_run_log_entries() {
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "run1", "stageA");
+        em.text("  reading the code  ");
+        em.tool("Edit", "src/auth.rs");
+        em.tool_result(true, "12 lines");
+        em.notice("Verdict: changes requested");
+        em.text("   "); // blank → skipped
+
+        let ev = rec.events.lock();
+        assert_eq!(ev.len(), 4); // blank text skipped
+        for (name, _) in ev.iter() { assert_eq!(name, "run://log"); }
+        assert_eq!(ev[0].1, json!({"runId":"run1","stageId":"stageA","entry":{"kind":"text","text":"reading the code"}}));
+        assert_eq!(ev[1].1, json!({"runId":"run1","stageId":"stageA","entry":{"kind":"tool","tool":"Edit","hint":"src/auth.rs"}}));
+        assert_eq!(ev[2].1, json!({"runId":"run1","stageId":"stageA","entry":{"kind":"tool_result","ok":true,"detail":"12 lines"}}));
+        assert_eq!(ev[3].1, json!({"runId":"run1","stageId":"stageA","entry":{"kind":"notice","text":"Verdict: changes requested"}}));
+    }
+
+    #[test]
+    fn tool_hint_prefers_descriptive_keys_and_summarize_caps() {
+        assert_eq!(tool_hint(&json!({"content":"AAAA","file_path":"src/x.rs"})), "src/x.rs");
+        assert_eq!(tool_hint(&json!({"command":"cargo test"})), "cargo test");
+        assert_eq!(tool_hint(&json!({})), "");
+        // summarize: first line, capped at 120 chars
+        assert_eq!(summarize("ok\nmore"), "ok");
+        let long = "x".repeat(200);
+        assert_eq!(summarize(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn entries_from_stream_event_maps_assistant_and_skips_result() {
+        // assistant text + tool_use → [text, tool]
+        let asst = json!({"type":"assistant","message":{"content":[
+            {"type":"text","text":"reviewing"},
+            {"type":"tool_use","name":"Read","input":{"file_path":"src/a.rs"}}
+        ]}});
+        let es = entries_from_stream_event(&asst);
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[0], json!({"kind":"text","text":"reviewing"}));
+        assert_eq!(es[1], json!({"kind":"tool","tool":"Read","hint":"src/a.rs"}));
+        // user tool_result → [tool_result]
+        let user = json!({"type":"user","message":{"content":[
+            {"type":"tool_result","is_error":false,"content":"42 lines"}
+        ]}});
+        let ue = entries_from_stream_event(&user);
+        assert_eq!(ue.len(), 1);
+        assert_eq!(ue[0], json!({"kind":"tool_result","ok":true,"detail":"42 lines"}));
+        // result/system → none
+        assert!(entries_from_stream_event(&json!({"type":"result","subtype":"success"})).is_empty());
+        assert!(entries_from_stream_event(&json!({"type":"system","subtype":"init"})).is_empty());
+    }
+}

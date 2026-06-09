@@ -3,6 +3,7 @@
 
 pub mod agentic;
 pub mod cli_runner;
+pub mod live;
 pub mod cost;
 pub mod events;
 pub mod runner;
