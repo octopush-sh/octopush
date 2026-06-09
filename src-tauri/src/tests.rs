@@ -1733,10 +1733,18 @@ mod orchestrator_types_tests {
 #[cfg(test)]
 mod agentic_loop_tests {
     use crate::orchestrator::agentic::run_agentic_loop;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::live::LiveEmitter;
     use crate::providers::{
         LlmProvider, LlmRequest, LlmResponse, LlmStopReason, LlmToolUse,
     };
     use parking_lot::Mutex;
+    use serde_json::Value;
+
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+    }
 
     /// A provider that returns a scripted sequence of responses.
     struct ScriptedProvider {
@@ -1787,6 +1795,8 @@ mod agentic_loop_tests {
             ]),
         };
         let client = reqwest::Client::new();
+        let sink = NoopSink;
+        let emitter = LiveEmitter::new(&sink, "test-run", "test-stage");
         let result = run_agentic_loop(
             &provider,
             "http://unused",
@@ -1797,6 +1807,7 @@ mod agentic_loop_tests {
             "do something",
             tmp.path(),
             25,
+            &emitter,
         )
         .await
         .unwrap();
@@ -2858,6 +2869,51 @@ mod live_tests {
     use crate::orchestrator::live::{entries_from_stream_event, summarize, tool_hint, LiveEmitter};
     use parking_lot::Mutex;
     use serde_json::{json, Value};
+    use crate::orchestrator::agentic::run_agentic_loop;
+    use crate::providers::{LlmProvider, LlmRequest, LlmResponse, LlmStopReason, LlmToolUse};
+    use std::collections::VecDeque;
+
+    struct ScriptedProvider { turns: Mutex<VecDeque<LlmResponse>> }
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn complete(&self, _b: &str, _k: Option<&str>, _r: &LlmRequest, _c: &reqwest::Client)
+            -> crate::error::AppResult<LlmResponse> {
+            Ok(self.turns.lock().pop_front().expect("ScriptedProvider ran out of turns"))
+        }
+    }
+    fn resp(text: &str, tools: Vec<LlmToolUse>, stop: LlmStopReason) -> LlmResponse {
+        LlmResponse { text: text.into(), tool_uses: tools, stop_reason: stop,
+            input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 }
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_streams_text_tool_and_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("inspecting the change",
+                 vec![LlmToolUse { id: "t1".into(), name: "read_file".into(),
+                       input: serde_json::json!({"path": "a.rs"}) }],
+                 LlmStopReason::ToolUse),
+            resp("looks good", vec![], LlmStopReason::EndTurn),
+        ])) };
+
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 10, &em).await.unwrap();
+
+        assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
+        let kinds: Vec<String> = rec.events.lock().iter()
+            .map(|(_, p)| p["entry"]["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
+        // the tool entry carries the name + hint
+        let tool = &rec.events.lock()[1].1["entry"];
+        assert_eq!(tool["tool"], "read_file");
+        assert_eq!(tool["hint"], "a.rs");
+    }
 
     struct Recorder { events: Mutex<Vec<(String, Value)>> }
     impl EventSink for Recorder {

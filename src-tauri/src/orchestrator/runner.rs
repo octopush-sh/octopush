@@ -158,6 +158,8 @@ impl AgentRunner for ApiRunner {
         let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
+        let emitter = crate::orchestrator::live::LiveEmitter::new(
+            ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
         let result = run_agentic_loop(
             provider.as_ref(),
             &api_base,
@@ -168,6 +170,7 @@ impl AgentRunner for ApiRunner {
             &user,
             &ctx.workspace_path,
             MAX_STAGE_ITERATIONS,
+            &emitter,
         )
         .await;
 
@@ -182,6 +185,13 @@ impl AgentRunner for ApiRunner {
                 );
                 let kind = artifact_kind_for(&stage.role);
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
+                let verdict = parse_verdict(&r.text);
+                if let Some(v) = &verdict {
+                    emitter.notice(match v {
+                        crate::orchestrator::types::ReviewVerdict::Pass => "Verdict: passed",
+                        crate::orchestrator::types::ReviewVerdict::ChangesRequested => "Verdict: changes requested",
+                    });
+                }
                 Ok(StageOutcome {
                     artifact: StageArtifact {
                         kind,
@@ -195,7 +205,7 @@ impl AgentRunner for ApiRunner {
                     status: StageStatus::Done,
                     tool_calls: r.tool_calls,
                     error: None,
-                    verdict: parse_verdict(&r.text),
+                    verdict,
                 })
             }
             Err(e) => Ok(StageOutcome {

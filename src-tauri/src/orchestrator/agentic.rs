@@ -34,6 +34,7 @@ pub async fn run_agentic_loop(
     initial_user: &str,
     workspace_path: &Path,
     max_iterations: usize,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
 ) -> AppResult<AgenticResult> {
     let tools = build_llm_tools();
     let mut messages: Vec<LlmMessage> = vec![LlmMessage {
@@ -90,6 +91,9 @@ pub async fn run_agentic_loop(
             return Ok(out);
         }
 
+        // Emit narration text before processing tool calls.
+        emitter.text(&resp.text);
+
         // Record the assistant tool-use turn.
         messages.push(LlmMessage {
             role: LlmRole::Assistant,
@@ -102,7 +106,9 @@ pub async fn run_agentic_loop(
         // Execute each tool, collect results + log.
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
+            emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
             let result = execute_tool(workspace_path, &u.name, &u.input);
+            emitter.tool_result(true, &crate::orchestrator::live::summarize(&result));
             out.tool_calls.push(ToolCallLog {
                 name: u.name.clone(),
                 input: u.input.clone(),
