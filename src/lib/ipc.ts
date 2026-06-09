@@ -16,6 +16,9 @@ export interface PipelineStage {
   agentModel: string;
   substrate: AgentSubstrate;
   checkpoint: boolean;
+  loopTargetPosition: number | null;
+  loopMaxIterations: number;
+  loopMode: "gated" | "auto" | null;
 }
 export interface Pipeline {
   id: string;
@@ -58,12 +61,16 @@ export interface RunStage {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  loopTargetPosition: number | null;
+  loopMaxIterations: number;
+  loopMode: "gated" | "auto" | null;
+  loopIterations: number;
 }
 export interface RunDetail {
   run: Run | null;
   stages: RunStage[];
 }
-export type CheckpointActionName = "approve" | "reject" | "edit" | "abort";
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back";
 
 export type FileReadResult =
   | { kind: "text"; content: string; size: number; mtime: number }
