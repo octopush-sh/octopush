@@ -10,7 +10,7 @@
  * this panel deliberately doesn't restate it.
  */
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   FilePlus,
   FileEdit,
@@ -22,8 +22,11 @@ import {
   GitCommit,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
+import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
 
@@ -37,18 +40,30 @@ interface Props {
   /** Optional: called after a successful commit or push, so the parent can
    *  refresh git status / diff downstream. */
   onChange?: () => void;
+  /** Optional: hands the parent a function that focuses the commit textarea
+   *  (wired to the `c` keyboard shortcut in App). */
+  registerFocusCommit?: (fn: () => void) => void;
 }
 
 const POLL_MS = 5_000;
 
 const MAX_VISIBLE_FILES = 200;
 
-export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: Props) {
+export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, registerFocusCommit }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [committing, setCommitting] = useState(false);
   const [pushing, setPushing] = useState(false);
+  const [amend, setAmend] = useState(false);
+  const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [discardTarget, setDiscardTarget] = useState<string | null>(null);
+  const commitRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    registerFocusCommit?.(() => commitRef.current?.focus());
+  }, [registerFocusCommit]);
 
   const refresh = useCallback(async () => {
     try {
@@ -110,22 +125,75 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
     }
   }
 
-  async function handleCommit() {
-    if (!commitMessage.trim() || staged.length === 0) return;
+  async function handleDraft() {
+    setDrafting(true);
+    try {
+      const d = await ipc.getStagedDiff(projectPath);
+      const r = await ipc.aiComplete("claude-sonnet-4-6", COMMIT_SYSTEM, buildCommitPrompt(d));
+      setCommitMessage(r.text.trim());
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't draft message", body: String(e) });
+    } finally {
+      setDrafting(false);
+    }
+  }
+
+  async function toggleAmend(next: boolean) {
+    if (next) {
+      try {
+        const lc = await ipc.getLastCommit(projectPath);
+        if (!lc) {
+          pushToast({ level: "info", title: "Nothing to amend", body: "This branch has no commits yet." });
+          return; // leave amend OFF
+        }
+        setAmend(true);
+        setLastCommit(lc);
+        if (commitMessage.trim() === "") {
+          setCommitMessage(lc.subject + (lc.body ? "\n\n" + lc.body : ""));
+        }
+      } catch {
+        pushToast({ level: "error", title: "Couldn't load the last commit" });
+        // leave amend OFF
+      }
+    } else {
+      setAmend(false);
+      const prefill = lastCommit ? lastCommit.subject + (lastCommit.body ? "\n\n" + lastCommit.body : "") : "";
+      if (commitMessage === prefill) setCommitMessage("");
+      setLastCommit(null);
+    }
+  }
+
+  async function handleCommitOrAmend() {
+    const msg = commitMessage.trim();
+    if (!msg || (!amend && staged.length === 0)) return;
     setCommitting(true);
     try {
-      const sha = await ipc.commitChanges(projectPath, commitMessage.trim());
+      const sha = amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
       // A commit changes the worktree's dirty state — refresh the rail signal.
       const pid = useProjectStore.getState().current?.id;
       if (pid) void useWorkspaceStore.getState().loadGitSummaries(pid);
-      pushToast({ level: "success", title: "Committed", body: sha });
-      setCommitMessage("");
+      pushToast({ level: "success", title: amend ? "Amended" : "Committed", body: sha });
+      setCommitMessage(""); setAmend(false); setLastCommit(null);
       await refresh();
       onChange?.();
     } catch (e) {
-      pushToast({ level: "error", title: "Commit failed", body: String(e) });
+      pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
     } finally {
       setCommitting(false);
+    }
+  }
+
+  async function confirmDiscard() {
+    const path = discardTarget;
+    if (!path) return;
+    setDiscardTarget(null);
+    try {
+      await ipc.discardFile(projectPath, path);
+      pushToast({ level: "success", title: "Changes discarded", body: path });
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Discard failed", body: String(e) });
     }
   }
 
@@ -147,7 +215,7 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
     }
   }
 
-  const canCommit = staged.length > 0 && commitMessage.trim().length > 0 && !committing;
+  const canCommit = commitMessage.trim().length > 0 && (amend || staged.length > 0) && !committing;
   // Push enabled when:
   //  - there are commits ahead of upstream (normal case), OR
   //  - the branch has no upstream yet AND there's at least one commit to push
@@ -186,6 +254,7 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
               busyPath={busyPath}
               onRowClick={onFileClick}
               onToggle={toggleStage}
+              onDiscard={(p) => setDiscardTarget(p)}
               toggleMode="unstage"
               emptyHint="Nothing staged."
               headerAction={
@@ -209,6 +278,7 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
               busyPath={busyPath}
               onRowClick={onFileClick}
               onToggle={toggleStage}
+              onDiscard={(p) => setDiscardTarget(p)}
               toggleMode="stage"
               emptyHint="Nothing pending."
             />
@@ -218,19 +288,55 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
 
       {/* Commit + Publish actions */}
       <div className="space-y-2 border-t border-octo-hairline p-3">
-        <textarea
-          value={commitMessage}
-          onChange={(e) => setCommitMessage(e.target.value)}
-          placeholder="Describe what you're shipping…"
-          rows={2}
-          disabled={committing}
-          className="w-full resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-1.5 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-50"
-        />
+        <div className="relative">
+          <textarea
+            ref={commitRef}
+            value={commitMessage}
+            onChange={(e) => setCommitMessage(e.target.value)}
+            placeholder="Describe the change…"
+            rows={3}
+            disabled={committing}
+            className="w-full resize-none rounded-md border border-octo-hairline bg-octo-onyx p-2 pr-16 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
+          />
+          <button
+            type="button"
+            onClick={handleDraft}
+            disabled={staged.length === 0 || drafting}
+            aria-label="Draft commit message with AI"
+            className="absolute right-2 top-2 rounded font-mono text-[9px] uppercase tracking-[0.12em] text-octo-brass transition disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            style={{ border: "1px solid var(--brass-dim)", padding: "1px 6px" }}
+          >
+            {drafting ? "…" : "✨ Draft"}
+          </button>
+        </div>
+
+        <label className="flex items-center gap-2 text-[11px] text-octo-sage">
+          <input
+            type="checkbox"
+            checked={amend}
+            disabled={committing}
+            onChange={(e) => toggleAmend(e.target.checked)}
+            aria-label="Amend last commit"
+            className="accent-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          />
+          Amend last commit
+        </label>
+        {amend && lastCommit && (
+          <div className="font-mono text-[9px] text-octo-mute">
+            ↳ folds staged into {lastCommit.shortSha} "{lastCommit.subject}"
+          </div>
+        )}
+        {amend && ahead === 0 && hasUpstream && (
+          <div className="font-mono text-[9px] text-octo-rouge">
+            Last commit is pushed — amending rewrites history.
+          </div>
+        )}
 
         <button
-          onClick={handleCommit}
+          type="button"
+          onClick={handleCommitOrAmend}
           disabled={!canCommit}
-          className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           style={{
             color: canCommit ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
             background: canCommit ? "var(--brass-ghost)" : "transparent",
@@ -244,9 +350,7 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
           ) : (
             <GitCommit size={11} />
           )}
-          {staged.length > 0
-            ? `Commit ${staged.length} file${staged.length !== 1 ? "s" : ""}`
-            : "Commit"}
+          {amend ? "Amend" : "Commit"}
         </button>
 
         <button
@@ -272,6 +376,17 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange }: 
           )}
         </button>
       </div>
+
+      {discardTarget && (
+        <ConfirmDialog
+          title="Discard changes"
+          body={`Discard changes to ${discardTarget.split("/").pop()}? This can't be undone.`}
+          destructiveLabel="Discard"
+          cancelLabel="Cancel"
+          onConfirm={confirmDiscard}
+          onCancel={() => setDiscardTarget(null)}
+        />
+      )}
     </aside>
   );
 }
@@ -285,6 +400,7 @@ function Section({
   busyPath,
   onRowClick,
   onToggle,
+  onDiscard,
   toggleMode,
   emptyHint,
   headerAction,
@@ -295,6 +411,7 @@ function Section({
   busyPath: string | null;
   onRowClick?: (path: string) => void;
   onToggle: (file: FileChange) => void;
+  onDiscard: (path: string) => void;
   toggleMode: "stage" | "unstage";
   emptyHint: string;
   headerAction?: React.ReactNode;
@@ -321,6 +438,7 @@ function Section({
               busy={busyPath === file.path}
               onClick={() => onRowClick?.(file.path)}
               onToggle={() => onToggle(file)}
+              onDiscard={onDiscard}
               toggleMode={toggleMode}
             />
           ))}
@@ -342,12 +460,14 @@ function FileRow({
   busy,
   onClick,
   onToggle,
+  onDiscard,
   toggleMode,
 }: {
   file: FileChange;
   busy: boolean;
   onClick: () => void;
   onToggle: () => void;
+  onDiscard: (path: string) => void;
   toggleMode: "stage" | "unstage";
 }) {
   return (
@@ -391,6 +511,20 @@ function FileRow({
           {shortenPath(file.path)}
         </span>
         <StatusGlyph status={file.status} />
+      </button>
+
+      {/* Discard affordance — revealed on row hover / keyboard focus. */}
+      <button
+        type="button"
+        aria-label={`Discard changes to ${file.path.split("/").pop()}`}
+        title="Discard changes to this file"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDiscard(file.path);
+        }}
+        className="ml-1 shrink-0 rounded px-1 text-[12px] leading-none text-octo-sage opacity-0 transition group-hover:opacity-70 hover:!text-octo-rouge focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        ×
       </button>
     </li>
   );
