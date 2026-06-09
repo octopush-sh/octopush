@@ -127,13 +127,17 @@ pub fn parse_verdict(text: &str) -> Option<crate::orchestrator::types::ReviewVer
     use crate::orchestrator::types::ReviewVerdict;
     let mut found = None;
     for line in text.lines() {
-        let l = line.trim();
-        if let Some(rest) = l.strip_prefix("VERDICT:").or_else(|| l.strip_prefix("verdict:")) {
-            match rest.trim().to_ascii_uppercase().as_str() {
-                "PASS" => found = Some(ReviewVerdict::Pass),
-                "CHANGES_REQUESTED" => found = Some(ReviewVerdict::ChangesRequested),
-                _ => {}
-            }
+        let upper = line.trim().to_ascii_uppercase();
+        // Tolerate "VERDICT:" and "VERDICT :" (optional space before the colon).
+        let Some(after_kw) = upper.strip_prefix("VERDICT") else { continue };
+        let Some(rest) = after_kw.trim_start().strip_prefix(':') else { continue };
+        let rest = rest.trim();
+        // Match the leading token; trailing prose (e.g. "PASS (lgtm)") is tolerated.
+        // Check CHANGES_REQUESTED first (distinct token).
+        if rest.starts_with("CHANGES_REQUESTED") {
+            found = Some(ReviewVerdict::ChangesRequested);
+        } else if rest.starts_with("PASS") {
+            found = Some(ReviewVerdict::Pass);
         }
     }
     found

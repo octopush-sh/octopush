@@ -50,7 +50,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   // Compute loop props for CheckpointBar
   let loopTargetRole: string | null = null;
   let loopState: { iteration: number; max: number } | null = null;
-  if (blockedStage && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null) {
+  if (blockedStage && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null && blockedStage.status === "awaiting_checkpoint") {
     const targetStage = stages.find((s) => s.position === blockedStage.loopTargetPosition);
     if (targetStage) {
       loopTargetRole = labelForRole(targetStage.role);

@@ -22,22 +22,23 @@ interface Props {
 export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loopTargetRole, loopState, onSendBack }: Props) {
   const [rejecting, setRejecting] = useState(false);
   const [sendingBack, setSendingBack] = useState(false);
-  const [feedback, setFeedback] = useState("");
+  const [rejectFeedback, setRejectFeedback] = useState("");
+  const [sendBackFeedback, setSendBackFeedback] = useState("");
   const failed = blockedStage.status === "failed";
 
   const atCap = loopState !== null && loopState.iteration >= loopState.max;
   const canSendBack = loopTargetRole !== null && !atCap;
 
   function handleSendBack() {
-    onSendBack(feedback);
+    onSendBack(sendBackFeedback);
     setSendingBack(false);
-    setFeedback("");
+    setSendBackFeedback("");
   }
 
   function handleReject() {
-    onReject(feedback);
+    onReject(rejectFeedback);
     setRejecting(false);
-    setFeedback("");
+    setRejectFeedback("");
   }
 
   return (
@@ -46,7 +47,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
       {loopState !== null && (
         <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-mute octo-rise-in">
           {atCap
-            ? <>Loop exhausted ({loopState.max}/{loopState.max}) — approve or abort</>
+            ? <>Loop exhausted ({loopState.iteration}/{loopState.max}) — approve or abort</>
             : <>Review loop · {loopState.iteration} of {loopState.max} used</>
           }
         </div>
@@ -92,8 +93,8 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
       {rejecting && (
         <div className="mt-3 flex flex-col gap-2 octo-rise-in">
           <textarea
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
+            value={rejectFeedback}
+            onChange={(e) => setRejectFeedback(e.target.value)}
             placeholder="Optional feedback for the re-run…"
             className="h-20 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:text-octo-mute"
           />
@@ -102,7 +103,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
               className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx">
               Re-run the stage ⟶
             </button>
-            <button type="button" onClick={() => { setRejecting(false); setFeedback(""); }}
+            <button type="button" onClick={() => { setRejecting(false); setRejectFeedback(""); }}
               className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute">
               Cancel
             </button>
@@ -113,8 +114,8 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
       {sendingBack && (
         <div className="mt-3 flex flex-col gap-2 octo-rise-in">
           <textarea
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
+            value={sendBackFeedback}
+            onChange={(e) => setSendBackFeedback(e.target.value)}
             placeholder="Optional feedback for the send-back…"
             className="h-20 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:text-octo-mute"
           />
@@ -123,7 +124,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
               className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx">
               Send back ⟶
             </button>
-            <button type="button" onClick={() => { setSendingBack(false); setFeedback(""); }}
+            <button type="button" onClick={() => { setSendingBack(false); setSendBackFeedback(""); }}
               className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute">
               Cancel
             </button>

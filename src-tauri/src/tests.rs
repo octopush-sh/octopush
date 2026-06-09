@@ -2656,6 +2656,16 @@ mod verdict_tests {
         assert_eq!(parse_verdict("no verdict here"), None);
         assert_eq!(parse_verdict("VERDICT: maybe"), None);
     }
+
+    #[test]
+    fn parses_verdict_tolerates_case_trailing_text_and_spacing() {
+        use crate::orchestrator::runner::parse_verdict;
+        use crate::orchestrator::types::ReviewVerdict;
+        assert_eq!(parse_verdict("Verdict: PASS (looks good)"), Some(ReviewVerdict::Pass));
+        assert_eq!(parse_verdict("VERDICT: CHANGES_REQUESTED — see notes"), Some(ReviewVerdict::ChangesRequested));
+        assert_eq!(parse_verdict("VERDICT : pass"), Some(ReviewVerdict::Pass));
+        assert_eq!(parse_verdict("VERDICTS: not a verdict line"), None);
+    }
 }
 
 #[cfg(test)]
