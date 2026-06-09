@@ -9,4 +9,10 @@ describe("commitMessage", () => {
   it("buildCommitPrompt embeds the staged diff", () => {
     expect(buildCommitPrompt("DIFFX")).toContain("DIFFX");
   });
+  it("caps a very large diff in the prompt", () => {
+    const big = "x".repeat(20000);
+    const prompt = buildCommitPrompt(big);
+    expect(prompt.length).toBeLessThan(13000);
+    expect(prompt).toContain("truncated for the prompt");
+  });
 });

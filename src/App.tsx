@@ -913,6 +913,7 @@ function App() {
   const [largeFile, setLargeFile] = useState<{ size: number; path: string } | null>(null);
   const largeFileResolver = useRef<((ok: boolean) => void) | null>(null);
   const focusCommitFn = useRef<(() => void) | null>(null);
+  const registerFocusCommit = useCallback((fn: () => void) => { focusCommitFn.current = fn; }, []);
   const confirmLargeFile = useCallback((size: number, path: string) => {
     return new Promise<boolean>((resolve) => {
       largeFileResolver.current = resolve;
@@ -1423,7 +1424,7 @@ function App() {
                         projectPath={activeWorkspace.worktreePath || project.path}
                         diff={gitDiff}
                         onFileClick={(filePath) => navigateToFile(filePath, "diff")}
-                        registerFocusCommit={(fn) => { focusCommitFn.current = fn; }}
+                        registerFocusCommit={registerFocusCommit}
                         onChange={() => {
                           // Refetch diff + status after commit / push so the
                           // canvas catches up immediately.

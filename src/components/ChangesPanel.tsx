@@ -144,21 +144,19 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
         const lc = await ipc.getLastCommit(projectPath);
         if (!lc) {
           pushToast({ level: "info", title: "Nothing to amend", body: "This branch has no commits yet." });
-          return; // leave amend OFF
+          return;
         }
         setAmend(true);
         setLastCommit(lc);
-        if (commitMessage.trim() === "") {
-          setCommitMessage(lc.subject + (lc.body ? "\n\n" + lc.body : ""));
-        }
+        const prefill = lc.subject + (lc.body ? "\n\n" + lc.body : "");
+        setCommitMessage((prev) => (prev.trim() === "" ? prefill : prev));
       } catch {
         pushToast({ level: "error", title: "Couldn't load the last commit" });
-        // leave amend OFF
       }
     } else {
       setAmend(false);
       const prefill = lastCommit ? lastCommit.subject + (lastCommit.body ? "\n\n" + lastCommit.body : "") : "";
-      if (commitMessage === prefill) setCommitMessage("");
+      setCommitMessage((prev) => (prev === prefill ? "" : prev));
       setLastCommit(null);
     }
   }
