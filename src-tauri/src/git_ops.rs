@@ -350,29 +350,11 @@ pub fn delete_branch(path: &Path, branch_name: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub fn get_diff_text(path: &Path, ignore_whitespace: bool) -> AppResult<String> {
-    /// Cap the Review diff payload. Beyond this, building/serializing/parsing/
-    /// rendering the diff blocks the UI (e.g. a worktree with a large untracked
-    /// folder synthesizes MBs of "new file" content). 1 MiB is far more than a
-    /// human reviews; the rest is truncated.
+/// Shared diff-to-text printer. Converts any `git2::Diff` into a unified-
+/// patch string, capped at 1 MiB to guard against enormous diffs stalling
+/// the UI.
+fn diff_to_text(diff: &git2::Diff) -> AppResult<String> {
     const MAX_DIFF_BYTES: usize = 1_048_576;
-
-    let repo = open_repo(path)?;
-    // Include untracked files (treat each as a synthesized "new file" diff)
-    // and recurse into untracked directories. Without these flags, brand-new
-    // files in the worktree are invisible to the Review canvas — see the
-    // "Nothing to review" bug on workspaces where every change is a new file.
-    let mut opts = git2::DiffOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true);
-    if ignore_whitespace {
-        opts.ignore_whitespace(true);
-    }
-    let diff = repo
-        .diff_index_to_workdir(None, Some(&mut opts))
-        .map_err(|e| AppError::Other(format!("diff: {e}")))?;
-
     let mut buf = Vec::new();
     let mut truncated = false;
     let print_result = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
@@ -407,12 +389,57 @@ pub fn get_diff_text(path: &Path, ignore_whitespace: bool) -> AppResult<String> 
             return Err(AppError::Other(format!("diff print: {e}")));
         }
     }
-
     let mut out = String::from_utf8_lossy(&buf).to_string();
     if truncated {
         out.push_str("\n... diff truncated (too large to display fully) ...\n");
     }
     Ok(out)
+}
+
+pub fn get_diff_text(path: &Path, ignore_whitespace: bool) -> AppResult<String> {
+    let repo = open_repo(path)?;
+    // Include untracked files (treat each as a synthesized "new file" diff)
+    // and recurse into untracked directories. Without these flags, brand-new
+    // files in the worktree are invisible to the Review canvas — see the
+    // "Nothing to review" bug on workspaces where every change is a new file.
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    if ignore_whitespace {
+        opts.ignore_whitespace(true);
+    }
+    let diff = repo
+        .diff_index_to_workdir(None, Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("diff: {e}")))?;
+    diff_to_text(&diff)
+}
+
+/// Staged diff: HEAD tree → index (what `git diff --cached` shows). "" when nothing
+/// is staged. On an empty repo (no HEAD), diffs the empty tree → index.
+pub fn get_staged_diff_text(path: &Path) -> AppResult<String> {
+    let repo = open_repo(path)?;
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut opts = git2::DiffOptions::new();
+    let diff = repo
+        .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("staged diff: {e}")))?;
+    diff_to_text(&diff)
+}
+
+/// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
+pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
+    let repo = open_repo(path)?;
+    let commit = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let short_sha = commit.id().to_string()[..7].to_string();
+    let msg = commit.message().unwrap_or("");
+    let mut lines = msg.splitn(2, '\n');
+    let subject = lines.next().unwrap_or("").trim().to_string();
+    let body = lines.next().unwrap_or("").trim_start_matches('\n').trim_end().to_string();
+    Ok(Some((short_sha, subject, body)))
 }
 
 #[cfg(test)]
@@ -480,5 +507,61 @@ mod tests {
         let diff = get_diff_text(dir.path(), false).unwrap();
         assert!(diff.len() < 1_300_000, "single huge line must be capped, got {}", diff.len());
         assert!(diff.contains("diff truncated"));
+    }
+
+    // ── G4 helpers/tests ──────────────────────────────────────────
+    fn commit_file(dir: &std::path::Path, name: &str, content: &str, msg: &str) -> git2::Oid {
+        let repo = Repository::open(dir).unwrap();
+        std::fs::write(dir.join(name), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents).unwrap()
+    }
+
+    #[test]
+    fn staged_diff_shows_only_index_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("a.txt")).unwrap();
+        idx.write().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "three\n").unwrap();
+        let staged = get_staged_diff_text(dir.path()).unwrap();
+        assert!(staged.contains("+two"), "staged diff shows staged line: {staged}");
+        assert!(!staged.contains("+three"), "staged diff must NOT include the unstaged line");
+    }
+
+    #[test]
+    fn staged_diff_empty_when_nothing_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        assert_eq!(get_staged_diff_text(dir.path()).unwrap(), "");
+    }
+
+    #[test]
+    fn last_commit_returns_subject_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "feat: thing\n\nbody line 1\nbody line 2");
+        let lc = last_commit(dir.path()).unwrap().expect("a commit exists");
+        assert_eq!(lc.1, "feat: thing");
+        assert!(lc.2.contains("body line 1"));
+        assert_eq!(lc.0.len(), 7, "short sha is 7 chars: {}", lc.0);
+    }
+
+    #[test]
+    fn last_commit_none_on_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        assert!(last_commit(dir.path()).unwrap().is_none());
     }
 }
