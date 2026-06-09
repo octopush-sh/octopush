@@ -78,6 +78,8 @@ export type FileReadResult =
   | { kind: "unsupportedEncoding"; size: number; mtime: number }
   | { kind: "tooLarge"; size: number };
 
+export interface LastCommit { shortSha: string; subject: string; body: string }
+
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
@@ -362,6 +364,14 @@ export const ipc = {
   /** Returns the new short SHA on success. */
   commitChanges: (workspacePath: string, message: string) =>
     invoke<string>("commit_changes", { workspacePath, message }),
+
+  getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
+  amendCommit: (workspacePath: string, message: string) =>
+    invoke<string>("amend_commit", { workspacePath, message }),
+  getLastCommit: (workspacePath: string) =>
+    invoke<LastCommit | null>("get_last_commit", { workspacePath }),
+  discardFile: (workspacePath: string, filePath: string) =>
+    invoke<void>("discard_file", { workspacePath, filePath }),
 
   /** Returns the trimmed git-push output (combined stdout+stderr). */
   pushBranch: (workspacePath: string) =>
