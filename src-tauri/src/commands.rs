@@ -888,6 +888,7 @@ pub async fn resolve_checkpoint(
         "edit" => CheckpointAction::Edit,
         "abort" => CheckpointAction::Abort,
         "reject" => CheckpointAction::Reject { feedback, model_override },
+        "send_back" => CheckpointAction::SendBack { feedback },
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
     // Drive in the background; the frontend reacts to run:// events.
