@@ -44,9 +44,22 @@ pub fn artifact_kind_for(role: &str) -> ArtifactKind {
     }
 }
 
-/// Role-specific system prompt.
+/// Prepended to every stage prompt: the agent is one step in an automated,
+/// headless pipeline — there is no human to answer it mid-stage, so it must act
+/// autonomously and never block on input. The worktree is the shared blackboard
+/// between stages, so the agent leaves its changes uncommitted (later stages
+/// read them from the working tree) and must not touch git itself.
+const PIPELINE_PREAMBLE: &str = "You are one stage in an automated, headless build pipeline. \
+    There is NO human watching this stage and no way to answer you — never ask questions, never \
+    present options or menus, and never wait for input, confirmation, or approval. Work \
+    autonomously to completion using your tools, then end with a brief summary of what you did \
+    and anything still outstanding. Do not commit, push, or otherwise manage git: leave any code \
+    changes uncommitted in the working tree — the next stage reads them from there, and that is \
+    expected and correct.";
+
+/// Role-specific system prompt, with the shared [`PIPELINE_PREAMBLE`] prepended.
 pub fn system_prompt_for(role: &str) -> String {
-    match role {
+    let role_body = match role {
         "plan" => "You are a senior engineer. Produce a concise, concrete implementation plan \
             for the task. Do not write code; describe the steps, files, and approach.",
         "plan_review" | "critique" => "You are a critical reviewer. Review the proposed plan for \
@@ -60,8 +73,8 @@ pub fn system_prompt_for(role: &str) -> String {
         "repro" => "You are a debugger. Reproduce the reported issue and describe the root cause.",
         "refine" => "You are an editor. Refine and finalize the plan based on the prior review.",
         _ => "You are a helpful engineering assistant working in the project workspace.",
-    }
-    .to_string()
+    };
+    format!("{PIPELINE_PREAMBLE}\n\n{role_body}")
 }
 
 /// Build the user message that seeds a stage from the task + the prior artifact.

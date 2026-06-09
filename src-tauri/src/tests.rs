@@ -1851,6 +1851,17 @@ mod runner_helpers_tests {
     }
 
     #[test]
+    fn system_prompt_frames_agent_as_non_interactive_pipeline_worker() {
+        // Every stage, regardless of role, gets the autonomous/no-questions framing.
+        for role in ["plan", "implement", "code_review", "test", "anything"] {
+            let p = system_prompt_for(role).to_lowercase();
+            assert!(p.contains("never ask"), "role {role} missing no-questions directive");
+            assert!(p.contains("pipeline"), "role {role} missing pipeline framing");
+            assert!(p.contains("git"), "role {role} missing git-ownership note");
+        }
+    }
+
+    #[test]
     fn user_input_includes_task_and_prior_artifact() {
         let prior = StageArtifact {
             kind: ArtifactKind::Plan,
