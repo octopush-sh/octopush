@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { useRunsStore } from "../stores/runsStore";
 import { PipelineSetup } from "./PipelineSetup";
-import { RunTrack } from "./RunTrack";
+import { RunTrack, labelForRole } from "./RunTrack";
 import { StageFocus } from "./StageFocus";
 import { CheckpointBar } from "./CheckpointBar";
 import { RunCostMeter } from "./RunCostMeter";
@@ -47,6 +47,17 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const shownStage = stages.find((s) => s.id === shownStageId) ?? null;
   const blockedStage = stages.find((s) => s.status === "awaiting_checkpoint" || s.status === "failed") ?? null;
 
+  // Compute loop props for CheckpointBar
+  let loopTargetRole: string | null = null;
+  let loopState: { iteration: number; max: number } | null = null;
+  if (blockedStage && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null) {
+    const targetStage = stages.find((s) => s.position === blockedStage.loopTargetPosition);
+    if (targetStage) {
+      loopTargetRole = labelForRole(targetStage.role);
+      loopState = { iteration: blockedStage.loopIterations, max: blockedStage.loopMaxIterations };
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <RunTrack
@@ -63,6 +74,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onApprove={() => void resolve(run.id, "approve")}
           onReject={(feedback) => void resolve(run.id, "reject", feedback || undefined)}
           onAbort={() => void abort(run.id)}
+          loopTargetRole={loopTargetRole}
+          loopState={loopState}
+          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
         />
       )}
     </div>
