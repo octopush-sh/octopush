@@ -54,6 +54,31 @@ impl AgentSubstrate {
     }
 }
 
+/// How a review stage's loop-back behaves. Persisted as text in
+/// `*_stages.loop_mode`; absent/unknown ⇒ no loop (linear).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum LoopMode {
+    Gated,
+    Auto,
+}
+
+impl LoopMode {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            LoopMode::Gated => "gated",
+            LoopMode::Auto => "auto",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "gated" => Some(LoopMode::Gated),
+            "auto" => Some(LoopMode::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// Per-stage lifecycle status (persisted as text in `run_stages.status`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum StageStatus {
@@ -131,6 +156,12 @@ pub struct StageSpec {
     pub checkpoint: bool,
     /// Optional human feedback from a prior rejection of this stage.
     pub feedback: Option<String>,
+    /// Loop config (gated mode in L1): where to return to, the cap, the mode,
+    /// and how many loop-backs have already happened.
+    pub loop_target: Option<i64>,
+    pub loop_max: i64,
+    pub loop_mode: Option<LoopMode>,
+    pub loop_iterations: i64,
 }
 
 /// A single tool invocation, captured for the run-event log.
@@ -163,6 +194,11 @@ pub enum CheckpointAction {
     Reject {
         feedback: Option<String>,
         model_override: Option<String>,
+    },
+    /// Route work back to the review stage's `loop_target` (re-run the target +
+    /// intervening stages with the reviewer's findings), bounded by the cap.
+    SendBack {
+        feedback: Option<String>,
     },
     /// Artifact was edited out-of-band; continue.
     Edit,

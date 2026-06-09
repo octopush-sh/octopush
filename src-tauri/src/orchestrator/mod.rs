@@ -92,6 +92,16 @@ impl Orchestrator {
         );
     }
 
+    /// A just-completed stage that should pause for a human loop decision: it
+    /// carries gated loop config with a target and a positive cap. (Auto mode
+    /// is Plan L3.)
+    fn stage_has_gated_loop(stage: &crate::db::RunStageRow) -> bool {
+        stage.loop_target_position.is_some()
+            && stage.loop_max_iterations > 0
+            && stage.loop_mode.as_deref().and_then(crate::orchestrator::types::LoopMode::from_db)
+                == Some(crate::orchestrator::types::LoopMode::Gated)
+    }
+
     fn workspace_path(&self, run: &crate::db::RunRow) -> AppResult<PathBuf> {
         let path: Option<String> = self.db.lock().conn_ref_path(&run.workspace_id)?;
         path.map(PathBuf::from)
@@ -121,6 +131,10 @@ impl Orchestrator {
             substrate,
             checkpoint: stage.checkpoint,
             feedback: stage.feedback.clone(),
+            loop_target: stage.loop_target_position,
+            loop_max: stage.loop_max_iterations,
+            loop_mode: stage.loop_mode.as_deref().and_then(crate::orchestrator::types::LoopMode::from_db),
+            loop_iterations: stage.loop_iterations,
         };
 
         // Input artifact = the previous done stage's artifact, or a seed Note from the task.
@@ -223,8 +237,16 @@ impl Orchestrator {
             .reference_model
             .clone()
             .or_else(crate::orchestrator::cost::pick_reference_model);
-        let mut cost = 0.0;
+        let (retired_cost, retired_in, retired_out) = self.db.lock().get_retired_cost(run_id)?;
+        let mut cost = retired_cost;
         let mut baseline = 0.0;
+        if let Some(ref_model) = &reference {
+            baseline += crate::orchestrator::cost::baseline_cost(
+                ref_model,
+                retired_in as u64,
+                retired_out as u64,
+            );
+        }
         for s in &stages {
             cost += s.cost_usd;
             if let Some(ref_model) = &reference {
@@ -317,7 +339,7 @@ impl Orchestrator {
                     self.emit_checkpoint(run_id, &stage.id);
                     return Ok(RunStatus::Paused);
                 }
-                StageStatus::Done if stage.checkpoint => {
+                StageStatus::Done if stage.checkpoint || Self::stage_has_gated_loop(&stage) => {
                     self.db
                         .lock()
                         .set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
@@ -369,6 +391,39 @@ impl Orchestrator {
                         feedback.as_deref(),
                     )?;
                     self.recompute_run_cost(run_id)?;
+                }
+            }
+            CheckpointAction::SendBack { feedback } => {
+                if let Some(review) = &blocked {
+                    // Only a review parked at its checkpoint can be sent back. A failed
+                    // stage is recovered via Reject/re-run, not SendBack → no-op here.
+                    if review.status == "awaiting_checkpoint" {
+                        let can_loop = match review.loop_target_position {
+                            Some(target_pos) => {
+                                target_pos < review.position
+                                    && review.loop_iterations < review.loop_max_iterations
+                            }
+                            None => false,
+                        };
+                        if can_loop {
+                            let target_pos = review.loop_target_position.unwrap();
+                            // Retire each stage's cost BEFORE resetting it (reset zeroes cost).
+                            for s in &stages {
+                                if s.position >= target_pos && s.position <= review.position {
+                                    self.db.lock().retire_stage_cost(
+                                        run_id, s.cost_usd, s.input_tokens, s.output_tokens,
+                                    )?;
+                                    let fb = if s.position == target_pos { feedback.as_deref() } else { None };
+                                    self.db.lock().reset_run_stage(&s.id, None, fb)?;
+                                }
+                            }
+                            self.db.lock().increment_loop_iteration(&review.id)?;
+                            self.recompute_run_cost(run_id)?;
+                        } else {
+                            // No usable loop (no/invalid target or cap reached) → accept the review.
+                            self.db.lock().set_run_stage_status(&review.id, "done")?;
+                        }
+                    }
                 }
             }
         }

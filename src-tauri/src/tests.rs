@@ -2032,6 +2032,58 @@ mod run_crud_tests {
         let plan = stages.iter().find(|s| s.position == 0).unwrap();
         assert_ne!(plan.agent_model, "claude-opus-4-6");
     }
+
+    #[test]
+    fn pipeline_stage_loop_config_roundtrips() {
+        let db = test_db();
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated")).unwrap();
+        let stages = db.get_pipeline_stages(&pid).unwrap();
+        assert_eq!(stages[0].loop_target_position, None);
+        assert_eq!(stages[0].loop_max_iterations, 0);
+        assert_eq!(stages[0].loop_mode, None);
+        assert_eq!(stages[1].loop_target_position, Some(0));
+        assert_eq!(stages[1].loop_max_iterations, 2);
+        assert_eq!(stages[1].loop_mode.as_deref(), Some("gated"));
+    }
+
+    #[test]
+    fn create_run_copies_loop_config_and_counter_increments() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated")).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let stages = db.list_run_stages(&run).unwrap();
+        assert_eq!(stages[1].loop_target_position, Some(0));
+        assert_eq!(stages[1].loop_max_iterations, 2);
+        assert_eq!(stages[1].loop_mode.as_deref(), Some("gated"));
+        assert_eq!(stages[1].loop_iterations, 0);
+
+        db.increment_loop_iteration(&stages[1].id).unwrap();
+        let after = db.list_run_stages(&run).unwrap();
+        assert_eq!(after[1].loop_iterations, 1);
+    }
+
+    #[test]
+    fn retire_stage_cost_accumulates_on_the_run() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        assert_eq!(db.get_retired_cost(&run).unwrap(), (0.0, 0, 0));
+
+        db.retire_stage_cost(&run, 0.5, 100, 40).unwrap();
+        db.retire_stage_cost(&run, 0.25, 50, 10).unwrap();
+        let (cost, inp, out) = db.get_retired_cost(&run).unwrap();
+        assert!((cost - 0.75).abs() < 1e-9);
+        assert_eq!(inp, 150);
+        assert_eq!(out, 50);
+    }
 }
 
 #[cfg(test)]
@@ -2247,6 +2299,81 @@ mod orchestrator_tests {
         // Re-driving a completed run must be a no-op (still completed, no re-run).
         let status = orch.run_to_pause(&run_id).await.unwrap();
         assert_eq!(status, RunStatus::Completed);
+    }
+
+    /// (orch, run_id, db) for a pipeline: implement(pos 0, no loop) ->
+    /// code_review(pos 1, gated loop back to 0, cap = `max_iter`).
+    fn looped_run(max_iter: i64) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Looped", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), max_iter, Some("gated")).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn gated_loop_review_stage_pauses_for_checkpoint() {
+        let (orch, run_id, db) = looped_run(2);
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done");                  // implement
+        assert_eq!(stages[1].status, "awaiting_checkpoint");   // code_review parked (gated loop)
+    }
+
+    #[tokio::test]
+    async fn send_back_resets_range_increments_and_retires_cost() {
+        let (orch, run_id, db) = looped_run(2);
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        let before = db.lock().list_run_stages(&run_id).unwrap();
+        let review_id = before[1].id.clone();
+        let spent_before = db.lock().get_run(&run_id).unwrap().unwrap().cost_usd;
+
+        let status = orch.resolve_checkpoint(
+            &run_id,
+            CheckpointAction::SendBack { feedback: Some("fix the bug".into()) },
+        ).await.unwrap();
+
+        let after = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(after[1].status, "awaiting_checkpoint");
+        let review = after.iter().find(|s| s.id == review_id).unwrap();
+        assert_eq!(review.loop_iterations, 1);
+        assert_eq!(after[0].feedback.as_deref(), Some("fix the bug"));
+        let spent_after = db.lock().get_run(&run_id).unwrap().unwrap().cost_usd;
+        assert!(spent_after + 1e-9 >= spent_before);
+    }
+
+    #[tokio::test]
+    async fn send_back_at_cap_does_not_loop() {
+        let (orch, run_id, db) = looped_run(1);
+        orch.run_to_pause(&run_id).await.unwrap();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert_eq!(status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn send_back_on_failed_review_is_noop() {
+        let (orch, run_id, db) = looped_run(2);
+        orch.run_to_pause(&run_id).await.unwrap();
+        // Force the parked review stage into 'failed' instead of awaiting_checkpoint.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        let review_id = stages[1].id.clone();
+        db.lock().fail_run_stage(&review_id, "boom").unwrap();
+        // SendBack must NOT loop-back a failed stage.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: Some("x".into()) }).await.unwrap();
+        let after = db.lock().list_run_stages(&run_id).unwrap();
+        let review = after.iter().find(|s| s.id == review_id).unwrap();
+        assert_eq!(review.status, "failed");   // unchanged — not looped, not approved
+        assert_eq!(review.loop_iterations, 0); // no iteration burned
+        assert_eq!(after[0].feedback, None);   // target stage not reset/feedback'd
     }
 }
 

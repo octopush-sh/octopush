@@ -328,6 +328,19 @@ impl Db {
                 "#,
             )?;
         }
+
+        // ── v5 Direct review feedback loop (Plan L1) ───────────────
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN loop_target_position INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN loop_max_iterations INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN loop_mode TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN loop_target_position INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN loop_max_iterations INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN loop_mode TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN loop_iterations INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_cost_usd REAL NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_input_tokens INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_output_tokens INTEGER NOT NULL DEFAULT 0")?;
+
         Ok(())
     }
 
@@ -1373,7 +1386,8 @@ impl Db {
 
     pub fn get_pipeline_stages(&self, pipeline_id: &str) -> AppResult<Vec<PipelineStageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint
+            "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                    loop_target_position, loop_max_iterations, loop_mode
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -1385,6 +1399,9 @@ impl Db {
                 agent_model: r.get(4)?,
                 substrate: r.get(5)?,
                 checkpoint: r.get::<_, i64>(6)? != 0,
+                loop_target_position: r.get(7)?,
+                loop_max_iterations: r.get(8)?,
+                loop_mode: r.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1406,6 +1423,7 @@ impl Db {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_pipeline_stage(
         &self,
         pipeline_id: &str,
@@ -1414,12 +1432,18 @@ impl Db {
         agent_model: &str,
         substrate: &str,
         checkpoint: bool,
+        loop_target_position: Option<i64>,
+        loop_max_iterations: i64,
+        loop_mode: Option<&str>,
     ) -> AppResult<String> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO pipeline_stages (id, pipeline_id, position, role, agent_model, substrate, checkpoint)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![id, pipeline_id, position, role, agent_model, substrate, checkpoint as i64],
+            "INSERT INTO pipeline_stages
+                (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                 loop_target_position, loop_max_iterations, loop_mode)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id, pipeline_id, position, role, agent_model, substrate, checkpoint as i64,
+                    loop_target_position, loop_max_iterations, loop_mode],
         )?;
         Ok(id)
     }
@@ -1481,7 +1505,7 @@ impl Db {
             }
             let pid = self.insert_pipeline(name, desc, true)?;
             for (i, (role, model, substrate, checkpoint)) in stages.iter().enumerate() {
-                self.insert_pipeline_stage(&pid, i as i64, role, model, substrate, *checkpoint)?;
+                self.insert_pipeline_stage(&pid, i as i64, role, model, substrate, *checkpoint, None, 0, None)?;
             }
         }
         Ok(())
@@ -1525,9 +1549,12 @@ impl Db {
                 .unwrap_or(s.agent_model.as_str());
             let sid = Uuid::new_v4().to_string();
             self.conn.execute(
-                "INSERT INTO run_stages (id, run_id, position, role, agent_model, substrate, checkpoint, status)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending')",
-                params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64],
+                "INSERT INTO run_stages
+                    (id, run_id, position, role, agent_model, substrate, checkpoint, status,
+                     loop_target_position, loop_max_iterations, loop_mode)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10)",
+                params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
+                        s.loop_target_position, s.loop_max_iterations, s.loop_mode],
             )?;
         }
         Ok(id)
@@ -1559,7 +1586,8 @@ impl Db {
     pub fn list_run_stages(&self, run_id: &str) -> AppResult<Vec<RunStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
-                    input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at
+                    input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
+                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1580,6 +1608,10 @@ impl Db {
                 error: r.get(13)?,
                 started_at: r.get(14)?,
                 finished_at: r.get(15)?,
+                loop_target_position: r.get(16)?,
+                loop_max_iterations: r.get(17)?,
+                loop_mode: r.get(18)?,
+                loop_iterations: r.get(19)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1682,6 +1714,46 @@ impl Db {
             params![stage_id, feedback],
         )?;
         Ok(())
+    }
+
+    /// Bump the loop-back counter on a review stage that triggered a loop.
+    pub fn increment_loop_iteration(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET loop_iterations = loop_iterations + 1 WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    /// Accumulate a soon-to-be-reset stage's spend onto the run, so the cost
+    /// meter keeps counting work erased by a loop-back / reject.
+    pub fn retire_stage_cost(
+        &self,
+        run_id: &str,
+        cost_usd: f64,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs
+             SET retired_cost_usd = retired_cost_usd + ?2,
+                 retired_input_tokens = retired_input_tokens + ?3,
+                 retired_output_tokens = retired_output_tokens + ?4
+             WHERE id = ?1",
+            params![run_id, cost_usd, input_tokens, output_tokens],
+        )?;
+        Ok(())
+    }
+
+    /// `(retired_cost_usd, retired_input_tokens, retired_output_tokens)` for the run.
+    pub fn get_retired_cost(&self, run_id: &str) -> AppResult<(f64, i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT retired_cost_usd, retired_input_tokens, retired_output_tokens FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(Into::into)
     }
 
     pub fn set_run_stage_artifact(&self, stage_id: &str, artifact_json: &str) -> AppResult<()> {
@@ -1797,6 +1869,9 @@ pub struct PipelineStageRow {
     pub agent_model: String,
     pub substrate: String,
     pub checkpoint: bool,
+    pub loop_target_position: Option<i64>,
+    pub loop_max_iterations: i64,
+    pub loop_mode: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1850,6 +1925,10 @@ pub struct RunStageRow {
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    pub loop_target_position: Option<i64>,
+    pub loop_max_iterations: i64,
+    pub loop_mode: Option<String>,
+    pub loop_iterations: i64,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {
