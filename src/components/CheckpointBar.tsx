@@ -47,7 +47,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
         <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-mute octo-rise-in">
           {atCap
             ? <>Loop exhausted ({loopState.max}/{loopState.max}) — approve or abort</>
-            : <>Reviewed {loopState.iteration} of {loopState.max} — changes requested</>
+            : <>Review loop · {loopState.iteration} of {loopState.max} used</>
           }
         </div>
       )}

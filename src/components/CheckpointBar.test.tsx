@@ -140,6 +140,6 @@ describe("CheckpointBar", () => {
         onSendBack={vi.fn()}
       />,
     );
-    expect(screen.getByText(/Reviewed 1 of 2/i)).toBeInTheDocument();
+    expect(screen.getByText(/Review loop · 1 of 2 used/i)).toBeInTheDocument();
   });
 });
