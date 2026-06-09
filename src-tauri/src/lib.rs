@@ -24,6 +24,7 @@ pub mod perf;
 pub mod issue_tracker;
 pub mod github;
 pub mod orchestrator;
+pub mod git_lock;
 
 #[cfg(test)]
 mod tests;

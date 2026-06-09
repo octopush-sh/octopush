@@ -3013,3 +3013,18 @@ mod g7_git_tests {
             "a.txt should be marked conflicted");
     }
 }
+
+#[cfg(test)]
+mod git_lock_tests {
+    use crate::git_lock::lock_for;
+    use std::sync::Arc;
+
+    #[test]
+    fn same_path_shares_one_lock_distinct_paths_differ() {
+        let a1 = lock_for("/repo/a");
+        let a2 = lock_for("/repo/a");
+        let b = lock_for("/repo/b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same path must share one mutex");
+        assert!(!Arc::ptr_eq(&a1, &b), "distinct paths must have distinct mutexes");
+    }
+}
