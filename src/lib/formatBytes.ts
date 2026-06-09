@@ -1,18 +1,12 @@
-/** Human-readable byte size: ≥10 of a unit shows whole numbers, otherwise 1 decimal.
- *  Non-finite or negative input renders as an em-dash placeholder. */
-export function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return "—";
-  if (n < 1024) return `${n} B`;
+/** Human-readable byte size: whole bytes under 1 KB, else one decimal. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
   }
-  // Round to one decimal first so values like 9.95 promote to "10" (whole),
-  // never "10.0", keeping the ≥10 → whole-number rule consistent.
-  const oneDecimal = Math.round(v * 10) / 10;
-  const num = oneDecimal < 10 ? oneDecimal.toFixed(1) : String(Math.round(v));
-  return `${num} ${units[i]}`;
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
