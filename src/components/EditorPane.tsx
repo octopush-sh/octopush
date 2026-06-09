@@ -24,6 +24,7 @@ import { parseDiffForFile } from "../lib/diffParser";
 import { useEditorStore } from "../stores/editorStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { EditorStatusBar } from "./EditorStatusBar";
+import { EditorBinaryPane } from "./EditorBinaryPane";
 
 interface Props {
   workspaceId: string;
@@ -162,22 +163,22 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     const view = viewRef.current;
     if (!view) return;
 
-    // No active file (e.g. the last tab was just closed): clear the view so the
-    // previous file's content doesn't linger behind the empty-state overlay.
-    if (!activeFile) {
+    // Cache the outgoing text tab's live state before any switch.
+    const prevPath = lastPathRef.current;
+    if (prevPath && prevPath !== activeFile?.path) {
+      stateCache.current.set(prevPath, view.state);
+    }
+
+    // No active file, or a binary file: clear the view so neither stale text
+    // nor garbled bytes show behind the overlay / binary pane.
+    if (!activeFile || activeFile.kind !== "text") {
       view.setState(EditorState.create({ doc: "" }));
       lastPathRef.current = null;
       return;
     }
 
-    const prevPath = lastPathRef.current;
-    if (prevPath && prevPath !== activeFile.path) {
-      stateCache.current.set(prevPath, view.state);
-    }
-
     const cached = stateCache.current.get(activeFile.path);
-    const next = cached ?? freshState(activeFile);
-    view.setState(next);
+    view.setState(cached ?? freshState(activeFile));
     view.dispatch({ effects: [
       wrapComp.reconfigure(wrapValue(prefsRef.current)),
       lineNumComp.reconfigure(lineNumValue(prefsRef.current)),
@@ -227,8 +228,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
             </span>
           </div>
         )}
+        {activeFile?.kind === "binary" && (
+          <div className="absolute inset-0" style={{ background: "var(--color-octo-onyx)" }}>
+            <EditorBinaryPane
+              path={activeFile.path}
+              size={activeFile.size}
+              reason={activeFile.binaryReason ?? "binary"}
+            />
+          </div>
+        )}
       </div>
-      {activeFile && (
+      {activeFile?.kind === "text" && (
         <EditorStatusBar
           line={pos.line}
           col={pos.col}

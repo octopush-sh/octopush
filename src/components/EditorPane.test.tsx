@@ -79,6 +79,10 @@ vi.mock("./EditorStatusBar", () => ({
   EditorStatusBar: () => <div data-testid="status-bar" />,
 }));
 
+vi.mock("./EditorBinaryPane", () => ({
+  EditorBinaryPane: () => <div data-testid="binary-pane" />,
+}));
+
 vi.mock("@codemirror/lang-javascript", () => ({
   javascript: vi.fn(() => ({})),
 }));
@@ -103,10 +107,12 @@ vi.mock("../stores/editorStore", () => ({
   useEditorStore: vi.fn((selector: (s: unknown) => unknown) => {
     const state = {
       getActivePath: (wsId: string) =>
-        wsId === "ws-active" ? "/repo/file.ts" : null,
+        wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
       getFiles: (wsId: string) =>
         wsId === "ws-active"
-          ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript" }]
+          ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5 }]
+          : wsId === "ws-binary"
+          ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048 }]
           : [],
       setContent: vi.fn(),
       saveActive: mockSaveActive,
@@ -144,6 +150,12 @@ describe("EditorPane", () => {
       />,
     );
     expect(screen.getByTestId("editor-host")).toBeInTheDocument();
+  });
+
+  it("renders the binary pane (not the status bar) for a binary file", () => {
+    render(<EditorPane workspaceId="ws-binary" workspacePath="/repo" diffText="" />);
+    expect(screen.getByTestId("binary-pane")).toBeInTheDocument();
+    expect(screen.queryByTestId("status-bar")).not.toBeInTheDocument();
   });
 
   it("clears the editor view when the last tab closes (no stale content behind overlay)", () => {
