@@ -912,6 +912,7 @@ function App() {
   // Large-file confirm dialog state
   const [largeFile, setLargeFile] = useState<{ size: number; path: string } | null>(null);
   const largeFileResolver = useRef<((ok: boolean) => void) | null>(null);
+  const focusCommitFn = useRef<(() => void) | null>(null);
   const confirmLargeFile = useCallback((size: number, path: string) => {
     return new Promise<boolean>((resolve) => {
       largeFileResolver.current = resolve;
@@ -1422,6 +1423,7 @@ function App() {
                         projectPath={activeWorkspace.worktreePath || project.path}
                         diff={gitDiff}
                         onFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                        registerFocusCommit={(fn) => { focusCommitFn.current = fn; }}
                         onChange={() => {
                           // Refetch diff + status after commit / push so the
                           // canvas catches up immediately.
@@ -1463,6 +1465,7 @@ function App() {
                             .catch(() => {});
                         }}
                         initialTestCommand={activeWorkspace.testCommand ?? null}
+                        onFocusCommit={() => focusCommitFn.current?.()}
                       >
                         {/* Editor mode content */}
                         <EditorTabs workspaceId={activeWorkspaceId!} />
