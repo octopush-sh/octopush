@@ -38,6 +38,10 @@ Object.defineProperty(globalThis, "requestAnimationFrame", {
 // NOTE: Must use class (constructor), not arrow function, because the component
 // uses `new Terminal(...)` which requires a constructable function.
 
+const xtermHoisted = vi.hoisted(() => ({
+  last: null as unknown as { getSelection: ReturnType<typeof vi.fn> } | null,
+}));
+
 vi.mock("@xterm/xterm", () => {
   class Terminal {
     loadAddon = vi.fn();
@@ -49,6 +53,11 @@ vi.mock("@xterm/xterm", () => {
     write = vi.fn();
     focus = vi.fn();
     dispose = vi.fn();
+    getSelection = vi.fn(() => "");
+    attachCustomKeyEventHandler = vi.fn();
+    constructor() {
+      xtermHoisted.last = this;
+    }
   }
   return { Terminal };
 });
@@ -119,6 +128,44 @@ beforeEach(() => {
   // Reset event listeners between tests.
   Object.keys(eventListeners).forEach((k) => delete eventListeners[k]);
   mockIpc.spawnOrAttachTerminal.mockResolvedValue({ mode: "Spawned", pid: 12345 });
+});
+
+describe("TerminalPane — clipboard", () => {
+  it("copies the xterm selection to the clipboard on right-click", async () => {
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { container } = render(
+      <TerminalPane terminalId="tc" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    // Selection is non-empty → right-click copies it and suppresses the
+    // browser's "copy word under cursor".
+    xtermHoisted.last!.getSelection.mockReturnValue("selected text");
+    const el = container.querySelector(".xterm-container") as HTMLElement;
+    const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    el.dispatchEvent(ev);
+
+    expect(writeText).toHaveBeenCalledWith("selected text");
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("does not copy or preventDefault when there is no selection", async () => {
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { container } = render(
+      <TerminalPane terminalId="tc2" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    xtermHoisted.last!.getSelection.mockReturnValue("");
+    const el = container.querySelector(".xterm-container") as HTMLElement;
+    const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    el.dispatchEvent(ev);
+
+    expect(writeText).not.toHaveBeenCalled();
+    expect(ev.defaultPrevented).toBe(false);
+  });
 });
 
 describe("TerminalPane — spawn callback", () => {
