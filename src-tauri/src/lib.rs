@@ -180,6 +180,7 @@ pub fn run() {
             commands::resolve_checkpoint,
             commands::abort_run,
             commands::estimate_run_cost,
+            commands::get_stage_log,
             // File operations
             commands::open_file_in_system,
             commands::reveal_in_finder,

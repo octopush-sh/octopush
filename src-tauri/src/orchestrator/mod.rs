@@ -6,6 +6,7 @@ pub mod cli_runner;
 pub mod live;
 pub mod cost;
 pub mod events;
+pub mod persist;
 pub mod runner;
 pub mod types;
 
@@ -33,6 +34,10 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(db: Arc<Mutex<Db>>, events: Arc<dyn EventSink>) -> Self {
+        // Mirror run://log entries into stage_log so journals survive reloads.
+        let events: Arc<dyn EventSink> = Arc::new(
+            crate::orchestrator::persist::PersistingSink::new(events, Arc::clone(&db)),
+        );
         Self {
             db,
             events,

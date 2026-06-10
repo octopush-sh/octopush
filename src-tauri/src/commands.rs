@@ -957,6 +957,20 @@ pub async fn abort_run(
     Arc::clone(&*orch).abort_run(&run_id).await
 }
 
+/// The persisted live journal for a stage, oldest first. Rows that fail to
+/// parse (shouldn't happen — we wrote them) are skipped rather than erroring.
+#[tauri::command]
+pub async fn get_stage_log(
+    state: State<'_, AppState>,
+    stage_id: String,
+) -> AppResult<Vec<serde_json::Value>> {
+    let rows = state.db.lock().list_stage_log(&stage_id)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| serde_json::from_str(r).ok())
+        .collect())
+}
+
 #[tauri::command]
 pub async fn estimate_run_cost(
     state: State<'_, AppState>,

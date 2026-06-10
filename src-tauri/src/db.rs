@@ -341,6 +341,21 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_input_tokens INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_output_tokens INTEGER NOT NULL DEFAULT 0")?;
 
+        // ── v6 Direct iteration history: persisted live journals ──
+        // One row per `run://log` entry (including `{"kind":"reset"}` markers),
+        // so stage journals survive app reloads and loop-backs.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS stage_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id    TEXT NOT NULL,
+                stage_id  TEXT NOT NULL,
+                entry     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stage_log_stage ON stage_log(stage_id, id);
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -1878,6 +1893,24 @@ impl Db {
             params![stage_id, artifact_json],
         )?;
         Ok(())
+    }
+
+    /// Append one `run://log` entry (JSON) to a stage's persisted journal.
+    pub fn append_stage_log(&self, run_id: &str, stage_id: &str, entry_json: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO stage_log (run_id, stage_id, entry) VALUES (?1,?2,?3)",
+            params![run_id, stage_id, entry_json],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted journal entries for a stage, oldest first.
+    pub fn list_stage_log(&self, stage_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry FROM stage_log WHERE stage_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![stage_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn insert_run_event(&self, run_id: &str, kind: &str, payload_json: &str) -> AppResult<()> {

@@ -3191,6 +3191,115 @@ mod git_lock_tests {
 }
 
 #[cfg(test)]
+mod stage_log_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::live::RUN_LOG_EVENT;
+    use crate::orchestrator::persist::PersistingSink;
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    /// Records every forwarded (event, payload) pair.
+    struct Recorder {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+    impl EventSink for Recorder {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events.lock().push((event.to_string(), payload));
+        }
+    }
+
+    /// (db, recorder, persisting sink, tempfile guard).
+    fn harness() -> (Arc<Mutex<Db>>, Arc<Recorder>, PersistingSink, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let rec = Arc::new(Recorder { events: Mutex::new(vec![]) });
+        let sink = PersistingSink::new(rec.clone(), Arc::clone(&db));
+        (db, rec, sink, tmp)
+    }
+
+    #[test]
+    fn run_log_entry_is_persisted_and_forwarded() {
+        let (db, rec, sink, _tmp) = harness();
+        let entry = json!({ "kind": "text", "text": "hello" });
+        sink.emit(
+            RUN_LOG_EVENT,
+            json!({ "runId": "r1", "stageId": "s1", "entry": entry }),
+        );
+        // Persisted, parseable, in order.
+        let rows = db.lock().list_stage_log("s1").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed: Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(parsed, entry);
+        // Forwarded untouched.
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].0, RUN_LOG_EVENT);
+        assert_eq!(fwd[0].1["entry"], entry);
+    }
+
+    #[test]
+    fn reset_payload_persists_a_reset_marker_row() {
+        let (db, rec, sink, _tmp) = harness();
+        sink.emit(
+            RUN_LOG_EVENT,
+            json!({ "runId": "r1", "stageId": "s1", "entry": json!({"kind":"text","text":"old"}) }),
+        );
+        sink.emit(
+            RUN_LOG_EVENT,
+            json!({ "runId": "r1", "stageId": "s1", "reset": true }),
+        );
+        let rows = db.lock().list_stage_log("s1").unwrap();
+        assert_eq!(rows.len(), 2);
+        let marker: Value = serde_json::from_str(&rows[1]).unwrap();
+        assert_eq!(marker, json!({ "kind": "reset" }));
+        // The reset event itself still reaches the frontend.
+        assert_eq!(rec.events.lock().len(), 2);
+    }
+
+    #[test]
+    fn non_log_events_forward_without_persisting() {
+        let (db, rec, sink, _tmp) = harness();
+        let payload = json!({ "runId": "r1", "costUsd": 0.5 });
+        sink.emit("run://cost", payload.clone());
+        let count: i64 = db
+            .lock()
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM stage_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].0, "run://cost");
+        assert_eq!(fwd[0].1, payload);
+    }
+
+    #[test]
+    fn stage_log_rows_are_ordered_and_scoped_by_stage() {
+        let (db, _rec, sink, _tmp) = harness();
+        for i in 0..3 {
+            sink.emit(
+                RUN_LOG_EVENT,
+                json!({ "runId": "r1", "stageId": "s1", "entry": json!({"kind":"text","text": format!("e{i}")}) }),
+            );
+        }
+        sink.emit(
+            RUN_LOG_EVENT,
+            json!({ "runId": "r1", "stageId": "s2", "entry": json!({"kind":"text","text":"other"}) }),
+        );
+        let rows = db.lock().list_stage_log("s1").unwrap();
+        assert_eq!(rows.len(), 3);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| serde_json::from_str::<Value>(r).unwrap()["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, vec!["e0", "e1", "e2"]);
+    }
+}
+
+#[cfg(test)]
 mod g7_timeout_tests {
     use crate::commands::run_with_timeout;
     use std::time::Duration;
