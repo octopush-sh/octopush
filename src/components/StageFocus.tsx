@@ -4,8 +4,15 @@ import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { labelForRole } from "./RunTrack";
 import { DiffViewer } from "./DiffViewer";
+import { FadeSwap } from "./primitives/FadeSwap";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
+
+const ROLE_VERBS: Record<string, string> = {
+  plan: "planning…", plan_review: "reviewing…", implement: "implementing…",
+  code_review: "reviewing…", test: "testing…", repro: "reproducing…",
+  fix: "fixing…", verify: "verifying…", critique: "critiquing…", refine: "refining…",
+};
 
 interface ParsedArtifact {
   kind: string;
@@ -48,10 +55,10 @@ export function StageFocus({ stage, workspacePath }: Props) {
     return () => { cancelled = true; };
   }, [stage?.id, stage?.status, artifact?.refsWorktree, workspacePath]);
 
-  // Keep the live journal pinned to the newest activity while a stage runs.
+  // Keep the live journal pinned to the newest activity while a stage runs (S6: smooth).
   useEffect(() => {
     if (stage?.status === "running" && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTo?.({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
     }
   }, [liveEntries, stage?.status]);
 
@@ -60,15 +67,15 @@ export function StageFocus({ stage, workspacePath }: Props) {
     for (let i = 0; i < liveEntries.length; i++) {
       const e = liveEntries[i];
       if (e.kind === "text") {
-        items.push(<div key={i} className="text-octo-sage">{e.text}</div>);
+        items.push(<div key={i} className="octo-rise-in text-octo-sage">{e.text}</div>);
       } else if (e.kind === "notice") {
-        items.push(<div key={i} className="font-mono text-[10px] uppercase tracking-[0.12em] text-octo-brass">{e.text}</div>);
+        items.push(<div key={i} className="octo-rise-in font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">{e.text}</div>);
       } else if (e.kind === "tool") {
         const next = liveEntries[i + 1];
         const res = next && next.kind === "tool_result" ? next : null;
         if (res) i++; // consume the paired result
         items.push(
-          <div key={i} className="rounded-md border border-octo-hairline bg-octo-panel-2 px-3 py-2">
+          <div key={i} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel-2 px-3 py-2">
             <div className="flex items-center gap-2 font-mono text-[12px]">
               <span className="text-octo-brass">§</span>
               <span className="text-octo-ivory">{e.tool}</span>
@@ -85,7 +92,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
       } else if (e.kind === "tool_result") {
         // orphan result (no preceding tool in buffer) — render compactly
         items.push(
-          <div key={i} className="flex items-center gap-1.5 font-mono text-[11px] text-octo-mute">
+          <div key={i} className="octo-rise-in flex items-center gap-1.5 font-mono text-[11px] text-octo-mute">
             <span className={e.ok ? "text-octo-verdigris" : "text-octo-rouge"}>{e.ok ? "✓" : "✕"}</span>
             <span>{e.detail}</span>
           </div>,
@@ -97,46 +104,66 @@ export function StageFocus({ stage, workspacePath }: Props) {
 
   if (!stage) {
     return (
-      <div className="flex flex-1 items-center justify-center text-octo-mute font-mono text-sm">
-        Select a stage to inspect it.
+      <div className="flex flex-1 items-center justify-center font-serif text-sm text-octo-mute">
+        Pick a stage above to see its work.
       </div>
     );
   }
 
+  const mode =
+    stage.status === "failed" && stage.error ? "failed"
+    : artifact ? "artifact"
+    : stage.status === "running" ? "running"
+    : "idle";
+
   return (
-    <div className="flex flex-1 flex-col overflow-hidden octo-fade-in">
-      <div className="flex items-center gap-2 border-b border-octo-hairline px-4 py-2.5 font-mono text-xs text-octo-sage">
-        <span className="text-octo-brass">§ {stage.role.toUpperCase()}</span>
-        <span>· {labelForRole(stage.role)} · {stage.agentModel}</span>
-        <span className="ml-auto text-octo-brass">${stage.costUsd.toFixed(2)}</span>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-2.5">
+        <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+          § {stage.role.replace(/_/g, " ").toUpperCase()}
+        </span>
+        <span className="font-serif text-sm text-octo-ivory">{labelForRole(stage.role)}</span>
+        <span className="truncate font-mono text-[10px] text-octo-mute">{stage.agentModel}</span>
+        <span className="octo-tabular ml-auto font-mono text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
       </div>
       <div
         ref={scrollRef}
         className="chat-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
       >
-        {stage.status === "failed" && stage.error ? (
-          <>
-            <span className="text-octo-rouge">{stage.error}</span>
-            {journal.length > 0 && <div className="mt-2 flex flex-col gap-2 opacity-70">{journal}</div>}
-          </>
-        ) : artifact ? (
-          <div className="whitespace-pre-wrap">
-            {artifact.text || "(no output text)"}
-            {artifact.refsWorktree &&
-              (diffLoading ? (
-                <div className="p-4 font-mono text-xs text-octo-mute">Loading diff…</div>
-              ) : (
-                <DiffViewer diff={diff} />
-              ))}
-          </div>
-        ) : stage.status === "running" ? (
-          <>
-            {journal}
-            <div className="flex items-center gap-2 text-octo-brass"><span>working…</span></div>
-          </>
-        ) : (
-          <span className="text-octo-mute">No artifact yet.</span>
-        )}
+        <FadeSwap swapKey={`${stage.id}:${mode}`} className="flex flex-col gap-2">
+          {mode === "failed" ? (
+            <>
+              <div className="octo-rise-in rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2">
+                <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</div>
+                <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
+              </div>
+              {journal.length > 0 && <div className="flex flex-col gap-2">{journal}</div>}
+            </>
+          ) : mode === "artifact" ? (
+            <div className="whitespace-pre-wrap">
+              {artifact!.text || "(no output text)"}
+              {artifact!.refsWorktree && (
+                <FadeSwap swapKey={diffLoading ? "loading" : "diff"}>
+                  {diffLoading ? (
+                    <div className="py-4 font-mono text-xs text-octo-mute">fetching the diff…</div>
+                  ) : (
+                    <DiffViewer diff={diff} />
+                  )}
+                </FadeSwap>
+              )}
+            </div>
+          ) : mode === "running" ? (
+            <>
+              {journal}
+              <div className="flex items-center gap-2 font-mono text-[11px] text-octo-brass">
+                <span className="octo-stage-pulse inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" />
+                <span>{ROLE_VERBS[stage.role] ?? "working…"}</span>
+              </div>
+            </>
+          ) : (
+            <span className="text-octo-mute">Nothing produced yet.</span>
+          )}
+        </FadeSwap>
       </div>
     </div>
   );

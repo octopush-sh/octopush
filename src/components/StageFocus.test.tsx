@@ -38,11 +38,32 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();          // tool name
     expect(screen.getByText("src/auth.rs")).toBeInTheDocument();   // hint
     expect(screen.getByText(/142 lines/)).toBeInTheDocument();     // result detail
-    expect(screen.getByText(/working/)).toBeInTheDocument();       // running pulse
+    expect(screen.getByText(/reviewing…/)).toBeInTheDocument();    // running pulse (role verb for code_review)
   });
 
-  it("shows the empty 'working…' state when there are no entries yet", () => {
+  it("shows the running indicator even when there are no entries yet", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    expect(screen.getByText(/working/)).toBeInTheDocument();
+    expect(screen.getByText(/reviewing…/)).toBeInTheDocument();
+  });
+
+  it("shows the role verb while running", () => {
+    render(<StageFocus stage={{ ...baseStage, role: "plan" }} workspacePath="/tmp" />);
+    expect(screen.getByText("planning…")).toBeInTheDocument();
+  });
+
+  it("renders a designed error banner plus the journal at full opacity on failure", () => {
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "text", text: "evidence line" }] } });
+    const { container } = render(
+      <StageFocus stage={{ ...baseStage, status: "failed", error: "agent exploded" }} workspacePath="/tmp" />,
+    );
+    expect(screen.getByText("✕ stage halted")).toBeInTheDocument();
+    expect(screen.getByText("agent exploded")).toBeInTheDocument();
+    expect(screen.getByText("evidence line")).toBeInTheDocument(); // journal is evidence…
+    expect(container.querySelector(".opacity-70")).toBeNull();     // …shown at full opacity
+  });
+
+  it("uses the serif empty state", () => {
+    render(<StageFocus stage={null} workspacePath="/tmp" />);
+    expect(screen.getByText("Pick a stage above to see its work.")).toBeInTheDocument();
   });
 });
