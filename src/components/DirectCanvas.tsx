@@ -18,6 +18,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const loadRuns = useRunsStore((s) => s.loadRuns);
   const refreshDetail = useRunsStore((s) => s.refreshDetail);
   const viewedId = useRunsStore((s) => s.getViewedRunId(workspaceId));
+  const executingRun = useRunsStore((s) => s.hasExecutingRun(workspaceId));
   const detail = useRunsStore((s) => (viewedId ? s.getDetail(viewedId) : undefined));
   const selectedStageId = useRunsStore((s) => (viewedId ? s.getSelectedStageId(viewedId) : null));
   const selectStage = useRunsStore((s) => s.selectStage);
@@ -37,6 +38,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
         onBegin={(pipelineId, task, stageOverrides) =>
           void begin(workspaceId, pipelineId, task, stageOverrides, linkedIssueKey ?? undefined)
         }
+        executingRun={executingRun}
       />
     );
   }
