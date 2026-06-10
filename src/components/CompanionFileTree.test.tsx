@@ -272,4 +272,58 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.queryByText("app.war")).not.toBeInTheDocument());
     expect(mockReadDirectory).toHaveBeenLastCalledWith(ROOT, false);
   });
+
+  it("discards a stale in-flight response after the toggle flips (generation guard)", async () => {
+    let resolveStale!: (v: unknown) => void;
+    let call = 0;
+    mockReadDirectory.mockImplementation((_path: string, show?: boolean) => {
+      call += 1;
+      if (call === 1) {
+        // First (toggle-off) root fetch: held open, resolved later with a sentinel.
+        return new Promise((res) => {
+          resolveStale = res;
+        });
+      }
+      return Promise.resolve(
+        show
+          ? [...ROOT_CHILDREN, { name: "app.war", path: "/repo/app.war", isDir: false, isIgnored: true }]
+          : ROOT_CHILDREN,
+      );
+    });
+
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+
+    // Toggle while the first fetch is still in flight.
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+    await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
+
+    // Now resolve the stale (pre-toggle) response with a sentinel entry.
+    resolveStale([{ name: "STALE.txt", path: "/repo/STALE.txt", isDir: false, isIgnored: false }]);
+    await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
+    expect(screen.queryByText("STALE.txt")).not.toBeInTheDocument();
+  });
+
+  it("toggling refetches expanded subfolders too", async () => {
+    mockReadDirectory.mockImplementation((path: string, show?: boolean) => {
+      if (path === ROOT) return Promise.resolve(ROOT_CHILDREN);
+      if (path === "/repo/src") {
+        return Promise.resolve(
+          show
+            ? [...SRC_CHILDREN, { name: "gen.ts", path: "/repo/src/gen.ts", isDir: false, isIgnored: true }]
+            : SRC_CHILDREN,
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+
+    await waitFor(() => expect(screen.getByText("gen.ts")).toBeInTheDocument());
+    expect(mockReadDirectory).toHaveBeenCalledWith("/repo/src", true);
+  });
 });

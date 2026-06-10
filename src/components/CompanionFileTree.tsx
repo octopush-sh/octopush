@@ -38,14 +38,24 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     [children, showIgnored],
   );
 
+  const prevRootRef = useRef(rootPath);
+
   // (Re)load on mount, on workspace switch, and when the show-ignored toggle
   // flips: bump the generation (discarding in-flight responses), drop the
-  // cache, and force-refetch every expanded folder.
+  // cache, and force-refetch. A toggle refetches every expanded folder; a
+  // workspace switch resets expansion to the new root alone.
   useEffect(() => {
     genRef.current += 1;
     setChildren({});
+    const rootChanged = prevRootRef.current !== rootPath;
+    prevRootRef.current = rootPath;
+    if (rootChanged) {
+      setExpanded(new Set([rootPath]));
+      void fetchChildren(rootPath, { force: true });
+      return;
+    }
     const toFetch = new Set(expanded);
-    toFetch.add(rootPath); // a freshly-switched workspace root may not be in `expanded` yet
+    toFetch.add(rootPath);
     for (const p of toFetch) {
       void fetchChildren(p, { force: true });
     }
