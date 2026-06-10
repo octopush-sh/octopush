@@ -1,8 +1,15 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { ChevronDown, ChevronUp, X } from "lucide-react";
 import type { PipelineWithStages, StageDraft } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { ModelPicker } from "./ModelPicker";
 import { labelForRole, ROMAN } from "./RunTrack";
+import { Listbox } from "./controls/Listbox";
+import { SegmentedControl } from "./controls/SegmentedControl";
+import { TogglePill } from "./controls/TogglePill";
+import { Stepper } from "./controls/Stepper";
+import { IconButton } from "./controls/IconButton";
+import { Reveal } from "./primitives/Reveal";
 
 // Keep in sync with KNOWN_ROLES/REVIEW_ROLES in src-tauri/src/db.rs (the authoritative validator).
 const ALL_ROLES = [
@@ -10,6 +17,28 @@ const ALL_ROLES = [
   "repro", "fix", "verify", "critique", "refine",
 ];
 const REVIEW_ROLES = new Set(["plan_review", "code_review", "critique", "verify"]);
+// Keep in sync with KNOWN_ROLES in src-tauri/src/db.rs (authoritative validator).
+const ROLE_DESCRIPTIONS: Record<string, string> = {
+  plan: "Outline the approach before any code",
+  plan_review: "Critique the plan — can loop back",
+  implement: "Write the code in the worktree",
+  code_review: "Review the diff — can loop back",
+  test: "Write and run the tests",
+  repro: "Reproduce the reported problem",
+  fix: "Apply the fix",
+  verify: "Confirm the fix holds — can loop back",
+  critique: "Critique the artifact — can loop back",
+  refine: "Polish from the critique",
+};
+const ROLE_OPTIONS = ALL_ROLES.map((r) => ({ value: r, label: labelForRole(r), description: ROLE_DESCRIPTIONS[r] }));
+const SUBSTRATE_OPTIONS = [
+  { value: "api" as const, label: "API", activeClass: "bg-[var(--state-blue-ghost)] text-octo-state-blue" },
+  { value: "cli" as const, label: "CLI", activeClass: "bg-[var(--state-purple-ghost)] text-octo-state-purple" },
+];
+const MODE_OPTIONS = [
+  { value: "gated" as const, label: "Gated" },
+  { value: "auto" as const, label: "Auto" },
+];
 // Keep the default model in sync with the seeder's choices in db.rs seed_builtin_pipelines.
 const DEFAULT_STAGE = { role: "implement", agentModel: "claude-sonnet-4-6", substrate: "api" as const, checkpoint: false };
 
@@ -116,7 +145,22 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
       return next;
     });
 
-  const removeStage = (key: string) => mutate((prev) => prev.filter((s) => s.key !== key));
+  const [exiting, setExiting] = useState<Set<string>>(new Set());
+  const removeStage = (key: string) => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+      mutate((prev) => prev.filter((s) => s.key !== key));
+      return;
+    }
+    setExiting((prev) => new Set(prev).add(key));
+    setTimeout(() => {
+      setExiting((prev) => { const n = new Set(prev); n.delete(key); return n; });
+      mutate((prev) => prev.filter((s) => s.key !== key));
+    }, 120);
+  };
+
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const jumpTo = (key: string) => cardRefs.current[key]?.scrollIntoView({ behavior: "smooth", block: "center" });
+
   const addStage = () =>
     mutate((prev) => [
       ...prev,
@@ -151,37 +195,38 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
   };
 
   return (
-    <div className="flex-1 overflow-auto px-5 py-5 octo-fade-in">
-      <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-brass">I · Name the pipeline</p>
+    <div className="h-full flex-1 overflow-auto px-8 py-6 octo-fade-in">
+      <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">direct · builder</p>
       <input
         value={name}
         onChange={(e) => setName(e.target.value)}
-        placeholder="What is this pipeline called?"
-        className="mb-2 w-full rounded-lg border border-octo-hairline bg-octo-panel-2 px-3 py-2 font-serif text-lg text-octo-ivory placeholder:text-octo-mute"
+        placeholder="Name this pipeline"
+        aria-label="Pipeline name"
+        className="mb-1 w-full border-b border-transparent bg-transparent pb-1 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
       />
       <input
         value={description}
         onChange={(e) => setDescription(e.target.value)}
-        placeholder="One line on when to reach for it"
-        className="mb-6 w-full rounded-lg border border-octo-hairline bg-octo-panel-2 px-3 py-2 text-sm text-octo-sage placeholder:text-octo-mute"
+        placeholder="When should the team reach for it?"
+        aria-label="Pipeline description"
+        className="mb-6 w-full border-b border-transparent bg-transparent pb-1 font-mono text-xs text-octo-sage outline-none transition-colors duration-[180ms] placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
       />
 
-      <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-brass">II · Assemble the stages</p>
-      <div className="mb-4 flex flex-col gap-2.5">
+      <PreviewRail stages={stages} onJump={jumpTo} />
+
+      <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">II · Compose the stages</p>
+      <div className="mb-4 flex flex-col gap-3">
         {stages.map((s, i) => (
-          <div key={s.key} className="rounded-lg border border-octo-hairline bg-octo-panel-2 px-3 py-2.5 octo-rise-in">
+          <div
+            key={s.key}
+            ref={(el) => { cardRefs.current[s.key] = el; }}
+            className={`rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-3 ${
+              exiting.has(s.key) ? "octo-fade-out pointer-events-none" : "octo-rise-in"
+            }`}
+          >
             <div className="flex items-center gap-3">
               <span className="w-7 shrink-0 font-mono text-[11px] text-octo-brass">{ROMAN[i] ?? i + 1}</span>
-              <select
-                value={s.role}
-                onChange={(e) => patch(s.key, { role: e.target.value })}
-                aria-label="Stage role"
-                className="rounded-md border border-octo-hairline bg-octo-onyx px-2 py-1.5 font-serif text-sm text-octo-ivory"
-              >
-                {ALL_ROLES.map((r) => (
-                  <option key={r} value={r}>{labelForRole(r)}</option>
-                ))}
-              </select>
+              <Listbox value={s.role} options={ROLE_OPTIONS} onChange={(r) => patch(s.key, { role: r })} ariaLabel="Stage role" className="w-44 shrink-0" />
               <div className="min-w-0 flex-1">
                 <ModelPicker
                   activeModel={s.agentModel}
@@ -189,119 +234,84 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
                   allowedProviders={s.substrate === "cli" ? ["anthropic"] : undefined}
                 />
               </div>
-              <button
-                type="button"
-                onClick={() => patch(s.key, { substrate: s.substrate === "api" ? "cli" : "api" })}
-                className={`rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase ${
-                  s.substrate === "cli"
-                    ? "text-octo-state-purple border-octo-state-purple"
-                    : "text-octo-state-blue border-octo-state-blue"
-                }`}
-              >
-                {s.substrate}
-              </button>
-              <label className="flex items-center gap-1.5 font-mono text-[9px] uppercase text-octo-mute">
-                <input
-                  type="checkbox"
-                  checked={s.checkpoint}
-                  onChange={(e) => patch(s.key, { checkpoint: e.target.checked })}
-                />
-                checkpoint
-              </label>
+              <SegmentedControl options={SUBSTRATE_OPTIONS} value={s.substrate} onChange={(v) => patch(s.key, { substrate: v })} ariaLabel="Execution substrate" />
+              <TogglePill on={s.checkpoint} onChange={(v) => patch(s.key, { checkpoint: v })} label="⟜ gate" ariaLabel="Approval gate" />
               <div className="ml-auto flex items-center gap-1">
-                <button type="button" onClick={() => move(i, -1)} disabled={i === 0}
-                  className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-xs text-octo-sage disabled:opacity-30">↑</button>
-                <button type="button" onClick={() => move(i, 1)} disabled={i === stages.length - 1}
-                  className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-xs text-octo-sage disabled:opacity-30">↓</button>
-                <button type="button" onClick={() => removeStage(s.key)} disabled={stages.length === 1}
-                  aria-label="Remove stage"
-                  className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-xs text-octo-mute hover:text-octo-rouge disabled:opacity-30">✕</button>
+                <IconButton label="Move up" disabled={i === 0} onClick={() => move(i, -1)}><ChevronUp size={12} /></IconButton>
+                <IconButton label="Move down" disabled={i === stages.length - 1} onClick={() => move(i, 1)}><ChevronDown size={12} /></IconButton>
+                <IconButton label="Remove stage" danger disabled={stages.length === 1} onClick={() => removeStage(s.key)}><X size={12} /></IconButton>
               </div>
             </div>
 
-            {REVIEW_ROLES.has(s.role) && (
-              <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-octo-hairline pt-2 font-mono text-[11px] text-octo-sage">
-                <span className="text-octo-brass">⟜ loop</span>
-                <label className="flex items-center gap-1.5">
-                  Return to
-                  <select
-                    value={s.loopTargetKey ?? ""}
-                    onChange={(e) =>
-                      patch(s.key, e.target.value
-                        ? { loopTargetKey: e.target.value, loopMaxIterations: s.loopMaxIterations || 2, loopMode: s.loopMode ?? "gated" }
-                        : { loopTargetKey: null, loopMaxIterations: 0, loopMode: null })
-                    }
-                    className="rounded border border-octo-hairline bg-octo-onyx px-1.5 py-1 text-octo-ivory"
-                  >
-                    <option value="">— linear —</option>
-                    {stages.slice(0, i).map((t, ti) => (
-                      <option key={t.key} value={t.key}>{ROMAN[ti] ?? ti + 1} · {labelForRole(t.role)}</option>
-                    ))}
-                  </select>
-                </label>
-                {s.loopTargetKey && (
-                  <>
-                    <label className="flex items-center gap-1.5">
-                      Max loop-backs
-                      <input
-                        type="number" min={1} value={s.loopMaxIterations}
-                        onChange={(e) => patch(s.key, { loopMaxIterations: Math.max(1, Number(e.target.value) || 1) })}
-                        className="w-14 rounded border border-octo-hairline bg-octo-onyx px-1.5 py-1 text-octo-ivory"
-                      />
+            <Reveal open={REVIEW_ROLES.has(s.role)}>
+              <div className="mt-3 border-t border-octo-hairline pt-3">
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                  <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">⟜ loop</span>
+                  <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.1em] text-octo-mute">
+                    return to
+                    <Listbox
+                      value={s.loopTargetKey}
+                      options={[
+                        { value: "", label: "— linear —" },
+                        ...stages.slice(0, i).map((t, ti) => ({ value: t.key, label: `${ROMAN[ti] ?? ti + 1} · ${labelForRole(t.role)}` })),
+                      ]}
+                      onChange={(v) =>
+                        patch(s.key, v
+                          ? { loopTargetKey: v, loopMaxIterations: s.loopMaxIterations || 2, loopMode: s.loopMode ?? "gated" }
+                          : { loopTargetKey: null, loopMaxIterations: 0, loopMode: null })
+                      }
+                      placeholder="— linear —"
+                      ariaLabel="Loop target"
+                      className="w-44"
+                    />
+                  </label>
+                  {/* S1: sub-controls stay mounted — they dim instead of reflowing. */}
+                  <div className={`flex items-center gap-x-5 transition-opacity duration-[220ms] ${s.loopTargetKey ? "" : "pointer-events-none opacity-30"}`} aria-hidden={!s.loopTargetKey}>
+                    <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.1em] text-octo-mute">
+                      max loop-backs
+                      <Stepper value={s.loopMaxIterations || 2} min={1} max={9} onChange={(v) => patch(s.key, { loopMaxIterations: v })} ariaLabel="Max loop-backs" />
                     </label>
-                    <label className="flex items-center gap-1.5">
-                      Mode
-                      <select
-                        value={s.loopMode ?? "gated"}
-                        onChange={(e) => patch(s.key, { loopMode: e.target.value as "gated" | "auto" })}
-                        className="rounded border border-octo-hairline bg-octo-onyx px-1.5 py-1 text-octo-ivory"
-                      >
-                        <option value="gated">gated</option>
-                        <option value="auto">auto</option>
-                      </select>
+                    <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.1em] text-octo-mute">
+                      mode
+                      <SegmentedControl options={MODE_OPTIONS} value={s.loopMode ?? "gated"} onChange={(v) => patch(s.key, { loopMode: v })} ariaLabel="Loop mode" />
                     </label>
-                    {s.loopMode === "auto" && (
-                      <span className="text-octo-mute">Auto relies on a parseable verdict; it gates to you otherwise.</span>
-                    )}
-                  </>
-                )}
-                {s.loopCleared && (
-                  <span className="text-octo-mute">Loop target removed — review is linear again.</span>
-                )}
+                  </div>
+                </div>
+                <div className="mt-1.5 h-4 font-mono text-[10px] text-octo-mute">
+                  {s.loopCleared
+                    ? "Loop target removed — review is linear again."
+                    : s.loopTargetKey && s.loopMode === "auto"
+                      ? "Auto relies on a parseable verdict; it gates to you otherwise."
+                      : ""}
+                </div>
               </div>
-            )}
-            {s.loopCleared && !REVIEW_ROLES.has(s.role) && (
-              <div className="mt-2 border-t border-octo-hairline pt-2 font-mono text-[11px] text-octo-mute">
+            </Reveal>
+            <Reveal open={s.loopCleared && !REVIEW_ROLES.has(s.role)}>
+              <div className="mt-2 border-t border-octo-hairline pt-2 font-mono text-[10px] text-octo-mute">
                 Loop target removed — review is linear again.
               </div>
-            )}
+            </Reveal>
           </div>
         ))}
       </div>
-      <button
-        type="button"
-        onClick={addStage}
-        className="mb-6 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage hover:border-[var(--brass-dim)]"
-      >
-        + Add a stage
+      <button type="button" onClick={addStage}
+        className="mb-8 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-ivory">
+        ⟶ Add another stage
       </button>
 
-      {error && <p className="mb-3 font-mono text-xs text-octo-rouge">{error}</p>}
+      <Reveal open={error !== null}>
+        <div className="mb-3 rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2 font-mono text-xs text-octo-rouge">
+          {error}
+        </div>
+      </Reveal>
 
-      <div className="flex items-center gap-2 border-t border-octo-hairline pt-4">
-        <button
-          type="button"
-          disabled={saving || !name.trim()}
-          onClick={() => void onSave()}
-          className="rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx disabled:opacity-40"
-        >
+      <div className="sticky bottom-0 -mx-8 flex items-center gap-2 border-t border-octo-hairline bg-octo-panel px-8 py-3">
+        <button type="button" disabled={saving || !name.trim()} onClick={() => void onSave()}
+          className="rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40">
           {isBuiltin ? "Save as my copy ⟶" : "Save pipeline ⟶"}
         </button>
-        <button
-          type="button"
-          onClick={onClose}
-          className="rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute"
-        >
+        <button type="button" onClick={onClose}
+          className="rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage">
           Cancel
         </button>
         {pipeline && !isBuiltin && (
@@ -312,12 +322,38 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
             </button>
           ) : (
             <button type="button" onClick={() => setConfirmingDelete(true)}
-              className="ml-auto rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute hover:text-octo-rouge">
+              className="ml-auto rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
               Delete
             </button>
           )
         )}
       </div>
+    </div>
+  );
+}
+
+function PreviewRail({ stages, onJump }: { stages: DraftStage[]; onJump: (key: string) => void }) {
+  return (
+    <div className="mb-8 flex items-start overflow-x-auto rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-3">
+      {stages.map((s, i) => {
+        const targetIdx = s.loopTargetKey ? stages.findIndex((t) => t.key === s.loopTargetKey) : -1;
+        const looping = targetIdx !== -1 && targetIdx < i;
+        return (
+          <div key={s.key} className="flex items-start">
+            {i > 0 && (
+              <span className="mx-2 mt-1 text-octo-brass opacity-60">{stages[i - 1].checkpoint ? "⟜" : "⟶"}</span>
+            )}
+            <button type="button" onClick={() => onJump(s.key)}
+              className="flex flex-col items-start gap-0.5 rounded-sm px-1.5 py-0.5 text-left transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+              <span className="font-mono text-[10px] text-octo-brass">{ROMAN[i] ?? i + 1}</span>
+              <span className="whitespace-nowrap font-serif text-[13px] text-octo-ivory">{labelForRole(s.role)}</span>
+              <span className="h-3.5 whitespace-nowrap font-mono text-[9px] text-octo-mute">
+                {looping ? `⟜ back to ${ROMAN[targetIdx] ?? targetIdx + 1} · ×${s.loopMaxIterations}` : ""}
+              </span>
+            </button>
+          </div>
+        );
+      })}
     </div>
   );
 }

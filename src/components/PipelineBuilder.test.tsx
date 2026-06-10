@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 
 vi.mock("./ModelPicker", () => ({
   ModelPicker: ({ activeModel }: any) => <div data-testid="model">{activeModel}</div>,
@@ -28,6 +28,22 @@ const custom = {
   pipeline: { id: "p2", name: "Mine", description: "d", isBuiltin: false, createdAt: "t" },
   stages: [stage({ id: "s0", position: 0, role: "plan" })],
 } as any;
+// A review stage with NO loop target — the linear case for the S1 stability test.
+const linearReview = {
+  pipeline: { id: "p4", name: "Linear", description: "d", isBuiltin: false, createdAt: "t" },
+  stages: [
+    stage({ id: "s0", position: 0, role: "implement" }),
+    stage({ id: "s1", position: 1, role: "code_review" }),
+  ],
+} as any;
+
+/** The loop-cleared notice now lives in fixed Reveal slots that stay mounted
+ *  (hidden via aria-hidden when collapsed), so assert on *visible* notices only.
+ *  Exact-text match so ancestor containers don't match. */
+const visibleLoopNotices = () =>
+  screen
+    .getAllByText("Loop target removed — review is linear again.")
+    .filter((el) => !el.closest('[aria-hidden="true"]'));
 
 describe("PipelineBuilder", () => {
   beforeEach(() => { saveMock.mockClear(); removeMock.mockClear(); });
@@ -55,8 +71,8 @@ describe("PipelineBuilder", () => {
   it("moving the loop target below its review clears the loop with a notice", () => {
     render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
     // implement (0) ↓ → becomes index 1, after the review → loop must clear
-    fireEvent.click(screen.getAllByRole("button", { name: "↓" })[0]);
-    expect(screen.getByText(/Loop target removed/)).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Move down" })[0]);
+    expect(visibleLoopNotices().length).toBe(1);
   });
 
   it("save serializes loop targets to positions and calls store.save", async () => {
@@ -72,7 +88,7 @@ describe("PipelineBuilder", () => {
 
   it("add stage appends a card", () => {
     render(<PipelineBuilder pipeline={custom} onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: /Add a stage/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Add another stage/ }));
     expect(screen.getAllByTestId("model").length).toBe(2);
   });
 
@@ -85,7 +101,7 @@ describe("PipelineBuilder", () => {
       ],
     } as any;
     render(<PipelineBuilder pipeline={corrupt} onClose={vi.fn()} />);
-    expect(screen.getByText(/Loop target removed/)).toBeInTheDocument();
+    expect(visibleLoopNotices().length).toBe(1);
     fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
     await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
     expect(saveMock.mock.calls[0][0].stages[0].loopTargetPosition).toBe(null); // cleared, valid
@@ -93,8 +109,60 @@ describe("PipelineBuilder", () => {
 
   it("changing a review role to a non-review role clears the loop with a visible notice", () => {
     render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-    const roleSelects = screen.getAllByLabelText("Stage role");
-    fireEvent.change(roleSelects[1], { target: { value: "implement" } }); // the code_review w/ loop
-    expect(screen.getByText(/Loop target removed/)).toBeInTheDocument();
+    // open the second stage's role Listbox, pick "Implement"
+    fireEvent.click(screen.getAllByRole("button", { name: "Stage role" })[1]);
+    fireEvent.click(screen.getByRole("option", { name: /^Implement/ }));
+    expect(visibleLoopNotices().length).toBe(1);
+  });
+
+  it("picking '— linear —' in the loop target clears the loop on save", async () => {
+    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Loop target" }));
+    fireEvent.click(screen.getByRole("option", { name: "— linear —" }));
+    fireEvent.click(screen.getByRole("button", { name: /Save as my copy/ }));
+    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
+    const draft = saveMock.mock.calls[0][0];
+    expect(draft.stages[1].loopTargetPosition).toBe(null);
+    expect(draft.stages[1].loopMode).toBe(null);
+  });
+
+  it("renders the live preview rail with loop-back annotation", () => {
+    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
+    // the builtin's code_review loops back to stage I with ×2
+    expect(screen.getByText("⟜ back to I · ×2")).toBeInTheDocument();
+  });
+
+  it("keeps loop sub-controls mounted but inert when linear (S1)", () => {
+    render(<PipelineBuilder pipeline={linearReview} onClose={vi.fn()} />);
+    // Steppers stay mounted (hidden:true — the dim wrapper is aria-hidden while linear);
+    // scope to the one inside the OPEN review loop panel (Reveal aria-hidden="false").
+    const incs = screen.getAllByRole("button", { name: "Increase", hidden: true });
+    const inOpenPanel = incs.filter((b) => b.closest('[aria-hidden="false"]'));
+    expect(inOpenPanel.length).toBe(1);
+    const wrapper = inOpenPanel[0].closest(".pointer-events-none");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.className).toContain("opacity-30");
+  });
+
+  it("removing a stage fades it out, then deletes it after the exit timer", () => {
+    vi.useFakeTimers();
+    try {
+      render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
+      fireEvent.click(screen.getAllByRole("button", { name: "Remove stage" })[1]);
+      expect(screen.getAllByTestId("model").length).toBe(2); // still mounted during the exit fade
+      act(() => { vi.advanceTimersByTime(130); });
+      expect(screen.getAllByTestId("model").length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("two-step delete still works", async () => {
+    const onClose = vi.fn();
+    render(<PipelineBuilder pipeline={custom} onClose={onClose} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Confirm delete/ }));
+    await vi.waitFor(() => expect(removeMock).toHaveBeenCalledWith("p2"));
+    expect(onClose).toHaveBeenCalled();
   });
 });
