@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("../lib/ipc", () => ({
   ipc: {
     listPipelines: vi.fn(),
+    savePipeline: vi.fn(),
+    deletePipeline: vi.fn(),
   },
 }));
 
@@ -38,5 +40,23 @@ describe("pipelineStore", () => {
     expect(usePipelineStore.getState().loaded).toBe(true);
     expect(usePipelineStore.getState().error).toBe("boom");
     expect(usePipelineStore.getState().pipelines).toHaveLength(0);
+  });
+
+  it("save calls savePipeline and reloads the list", async () => {
+    (ipc.savePipeline as any) = vi.fn().mockResolvedValue("new-id");
+    (ipc.listPipelines as any).mockResolvedValue([]);
+    const draft = { pipelineId: null, name: "Mine", description: "d", stages: [] as any[] };
+    const id = await usePipelineStore.getState().save(draft as any);
+    expect(id).toBe("new-id");
+    expect(ipc.savePipeline).toHaveBeenCalledWith(draft);
+    expect(ipc.listPipelines).toHaveBeenCalled(); // reloaded
+  });
+
+  it("remove calls deletePipeline and reloads the list", async () => {
+    (ipc.deletePipeline as any) = vi.fn().mockResolvedValue(undefined);
+    (ipc.listPipelines as any).mockResolvedValue([]);
+    await usePipelineStore.getState().remove("p1");
+    expect(ipc.deletePipeline).toHaveBeenCalledWith("p1");
+    expect(ipc.listPipelines).toHaveBeenCalled();
   });
 });

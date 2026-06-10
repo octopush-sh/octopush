@@ -856,6 +856,25 @@ pub async fn get_pipeline(
 }
 
 #[tauri::command]
+pub async fn save_pipeline(
+    state: State<'_, AppState>,
+    pipeline_id: Option<String>,
+    name: String,
+    description: String,
+    stages: Vec<crate::db::StageDraft>,
+) -> AppResult<String> {
+    state.db.lock().save_pipeline(pipeline_id, &name, &description, &stages)
+}
+
+#[tauri::command]
+pub async fn delete_pipeline(
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<()> {
+    state.db.lock().delete_pipeline(&pipeline_id)
+}
+
+#[tauri::command]
 pub async fn create_run(
     state: State<'_, AppState>,
     workspace_id: String,

@@ -31,6 +31,22 @@ export interface PipelineWithStages {
   pipeline: Pipeline;
   stages: PipelineStage[];
 }
+/** A builder-authored stage (position = array index). */
+export interface StageDraft {
+  role: string;
+  agentModel: string;
+  substrate: AgentSubstrate;
+  checkpoint: boolean;
+  loopTargetPosition: number | null;
+  loopMaxIterations: number;
+  loopMode: "gated" | "auto" | null;
+}
+export interface PipelineDraft {
+  pipelineId: string | null; // null = create; a builtin id = fork; a custom id = update
+  name: string;
+  description: string;
+  stages: StageDraft[];
+}
 export interface Run {
   id: string;
   workspaceId: string;
@@ -467,6 +483,17 @@ export const ipc = {
   // ─── Direct mode (orchestration) ──────────────────────────────────
   listPipelines: () =>
     invoke<PipelineWithStages[]>("list_pipelines"),
+
+  savePipeline: (draft: PipelineDraft) =>
+    invoke<string>("save_pipeline", {
+      pipelineId: draft.pipelineId,
+      name: draft.name,
+      description: draft.description,
+      stages: draft.stages,
+    }),
+
+  deletePipeline: (pipelineId: string) =>
+    invoke<void>("delete_pipeline", { pipelineId }),
 
   createRun: (
     workspaceId: string,

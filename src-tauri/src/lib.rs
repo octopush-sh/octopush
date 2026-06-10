@@ -171,6 +171,8 @@ pub fn run() {
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,
+            commands::save_pipeline,
+            commands::delete_pipeline,
             commands::create_run,
             commands::start_run,
             commands::get_run,

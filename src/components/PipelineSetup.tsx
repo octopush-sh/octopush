@@ -9,9 +9,10 @@ interface Props {
   defaultTask: string;
   onBegin: (pipelineId: string, task: string, stageOverrides: [number, string][]) => void;
   executingRun: boolean;
+  onEditPipeline: (pipelineId: string | null) => void;
 }
 
-export function PipelineSetup({ defaultTask, onBegin, executingRun }: Props) {
+export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeline }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
@@ -24,7 +25,8 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun }: Props) {
 
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
-    if (!selectedId && pipelines.length > 0) setSelectedId(pipelines[0].pipeline.id);
+    const exists = selectedId && pipelines.some((p) => p.pipeline.id === selectedId);
+    if (!exists && pipelines.length > 0) setSelectedId(pipelines[0].pipeline.id);
   }, [pipelines, selectedId]);
   useEffect(() => {
     if (!selectedId) return;
@@ -76,22 +78,37 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun }: Props) {
       ) : (
         <div className="mb-6 flex gap-2.5">
           {pipelines.map((p) => (
-            <button
-              key={p.pipeline.id}
-              type="button"
-              onClick={() => { setSelectedId(p.pipeline.id); setOverrides({}); }}
-              className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
-                p.pipeline.id === selectedId
-                  ? "border-octo-brass bg-[var(--brass-ghost)]"
-                  : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
-              }`}
-            >
-              <h3 className="mb-1 font-serif text-[15px] text-octo-ivory">{p.pipeline.name}</h3>
-              <p className="m-0 text-[11px] text-octo-sage">{p.pipeline.description}</p>
-            </button>
+            <div key={p.pipeline.id} className="relative flex-1">
+              <button
+                type="button"
+                onClick={() => { setSelectedId(p.pipeline.id); setOverrides({}); }}
+                className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                  p.pipeline.id === selectedId
+                    ? "border-octo-brass bg-[var(--brass-ghost)]"
+                    : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
+                }`}
+              >
+                <h3 className="mb-1 pr-10 font-serif text-[15px] text-octo-ivory">{p.pipeline.name}</h3>
+                <p className="m-0 text-[11px] text-octo-sage">{p.pipeline.description}</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => onEditPipeline(p.pipeline.id)}
+                className="absolute right-2 top-2 rounded border border-transparent px-1.5 py-0.5 font-mono text-[9px] uppercase text-octo-mute hover:border-octo-hairline hover:text-octo-brass"
+              >
+                Edit
+              </button>
+            </div>
           ))}
         </div>
       )}
+      <button
+        type="button"
+        onClick={() => onEditPipeline(null)}
+        className="mb-6 font-serif text-[13px] text-octo-brass hover:text-octo-ivory"
+      >
+        ⟶ Compose a new pipeline
+      </button>
 
       {selected && (
         <>

@@ -1,8 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import type { Run } from "../lib/ipc";
 
-vi.mock("./PipelineSetup", () => ({ PipelineSetup: () => <div>LAUNCHER</div> }));
+vi.mock("./PipelineSetup", () => ({
+  PipelineSetup: ({ onEditPipeline }: any) => (
+    <div>
+      LAUNCHER
+      <button onClick={() => onEditPipeline(null)}>compose</button>
+    </div>
+  ),
+}));
+vi.mock("./PipelineBuilder", () => ({ PipelineBuilder: () => <div>BUILDER</div> }));
 vi.mock("./RunTrack", () => ({ RunTrack: () => <div>RUNVIEW</div>, labelForRole: (r: string) => r }));
 vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
 vi.mock("./CheckpointBar", () => ({ CheckpointBar: () => <div /> }));
@@ -33,5 +41,13 @@ describe("DirectCanvas viewed-run routing", () => {
     useRunsStore.getState().selectRun("w1", "r1");
     render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
     expect(screen.getByText("RUNVIEW")).toBeInTheDocument();
+  });
+
+  it("opens the builder from the launcher and closes back", () => {
+    useRunsStore.getState().selectRun("w1", null);
+    render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
+    fireEvent.click(screen.getByText("compose"));
+    expect(screen.getByText("BUILDER")).toBeInTheDocument();
+    expect(screen.queryByText("LAUNCHER")).not.toBeInTheDocument();
   });
 });

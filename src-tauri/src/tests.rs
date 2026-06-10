@@ -1938,6 +1938,13 @@ mod pipeline_crud_tests {
         Db::open(tmp.path()).unwrap()
     }
 
+    fn draft(role: &str) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            role: role.into(), agent_model: "claude-haiku-4-5".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+        }
+    }
+
     #[test]
     fn seed_is_idempotent_and_lists_three() {
         let db = test_db();
@@ -1956,6 +1963,97 @@ mod pipeline_crud_tests {
         assert!(implement.checkpoint);
         let plan = stages.iter().find(|s| s.role == "plan").unwrap();
         assert!(!plan.checkpoint);
+    }
+
+    #[test]
+    fn validate_pipeline_stages_enforces_roles_substrates_and_loop_contract() {
+        use crate::db::validate_pipeline_stages;
+        // valid linear pipeline
+        assert!(validate_pipeline_stages(&[draft("plan"), draft("implement")]).is_ok());
+        // empty pipeline / unknown role / bad substrate / empty model
+        assert!(validate_pipeline_stages(&[]).is_err());
+        assert!(validate_pipeline_stages(&[draft("dance")]).is_err());
+        let mut bad_sub = draft("plan"); bad_sub.substrate = "ftp".into();
+        assert!(validate_pipeline_stages(&[bad_sub]).is_err());
+        let mut no_model = draft("plan"); no_model.agent_model = "".into();
+        assert!(validate_pipeline_stages(&[no_model]).is_err());
+
+        // valid gated loop: code_review at index 1 loops back to 0
+        let mut review = draft("code_review");
+        review.loop_target_position = Some(0); review.loop_max_iterations = 2; review.loop_mode = Some("gated".into());
+        assert!(validate_pipeline_stages(&[draft("implement"), review.clone()]).is_ok());
+
+        // loop on a non-review role
+        let mut looped_impl = draft("implement");
+        looped_impl.loop_target_position = Some(0); looped_impl.loop_max_iterations = 2; looped_impl.loop_mode = Some("gated".into());
+        assert!(validate_pipeline_stages(&[draft("plan"), looped_impl]).is_err());
+        // target not strictly earlier (self)
+        let mut self_loop = review.clone(); self_loop.loop_target_position = Some(1);
+        assert!(validate_pipeline_stages(&[draft("implement"), self_loop]).is_err());
+        // target out of range
+        let mut far = review.clone(); far.loop_target_position = Some(5);
+        assert!(validate_pipeline_stages(&[draft("implement"), far]).is_err());
+        // max 0 with a target / bad mode
+        let mut zero = review.clone(); zero.loop_max_iterations = 0;
+        assert!(validate_pipeline_stages(&[draft("implement"), zero]).is_err());
+        let mut mode = review.clone(); mode.loop_mode = Some("magic".into());
+        assert!(validate_pipeline_stages(&[draft("implement"), mode]).is_err());
+        // no target but leftover loop fields → invalid (builder must normalize)
+        let mut leftover = draft("code_review"); leftover.loop_max_iterations = 2;
+        assert!(validate_pipeline_stages(&[draft("implement"), leftover]).is_err());
+    }
+
+    #[test]
+    fn save_pipeline_creates_forks_builtins_and_updates_customs() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let ff = db.list_pipelines().unwrap().into_iter().find(|p| p.name == "Feature Factory").unwrap();
+        let ff_stages_before = db.get_pipeline_stages(&ff.id).unwrap();
+
+        // CREATE: no id → new custom pipeline.
+        let created = db.save_pipeline(None, "Mine", "d", &[draft("plan"), draft("implement")]).unwrap();
+        let mine = db.list_pipelines().unwrap().into_iter().find(|p| p.id == created).unwrap();
+        assert!(!mine.is_builtin);
+        assert_eq!(db.get_pipeline_stages(&created).unwrap().len(), 2);
+
+        // FORK: saving a builtin returns a NEW id; the builtin is untouched.
+        let forked = db.save_pipeline(Some(ff.id.clone()), "Feature Factory (custom)", "my copy", &[draft("plan")]).unwrap();
+        assert_ne!(forked, ff.id);
+        let ff_stages_after = db.get_pipeline_stages(&ff.id).unwrap();
+        assert_eq!(ff_stages_before.len(), ff_stages_after.len()); // builtin intact
+        assert_eq!(db.get_pipeline_stages(&forked).unwrap().len(), 1);
+        assert!(!db.list_pipelines().unwrap().iter().find(|p| p.id == forked).unwrap().is_builtin);
+
+        // UPDATE: saving a custom updates in place (same id, replaced stages + meta).
+        let updated = db.save_pipeline(Some(created.clone()), "Mine v2", "d2", &[draft("plan"), draft("implement"), draft("test")]).unwrap();
+        assert_eq!(updated, created);
+        let row = db.list_pipelines().unwrap().into_iter().find(|p| p.id == created).unwrap();
+        assert_eq!(row.name, "Mine v2");
+        assert_eq!(db.get_pipeline_stages(&created).unwrap().len(), 3);
+
+        // INVALID draft → error AND the custom's prior stages survive (transactional).
+        let err = db.save_pipeline(Some(created.clone()), "Mine v3", "d3", &[draft("dance")]);
+        assert!(err.is_err());
+        assert_eq!(db.get_pipeline_stages(&created).unwrap().len(), 3); // unchanged
+        assert_eq!(db.list_pipelines().unwrap().into_iter().find(|p| p.id == created).unwrap().name, "Mine v2");
+
+        // Unknown id → error.
+        assert!(db.save_pipeline(Some("nope".into()), "x", "d", &[draft("plan")]).is_err());
+        // Empty name → error.
+        assert!(db.save_pipeline(None, "   ", "d", &[draft("plan")]).is_err());
+    }
+
+    #[test]
+    fn delete_pipeline_rejects_builtins_and_removes_customs_with_stages() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let ff = db.list_pipelines().unwrap().into_iter().find(|p| p.name == "Feature Factory").unwrap();
+        assert!(db.delete_pipeline(&ff.id).is_err()); // builtin protected
+
+        let id = db.save_pipeline(None, "Mine", "d", &[draft("plan")]).unwrap();
+        db.delete_pipeline(&id).unwrap();
+        assert!(db.list_pipelines().unwrap().iter().all(|p| p.id != id));
+        assert!(db.get_pipeline_stages(&id).unwrap().is_empty()); // stages gone too
     }
 }
 

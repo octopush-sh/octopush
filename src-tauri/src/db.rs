@@ -1534,6 +1534,99 @@ impl Db {
         Ok(())
     }
 
+    /// Create, fork, or update a pipeline from builder drafts (validated).
+    /// - `None` → create a new custom pipeline.
+    /// - `Some(builtin)` → FORK: a new custom copy is created; the builtin is never touched.
+    /// - `Some(custom)` → update meta + replace the stage set, transactionally.
+    /// Returns the saved pipeline's id (the new id when created/forked).
+    pub fn save_pipeline(
+        &self,
+        pipeline_id: Option<String>,
+        name: &str,
+        description: &str,
+        stages: &[StageDraft],
+    ) -> AppResult<String> {
+        use crate::error::AppError;
+        if name.trim().is_empty() {
+            return Err(AppError::Other("the pipeline needs a name".into()));
+        }
+        validate_pipeline_stages(stages)?;
+
+        // Resolve the edit target: does it exist, and is it a builtin?
+        let target: Option<(String, bool)> = match pipeline_id.as_deref() {
+            Some(id) => Some(
+                self.conn
+                    .query_row(
+                        "SELECT id, is_builtin FROM pipelines WHERE id = ?1",
+                        params![id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| AppError::Other("pipeline not found".into()))?,
+            ),
+            None => None,
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        let saved_id = match target {
+            // Update a custom pipeline in place.
+            Some((id, false)) => {
+                tx.execute(
+                    "UPDATE pipelines SET name = ?2, description = ?3 WHERE id = ?1",
+                    params![id, name, description],
+                )?;
+                tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![id])?;
+                id
+            }
+            // Create (no target) or fork (builtin target): a fresh custom pipeline.
+            _ => {
+                let id = Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
+                    "INSERT INTO pipelines (id, name, description, is_builtin, created_at)
+                     VALUES (?1,?2,?3,0,?4)",
+                    params![id, name, description, now],
+                )?;
+                id
+            }
+        };
+        for (i, s) in stages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pipeline_stages
+                    (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                     loop_target_position, loop_max_iterations, loop_mode)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
+                        s.substrate, s.checkpoint as i64,
+                        s.loop_target_position, s.loop_max_iterations, s.loop_mode],
+            )?;
+        }
+        tx.commit()?;
+        Ok(saved_id)
+    }
+
+    /// Delete a custom pipeline and its stages. Builtins are protected.
+    pub fn delete_pipeline(&self, pipeline_id: &str) -> AppResult<()> {
+        use crate::error::AppError;
+        let is_builtin: bool = self
+            .conn
+            .query_row(
+                "SELECT is_builtin FROM pipelines WHERE id = ?1",
+                params![pipeline_id],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::Other("pipeline not found".into()))?;
+        if is_builtin {
+            return Err(AppError::Other("builtin pipelines cannot be deleted".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![pipeline_id])?;
+        tx.execute("DELETE FROM pipelines WHERE id = ?1", params![pipeline_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ─── Runs ─────────────────────────────────────────────────────
 
     /// Create a run and copy the pipeline's stages into `run_stages` (a private copy
@@ -1870,6 +1963,68 @@ pub struct UsageBreakdown {
     pub cloud_tokens: i64,
     pub local_tokens: i64,
     pub estimated_local_savings_usd: f64,
+}
+
+/// A builder-authored stage. Position is the array index; the loop contract
+/// (review-loop spec §3.7) is enforced by [`validate_pipeline_stages`].
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StageDraft {
+    pub role: String,
+    pub agent_model: String,
+    pub substrate: String,
+    pub checkpoint: bool,
+    pub loop_target_position: Option<i64>,
+    pub loop_max_iterations: i64,
+    pub loop_mode: Option<String>,
+}
+
+// Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
+const KNOWN_ROLES: &[&str] = &[
+    "plan", "plan_review", "implement", "code_review", "test",
+    "repro", "fix", "verify", "critique", "refine",
+];
+const REVIEW_ROLES: &[&str] = &["plan_review", "code_review", "critique", "verify"];
+
+/// Validate a pipeline's stage drafts (the §3.7 builder contract). Pure.
+pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    if stages.is_empty() {
+        return Err(AppError::Other("a pipeline needs at least one stage".into()));
+    }
+    for (i, s) in stages.iter().enumerate() {
+        if !KNOWN_ROLES.contains(&s.role.as_str()) {
+            return Err(AppError::Other(format!("unknown stage role '{}'", s.role)));
+        }
+        if !matches!(s.substrate.as_str(), "api" | "cli") {
+            return Err(AppError::Other(format!("unknown substrate '{}'", s.substrate)));
+        }
+        if s.agent_model.trim().is_empty() {
+            return Err(AppError::Other(format!("stage {} has no model", i + 1)));
+        }
+        match s.loop_target_position {
+            Some(target) => {
+                if !REVIEW_ROLES.contains(&s.role.as_str()) {
+                    return Err(AppError::Other(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
+                }
+                if target < 0 || target >= i as i64 {
+                    return Err(AppError::Other("loop target must be an earlier stage".into()));
+                }
+                if s.loop_max_iterations < 1 {
+                    return Err(AppError::Other("loop max iterations must be at least 1".into()));
+                }
+                if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
+                    return Err(AppError::Other("loop mode must be 'gated' or 'auto'".into()));
+                }
+            }
+            None => {
+                if s.loop_max_iterations != 0 || s.loop_mode.is_some() {
+                    return Err(AppError::Other("loop fields set without a loop target".into()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

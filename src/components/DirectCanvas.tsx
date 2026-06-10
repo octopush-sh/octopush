@@ -1,6 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRunsStore } from "../stores/runsStore";
+import { usePipelineStore } from "../stores/pipelineStore";
 import { PipelineSetup } from "./PipelineSetup";
+import { PipelineBuilder } from "./PipelineBuilder";
 import { RunTrack, labelForRole } from "./RunTrack";
 import { StageFocus } from "./StageFocus";
 import { CheckpointBar } from "./CheckpointBar";
@@ -26,10 +28,23 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const resolve = useRunsStore((s) => s.resolve);
   const abort = useRunsStore((s) => s.abort);
 
+  // Builder: undefined = closed; null = compose new; a pipelineId = edit that one.
+  const [builder, setBuilder] = useState<undefined | null | string>(undefined);
+  const pipelines = usePipelineStore((s) => s.pipelines);
+
   useEffect(() => { if (active) void loadRuns(workspaceId); }, [active, workspaceId, loadRuns]);
   useEffect(() => {
     if (active && viewedId && !detail?.run) void refreshDetail(viewedId);
   }, [active, viewedId, detail?.run, refreshDetail]);
+
+  if (builder !== undefined) {
+    return (
+      <PipelineBuilder
+        pipeline={builder ? pipelines.find((p) => p.pipeline.id === builder) ?? null : null}
+        onClose={() => setBuilder(undefined)}
+      />
+    );
+  }
 
   if (!viewedId || !detail?.run) {
     return (
@@ -39,6 +54,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           void begin(workspaceId, pipelineId, task, stageOverrides, linkedIssueKey ?? undefined)
         }
         executingRun={executingRun}
+        onEditPipeline={(id) => setBuilder(id)}
       />
     );
   }
