@@ -177,6 +177,19 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 | `.octo-fade-in` | tab/mode content crossfade | fade · --dur-quick |
 | `.octo-pop-in` | status dots / small badges appearing | fade+scale · --dur-quick |
 | `.octo-rise-in` | list rows appearing | fade+rise 4px · --dur-standard |
+| `<FadeSwap swapKey>` | mutually exclusive view swaps (canvas states, pane modes) | exit fade 120ms → `.octo-fade-in` (`src/components/primitives/FadeSwap.tsx`) |
+| `<Reveal open>` | expanding/collapsing regions (decision strips, sub-panels) | grid-rows 0fr↔1fr · --dur-standard (`src/components/primitives/Reveal.tsx`) |
+| `.octo-tabular` | every live numeric value (cost, %, mm:ss, counters) | `font-variant-numeric: tabular-nums` |
+| `.octo-sweep` | one-shot brass rule sweep (Direct run-completion moment only) | width 0→100% · --dur-reveal |
+
+### Stability doctrine (binding for live surfaces; born in Direct)
+
+- **S1 — Fixed-slot live text.** Text that changes while something runs lives in a fixed-height truncating slot that exists in every state — content changes never resize the container.
+- **S2 — Tabular numerals.** Every live numeric value uses `.octo-tabular`; timers get a `ch`-based fixed width.
+- **S3 — No abrupt subtree swaps.** Mutually exclusive views transition through `<FadeSwap>`.
+- **S4 — Height changes are animated.** Anything that expands/collapses goes through `<Reveal>`.
+- **S5 — No motion on live tickers.** Streaming values update in place; motion is reserved for state *transitions*.
+- **S6 — Smooth, calm scrolling.** Autoscroll uses `scrollTo({behavior:"smooth"})`; entries enter with `.octo-rise-in`.
 
 Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPanel`, the rail project collapse, the Recently-closed drawer). All entrance/collapse motion respects `prefers-reduced-motion`.
 
@@ -238,13 +251,17 @@ Direct introduces a set of new visual patterns. Use them only in Direct mode; do
 | `API`      | `--color-octo-state-blue` | Stage runs via the Claude API directly |
 | `CLI`      | `--color-octo-state-purple` | Stage runs via Claude Code CLI in the worktree |
 
-Pills share the same geometry as the existing status pills (mono uppercase, `sm` radius, dot icon omitted here — substrate is the identity). Never use these two colors outside Direct mode substrate pills.
+Pills share the same geometry as the existing status pills (mono uppercase, `sm` radius, fixed width, dot icon omitted here — substrate is the identity). Never use these two colors outside Direct mode substrate pills.
+
+**Provider dot tokens** — `--provider-anthropic / -openai / -deepseek / -ollama` exist for the decorative identity dots in the ModelPicker (and Direct surfaces that embed it). Decorative only; never for text or borders.
+
+**Atelier form controls** (`src/components/controls/`) — `SegmentedControl`, `TogglePill`, `Stepper`, `Listbox` (portal + fixed positioning), `IconButton`. Direct surfaces never use native `<select>`, checkboxes, or number spinners; new form UI should reach for these first.
 
 **Run track** — the horizontal stage list across the canvas top.
 
-- Each stage: roman numeral header (`I`, `II`, `III` …) in brass mono, substrate pill, model name in mono mute, per-stage cost in mono mute.
-- Stages connect left-to-right with `⟶` in brass (connector) or `⟜` in brass (checkpoint gate — pauses for human approval).
-- A running stage shows a verdigris status dot and a live cost ticker. A failed stage shows a rouge dot.
+- Each stage is a **fixed-geometry card** (S1): roman numeral + status glyph + status word, role in serif, model + substrate pill, and one reserved live line that shows activity (running), verdict (done), or cost (idle) — geometry never changes while a run executes.
+- Stages connect left-to-right with `⟶` in brass (connector) or `⟜` in brass (checkpoint gate — pauses for human approval). Connectors render at 40% opacity until the stage on their left is done — progress visibly fills the line.
+- A running stage pulses (`octo-stage-pulse`) with a verdigris dot and a `5ch` tabular timer. Done = verdigris `✓`. Failed = rouge accent.
 - The track scrolls horizontally when stages overflow the canvas width; the focus pane below is always visible.
 
 **Focus pane** — the lower half of the Direct canvas.
@@ -253,16 +270,17 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 - Header: `§ ROLE` (e.g., `§ PLANNER`, `§ IMPLEMENTER`) in brass mono — the same `§` signature as tool call cards.
 - For code stages, the worktree diff is embedded beneath the artifact using the same diff styling as Review mode (`--verdigris` adds / `--rouge` dels).
 
-**Checkpoint bar** — replaces the input bar when the run is paused at a `⟜` gate.
+**Checkpoint decision strip** — docked at the canvas bottom when the run pauses at a `⟜` gate; it *unfolds* through `<Reveal>` and folds away on resolve (never mounts abruptly).
 
-- Three ghost buttons in a hairline-bordered strip: `Approve`, `Reject`, `Abort`. No italic-serif phrases here — these are consequential decisions that need clarity.
-- Approve continues the run; Reject re-queues the stage; Abort terminates the pipeline.
+- Button hierarchy (surgical brass): **Approve & continue** is the only solid-brass button; **Send back to {role} ⟜** is brass-outlined serif; Reject/Re-run and Abort are ghost (Abort gets a rouge hover). Serif phrases stay upright.
+- The loop meter (`review loop · 2 of 3 used`) renders in a fixed slot with tabular numerals and turns brass at the cap.
+- A failed stage swaps the accent to rouge with a `✕ stage halted` eyebrow.
 
-**Cost meter** — a single-line strip at the bottom of the canvas during a run.
+**Ledger strip** (cost meter) — a single calm line at the canvas bottom, **savings-first** (the differentiator leads).
 
-- Format: `spent: $0.014 · saved vs. all-premium: $0.089` in JetBrains Mono, `text-octo-brass` for the values, `text-octo-mute` for the labels.
-- Updated live; no animation on the numbers (functional indicator — per motion §5.3: no motion on live counters).
-- Visually matches the status bar aesthetic (calm, single-line, panel bg).
+- Format: `saved $0.089 · 86% under all-premium  ·  spent $0.014` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
+- A 2px progress inset beneath (brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
+- **Completion moment:** when a run completes, a one-shot brass sweep (`.octo-sweep`) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
 
 ### Status bar (bottom)
 
