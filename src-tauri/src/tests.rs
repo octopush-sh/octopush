@@ -2843,6 +2843,19 @@ mod cli_runner_tests {
     fn unparseable_output_is_an_error() {
         assert!(parse_cli_result("not json", true, "plan").is_err());
     }
+
+    #[test]
+    fn non_success_subtype_is_a_failed_stage_with_usage_kept() {
+        // claude -p reports hitting --max-turns as subtype "error_max_turns",
+        // historically with is_error=false — a success-shaped failure.
+        const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"","is_error":false,
+            "total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let outcome = parse_cli_result(MAX_TURNS, true, "implement").unwrap();
+        assert!(matches!(outcome.status, crate::orchestrator::types::StageStatus::Failed));
+        assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
+        assert_eq!(outcome.cost_usd, 1.25);
+        assert_eq!(outcome.input_tokens, 10);
+    }
 }
 
 #[cfg(test)]
