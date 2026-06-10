@@ -14,7 +14,7 @@ vi.mock("./PipelineBuilder", () => ({ PipelineBuilder: () => <div>BUILDER</div> 
 vi.mock("./RunTrack", () => ({ RunTrack: () => <div>RUNVIEW</div>, labelForRole: (r: string) => r }));
 vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
 vi.mock("./CheckpointBar", () => ({ CheckpointBar: () => <div>CHECKPOINT</div> }));
-vi.mock("./RunCostMeter", () => ({ RunCostMeter: () => <div /> }));
+vi.mock("./RunLedger", () => ({ RunLedger: () => <div /> }));
 
 const { DirectCanvas } = await import("./DirectCanvas");
 const { useRunsStore } = await import("../stores/runsStore");

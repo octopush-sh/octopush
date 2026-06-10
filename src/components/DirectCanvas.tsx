@@ -7,7 +7,7 @@ import { PipelineBuilder } from "./PipelineBuilder";
 import { RunTrack, labelForRole } from "./RunTrack";
 import { StageFocus } from "./StageFocus";
 import { CheckpointBar } from "./CheckpointBar";
-import { RunCostMeter } from "./RunCostMeter";
+import { RunLedger } from "./RunLedger";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
 
@@ -97,7 +97,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
       <div className="flex h-full min-h-0 flex-col">
         <RunTrack run={run} stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
         <StageFocus stage={shownStage} workspacePath={workspacePath} />
-        <RunCostMeter run={run} stages={stages} />
+        <RunLedger run={run} stages={stages} />
         <Reveal open={checkpointOpen}>
           {barStage && (
             <CheckpointBar
