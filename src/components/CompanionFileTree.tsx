@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Eye, EyeOff } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { DirectoryEntry } from "../lib/types";
 import { fileIcon } from "../lib/fileIcons";
+import { useReviewPrefs } from "../stores/reviewPrefsStore";
 
 interface Props {
   rootPath: string;
@@ -15,26 +17,40 @@ type ChildState = DirectoryEntry[] | "loading" | "error";
 export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileClick }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set([rootPath]));
   const [children, setChildren] = useState<Record<string, ChildState>>({});
+  const showIgnored = useReviewPrefs((s) => !!s.showIgnoredFiles[rootPath]);
+  const toggleShowIgnored = useReviewPrefs((s) => s.toggleShowIgnored);
+  const genRef = useRef(0);
 
   const fetchChildren = useCallback(
-    async (path: string) => {
-      if (children[path] && children[path] !== "error") return; // already cached
+    async (path: string, opts?: { force?: boolean }) => {
+      if (!opts?.force && children[path] && children[path] !== "error") return; // already cached
+      const gen = genRef.current;
       setChildren((prev) => ({ ...prev, [path]: "loading" }));
       try {
-        const entries = await ipc.readDirectory(path);
+        const entries = await ipc.readDirectory(path, showIgnored);
+        if (genRef.current !== gen) return; // toggle flipped mid-flight; discard
         setChildren((prev) => ({ ...prev, [path]: entries }));
       } catch {
+        if (genRef.current !== gen) return;
         setChildren((prev) => ({ ...prev, [path]: "error" }));
       }
     },
-    [children],
+    [children, showIgnored],
   );
 
-  // Eagerly load root on mount.
+  // (Re)load on mount, on workspace switch, and when the show-ignored toggle
+  // flips: bump the generation (discarding in-flight responses), drop the
+  // cache, and force-refetch every expanded folder.
   useEffect(() => {
-    fetchChildren(rootPath);
+    genRef.current += 1;
+    setChildren({});
+    const toFetch = new Set(expanded);
+    toFetch.add(rootPath); // a freshly-switched workspace root may not be in `expanded` yet
+    for (const p of toFetch) {
+      void fetchChildren(p, { force: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootPath]);
+  }, [rootPath, showIgnored]);
 
   const toggleExpand = useCallback(
     (path: string) => {
@@ -56,8 +72,22 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     <section className="flex h-full min-h-0 flex-col">
       {/* Eyebrow — same height & padding as the canvas toolbar and the
           left rail's CHANGES eyebrow so the three top bars form one row. */}
-      <h3 className="flex h-11 shrink-0 items-center border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+      <h3 className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
         Files
+        <button
+          type="button"
+          aria-label="Show ignored files"
+          aria-pressed={showIgnored}
+          title={showIgnored ? "Hide ignored files" : "Show ignored files"}
+          onClick={() => toggleShowIgnored(rootPath)}
+          className="rounded-sm p-1 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          {showIgnored ? (
+            <Eye size={12} className="text-octo-brass" />
+          ) : (
+            <EyeOff size={12} className="text-octo-mute" />
+          )}
+        </button>
       </h3>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
@@ -65,6 +95,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
           path={rootPath}
           label={rootLabel}
           isDir={true}
+          isIgnored={false}
           depth={0}
           isRoot={true}
           expanded={expanded}
@@ -82,6 +113,7 @@ interface TreeNodeProps {
   path: string;
   label: string;
   isDir: boolean;
+  isIgnored: boolean;
   depth: number;
   isRoot: boolean;
   expanded: Set<string>;
@@ -91,9 +123,10 @@ interface TreeNodeProps {
   onFileClick?: (absPath: string) => void;
 }
 
-/** Returns the label color class for a file/folder based on depth and changed state. */
-function depthColorClass(depth: number, isChanged: boolean): string {
+/** Returns the label color class for a file/folder based on state and depth. */
+function depthColorClass(depth: number, isChanged: boolean, isIgnored: boolean): string {
   if (isChanged) return "text-octo-ivory";
+  if (isIgnored) return "text-octo-mute";
   if (depth >= 4) return "text-octo-mute";
   return "text-octo-sage";
 }
@@ -102,6 +135,7 @@ function TreeNode({
   path,
   label,
   isDir,
+  isIgnored,
   depth,
   isRoot,
   expanded,
@@ -170,7 +204,7 @@ function TreeNode({
               size={12}
               aria-hidden="true"
               className="shrink-0"
-              style={{ color: "var(--color-octo-mute)" }}
+              style={{ color: "var(--color-octo-mute)", opacity: isIgnored ? 0.6 : 1 }}
             />
           )
         )}
@@ -195,7 +229,7 @@ function TreeNode({
           </span>
         ) : (
           <span
-            className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}
+            className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged, isIgnored)}`}
           >
             {label}
           </span>
@@ -243,6 +277,7 @@ function TreeNode({
                 path={entry.path}
                 label={entry.name}
                 isDir={entry.isDir}
+                isIgnored={entry.isIgnored}
                 depth={depth + 1}
                 isRoot={false}
                 expanded={expanded}

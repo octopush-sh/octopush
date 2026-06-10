@@ -13,23 +13,25 @@ vi.mock("../lib/ipc", () => ({
 
 // Import after mock is set up.
 import { CompanionFileTree } from "./CompanionFileTree";
+import { useReviewPrefs } from "../stores/reviewPrefsStore";
 
 const ROOT = "/repo";
 const CHANGED = new Set(["/repo/src/Main.java"]);
 
 const ROOT_CHILDREN = [
-  { name: "src", path: "/repo/src", isDir: true },
-  { name: "docs", path: "/repo/docs", isDir: true },
-  { name: "pom.xml", path: "/repo/pom.xml", isDir: false },
+  { name: "src", path: "/repo/src", isDir: true, isIgnored: false },
+  { name: "docs", path: "/repo/docs", isDir: true, isIgnored: false },
+  { name: "pom.xml", path: "/repo/pom.xml", isDir: false, isIgnored: false },
 ];
 
 const SRC_CHILDREN = [
-  { name: "Main.java", path: "/repo/src/Main.java", isDir: false },
-  { name: "Helper.java", path: "/repo/src/Helper.java", isDir: false },
+  { name: "Main.java", path: "/repo/src/Main.java", isDir: false, isIgnored: false },
+  { name: "Helper.java", path: "/repo/src/Helper.java", isDir: false, isIgnored: false },
 ];
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useReviewPrefs.setState({ showIgnoredFiles: {} });
   // Default: root children resolve immediately.
   mockReadDirectory.mockImplementation((path: string) => {
     if (path === ROOT) return Promise.resolve(ROOT_CHILDREN);
@@ -67,7 +69,7 @@ describe("CompanionFileTree", () => {
     await userEvent.click(screen.getByText("src"));
 
     await waitFor(() => {
-      expect(mockReadDirectory).toHaveBeenCalledWith("/repo/src");
+      expect(mockReadDirectory).toHaveBeenCalledWith("/repo/src", false);
       expect(screen.getByText("Main.java")).toBeInTheDocument();
       expect(screen.getByText("Helper.java")).toBeInTheDocument();
     });
@@ -130,7 +132,7 @@ describe("CompanionFileTree", () => {
 
   it("shows empty indicator for an empty folder", async () => {
     mockReadDirectory.mockImplementation((path: string) => {
-      if (path === ROOT) return Promise.resolve([{ name: "empty-dir", path: "/repo/empty-dir", isDir: true }]);
+      if (path === ROOT) return Promise.resolve([{ name: "empty-dir", path: "/repo/empty-dir", isDir: true, isIgnored: false }]);
       return Promise.resolve([]);
     });
 
@@ -180,13 +182,13 @@ describe("CompanionFileTree", () => {
     const changedDeepPath = "/r/a/b/c/d/changed.txt";
 
     mockReadDirectory.mockImplementation((path: string) => {
-      if (path === DEEP_ROOT)             return Promise.resolve([{ name: "a", path: "/r/a", isDir: true }]);
-      if (path === "/r/a")                return Promise.resolve([{ name: "b", path: "/r/a/b", isDir: true }]);
-      if (path === "/r/a/b")              return Promise.resolve([{ name: "c", path: "/r/a/b/c", isDir: true }]);
-      if (path === "/r/a/b/c")            return Promise.resolve([{ name: "d", path: "/r/a/b/c/d", isDir: true }]);
+      if (path === DEEP_ROOT)             return Promise.resolve([{ name: "a", path: "/r/a", isDir: true, isIgnored: false }]);
+      if (path === "/r/a")                return Promise.resolve([{ name: "b", path: "/r/a/b", isDir: true, isIgnored: false }]);
+      if (path === "/r/a/b")              return Promise.resolve([{ name: "c", path: "/r/a/b/c", isDir: true, isIgnored: false }]);
+      if (path === "/r/a/b/c")            return Promise.resolve([{ name: "d", path: "/r/a/b/c/d", isDir: true, isIgnored: false }]);
       if (path === "/r/a/b/c/d")          return Promise.resolve([
-        { name: "deep.txt",    path: deepPath,        isDir: false },
-        { name: "changed.txt", path: changedDeepPath, isDir: false },
+        { name: "deep.txt",    path: deepPath,        isDir: false, isIgnored: false },
+        { name: "changed.txt", path: changedDeepPath, isDir: false, isIgnored: false },
       ]);
       return Promise.resolve([]);
     });
@@ -214,5 +216,60 @@ describe("CompanionFileTree", () => {
     // changed.txt is at depth 5 but IS changed → should carry text-octo-ivory
     const changedLabel = screen.getByText("changed.txt");
     expect(changedLabel.className).toContain("text-octo-ivory");
+  });
+
+  it("eye toggle re-fetches with showIgnored=true and shows dimmed ignored entries", async () => {
+    mockReadDirectory.mockImplementation((path: string, show?: boolean) => {
+      if (path === ROOT) {
+        return Promise.resolve(
+          show
+            ? [
+                ...ROOT_CHILDREN,
+                { name: "build", path: "/repo/build", isDir: true, isIgnored: true },
+                { name: "app.war", path: "/repo/app.war", isDir: false, isIgnored: true },
+              ]
+            : ROOT_CHILDREN,
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    expect(screen.queryByText("app.war")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+
+    await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
+    expect(mockReadDirectory).toHaveBeenLastCalledWith(ROOT, true);
+
+    // Ignored entries are dimmed but still clickable rows.
+    expect(screen.getByText("app.war").className).toContain("text-octo-mute");
+    expect(screen.getByText("build").className).toContain("text-octo-mute");
+    // Non-ignored entries keep their normal color.
+    expect(screen.getByText("pom.xml").className).toContain("text-octo-sage");
+  });
+
+  it("toggling back off re-fetches without the flag and hides ignored entries", async () => {
+    mockReadDirectory.mockImplementation((path: string, show?: boolean) => {
+      if (path === ROOT) {
+        return Promise.resolve(
+          show
+            ? [...ROOT_CHILDREN, { name: "app.war", path: "/repo/app.war", isDir: false, isIgnored: true }]
+            : ROOT_CHILDREN,
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+    await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+    await waitFor(() => expect(screen.queryByText("app.war")).not.toBeInTheDocument());
+    expect(mockReadDirectory).toHaveBeenLastCalledWith(ROOT, false);
   });
 });

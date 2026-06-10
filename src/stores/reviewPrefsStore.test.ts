@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { useReviewPrefs } from "./reviewPrefsStore";
 
 describe("reviewPrefsStore", () => {
-  beforeEach(() => { localStorage.clear(); useReviewPrefs.setState({ readingMode: "inline", ignoreWhitespace: false }); });
+  beforeEach(() => { localStorage.clear(); useReviewPrefs.setState({ readingMode: "inline", ignoreWhitespace: false, showIgnoredFiles: {} }); });
   it("defaults to inline + whitespace-sensitive", () => {
     expect(useReviewPrefs.getState().readingMode).toBe("inline");
     expect(useReviewPrefs.getState().ignoreWhitespace).toBe(false);
@@ -17,8 +17,6 @@ describe("reviewPrefsStore", () => {
     expect(useReviewPrefs.getState().ignoreWhitespace).toBe(true);
   });
   it("toggleShowIgnored flips the per-root flag without touching other roots", () => {
-    useReviewPrefs.setState({ showIgnoredFiles: {} });
-
     useReviewPrefs.getState().toggleShowIgnored("/repo");
     expect(useReviewPrefs.getState().showIgnoredFiles["/repo"]).toBe(true);
     expect(useReviewPrefs.getState().showIgnoredFiles["/other"]).toBeUndefined();
