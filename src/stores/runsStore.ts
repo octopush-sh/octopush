@@ -11,6 +11,7 @@ import {
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
+const beginningWs = new Set<string>();
 const MAX_LOG_LINES = 200;
 
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
@@ -23,6 +24,9 @@ interface RunsState {
   activeRunIdByWs: Record<string, string | null>;
   detailByRun: Record<string, RunDetail>;
   selectedStageByRun: Record<string, string | null>;
+  /** The run the canvas is VIEWING per workspace. Absent = default (active run);
+   *  null = the launcher (explicit "new run"); a runId = view that run. */
+  selectedRunIdByWs: Record<string, string | null>;
   /** Structured live activity entries per stage id, streamed from both substrates. */
   liveByStage: Record<string, LiveEntry[]>;
 
@@ -30,6 +34,9 @@ interface RunsState {
   getActiveRunId: (workspaceId: string) => string | null;
   getDetail: (runId: string) => RunDetail | undefined;
   getSelectedStageId: (runId: string) => string | null;
+  getViewedRunId: (workspaceId: string) => string | null;
+  hasExecutingRun: (workspaceId: string) => boolean;
+  selectRun: (workspaceId: string, runId: string | null) => void;
   getLiveEntries: (stageId: string) => LiveEntry[];
   appendEntry: (stageId: string, entry: LiveEntry) => void;
   clearLog: (stageId: string) => void;
@@ -69,12 +76,21 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   activeRunIdByWs: {},
   detailByRun: {},
   selectedStageByRun: {},
+  selectedRunIdByWs: {},
   liveByStage: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
   getDetail: (runId) => get().detailByRun[runId],
   getSelectedStageId: (runId) => get().selectedStageByRun[runId] ?? null,
+  getViewedRunId: (workspaceId) => {
+    const sel = get().selectedRunIdByWs;
+    return workspaceId in sel ? sel[workspaceId] : get().getActiveRunId(workspaceId);
+  },
+  hasExecutingRun: (workspaceId) =>
+    get().getRuns(workspaceId).some((r) => r.status === "running" || r.status === "paused"),
+  selectRun: (workspaceId, runId) =>
+    set((s) => ({ selectedRunIdByWs: { ...s.selectedRunIdByWs, [workspaceId]: runId } })),
   getLiveEntries: (stageId) => get().liveByStage[stageId] ?? EMPTY_ENTRIES,
 
   appendEntry: (stageId, entry) =>
@@ -132,10 +148,23 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   },
 
   begin: async (workspaceId, pipelineId, task, stageOverrides, linkedIssueKey) => {
-    const runId = await ipc.createRun(workspaceId, pipelineId, task, undefined, linkedIssueKey, stageOverrides);
-    await ipc.startRun(runId);
-    set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
-    await get().loadRuns(workspaceId);
+    if (beginningWs.has(workspaceId)) return; // guard against double-click double-start
+    beginningWs.add(workspaceId);
+    try {
+      const runId = await ipc.createRun(workspaceId, pipelineId, task, undefined, linkedIssueKey, stageOverrides);
+      try {
+        await ipc.startRun(runId);
+      } catch (e) {
+        // start was refused (e.g. another run is in progress) — drop the orphaned draft.
+        await ipc.abortRun(runId).catch(() => {});
+        throw e;
+      }
+      set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
+      await get().loadRuns(workspaceId);
+      get().selectRun(workspaceId, runId);
+    } finally {
+      beginningWs.delete(workspaceId);
+    }
   },
 
   resolve: async (runId, action, feedback, modelOverride) => {

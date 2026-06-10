@@ -2488,6 +2488,42 @@ mod orchestrator_tests {
         assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[1].status, "awaiting_checkpoint");
         assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[1].loop_iterations, 0);
     }
+
+    /// A concurrent run in the same workspace must be detected and rejected.
+    /// The run whose status is already `running` or `paused` blocks a new start.
+    /// A `draft` run must NOT count. A run must never block itself.
+    #[tokio::test]
+    async fn has_concurrent_run_detects_another_executing_run_in_the_workspace() {
+        let (db, ws) = db_with_workspace();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // Create two runs in the same workspace.
+        let pipelines = db.lock().list_pipelines().unwrap();
+        let pipeline_id = pipelines.first().unwrap().id.clone();
+        let run_a = db.lock().create_run(&ws, &pipeline_id, "task-a", None, None, &[]).unwrap();
+        let run_b = db.lock().create_run(&ws, &pipeline_id, "task-b", None, None, &[]).unwrap();
+
+        // Both start as `draft` — neither should block the other.
+        assert!(!orch.has_concurrent_run(&run_a).await.unwrap());
+        assert!(!orch.has_concurrent_run(&run_b).await.unwrap());
+
+        // Transition run_a to `running`.
+        db.lock().set_run_status(&run_a, "running", false).unwrap();
+
+        // run_a must not block itself.
+        assert!(!orch.has_concurrent_run(&run_a).await.unwrap());
+        // run_b sees run_a running → concurrent run detected.
+        assert!(orch.has_concurrent_run(&run_b).await.unwrap());
+
+        // Transition run_a to `paused` — still executing, still blocks run_b.
+        db.lock().set_run_status(&run_a, "paused", false).unwrap();
+        assert!(orch.has_concurrent_run(&run_b).await.unwrap());
+
+        // Transition run_a to `completed` — no longer executing, run_b is free.
+        db.lock().set_run_status(&run_a, "completed", true).unwrap();
+        assert!(!orch.has_concurrent_run(&run_b).await.unwrap());
+    }
 }
 
 #[cfg(test)]

@@ -881,6 +881,11 @@ pub async fn start_run(
     orch: State<'_, Arc<Orchestrator>>,
     run_id: String,
 ) -> AppResult<()> {
+    if orch.has_concurrent_run(&run_id).await? {
+        return Err(AppError::Other(
+            "another run in this workspace is already executing".into(),
+        ));
+    }
     Arc::clone(&*orch).start_run(run_id);
     Ok(())
 }

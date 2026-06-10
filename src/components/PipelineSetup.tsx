@@ -8,9 +8,10 @@ import { savingsVsBaseline } from "../lib/runStatus";
 interface Props {
   defaultTask: string;
   onBegin: (pipelineId: string, task: string, stageOverrides: [number, string][]) => void;
+  executingRun: boolean;
 }
 
-export function PipelineSetup({ defaultTask, onBegin }: Props) {
+export function PipelineSetup({ defaultTask, onBegin, executingRun }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
@@ -127,14 +128,21 @@ export function PipelineSetup({ defaultTask, onBegin }: Props) {
                 </div>
               )}
             </div>
-            <button
-              type="button"
-              disabled={!task.trim()}
-              onClick={() => onBegin(selected.pipeline.id, task.trim(), overrideTuples())}
-              className="ml-auto rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx disabled:opacity-40"
-            >
-              Begin the run ⟶
-            </button>
+            <div className="ml-auto flex flex-col items-end gap-1.5">
+              <button
+                type="button"
+                disabled={!task.trim() || executingRun}
+                onClick={() => onBegin(selected.pipeline.id, task.trim(), overrideTuples())}
+                className="rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx disabled:opacity-40"
+              >
+                Begin the run ⟶
+              </button>
+              {executingRun && (
+                <p className="m-0 font-mono text-[10px] text-octo-mute">
+                  A run is in progress — finish or abort it before starting another.
+                </p>
+              )}
+            </div>
           </div>
         </>
       )}

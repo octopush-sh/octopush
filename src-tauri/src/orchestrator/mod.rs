@@ -488,6 +488,23 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Returns `true` when another run in the same workspace is currently
+    /// `running` or `paused` (i.e. executing or suspended mid-run).
+    ///
+    /// `draft`, `completed`, and `aborted` statuses are never considered
+    /// executing. A run is never considered concurrent with itself.
+    pub async fn has_concurrent_run(&self, run_id: &str) -> AppResult<bool> {
+        let db = self.db.lock();
+        let Some(run) = db.get_run(run_id)? else { return Ok(false) };
+        drop(db);
+        let peers = self.db.lock().list_runs(&run.workspace_id)?;
+        let blocked = peers.iter().any(|r| {
+            r.id != run_id
+                && (r.status == "running" || r.status == "paused")
+        });
+        Ok(blocked)
+    }
+
     /// Spawn the drive as a background task (production entry point).
     pub fn start_run(self: Arc<Self>, run_id: String) {
         tokio::spawn(async move {
