@@ -24,6 +24,7 @@ pub mod perf;
 pub mod issue_tracker;
 pub mod github;
 pub mod orchestrator;
+pub mod git_lock;
 
 #[cfg(test)]
 mod tests;
@@ -237,6 +238,8 @@ pub fn run() {
             commands::amend_commit,
             commands::discard_file,
             commands::push_branch,
+            commands::fetch_changes,
+            commands::pull,
             commands::find_pr_for_branch,
             commands::open_prs_for_project,
             // Workspace-wide file & text search

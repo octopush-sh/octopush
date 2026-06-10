@@ -2977,3 +2977,72 @@ mod live_tests {
         assert!(!looks_like_error("  \n42 lines changed"));
     }
 }
+
+#[cfg(test)]
+mod g7_git_tests {
+    use crate::git_ops::get_status;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn get_status_reports_conflicted_files() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "t@t.dev"]);
+        git(p, &["config", "user.name", "T"]);
+        std::fs::write(p.join("a.txt"), "base\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        git(p, &["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("a.txt"), "feature\n").unwrap();
+        git(p, &["commit", "-qam", "feature"]);
+        git(p, &["checkout", "-q", "-"]); // back to base branch (portable, no name assumption)
+        std::fs::write(p.join("a.txt"), "main\n").unwrap();
+        git(p, &["commit", "-qam", "main"]);
+        let _ = Command::new("git").args(["merge", "feature"]).current_dir(p).output().unwrap();
+
+        let st = get_status(p).unwrap();
+        assert!(st.conflicted >= 1, "expected a conflicted file, got {}", st.conflicted);
+        assert!(st.changed_files.iter().any(|f| f.path == "a.txt" && f.conflicted),
+            "a.txt should be marked conflicted");
+    }
+}
+
+#[cfg(test)]
+mod git_lock_tests {
+    use crate::git_lock::lock_for;
+    use std::sync::Arc;
+
+    #[test]
+    fn same_path_shares_one_lock_distinct_paths_differ() {
+        let a1 = lock_for("/repo/a");
+        let a2 = lock_for("/repo/a");
+        let b = lock_for("/repo/b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same path must share one mutex");
+        assert!(!Arc::ptr_eq(&a1, &b), "distinct paths must have distinct mutexes");
+    }
+}
+
+#[cfg(test)]
+mod g7_timeout_tests {
+    use crate::commands::run_with_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn run_with_timeout_returns_value_when_fast_and_none_when_slow() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let fast = rt.block_on(run_with_timeout(Duration::from_millis(500), || 42));
+        assert_eq!(fast, Some(42));
+        let slow = rt.block_on(run_with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(300));
+            7
+        }));
+        assert_eq!(slow, None);
+    }
+}

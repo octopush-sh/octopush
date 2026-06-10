@@ -17,6 +17,22 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+// ─── Timeout helper ───────────────────────────────────────────────
+
+/// Run a blocking closure with a wall-clock timeout. `None` on timeout (the closure keeps
+/// running on the blocking pool but its result is dropped) — keeps slow git2 graph walks
+/// from hanging the UI.
+pub async fn run_with_timeout<F, T>(dur: std::time::Duration, f: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::time::timeout(dur, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    }
+}
+
 // ─── Session commands ─────────────────────────────────────────────
 
 #[tauri::command]
@@ -576,7 +592,15 @@ pub async fn update_project_jira_key(
 #[tauri::command]
 pub async fn get_git_status(path: String) -> AppResult<crate::git_ops::GitStatus> {
     let path = expand_tilde(&path);
-    crate::git_ops::get_status(std::path::Path::new(&path))
+    let mut status = crate::git_ops::status_files(std::path::Path::new(&path))?;
+    let p = path.clone();
+    match run_with_timeout(std::time::Duration::from_secs(3), move || {
+        crate::git_ops::ahead_behind(std::path::Path::new(&p))
+    }).await {
+        Some(Some((a, b))) => { status.ahead = a; status.behind = b; status.ahead_behind_known = true; }
+        _ => { status.ahead = 0; status.behind = 0; status.ahead_behind_known = false; }
+    }
+    Ok(status)
 }
 
 /// Compact per-workspace git signal for the rail (one entry per worktree that
@@ -605,9 +629,14 @@ pub async fn workspaces_git_summary(
             continue;
         }
         // A single unreadable worktree shouldn't sink the whole project's
-        // summary — default it to clean and keep going.
-        let (dirty, ahead, behind) =
-            crate::git_ops::dirty_ahead_behind(path).unwrap_or((false, 0, 0));
+        // summary — default it to clean and keep going. `is_dirty` is fast
+        // (index walk); `ahead_behind` can block on graph traversal so we
+        // time it out separately to keep the rail responsive.
+        let dirty = crate::git_ops::is_dirty(path).unwrap_or(false);
+        let wt2 = wt.clone();
+        let (ahead, behind) = run_with_timeout(std::time::Duration::from_secs(3), move || {
+            crate::git_ops::ahead_behind(std::path::Path::new(&wt2))
+        }).await.flatten().unwrap_or((0, 0));
         out.push(WorkspaceGitSummary {
             workspace_id: row.id,
             dirty,
@@ -2237,6 +2266,7 @@ pub async fn commit_changes(workspace_path: String, message: String) -> AppResul
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
@@ -2556,6 +2586,45 @@ pub async fn push_branch(workspace_path: String) -> AppResult<String> {
         return Err(AppError::Other(format!("git push failed: {}", combined.trim())));
     }
     Ok(combined.trim().to_string())
+}
+
+#[tauri::command]
+pub async fn fetch_changes(workspace_path: String) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg("git fetch 2>&1")
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git fetch: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(format!("git fetch failed: {combined}")));
+    }
+    Ok(combined)
+}
+
+#[tauri::command]
+pub async fn pull(workspace_path: String, strategy: String) -> AppResult<crate::git_ops::PullOutcome> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    let flag = match strategy.as_str() {
+        "ffOnly" => "--ff-only",
+        "rebase" => "--rebase",
+        "merge" => "--no-rebase",
+        other => return Err(AppError::Other(format!("unknown pull strategy: {other}"))),
+    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("git pull {flag} 2>&1");
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git pull: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let kind = crate::git_ops::classify_pull(output.status.success(), &combined);
+    Ok(crate::git_ops::PullOutcome { kind, output: combined })
 }
 
 // ─── Test runner ──────────────────────────────────────────────────
@@ -2919,6 +2988,7 @@ pub async fn amend_commit(workspace_path: String, message: String) -> AppResult<
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
     let cmd = format!("git commit --amend -m '{}'", msg_escaped);

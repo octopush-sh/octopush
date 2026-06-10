@@ -26,6 +26,7 @@ import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ModalShell } from "./ModalShell";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -59,6 +60,8 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
   const [drafting, setDrafting] = useState(false);
   const [discardTarget, setDiscardTarget] = useState<string | null>(null);
+  const [reconcile, setReconcile] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const commitRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -85,6 +88,10 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
   const unstaged = files.filter((f) => f.unstaged);
   const ahead = gitStatus?.ahead ?? 0;
   const hasUpstream = gitStatus?.hasUpstream ?? false;
+  const behind = gitStatus?.behind ?? 0;
+  const conflicted = gitStatus?.conflicted ?? 0;
+  const aheadBehindKnown = gitStatus?.aheadBehindKnown ?? true;
+  const branchName = gitStatus?.branch ?? null;
 
   // +/− line totals derived from the diff.
   const addCount = diff
@@ -213,6 +220,46 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
     }
   }
 
+  async function runPull(strategy: "ffOnly" | "rebase" | "merge") {
+    setSyncing(true);
+    try {
+      const r = await ipc.pull(projectPath, strategy);
+      if (r.kind === "ok") {
+        pushToast({ level: "success", title: "Pulled", body: r.output.split("\n").slice(-1)[0] || undefined });
+      } else if (r.kind === "diverged") {
+        setReconcile(true);
+      } else if (r.kind === "conflict") {
+        pushToast({ level: "warning", title: "Merge conflicts", body: "Resolve the conflicted files." });
+      } else {
+        pushToast({ level: "error", title: "Pull failed", body: r.output });
+      }
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Pull failed", body: String(e) });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleFetch() {
+    setSyncing(true);
+    try {
+      await ipc.fetchChanges(projectPath);
+      pushToast({ level: "success", title: "Fetched" });
+      await refresh(); onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Fetch failed", body: String(e) });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function reconcileWith(strategy: "rebase" | "merge") {
+    setReconcile(false);
+    await runPull(strategy);
+  }
+
   const canCommit = commitMessage.trim().length > 0 && (amend || staged.length > 0) && !committing;
   // Push enabled when:
   //  - there are commits ahead of upstream (normal case), OR
@@ -231,13 +278,32 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
           Changes
         </span>
         {(addCount > 0 || delCount > 0) && (
-          <span className="ml-auto font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+          <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
             <span className="text-octo-verdigris">+{addCount}</span>
             <span className="px-1 opacity-50">/</span>
             <span className="text-octo-rouge">−{delCount}</span>
           </span>
         )}
+        {branchName && <span className="font-mono text-[10px] text-octo-sage">{branchName}</span>}
+        {aheadBehindKnown && (ahead > 0 || behind > 0) && (
+          <span data-testid="ahead-behind" className="font-mono text-[10px] text-octo-mute">
+            {ahead > 0 && <span className="text-octo-brass">↑{ahead}</span>}
+            {behind > 0 && <span className="ml-1 text-octo-sage">↓{behind}</span>}
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-1.5">
+          <button type="button" onClick={handleFetch} disabled={syncing} title="Fetch from remote"
+            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-sage disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass">Fetch</button>
+          <button type="button" onClick={() => runPull("ffOnly")} disabled={syncing || behind === 0} title="Pull from remote"
+            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-brass disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            style={{ border: "1px solid var(--brass-dim)" }}>Pull</button>
+        </span>
       </header>
+      {conflicted > 0 && (
+        <div className="shrink-0 border-b border-octo-hairline px-4 py-2 text-[11px] text-octo-rouge">
+          {conflicted} conflict{conflicted !== 1 ? "s" : ""} — resolve them in your terminal for now; in-app resolution is coming next.
+        </div>
+      )}
 
       {/* Scrollable section list */}
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -384,6 +450,20 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
           onConfirm={confirmDiscard}
           onCancel={() => setDiscardTarget(null)}
         />
+      )}
+
+      {reconcile && (
+        <ModalShell onClose={() => setReconcile(false)} ariaLabel="Reconcile diverged branch">
+          <div className="p-5">
+            <h2 className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">Diverged</h2>
+            <p className="mb-4 text-[12px] text-octo-sage">Your branch and its upstream have diverged. Reconcile by:</p>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setReconcile(false)} className="rounded px-3 py-1.5 text-[11px] text-octo-mute focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass">Cancel</button>
+              <button type="button" onClick={() => reconcileWith("merge")} className="rounded px-3 py-1.5 text-[11px] text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass" style={{ border: "1px solid var(--brass-dim)" }}>Merge</button>
+              <button type="button" onClick={() => reconcileWith("rebase")} className="rounded px-3 py-1.5 text-[11px] font-semibold text-octo-onyx focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass" style={{ background: "var(--color-octo-brass)" }}>Rebase</button>
+            </div>
+          </div>
+        </ModalShell>
       )}
     </aside>
   );
@@ -539,6 +619,8 @@ function FileStatusIcon({ status }: { status: FileChange["status"] }) {
       return <FileX {...props} className="shrink-0 text-octo-rouge" />;
     case "renamed":
       return <FileMinus {...props} className="shrink-0 text-octo-sage" />;
+    case "conflicted":
+      return <FileX {...props} className="shrink-0 text-octo-rouge" />;
     default:
       return <FileEdit {...props} className="shrink-0 text-octo-mute" />;
   }
@@ -551,6 +633,7 @@ function StatusGlyph({ status }: { status: FileChange["status"] }) {
     deleted: { letter: "D", color: "text-octo-rouge" },
     renamed: { letter: "R", color: "text-octo-sage" },
     unknown: { letter: "?", color: "text-octo-mute" },
+    conflicted: { letter: "!", color: "text-octo-rouge" },
   };
   const { letter, color } = map[status];
   return (

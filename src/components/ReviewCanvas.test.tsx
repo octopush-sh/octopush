@@ -64,10 +64,12 @@ index abc1234..def5678 100644
 
 const SAMPLE_GIT_STATUS = {
   branch: "feat/test",
-  changedFiles: [{ path: "src/foo.ts", status: "modified" as const, staged: false, unstaged: true }],
+  changedFiles: [{ path: "src/foo.ts", status: "modified" as const, staged: false, unstaged: true, conflicted: false }],
   ahead: 0,
   behind: 0,
   hasUpstream: false,
+  conflicted: 0,
+  aheadBehindKnown: true,
 };
 
 function renderCanvas(overrides?: Partial<Parameters<typeof ReviewCanvas>[0]>) {
@@ -243,7 +245,7 @@ describe("ReviewCanvas misc", () => {
   it("shows empty state when diff is empty", () => {
     renderCanvas({
       gitDiff: "",
-      gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false },
+      gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true },
     });
     expect(screen.getByText(/Nothing to review/)).toBeTruthy();
   });

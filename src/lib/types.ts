@@ -224,15 +224,21 @@ export interface GitStatus {
    *  tracking branch configured). UI uses this to enable Publish for the
    *  first push, since `ahead` is 0 with no upstream to compare against. */
   hasUpstream: boolean;
+  /** Count of files with an unresolved merge conflict. */
+  conflicted: number;
+  /** False when ahead/behind timed out (huge graph); UI hides the ↑/↓ badge. */
+  aheadBehindKnown: boolean;
 }
 
 export interface FileChange {
   path: string;
-  status: "new" | "modified" | "deleted" | "renamed" | "unknown";
+  status: "new" | "modified" | "deleted" | "renamed" | "unknown" | "conflicted";
   /** The file has changes in the index (staged for commit). */
   staged: boolean;
   /** The file has unstaged worktree modifications. */
   unstaged: boolean;
+  /** Unresolved merge-conflict (unmerged index) state. */
+  conflicted: boolean;
 }
 
 export type PrState = "open" | "draft" | "merged" | "closed";

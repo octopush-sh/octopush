@@ -9,7 +9,7 @@ const { ipcMock, pushToast } = vi.hoisted(() => ({
     stageFile: vi.fn(), unstageFile: vi.fn(), unstageAllChanges: vi.fn(),
     commitChanges: vi.fn(), amendCommit: vi.fn(), pushBranch: vi.fn(),
     getStagedDiff: vi.fn(), getLastCommit: vi.fn(), discardFile: vi.fn(),
-    aiComplete: vi.fn(),
+    aiComplete: vi.fn(), fetchChanges: vi.fn(), pull: vi.fn(),
   },
   pushToast: vi.fn(),
 }));
@@ -23,9 +23,10 @@ import { ChangesPanel } from "./ChangesPanel";
 
 const STATUS = {
   branch: "main", ahead: 0, behind: 0, hasUpstream: true,
+  conflicted: 0, aheadBehindKnown: true,
   changedFiles: [
-    { path: "a.ts", status: "modified", staged: true, unstaged: false },
-    { path: "b.ts", status: "modified", staged: false, unstaged: true },
+    { path: "a.ts", status: "modified", staged: true, unstaged: false, conflicted: false },
+    { path: "b.ts", status: "modified", staged: false, unstaged: true, conflicted: false },
   ],
 };
 
@@ -86,5 +87,51 @@ describe("ChangesPanel G4", () => {
     await waitFor(() => expect(ipcMock.getLastCommit).toHaveBeenCalled());
     expect(box.checked).toBe(false);
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Nothing to amend" }));
+  });
+
+  it("Pull (ff-only ok) calls ipc.pull and toasts", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({
+      branch: "main", ahead: 0, behind: 2, hasUpstream: true,
+      conflicted: 0, aheadBehindKnown: true, changedFiles: [],
+    });
+    ipcMock.pull.mockResolvedValue({ kind: "ok", output: "Updated." });
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByRole("button", { name: /^pull$/i });
+    await userEvent.click(screen.getByRole("button", { name: /^pull$/i }));
+    await waitFor(() => expect(ipcMock.pull).toHaveBeenCalledWith("/repo", "ffOnly"));
+  });
+
+  it("diverged pull opens the reconcile dialog and routes Rebase", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({
+      branch: "main", ahead: 1, behind: 1, hasUpstream: true,
+      conflicted: 0, aheadBehindKnown: true, changedFiles: [],
+    });
+    ipcMock.pull
+      .mockResolvedValueOnce({ kind: "diverged", output: "Not possible to fast-forward" })
+      .mockResolvedValueOnce({ kind: "ok", output: "Rebased." });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /^pull$/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /^rebase$/i }));
+    await waitFor(() => expect(ipcMock.pull).toHaveBeenNthCalledWith(2, "/repo", "rebase"));
+  });
+
+  it("shows a conflict banner when conflicted > 0", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({
+      branch: "main", ahead: 0, behind: 0, hasUpstream: true,
+      conflicted: 2, aheadBehindKnown: true,
+      changedFiles: [{ path: "a.ts", status: "conflicted", staged: false, unstaged: true, conflicted: true }],
+    });
+    render(<ChangesPanel projectPath="/repo" />);
+    expect(await screen.findByText(/2 conflicts/i)).toBeInTheDocument();
+  });
+
+  it("hides the ahead/behind badge when aheadBehindKnown is false", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({
+      branch: "main", ahead: 0, behind: 0, hasUpstream: true,
+      conflicted: 0, aheadBehindKnown: false, changedFiles: [],
+    });
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText("main");
+    expect(screen.queryByTestId("ahead-behind")).not.toBeInTheDocument();
   });
 });

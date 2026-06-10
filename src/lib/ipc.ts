@@ -85,6 +85,9 @@ export type FileReadResult =
   | { kind: "unsupportedEncoding"; size: number; mtime: number }
   | { kind: "tooLarge"; size: number };
 
+export type PullKind = "ok" | "diverged" | "conflict" | "error";
+export interface PullOutcome { kind: PullKind; output: string }
+
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
 import { invoke } from "@tauri-apps/api/core";
@@ -379,6 +382,11 @@ export const ipc = {
     invoke<LastCommit | null>("get_last_commit", { workspacePath }),
   discardFile: (workspacePath: string, filePath: string) =>
     invoke<void>("discard_file", { workspacePath, filePath }),
+
+  fetchChanges: (workspacePath: string) => invoke<string>("fetch_changes", { workspacePath }),
+
+  pull: (workspacePath: string, strategy: "ffOnly" | "rebase" | "merge") =>
+    invoke<PullOutcome>("pull", { workspacePath, strategy }),
 
   /** Returns the trimmed git-push output (combined stdout+stderr). */
   pushBranch: (workspacePath: string) =>
