@@ -51,6 +51,12 @@
   /* Hunk rail left-border accent — between glow and dim in presence */
   --brass-rule-dim: rgba(212, 165, 116, 0.18);
 
+  /* Provider identity dots — decorative, ModelPicker + Direct only. */
+  --provider-anthropic: #cc785c;
+  --provider-openai:    #74aa9c;
+  --provider-deepseek:  #5c8acc;
+  --provider-ollama:    #a8a8a8;
+
   /* Onyx overlay — used for sticky rail backdrops that must be semi-transparent */
   --onyx-40:        rgba(12, 10, 8, 0.4);
 
@@ -208,6 +214,24 @@
 @media (prefers-reduced-motion: reduce) {
   .octo-stage-pulse { animation: none; }
 }
+
+/* ── Direct premium polish · stability utilities ─────────────────
+   S2: every live numeric value renders tabular so digits never shift width. */
+.octo-tabular { font-variant-numeric: tabular-nums; }
+
+/* S3 exit half of FadeSwap (see src/components/primitives/FadeSwap.tsx). */
+@keyframes octo-exit-fade {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+.octo-fade-out { animation: octo-exit-fade 120ms var(--ease-octo) both; }
+
+/* One-shot brass sweep — the Direct run-completion moment (ledger strip). */
+@keyframes octo-sweep {
+  from { width: 0; }
+  to   { width: 100%; }
+}
+.octo-sweep { animation: octo-sweep var(--dur-reveal) var(--ease-octo) both; }
 
 /* Accessibility: honor reduced-motion — neutralize all motion app-wide
    (entrance primitives, grid-rows collapses, glides, pulses). */

@@ -33,10 +33,10 @@ function pushRecent(modelId: string): string[] {
 
 // Provider color palette — one accent dot per provider family.
 const PROVIDER_COLORS: Record<string, string> = {
-  anthropic: "#cc785c",
-  openai: "#74aa9c",
-  deepseek: "#5c8acc",
-  ollama: "#a8a8a8",
+  anthropic: "var(--provider-anthropic)",
+  openai: "var(--provider-openai)",
+  deepseek: "var(--provider-deepseek)",
+  ollama: "var(--provider-ollama)",
 };
 
 function providerColor(name: string): string {
