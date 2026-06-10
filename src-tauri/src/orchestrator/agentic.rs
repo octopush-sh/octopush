@@ -19,6 +19,9 @@ pub struct AgenticResult {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub tool_calls: Vec<ToolCallLog>,
+    /// False when the loop exhausted `max_iterations` without a final answer.
+    /// Callers must not treat an unfinished result as a successful stage.
+    pub finished: bool,
 }
 
 /// Run the tool-use loop against `provider` until it returns a final answer
@@ -88,6 +91,7 @@ pub async fn run_agentic_loop(
 
         if is_final {
             out.text = resp.text.trim().to_string();
+            out.finished = true;
             return Ok(out);
         }
 

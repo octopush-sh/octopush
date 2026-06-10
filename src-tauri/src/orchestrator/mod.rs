@@ -223,6 +223,20 @@ impl Orchestrator {
             }
             _ => {
                 let err = outcome.error.unwrap_or_else(|| "stage failed".into());
+                // Persist whatever usage the failed attempt burned (e.g. an
+                // iteration-capped agentic loop) so run cost stays truthful,
+                // then mark the failure. Reset-on-rerun retires it as usual.
+                if outcome.cost_usd > 0.0 || outcome.input_tokens > 0 || outcome.output_tokens > 0 {
+                    self.db.lock().complete_run_stage(
+                        &stage.id,
+                        "failed",
+                        outcome.input_tokens as i64,
+                        outcome.output_tokens as i64,
+                        outcome.cost_usd,
+                        None,
+                    )?;
+                    self.recompute_run_cost(&run.id)?;
+                }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 Ok((StageStatus::Failed, None))
             }

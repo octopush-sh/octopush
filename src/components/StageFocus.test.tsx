@@ -66,4 +66,32 @@ describe("StageFocus live journal", () => {
     render(<StageFocus stage={null} workspacePath="/tmp" />);
     expect(screen.getByText("Pick a stage above to see its work.")).toBeInTheDocument();
   });
+
+  it("keeps the work journal reachable on a done stage with an artifact (collapsed drawer)", async () => {
+    const { fireEvent } = await import("@testing-library/react");
+    useRunsStore.setState({ liveByStage: { st1: [
+      { kind: "text", text: "history line one" },
+      { kind: "tool", tool: "Edit", hint: "src/x.rs" },
+      { kind: "tool_result", ok: true, detail: "3 lines" },
+    ] } });
+    const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
+    render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
+
+    expect(screen.getByText("final artifact text")).toBeInTheDocument();
+    // The drawer toggle is present and collapsed (content inert via Reveal).
+    const toggle = screen.getByRole("button", { name: /work journal/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("history line one").closest('[aria-hidden="true"]')).not.toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("history line one").closest('[aria-hidden="true"]')).toBeNull();
+    expect(screen.getByText("Edit")).toBeInTheDocument();
+  });
+
+  it("shows no journal drawer when a done stage has no live entries", () => {
+    const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
+    render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
+    expect(screen.queryByRole("button", { name: /work journal/i })).not.toBeInTheDocument();
+  });
 });

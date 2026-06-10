@@ -3004,6 +3004,7 @@ mod live_tests {
                                    "sys", "do it", dir.path(), 10, &em).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
+        assert!(out.finished, "a final answer marks the result finished");
         let kinds: Vec<String> = rec.events.lock().iter()
             .map(|(_, p)| p["entry"]["kind"].as_str().unwrap().to_string()).collect();
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
@@ -3011,6 +3012,32 @@ mod live_tests {
         let tool = &rec.events.lock()[1].1["entry"];
         assert_eq!(tool["tool"], "read_file");
         assert_eq!(tool["hint"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_exhaustion_is_not_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+        // Every turn asks for another tool — the loop never reaches a final answer.
+        let tool_turn = || resp("still digging",
+            vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                  input: serde_json::json!({"path": "a.rs"}) }],
+            LlmStopReason::ToolUse);
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![tool_turn(), tool_turn()])) };
+
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 2, &em).await.unwrap();
+
+        assert!(!out.finished, "iteration exhaustion must not read as success");
+        assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
+        // Usage from the burned iterations is preserved for cost accounting.
+        assert_eq!(out.input_tokens, 2);
+        assert_eq!(out.output_tokens, 2);
+        assert_eq!(out.tool_calls.len(), 2);
     }
 
     struct Recorder { events: Mutex<Vec<(String, Value)>> }

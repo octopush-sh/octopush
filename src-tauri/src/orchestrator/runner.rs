@@ -183,6 +183,29 @@ impl AgentRunner for ApiRunner {
                     r.cache_read_tokens,
                     r.cache_creation_tokens,
                 );
+                // Iteration exhaustion is a failure, not a thin success: the
+                // stage never produced a final answer, so don't hand its
+                // placeholder text to the next stage. Usage is preserved for
+                // cost accounting; the live journal stays as the evidence.
+                if !r.finished {
+                    return Ok(StageOutcome {
+                        artifact: StageArtifact {
+                            kind: ArtifactKind::Note,
+                            text: String::new(),
+                            payload: None,
+                            refs_worktree: false,
+                        },
+                        input_tokens: r.input_tokens,
+                        output_tokens: r.output_tokens,
+                        cost_usd: cost,
+                        status: StageStatus::Failed,
+                        tool_calls: r.tool_calls,
+                        error: Some(format!(
+                            "agentic loop hit {MAX_STAGE_ITERATIONS} iterations without finishing — review the work journal, then re-run or abort"
+                        )),
+                        verdict: None,
+                    });
+                }
                 let kind = artifact_kind_for(&stage.role);
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
                 let verdict = parse_verdict(&r.text);

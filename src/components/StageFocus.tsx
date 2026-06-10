@@ -5,6 +5,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { labelForRole } from "./RunTrack";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { Reveal } from "./primitives/Reveal";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
@@ -140,18 +141,21 @@ export function StageFocus({ stage, workspacePath }: Props) {
               {journal.length > 0 && <div className="flex flex-col gap-2">{journal}</div>}
             </>
           ) : mode === "artifact" ? (
-            <div className="whitespace-pre-wrap">
-              {artifact!.text || "(no output text)"}
-              {artifact!.refsWorktree && (
-                <FadeSwap swapKey={diffLoading ? "loading" : "diff"}>
-                  {diffLoading ? (
-                    <div className="py-4 font-mono text-xs text-octo-mute">fetching the diff…</div>
-                  ) : (
-                    <DiffViewer diff={diff} />
-                  )}
-                </FadeSwap>
-              )}
-            </div>
+            <>
+              <div className="whitespace-pre-wrap">
+                {artifact!.text || "(no output text)"}
+                {artifact!.refsWorktree && (
+                  <FadeSwap swapKey={diffLoading ? "loading" : "diff"}>
+                    {diffLoading ? (
+                      <div className="py-4 font-mono text-xs text-octo-mute">fetching the diff…</div>
+                    ) : (
+                      <DiffViewer diff={diff} />
+                    )}
+                  </FadeSwap>
+                )}
+              </div>
+              {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
+            </>
           ) : mode === "running" ? (
             <>
               {journal}
@@ -165,6 +169,29 @@ export function StageFocus({ stage, workspacePath }: Props) {
           )}
         </FadeSwap>
       </div>
+    </div>
+  );
+}
+
+/** The work journal stays reachable after a stage finishes — it's the evidence
+ *  of what the agent did. Collapsed by default so the artifact leads. */
+function JournalDrawer({ items }: { items: ReactElement[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-4 border-t border-octo-hairline pt-2">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass"
+      >
+        <span className="text-octo-brass">§</span>
+        <span>work journal · <span className="octo-tabular tracking-normal">{items.length}</span></span>
+        <span>{open ? "▾" : "▸"}</span>
+      </button>
+      <Reveal open={open}>
+        <div className="flex flex-col gap-2 pt-2">{items}</div>
+      </Reveal>
     </div>
   );
 }
