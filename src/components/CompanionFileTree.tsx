@@ -159,7 +159,7 @@ function TreeNode({
           </span>
         ) : isChanged ? (
           <span
-            className="shrink-0 font-mono text-[10px]"
+            className="inline-flex w-3 shrink-0 items-center justify-center font-mono text-[10px]"
             style={{ color: "var(--color-octo-brass)" }}
           >
             ●

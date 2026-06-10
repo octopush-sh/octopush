@@ -25,6 +25,7 @@ describe("fileIcon", () => {
   it("maps lockfiles by full name", () => {
     expect(fileIcon("Cargo.lock")).toBe(FileLock);
     expect(fileIcon("package-lock.json")).toBe(FileLock);
+    expect(fileIcon("Gemfile.lock")).toBe(FileLock);
   });
 
   it("falls back to the generic File icon", () => {
