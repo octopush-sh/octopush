@@ -3,7 +3,7 @@ import { stageStatusMeta } from "../lib/runStatus";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 
-const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
+export const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 
 interface Props {
   run: Run;
