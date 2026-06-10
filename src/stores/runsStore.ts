@@ -23,6 +23,9 @@ interface RunsState {
   activeRunIdByWs: Record<string, string | null>;
   detailByRun: Record<string, RunDetail>;
   selectedStageByRun: Record<string, string | null>;
+  /** The run the canvas is VIEWING per workspace. Absent = default (active run);
+   *  null = the launcher (explicit "new run"); a runId = view that run. */
+  selectedRunIdByWs: Record<string, string | null>;
   /** Structured live activity entries per stage id, streamed from both substrates. */
   liveByStage: Record<string, LiveEntry[]>;
 
@@ -30,6 +33,9 @@ interface RunsState {
   getActiveRunId: (workspaceId: string) => string | null;
   getDetail: (runId: string) => RunDetail | undefined;
   getSelectedStageId: (runId: string) => string | null;
+  getViewedRunId: (workspaceId: string) => string | null;
+  hasExecutingRun: (workspaceId: string) => boolean;
+  selectRun: (workspaceId: string, runId: string | null) => void;
   getLiveEntries: (stageId: string) => LiveEntry[];
   appendEntry: (stageId: string, entry: LiveEntry) => void;
   clearLog: (stageId: string) => void;
@@ -69,12 +75,20 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   activeRunIdByWs: {},
   detailByRun: {},
   selectedStageByRun: {},
+  selectedRunIdByWs: {},
   liveByStage: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
   getDetail: (runId) => get().detailByRun[runId],
   getSelectedStageId: (runId) => get().selectedStageByRun[runId] ?? null,
+  getViewedRunId: (workspaceId) => {
+    const sel = get().selectedRunIdByWs;
+    return workspaceId in sel ? sel[workspaceId] : get().getActiveRunId(workspaceId);
+  },
+  hasExecutingRun: (workspaceId) => get().getActiveRunId(workspaceId) !== null,
+  selectRun: (workspaceId, runId) =>
+    set((s) => ({ selectedRunIdByWs: { ...s.selectedRunIdByWs, [workspaceId]: runId } })),
   getLiveEntries: (stageId) => get().liveByStage[stageId] ?? EMPTY_ENTRIES,
 
   appendEntry: (stageId, entry) =>
@@ -136,6 +150,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     await ipc.startRun(runId);
     set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
     await get().loadRuns(workspaceId);
+    get().selectRun(workspaceId, runId);
   },
 
   resolve: async (runId, action, feedback, modelOverride) => {

@@ -36,7 +36,7 @@ describe("runsStore", () => {
   beforeEach(() => {
     useRunsStore.setState({
       runsByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
-      liveByStage: {},
+      selectedRunIdByWs: {}, liveByStage: {},
     });
     vi.clearAllMocks();
   });
@@ -117,5 +117,32 @@ describe("runsStore", () => {
     // The list entry must be updated too (not stale).
     expect(useRunsStore.getState().getRuns("w1")[0].status).toBe("completed");
     expect(useRunsStore.getState().getRuns("w1")).toHaveLength(1);
+  });
+
+  it("getViewedRunId defaults to the active run, honors an explicit selection, and null = launcher", () => {
+    useRunsStore.setState({ activeRunIdByWs: { w1: "rActive" }, selectedRunIdByWs: {} });
+    expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rActive"); // default → active
+    useRunsStore.getState().selectRun("w1", "rOther");
+    expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rOther");  // explicit run
+    useRunsStore.getState().selectRun("w1", null);
+    expect(useRunsStore.getState().getViewedRunId("w1")).toBe(null);      // launcher
+  });
+
+  it("hasExecutingRun reflects a non-terminal active run", () => {
+    useRunsStore.setState({ activeRunIdByWs: { w1: "r1" } });
+    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(true);
+    useRunsStore.setState({ activeRunIdByWs: { w1: null } });
+    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(false);
+  });
+
+  it("begin auto-selects the newly created run for viewing", async () => {
+    (ipc.createRun as any).mockResolvedValue("rNew");
+    (ipc.startRun as any).mockResolvedValue(undefined);
+    (ipc.listRuns as any).mockResolvedValue([
+      { id: "rNew", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
+        costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null },
+    ]);
+    await useRunsStore.getState().begin("w1", "p", "t", []);
+    expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rNew");
   });
 });
