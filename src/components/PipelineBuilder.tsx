@@ -4,11 +4,13 @@ import { usePipelineStore } from "../stores/pipelineStore";
 import { ModelPicker } from "./ModelPicker";
 import { labelForRole, ROMAN } from "./RunTrack";
 
+// Keep in sync with KNOWN_ROLES/REVIEW_ROLES in src-tauri/src/db.rs (the authoritative validator).
 const ALL_ROLES = [
   "plan", "plan_review", "implement", "code_review", "test",
   "repro", "fix", "verify", "critique", "refine",
 ];
 const REVIEW_ROLES = new Set(["plan_review", "code_review", "critique", "verify"]);
+// Keep the default model in sync with the seeder's choices in db.rs seed_builtin_pipelines.
 const DEFAULT_STAGE = { role: "implement", agentModel: "claude-sonnet-4-6", substrate: "api" as const, checkpoint: false };
 
 /** Builder-local stage: loop target tracked by stage IDENTITY (key), not position. */
@@ -34,7 +36,7 @@ function draftsFrom(pipeline: PipelineWithStages | null): DraftStage[] {
   }
   const sorted = [...pipeline.stages].sort((a, b) => a.position - b.position);
   const keys = sorted.map(() => newKey());
-  return sorted.map((s, i) => ({
+  return normalizeLoops(sorted.map((s, i) => ({
     key: keys[i],
     role: s.role,
     agentModel: s.agentModel,
@@ -47,7 +49,7 @@ function draftsFrom(pipeline: PipelineWithStages | null): DraftStage[] {
     loopMaxIterations: s.loopMaxIterations,
     loopMode: s.loopMode as "gated" | "auto" | null,
     loopCleared: false,
-  }));
+  })));
 }
 
 /** Clear loops whose target no longer exists, isn't strictly earlier, or whose
@@ -64,9 +66,9 @@ function normalizeLoops(stages: DraftStage[]): DraftStage[] {
 }
 
 function toStageDrafts(stages: DraftStage[]): StageDraft[] {
-  return stages.map((s) => {
+  return stages.map((s, i) => {
     const targetIdx = s.loopTargetKey ? stages.findIndex((t) => t.key === s.loopTargetKey) : -1;
-    const hasLoop = targetIdx !== -1;
+    const hasLoop = targetIdx !== -1 && targetIdx < i;
     return {
       role: s.role,
       agentModel: s.agentModel,
@@ -190,7 +192,11 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
               <button
                 type="button"
                 onClick={() => patch(s.key, { substrate: s.substrate === "api" ? "cli" : "api" })}
-                className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] uppercase text-octo-sage hover:border-[var(--brass-dim)]"
+                className={`rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase ${
+                  s.substrate === "cli"
+                    ? "text-octo-state-purple border-octo-state-purple"
+                    : "text-octo-state-blue border-octo-state-blue"
+                }`}
               >
                 {s.substrate}
               </button>
@@ -262,6 +268,11 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
                 {s.loopCleared && (
                   <span className="text-octo-mute">Loop target removed — review is linear again.</span>
                 )}
+              </div>
+            )}
+            {s.loopCleared && !REVIEW_ROLES.has(s.role) && (
+              <div className="mt-2 border-t border-octo-hairline pt-2 font-mono text-[11px] text-octo-mute">
+                Loop target removed — review is linear again.
               </div>
             )}
           </div>

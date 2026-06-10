@@ -75,4 +75,26 @@ describe("PipelineBuilder", () => {
     fireEvent.click(screen.getByRole("button", { name: /Add a stage/ }));
     expect(screen.getAllByTestId("model").length).toBe(2);
   });
+
+  it("a stored forward loop target loads normalized (cleared) and saves a valid draft", async () => {
+    const corrupt = {
+      pipeline: { id: "p3", name: "Corrupt", description: "d", isBuiltin: false, createdAt: "t" },
+      stages: [
+        stage({ id: "s0", position: 0, role: "code_review", loopTargetPosition: 1, loopMaxIterations: 2, loopMode: "gated" }),
+        stage({ id: "s1", position: 1, role: "implement" }),
+      ],
+    } as any;
+    render(<PipelineBuilder pipeline={corrupt} onClose={vi.fn()} />);
+    expect(screen.getByText(/Loop target removed/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
+    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
+    expect(saveMock.mock.calls[0][0].stages[0].loopTargetPosition).toBe(null); // cleared, valid
+  });
+
+  it("changing a review role to a non-review role clears the loop with a visible notice", () => {
+    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
+    const roleSelects = screen.getAllByLabelText("Stage role");
+    fireEvent.change(roleSelects[1], { target: { value: "implement" } }); // the code_review w/ loop
+    expect(screen.getByText(/Loop target removed/)).toBeInTheDocument();
+  });
 });

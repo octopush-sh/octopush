@@ -1979,6 +1979,7 @@ pub struct StageDraft {
     pub loop_mode: Option<String>,
 }
 
+// Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
 const KNOWN_ROLES: &[&str] = &[
     "plan", "plan_review", "implement", "code_review", "test",
     "repro", "fix", "verify", "critique", "refine",

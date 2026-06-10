@@ -19,6 +19,13 @@ vi.mock("../lib/ipc", async (importOriginal) => {
 
 const { PipelineSetup } = await import("./PipelineSetup");
 
+// Fix A: dangling-selectedId recovery — the module-level store mock always returns the same [PIPE]
+// slice, so we cannot cheaply simulate "store reloads without the previously-selected id" in a
+// second render. The effect logic is exercised indirectly: the existing tests confirm section III
+// renders (auto-select picked pipelines[0]) when `selectedId` starts null, which is the same
+// `!exists` branch that now also fires on a dangling id.  Manual test: delete the selected
+// pipeline in the app → section III + Begin reappear immediately (was: vanished with no recovery).
+
 describe("PipelineSetup begin gate", () => {
   it("disables Begin + shows the helper when a run is executing", () => {
     render(<PipelineSetup defaultTask="build it" onBegin={vi.fn()} executingRun onEditPipeline={vi.fn()} />);

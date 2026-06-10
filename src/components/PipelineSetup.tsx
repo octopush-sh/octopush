@@ -25,7 +25,8 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
 
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
-    if (!selectedId && pipelines.length > 0) setSelectedId(pipelines[0].pipeline.id);
+    const exists = selectedId && pipelines.some((p) => p.pipeline.id === selectedId);
+    if (!exists && pipelines.length > 0) setSelectedId(pipelines[0].pipeline.id);
   }, [pipelines, selectedId]);
   useEffect(() => {
     if (!selectedId) return;
