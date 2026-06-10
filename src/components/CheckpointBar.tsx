@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { RunStage } from "../lib/ipc";
 import { labelForRole } from "./RunTrack";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -21,28 +21,25 @@ interface Props {
 }
 
 export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loopTargetRole, loopState, onSendBack }: Props) {
-  const [rejecting, setRejecting] = useState(false);
-  const [sendingBack, setSendingBack] = useState(false);
-  const [rejectFeedback, setRejectFeedback] = useState("");
-  const [sendBackFeedback, setSendBackFeedback] = useState("");
+  const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
+  const [feedback, setFeedback] = useState("");
   const failed = blockedStage.status === "failed";
+
+  // The bar stays mounted inside the Reveal dock across pauses — a new
+  // checkpoint must never inherit the previous one's editor mode or text.
+  useEffect(() => {
+    setMode("decide");
+    setFeedback("");
+  }, [blockedStage.id]);
 
   const atCap = loopState !== null && loopState.iteration >= loopState.max;
   const canSendBack = loopTargetRole !== null && !atCap;
 
-  function handleSendBack() {
-    onSendBack(sendBackFeedback);
-    setSendingBack(false);
-    setSendBackFeedback("");
+  function submitFeedback() {
+    (mode === "reject" ? onReject : onSendBack)(feedback);
+    setMode("decide");
+    setFeedback("");
   }
-
-  function handleReject() {
-    onReject(rejectFeedback);
-    setRejecting(false);
-    setRejectFeedback("");
-  }
-
-  const mode = rejecting ? "reject" : sendingBack ? "sendback" : "decide";
 
   return (
     <div className={`border-t px-4 py-3 ${failed ? "border-octo-rouge bg-[var(--rouge-ghost)]" : "border-[var(--brass-dim)] bg-[var(--brass-faint)]"}`}>
@@ -80,12 +77,12 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
               </button>
             )}
             {canSendBack && (
-              <button type="button" onClick={() => setSendingBack(true)}
+              <button type="button" onClick={() => setMode("sendback")}
                 className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                 Send back to {loopTargetRole} ⟜
               </button>
             )}
-            <button type="button" onClick={() => setRejecting(true)}
+            <button type="button" onClick={() => setMode("reject")}
               className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
               {failed ? "Re-run" : "Reject"}
             </button>
@@ -98,18 +95,18 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
           <div className="flex flex-col gap-2">
             <textarea
               autoFocus
-              value={mode === "reject" ? rejectFeedback : sendBackFeedback}
-              onChange={(e) => (mode === "reject" ? setRejectFeedback(e.target.value) : setSendBackFeedback(e.target.value))}
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
               placeholder={mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
               className="h-20 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
             <div className="flex gap-2">
-              <button type="button" onClick={mode === "reject" ? handleReject : handleSendBack}
+              <button type="button" onClick={submitFeedback}
                 className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi">
                 {mode === "reject" ? "Re-run the stage ⟶" : "Send back ⟶"}
               </button>
               <button type="button"
-                onClick={() => { setRejecting(false); setSendingBack(false); setRejectFeedback(""); setSendBackFeedback(""); }}
+                onClick={() => { setMode("decide"); setFeedback(""); }}
                 className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute">
                 Cancel
               </button>

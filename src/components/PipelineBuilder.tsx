@@ -1,6 +1,7 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, X } from "lucide-react";
 import type { PipelineWithStages, StageDraft } from "../lib/ipc";
+import { prefersReducedMotion } from "../lib/motion";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { ModelPicker } from "./ModelPicker";
 import { labelForRole, ROMAN } from "./RunTrack";
@@ -145,20 +146,26 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
       return next;
     });
 
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [exiting, setExiting] = useState<Set<string>>(new Set());
+  const exitTimeouts = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEffect(() => () => exitTimeouts.current.forEach(clearTimeout), []);
   const removeStage = (key: string) => {
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+    const drop = () => {
+      delete cardRefs.current[key];
       mutate((prev) => prev.filter((s) => s.key !== key));
+    };
+    if (prefersReducedMotion()) {
+      drop();
       return;
     }
     setExiting((prev) => new Set(prev).add(key));
-    setTimeout(() => {
+    exitTimeouts.current.push(setTimeout(() => {
       setExiting((prev) => { const n = new Set(prev); n.delete(key); return n; });
-      mutate((prev) => prev.filter((s) => s.key !== key));
-    }, 120);
+      drop();
+    }, 120));
   };
 
-  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const jumpTo = (key: string) => cardRefs.current[key]?.scrollIntoView({ behavior: "smooth", block: "center" });
 
   const addStage = () =>
@@ -195,7 +202,7 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
   };
 
   return (
-    <div className="h-full flex-1 overflow-auto px-8 py-6 octo-fade-in">
+    <div className="min-h-0 flex-1 overflow-auto px-8 py-6 octo-fade-in">
       <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">direct · builder</p>
       <input
         value={name}

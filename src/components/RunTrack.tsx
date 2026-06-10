@@ -1,4 +1,5 @@
 import type { LiveEntry, Run, RunStage } from "../lib/ipc";
+import { stageStatusGlyph, stageStatusWord } from "../lib/runStatus";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 
@@ -60,33 +61,13 @@ export function RunTrack({ run: _run, stages, selectedStageId, onSelectStage }: 
   );
 }
 
-function statusGlyph(status: string): { glyph: string; cls: string } {
-  switch (status) {
-    case "running": return { glyph: "●", cls: "text-octo-verdigris" };
-    case "done": return { glyph: "✓", cls: "text-octo-verdigris" };
-    case "failed": return { glyph: "✕", cls: "text-octo-rouge" };
-    case "awaiting_checkpoint": return { glyph: "◆", cls: "text-octo-brass" };
-    default: return { glyph: "○", cls: "text-octo-mute" };
-  }
-}
-
-function statusWord(status: string): string {
-  switch (status) {
-    case "running": return "running";
-    case "done": return "done";
-    case "failed": return "halted";
-    case "awaiting_checkpoint": return "review";
-    default: return "pending";
-  }
-}
-
 function StageCard({ stage: s, index, selected, onSelect }: {
   stage: RunStage; index: number; selected: boolean; onSelect: () => void;
 }) {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
   const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
   const running = s.status === "running";
-  const { glyph, cls } = statusGlyph(s.status);
+  const { label: glyph, className: cls } = stageStatusGlyph(s.status);
 
   // S1: ONE fixed-height live line; content picked by status, geometry constant.
   const verdict = s.status === "done" ? lastNotice(entries) : "";
@@ -113,7 +94,7 @@ function StageCard({ stage: s, index, selected, onSelect }: {
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
         <span className="text-octo-brass">{ROMAN[index] ?? index + 1}</span>
         <span key={s.status} className={`octo-pop-in ${cls}`}>{glyph}</span>
-        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{statusWord(s.status)}</span>
+        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{stageStatusWord(s.status)}</span>
         <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-brass">{running ? elapsed : ""}</span>
       </span>
       <span className="h-5 truncate font-serif text-sm leading-5 text-octo-ivory">{labelForRole(s.role)}</span>

@@ -52,7 +52,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
       : [];
 
   return (
-    <div className="h-full flex-1 overflow-auto px-8 py-6 octo-fade-in">
+    <div className="min-h-0 flex-1 overflow-auto px-8 py-6 octo-fade-in">
       {/* Ceremony */}
       <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">direct</p>
       <h1 className="m-0 mb-2 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>

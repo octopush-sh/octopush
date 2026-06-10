@@ -174,4 +174,29 @@ describe("CheckpointBar", () => {
     expect(screen.getByText("3/3").className).toContain("octo-tabular");
     expect(screen.getByText(/loop exhausted/i).className).toContain("text-octo-brass");
   });
+
+  it("resets the feedback editor when a new checkpoint arrives (bar stays mounted in the Reveal dock)", () => {
+    vi.useFakeTimers();
+    const props = {
+      onApprove: vi.fn(), onReject: vi.fn(), onAbort: vi.fn(),
+      loopTargetRole: null, loopState: null, onSendBack: vi.fn(),
+    };
+    const { rerender } = render(<CheckpointBar blockedStage={makeStage()} {...props} />);
+
+    // Open the reject editor and type feedback, but don't submit.
+    fireEvent.click(screen.getByText(/^Reject$/));
+    act(() => { vi.advanceTimersByTime(130); });
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "stale text" } });
+
+    // A different stage pauses next — the editor must reset to the decision row.
+    rerender(<CheckpointBar blockedStage={makeStage({ id: "s2", role: "test" })} {...props} />);
+    act(() => { vi.advanceTimersByTime(130); });
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/Approve/i)).toBeInTheDocument();
+
+    // And reopening the editor starts blank.
+    fireEvent.click(screen.getByText(/^Reject$/));
+    act(() => { vi.advanceTimersByTime(130); });
+    expect(screen.getByRole("textbox")).toHaveValue("");
+  });
 });

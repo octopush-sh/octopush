@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useRunsStore } from "../stores/runsStore";
-import { runStatusMeta } from "../lib/runStatus";
+import { runStatusMeta, savingsVsBaseline } from "../lib/runStatus";
 
 interface Props { workspaceId: string; }
 
@@ -15,7 +15,7 @@ export function CompanionRuns({ workspaceId }: Props) {
   const totals = runs.reduce(
     (acc, r) => {
       if (r.baselineUsd > 0) {
-        acc.saved += Math.max(0, r.baselineUsd - r.costUsd);
+        acc.saved += savingsVsBaseline(r.costUsd, r.baselineUsd).saved;
         acc.n += 1;
       }
       return acc;

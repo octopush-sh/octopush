@@ -94,7 +94,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     const barStage = blockedStage ?? lastBlocked;
 
     body = (
-      <div className="flex h-full min-h-0 flex-col">
+      <div className="flex min-h-0 flex-1 flex-col">
         <RunTrack run={run} stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
         <StageFocus stage={shownStage} workspacePath={workspacePath} />
         <RunLedger run={run} stages={stages} />
@@ -116,7 +116,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   }
 
   return (
-    <FadeSwap swapKey={canvasKey} className="flex h-full min-h-0 flex-col [&>*]:min-h-0 [&>*]:flex-1">
+    <FadeSwap swapKey={canvasKey} className="flex h-full min-h-0 flex-col">
       {body}
     </FadeSwap>
   );

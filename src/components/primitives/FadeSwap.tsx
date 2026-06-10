@@ -1,11 +1,7 @@
-// src/components/primitives/FadeSwap.tsx
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { prefersReducedMotion } from "../../lib/motion";
 
 const EXIT_MS = 120;
-
-function prefersReducedMotion(): boolean {
-  return typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
-}
 
 interface Props {
   swapKey: string;
