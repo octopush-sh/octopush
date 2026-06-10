@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { ipc } from "../lib/ipc";
 import type { DirectoryEntry } from "../lib/types";
+import { fileIcon } from "../lib/fileIcons";
 
 interface Props {
   rootPath: string;
@@ -111,6 +112,7 @@ function TreeNode({
 }: TreeNodeProps) {
   const isExpanded = expanded.has(path);
   const isChanged = !isDir && changedPaths.has(path);
+  const Icon = !isDir ? fileIcon(label) : null;
 
   return (
     <div>
@@ -155,15 +157,22 @@ function TreeNode({
           >
             ▶
           </span>
-        ) : (
+        ) : isChanged ? (
           <span
             className="shrink-0 font-mono text-[10px]"
-            style={{
-              color: isChanged ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
-            }}
+            style={{ color: "var(--color-octo-brass)" }}
           >
-            {isChanged ? "●" : "◦"}
+            ●
           </span>
+        ) : (
+          Icon && (
+            <Icon
+              size={12}
+              aria-hidden="true"
+              className="shrink-0"
+              style={{ color: "var(--color-octo-mute)" }}
+            />
+          )
         )}
 
         {/* § glyph for folders (quiet brand mark, not for root) */}
