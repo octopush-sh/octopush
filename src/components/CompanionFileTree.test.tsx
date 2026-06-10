@@ -351,4 +351,41 @@ describe("CompanionFileTree", () => {
     expect(mockReveal).toHaveBeenCalledWith("/repo/src/Main.java");
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
   });
+
+  it("exposes tree semantics: role=tree, treeitems, aria-expanded on dirs", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    expect(screen.getByRole("tree", { name: /workspace files/i })).toBeInTheDocument();
+
+    const items = screen.getAllByRole("treeitem");
+    expect(items.length).toBeGreaterThanOrEqual(4); // root + src + docs + pom.xml
+
+    // The src dir row is collapsed → aria-expanded=false; expanding flips it.
+    const srcRow = screen.getByText("src").closest('[role="treeitem"]') as HTMLElement;
+    expect(srcRow).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(srcRow).toHaveAttribute("aria-expanded", "true"));
+
+    // File rows carry no aria-expanded.
+    const fileRow = screen.getByTestId("file-row-/repo/pom.xml");
+    expect(fileRow).not.toHaveAttribute("aria-expanded");
+  });
+
+  it("Enter on a focused file row opens the file; Space toggles a dir", async () => {
+    const onFileClick = vi.fn();
+    render(
+      <CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} onFileClick={onFileClick} />,
+    );
+    await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());
+
+    const fileRow = screen.getByTestId("file-row-/repo/pom.xml");
+    fileRow.focus();
+    fireEvent.keyDown(fileRow, { key: "Enter" });
+    expect(onFileClick).toHaveBeenCalledWith("/repo/pom.xml");
+
+    const srcRow = screen.getByText("src").closest('[role="treeitem"]') as HTMLElement;
+    fireEvent.keyDown(srcRow, { key: " " });
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+  });
 });

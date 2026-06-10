@@ -116,7 +116,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
         </button>
       </h3>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+      <div role="tree" aria-label="Workspace files" className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         <TreeNode
           path={rootPath}
           label={rootLabel}
@@ -193,7 +193,10 @@ function TreeNode({
     <div>
       {/* Row */}
       <div
-        className="group relative flex cursor-pointer items-center gap-1 rounded-sm py-1 pr-1 transition-colors duration-[220ms]"
+        role="treeitem"
+        aria-expanded={isDir ? isExpanded : undefined}
+        tabIndex={0}
+        className="group relative flex cursor-pointer items-center gap-1 rounded-sm py-1 pr-1 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         style={{
           paddingLeft: `${depth * 14 + 4}px`,
           background: "transparent",
@@ -209,6 +212,16 @@ function TreeNode({
             onToggle(path);
           } else if (onFileClick) {
             onFileClick(path);
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (isDir) {
+              onToggle(path);
+            } else if (onFileClick) {
+              onFileClick(path);
+            }
           }
         }}
         onContextMenu={(e) => onRowContextMenu(e, path, label, isDir)}
@@ -256,7 +269,7 @@ function TreeNode({
           <span
             aria-hidden="true"
             className="shrink-0 font-mono text-[10px]"
-            style={{ color: "rgba(212, 165, 116, 0.4)" }}
+            style={{ color: "var(--brass-dim)" }}
           >
             §
           </span>
@@ -280,7 +293,7 @@ function TreeNode({
 
       {/* Children (only if dir + expanded) */}
       {isDir && isExpanded && (
-        <div>
+        <div role="group">
           {(() => {
             const state = children[path];
             if (!state || state === "loading") {
@@ -340,7 +353,7 @@ function TreeNode({
 /**
  * Renders vertical indent guide lines, one per depth level.
  * Ancestor guides are rendered at low opacity (~20%) to recede;
- * the current row's own guide (last one) is highlighted at ~50% using brass-dim.
+ * the current row's own guide (last one) is highlighted using brass-dim.
  */
 function IndentGuides({ depth }: { depth: number }) {
   return (
@@ -355,8 +368,8 @@ function IndentGuides({ depth }: { depth: number }) {
             style={{
               left: `${i * 14 + 10}px`,
               borderColor: isCurrentLevel
-                ? "rgba(212, 165, 116, 0.5)" // current row's guide: brass-dim at ~50%
-                : "var(--color-octo-hairline)", // ancestor guides: hairline at ~20% via rgba
+                ? "var(--brass-dim)" // current row's guide: dimmed brass
+                : "var(--color-octo-hairline)", // ancestor guides: hairline, receded via opacity
               opacity: isCurrentLevel ? 1 : 0.2,
             }}
           />
