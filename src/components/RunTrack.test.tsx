@@ -54,4 +54,52 @@ describe("RunTrack liveness", () => {
     render(<RunTrack run={run} stages={[stage({})]} selectedStageId={null} onSelectStage={() => {}} />);
     expect(screen.queryByText(/§ /)).not.toBeInTheDocument();
   });
+
+  it("reserves the elapsed slot in every status (S1)", () => {
+    render(<RunTrack run={run} stages={[stage({})]} selectedStageId={null} onSelectStage={() => {}} />);
+    const card = screen.getByRole("button");
+    const slot = card.querySelector("span.octo-tabular");
+    expect(slot).not.toBeNull();
+    expect(slot!.className).toContain("w-[5ch]");
+    expect(slot!.textContent).toBe(""); // empty, but the slot exists
+  });
+
+  it("renders cost in the live line for idle stages and activity for running ones", () => {
+    const { unmount } = render(
+      <RunTrack run={run} stages={[stage({ costUsd: 0.05 })]} selectedStageId={null} onSelectStage={() => {}} />,
+    );
+    const cost = screen.getByText("$0.05");
+    expect(cost.className).toContain("octo-tabular");
+    unmount();
+
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Bash", hint: "npm test" }] } });
+    render(
+      <RunTrack
+        run={run}
+        stages={[stage({ status: "running", startedAt: "2026-06-09T00:00:00Z" })]}
+        selectedStageId={null}
+        onSelectStage={() => {}}
+      />,
+    );
+    expect(screen.getByText(/§ Bash npm test/)).toBeInTheDocument();
+  });
+
+  it("dims connectors after pending stages and brightens them after done stages", () => {
+    const second = stage({ id: "st2", position: 1, role: "implement" });
+    const { unmount } = render(
+      <RunTrack run={run} stages={[stage({}), second]} selectedStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(screen.getByText("⟶").className).toContain("opacity-40");
+    unmount();
+
+    render(
+      <RunTrack
+        run={run}
+        stages={[stage({ status: "done", finishedAt: "t" }), second]}
+        selectedStageId={null}
+        onSelectStage={() => {}}
+      />,
+    );
+    expect(screen.getByText("⟶").className).toContain("opacity-100");
+  });
 });

@@ -1,5 +1,4 @@
 import type { LiveEntry, Run, RunStage } from "../lib/ipc";
-import { stageStatusMeta } from "../lib/runStatus";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 
@@ -35,28 +34,50 @@ export function RunTrack({ run: _run, stages, selectedStageId, onSelectStage }: 
 
   return (
     <div className="border-b border-octo-hairline bg-octo-panel px-4 py-3">
-      <div className="mb-3 flex items-baseline gap-6 font-mono text-xs octo-fade-in">
-        <Meta label="stage" value={`${Math.min(doneCount + 1, stages.length)} / ${stages.length}`} valueClass="text-octo-ivory" />
+      <div className="octo-fade-in mb-3">
+        <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">stage</div>
+        <div className="octo-tabular font-mono text-sm text-octo-ivory">
+          {Math.min(doneCount + 1, stages.length)} / {stages.length}
+        </div>
       </div>
-      <div className="flex items-stretch">
+      <div className="flex items-stretch overflow-x-auto pb-1">
         {stages.map((s, i) => (
-          <div key={s.id} className="flex items-stretch min-w-0">
+          <div key={s.id} className="flex min-w-0 items-stretch">
             {i > 0 && (
-              <div className="flex w-6 items-center justify-center text-octo-brass">
+              <div
+                className={`flex w-6 shrink-0 items-center justify-center text-octo-brass transition-opacity duration-[280ms] ${
+                  stages[i - 1].status === "done" ? "opacity-100" : "opacity-40"
+                }`}
+              >
                 {stages[i - 1].checkpoint ? "⟜" : "⟶"}
               </div>
             )}
-            <StageCard
-              stage={s}
-              index={i}
-              selected={s.id === selectedStageId}
-              onSelect={() => onSelectStage(s.id)}
-            />
+            <StageCard stage={s} index={i} selected={s.id === selectedStageId} onSelect={() => onSelectStage(s.id)} />
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function statusGlyph(status: string): { glyph: string; cls: string } {
+  switch (status) {
+    case "running": return { glyph: "●", cls: "text-octo-verdigris" };
+    case "done": return { glyph: "✓", cls: "text-octo-verdigris" };
+    case "failed": return { glyph: "✕", cls: "text-octo-rouge" };
+    case "awaiting_checkpoint": return { glyph: "◆", cls: "text-octo-brass" };
+    default: return { glyph: "○", cls: "text-octo-mute" };
+  }
+}
+
+function statusWord(status: string): string {
+  switch (status) {
+    case "running": return "running";
+    case "done": return "done";
+    case "failed": return "halted";
+    case "awaiting_checkpoint": return "review";
+    default: return "pending";
+  }
 }
 
 function StageCard({ stage: s, index, selected, onSelect }: {
@@ -65,55 +86,58 @@ function StageCard({ stage: s, index, selected, onSelect }: {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
   const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
   const running = s.status === "running";
-  const activity = running ? lastActivity(entries) : "";
+  const { glyph, cls } = statusGlyph(s.status);
+
+  // S1: ONE fixed-height live line; content picked by status, geometry constant.
   const verdict = s.status === "done" ? lastNotice(entries) : "";
-  const meta = stageStatusMeta(s.status);
+  const live = running
+    ? { text: lastActivity(entries), cls: "text-octo-brass", tabular: false }
+    : verdict
+      ? { text: verdict, cls: "text-octo-verdigris", tabular: false }
+      : { text: `$${s.costUsd.toFixed(2)}`, cls: "text-octo-mute", tabular: true };
+
   return (
     <button
       type="button"
       onClick={onSelect}
-      className={`relative flex min-w-0 flex-1 flex-col gap-1 rounded-lg border px-3 py-2 text-left transition-colors octo-rise-in ${
+      className={`octo-rise-in flex h-[96px] min-w-[170px] max-w-[230px] flex-1 basis-0 flex-col gap-1 rounded-lg border px-3 py-2 text-left transition-colors ${
         running ? "octo-stage-pulse " : ""
-      }${selected ? "border-octo-brass bg-[var(--brass-ghost)]" : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"}`}
+      }${
+        selected
+          ? "border-octo-brass bg-[var(--brass-ghost)]"
+          : s.status === "failed"
+            ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
+            : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
+      }`}
     >
-      {running && elapsed && (
-        <span className="absolute right-3 top-2 font-mono text-[10px] text-octo-brass">{elapsed}</span>
-      )}
-      <span className="font-mono text-[10px] text-octo-brass">
-        {ROMAN[index] ?? index + 1} <span className={meta.className}>{meta.label}</span>
+      <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
+        <span className="text-octo-brass">{ROMAN[index] ?? index + 1}</span>
+        <span key={s.status} className={`octo-pop-in ${cls}`}>{glyph}</span>
+        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{statusWord(s.status)}</span>
+        <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-brass">{running ? elapsed : ""}</span>
       </span>
-      <span className="font-serif text-sm text-octo-ivory">{labelForRole(s.role)}</span>
-      <span className="flex items-center gap-2 font-mono text-[9px] text-octo-sage">
-        {s.agentModel}
+      <span className="h-5 truncate font-serif text-sm leading-5 text-octo-ivory">{labelForRole(s.role)}</span>
+      <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-sage">
+        <span className="truncate">{s.agentModel}</span>
         <SubstratePill substrate={s.substrate} />
       </span>
-      {running && activity ? (
-        <span className="mt-auto truncate font-mono text-[10px] text-octo-brass">{activity}</span>
-      ) : verdict ? (
-        <span className="mt-auto truncate font-mono text-[10px] text-octo-verdigris">{verdict}</span>
-      ) : (
-        <span className="mt-auto font-mono text-[10px] text-octo-mute">${s.costUsd.toFixed(2)}</span>
-      )}
+      <span
+        key={`${s.status}-live`}
+        className={`octo-fade-in mt-auto block h-4 truncate font-mono text-[10px] leading-4 ${live.cls} ${live.tabular ? "octo-tabular" : ""}`}
+      >
+        {live.text}
+      </span>
     </button>
-  );
-}
-
-function Meta({ label, value, valueClass }: { label: string; value: string; valueClass: string }) {
-  return (
-    <div>
-      <div className="text-[9px] uppercase tracking-[0.14em] text-octo-mute">{label}</div>
-      <div className={`text-sm ${valueClass}`}>{value}</div>
-    </div>
   );
 }
 
 function SubstratePill({ substrate }: { substrate: string }) {
   const cls =
     substrate === "cli"
-      ? "text-octo-state-purple border-octo-state-purple"
-      : "text-octo-state-blue border-octo-state-blue";
+      ? "text-octo-state-purple border-[var(--state-purple-dim)]"
+      : "text-octo-state-blue border-[var(--state-blue-dim)]";
   return (
-    <span className={`rounded border px-1.5 py-0.5 text-[8px] uppercase ${cls}`}>
+    <span className={`flex w-9 shrink-0 items-center justify-center rounded-sm border py-0.5 font-mono text-[8px] uppercase tracking-[0.1em] ${cls}`}>
       {substrate}
     </span>
   );
