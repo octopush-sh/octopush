@@ -16,17 +16,21 @@ interface Props {
 
 export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey, workspacePath }: Props) {
   const loadRuns = useRunsStore((s) => s.loadRuns);
-  const activeRunId = useRunsStore((s) => s.getActiveRunId(workspaceId));
-  const detail = useRunsStore((s) => (activeRunId ? s.getDetail(activeRunId) : undefined));
-  const selectedStageId = useRunsStore((s) => (activeRunId ? s.getSelectedStageId(activeRunId) : null));
+  const refreshDetail = useRunsStore((s) => s.refreshDetail);
+  const viewedId = useRunsStore((s) => s.getViewedRunId(workspaceId));
+  const detail = useRunsStore((s) => (viewedId ? s.getDetail(viewedId) : undefined));
+  const selectedStageId = useRunsStore((s) => (viewedId ? s.getSelectedStageId(viewedId) : null));
   const selectStage = useRunsStore((s) => s.selectStage);
   const begin = useRunsStore((s) => s.begin);
   const resolve = useRunsStore((s) => s.resolve);
   const abort = useRunsStore((s) => s.abort);
 
   useEffect(() => { if (active) void loadRuns(workspaceId); }, [active, workspaceId, loadRuns]);
+  useEffect(() => {
+    if (active && viewedId && !detail?.run) void refreshDetail(viewedId);
+  }, [active, viewedId, detail?.run, refreshDetail]);
 
-  if (!activeRunId || !detail?.run) {
+  if (!viewedId || !detail?.run) {
     return (
       <PipelineSetup
         defaultTask={defaultTask}
