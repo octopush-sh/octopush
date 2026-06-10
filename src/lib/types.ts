@@ -278,6 +278,7 @@ export interface DirectoryEntry {
   name: string;
   path: string;
   isDir: boolean;
+  isIgnored: boolean;
 }
 
 // ─── Settings ─────────────────────────────────────────────────────

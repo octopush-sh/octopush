@@ -16,4 +16,14 @@ describe("reviewPrefsStore", () => {
     useReviewPrefs.getState().setIgnoreWhitespace(true);
     expect(useReviewPrefs.getState().ignoreWhitespace).toBe(true);
   });
+  it("toggleShowIgnored flips the per-root flag without touching other roots", () => {
+    useReviewPrefs.setState({ showIgnoredFiles: {} });
+
+    useReviewPrefs.getState().toggleShowIgnored("/repo");
+    expect(useReviewPrefs.getState().showIgnoredFiles["/repo"]).toBe(true);
+    expect(useReviewPrefs.getState().showIgnoredFiles["/other"]).toBeUndefined();
+
+    useReviewPrefs.getState().toggleShowIgnored("/repo");
+    expect(useReviewPrefs.getState().showIgnoredFiles["/repo"]).toBe(false);
+  });
 });
