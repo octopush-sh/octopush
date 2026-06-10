@@ -494,11 +494,9 @@ impl Orchestrator {
     /// `draft`, `completed`, and `aborted` statuses are never considered
     /// executing. A run is never considered concurrent with itself.
     pub async fn has_concurrent_run(&self, run_id: &str) -> AppResult<bool> {
-        let run = self
-            .db
-            .lock()
-            .get_run(run_id)?
-            .ok_or_else(|| AppError::Other(format!("run not found: {run_id}")))?;
+        let db = self.db.lock();
+        let Some(run) = db.get_run(run_id)? else { return Ok(false) };
+        drop(db);
         let peers = self.db.lock().list_runs(&run.workspace_id)?;
         let blocked = peers.iter().any(|r| {
             r.id != run_id

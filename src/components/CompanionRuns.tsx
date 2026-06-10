@@ -7,7 +7,6 @@ interface Props { workspaceId: string; }
 export function CompanionRuns({ workspaceId }: Props) {
   const loadRuns = useRunsStore((s) => s.loadRuns);
   const runs = useRunsStore((s) => s.getRuns(workspaceId));
-  const activeId = useRunsStore((s) => s.getActiveRunId(workspaceId));
   const viewedId = useRunsStore((s) => s.getViewedRunId(workspaceId));
   const selectRun = useRunsStore((s) => s.selectRun);
 
@@ -32,7 +31,7 @@ export function CompanionRuns({ workspaceId }: Props) {
       )}
       {runs.map((r) => {
         const meta = runStatusMeta(r.status);
-        const executing = r.id === activeId;
+        const executing = r.status === "running" || r.status === "paused";
         return (
           <button
             key={r.id}

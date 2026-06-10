@@ -11,6 +11,7 @@ import {
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
+const beginningWs = new Set<string>();
 const MAX_LOG_LINES = 200;
 
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
@@ -86,7 +87,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     const sel = get().selectedRunIdByWs;
     return workspaceId in sel ? sel[workspaceId] : get().getActiveRunId(workspaceId);
   },
-  hasExecutingRun: (workspaceId) => get().getActiveRunId(workspaceId) !== null,
+  hasExecutingRun: (workspaceId) =>
+    get().getRuns(workspaceId).some((r) => r.status === "running" || r.status === "paused"),
   selectRun: (workspaceId, runId) =>
     set((s) => ({ selectedRunIdByWs: { ...s.selectedRunIdByWs, [workspaceId]: runId } })),
   getLiveEntries: (stageId) => get().liveByStage[stageId] ?? EMPTY_ENTRIES,
@@ -146,11 +148,23 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   },
 
   begin: async (workspaceId, pipelineId, task, stageOverrides, linkedIssueKey) => {
-    const runId = await ipc.createRun(workspaceId, pipelineId, task, undefined, linkedIssueKey, stageOverrides);
-    await ipc.startRun(runId);
-    set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
-    await get().loadRuns(workspaceId);
-    get().selectRun(workspaceId, runId);
+    if (beginningWs.has(workspaceId)) return; // guard against double-click double-start
+    beginningWs.add(workspaceId);
+    try {
+      const runId = await ipc.createRun(workspaceId, pipelineId, task, undefined, linkedIssueKey, stageOverrides);
+      try {
+        await ipc.startRun(runId);
+      } catch (e) {
+        // start was refused (e.g. another run is in progress) — drop the orphaned draft.
+        await ipc.abortRun(runId).catch(() => {});
+        throw e;
+      }
+      set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
+      await get().loadRuns(workspaceId);
+      get().selectRun(workspaceId, runId);
+    } finally {
+      beginningWs.delete(workspaceId);
+    }
   },
 
   resolve: async (runId, action, feedback, modelOverride) => {

@@ -128,11 +128,17 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().getViewedRunId("w1")).toBe(null);      // launcher
   });
 
-  it("hasExecutingRun reflects a non-terminal active run", () => {
-    useRunsStore.setState({ activeRunIdByWs: { w1: "r1" } });
+  it("hasExecutingRun is true only when a run in the workspace is running or paused", () => {
+    const mk = (id: string, status: import("../lib/ipc").RunStatus) => ({ id, workspaceId: "w1", pipelineId: "p", task: "t",
+      status, costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null });
+    useRunsStore.setState({ runsByWs: { w1: [mk("r1", "completed")] } });
+    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(false); // terminal → false
+    useRunsStore.setState({ runsByWs: { w1: [mk("r1", "draft")] } });
+    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(false); // draft does NOT count
+    useRunsStore.setState({ runsByWs: { w1: [mk("r1", "paused")] } });
+    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(true);  // paused counts
+    useRunsStore.setState({ runsByWs: { w1: [mk("r1", "running")] } });
     expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(true);
-    useRunsStore.setState({ activeRunIdByWs: { w1: null } });
-    expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(false);
   });
 
   it("begin auto-selects the newly created run for viewing", async () => {
@@ -144,5 +150,16 @@ describe("runsStore", () => {
     ]);
     await useRunsStore.getState().begin("w1", "p", "t", []);
     expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rNew");
+  });
+
+  it("begin aborts the draft and does not select it when startRun is rejected", async () => {
+    (ipc.createRun as any).mockResolvedValue("rDraft");
+    (ipc.startRun as any).mockRejectedValue(new Error("another run is already in progress"));
+    (ipc.abortRun as any) = (ipc.abortRun as any) ?? vi.fn();
+    (ipc.abortRun as any).mockResolvedValue(undefined);
+    await useRunsStore.getState().begin("w1", "p", "t", []).catch(() => {});
+    expect(ipc.abortRun).toHaveBeenCalledWith("rDraft");
+    // no explicit selection of the dead draft
+    expect("w1" in (useRunsStore.getState() as any).selectedRunIdByWs).toBe(false);
   });
 });
