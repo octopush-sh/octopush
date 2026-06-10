@@ -1458,13 +1458,15 @@ mod read_directory_tests {
         fs::create_dir(tmp.path().join("target")).unwrap();
         fs::write(tmp.path().join("target").join("app.war"), "x").unwrap();
         fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
-        fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        fs::write(tmp.path().join(".gitignore"), "target/\nsecret.txt\n").unwrap();
+        fs::write(tmp.path().join("secret.txt"), "s").unwrap();
         let root = tmp.path().to_string_lossy().to_string();
 
         // Default mode: target absent, nothing flagged.
         let entries = read_directory(root.clone(), None).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"target"), "default mode must hide gitignored dirs");
+        assert!(!names.contains(&"secret.txt"), "default mode must hide gitignored files");
         assert!(entries.iter().all(|e| !e.is_ignored), "default mode never flags");
 
         // Show-ignored mode: target present, flagged, still sorted dirs-first.
@@ -1475,6 +1477,12 @@ mod read_directory_tests {
             .expect("target must be visible in show-ignored mode");
         assert!(target.is_ignored, "target must be flagged ignored");
         assert!(target.is_dir);
+        let secret = entries
+            .iter()
+            .find(|e| e.name == "secret.txt")
+            .expect("secret.txt visible");
+        assert!(secret.is_ignored, "gitignored plain file must be flagged");
+        assert!(!secret.is_dir);
         let main = entries.iter().find(|e| e.name == "main.rs").unwrap();
         assert!(!main.is_ignored, "tracked files must not be flagged");
         assert!(entries[0].is_dir, "dirs still sort before files");
