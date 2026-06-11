@@ -308,6 +308,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
           path={menu.path}
           name={menu.name}
           isDir={menu.isDir}
+          isRoot={menu.path === rootPath}
           rootPath={rootPath}
           x={menu.x}
           y={menu.y}

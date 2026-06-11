@@ -10,6 +10,9 @@ interface Props {
   /** Display name (file or folder basename). */
   name: string;
   isDir: boolean;
+  /** True when the entry is the workspace root itself — hides Rename/Delete,
+   *  which the backend always refuses for the root. */
+  isRoot?: boolean;
   /** Workspace root, for computing the relative path. */
   rootPath: string;
   x: number;
@@ -47,6 +50,7 @@ export function FileTreeContextMenu({
   path,
   name,
   isDir,
+  isRoot = false,
   rootPath,
   x,
   y,
@@ -155,24 +159,28 @@ export function FileTreeContextMenu({
           </button>
         </>
       )}
-      <button
-        type="button"
-        role="menuitem"
-        className={ITEM}
-        title={isDir ? "Rename this folder" : "Rename this file"}
-        onClick={run(onRename)}
-      >
-        <Pencil size={12} className="shrink-0" /> Rename
-      </button>
-      <button
-        type="button"
-        role="menuitem"
-        className={DANGER}
-        title="Delete permanently"
-        onClick={run(onDelete)}
-      >
-        <Trash2 size={12} className="shrink-0" /> Delete
-      </button>
+      {!isRoot && (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            className={ITEM}
+            title={isDir ? "Rename this folder" : "Rename this file"}
+            onClick={run(onRename)}
+          >
+            <Pencil size={12} className="shrink-0" /> Rename
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className={DANGER}
+            title="Delete permanently"
+            onClick={run(onDelete)}
+          >
+            <Trash2 size={12} className="shrink-0" /> Delete
+          </button>
+        </>
+      )}
     </div>,
     document.body,
   );

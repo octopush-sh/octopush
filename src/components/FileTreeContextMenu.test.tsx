@@ -169,6 +169,14 @@ describe("FileTreeContextMenu", () => {
     expect(onDismiss).toHaveBeenCalled();
   });
 
+  it("root target: keeps New file/New folder but hides Rename and Delete", () => {
+    renderMenu({ path: "/repo", name: "repo", isDir: true, isRoot: true });
+    expect(screen.getByRole("menuitem", { name: /new file/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new folder/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /rename/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /delete/i })).not.toBeInTheDocument();
+  });
+
   it("Delete invokes onDelete, dismisses, and is rouge-styled", async () => {
     const { onDelete, onDismiss } = renderMenu();
     const item = screen.getByRole("menuitem", { name: /delete/i });

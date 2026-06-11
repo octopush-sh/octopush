@@ -4015,6 +4015,24 @@ mod g6_fileops_tests {
     }
 
     #[test]
+    fn rename_changes_only_case() {
+        // On case-insensitive filesystems (macOS APFS) the destination stats
+        // to the source itself — the dest-exists guard must not refuse that.
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("readme.md"), "hello").unwrap();
+        fs_rename_inner(&ws, "readme.md", "README.md").unwrap();
+        // Both names stat on a case-insensitive FS — assert via the real
+        // directory listing that the entry is now spelled README.md.
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"README.md".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"readme.md".to_string()), "got: {names:?}");
+        assert_eq!(fs::read_to_string(tmp.path().join("README.md")).unwrap(), "hello");
+    }
+
+    #[test]
     fn rename_refuses_when_the_destination_already_exists() {
         let (tmp, ws) = ws();
         fs::write(tmp.path().join("a.txt"), "a").unwrap();

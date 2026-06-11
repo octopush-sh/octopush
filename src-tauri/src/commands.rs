@@ -3358,8 +3358,25 @@ fn validate_simple_name(name: &str) -> AppResult<()> {
 pub(crate) fn fs_rename_inner(workspace_path: &str, from: &str, to: &str) -> AppResult<()> {
     let from_p = contained_path(workspace_path, from)?;
     let to_p = contained_path(workspace_path, to)?;
-    if to_p.symlink_metadata().is_ok() {
-        return Err(AppError::Other("destination already exists".into()));
+    if let Ok(to_meta) = to_p.symlink_metadata() {
+        // On case-insensitive filesystems (e.g. macOS APFS) a case-only rename
+        // makes the destination stat to the source itself — allow that.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let same_entry = from_p
+                .symlink_metadata()
+                .map(|m| m.dev() == to_meta.dev() && m.ino() == to_meta.ino())
+                .unwrap_or(false);
+            if !same_entry {
+                return Err(AppError::Other("destination already exists".into()));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = to_meta;
+            return Err(AppError::Other("destination already exists".into()));
+        }
     }
     std::fs::rename(&from_p, &to_p).map_err(|e| AppError::Other(format!("rename failed: {e}")))
 }

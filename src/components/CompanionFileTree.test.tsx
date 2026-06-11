@@ -454,6 +454,20 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
   });
 
+  it("right-clicking the root row offers create items but no Rename/Delete", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("my-project")).toBeInTheDocument());
+
+    const rootRow = screen.getByText("my-project").closest('[role="treeitem"]') as HTMLElement;
+    fireEvent.contextMenu(rootRow);
+
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new file/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new folder/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /rename/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /delete/i })).not.toBeInTheDocument();
+  });
+
   it("exposes tree semantics: role=tree, treeitems, aria-expanded on dirs", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
