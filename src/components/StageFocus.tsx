@@ -130,7 +130,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
 
   // A terminal stage with a captured snapshot renders the frozen diff instead —
   // the live worktree keeps mutating under later stages, so we never fetch it.
-  const terminal = stage?.status === "done" || stage?.status === "failed";
+  const terminal = stage != null && stage.status !== "running";
   const snapshot = terminal ? stage?.diffSnapshot ?? null : null;
 
   useEffect(() => {
@@ -162,7 +162,9 @@ export function StageFocus({ stage, workspacePath }: Props) {
     setLogSegments([]);
     if (!stage) return;
     const stageId = stage.id;
-    const terminal = stage.status === "done" || stage.status === "failed";
+    // Any non-running stage may hydrate from the persisted log (done/failed,
+    // and budget-parked awaiting_checkpoint stages whose only content is a notice).
+    const terminal = stage.status !== "running";
     void ipc.listStageIterations(stageId)
       .then((rows) => { if (!cancelled) setIterations(rows); })
       .catch(() => {});
@@ -321,6 +323,8 @@ export function StageFocus({ stage, workspacePath }: Props) {
                 <span>{ROLE_VERBS[stage.role] ?? "working…"}</span>
               </div>
             </>
+          ) : journal.length > 0 ? (
+            <div className="flex flex-col gap-2">{journal}</div>
           ) : (
             <span className="text-octo-mute">Nothing produced yet.</span>
           )}

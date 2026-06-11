@@ -103,7 +103,10 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     // Loop props (unchanged logic, but computed off blockedStage)
     let loopTargetRole: string | null = null;
     let loopState: { iteration: number; max: number } | null = null;
-    if (blockedStage && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null && blockedStage.status === "awaiting_checkpoint") {
+    // A budget-parked stage (never started) offers no send-back — it has produced
+    // nothing to send. Approve overrides the budget once; Reject re-parks.
+    const budgetParked = blockedStage !== null && blockedStage.startedAt === null && blockedStage.artifact === null;
+    if (blockedStage && !budgetParked && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null && blockedStage.status === "awaiting_checkpoint") {
       const targetStage = stages.find((s) => s.position === blockedStage.loopTargetPosition);
       if (targetStage) {
         loopTargetRole = labelForRole(targetStage.role);

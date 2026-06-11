@@ -592,7 +592,11 @@ impl Orchestrator {
                 if let Some(review) = &blocked {
                     // Only a review parked at its checkpoint can be sent back. A failed
                     // stage is recovered via Reject/re-run, not SendBack → no-op here.
-                    if review.status == "awaiting_checkpoint" {
+                    // A budget-parked stage (never started: no started_at, no artifact)
+                    // has produced nothing to send back — leave it parked; Approve is
+                    // the only override and Reject re-parks.
+                    let budget_parked = review.started_at.is_none() && review.artifact.is_none();
+                    if review.status == "awaiting_checkpoint" && !budget_parked {
                         let can_loop = match review.loop_target_position {
                             Some(target_pos) => {
                                 target_pos < review.position

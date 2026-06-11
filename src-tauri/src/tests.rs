@@ -3141,6 +3141,21 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn send_back_on_a_budget_parked_stage_leaves_it_parked() {
+        // A budget-parked stage never ran — SendBack must neither mark it done
+        // (skipping it) nor burn a loop iteration. Approve is the only override.
+        let (orch, run_id, db) = budgeted_run(2, 0.02, Some(0.01));
+        orch.run_to_pause(&run_id).await.unwrap();
+        let parked = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert_eq!(parked.status, "awaiting_checkpoint");
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let after = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert_eq!(after.status, "awaiting_checkpoint", "stage must stay parked");
+        assert_eq!(after.started_at, None, "stage must not have run");
+        assert_eq!(after.loop_iterations, parked.loop_iterations, "no loop iteration burned");
+    }
+
+    #[tokio::test]
     async fn approving_a_budget_checkpoint_overrides_once_then_the_gate_rearms() {
         let (orch, run_id, db) = budgeted_run(3, 0.02, Some(0.01));
         orch.run_to_pause(&run_id).await.unwrap();

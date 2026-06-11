@@ -97,6 +97,18 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("Edit")).toBeInTheDocument();
   });
 
+  it("renders the journal in idle mode so a budget-parked stage shows its notice", () => {
+    // awaiting_checkpoint + never started + no artifact = budget-parked; its
+    // only content is the run://log notice — it must be visible, not
+    // "Nothing produced yet."
+    useRunsStore.setState({ liveByStage: { st1: [
+      { kind: "notice", text: "budget reached — $0.02 of $0.01 spent" },
+    ] } });
+    render(<StageFocus stage={{ ...baseStage, status: "awaiting_checkpoint" }} workspacePath="/tmp" />);
+    expect(screen.getByText(/budget reached/)).toBeInTheDocument();
+    expect(screen.queryByText("Nothing produced yet.")).not.toBeInTheDocument();
+  });
+
   it("shows no journal drawer when a done stage has no live entries", () => {
     const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
     render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
