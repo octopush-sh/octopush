@@ -55,6 +55,8 @@ interface EditorStore {
   openFile: (workspaceId: string, path: string, confirm?: OpenConfirm) => Promise<void>;
   closeFile: (workspaceId: string, path: string) => void;
   setActive: (workspaceId: string, path: string) => void;
+  /** Move an open tab from one position to another (drag-reorder). */
+  reorderFiles: (workspaceId: string, fromIndex: number, toIndex: number) => void;
   setContent: (workspaceId: string, path: string, content: string) => void;
   saveActive: (workspaceId: string, opts?: { force?: boolean }) => Promise<void>;
   clearSaveConflict: () => void;
@@ -196,6 +198,22 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     set((s) => ({
       activeByWs: { ...s.activeByWs, [workspaceId]: path },
     })),
+
+  reorderFiles: (workspaceId, fromIndex, toIndex) =>
+    set((s) => {
+      const prev = s.filesByWs[workspaceId] ?? EMPTY_FILES;
+      if (
+        fromIndex === toIndex ||
+        fromIndex < 0 || fromIndex >= prev.length ||
+        toIndex < 0 || toIndex >= prev.length
+      ) {
+        return {};
+      }
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return { filesByWs: { ...s.filesByWs, [workspaceId]: next } };
+    }),
 
   setContent: (workspaceId, path, content) =>
     set((s) => {

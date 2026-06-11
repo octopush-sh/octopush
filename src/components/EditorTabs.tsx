@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useEditorStore } from "../stores/editorStore";
 
 interface Props {
@@ -10,8 +11,50 @@ export function EditorTabs({ workspaceId }: Props) {
   const isDirty = useEditorStore((s) => s.isDirty);
   const setActive = useEditorStore((s) => s.setActive);
   const closeFile = useEditorStore((s) => s.closeFile);
+  const reorderFiles = useEditorStore((s) => s.reorderFiles);
+
+  // Drag-reorder state: the index being dragged and the current drop target.
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [dropIdx, setDropIdx] = useState<number | null>(null);
 
   if (files.length === 0) return null;
+
+  /** Roving-tabindex focus movement (mirrors CompanionFileTree): arrows move
+   *  focus only; Enter/Space activates. The active tab keeps tabIndex 0. */
+  const onTabKeyDown = (
+    e: React.KeyboardEvent<HTMLDivElement>,
+    path: string,
+  ) => {
+    const keys = ["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "];
+    if (!keys.includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (e.key === "Enter" || e.key === " ") {
+      setActive(workspaceId, path);
+      return;
+    }
+
+    const tablist = e.currentTarget.parentElement;
+    if (!tablist) return;
+    const tabs = Array.from(
+      tablist.querySelectorAll<HTMLElement>('[role="tab"]'),
+    );
+    const idx = tabs.indexOf(e.currentTarget);
+    if (idx === -1) return;
+
+    let next = idx;
+    if (e.key === "ArrowLeft") next = Math.max(0, idx - 1);
+    else if (e.key === "ArrowRight") next = Math.min(tabs.length - 1, idx + 1);
+    else if (e.key === "Home") next = 0;
+    else next = tabs.length - 1; // End
+    tabs[next]?.focus();
+  };
+
+  const clearDrag = () => {
+    setDragIdx(null);
+    setDropIdx(null);
+  };
 
   return (
     <div
@@ -20,10 +63,13 @@ export function EditorTabs({ workspaceId }: Props) {
       className="flex overflow-x-auto border-b border-octo-hairline bg-octo-panel"
       style={{ scrollbarWidth: "none" }}
     >
-      {files.map((file) => {
+      {files.map((file, index) => {
         const filename = file.path.split("/").pop() ?? file.path;
         const isActive = file.path === activePath;
         const dirty = isDirty(workspaceId, file.path);
+        const isDragging = dragIdx === index;
+        const isDropTarget =
+          dropIdx === index && dragIdx !== null && dragIdx !== index;
 
         return (
           <div
@@ -31,15 +77,45 @@ export function EditorTabs({ workspaceId }: Props) {
             role="tab"
             aria-selected={isActive}
             tabIndex={isActive ? 0 : -1}
+            title={file.path}
             data-testid={`tab-${file.path}`}
-            className="group relative flex shrink-0 cursor-pointer items-center gap-1.5 px-3 py-2 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            draggable
+            className={`group relative flex shrink-0 cursor-pointer items-center gap-1.5 px-3 py-2 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              isDragging ? "opacity-60" : ""
+            }`}
             style={{
               borderBottom: isActive
                 ? "2px solid var(--color-octo-brass)"
                 : "2px solid transparent",
+              // Constant-width left border keeps the row from shifting while
+              // the drop cue appears — calm, no layout jump.
+              borderLeft: isDropTarget
+                ? "2px solid var(--brass-dim)"
+                : "2px solid transparent",
               background: isActive ? "var(--brass-faint)" : "transparent",
             }}
             onClick={() => setActive(workspaceId, file.path)}
+            onKeyDown={(e) => onTabKeyDown(e, file.path)}
+            onDragStart={(e) => {
+              setDragIdx(index);
+              if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+              if (dragIdx !== null && dropIdx !== index) setDropIdx(index);
+            }}
+            onDragLeave={() => {
+              if (dropIdx === index) setDropIdx(null);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              if (dragIdx !== null && dragIdx !== index) {
+                reorderFiles(workspaceId, dragIdx, index);
+              }
+              clearDrag();
+            }}
+            onDragEnd={clearDrag}
           >
             {/* Filename */}
             <span

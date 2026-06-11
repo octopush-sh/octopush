@@ -242,6 +242,49 @@ describe("editorStore.reloadFromDisk", () => {
   });
 });
 
+describe("editorStore.reorderFiles", () => {
+  beforeEach(reset);
+
+  async function openThree() {
+    readFileChecked.mockImplementation((path: unknown) =>
+      Promise.resolve({ kind: "text", content: String(path), size: 2, mtime: 1 }),
+    );
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+    await useEditorStore.getState().openFile("ws", "/b.ts");
+    await useEditorStore.getState().openFile("ws", "/c.ts");
+  }
+
+  const order = () => useEditorStore.getState().getFiles("ws").map((f) => f.path);
+
+  it("moves a tab forward (drag right)", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 0, 2);
+    expect(order()).toEqual(["/b.ts", "/c.ts", "/a.ts"]);
+  });
+
+  it("moves a tab backward (drag left)", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 2, 0);
+    expect(order()).toEqual(["/c.ts", "/a.ts", "/b.ts"]);
+  });
+
+  it("ignores no-op and out-of-range indices", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 1, 1);
+    useEditorStore.getState().reorderFiles("ws", -1, 2);
+    useEditorStore.getState().reorderFiles("ws", 0, 3);
+    expect(order()).toEqual(["/a.ts", "/b.ts", "/c.ts"]);
+  });
+
+  it("does not touch the active path or other workspaces", async () => {
+    await openThree();
+    useEditorStore.getState().setActive("ws", "/b.ts");
+    useEditorStore.getState().reorderFiles("ws", 0, 2);
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/b.ts");
+    expect(useEditorStore.getState().getFiles("ws-other")).toEqual([]);
+  });
+});
+
 describe("editorStore.checkActiveAgainstDisk", () => {
   beforeEach(reset);
 
