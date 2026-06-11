@@ -8,7 +8,14 @@ const hoisted = vi.hoisted(() => ({ lastView: null as unknown as { setState: Ret
 vi.mock("@codemirror/view", () => {
   class EditorViewMock {
     dom = document.createElement("div");
-    state = { doc: { toString: () => "" }, selection: { main: { head: 0 } } };
+    state = {
+      doc: {
+        toString: () => "",
+        lines: 100,
+        line: (n: number) => ({ from: n * 10 }),
+      },
+      selection: { main: { head: 0 } },
+    };
     destroy = vi.fn();
     dispatch = vi.fn();
     setState = vi.fn();
@@ -17,6 +24,7 @@ vi.mock("@codemirror/view", () => {
     static updateListener = { of: vi.fn(() => ({})) };
     static theme = vi.fn(() => ({}));
     static lineWrapping = {};
+    static scrollIntoView = vi.fn((pos: number, opts: unknown) => ({ pos, opts }));
   }
   return {
     EditorView: EditorViewMock,
@@ -123,10 +131,13 @@ const mockReloadFromDisk = vi.fn().mockResolvedValue(true);
 const mockCheckActiveAgainstDisk = vi.fn().mockResolvedValue(undefined);
 const mockClearSaveConflict = vi.fn();
 
+const mockClearPendingReveal = vi.fn();
+
 const mockStore = {
   saveConflict: null as
     | { workspaceId: string; path: string; kind: "changed" | "deleted" }
     | null,
+  pendingReveal: null as { path: string; line: number } | null,
 };
 
 vi.mock("../stores/editorStore", () => ({
@@ -147,6 +158,9 @@ vi.mock("../stores/editorStore", () => ({
       checkActiveAgainstDisk: mockCheckActiveAgainstDisk,
       saveConflict: mockStore.saveConflict,
       clearSaveConflict: mockClearSaveConflict,
+      getPendingReveal: (wsId: string) =>
+        wsId === "ws-active" ? mockStore.pendingReveal : null,
+      clearPendingReveal: mockClearPendingReveal,
     };
     return selector(state);
   }),
@@ -160,6 +174,7 @@ beforeEach(() => {
   mockReloadFromDisk.mockResolvedValue(true);
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
   mockStore.saveConflict = null;
+  mockStore.pendingReveal = null;
 });
 
 describe("EditorPane", () => {
@@ -276,6 +291,52 @@ describe("EditorPane — save-conflict dialog", () => {
     expect(mockSaveActive).not.toHaveBeenCalled();
     expect(mockReloadFromDisk).not.toHaveBeenCalled();
     expect(mockCloseFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditorPane — open at line (pending reveal)", () => {
+  it("scrolls the view to the requested line and consumes the reveal", () => {
+    mockStore.pendingReveal = { path: "/repo/file.ts", line: 5 };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+
+    const view = hoisted.lastView! as unknown as {
+      dispatch: ReturnType<typeof vi.fn>;
+    };
+    // doc.line(5).from === 50 in the mock — cursor placed there, scrolled into view.
+    const revealCall = view.dispatch.mock.calls.find(
+      (c) => (c[0] as { selection?: { anchor: number } })?.selection?.anchor === 50,
+    );
+    expect(revealCall).toBeTruthy();
+    expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active");
+  });
+
+  it("clamps an out-of-range line to the end of the document", () => {
+    mockStore.pendingReveal = { path: "/repo/file.ts", line: 9999 };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+
+    const view = hoisted.lastView! as unknown as {
+      dispatch: ReturnType<typeof vi.fn>;
+    };
+    // The mock doc has 100 lines — line(100).from === 1000.
+    const revealCall = view.dispatch.mock.calls.find(
+      (c) => (c[0] as { selection?: { anchor: number } })?.selection?.anchor === 1000,
+    );
+    expect(revealCall).toBeTruthy();
+    expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active");
+  });
+
+  it("ignores a reveal that targets a different file than the active one", () => {
+    mockStore.pendingReveal = { path: "/repo/other.ts", line: 5 };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+
+    const view = hoisted.lastView! as unknown as {
+      dispatch: ReturnType<typeof vi.fn>;
+    };
+    const revealCall = view.dispatch.mock.calls.find(
+      (c) => (c[0] as { selection?: unknown })?.selection !== undefined,
+    );
+    expect(revealCall).toBeFalsy();
+    expect(mockClearPendingReveal).not.toHaveBeenCalled();
   });
 });
 

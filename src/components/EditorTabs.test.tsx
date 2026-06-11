@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { OpenFile } from "../stores/editorStore";
 
@@ -12,6 +12,7 @@ const mockFiles: OpenFile[] = [
 
 const mockSetActive = vi.fn();
 const mockCloseFile = vi.fn();
+const mockReorderFiles = vi.fn();
 
 vi.mock("../stores/editorStore", () => ({
   useEditorStore: vi.fn((selector: (s: unknown) => unknown) => {
@@ -21,6 +22,7 @@ vi.mock("../stores/editorStore", () => ({
       isDirty: (_wsId: string, path: string) => path === "/repo/bar.ts",
       setActive: mockSetActive,
       closeFile: mockCloseFile,
+      reorderFiles: mockReorderFiles,
     };
     return selector(state);
   }),
@@ -76,4 +78,106 @@ describe("EditorTabs", () => {
     expect(active).toHaveTextContent("foo.ts");
   });
 
+  it("shows the full path as a tooltip on each tab (truncation aid)", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    expect(screen.getByTestId("tab-/repo/foo.ts")).toHaveAttribute("title", "/repo/foo.ts");
+    expect(screen.getByTestId("tab-/repo/bar.ts")).toHaveAttribute("title", "/repo/bar.ts");
+  });
+});
+
+describe("EditorTabs — keyboard navigation (roving tabindex)", () => {
+  it("uses roving tabindex: active tab is 0, the rest are -1", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo, bar] = screen.getAllByRole("tab");
+    expect(foo).toHaveAttribute("tabindex", "0");   // active
+    expect(bar).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("ArrowRight / ArrowLeft move focus between tabs without activating them", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo, bar] = screen.getAllByRole("tab");
+    foo.focus();
+
+    fireEvent.keyDown(foo, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(bar);
+    expect(mockSetActive).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(bar, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(foo);
+    expect(mockSetActive).not.toHaveBeenCalled();
+  });
+
+  it("focus stops at the edges (no wrap)", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo, bar] = screen.getAllByRole("tab");
+
+    foo.focus();
+    fireEvent.keyDown(foo, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(foo);
+
+    bar.focus();
+    fireEvent.keyDown(bar, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(bar);
+  });
+
+  it("Home / End jump to the first / last tab", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo, bar] = screen.getAllByRole("tab");
+
+    foo.focus();
+    fireEvent.keyDown(foo, { key: "End" });
+    expect(document.activeElement).toBe(bar);
+
+    fireEvent.keyDown(bar, { key: "Home" });
+    expect(document.activeElement).toBe(foo);
+  });
+
+  it("Enter and Space activate the focused tab", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [, bar] = screen.getAllByRole("tab");
+
+    bar.focus();
+    fireEvent.keyDown(bar, { key: "Enter" });
+    expect(mockSetActive).toHaveBeenCalledWith("ws-1", "/repo/bar.ts");
+
+    mockSetActive.mockClear();
+    fireEvent.keyDown(bar, { key: " " });
+    expect(mockSetActive).toHaveBeenCalledWith("ws-1", "/repo/bar.ts");
+  });
+});
+
+describe("EditorTabs — drag to reorder", () => {
+  it("dropping a dragged tab onto another calls reorderFiles(from, to)", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo, bar] = screen.getAllByRole("tab");
+
+    fireEvent.dragStart(foo);
+    fireEvent.dragOver(bar);
+    fireEvent.drop(bar);
+
+    expect(mockReorderFiles).toHaveBeenCalledWith("ws-1", 0, 1);
+  });
+
+  it("marks tabs draggable and shows a quiet cue on the dragged tab", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo] = screen.getAllByRole("tab");
+    expect(foo).toHaveAttribute("draggable", "true");
+
+    fireEvent.dragStart(foo);
+    expect(foo.className).toContain("opacity-60");
+
+    fireEvent.dragEnd(foo);
+    expect(foo.className).not.toContain("opacity-60");
+  });
+
+  it("dropping a tab onto itself does not reorder", () => {
+    render(<EditorTabs workspaceId="ws-1" />);
+    const [foo] = screen.getAllByRole("tab");
+
+    fireEvent.dragStart(foo);
+    fireEvent.dragOver(foo);
+    fireEvent.drop(foo);
+
+    expect(mockReorderFiles).not.toHaveBeenCalled();
+  });
 });

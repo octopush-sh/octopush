@@ -1008,8 +1008,10 @@ function App() {
    *              file as a tab. "diff" → switches to the Diff view and
    *              scrolls the canvas to that file's hunks.
    * @param line  Optional new-file line number (e.g. from an AI review
-   *              finding). In diff view we scroll to the matching diff row
-   *              when it's visible, falling back to the file header.
+   *              finding, or the diff's `o` key). In diff view we scroll to
+   *              the matching diff row when it's visible, falling back to
+   *              the file header. In editor view the cursor lands on that
+   *              line (EditorPane consumes the store's pending reveal).
    */
   const navigateToFile = useCallback(
     (path: string, view: ReviewViewMode = "editor", line?: number | null) => {
@@ -1024,7 +1026,7 @@ function App() {
       setReviewViewMode(view);
 
       if (view === "editor") {
-        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile).catch((e) =>
+        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile, line ?? undefined).catch((e) =>
           pushToast({
             level: "error",
             title: "Could not open file",
@@ -1560,7 +1562,7 @@ function App() {
                         gitDiff={gitDiff}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}
-                        onOpenFileAtLine={(p) => navigateToFile(p, "editor")}
+                        onOpenFileAtLine={(p, line) => navigateToFile(p, "editor", line)}
                         onDiffChange={() => {
                           // Re-fetch git status + diff after a hunk action
                           const path = activeWorkspace.worktreePath || project.path;

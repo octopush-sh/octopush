@@ -124,6 +124,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const checkActiveAgainstDisk = useEditorStore((s) => s.checkActiveAgainstDisk);
   const saveConflict = useEditorStore((s) => s.saveConflict);
   const clearSaveConflict = useEditorStore((s) => s.clearSaveConflict);
+  const pendingReveal = useEditorStore((s) => s.getPendingReveal(workspaceId));
+  const clearPendingReveal = useEditorStore((s) => s.clearPendingReveal);
 
   const wrap = useEditorPrefs((s) => s.wrap);
   const fontSize = useEditorPrefs((s) => s.fontSize);
@@ -201,6 +203,28 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     lastPathRef.current = activeFile.path;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath, workspaceId]);
+
+  // One-shot open-at-line: once the revealed file IS the active document
+  // (declared after the swap effect so the doc is already in place), put the
+  // cursor on the requested line and scroll it to the center. Consuming the
+  // reveal keeps later tab switches from re-jumping.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !pendingReveal) return;
+    if (!activeFile || activeFile.kind !== "text") return;
+    if (activeFile.path !== pendingReveal.path) return;
+
+    const doc = view.state.doc;
+    const lineNo = Math.max(1, Math.min(pendingReveal.line, doc.lines));
+    const pos = doc.line(lineNo).from;
+    view.dispatch({
+      selection: { anchor: pos },
+      effects: EditorView.scrollIntoView(pos, { y: "center" }),
+    });
+    view.focus?.();
+    clearPendingReveal(workspaceId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReveal, activePath, workspaceId]);
 
   // Replace the document when the active buffer was reloaded from disk
   // (version bump): the swap effect only fires on path changes, so an

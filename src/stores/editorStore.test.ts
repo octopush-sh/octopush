@@ -18,7 +18,9 @@ vi.mock("../lib/editorLang", () => ({ langForExtension: () => "javascript" }));
 import { useEditorStore } from "./editorStore";
 
 function reset() {
-  useEditorStore.setState({ filesByWs: {}, activeByWs: {}, saveConflict: null });
+  useEditorStore.setState({
+    filesByWs: {}, activeByWs: {}, saveConflict: null, pendingRevealByWs: {},
+  });
   vi.clearAllMocks();
   // Default: disk matches the tracked state (no external change).
   fileMeta.mockResolvedValue({ mtimeMs: 100, size: 2 });
@@ -239,6 +241,94 @@ describe("editorStore.reloadFromDisk", () => {
     expect(ok).toBe(false);
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error" }));
     expect(useEditorStore.getState().getFiles("ws")[0].content).toBe("v1");
+  });
+});
+
+describe("editorStore.openFile — open at line (pending reveal)", () => {
+  beforeEach(reset);
+
+  it("records a pending reveal when opening a new file with a line", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toMatchObject({
+      path: "/a.ts", line: 42,
+    });
+  });
+
+  it("records a pending reveal when re-opening an already-open file with a line", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 7);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toMatchObject({
+      path: "/a.ts", line: 7,
+    });
+    expect(readFileChecked).toHaveBeenCalledTimes(1); // no re-read
+  });
+
+  it("a plain open clears any stale pending reveal for the workspace", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42);
+    await useEditorStore.getState().openFile("ws", "/b.ts");
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+  });
+
+  it("a declined large-file open leaves no pending reveal", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "big", size: 5_000_000, mtime: 1 });
+    const confirm = vi.fn().mockResolvedValue(false);
+    await useEditorStore.getState().openFile("ws", "/big.ts", confirm, 9);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+  });
+
+  it("clearPendingReveal consumes the reveal", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 3);
+    useEditorStore.getState().clearPendingReveal("ws");
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+  });
+});
+
+describe("editorStore.reorderFiles", () => {
+  beforeEach(reset);
+
+  async function openThree() {
+    readFileChecked.mockImplementation((path: unknown) =>
+      Promise.resolve({ kind: "text", content: String(path), size: 2, mtime: 1 }),
+    );
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+    await useEditorStore.getState().openFile("ws", "/b.ts");
+    await useEditorStore.getState().openFile("ws", "/c.ts");
+  }
+
+  const order = () => useEditorStore.getState().getFiles("ws").map((f) => f.path);
+
+  it("moves a tab forward (drag right)", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 0, 2);
+    expect(order()).toEqual(["/b.ts", "/c.ts", "/a.ts"]);
+  });
+
+  it("moves a tab backward (drag left)", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 2, 0);
+    expect(order()).toEqual(["/c.ts", "/a.ts", "/b.ts"]);
+  });
+
+  it("ignores no-op and out-of-range indices", async () => {
+    await openThree();
+    useEditorStore.getState().reorderFiles("ws", 1, 1);
+    useEditorStore.getState().reorderFiles("ws", -1, 2);
+    useEditorStore.getState().reorderFiles("ws", 0, 3);
+    expect(order()).toEqual(["/a.ts", "/b.ts", "/c.ts"]);
+  });
+
+  it("does not touch the active path or other workspaces", async () => {
+    await openThree();
+    useEditorStore.getState().setActive("ws", "/b.ts");
+    useEditorStore.getState().reorderFiles("ws", 0, 2);
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/b.ts");
+    expect(useEditorStore.getState().getFiles("ws-other")).toEqual([]);
   });
 });
 

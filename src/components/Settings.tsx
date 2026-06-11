@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Download, RefreshCw, CheckCircle, Loader2, Pencil, X } from "lucide-react";
+import { Download, RefreshCw, CheckCircle, Loader2, Minus, Pencil, Plus, X } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { useAttentionStore } from "../stores/attentionStore";
+import { useEditorPrefs, FONT_MIN, FONT_MAX, TAB_WIDTHS } from "../stores/editorPrefsStore";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell,
@@ -181,6 +182,10 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 function GeneralPane() {
   const soundEnabled = useAttentionStore((s) => s.soundEnabled);
   const setSoundEnabled = useAttentionStore((s) => s.setSoundEnabled);
+  const wrap = useEditorPrefs((s) => s.wrap);
+  const setWrap = useEditorPrefs((s) => s.setWrap);
+  const lineNumbers = useEditorPrefs((s) => s.lineNumbers);
+  const setLineNumbers = useEditorPrefs((s) => s.setLineNumbers);
 
   return (
     <>
@@ -200,9 +205,130 @@ function GeneralPane() {
         />
 
         <SectionLabel>Editor</SectionLabel>
+        <ToggleRow
+          testId="editor-wrap"
+          label="Word wrap"
+          description="Wrap long lines to the editor width instead of scrolling horizontally."
+          checked={wrap}
+          onChange={setWrap}
+        />
+        <FontSizeRow />
+        <TabWidthRow />
+        <ToggleRow
+          testId="editor-linenumbers"
+          label="Line numbers"
+          description="Show line numbers in the editor gutter."
+          checked={lineNumbers}
+          onChange={setLineNumbers}
+        />
         <EditorCommandRow />
       </div>
     </>
+  );
+}
+
+function FontSizeRow() {
+  const fontSize = useEditorPrefs((s) => s.fontSize);
+  const bumpFontSize = useEditorPrefs((s) => s.bumpFontSize);
+
+  return (
+    <div
+      className="flex items-center justify-between gap-4 rounded-lg px-4 py-3"
+      style={{
+        border: "1px solid var(--color-octo-hairline)",
+        background: "var(--color-octo-panel)",
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="font-serif text-[14px] leading-tight text-octo-ivory">
+          Font size
+        </div>
+        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+          Editor text size in pixels, from {FONT_MIN} to {FONT_MAX}.
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <button
+          type="button"
+          data-testid="editor-font-dec"
+          onClick={() => bumpFontSize(-1)}
+          disabled={fontSize <= FONT_MIN}
+          aria-label="Decrease font size"
+          title="Decrease font size"
+          className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition hover:text-octo-brass disabled:opacity-40 disabled:hover:text-octo-mute"
+          style={{ border: "1px solid var(--color-octo-hairline)" }}
+        >
+          <Minus size={12} />
+        </button>
+        <span
+          data-testid="editor-font-value"
+          className="w-9 text-center font-mono text-[12px] text-octo-ivory"
+        >
+          {fontSize}px
+        </span>
+        <button
+          type="button"
+          data-testid="editor-font-inc"
+          onClick={() => bumpFontSize(1)}
+          disabled={fontSize >= FONT_MAX}
+          aria-label="Increase font size"
+          title="Increase font size"
+          className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition hover:text-octo-brass disabled:opacity-40 disabled:hover:text-octo-mute"
+          style={{ border: "1px solid var(--color-octo-hairline)" }}
+        >
+          <Plus size={12} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TabWidthRow() {
+  const tabWidth = useEditorPrefs((s) => s.tabWidth);
+  const setTabWidth = useEditorPrefs((s) => s.setTabWidth);
+
+  return (
+    <div
+      className="flex items-center justify-between gap-4 rounded-lg px-4 py-3"
+      style={{
+        border: "1px solid var(--color-octo-hairline)",
+        background: "var(--color-octo-panel)",
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="font-serif text-[14px] leading-tight text-octo-ivory">
+          Tab width
+        </div>
+        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+          Spaces per indentation level.
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {TAB_WIDTHS.map((w) => {
+          const active = tabWidth === w;
+          return (
+            <button
+              key={w}
+              type="button"
+              data-testid={`editor-tab-${w}`}
+              onClick={() => setTabWidth(w)}
+              aria-pressed={active}
+              title={`Indent with ${w} spaces`}
+              className={`rounded-md px-2.5 py-1 font-mono text-[11px] transition ${
+                active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+              }`}
+              style={
+                active
+                  ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
+                  : { border: "1px solid var(--color-octo-hairline)" }
+              }
+            >
+              {w}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -263,11 +389,13 @@ function ToggleRow({
   description,
   checked,
   onChange,
+  testId,
 }: {
   label: string;
   description?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  testId?: string;
 }) {
   return (
     <label
@@ -291,6 +419,7 @@ function ToggleRow({
         type="button"
         role="switch"
         aria-checked={checked}
+        data-testid={testId}
         onClick={() => onChange(!checked)}
         className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
         style={{

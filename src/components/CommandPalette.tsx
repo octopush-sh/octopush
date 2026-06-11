@@ -6,6 +6,7 @@ import { pushToast } from "./Toasts";
 import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { useThemeStore } from "../stores/themeStore";
 import { useUpdaterStore } from "../stores/updaterStore";
+import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { ModalShell } from "./ModalShell";
 
 interface Props {
@@ -26,6 +27,10 @@ export function CommandPalette({
   const [models, setModels] = useState<ModelWithProvider[]>([]);
   const [templates, setTemplates] = useState<SessionTemplate[]>([]);
   const { themes, apply: applyTheme } = useThemeStore();
+  const editorWrap = useEditorPrefs((s) => s.wrap);
+  const editorFontSize = useEditorPrefs((s) => s.fontSize);
+  const editorTabWidth = useEditorPrefs((s) => s.tabWidth);
+  const editorLineNumbers = useEditorPrefs((s) => s.lineNumbers);
 
   useEffect(() => {
     if (open) {
@@ -226,6 +231,37 @@ export function CommandPalette({
                   />
                 </>
               )}
+            </Group>
+
+            {/* Editor */}
+            <Group heading="Editor">
+              <Item
+                glyph="¶"
+                label={`Toggle word wrap — ${editorWrap ? "on" : "off"}`}
+                onSelect={() => run(() => useEditorPrefs.getState().toggleWrap())}
+              />
+              <Item
+                glyph="+"
+                label="Increase font size"
+                detail={`${editorFontSize}px`}
+                onSelect={() => run(() => useEditorPrefs.getState().bumpFontSize(1))}
+              />
+              <Item
+                glyph="−"
+                label="Decrease font size"
+                detail={`${editorFontSize}px`}
+                onSelect={() => run(() => useEditorPrefs.getState().bumpFontSize(-1))}
+              />
+              <Item
+                glyph="⌶"
+                label={`Cycle tab width — ${editorTabWidth} spaces`}
+                onSelect={() => run(() => useEditorPrefs.getState().cycleTabWidth())}
+              />
+              <Item
+                glyph="#"
+                label={`Toggle line numbers — ${editorLineNumbers ? "on" : "off"}`}
+                onSelect={() => run(() => useEditorPrefs.getState().toggleLineNumbers())}
+              />
             </Group>
 
             {/* Themes */}
