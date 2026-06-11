@@ -79,8 +79,10 @@ export function ReviewCanvas({
   };
   const [fileEdits, setFileEdits] = useState<FileEdit[]>([]);
 
-  const { readingMode, ignoreWhitespace, setReadingMode, setIgnoreWhitespace } =
-    useReviewPrefs();
+  const readingMode = useReviewPrefs((s) => s.readingMode);
+  const ignoreWhitespace = useReviewPrefs((s) => s.ignoreWhitespace);
+  const setReadingMode = useReviewPrefs((s) => s.setReadingMode);
+  const setIgnoreWhitespace = useReviewPrefs((s) => s.setIgnoreWhitespace);
 
   // Reject-undo inline bar (error=true when applyHunk couldn't restore the change)
   const [undo, setUndo] = useState<{ rawText: string; error?: boolean } | null>(null);

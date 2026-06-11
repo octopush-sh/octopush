@@ -22,12 +22,15 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
       setReadingMode: (readingMode) => set({ readingMode }),
       setIgnoreWhitespace: (ignoreWhitespace) => set({ ignoreWhitespace }),
       toggleShowIgnored: (rootPath) =>
-        set((s) => ({
-          showIgnoredFiles: {
-            ...s.showIgnoredFiles,
-            [rootPath]: !s.showIgnoredFiles[rootPath],
-          },
-        })),
+        set((s) => {
+          const next = { ...s.showIgnoredFiles };
+          if (next[rootPath]) {
+            delete next[rootPath];
+          } else {
+            next[rootPath] = true;
+          }
+          return { showIgnoredFiles: next };
+        }),
     }),
     { name: "octo-review-prefs" },
   ),

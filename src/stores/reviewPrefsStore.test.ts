@@ -22,6 +22,7 @@ describe("reviewPrefsStore", () => {
     expect(useReviewPrefs.getState().showIgnoredFiles["/other"]).toBeUndefined();
 
     useReviewPrefs.getState().toggleShowIgnored("/repo");
-    expect(useReviewPrefs.getState().showIgnoredFiles["/repo"]).toBe(false);
+    expect(useReviewPrefs.getState().showIgnoredFiles["/repo"]).toBeUndefined();
+    expect("/repo" in useReviewPrefs.getState().showIgnoredFiles).toBe(false);
   });
 });
