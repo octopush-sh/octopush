@@ -129,6 +129,9 @@ export type FileReadResult =
 export type PullKind = "ok" | "diverged" | "conflict" | "error";
 export interface PullOutcome { kind: PullKind; output: string }
 
+export type ContinueKind = "ok" | "moreConflicts" | "error";
+export interface ContinueOutcome { kind: ContinueKind; output: string }
+
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
 import { invoke } from "@tauri-apps/api/core";
@@ -435,6 +438,14 @@ export const ipc = {
   /** Mark a hand-merged conflicted file as resolved (git add). */
   markConflictResolved: (workspacePath: string, file: string) =>
     invoke<void>("mark_conflict_resolved", { workspacePath, file }),
+
+  /** Continue the in-progress merge/rebase. moreConflicts = a later step conflicted. */
+  continueOperation: (workspacePath: string) =>
+    invoke<ContinueOutcome>("continue_operation", { workspacePath }),
+
+  /** Abort the in-progress merge/rebase; returns the trimmed git output. */
+  abortOperation: (workspacePath: string) =>
+    invoke<string>("abort_operation", { workspacePath }),
 
   fetchChanges: (workspacePath: string) => invoke<string>("fetch_changes", { workspacePath }),
 

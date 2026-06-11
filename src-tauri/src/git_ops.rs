@@ -47,6 +47,28 @@ pub struct PullOutcome { pub kind: PullKind, pub output: String }
 #[serde(rename_all = "camelCase")]
 pub enum PullKind { Ok, Diverged, Conflict, Error }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueOutcome { pub kind: ContinueKind, pub output: String }
+
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum ContinueKind { Ok, MoreConflicts, Error }
+
+/// Classify a `git merge|rebase --continue` result from its exit success +
+/// combined output. Pure. MoreConflicts = the next step of a multi-commit
+/// rebase hit conflicts (the resolution section should persist).
+pub fn classify_continue(success: bool, combined: &str) -> ContinueKind {
+    let s = combined.to_lowercase();
+    if success {
+        ContinueKind::Ok
+    } else if s.contains("conflict") || s.contains("could not apply") {
+        ContinueKind::MoreConflicts
+    } else {
+        ContinueKind::Error
+    }
+}
+
 /// Classify a `git pull` result from its exit success + combined output. Pure.
 pub fn classify_pull(success: bool, combined: &str) -> PullKind {
     let s = combined.to_lowercase();
@@ -679,5 +701,25 @@ mod tests {
         assert_eq!(classify_pull(false, "CONFLICT (content): Merge conflict in a.txt"), PullKind::Conflict);
         assert_eq!(classify_pull(false, "error: Automatic merge failed"), PullKind::Conflict);
         assert_eq!(classify_pull(false, "fatal: couldn't find remote ref"), PullKind::Error);
+    }
+
+    #[test]
+    fn classify_continue_distinguishes_outcomes() {
+        use super::{classify_continue, ContinueKind};
+        assert_eq!(classify_continue(true, "[main 1a2b3c4] merge side"), ContinueKind::Ok);
+        assert_eq!(classify_continue(true, ""), ContinueKind::Ok);
+        assert_eq!(
+            classify_continue(false, "CONFLICT (content): Merge conflict in a.txt"),
+            ContinueKind::MoreConflicts,
+        );
+        assert_eq!(
+            classify_continue(false, "error: could not apply f00ba4... next commit"),
+            ContinueKind::MoreConflicts,
+        );
+        assert_eq!(
+            classify_continue(false, "error: Committing is not possible because you have unmerged files."),
+            ContinueKind::Error,
+        );
+        assert_eq!(classify_continue(false, "fatal: No rebase in progress?"), ContinueKind::Error);
     }
 }

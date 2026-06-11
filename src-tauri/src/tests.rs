@@ -3931,4 +3931,30 @@ mod conflict_resolution_tests {
         let st = get_status(tmp.path()).unwrap();
         assert_eq!(st.conflicted, 0, "git add clears the unmerged index state");
     }
+
+    // ── continue / abort ──────────────────────────────────────────
+    // Continue's happy path needs the user's login shell + a real multi-step
+    // operation; it's exercised manually. Abort is fully integration-tested.
+
+    #[tokio::test]
+    async fn abort_returns_repo_to_normal_state_with_clean_tree() {
+        let tmp = conflicted_repo();
+        let path = tmp.path().to_string_lossy().to_string();
+        crate::commands::abort_operation(path).await.expect("abort succeeds");
+        assert_eq!(operation_state(tmp.path()).unwrap(), None, "merge state cleared");
+        let st = get_status(tmp.path()).unwrap();
+        assert_eq!(st.conflicted, 0);
+        assert!(st.changed_files.is_empty(), "working tree clean after abort: {:?}", st.changed_files);
+        // The pre-merge content is restored.
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "main\n");
+    }
+
+    #[tokio::test]
+    async fn continue_and_abort_reject_when_no_operation_in_progress() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-b", "main"]);
+        let path = tmp.path().to_string_lossy().to_string();
+        assert!(crate::commands::continue_operation(path.clone()).await.is_err());
+        assert!(crate::commands::abort_operation(path).await.is_err());
+    }
 }
