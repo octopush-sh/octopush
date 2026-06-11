@@ -663,6 +663,78 @@ pub fn commit_diff_text(path: &Path, sha: &str) -> AppResult<String> {
     diff_to_text(&diff)
 }
 
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameLine {
+    /// 1-based line number in the committed (HEAD) version of the file.
+    pub line: u32,
+    pub sha_short: String,
+    pub author_name: String,
+    pub timestamp_ms: i64,
+    pub summary: String,
+}
+
+/// Per-line blame of `file` (workdir-relative) against HEAD. Errors friendly
+/// when the file has no committed history yet or is too large to blame.
+pub fn blame_file(path: &Path, file: &str) -> AppResult<Vec<BlameLine>> {
+    const MAX_BLAME_BYTES: usize = 1_048_576; // 1 MiB — keep the gutter snappy
+
+    let repo = open_repo(path)?;
+    let head_tree = repo
+        .head()
+        .and_then(|h| h.peel_to_tree())
+        .map_err(|_| AppError::Other("this repository has no commits yet".into()))?;
+    let entry = head_tree.get_path(Path::new(file)).map_err(|_| {
+        AppError::Other(format!("'{file}' has no committed history yet"))
+    })?;
+    let blob = repo
+        .find_blob(entry.id())
+        .map_err(|_| AppError::Other(format!("'{file}' is not a blameable file")))?;
+    if blob.size() > MAX_BLAME_BYTES {
+        return Err(AppError::Other(format!(
+            "'{file}' is too large to blame (over 1 MiB)"
+        )));
+    }
+
+    let blame = repo
+        .blame_file(Path::new(file), None)
+        .map_err(|e| AppError::Other(format!("blame '{file}': {e}")))?;
+
+    // Cache the summary per commit — hunks repeat commits constantly.
+    let mut summaries: std::collections::HashMap<git2::Oid, String> =
+        std::collections::HashMap::new();
+    let mut out: Vec<BlameLine> = Vec::new();
+    for hunk in blame.iter() {
+        let oid = hunk.final_commit_id();
+        let summary = summaries
+            .entry(oid)
+            .or_insert_with(|| {
+                repo.find_commit(oid)
+                    .ok()
+                    .and_then(|c| c.summary().map(String::from))
+                    .unwrap_or_default()
+            })
+            .clone();
+        let sig = hunk.final_signature();
+        let author_name = sig.name().unwrap_or("").to_string();
+        let timestamp_ms = sig.when().seconds() * 1000;
+        let sha = oid.to_string();
+        let sha_short = sha[..7].to_string();
+        let start = hunk.final_start_line();
+        for i in 0..hunk.lines_in_hunk() {
+            out.push(BlameLine {
+                line: (start + i) as u32,
+                sha_short: sha_short.clone(),
+                author_name: author_name.clone(),
+                timestamp_ms,
+                summary: summary.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|l| l.line);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +920,50 @@ mod tests {
         init_repo(dir.path()).unwrap();
         commit_file(dir.path(), "a.txt", "one\n", "first");
         assert!(commit_diff_text(dir.path(), "not-a-sha").is_err());
+    }
+
+    // ── G7 slice III: blame ───────────────────────────────────────
+
+    #[test]
+    fn blame_file_attributes_lines_to_their_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "one\ntwo\n", "second");
+
+        let lines = blame_file(dir.path(), "a.txt").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, 1);
+        assert_eq!(lines[0].summary, "first");
+        assert_eq!(lines[1].line, 2);
+        assert_eq!(lines[1].summary, "second");
+        assert_ne!(lines[0].sha_short, lines[1].sha_short);
+        assert_eq!(lines[0].sha_short.len(), 7);
+        assert_eq!(lines[0].author_name, "Test");
+        assert!(lines[0].timestamp_ms > 0);
+    }
+
+    #[test]
+    fn blame_file_uncommitted_path_errors_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        std::fs::write(dir.path().join("new.txt"), "x\n").unwrap();
+        let err = blame_file(dir.path(), "new.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("committed"),
+            "friendly message about no committed history: {err}"
+        );
+    }
+
+    #[test]
+    fn blame_file_caps_huge_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let big = "x".repeat(70).repeat(20_000); // ~1.4 MiB
+        commit_file(dir.path(), "big.txt", &big, "huge");
+        let err = blame_file(dir.path(), "big.txt").unwrap_err();
+        assert!(err.to_string().contains("too large"), "friendly cap message: {err}");
     }
 
     #[test]

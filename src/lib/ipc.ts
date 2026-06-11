@@ -143,6 +143,16 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
+/** One line of per-line blame (G7 slice III). Lines are 1-based and refer
+ *  to the committed (HEAD) version of the file. */
+export interface BlameLine {
+  line: number;
+  shaShort: string;
+  authorName: string;
+  timestampMs: number;
+  summary: string;
+}
+
 /** One row of the commit history browser (G7 slice III). */
 export interface CommitInfo {
   sha: string;
@@ -455,6 +465,9 @@ export const ipc = {
   /** Unified diff of one commit vs its first parent (root: vs empty tree). */
   commitDiff: (path: string, sha: string) =>
     invoke<string>("commit_diff", { path, sha }),
+  /** Per-line blame of a workdir-relative file against HEAD. */
+  blameFile: (path: string, file: string) =>
+    invoke<BlameLine[]>("blame_file", { path, file }),
   discardFile: (workspacePath: string, filePath: string) =>
     invoke<void>("discard_file", { workspacePath, filePath }),
 

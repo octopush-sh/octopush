@@ -7,6 +7,9 @@ interface Props {
   lang: string;
   /** Disk changed (or file deleted) under unsaved local edits. */
   diskStale?: boolean;
+  /** Blame is on while the buffer has unsaved edits — the gutter describes
+   *  the saved state of the file, not what's being typed. */
+  blameSavedNote?: boolean;
 }
 
 const SEG =
@@ -14,7 +17,7 @@ const SEG =
 const CLICK =
   "transition-colors hover:bg-octo-panel hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
 
-export function EditorStatusBar({ line, col, selectionCount, lang, diskStale }: Props) {
+export function EditorStatusBar({ line, col, selectionCount, lang, diskStale, blameSavedNote }: Props) {
   const wrap = useEditorPrefs((s) => s.wrap);
   const lineNumbers = useEditorPrefs((s) => s.lineNumbers);
   const tabWidth = useEditorPrefs((s) => s.tabWidth);
@@ -38,6 +41,16 @@ export function EditorStatusBar({ line, col, selectionCount, lang, diskStale }: 
 
       {selectionCount > 1 && (
         <div className={`${SEG} text-octo-brass`}>{selectionCount} selections</div>
+      )}
+
+      {blameSavedNote && (
+        <div
+          className={`${SEG} octo-pop-in`}
+          data-testid="statusbar-blame-saved"
+          title="The blame gutter describes the last saved version of this file — unsaved edits are not reflected."
+        >
+          blame: saved version
+        </div>
       )}
 
       {diskStale && (

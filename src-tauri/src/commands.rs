@@ -3364,6 +3364,12 @@ pub async fn commit_diff(path: String, sha: String) -> AppResult<String> {
 }
 
 #[tauri::command]
+pub async fn blame_file(path: String, file: String) -> AppResult<Vec<crate::git_ops::BlameLine>> {
+    let path = expand_tilde(&path);
+    crate::git_ops::blame_file(std::path::Path::new(&path), &file)
+}
+
+#[tauri::command]
 pub async fn amend_commit(workspace_path: String, message: String) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));

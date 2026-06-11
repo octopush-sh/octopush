@@ -18,11 +18,13 @@ import { css } from "@codemirror/lang-css";
 import { xml } from "@codemirror/lang-xml";
 import { yaml } from "@codemirror/lang-yaml";
 import { atelierTheme } from "./editor/atelierTheme";
+import { blameGutter } from "./editor/blameGutter";
 import { diffGutter } from "./editor/diffGutter";
 import { selectAllOccurrences } from "./editor/multiCursor";
 import { parseDiffForFile } from "../lib/diffParser";
 import { useEditorStore } from "../stores/editorStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
+import { useBlameStore } from "../stores/blameStore";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorBinaryPane } from "./EditorBinaryPane";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -54,6 +56,7 @@ const wrapComp = new Compartment();
 const lineNumComp = new Compartment();
 const tabComp = new Compartment();
 const fontComp = new Compartment();
+const blameComp = new Compartment();
 
 interface Prefs { wrap: boolean; fontSize: number; tabWidth: number; lineNumbers: boolean; }
 
@@ -73,6 +76,7 @@ function buildState(opts: {
   return EditorState.create({
     doc,
     extensions: [
+      blameComp.of([]),
       lineNumComp.of(lineNumValue(prefs)),
       highlightActiveLine(),
       drawSelection(),
@@ -132,6 +136,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const tabWidth = useEditorPrefs((s) => s.tabWidth);
   const lineNumbersPref = useEditorPrefs((s) => s.lineNumbers);
   const prefs: Prefs = { wrap, fontSize, tabWidth, lineNumbers: lineNumbersPref };
+
+  const blameEnabled = useBlameStore((s) => s.enabled);
+  const blameLines = useBlameStore((s) =>
+    activePath ? s.linesByPath[activePath] : undefined,
+  );
 
   const activeFile = activePath ? files.find((f) => f.path === activePath) ?? null : null;
 
@@ -275,6 +284,29 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wrap, fontSize, tabWidth, lineNumbersPref]);
 
+  // ── Blame gutter (G7 slice III) ─────────────────────────────────
+  // Fetch blame for the active file while the toggle is on. Re-fetches on
+  // file switch, save (mtime bump) and external reload (version bump) so the
+  // gutter never describes a state the disk no longer has.
+  const activeMtime = activeFile?.kind === "text" ? activeFile.mtime : 0;
+  useEffect(() => {
+    if (!blameEnabled || !activeFile || activeFile.kind !== "text") return;
+    void useBlameStore.getState().load(workspacePath, activeFile.path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blameEnabled, activePath, activeVersion, activeMtime, workspacePath]);
+
+  // Swap the gutter in/out via its compartment. Runs after the file-swap
+  // effect (declared later), so restored cached states get re-decorated too.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: blameComp.reconfigure(
+        blameEnabled && blameLines ? blameGutter(blameLines) : [],
+      ),
+    });
+  }, [blameEnabled, blameLines, activePath]);
+
   // IMPORTANT: the host is mounted UNCONDITIONALLY so the view-once effect (deps
   // `[]`) always finds `hostRef.current`. The empty-state message is an overlay,
   // not an early return — an early return would unmount the host on the
@@ -312,6 +344,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           selectionCount={pos.selections}
           lang={activeFile.lang}
           diskStale={activeFile.diskStale}
+          blameSavedNote={blameEnabled && activeFile.content !== activeFile.savedContent}
         />
       )}
       {conflict && (

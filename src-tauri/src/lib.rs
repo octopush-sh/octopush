@@ -243,6 +243,7 @@ pub fn run() {
             commands::get_last_commit,
             commands::git_log,
             commands::commit_diff,
+            commands::blame_file,
             commands::amend_commit,
             commands::discard_file,
             // File operations (G6 slice II)
