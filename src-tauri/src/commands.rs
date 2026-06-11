@@ -3302,6 +3302,137 @@ pub async fn discard_file(workspace_path: String, file_path: String) -> AppResul
     discard_file_inner(&workspace_path, &file_path)
 }
 
+// ─── File operations (G6 slice II) ────────────────────────────────
+
+/// Resolve `target` (relative to the workspace, or absolute) and verify it is
+/// contained inside the workspace. Canonicalizes the workspace root and the
+/// target's PARENT (the leaf may not exist yet for creates), mirrors the
+/// `starts_with` guard used by `discard_file_inner`, and refuses any path with
+/// a `.git` component as well as the workspace root itself.
+pub(crate) fn contained_path(workspace_path: &str, target: &str) -> AppResult<std::path::PathBuf> {
+    let ws = expand_tilde(workspace_path);
+    let ws_canon = std::path::Path::new(&ws)
+        .canonicalize()
+        .map_err(|e| AppError::Other(format!("workspace not found: {e}")))?;
+
+    let target = expand_tilde(target);
+    let target_path = std::path::Path::new(&target);
+    let joined = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        ws_canon.join(target_path)
+    };
+
+    let parent = joined
+        .parent()
+        .ok_or_else(|| AppError::Other("invalid path: no parent".into()))?;
+    let leaf = joined
+        .file_name()
+        .ok_or_else(|| AppError::Other("invalid path: no file name".into()))?
+        .to_os_string();
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| AppError::Other(format!("parent directory not found: {e}")))?;
+    let resolved = parent_canon.join(&leaf);
+
+    if !resolved.starts_with(&ws_canon) {
+        return Err(AppError::Other("refusing to touch a path outside the workspace".into()));
+    }
+    if resolved == ws_canon {
+        return Err(AppError::Other("refusing to operate on the workspace root".into()));
+    }
+    if resolved.components().any(|c| c.as_os_str() == ".git") {
+        return Err(AppError::Other("refusing to touch .git".into()));
+    }
+    Ok(resolved)
+}
+
+/// A new entry's name must be a single path component.
+fn validate_simple_name(name: &str) -> AppResult<()> {
+    if name.trim().is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(AppError::Other(format!("invalid name: {name:?}")));
+    }
+    Ok(())
+}
+
+pub(crate) fn fs_rename_inner(workspace_path: &str, from: &str, to: &str) -> AppResult<()> {
+    let from_p = contained_path(workspace_path, from)?;
+    let to_p = contained_path(workspace_path, to)?;
+    if let Ok(to_meta) = to_p.symlink_metadata() {
+        // On case-insensitive filesystems (e.g. macOS APFS) a case-only rename
+        // makes the destination stat to the source itself — allow that.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let same_entry = from_p
+                .symlink_metadata()
+                .map(|m| m.dev() == to_meta.dev() && m.ino() == to_meta.ino())
+                .unwrap_or(false);
+            if !same_entry {
+                return Err(AppError::Other("destination already exists".into()));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = to_meta;
+            return Err(AppError::Other("destination already exists".into()));
+        }
+    }
+    std::fs::rename(&from_p, &to_p).map_err(|e| AppError::Other(format!("rename failed: {e}")))
+}
+
+pub(crate) fn fs_create_file_inner(workspace_path: &str, parent: &str, name: &str) -> AppResult<()> {
+    validate_simple_name(name)?;
+    let target = std::path::Path::new(parent).join(name);
+    let p = contained_path(workspace_path, &target.to_string_lossy())?;
+    if p.symlink_metadata().is_ok() {
+        return Err(AppError::Other("an entry with that name already exists".into()));
+    }
+    std::fs::write(&p, "").map_err(|e| AppError::Other(format!("create file failed: {e}")))
+}
+
+pub(crate) fn fs_create_dir_inner(workspace_path: &str, parent: &str, name: &str) -> AppResult<()> {
+    validate_simple_name(name)?;
+    let target = std::path::Path::new(parent).join(name);
+    let p = contained_path(workspace_path, &target.to_string_lossy())?;
+    if p.symlink_metadata().is_ok() {
+        return Err(AppError::Other("an entry with that name already exists".into()));
+    }
+    std::fs::create_dir(&p).map_err(|e| AppError::Other(format!("create folder failed: {e}")))
+}
+
+pub(crate) fn fs_delete_inner(workspace_path: &str, target: &str) -> AppResult<()> {
+    let p = contained_path(workspace_path, target)?;
+    let meta = p
+        .symlink_metadata()
+        .map_err(|e| AppError::Other(format!("nothing to delete: {e}")))?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(&p).map_err(|e| AppError::Other(format!("delete failed: {e}")))
+    } else {
+        std::fs::remove_file(&p).map_err(|e| AppError::Other(format!("delete failed: {e}")))
+    }
+}
+
+#[tauri::command]
+pub async fn fs_rename(workspace_path: String, from: String, to: String) -> AppResult<()> {
+    fs_rename_inner(&workspace_path, &from, &to)
+}
+
+#[tauri::command]
+pub async fn fs_create_file(workspace_path: String, parent: String, name: String) -> AppResult<()> {
+    fs_create_file_inner(&workspace_path, &parent, &name)
+}
+
+#[tauri::command]
+pub async fn fs_create_dir(workspace_path: String, parent: String, name: String) -> AppResult<()> {
+    fs_create_dir_inner(&workspace_path, &parent, &name)
+}
+
+#[tauri::command]
+pub async fn fs_delete(workspace_path: String, target: String) -> AppResult<()> {
+    fs_delete_inner(&workspace_path, &target)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.

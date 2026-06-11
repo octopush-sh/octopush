@@ -3,11 +3,26 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 // Hoist the mock so it is available when vi.mock factory runs.
-const { mockReadDirectory, mockReveal, mockOpenSystem, mockOpenTerminal } = vi.hoisted(() => ({
+const {
+  mockReadDirectory,
+  mockReveal,
+  mockOpenSystem,
+  mockOpenTerminal,
+  mockFsRename,
+  mockFsCreateFile,
+  mockFsCreateDir,
+  mockFsDelete,
+  mockPushToast,
+} = vi.hoisted(() => ({
   mockReadDirectory: vi.fn(),
   mockReveal: vi.fn().mockResolvedValue(undefined),
   mockOpenSystem: vi.fn().mockResolvedValue(undefined),
   mockOpenTerminal: vi.fn().mockResolvedValue(undefined),
+  mockFsRename: vi.fn().mockResolvedValue(undefined),
+  mockFsCreateFile: vi.fn().mockResolvedValue(undefined),
+  mockFsCreateDir: vi.fn().mockResolvedValue(undefined),
+  mockFsDelete: vi.fn().mockResolvedValue(undefined),
+  mockPushToast: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", () => ({
@@ -16,8 +31,14 @@ vi.mock("../lib/ipc", () => ({
     revealInFinder: mockReveal,
     openFileInSystem: mockOpenSystem,
     openInTerminal: mockOpenTerminal,
+    fsRename: mockFsRename,
+    fsCreateFile: mockFsCreateFile,
+    fsCreateDir: mockFsCreateDir,
+    fsDelete: mockFsDelete,
   },
 }));
+
+vi.mock("./Toasts", () => ({ pushToast: mockPushToast }));
 
 // Import after mock is set up.
 import { CompanionFileTree, clearTreeStateCache } from "./CompanionFileTree";
@@ -433,6 +454,20 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
   });
 
+  it("right-clicking the root row offers create items but no Rename/Delete", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("my-project")).toBeInTheDocument());
+
+    const rootRow = screen.getByText("my-project").closest('[role="treeitem"]') as HTMLElement;
+    fireEvent.contextMenu(rootRow);
+
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new file/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new folder/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /rename/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /delete/i })).not.toBeInTheDocument();
+  });
+
   it("exposes tree semantics: role=tree, treeitems, aria-expanded on dirs", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
@@ -570,5 +605,159 @@ describe("CompanionFileTree", () => {
     fireEvent.keyDown(fileRow, { key: "F10", shiftKey: true });
     expect(await screen.findByRole("menu")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /open in system app/i })).toBeInTheDocument();
+  });
+
+  // ─── File operations (G6 slice II) ─────────────────────────────
+
+  /** Right-clicks the row for `label` (a dir has no file-row testid). */
+  function contextMenuOn(label: string) {
+    const row = screen.getByText(label).closest('[role="treeitem"]') as HTMLElement;
+    fireEvent.contextMenu(row);
+  }
+
+  it("dir menu shows all four file ops; file menu only Rename/Delete", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    contextMenuOn("src");
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new file/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /new folder/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /rename/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /delete/i })).toBeInTheDocument();
+
+    // Dismiss (Escape) and check a file's menu.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+
+    contextMenuOn("pom.xml");
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /new file/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /new folder/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /rename/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /delete/i })).toBeInTheDocument();
+  });
+
+  it("New file flow: dialog → fsCreateFile(root, dir, name) → refetch of that dir", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    contextMenuOn("src");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /new file/i }));
+
+    // Menu is gone; the name dialog is up.
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    const input = await screen.findByLabelText("File name");
+    await userEvent.type(input, "New.java{Enter}");
+
+    await waitFor(() =>
+      expect(mockFsCreateFile).toHaveBeenCalledWith(ROOT, "/repo/src", "New.java"),
+    );
+    // The affected dir is force-refetched.
+    await waitFor(() =>
+      expect(mockReadDirectory).toHaveBeenLastCalledWith("/repo/src", false),
+    );
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "success" }),
+    );
+    // Dialog closed.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("New folder flow calls fsCreateDir with the dir and name", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    contextMenuOn("src");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /new folder/i }));
+    await userEvent.type(await screen.findByLabelText("Folder name"), "utils{Enter}");
+
+    await waitFor(() => expect(mockFsCreateDir).toHaveBeenCalledWith(ROOT, "/repo/src", "utils"));
+    await waitFor(() =>
+      expect(mockReadDirectory).toHaveBeenLastCalledWith("/repo/src", false),
+    );
+  });
+
+  it("Rename flow: initial value is the current name; computes the new sibling path", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+
+    contextMenuOn("Main.java");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /rename/i }));
+
+    const input = await screen.findByLabelText("File name");
+    expect(input).toHaveValue("Main.java");
+    await userEvent.clear(input);
+    await userEvent.type(input, "Renamed.java{Enter}");
+
+    await waitFor(() =>
+      expect(mockFsRename).toHaveBeenCalledWith(ROOT, "/repo/src/Main.java", "/repo/src/Renamed.java"),
+    );
+    // The entry's parent dir is refetched.
+    await waitFor(() =>
+      expect(mockReadDirectory).toHaveBeenLastCalledWith("/repo/src", false),
+    );
+  });
+
+  it("Delete flow: confirms before calling fsDelete, then refetches the parent", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());
+
+    contextMenuOn("pom.xml");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /delete/i }));
+
+    // Confirm dialog is up; nothing deleted yet.
+    expect(await screen.findByRole("dialog", { name: /delete pom\.xml/i })).toBeInTheDocument();
+    expect(mockFsDelete).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: /^delete$/i }));
+
+    await waitFor(() => expect(mockFsDelete).toHaveBeenCalledWith(ROOT, "/repo/pom.xml"));
+    await waitFor(() => expect(mockReadDirectory).toHaveBeenLastCalledWith(ROOT, false));
+    expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "success" }));
+  });
+
+  it("Delete cancel leaves the file alone", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());
+
+    contextMenuOn("pom.xml");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /delete/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /cancel/i }));
+
+    expect(mockFsDelete).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("invalid name shows an inline error and never reaches ipc", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    contextMenuOn("src");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /new file/i }));
+    await userEvent.type(await screen.findByLabelText("File name"), "a/b{Enter}");
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(mockFsCreateFile).not.toHaveBeenCalled();
+    // The dialog stays open for correction.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("a failed operation surfaces an error toast", async () => {
+    mockFsDelete.mockRejectedValueOnce(new Error("locked"));
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());
+
+    contextMenuOn("pom.xml");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /delete/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^delete$/i }));
+
+    await waitFor(() =>
+      expect(mockPushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "error" }),
+      ),
+    );
   });
 });

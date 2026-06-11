@@ -5,6 +5,9 @@ import type { DirectoryEntry } from "../lib/types";
 import { fileIcon } from "../lib/fileIcons";
 import { useReviewPrefs } from "../stores/reviewPrefsStore";
 import { FileTreeContextMenu } from "./FileTreeContextMenu";
+import { FileNameDialog } from "./FileNameDialog";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { pushToast } from "./Toasts";
 
 interface Props {
   rootPath: string;
@@ -50,6 +53,14 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
+    path: string;
+    name: string;
+    isDir: boolean;
+  } | null>(null);
+  // The in-flight file operation: which dialog/confirm is open, and for which
+  // entry. Opened from the context menu (which dismisses itself first).
+  const [fileOp, setFileOp] = useState<{
+    kind: "newFile" | "newDir" | "rename" | "delete";
     path: string;
     name: string;
     isDir: boolean;
@@ -100,6 +111,78 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     [children, showIgnored],
   );
 
+  /** Force-refetch one directory in place (stale-while-revalidate). */
+  const refreshDir = useCallback(
+    (dirPath: string) => void fetchChildren(dirPath, { force: true }),
+    [fetchChildren],
+  );
+
+  /** Parent directory of an entry; entries at the top level map to the root. */
+  const parentOf = useCallback(
+    (path: string) => {
+      const idx = path.lastIndexOf("/");
+      const parent = idx > 0 ? path.slice(0, idx) : "";
+      return parent === "" || !path.startsWith(rootPath + "/") ? rootPath : parent;
+    },
+    [rootPath],
+  );
+
+  /** A renamed/deleted row may be the focus target; keep the roving tabindex
+   *  pointed at a rendered row by falling back to the root. */
+  const releaseFocusUnder = useCallback(
+    (path: string) => {
+      setFocusedPath((cur) => (cur === path || cur.startsWith(path + "/") ? rootPath : cur));
+    },
+    [rootPath],
+  );
+
+  const submitFileOp = useCallback(
+    async (name: string) => {
+      if (!fileOp) return;
+      const op = fileOp;
+      setFileOp(null);
+      try {
+        if (op.kind === "newFile") {
+          await ipc.fsCreateFile(rootPath, op.path, name);
+          pushToast({ level: "success", title: "File created", body: name });
+          refreshDir(op.path);
+        } else if (op.kind === "newDir") {
+          await ipc.fsCreateDir(rootPath, op.path, name);
+          pushToast({ level: "success", title: "Folder created", body: name });
+          refreshDir(op.path);
+        } else if (op.kind === "rename") {
+          if (name === op.name) return; // unchanged — quiet no-op
+          const parent = parentOf(op.path);
+          await ipc.fsRename(rootPath, op.path, parent + "/" + name);
+          pushToast({ level: "success", title: "Renamed", body: name });
+          releaseFocusUnder(op.path);
+          refreshDir(parent);
+        }
+      } catch (err) {
+        pushToast({
+          level: "error",
+          title: op.kind === "rename" ? "Rename failed" : "Create failed",
+          body: String(err),
+        });
+      }
+    },
+    [fileOp, rootPath, parentOf, refreshDir, releaseFocusUnder],
+  );
+
+  const confirmDelete = useCallback(async () => {
+    if (!fileOp) return;
+    const op = fileOp;
+    setFileOp(null);
+    try {
+      await ipc.fsDelete(rootPath, op.path);
+      pushToast({ level: "success", title: "Deleted", body: op.name });
+      releaseFocusUnder(op.path);
+      refreshDir(parentOf(op.path));
+    } catch (err) {
+      pushToast({ level: "error", title: "Delete failed", body: String(err) });
+    }
+  }, [fileOp, rootPath, parentOf, refreshDir, releaseFocusUnder]);
+
   const prevRootRef = useRef(rootPath);
   const didInitRef = useRef(false);
 
@@ -123,6 +206,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
       // show-ignored setting — same rule as the initial-mount hydration.
       const sameIgnored = cached !== undefined && cached.showIgnored === showIgnored;
       setMenu(null);
+      setFileOp(null);
       setExpanded(cached ? new Set(cached.expanded) : new Set([rootPath]));
       setChildren(sameIgnored ? cached.children : {});
       setFocusedPath(sameIgnored ? cached.focusedPath : rootPath);
@@ -224,10 +308,42 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
           path={menu.path}
           name={menu.name}
           isDir={menu.isDir}
+          isRoot={menu.path === rootPath}
           rootPath={rootPath}
           x={menu.x}
           y={menu.y}
           onDismiss={() => setMenu(null)}
+          onNewFile={() => setFileOp({ kind: "newFile", path: menu.path, name: menu.name, isDir: menu.isDir })}
+          onNewDir={() => setFileOp({ kind: "newDir", path: menu.path, name: menu.name, isDir: menu.isDir })}
+          onRename={() => setFileOp({ kind: "rename", path: menu.path, name: menu.name, isDir: menu.isDir })}
+          onDelete={() => setFileOp({ kind: "delete", path: menu.path, name: menu.name, isDir: menu.isDir })}
+        />
+      )}
+
+      {fileOp && fileOp.kind !== "delete" && (
+        <FileNameDialog
+          title={
+            fileOp.kind === "newFile" ? "New file" : fileOp.kind === "newDir" ? "New folder" : "Rename"
+          }
+          label={
+            fileOp.kind === "newDir" || (fileOp.kind === "rename" && fileOp.isDir)
+              ? "Folder name"
+              : "File name"
+          }
+          initial={fileOp.kind === "rename" ? fileOp.name : undefined}
+          confirmLabel={fileOp.kind === "rename" ? "Rename" : "Create"}
+          onSubmit={(name) => void submitFileOp(name)}
+          onClose={() => setFileOp(null)}
+        />
+      )}
+
+      {fileOp?.kind === "delete" && (
+        <ConfirmDialog
+          title={`Delete ${fileOp.name}?`}
+          body="This cannot be undone."
+          destructiveLabel="Delete"
+          onConfirm={confirmDelete}
+          onCancel={() => setFileOp(null)}
         />
       )}
     </section>

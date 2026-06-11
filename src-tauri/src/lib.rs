@@ -242,6 +242,11 @@ pub fn run() {
             commands::get_last_commit,
             commands::amend_commit,
             commands::discard_file,
+            // File operations (G6 slice II)
+            commands::fs_rename,
+            commands::fs_create_file,
+            commands::fs_create_dir,
+            commands::fs_delete,
             commands::push_branch,
             commands::fetch_changes,
             commands::pull,
