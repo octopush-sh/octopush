@@ -77,3 +77,25 @@ describe("buildReviewPrompt", () => {
     expect(buildReviewPrompt("DIFF")).toContain("DIFF");
   });
 });
+
+// The schema-call path (G5 follow-up): the backend returns the forced tool's
+// input serialized as raw JSON — parseAiReview must accept it unchanged, and
+// the schema enums must stay in lockstep with the parser's coercion sets so
+// guaranteed-shape responses never trip the coercion fallbacks.
+import { AI_REVIEW_SCHEMA } from "./aiReview";
+
+describe("AI_REVIEW_SCHEMA", () => {
+  it("is a valid object schema requiring summary + findings", () => {
+    expect(AI_REVIEW_SCHEMA.type).toBe("object");
+    expect(AI_REVIEW_SCHEMA.required).toEqual(["summary", "findings"]);
+  });
+  it("enums match the parser's accepted severities and categories", () => {
+    const item = AI_REVIEW_SCHEMA.properties.findings.items.properties;
+    expect([...item.severity.enum]).toEqual(["high", "medium", "low"]);
+    expect([...item.category.enum]).toEqual(["bug", "missing-test", "security", "style", "perf", "other"]);
+    // Round-trip: a schema-shaped finding survives parseAiReview untouched.
+    const finding = { severity: "high", category: "perf", title: "t", detail: "d", file: "a.ts", line: 7 };
+    const parsed = parseAiReview(JSON.stringify({ summary: "s", findings: [finding] }));
+    expect(parsed.findings[0]).toEqual(finding);
+  });
+});

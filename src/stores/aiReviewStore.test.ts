@@ -33,11 +33,12 @@ describe("aiReviewStore", () => {
     expect(r.result?.findings).toHaveLength(1);
     expect(r.diffHash).toBe(diffHash("DIFF"));
   });
-  it("run attributes the spend to the workspace (workspaceId option)", async () => {
+  it("run attributes the spend to the workspace and requests guaranteed-shape JSON", async () => {
     (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
     await useAiReview.getState().run("w1", "DIFF");
     const opts = (ipc.aiComplete as any).mock.calls[0][3];
     expect(opts).toMatchObject({ workspaceId: "w1" });
+    expect(opts.jsonSchema).toMatchObject({ type: "object", required: ["summary", "findings"] });
   });
   it("run sets error on ipc failure", async () => {
     (ipc.aiComplete as any).mockRejectedValue(new Error("no key"));

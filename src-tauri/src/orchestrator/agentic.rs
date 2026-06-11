@@ -53,6 +53,7 @@ pub async fn run_agentic_loop(
             system: system.to_string(),
             messages: messages.clone(),
             tools: tools.clone(),
+            tool_choice: None,
         };
         let resp = provider.complete(api_base, api_key, &req, client).await?;
         out.input_tokens += resp.input_tokens;

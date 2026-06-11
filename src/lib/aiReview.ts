@@ -20,6 +20,36 @@ Respond with ONLY a JSON object, no prose outside it, matching exactly:
 {"summary":"<=160 chars: what the change does + the single biggest risk","findings":[{"severity":"high|medium|low","category":"bug|missing-test|security|style|perf|other","title":"<=80 chars","detail":"1-2 sentences","file":"path exactly as in the diff, or null","line":<new-file line number from the @@ header, or null>}]}
 Use file/line when a finding maps to a specific changed line; use null for changeset-level findings. Order findings by severity (high first). If the change is clean, return an empty findings array with a summary saying so.`;
 
+/** JSON schema for the review result — sent as `jsonSchema` to `ipc.aiComplete`
+ *  so the backend forces a schema'd tool call and the response text is
+ *  guaranteed-shape JSON. `parseAiReview` still runs on it (validation +
+ *  enum coercion) and remains the fallback for prose responses. */
+export const AI_REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "string",
+      description: "<=160 chars: what the change does + the single biggest risk",
+    },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          severity: { type: "string", enum: ["high", "medium", "low"] },
+          category: { type: "string", enum: ["bug", "missing-test", "security", "style", "perf", "other"] },
+          title: { type: "string", description: "<=80 chars" },
+          detail: { type: "string", description: "1-2 sentences" },
+          file: { type: ["string", "null"], description: "path exactly as in the diff, or null" },
+          line: { type: ["number", "null"], description: "new-file line number from the @@ header, or null" },
+        },
+        required: ["severity", "category", "title", "detail", "file", "line"],
+      },
+    },
+  },
+  required: ["summary", "findings"],
+} as const;
+
 export function buildReviewPrompt(gitDiff: string): string {
   return `Here is the unified diff to review:\n\n${gitDiff}`;
 }

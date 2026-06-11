@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { ipc } from "../lib/ipc";
-import { AI_REVIEW_SYSTEM, buildReviewPrompt, parseAiReview, type AiReviewResult } from "../lib/aiReview";
+import { AI_REVIEW_SCHEMA, AI_REVIEW_SYSTEM, buildReviewPrompt, parseAiReview, type AiReviewResult } from "../lib/aiReview";
 
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
@@ -65,6 +65,7 @@ export const useAiReview = create<State>()(
         try {
           const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(gitDiff), {
             workspaceId: ws,
+            jsonSchema: AI_REVIEW_SCHEMA,
           });
           if (get().runGen[ws] !== gen) return; // a newer run superseded this one
           const result = parseAiReview(res.text);

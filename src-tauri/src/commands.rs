@@ -3201,14 +3201,49 @@ pub struct AiCompleteResult {
     pub cost_usd: f64,
 }
 
-/// Pure request builder — one user/text message, no tools. Unit-testable.
-pub fn build_ai_request(model: &str, system: String, prompt: String, max_tokens: u32) -> LlmRequest {
+/// Name of the forced tool used for guaranteed-shape (JSON-schema) output.
+pub(crate) const AI_RESULT_TOOL: &str = "emit_result";
+
+/// Pure request builder — one user/text message. With `json_schema` the
+/// request carries a single forced tool whose input IS the schema, so the
+/// provider returns guaranteed-shape JSON instead of prose to scrape.
+/// Unit-testable.
+pub fn build_ai_request(
+    model: &str,
+    system: String,
+    prompt: String,
+    max_tokens: u32,
+    json_schema: Option<serde_json::Value>,
+) -> LlmRequest {
+    let (tools, tool_choice) = match json_schema {
+        Some(schema) => (
+            vec![crate::providers::LlmTool {
+                name: AI_RESULT_TOOL.to_string(),
+                description: "Return the final result. Call this tool exactly once with the complete answer.".to_string(),
+                input_schema: schema,
+            }],
+            Some(AI_RESULT_TOOL.to_string()),
+        ),
+        None => (vec![], None),
+    };
     LlmRequest {
         model: model.to_string(),
         max_tokens,
         system,
         messages: vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(prompt) }],
-        tools: vec![],
+        tools,
+        tool_choice,
+    }
+}
+
+/// Pick the caller-visible text out of an LLM response: a forced-tool call
+/// yields its input serialized as JSON (the guaranteed-shape path); anything
+/// else falls back to the prose text, which callers may still scrape.
+/// Unit-testable.
+pub(crate) fn ai_response_text(resp: crate::providers::LlmResponse) -> String {
+    match resp.tool_uses.into_iter().next() {
+        Some(u) => u.input.to_string(),
+        None => resp.text,
     }
 }
 
@@ -3251,7 +3286,9 @@ pub(crate) fn ai_token_event(
 /// Generic one-shot model call — the shared G5 AI primitive. Returns text +
 /// token counts + computed cost, and records the usage to `token_events`
 /// (attributed to `workspace_id` when given) so Usage dashboards see
-/// AI-review / draft / conflict spend.
+/// AI-review / draft / conflict spend. With `json_schema` the model is
+/// forced through a schema'd tool call, so `text` is guaranteed-shape JSON
+/// (callers keep their prose-scrape parser as a fallback).
 #[tauri::command]
 pub async fn ai_complete(
     state: State<'_, AppState>,
@@ -3260,9 +3297,10 @@ pub async fn ai_complete(
     prompt: String,
     max_tokens: Option<u32>,
     workspace_id: Option<String>,
+    json_schema: Option<serde_json::Value>,
 ) -> AppResult<AiCompleteResult> {
     let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&model)?;
-    let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192));
+    let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192), json_schema);
     let client = crate::chat_engine::shared_http_client();
     let resp = provider.complete(&api_base, api_key.as_deref(), &req, client).await?;
     ensure_not_truncated(&resp.stop_reason)?;
@@ -3279,10 +3317,11 @@ pub async fn ai_complete(
             tracing::warn!(error = %e, "failed to record ai_complete token event");
         }
     }
+    let (input_tokens, output_tokens) = (resp.input_tokens, resp.output_tokens);
     Ok(AiCompleteResult {
-        text: resp.text,
-        input_tokens: resp.input_tokens,
-        output_tokens: resp.output_tokens,
+        text: ai_response_text(resp),
+        input_tokens,
+        output_tokens,
         cost_usd: cost,
     })
 }
@@ -3542,17 +3581,64 @@ mod ai_complete_tests {
 
     #[test]
     fn build_ai_request_makes_one_user_text_message_no_tools() {
-        let req = super::build_ai_request("claude-sonnet-4-6", "SYS".into(), "PROMPT".into(), 8192);
+        let req = super::build_ai_request("claude-sonnet-4-6", "SYS".into(), "PROMPT".into(), 8192, None);
         assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, 8192);
         assert_eq!(req.system, "SYS");
         assert_eq!(req.tools.len(), 0);
+        assert_eq!(req.tool_choice, None);
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, LlmRole::User);
         match &req.messages[0].content {
             LlmContent::Text(t) => assert_eq!(t, "PROMPT"),
             _ => panic!("expected Text content"),
         }
+    }
+
+    #[test]
+    fn build_ai_request_with_schema_forces_the_emit_result_tool() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" } },
+            "required": ["summary"]
+        });
+        let req = super::build_ai_request("m", "SYS".into(), "PROMPT".into(), 100, Some(schema.clone()));
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, super::AI_RESULT_TOOL);
+        assert_eq!(req.tools[0].input_schema, schema);
+        assert_eq!(req.tool_choice.as_deref(), Some(super::AI_RESULT_TOOL));
+    }
+
+    #[test]
+    fn ai_response_text_prefers_the_tool_input_then_falls_back_to_prose() {
+        use crate::providers::{LlmResponse, LlmStopReason, LlmToolUse};
+        let structured = LlmResponse {
+            text: "ignored preamble".into(),
+            tool_uses: vec![LlmToolUse {
+                id: "tu_1".into(),
+                name: super::AI_RESULT_TOOL.into(),
+                input: serde_json::json!({ "summary": "ok", "findings": [] }),
+            }],
+            stop_reason: LlmStopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let text = super::ai_response_text(structured);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["summary"], "ok");
+
+        let prose = LlmResponse {
+            text: "plain answer".into(),
+            tool_uses: vec![],
+            stop_reason: LlmStopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert_eq!(super::ai_response_text(prose), "plain answer");
     }
 
     #[test]

@@ -636,6 +636,9 @@ export const ipc = {
       maxTokens?: number;
       /** Attributes the spend to this workspace in Usage dashboards. */
       workspaceId?: string;
+      /** Forces a schema'd tool call — the returned `text` is then
+       *  guaranteed-shape JSON matching this schema. */
+      jsonSchema?: unknown;
     },
   ) =>
     invoke<{ text: string; inputTokens: number; outputTokens: number; costUsd: number }>(
@@ -646,6 +649,7 @@ export const ipc = {
         prompt,
         maxTokens: opts?.maxTokens ?? null,
         workspaceId: opts?.workspaceId ?? null,
+        jsonSchema: opts?.jsonSchema ?? null,
       },
     ),
 };

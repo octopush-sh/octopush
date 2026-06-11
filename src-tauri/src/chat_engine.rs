@@ -453,6 +453,7 @@ impl ChatEngine {
                 system: system_prompt.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
+                tool_choice: None,
             };
 
             let response = match provider
