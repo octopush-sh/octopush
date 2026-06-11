@@ -1,6 +1,6 @@
-import { createPortal } from "react-dom";
 import { Copy, ExternalLink, FilePlus, FolderOpen, FolderPlus, Pencil, SquareTerminal, Trash2 } from "lucide-react";
-import { useMenuChrome } from "../lib/useMenuChrome";
+import { MenuSurface } from "./MenuSurface";
+import { MENU_DANGER, MENU_HEADER, MENU_ITEM, MENU_SEP } from "../lib/menuStyles";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
 
@@ -28,12 +28,9 @@ interface Props {
   onDelete: () => void;
 }
 
-const ITEM =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
-// Same DANGER treatment as ProjectContextMenu — rouge text, rouge-ghost hover.
-const DANGER =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-rouge transition hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge";
-const SEP = "h-px bg-octo-hairline";
+const ITEM = MENU_ITEM;
+const DANGER = MENU_DANGER;
+const SEP = MENU_SEP;
 
 function relativePath(abs: string, root: string): string {
   if (abs === root) return ".";
@@ -42,9 +39,8 @@ function relativePath(abs: string, root: string): string {
 }
 
 /**
- * Context menu for companion file-tree rows. Rendered via a portal to
- * document.body with fixed positioning so it escapes the tree's
- * overflow-y-auto scroll container (same lesson as the ModelPicker dropdown).
+ * Context menu for companion file-tree rows. MenuSurface's portal+fixed
+ * chrome lets it escape the tree's overflow-y-auto scroll container.
  */
 export function FileTreeContextMenu({
   path,
@@ -60,8 +56,6 @@ export function FileTreeContextMenu({
   onRename,
   onDelete,
 }: Props) {
-  const { ref, pos } = useMenuChrome(x, y, onDismiss);
-
   const run = (fn: () => void) => () => {
     fn();
     onDismiss();
@@ -74,15 +68,9 @@ export function FileTreeContextMenu({
     );
   };
 
-  return createPortal(
-    <div
-      ref={ref}
-      role="menu"
-      aria-label={`Actions for ${name}`}
-      className="octo-menu-enter fixed z-[60] w-[224px] rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
-      style={{ left: pos.left, top: pos.top, transformOrigin: "top left" }}
-    >
-      <div className="truncate px-3 pb-1 pt-1 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+  return (
+    <MenuSurface x={x} y={y} ariaLabel={`Actions for ${name}`} onDismiss={onDismiss}>
+      <div className={MENU_HEADER}>
         {name}
       </div>
 
@@ -181,7 +169,6 @@ export function FileTreeContextMenu({
           </button>
         </>
       )}
-    </div>,
-    document.body,
+    </MenuSurface>
   );
 }

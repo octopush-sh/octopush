@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { Check, GitBranch } from "lucide-react";
-import { useMenuChrome } from "../lib/useMenuChrome";
+import { MenuSurface } from "./MenuSurface";
 
 /** Above this many branches the menu pins a filter input at the top. */
 const FILTER_THRESHOLD = 8;
@@ -23,8 +22,8 @@ const LABEL =
 /**
  * Quiet inline control for the workspace creator's branch preview row:
  * shows the base branch the new workspace will start from and, on click,
- * opens the house portal+fixed menu (FileTreeContextMenu chrome) to pick
- * any local branch. With no branches to offer it degrades to a static label.
+ * opens the house menu (MenuSurface chrome) to pick any local branch.
+ * With no branches to offer it degrades to a static label.
  */
 export function BaseBranchPicker({ branches, remoteBranches = [], value, onSelect }: Props) {
   const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
@@ -92,7 +91,6 @@ function BranchMenu({
   onSelect: (branch: string) => void;
   onDismiss: () => void;
 }) {
-  const { ref, pos } = useMenuChrome(x, y, onDismiss);
   const [query, setQuery] = useState("");
   const filterable = branches.length + remoteBranches.length > FILTER_THRESHOLD;
   const q = query.trim().toLowerCase();
@@ -100,9 +98,9 @@ function BranchMenu({
   const visible = q ? branches.filter(matches) : branches;
   const visibleRemote = q ? remoteBranches.filter(matches) : remoteBranches;
 
-  // useMenuChrome focuses the first menuitem on open; when the filter input
-  // exists it must win instead. This layout effect is registered after the
-  // hook's, so it runs after it and reclaims focus for the input.
+  // MenuSurface (useMenuChrome) focuses the first menuitem on open; when the
+  // filter input exists it must win instead. MenuSurface is a child component,
+  // so its layout effect runs before this one — this reclaims focus last.
   const inputRef = useRef<HTMLInputElement>(null);
   useLayoutEffect(() => {
     inputRef.current?.focus();
@@ -117,14 +115,8 @@ function BranchMenu({
       ?.scrollIntoView?.({ block: "nearest" });
   }, []);
 
-  return createPortal(
-    <div
-      ref={ref}
-      role="menu"
-      aria-label="Choose base branch"
-      className="octo-menu-enter fixed z-[60] w-[224px] rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
-      style={{ left: pos.left, top: pos.top, transformOrigin: "top left" }}
-    >
+  return (
+    <MenuSurface x={x} y={y} ariaLabel="Choose base branch" onDismiss={onDismiss}>
       {filterable && (
         <div className="border-b border-octo-hairline px-3 pb-1.5 pt-0.5">
           <input
@@ -166,8 +158,7 @@ function BranchMenu({
           </div>
         )}
       </div>
-    </div>,
-    document.body,
+    </MenuSurface>
   );
 }
 
