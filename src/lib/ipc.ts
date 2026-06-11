@@ -192,6 +192,7 @@ import type {
   ModelSuggestion,
   ModelWithProvider,
   Pr,
+  PrInfo,
   PerfStats,
   ProjectInfo,
   ProviderConfig,
@@ -591,6 +592,16 @@ export const ipc = {
 
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
+
+  /** Open pull requests for the project, for "start a workspace from a PR".
+   *  Rejects with a friendly message when the GitHub CLI is missing or not
+   *  authenticated — the UI maps any failure to a quiet empty state. */
+  listPrs: (path: string) => invoke<PrInfo[]>("list_prs", { path }),
+
+  /** Fetch a PR's head ref as a local branch (no-op if it already exists),
+   *  so it can serve as the base of a new workspace. */
+  ensurePrBranch: (path: string, number: number, headRefName: string) =>
+    invoke<void>("ensure_pr_branch", { path, number, headRefName }),
 
   // ─── Test runner ──────────────────────────────────────────────
   runTestCommand: (workspacePath: string, command: string) =>

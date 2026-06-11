@@ -274,6 +274,8 @@ pub fn run() {
             commands::list_tags,
             commands::find_pr_for_branch,
             commands::open_prs_for_project,
+            commands::list_prs,
+            commands::ensure_pr_branch,
             // Workspace-wide file & text search
             commands::list_workspace_files,
             commands::search_workspace_text,

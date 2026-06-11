@@ -2613,6 +2613,80 @@ pub(crate) fn parse_open_pr_list(values: &[serde_json::Value]) -> Vec<BranchPr> 
         .collect()
 }
 
+/// List open pull requests for the repo at `path`, for the workspace
+/// creator's "start from a pull request" menu. Runs `gh pr list` in the
+/// user's login shell (same pattern as `try_gh_cli`) so PATH and keychain
+/// credentials behave like in a terminal.
+///
+/// `gh` missing, unauthenticated, or pointed at a non-GitHub remote all
+/// surface as a friendly error — the UI maps any failure to a quiet
+/// "GitHub CLI not available" empty state.
+#[tauri::command]
+pub async fn list_prs(path: String) -> AppResult<Vec<crate::github::PrInfo>> {
+    let path = expand_tilde(&path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c")
+        .arg("gh pr list --json number,title,headRefName,author --limit 30")
+        .current_dir(&path)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.trim().chars().take(200).collect();
+        return Err(AppError::Other(format!("GitHub CLI not available: {snippet}")));
+    }
+
+    crate::github::pr_infos_from_json(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
+}
+
+/// Make a PR's head ref available as a local branch so it can serve as a
+/// workspace base. No-op when the branch already exists locally; otherwise
+/// `git fetch origin pull/<n>/head:<headRefName>` in the login shell (works
+/// for same-repo and fork PRs alike — GitHub exposes every PR head under
+/// `pull/<n>/head` regardless of where the branch lives).
+#[tauri::command]
+pub async fn ensure_pr_branch(
+    path: String,
+    number: u64,
+    head_ref_name: String,
+) -> AppResult<()> {
+    let path = expand_tilde(&path);
+
+    // Already fetched (or it's a same-repo branch the user has locally)?
+    // Scoped so the !Send `Repository` handle drops before any await.
+    {
+        if let Ok(repo) = crate::git_ops::open_repo(std::path::Path::new(&path)) {
+            if repo
+                .find_reference(&format!("refs/heads/{head_ref_name}"))
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    let _guard = crate::git_lock::git_lock(&path).await;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = crate::github::pr_fetch_command(number, &head_ref_name);
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git fetch: {e}")))?;
+
+    if !output.status.success() {
+        let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(AppError::Other(format!(
+            "fetching the head of PR #{number} failed: {combined}"
+        )));
+    }
+    Ok(())
+}
+
 /// Ask the `gh` CLI for the most recent PR on `branch` (any state). Returns
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave

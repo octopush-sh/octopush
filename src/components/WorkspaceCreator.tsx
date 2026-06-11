@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
-import { ChevronLeft } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronLeft, X } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
+import { PrPicker } from "./PrPicker";
+import type { PrInfo } from "../lib/types";
 import { BrassRule } from "./BrassRule";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
@@ -54,8 +56,37 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   const [base, setBase] = useState<string | null>(null);
   /** Explicit branch name typed by the user. null = follow the task slug. */
   const [branchOverride, setBranchOverride] = useState<string | null>(null);
+  /** The pull request this workspace starts from, if any (drives the chip). */
+  const [fromPr, setFromPr] = useState<PrInfo | null>(null);
+  const [prError, setPrError] = useState<string | null>(null);
+  /** Base in effect before a PR retargeted it — restored when the chip clears. */
+  const prevBaseRef = useRef<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
+
+  async function handlePickPr(pr: PrInfo) {
+    setPrError(null);
+    try {
+      await ipc.ensurePrBranch(projectPath, pr.number, pr.headRefName);
+    } catch (e) {
+      setPrError(String(e));
+      return;
+    }
+    // Remember the base only on the first pick — switching between PRs
+    // should still restore the original (default) base on clear.
+    if (fromPr === null) prevBaseRef.current = base;
+    setBase(pr.headRefName);
+    // The head ref now exists locally — offer it in the picker too.
+    setBranches((cur) => (cur.includes(pr.headRefName) ? cur : [...cur, pr.headRefName]));
+    setTask((cur) => (cur.trim() ? cur : pr.title));
+    setFromPr(pr);
+  }
+
+  function clearPr() {
+    setFromPr(null);
+    setPrError(null);
+    setBase(prevBaseRef.current ?? branches[0] ?? null);
+  }
 
   // Load local branches for the base picker. The repo default comes first.
   // On failure the picker degrades to a static label and creation still
@@ -213,7 +244,26 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                   value={base}
                   onSelect={setBase}
                 />
+                <PrPicker projectPath={projectPath} onPick={handlePickPr} />
+                {fromPr && (
+                  <span className="octo-rise-in inline-flex items-center gap-1.5 rounded-sm border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] normal-case tracking-[0.15em] text-octo-mute">
+                    from PR #{fromPr.number}
+                    <button
+                      type="button"
+                      title="Clear pull request base"
+                      onClick={clearPr}
+                      className="inline-flex items-center rounded-sm transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                    >
+                      <X size={9} />
+                    </button>
+                  </span>
+                )}
               </div>
+              {prError && (
+                <div className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-rouge">
+                  Could not fetch the pull request branch: {prError}
+                </div>
+              )}
               {branchCollides && (
                 <div className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-rouge">
                   Branch exists — the workspace will reuse it

@@ -12,6 +12,8 @@ vi.mock("../lib/ipc", () => ({
     updateWorkspaceLink: vi.fn().mockResolvedValue(undefined),
     createWorkspace: vi.fn(),
     listBranches: vi.fn(),
+    listPrs: vi.fn(),
+    ensurePrBranch: vi.fn(),
   },
 }));
 
@@ -320,6 +322,128 @@ describe("WorkspaceCreator", () => {
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][4]).toBe("main");
+    });
+  });
+
+  describe("start from a pull request", () => {
+    const PR_BUTTON = "Start from a pull request";
+    const CHIP_CLEAR = "Clear pull request base";
+    const mockPrs = [
+      { number: 42, title: "Add dark mode everywhere", headRefName: "feat/dark-mode", author: "octocat" },
+      { number: 7, title: "Fix checkout bug", headRefName: "fix/checkout", author: null },
+    ];
+
+    function renderCreator(props: { initialTask?: string } = {}) {
+      const onCreated = vi.fn();
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          {...props}
+        />
+      );
+      return onCreated;
+    }
+
+    beforeEach(() => {
+      vi.mocked(ipcModule.ipc.listPrs).mockResolvedValue(mockPrs);
+      vi.mocked(ipcModule.ipc.ensurePrBranch).mockResolvedValue(undefined);
+    });
+
+    it("opens a menu listing PRs with number, title, and author", async () => {
+      renderCreator();
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      const row = await screen.findByRole("menuitem", { name: /#42/ });
+      expect(row.textContent).toContain("Add dark mode everywhere");
+      expect(row.textContent).toContain("octocat");
+      expect(screen.getByRole("menuitem", { name: /#7/ })).toBeInTheDocument();
+      expect(vi.mocked(ipcModule.ipc.listPrs)).toHaveBeenCalledWith("/home/user/proj");
+    });
+
+    it("picking a PR fetches its head, sets the base, prefills an empty task, and shows the chip", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator(); // no initialTask — empty
+
+      await screen.findByTitle(/^Base branch: main/);
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      fireEvent.click(await screen.findByRole("menuitem", { name: /#42/ }));
+
+      await waitFor(() => {
+        expect(vi.mocked(ipcModule.ipc.ensurePrBranch)).toHaveBeenCalledWith(
+          "/home/user/proj",
+          42,
+          "feat/dark-mode"
+        );
+      });
+      // Task prefilled with the PR title.
+      const taskInput = screen.getByPlaceholderText(/e\.g\. Add dark mode/i) as HTMLInputElement;
+      expect(taskInput.value).toBe("Add dark mode everywhere");
+      // Base now points at the PR head.
+      expect(screen.getByTitle(/^Base branch: feat\/dark-mode/)).toBeInTheDocument();
+      // The chip is visible.
+      expect(screen.getByText(/from PR #42/)).toBeInTheDocument();
+
+      // Create proceeds through the normal path with the PR head as base.
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(await screen.findByText("Begin"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][5]).toBe("feat/dark-mode");
+    });
+
+    it("does not overwrite a task the user already typed", async () => {
+      renderCreator({ initialTask: "Keep my words" });
+      await screen.findByTitle(/^Base branch: main/);
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      fireEvent.click(await screen.findByRole("menuitem", { name: /#42/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/from PR #42/)).toBeInTheDocument();
+      });
+      const taskInput = screen.getByPlaceholderText(/e\.g\. Add dark mode/i) as HTMLInputElement;
+      expect(taskInput.value).toBe("Keep my words");
+    });
+
+    it("clearing the chip restores the previous base", async () => {
+      renderCreator();
+      await screen.findByTitle(/^Base branch: main/);
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      fireEvent.click(await screen.findByRole("menuitem", { name: /#42/ }));
+      await screen.findByText(/from PR #42/);
+      expect(screen.getByTitle(/^Base branch: feat\/dark-mode/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTitle(CHIP_CLEAR));
+      expect(screen.queryByText(/from PR #42/)).toBeNull();
+      expect(screen.getByTitle(/^Base branch: main/)).toBeInTheDocument();
+    });
+
+    it("shows a quiet empty state when the GitHub CLI is unavailable", async () => {
+      vi.mocked(ipcModule.ipc.listPrs).mockRejectedValue(new Error("GitHub CLI not available"));
+      renderCreator();
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      expect(await screen.findByText("GitHub CLI not available")).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem")).toBeNull();
+    });
+
+    it("shows a quiet empty state when there are no open PRs", async () => {
+      vi.mocked(ipcModule.ipc.listPrs).mockResolvedValue([]);
+      renderCreator();
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      expect(await screen.findByText("No open pull requests")).toBeInTheDocument();
+    });
+
+    it("a failed head fetch surfaces a quiet error and leaves base and chip untouched", async () => {
+      vi.mocked(ipcModule.ipc.ensurePrBranch).mockRejectedValue(new Error("network down"));
+      renderCreator();
+      await screen.findByTitle(/^Base branch: main/);
+      fireEvent.click(screen.getByTitle(PR_BUTTON));
+      fireEvent.click(await screen.findByRole("menuitem", { name: /#42/ }));
+
+      await screen.findByText(/Could not fetch the pull request branch/);
+      expect(screen.queryByText(/from PR #42/)).toBeNull();
+      expect(screen.getByTitle(/^Base branch: main/)).toBeInTheDocument();
     });
   });
 

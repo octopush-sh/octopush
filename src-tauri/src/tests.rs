@@ -4542,3 +4542,98 @@ mod ai_token_event_tests {
         assert!(report.total_cost_usd > 0.0);
     }
 }
+
+#[cfg(test)]
+mod workspace_from_pr_tests {
+    use crate::github::{pr_fetch_command, pr_infos_from_json};
+
+    #[test]
+    fn parses_a_gh_pr_list_fixture() {
+        // Shape of `gh pr list --json number,title,headRefName,author`:
+        // author is an object with a `login` (and may be absent entirely).
+        let raw = r#"[
+            {"number": 42, "title": "Add dark mode", "headRefName": "feat/dark-mode",
+             "author": {"id": "U_1", "is_bot": false, "login": "octocat", "name": "The Octocat"}},
+            {"number": 7, "title": "Fix checkout bug", "headRefName": "fix/checkout"}
+        ]"#;
+        let prs = pr_infos_from_json(raw).unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].title, "Add dark mode");
+        assert_eq!(prs[0].head_ref_name, "feat/dark-mode");
+        assert_eq!(prs[0].author.as_deref(), Some("octocat"));
+        assert_eq!(prs[1].number, 7);
+        assert_eq!(prs[1].author, None);
+    }
+
+    #[test]
+    fn skips_rows_missing_number_or_head_ref() {
+        let raw = r#"[
+            {"title": "no number", "headRefName": "x"},
+            {"number": 3, "title": "no head"},
+            {"number": 4, "title": "ok", "headRefName": "feat/ok"}
+        ]"#;
+        let prs = pr_infos_from_json(raw).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 4);
+    }
+
+    #[test]
+    fn non_json_gh_output_is_an_error() {
+        // e.g. `gh` printing auth guidance to stdout.
+        assert!(pr_infos_from_json("To get started with GitHub CLI, run: gh auth login").is_err());
+        assert!(pr_infos_from_json("").is_err());
+    }
+
+    #[test]
+    fn pr_info_serializes_camel_case_for_the_frontend() {
+        let prs = pr_infos_from_json(
+            r#"[{"number": 1, "title": "t", "headRefName": "feat/a", "author": {"login": "me"}}]"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&prs[0]).unwrap();
+        assert_eq!(json["headRefName"], "feat/a");
+        assert_eq!(json["author"], "me");
+    }
+
+    #[test]
+    fn fetch_command_targets_the_pr_head_ref() {
+        assert_eq!(
+            pr_fetch_command(42, "feat/dark-mode"),
+            "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
+        );
+    }
+
+    #[test]
+    fn fetch_command_escapes_single_quotes_in_the_branch() {
+        assert_eq!(
+            pr_fetch_command(1, "weird'name"),
+            "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
+        );
+    }
+
+    #[test]
+    fn ensure_pr_branch_skips_the_fetch_when_the_branch_exists_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let base = crate::git_ops::default_branch(dir.path()).unwrap().unwrap();
+        crate::git_ops::create_branch(dir.path(), "feat/already-here", &base).unwrap();
+
+        // No `origin` remote exists, so a real fetch would fail — succeeding
+        // proves the local-branch short-circuit kicked in.
+        tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            "feat/already-here".into(),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn pr_commands_are_registered_in_the_invoke_handler() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("commands::list_prs"));
+        assert!(lib.contains("commands::ensure_pr_branch"));
+    }
+}

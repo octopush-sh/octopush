@@ -269,6 +269,17 @@ export interface Pr {
 /** @deprecated Use `Pr` instead. */
 export type OpenPr = Pr;
 
+/** A pull request candidate for "start a workspace from a PR"
+ *  (from `list_prs`, backed by the GitHub CLI). */
+export interface PrInfo {
+  number: number;
+  title: string;
+  /** The PR's head branch name — becomes the workspace base after fetching. */
+  headRefName: string;
+  /** Author login; null for deleted accounts or when gh omits it. */
+  author: string | null;
+}
+
 /** A branch and its open PR, from open_prs_for_project (rail PR indicator). */
 export interface BranchPr {
   branch: string;
