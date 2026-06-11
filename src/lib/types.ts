@@ -228,6 +228,8 @@ export interface GitStatus {
   conflicted: number;
   /** False when ahead/behind timed out (huge graph); UI hides the ↑/↓ badge. */
   aheadBehindKnown: boolean;
+  /** The in-progress multi-step operation, if any. */
+  operation: "merge" | "rebase" | null;
 }
 
 export interface FileChange {

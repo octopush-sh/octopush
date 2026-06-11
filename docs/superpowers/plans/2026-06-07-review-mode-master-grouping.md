@@ -80,7 +80,7 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **Review debt (optional, non-blocking):** extract a shared `git_commit_via_login_shell` helper (`amend_commit` duplicates `commit_changes`); a single shared `DEFAULT_MODEL` constant (the `"claude-sonnet-4-6"` literal is repeated in aiReviewStore/chatStore/ChangesPanel); symlink-hardening of `discard_file_inner`'s containment guard.
 
 **From G7 slice 1 (deferred — slices II–V):**
-- **Slice II — Conflict resolution** (the user's terminal pain): per-file ours/theirs/edit, mark-resolved, continue/abort, AI resolution (reuses `ipc.aiComplete`). Builds on the `conflicted` detection G7-s1 shipped. The G7-s1 conflict banner currently points users to the terminal — Slice II replaces that.
+- **Slice II — Conflict resolution: SHIPPED 2026-06-11** (feat/review-g7-conflicts): take ours/theirs (rebase-aware UPSTREAM/MINE labels), mark-resolved, continue/abort with outcome classification, AI resolution with preview. Follow-ups from its review: graceful exit animation when the conflict section unmounts (op completes); refresh open editor buffers after resolve/take/abort (G2 mtime seam — a conflicted file open in the editor goes stale after an AI apply; a blind Cmd+S would overwrite the resolution).
 - **Slice III — Inspect:** log/history browser; per-line blame gutter.
 - **Slice IV — Branch & stash:** branch list/switch/create; stash push/pop/list.
 - **Slice V — Advanced:** reset (soft/mixed/hard, guarded); clean untracked; cherry-pick; tags.

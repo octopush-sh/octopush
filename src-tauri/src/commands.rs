@@ -2370,6 +2370,118 @@ pub async fn unstage_file(workspace_path: String, file_path: String) -> AppResul
     Ok(())
 }
 
+// ─── Conflict resolution (G7 slice II) ────────────────────────────
+
+/// Resolve a conflicted file by taking one side wholesale:
+/// `git checkout --ours|--theirs -- <file>` then `git add -- <file>`.
+/// The git_lock is held across BOTH steps so no other mutating command can
+/// interleave between the checkout and the add.
+#[tauri::command]
+pub async fn resolve_conflict_take(
+    workspace_path: String,
+    file: String,
+    side: String,
+) -> AppResult<()> {
+    let flag = match side.as_str() {
+        "ours" => "--ours",
+        "theirs" => "--theirs",
+        other => return Err(AppError::Other(format!(
+            "invalid side '{other}' — expected \"ours\" or \"theirs\""
+        ))),
+    };
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", flag, "--"])
+        .arg(&file)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git checkout: {e}")))?;
+    if !output.status.success() {
+        // e.g. delete/modify conflict where the chosen side has no version.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(friendly_git_error(&stderr)));
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["add", "--"])
+        .arg(&file)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git add: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(friendly_git_error(&stderr)));
+    }
+    Ok(())
+}
+
+/// Mark a hand-merged (or AI-merged) file as resolved: `git add -- <file>`
+/// clears the unmerged index state.
+#[tauri::command]
+pub async fn mark_conflict_resolved(workspace_path: String, file: String) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    let output = std::process::Command::new("git")
+        .args(["add", "--"])
+        .arg(&file)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git add: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(friendly_git_error(&stderr)));
+    }
+    Ok(())
+}
+
+/// Continue the in-progress merge/rebase once conflicts are staged. Runs via
+/// the user's login shell (gitconfig identity, signing) with
+/// `-c core.editor=true` so git never opens an interactive editor for the
+/// merge/rebase commit message. MoreConflicts = a later rebase step conflicted.
+#[tauri::command]
+pub async fn continue_operation(workspace_path: String) -> AppResult<crate::git_ops::ContinueOutcome> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    let op = crate::git_ops::operation_state(std::path::Path::new(&workspace_path))?
+        .ok_or_else(|| AppError::Other("no merge or rebase in progress".into()))?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("git -c core.editor=true {op} --continue 2>&1");
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git {op} --continue: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let kind = crate::git_ops::classify_continue(output.status.success(), &combined);
+    Ok(crate::git_ops::ContinueOutcome { kind, output: combined })
+}
+
+/// Abort the in-progress merge/rebase, restoring the pre-operation state.
+/// Returns the trimmed combined output.
+#[tauri::command]
+pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    let op = crate::git_ops::operation_state(std::path::Path::new(&workspace_path))?
+        .ok_or_else(|| AppError::Other("no merge or rebase in progress".into()))?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("git {op} --abort 2>&1");
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&workspace_path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git {op} --abort: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(format!("git {op} --abort failed: {combined}")));
+    }
+    Ok(combined)
+}
+
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.

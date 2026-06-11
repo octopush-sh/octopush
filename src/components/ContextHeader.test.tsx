@@ -99,7 +99,7 @@ describe("ContextHeader", () => {
           ],
           ahead: 0,
           behind: 0, hasUpstream: false,
-          conflicted: 0, aheadBehindKnown: true,
+          conflicted: 0, aheadBehindKnown: true, operation: null,
         }}
       />,
     );
@@ -112,7 +112,7 @@ describe("ContextHeader", () => {
         {...baseProps}
         workspaceName="X"
         branch="main"
-        gitStatus={{ branch: "main", changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true }}
+        gitStatus={{ branch: "main", changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true, operation: null }}
       />,
     );
     expect(screen.queryByText(/unstaged/)).not.toBeInTheDocument();

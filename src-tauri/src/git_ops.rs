@@ -21,6 +21,9 @@ pub struct GitStatus {
     /// False when ahead/behind couldn't be computed in time (huge-graph timeout);
     /// the UI hides the ↑/↓ badge rather than showing a misleading 0.
     pub ahead_behind_known: bool,
+    /// The in-progress multi-step operation, if any: "merge" or "rebase".
+    /// None when the repo is in its normal state.
+    pub operation: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -44,6 +47,28 @@ pub struct PullOutcome { pub kind: PullKind, pub output: String }
 #[serde(rename_all = "camelCase")]
 pub enum PullKind { Ok, Diverged, Conflict, Error }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueOutcome { pub kind: ContinueKind, pub output: String }
+
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum ContinueKind { Ok, MoreConflicts, Error }
+
+/// Classify a `git merge|rebase --continue` result from its exit success +
+/// combined output. Pure. MoreConflicts = the next step of a multi-commit
+/// rebase hit conflicts (the resolution section should persist).
+pub fn classify_continue(success: bool, combined: &str) -> ContinueKind {
+    let s = combined.to_lowercase();
+    if success {
+        ContinueKind::Ok
+    } else if s.contains("conflict") || s.contains("could not apply") {
+        ContinueKind::MoreConflicts
+    } else {
+        ContinueKind::Error
+    }
+}
+
 /// Classify a `git pull` result from its exit success + combined output. Pure.
 pub fn classify_pull(success: bool, combined: &str) -> PullKind {
     let s = combined.to_lowercase();
@@ -56,6 +81,25 @@ pub fn classify_pull(success: bool, combined: &str) -> PullKind {
     } else {
         PullKind::Error
     }
+}
+
+/// Map a libgit2 repository state to the operation name the UI cares about.
+fn state_to_operation(state: git2::RepositoryState) -> Option<&'static str> {
+    match state {
+        git2::RepositoryState::Merge => Some("merge"),
+        git2::RepositoryState::Rebase
+        | git2::RepositoryState::RebaseInteractive
+        | git2::RepositoryState::RebaseMerge => Some("rebase"),
+        _ => None,
+    }
+}
+
+/// The in-progress multi-step operation ("merge" or "rebase"), if any.
+/// Cheap: `repo.state()` is a flag read (checks for MERGE_HEAD / rebase
+/// directories) — no graph walk.
+pub fn operation_state(path: &Path) -> AppResult<Option<&'static str>> {
+    let repo = open_repo(path)?;
+    Ok(state_to_operation(repo.state()))
 }
 
 pub fn init_repo(path: &Path) -> AppResult<()> {
@@ -244,9 +288,10 @@ pub fn status_files(path: &Path) -> AppResult<GitStatus> {
         .and_then(|name| repo.find_branch(&name, git2::BranchType::Local).ok())
         .map(|b| b.upstream().is_ok())
         .unwrap_or(false);
+    let operation = state_to_operation(repo.state()).map(String::from);
     Ok(GitStatus {
         branch, changed_files, ahead: 0, behind: 0, has_upstream, conflicted,
-        ahead_behind_known: false,
+        ahead_behind_known: false, operation,
     })
 }
 
@@ -656,5 +701,25 @@ mod tests {
         assert_eq!(classify_pull(false, "CONFLICT (content): Merge conflict in a.txt"), PullKind::Conflict);
         assert_eq!(classify_pull(false, "error: Automatic merge failed"), PullKind::Conflict);
         assert_eq!(classify_pull(false, "fatal: couldn't find remote ref"), PullKind::Error);
+    }
+
+    #[test]
+    fn classify_continue_distinguishes_outcomes() {
+        use super::{classify_continue, ContinueKind};
+        assert_eq!(classify_continue(true, "[main 1a2b3c4] merge side"), ContinueKind::Ok);
+        assert_eq!(classify_continue(true, ""), ContinueKind::Ok);
+        assert_eq!(
+            classify_continue(false, "CONFLICT (content): Merge conflict in a.txt"),
+            ContinueKind::MoreConflicts,
+        );
+        assert_eq!(
+            classify_continue(false, "error: could not apply f00ba4... next commit"),
+            ContinueKind::MoreConflicts,
+        );
+        assert_eq!(
+            classify_continue(false, "error: Committing is not possible because you have unmerged files."),
+            ContinueKind::Error,
+        );
+        assert_eq!(classify_continue(false, "fatal: No rebase in progress?"), ContinueKind::Error);
     }
 }

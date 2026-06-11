@@ -10,6 +10,8 @@ const { ipcMock, pushToast } = vi.hoisted(() => ({
     commitChanges: vi.fn(), amendCommit: vi.fn(), pushBranch: vi.fn(),
     getStagedDiff: vi.fn(), getLastCommit: vi.fn(), discardFile: vi.fn(),
     aiComplete: vi.fn(), fetchChanges: vi.fn(), pull: vi.fn(),
+    resolveConflictTake: vi.fn(), markConflictResolved: vi.fn(),
+    continueOperation: vi.fn(), abortOperation: vi.fn(),
   },
   pushToast: vi.fn(),
 }));
@@ -18,6 +20,12 @@ vi.mock("./Toasts", () => ({ pushToast: (...a: unknown[]) => pushToast(...a) }))
 // Stores referenced by handleCommitOrAmend — actual import paths used in ChangesPanel.tsx.
 vi.mock("../stores/projectStore", () => ({ useProjectStore: { getState: () => ({ current: null }) } }));
 vi.mock("../stores/workspaceStore", () => ({ useWorkspaceStore: { getState: () => ({ loadGitSummaries: vi.fn() }) } }));
+// The AI modal has its own test file — here we only assert the wiring.
+vi.mock("./ConflictAiModal", () => ({
+  ConflictAiModal: ({ file, model }: { file: string; model: string }) => (
+    <div data-testid="conflict-ai-modal">{file}:{model}</div>
+  ),
+}));
 
 import { ChangesPanel } from "./ChangesPanel";
 
@@ -115,10 +123,10 @@ describe("ChangesPanel G4", () => {
     await waitFor(() => expect(ipcMock.pull).toHaveBeenNthCalledWith(2, "/repo", "rebase"));
   });
 
-  it("shows a conflict banner when conflicted > 0", async () => {
+  it("shows the conflict section header when conflicted > 0", async () => {
     ipcMock.getGitStatus.mockResolvedValue({
       branch: "main", ahead: 0, behind: 0, hasUpstream: true,
-      conflicted: 2, aheadBehindKnown: true,
+      conflicted: 2, aheadBehindKnown: true, operation: null,
       changedFiles: [{ path: "a.ts", status: "conflicted", staged: false, unstaged: true, conflicted: true }],
     });
     render(<ChangesPanel projectPath="/repo" />);
@@ -133,5 +141,153 @@ describe("ChangesPanel G4", () => {
     render(<ChangesPanel projectPath="/repo" />);
     await screen.findByText("main");
     expect(screen.queryByTestId("ahead-behind")).not.toBeInTheDocument();
+  });
+});
+
+// ─── G7 Slice II — conflict resolution ────────────────────────────
+
+const CONFLICT_STATUS = {
+  branch: "main", ahead: 0, behind: 0, hasUpstream: true,
+  conflicted: 2, aheadBehindKnown: true, operation: "merge",
+  changedFiles: [
+    { path: "src/a.ts", status: "conflicted", staged: false, unstaged: true, conflicted: true },
+    { path: "src/b.ts", status: "conflicted", staged: false, unstaged: true, conflicted: true },
+  ],
+};
+
+const RESOLVED_PENDING_STATUS = {
+  branch: "main", ahead: 0, behind: 0, hasUpstream: true,
+  conflicted: 0, aheadBehindKnown: true, operation: "merge",
+  changedFiles: [],
+};
+
+describe("ChangesPanel G7 conflicts", () => {
+  it("renders a row per conflicted file with OURS/THEIRS chips and tooltips", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    render(<ChangesPanel projectPath="/repo" />);
+    expect(await screen.findByText(/2 conflicts · merge/i)).toBeInTheDocument();
+    const ours = screen.getAllByRole("button", { name: "OURS" });
+    const theirs = screen.getAllByRole("button", { name: "THEIRS" });
+    expect(ours).toHaveLength(2);
+    expect(theirs).toHaveLength(2);
+    expect(ours[0].title).toMatch(/keep our version/i);
+    expect(theirs[0].title).toMatch(/keep their version/i);
+  });
+
+  it("OURS chip calls resolveConflictTake with side 'ours' and refreshes", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    ipcMock.resolveConflictTake.mockResolvedValue(undefined);
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText(/2 conflicts · merge/i);
+    const callsBefore = ipcMock.getGitStatus.mock.calls.length;
+    await userEvent.click(screen.getAllByRole("button", { name: "OURS" })[0]);
+    await waitFor(() =>
+      expect(ipcMock.resolveConflictTake).toHaveBeenCalledWith("/repo", "src/a.ts", "ours"),
+    );
+    await waitFor(() =>
+      expect(ipcMock.getGitStatus.mock.calls.length).toBeGreaterThan(callsBefore),
+    );
+  });
+
+  it("labels chips UPSTREAM/MINE during a rebase and MINE still takes 'theirs'", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...CONFLICT_STATUS, operation: "rebase" });
+    ipcMock.resolveConflictTake.mockResolvedValue(undefined);
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText(/2 conflicts · rebase/i);
+    const upstream = screen.getAllByRole("button", { name: "UPSTREAM" });
+    const mine = screen.getAllByRole("button", { name: "MINE" });
+    expect(upstream).toHaveLength(2);
+    expect(mine).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "OURS" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "THEIRS" })).not.toBeInTheDocument();
+    expect(upstream[0].title).toMatch(/keep the upstream version/i);
+    expect(mine[0].title).toMatch(/keep your commit's version/i);
+    await userEvent.click(mine[0]);
+    await waitFor(() =>
+      expect(ipcMock.resolveConflictTake).toHaveBeenCalledWith("/repo", "src/a.ts", "theirs"),
+    );
+  });
+
+  it("THEIRS chip calls resolveConflictTake with side 'theirs'", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    ipcMock.resolveConflictTake.mockResolvedValue(undefined);
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText(/2 conflicts · merge/i);
+    await userEvent.click(screen.getAllByRole("button", { name: "THEIRS" })[1]);
+    await waitFor(() =>
+      expect(ipcMock.resolveConflictTake).toHaveBeenCalledWith("/repo", "src/b.ts", "theirs"),
+    );
+  });
+
+  it("shows Continue/Abort when all conflicts are resolved but the operation is pending", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(RESOLVED_PENDING_STATUS);
+    render(<ChangesPanel projectPath="/repo" />);
+    expect(await screen.findByText(/all conflicts resolved · merge/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /continue merge/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^abort$/i })).toBeInTheDocument();
+  });
+
+  it("Abort asks for confirmation before calling abortOperation", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(RESOLVED_PENDING_STATUS);
+    ipcMock.abortOperation.mockResolvedValue("ok");
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /^abort$/i }));
+    expect(ipcMock.abortOperation).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/abort the merge\? conflict resolutions in progress are discarded\./i),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /abort merge/i }));
+    await waitFor(() => expect(ipcMock.abortOperation).toHaveBeenCalledWith("/repo"));
+  });
+
+  it("Continue with moreConflicts pushes a warning toast and refreshes", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(RESOLVED_PENDING_STATUS);
+    ipcMock.continueOperation.mockResolvedValue({ kind: "moreConflicts", output: "CONFLICT (content)" });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /continue merge/i }));
+    await waitFor(() => expect(ipcMock.continueOperation).toHaveBeenCalledWith("/repo"));
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "warning", title: "Next step has conflicts" }),
+    );
+  });
+
+  it("Continue ok pushes a success toast", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(RESOLVED_PENDING_STATUS);
+    ipcMock.continueOperation.mockResolvedValue({ kind: "ok", output: "All done." });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /continue merge/i }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "success" })),
+    );
+  });
+
+  it("Continue error pushes an error toast with the output", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(RESOLVED_PENDING_STATUS);
+    ipcMock.continueOperation.mockResolvedValue({ kind: "error", output: "fatal: oops" });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /continue merge/i }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "error", body: "fatal: oops" }),
+      ),
+    );
+  });
+
+  it("Sparkles opens the AI resolution modal for that file with the review model", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await screen.findByText(/2 conflicts · merge/i);
+    await userEvent.click(screen.getAllByRole("button", { name: /resolve with ai/i })[0]);
+    const modal = await screen.findByTestId("conflict-ai-modal");
+    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-4-6");
+  });
+
+  it("Pencil routes through the panel's file-open path", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    const onFileClick = vi.fn();
+    render(<ChangesPanel projectPath="/repo" onFileClick={onFileClick} />);
+    await screen.findByText(/2 conflicts · merge/i);
+    await userEvent.click(screen.getAllByRole("button", { name: /open in editor/i })[0]);
+    expect(onFileClick).toHaveBeenCalledWith("src/a.ts");
   });
 });

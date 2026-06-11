@@ -3833,3 +3833,128 @@ mod branch_listing_tests {
         assert_eq!(resolve_base("dev", None).unwrap(), "dev");
     }
 }
+
+// ─── G7 slice II: conflict resolution ─────────────────────────────
+#[cfg(test)]
+mod conflict_resolution_tests {
+    use crate::commands::{mark_conflict_resolved, resolve_conflict_take};
+    use crate::git_ops::{get_status, operation_state, status_files};
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Real merge conflict: base commit, then `side` and `main` edit the SAME
+    /// line of `file.txt`; merging `side` into `main` conflicts.
+    /// During the merge, HEAD (ours) has "main\n", the branch (theirs) "side\n".
+    fn conflicted_repo() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t"]);
+        git(d, &["config", "user.name", "t"]);
+        fs::write(d.join("file.txt"), "base\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "side"]);
+        fs::write(d.join("file.txt"), "side\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "side edit"]);
+        git(d, &["checkout", "main"]);
+        fs::write(d.join("file.txt"), "main\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "main edit"]);
+        // The merge must FAIL with a conflict — don't assert success here.
+        let out = Command::new("git").args(["merge", "side"]).current_dir(d).output().unwrap();
+        assert!(!out.status.success(), "merge of divergent same-line edits must conflict");
+        tmp
+    }
+
+    #[test]
+    fn operation_state_reports_merge_then_none_after_abort() {
+        let tmp = conflicted_repo();
+        assert_eq!(operation_state(tmp.path()).unwrap(), Some("merge"));
+        // GitStatus carries it too — cheaply, in status_files.
+        let st = status_files(tmp.path()).unwrap();
+        assert_eq!(st.operation.as_deref(), Some("merge"));
+        assert_eq!(st.conflicted, 1);
+
+        git(tmp.path(), &["merge", "--abort"]);
+        assert_eq!(operation_state(tmp.path()).unwrap(), None);
+        assert_eq!(status_files(tmp.path()).unwrap().operation, None);
+    }
+
+    #[tokio::test]
+    async fn take_ours_keeps_head_content_and_clears_conflict() {
+        let tmp = conflicted_repo();
+        let path = tmp.path().to_string_lossy().to_string();
+        resolve_conflict_take(path, "file.txt".into(), "ours".into())
+            .await
+            .expect("take ours succeeds");
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "main\n");
+        let st = get_status(tmp.path()).unwrap();
+        assert_eq!(st.conflicted, 0, "conflict must be resolved after take-ours");
+    }
+
+    #[tokio::test]
+    async fn take_theirs_keeps_branch_content_and_clears_conflict() {
+        let tmp = conflicted_repo();
+        let path = tmp.path().to_string_lossy().to_string();
+        resolve_conflict_take(path, "file.txt".into(), "theirs".into())
+            .await
+            .expect("take theirs succeeds");
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "side\n");
+        let st = get_status(tmp.path()).unwrap();
+        assert_eq!(st.conflicted, 0, "conflict must be resolved after take-theirs");
+    }
+
+    #[tokio::test]
+    async fn invalid_side_is_rejected() {
+        let tmp = conflicted_repo();
+        let path = tmp.path().to_string_lossy().to_string();
+        let err = resolve_conflict_take(path, "file.txt".into(), "mine".into()).await;
+        assert!(err.is_err(), "side other than ours/theirs must error");
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_stages_hand_merged_file() {
+        let tmp = conflicted_repo();
+        fs::write(tmp.path().join("file.txt"), "merged by hand\n").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        mark_conflict_resolved(path, "file.txt".into())
+            .await
+            .expect("mark resolved succeeds");
+        let st = get_status(tmp.path()).unwrap();
+        assert_eq!(st.conflicted, 0, "git add clears the unmerged index state");
+    }
+
+    // ── continue / abort ──────────────────────────────────────────
+    // Continue's happy path needs the user's login shell + a real multi-step
+    // operation; it's exercised manually. Abort is fully integration-tested.
+
+    #[tokio::test]
+    async fn abort_returns_repo_to_normal_state_with_clean_tree() {
+        let tmp = conflicted_repo();
+        let path = tmp.path().to_string_lossy().to_string();
+        crate::commands::abort_operation(path).await.expect("abort succeeds");
+        assert_eq!(operation_state(tmp.path()).unwrap(), None, "merge state cleared");
+        let st = get_status(tmp.path()).unwrap();
+        assert_eq!(st.conflicted, 0);
+        assert!(st.changed_files.is_empty(), "working tree clean after abort: {:?}", st.changed_files);
+        // The pre-merge content is restored.
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "main\n");
+    }
+
+    #[tokio::test]
+    async fn continue_and_abort_reject_when_no_operation_in_progress() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-b", "main"]);
+        let path = tmp.path().to_string_lossy().to_string();
+        assert!(crate::commands::continue_operation(path.clone()).await.is_err());
+        assert!(crate::commands::abort_operation(path).await.is_err());
+    }
+}

@@ -245,6 +245,11 @@ pub fn run() {
             commands::push_branch,
             commands::fetch_changes,
             commands::pull,
+            // Conflict resolution (G7 slice II)
+            commands::resolve_conflict_take,
+            commands::mark_conflict_resolved,
+            commands::continue_operation,
+            commands::abort_operation,
             commands::find_pr_for_branch,
             commands::open_prs_for_project,
             // Workspace-wide file & text search

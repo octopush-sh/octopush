@@ -70,6 +70,7 @@ const SAMPLE_GIT_STATUS = {
   hasUpstream: false,
   conflicted: 0,
   aheadBehindKnown: true,
+  operation: null,
 };
 
 function renderCanvas(overrides?: Partial<Parameters<typeof ReviewCanvas>[0]>) {
@@ -245,7 +246,7 @@ describe("ReviewCanvas misc", () => {
   it("shows empty state when diff is empty", () => {
     renderCanvas({
       gitDiff: "",
-      gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true },
+      gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true, operation: null },
     });
     expect(screen.getByText(/Nothing to review/)).toBeTruthy();
   });
