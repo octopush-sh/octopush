@@ -2913,6 +2913,34 @@ pub async fn pull(workspace_path: String, strategy: String) -> AppResult<crate::
     Ok(crate::git_ops::PullOutcome { kind, output: combined })
 }
 
+// ─── G7 slice IV: branch ops ──────────────────────────────────────
+
+/// Switch the workspace to an existing local branch. Worktree-aware: a
+/// branch checked out in another workspace errors with a friendly message
+/// (workspaces are worktrees — git forbids double checkouts).
+#[tauri::command]
+pub async fn switch_branch(workspace_path: String, name: String) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::switch_branch(std::path::Path::new(&workspace_path), &name)
+}
+
+/// Create `name` off `base` and switch to it, under one git_lock guard.
+#[tauri::command]
+pub async fn create_and_switch_branch(
+    workspace_path: String,
+    name: String,
+    base: String,
+) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::create_and_switch_branch(
+        std::path::Path::new(&workspace_path),
+        &name,
+        &base,
+    )
+}
+
 // ─── Test runner ──────────────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone, Debug)]

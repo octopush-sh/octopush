@@ -259,6 +259,9 @@ pub fn run() {
             commands::mark_conflict_resolved,
             commands::continue_operation,
             commands::abort_operation,
+            // Branch & stash (G7 slice IV)
+            commands::switch_branch,
+            commands::create_and_switch_branch,
             commands::find_pr_for_branch,
             commands::open_prs_for_project,
             // Workspace-wide file & text search

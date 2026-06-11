@@ -735,6 +735,53 @@ pub fn blame_file(path: &Path, file: &str) -> AppResult<Vec<BlameLine>> {
     Ok(out)
 }
 
+// ─── G7 slice IV: branch ops ───────────────────────────────────────
+
+/// Friendly message for a failed `git switch`. Pure. The worktree-aware
+/// case matters most here: workspaces ARE worktrees, so a branch that is
+/// checked out in another workspace can never be checked out in this one —
+/// git's raw "fatal: '<name>' is already used by worktree at <path>" gets
+/// rephrased in product language.
+pub fn friendly_switch_error(name: &str, combined: &str) -> String {
+    let s = combined.to_lowercase();
+    if s.contains("already checked out") || s.contains("already used by worktree") {
+        format!(
+            "'{name}' is checked out in another workspace — switch to that workspace instead, or create a new branch from it here."
+        )
+    } else if s.contains("would be overwritten by checkout") {
+        format!(
+            "Switching to '{name}' would overwrite local changes — commit or stash them first."
+        )
+    } else {
+        combined.trim().to_string()
+    }
+}
+
+/// `git switch <name>` via the user's login shell (gitconfig, hooks and
+/// filters behave like the user's terminal). Returns the trimmed combined
+/// output; failures come back as friendly errors via `friendly_switch_error`.
+pub fn switch_branch(path: &Path, name: &str) -> AppResult<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("git switch '{}' 2>&1", name.replace('\'', "'\\''"));
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git switch: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(friendly_switch_error(name, &combined)));
+    }
+    Ok(combined)
+}
+
+/// Create `name` off `base` (idempotent, reuses `create_branch`) and switch
+/// to it. The two steps share the caller's git_lock guard.
+pub fn create_and_switch_branch(path: &Path, name: &str, base: &str) -> AppResult<String> {
+    create_branch(path, name, base)?;
+    switch_branch(path, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,6 +1011,87 @@ mod tests {
         commit_file(dir.path(), "big.txt", &big, "huge");
         let err = blame_file(dir.path(), "big.txt").unwrap_err();
         assert!(err.to_string().contains("too large"), "friendly cap message: {err}");
+    }
+
+    // ── G7 slice IV: branch ops ───────────────────────────────────
+
+    #[test]
+    fn friendly_switch_error_rephrases_worktree_collisions() {
+        let msg = friendly_switch_error(
+            "feat/x",
+            "fatal: 'feat/x' is already used by worktree at '/tmp/wt'",
+        );
+        assert!(msg.contains("another workspace"), "friendly: {msg}");
+        let msg2 = friendly_switch_error(
+            "main",
+            "fatal: 'main' is already checked out at '/tmp/main'",
+        );
+        assert!(msg2.contains("another workspace"), "friendly: {msg2}");
+        let msg3 = friendly_switch_error(
+            "dev",
+            "error: Your local changes to the following files would be overwritten by checkout:",
+        );
+        assert!(msg3.contains("stash"), "friendly dirty-tree: {msg3}");
+        // Unrecognized output passes through trimmed.
+        assert_eq!(
+            friendly_switch_error("x", "  fatal: invalid reference: x\n"),
+            "fatal: invalid reference: x",
+        );
+    }
+
+    #[test]
+    fn switch_branch_switches_and_reports_current() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "side", &base).unwrap();
+
+        switch_branch(dir.path(), "side").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "side");
+
+        switch_branch(dir.path(), &base).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), base);
+    }
+
+    #[test]
+    fn switch_branch_to_unknown_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        assert!(switch_branch(dir.path(), "no-such-branch").is_err());
+    }
+
+    #[test]
+    fn switch_branch_checked_out_in_worktree_errors_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "wt-branch", &base).unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("wt-branch");
+        create_worktree(dir.path(), "wt-branch", &wt_path).unwrap();
+
+        let err = switch_branch(dir.path(), "wt-branch").unwrap_err();
+        assert!(
+            err.to_string().contains("another workspace"),
+            "friendly worktree-collision message: {err}"
+        );
+    }
+
+    #[test]
+    fn create_and_switch_branch_lands_on_the_new_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+
+        create_and_switch_branch(dir.path(), "feat/fresh", &base).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "feat/fresh");
     }
 
     #[test]
