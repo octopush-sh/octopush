@@ -299,16 +299,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           }
           body={
             conflict.kind === "changed"
-              ? `${conflictName} was modified outside the editor. Overwrite with your version, or reload and lose your unsaved edits?`
-              : `${conflictName} was deleted on disk. Save your version anyway, or close the tab?`
+              ? `${conflictName} was modified outside the editor. Overwrite with your version, reload from disk and lose your unsaved edits, or keep editing.`
+              : `${conflictName} was deleted on disk. Save your version anyway, close the tab, or keep editing.`
           }
           destructiveLabel={conflict.kind === "changed" ? "Overwrite" : "Save anyway"}
-          cancelLabel={conflict.kind === "changed" ? "Reload from disk" : "Close tab"}
+          secondaryLabel={conflict.kind === "changed" ? "Reload from disk" : "Close tab"}
+          cancelLabel="Keep editing"
           onConfirm={() => {
             clearSaveConflict();
             saveActive(workspaceId, { force: true }).catch(console.error);
           }}
-          onCancel={() => {
+          onSecondary={() => {
             const { kind, path } = conflict;
             clearSaveConflict();
             if (kind === "changed") {
@@ -317,6 +318,9 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
               closeFile(workspaceId, path);
             }
           }}
+          // Escape lands here — must be the safe choice: dismiss only, lose
+          // nothing. The diskStale chip remains the persistent signal.
+          onCancel={clearSaveConflict}
         />
       )}
     </div>

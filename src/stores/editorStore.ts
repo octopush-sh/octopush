@@ -58,8 +58,15 @@ interface EditorStore {
   setContent: (workspaceId: string, path: string, content: string) => void;
   saveActive: (workspaceId: string, opts?: { force?: boolean }) => Promise<void>;
   clearSaveConflict: () => void;
-  /** Replace the buffer with the disk contents (clears dirty + stale). */
-  reloadFromDisk: (workspaceId: string, path: string) => Promise<boolean>;
+  /** Replace the buffer with the disk contents (clears dirty + stale).
+   *  `onlyIfClean` aborts the swap (and flags diskStale) when the buffer is
+   *  dirty *at resolve time* — the silent focus path uses it so keystrokes
+   *  typed during the disk read are never clobbered. */
+  reloadFromDisk: (
+    workspaceId: string,
+    path: string,
+    opts?: { onlyIfClean?: boolean },
+  ) => Promise<boolean>;
   /** Window-focus check: silently reload a clean stale buffer; flag a dirty one. */
   checkActiveAgainstDisk: (workspaceId: string) => Promise<void>;
 }
@@ -218,10 +225,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!opts?.force) {
         const meta = await ipc.fileMeta(activePath);
         if (meta === null) {
+          // Flag the buffer too: if the user dismisses the dialog ("Keep
+          // editing"), the rouge status-bar chip stays as the signal.
+          patchFile(workspaceId, activePath, (f) => ({ ...f, diskStale: true }));
           set({ saveConflict: { workspaceId, path: activePath, kind: "deleted" } });
           return;
         }
-        if (meta.mtimeMs > file.mtime) {
+        if (meta.mtimeMs !== file.mtime) {
+          patchFile(workspaceId, activePath, (f) => ({ ...f, diskStale: true }));
           set({ saveConflict: { workspaceId, path: activePath, kind: "changed" } });
           return;
         }
@@ -230,8 +241,10 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       // Re-read the buffer after the await — the user may have kept typing.
       const latest = findFile(workspaceId, activePath) ?? file;
       const { mtime } = await ipc.writeFile(activePath, latest.content);
+      // Only what was actually written counts as saved — keystrokes typed
+      // during the write await must leave the buffer dirty.
       patchFile(workspaceId, activePath, (f) => ({
-        ...f, savedContent: f.content, mtime, diskStale: false,
+        ...f, savedContent: latest.content, mtime, diskStale: false,
       }));
       set((s) => ({
         saveConflict: s.saveConflict?.path === activePath ? null : s.saveConflict,
@@ -248,12 +261,22 @@ export const useEditorStore = create<EditorStore>((set, get) => {
 
   clearSaveConflict: () => set({ saveConflict: null }),
 
-  reloadFromDisk: async (workspaceId, path) => {
+  reloadFromDisk: async (workspaceId, path, opts) => {
     const file = findFile(workspaceId, path);
     if (!file || file.kind === "binary") return false;
 
     try {
       const res = await ipc.readFileChecked(path);
+      if (opts?.onlyIfClean) {
+        // Keystroke race: the user may have typed while the read was in
+        // flight. Judge dirtiness from the CURRENT state, not the snapshot.
+        const current = findFile(workspaceId, path);
+        if (!current || current.kind !== "text") return false;
+        if (current.content !== current.savedContent) {
+          patchFile(workspaceId, path, (f) => ({ ...f, diskStale: true }));
+          return false;
+        }
+      }
       if (res.kind !== "text") {
         pushToast({
           level: "error",
@@ -298,8 +321,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       return; // stat failure: stay quiet, the save guard will catch real trouble
     }
 
+    // Keystroke race: the user may have typed during the stat await. Judge
+    // dirtiness (and everything else) from the CURRENT state, never from the
+    // pre-await snapshot.
+    const fresh = findFile(workspaceId, activePath);
+    if (!fresh || fresh.kind !== "text") return;
+
     const setStale = (stale: boolean) => {
-      if (file.diskStale !== stale)
+      if (fresh.diskStale !== stale)
         patchFile(workspaceId, activePath, (f) => ({ ...f, diskStale: stale }));
     };
 
@@ -309,12 +338,12 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       setStale(true);
       return;
     }
-    if (meta.mtimeMs === file.mtime) {
+    if (meta.mtimeMs === fresh.mtime) {
       setStale(false); // disk matches again (e.g. checkout back)
       return;
     }
 
-    const dirty = file.content !== file.savedContent;
+    const dirty = fresh.content !== fresh.savedContent;
     if (dirty) {
       // Unsaved local edits + external change: quiet signal only; the
       // reload-or-overwrite dialog appears when they save.
@@ -322,8 +351,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       return;
     }
 
-    // Clean buffer: silently refresh it from disk.
-    const ok = await get().reloadFromDisk(workspaceId, activePath);
+    // Clean buffer: silently refresh it from disk — but only if it is STILL
+    // clean when the read resolves (the user may type meanwhile).
+    const ok = await get().reloadFromDisk(workspaceId, activePath, { onlyIfClean: true });
     if (ok) {
       pushToast({
         level: "info",

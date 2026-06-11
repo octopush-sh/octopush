@@ -44,7 +44,7 @@ export function EditorStatusBar({ line, col, selectionCount, lang, diskStale }: 
         <div
           className={`${SEG} octo-pop-in text-octo-rouge`}
           data-testid="statusbar-disk-stale"
-          title="This file changed on disk while you have unsaved edits. Saving will ask whether to overwrite your version or reload from disk."
+          title="This file changed or was deleted on disk while you have unsaved edits. Saving will prompt before anything is overwritten or lost."
         >
           <span className="h-[5px] w-[5px] rounded-full bg-octo-rouge" />
           disk changed

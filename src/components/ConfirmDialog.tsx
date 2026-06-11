@@ -6,6 +6,10 @@ interface Props {
   body: string;
   destructiveLabel: string;
   cancelLabel?: string;
+  /** Optional third action rendered between Cancel and the confirm,
+   *  styled like Cancel. Escape still maps to onCancel only. */
+  secondaryLabel?: string;
+  onSecondary?: () => void;
   requireInput?: string;
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
@@ -16,6 +20,8 @@ export function ConfirmDialog({
   body,
   destructiveLabel,
   cancelLabel = "Cancel",
+  secondaryLabel,
+  onSecondary,
   requireInput,
   onConfirm,
   onCancel,
@@ -78,6 +84,15 @@ export function ConfirmDialog({
           >
             {cancelLabel}
           </button>
+          {secondaryLabel && onSecondary && (
+            <button
+              type="button"
+              onClick={onSecondary}
+              className="rounded-md px-4 py-2 font-mono text-[11px] text-octo-sage transition hover:text-octo-ivory"
+            >
+              {secondaryLabel}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void onConfirm()}

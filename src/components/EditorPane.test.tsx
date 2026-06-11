@@ -106,6 +106,10 @@ vi.mock("./ConfirmDialog", () => ({
     <div data-testid="confirm-dialog">
       <span data-testid="confirm-title">{p.title}</span>
       <button onClick={() => p.onConfirm()}>{p.destructiveLabel}</button>
+      {p.secondaryLabel && (
+        <button onClick={() => p.onSecondary?.()}>{p.secondaryLabel}</button>
+      )}
+      {/* Escape in the real dialog (ModalShell) maps to onCancel. */}
       <button onClick={() => p.onCancel()}>{p.cancelLabel}</button>
     </div>
   ),
@@ -224,7 +228,7 @@ describe("EditorPane — save-conflict dialog", () => {
     expect(screen.queryByTestId("confirm-dialog")).not.toBeInTheDocument();
   });
 
-  it("changed conflict: Overwrite force-saves; Reload from disk reloads", () => {
+  it("changed conflict: Overwrite force-saves; Reload from disk (secondary) reloads", () => {
     mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "changed" };
     render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
     expect(screen.getByTestId("confirm-title")).toHaveTextContent("File changed on disk");
@@ -234,11 +238,23 @@ describe("EditorPane — save-conflict dialog", () => {
     expect(mockSaveActive).toHaveBeenCalledWith("ws-active", { force: true });
 
     fireEvent.click(screen.getByText("Reload from disk"));
+    expect(mockClearSaveConflict).toHaveBeenCalledTimes(2);
     expect(mockReloadFromDisk).toHaveBeenCalledWith("ws-active", "/repo/file.ts");
     expect(mockCloseFile).not.toHaveBeenCalled();
   });
 
-  it("deleted conflict: Save anyway force-saves; Close tab closes the file", () => {
+  it("changed conflict: Keep editing (cancel / Escape path) only clears the conflict — nothing destructive", () => {
+    mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "changed" };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+
+    fireEvent.click(screen.getByText("Keep editing"));
+    expect(mockClearSaveConflict).toHaveBeenCalledTimes(1);
+    expect(mockSaveActive).not.toHaveBeenCalled();
+    expect(mockReloadFromDisk).not.toHaveBeenCalled();
+    expect(mockCloseFile).not.toHaveBeenCalled();
+  });
+
+  it("deleted conflict: Save anyway force-saves; Close tab (secondary) closes the file", () => {
     mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "deleted" };
     render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
     expect(screen.getByTestId("confirm-title")).toHaveTextContent("File deleted on disk");
@@ -249,6 +265,17 @@ describe("EditorPane — save-conflict dialog", () => {
     fireEvent.click(screen.getByText("Close tab"));
     expect(mockCloseFile).toHaveBeenCalledWith("ws-active", "/repo/file.ts");
     expect(mockReloadFromDisk).not.toHaveBeenCalled();
+  });
+
+  it("deleted conflict: Keep editing (cancel / Escape path) only clears the conflict — nothing destructive", () => {
+    mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "deleted" };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+
+    fireEvent.click(screen.getByText("Keep editing"));
+    expect(mockClearSaveConflict).toHaveBeenCalledTimes(1);
+    expect(mockSaveActive).not.toHaveBeenCalled();
+    expect(mockReloadFromDisk).not.toHaveBeenCalled();
+    expect(mockCloseFile).not.toHaveBeenCalled();
   });
 });
 
