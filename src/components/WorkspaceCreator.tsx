@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { ChevronLeft } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { BrassRule } from "./BrassRule";
+import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { ipc } from "../lib/ipc";
 
@@ -59,6 +61,20 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       .catch(() => {});
   }, [projectPath]);
 
+  // Escape cancels the whole creator — but only when no inner layer claimed
+  // the key first. The BaseBranchPicker's menu chrome calls preventDefault()
+  // on its Escape; without the defaultPrevented guard, dismissing the branch
+  // menu would also tear down the creator.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (e.defaultPrevented) return;
+      if (!creating) onCancel();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [creating, onCancel]);
+
   const branch = slugify(task) || "new-workspace";
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
@@ -98,7 +114,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       className="flex h-full w-full bg-octo-bg"
       style={{
         background:
-          "radial-gradient(ellipse at 30% 25%, rgba(212,165,116,0.05), transparent 50%), var(--color-octo-onyx)",
+          "radial-gradient(ellipse at 30% 25%, var(--brass-faint), transparent 50%), var(--color-octo-onyx)",
       }}
     >
       {/* Left index pane */}
@@ -106,9 +122,10 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         <button
           type="button"
           onClick={onCancel}
-          className="mb-10 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute hover:text-octo-sage"
+          className="mb-10 inline-flex items-center gap-1 rounded-sm font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
-          ← Back
+          <ChevronLeft size={12} />
+          Back
         </button>
 
         <div className="font-serif text-[18px] text-octo-ivory">
@@ -130,7 +147,8 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       </aside>
 
       {/* Right content pane */}
-      <main className="flex flex-1 flex-col justify-center px-14 py-10">
+      <main className="flex flex-1 flex-col px-14 py-10">
+        <FadeSwap swapKey={String(step)} className="flex flex-1 flex-col justify-center">
         {step === 1 ? (
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
@@ -171,8 +189,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 type="button"
                 onClick={() => setStep(2)}
                 disabled={!taskValid}
-                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 Continue
               </button>
@@ -184,7 +201,8 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 Cancel
               </button>
               <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                ↵ to continue
+                <kbd className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] tracking-normal text-octo-mute">Enter</kbd>
+                <span className="ml-1">to continue</span>
               </div>
             </div>
           </>
@@ -218,10 +236,10 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
 
             {error && (
               <div
-                className="mt-6 max-w-[520px] rounded-md px-3 py-2 text-[12px] text-octo-rouge"
+                className="octo-rise-in mt-6 max-w-[520px] rounded-md px-3 py-2 text-[12px] text-octo-rouge"
                 style={{
                   borderLeft: "1px solid var(--color-octo-rouge)",
-                  background: "rgba(209, 139, 139, 0.08)",
+                  background: "var(--rouge-ghost)",
                   userSelect: "text",
                   WebkitUserSelect: "text",
                   cursor: "text",
@@ -246,31 +264,23 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
               <button
                 type="button"
                 onClick={() => setStep(1)}
-                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+                className="inline-flex items-center gap-1 rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
-                ← Back
+                <ChevronLeft size={12} />
+                Back
               </button>
               <button
                 type="button"
                 onClick={handleCreate}
                 disabled={!taskValid || creating}
-                className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 {creating ? "Creating…" : "Begin"}
-              </button>
-              <button
-                type="button"
-                onClick={handleCreate}
-                disabled={creating}
-                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
-                title="Skip the setup script"
-              >
-                Skip & begin
               </button>
             </div>
           </>
         )}
+        </FadeSwap>
       </main>
     </div>
   );
@@ -294,21 +304,22 @@ function StepIndex({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="flex w-full items-baseline gap-3 py-1.5 text-left disabled:cursor-not-allowed"
+      title={disabled ? "Complete the task first" : undefined}
+      className="flex w-full items-baseline gap-3 rounded-sm py-1.5 text-left disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
       <span
-        className={`w-6 font-mono text-[10px] uppercase tracking-[0.2em] ${
+        className={`w-6 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[220ms] ${
           active ? "text-octo-brass" : "text-octo-mute"
         }`}
       >
         {numeral}
       </span>
       <span
-        className={
+        className={`transition-colors duration-[220ms] ${
           active
             ? "font-serif text-[14px] text-octo-ivory"
             : "font-sans text-[12px] text-octo-mute"
-        }
+        }`}
       >
         {label}
       </span>

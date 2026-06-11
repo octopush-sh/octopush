@@ -3,7 +3,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 
 const BRANCHES = ["main", "feat-x", "release/1.0"];
-const TRIGGER_TITLE = "Base branch — the new branch starts from here";
+const TRIGGER_TITLE = "Base branch: main — the new branch starts from here";
 
 describe("BaseBranchPicker", () => {
   it("renders a trigger button with the selected base and an explanatory title", () => {
@@ -11,6 +11,9 @@ describe("BaseBranchPicker", () => {
     const trigger = screen.getByRole("button", { name: /main/ });
     expect(trigger).toHaveAttribute("title", TRIGGER_TITLE);
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    // The inner label span must NOT carry its own title — it would shadow
+    // the button tooltip on hover.
+    expect(trigger.querySelector("[title]")).toBeNull();
   });
 
   it("contains no arrow/chevron/caret glyphs in the trigger", () => {

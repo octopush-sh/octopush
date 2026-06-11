@@ -40,7 +40,7 @@ export function BaseBranchPicker({ branches, value, onSelect }: Props) {
       <button
         type="button"
         aria-haspopup="menu"
-        title="Base branch — the new branch starts from here"
+        title={`Base branch: ${label} — the new branch starts from here`}
         onClick={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           setMenuAt({ x: rect.left, y: rect.bottom + 4 });
@@ -48,9 +48,7 @@ export function BaseBranchPicker({ branches, value, onSelect }: Props) {
         className={`${LABEL} rounded-sm transition-colors duration-[220ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`}
       >
         <GitBranch size={10} className="shrink-0" />
-        <span className="max-w-[28ch] truncate" title={label}>
-          {label}
-        </span>
+        <span className="max-w-[28ch] truncate">{label}</span>
       </button>
       {menuAt && (
         <BranchMenu

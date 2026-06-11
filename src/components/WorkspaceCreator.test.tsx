@@ -79,8 +79,9 @@ describe("WorkspaceCreator", () => {
     );
 
     // Navigate to step 2 and click Begin
+    // Step 1 → 2 crossfades through the FadeSwap, so "Begin" mounts async.
     fireEvent.click(screen.getByText("Continue"));
-    fireEvent.click(screen.getByText("Begin"));
+    fireEvent.click(await screen.findByText("Begin"));
 
     await waitFor(() => {
       expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).toHaveBeenCalledWith(
@@ -106,8 +107,9 @@ describe("WorkspaceCreator", () => {
       />
     );
 
+    // Step 1 → 2 crossfades through the FadeSwap, so "Begin" mounts async.
     fireEvent.click(screen.getByText("Continue"));
-    fireEvent.click(screen.getByText("Begin"));
+    fireEvent.click(await screen.findByText("Begin"));
 
     await waitFor(() => {
       expect(onCreated).toHaveBeenCalled();
@@ -116,7 +118,7 @@ describe("WorkspaceCreator", () => {
   });
 
   describe("base branch", () => {
-    const TRIGGER_TITLE = "Base branch — the new branch starts from here";
+    const TRIGGER_TITLE = "Base branch: main — the new branch starts from here";
 
     function renderCreator(onCreated = vi.fn()) {
       render(
@@ -141,8 +143,9 @@ describe("WorkspaceCreator", () => {
         expect(screen.getByTitle(TRIGGER_TITLE)).toBeInTheDocument();
       });
 
+      // Step 1 → 2 crossfades through the FadeSwap, so "Begin" mounts async.
       fireEvent.click(screen.getByText("Continue"));
-      fireEvent.click(screen.getByText("Begin"));
+      fireEvent.click(await screen.findByText("Begin"));
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][5]).toBe("main");
@@ -160,8 +163,9 @@ describe("WorkspaceCreator", () => {
       fireEvent.click(screen.getByTitle(TRIGGER_TITLE));
       fireEvent.click(screen.getByRole("menuitem", { name: /release\/1\.0/ }));
 
+      // Step 1 → 2 crossfades through the FadeSwap, so "Begin" mounts async.
       fireEvent.click(screen.getByText("Continue"));
-      fireEvent.click(screen.getByText("Begin"));
+      fireEvent.click(await screen.findByText("Begin"));
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][5]).toBe("release/1.0");
@@ -176,12 +180,80 @@ describe("WorkspaceCreator", () => {
       // Creator renders fine — the picker degrades to a static label.
       expect(screen.getByText("What are you setting out to do?")).toBeInTheDocument();
 
+      // Step 1 → 2 crossfades through the FadeSwap, so "Begin" mounts async.
       fireEvent.click(screen.getByText("Continue"));
-      fireEvent.click(screen.getByText("Begin"));
+      fireEvent.click(await screen.findByText("Begin"));
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       // Empty string lets the backend resolve the repo default.
       expect(mockCreate.mock.calls[0][5]).toBe("");
+    });
+  });
+
+  describe("doctrine pass", () => {
+    function renderCreator() {
+      const onCancel = vi.fn();
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={vi.fn()}
+          onCancel={onCancel}
+          initialTask="Add dark mode"
+        />
+      );
+      return onCancel;
+    }
+
+    it("reaches step 2 content through the FadeSwap crossfade", async () => {
+      renderCreator();
+      expect(screen.getByText("What are you setting out to do?")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("Continue"));
+      expect(await screen.findByText("How does it start?")).toBeInTheDocument();
+      expect(screen.getByText("Begin")).toBeInTheDocument();
+    });
+
+    it("offers a single Begin CTA on the setup step — no Skip button", async () => {
+      renderCreator();
+      fireEvent.click(screen.getByText("Continue"));
+      await screen.findByText("Begin");
+      // (The setup copy mentions "skip" — only a Skip *button* is forbidden.)
+      expect(screen.queryByRole("button", { name: /skip/i })).toBeNull();
+    });
+
+    it("Escape cancels the creator", () => {
+      const onCancel = renderCreator();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it("an Escape already claimed by an inner layer (defaultPrevented) does NOT cancel", () => {
+      const onCancel = renderCreator();
+      // Simulate a menu layer (e.g. the branch picker's useMenuChrome) that
+      // consumed the Escape via preventDefault before it reaches the creator.
+      const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true, bubbles: true });
+      e.preventDefault();
+      window.dispatchEvent(e);
+      expect(onCancel).not.toHaveBeenCalled();
+    });
+
+    it("renders the continue hint as a <kbd>Enter</kbd> with no return glyph", () => {
+      renderCreator();
+      const kbd = screen.getByText("Enter");
+      expect(kbd.tagName).toBe("KBD");
+      expect(screen.getByText("to continue")).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain("↵");
+    });
+
+    it("Back buttons carry no arrow glyphs in their text", async () => {
+      renderCreator();
+      const noArrows = (el: HTMLElement) =>
+        expect(el.textContent).not.toMatch(/[←→⟶↵«»‹›]/);
+      screen.getAllByRole("button", { name: /back/i }).forEach(noArrows);
+
+      fireEvent.click(screen.getByText("Continue"));
+      await screen.findByText("Begin");
+      screen.getAllByRole("button", { name: /back/i }).forEach(noArrows);
     });
   });
 });
