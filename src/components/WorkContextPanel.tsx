@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ChevronDown, GitBranch, RotateCcw } from "lucide-react";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import type { Issue, LinkedIssueRef, StatusCategory, Workspace } from "../lib/types";
@@ -38,6 +39,12 @@ interface Props {
   configured: boolean;
   /** Caller guarantees this is non-null when Companion renders the panel. */
   projectKey?: string | null;
+  /** Project id — keys the persisted collapse preference. Without it the
+   *  collapse state is session-local. */
+  projectId?: string | null;
+  /** Fallback collapse state when the user hasn't toggled this project yet
+   *  (Companion passes mode !== "talk": expanded in Talk, tucked elsewhere). */
+  defaultCollapsed?: boolean;
   /** Active ticket key — drives detail fetch + epic resolution + exclude-self. */
   activeKey: string | null;
   onTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
@@ -46,6 +53,8 @@ interface Props {
 export function WorkContextPanel({
   configured,
   projectKey = null,
+  projectId = null,
+  defaultCollapsed = false,
   activeKey,
   onTicketContextMenu,
 }: Props) {
@@ -87,7 +96,21 @@ export function WorkContextPanel({
   }, [activeIssue?.parentKey, activeIssue?.subtask, loadAncestors]);
 
   const [activePill, setActivePill] = useState<PillKey>("mine");
-  const [collapsed, setCollapsed] = useState(false);
+
+  // Collapse: a user toggle persists per project (companionPrefsStore);
+  // until then we follow the mode-aware default from the caller. Without a
+  // project id (shouldn't happen from Companion) the override is local.
+  const storedCollapsed = useCompanionPrefs((s) =>
+    projectId != null ? s.workContextCollapsed[projectId] : undefined,
+  );
+  const setWorkContextCollapsed = useCompanionPrefs((s) => s.setWorkContextCollapsed);
+  const [localCollapsed, setLocalCollapsed] = useState<boolean | null>(null);
+  const collapsed =
+    (projectId != null ? storedCollapsed : localCollapsed) ?? defaultCollapsed;
+  function toggleCollapsed() {
+    if (projectId != null) setWorkContextCollapsed(projectId, !collapsed);
+    else setLocalCollapsed(!collapsed);
+  }
 
   // Initial my-issues load.
   useEffect(() => {
@@ -188,7 +211,9 @@ export function WorkContextPanel({
           ref={navRef}
           role="tablist"
           aria-label="Work context"
-          className="relative flex flex-1 items-center overflow-x-auto py-0.5"
+          // The static right-edge fade hints that the strip scrolls when
+          // pills overflow; on short strips it only grazes trailing padding.
+          className="relative flex flex-1 items-center overflow-x-auto py-0.5 [mask-image:linear-gradient(to_right,black_85%,transparent)]"
         >
           {/* Gliding indicator. Hidden until the first measurement so it
               never paints at the wrong (left=0) spot. */}
@@ -216,9 +241,7 @@ export function WorkContextPanel({
                 }`}
               >
                 {p.label}
-                <span className="border-l border-current pl-1.5 text-[9px] opacity-70">
-                  {p.count}
-                </span>
+                <span className="text-[9px] opacity-60">{p.count}</span>
               </button>
             );
           })}
@@ -238,7 +261,7 @@ export function WorkContextPanel({
         )}
         <button
           type="button"
-          onClick={() => setCollapsed((c) => !c)}
+          onClick={toggleCollapsed}
           aria-label={collapsed ? "Expand work context" : "Collapse work context"}
           title={collapsed ? "Expand work context" : "Collapse work context"}
           className="flex flex-shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
@@ -253,7 +276,10 @@ export function WorkContextPanel({
       {/* ── Body, with grid-rows expand/collapse ─────────────────── */}
       <div
         aria-hidden={collapsed}
-        className="grid overflow-hidden transition-all duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+        // `inert` takes the clipped rows out of the tab order while collapsed
+        // (aria-hidden alone leaves them keyboard-focusable).
+        inert={collapsed || undefined}
+        className="grid overflow-hidden transition-[grid-template-rows,opacity] duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
         style={{
           // grid-cols forces the column to track the container width
           // exactly. Without it, the implicit `minmax(auto, 1fr)` column
@@ -328,22 +354,13 @@ interface RowProps {
   onContextMenu?: (x: number, y: number) => void;
 }
 
-function TicketRow({ row, workspace, onJump, onContextMenu }: RowProps) {
+const TicketRow = memo(function TicketRow({ row, workspace, onJump, onContextMenu }: RowProps) {
   const openTicket = () => ipc.openFileInSystem(row.url).catch(() => {});
   return (
-    // `group` so the jump chip can expand on row hover. Not a <button>: it now
-    // nests an interactive chip, and button-in-button is invalid HTML — so it's
-    // a div with the button role + keyboard activation.
+    // Plain group container: the main content is a real <button> (open in
+    // Jira) and the jump chip is a SIBLING <button> — no nested interactives.
+    // Hover/border styling stays here so both buttons share one surface.
     <div
-      role="button"
-      tabIndex={0}
-      onClick={openTicket}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openTicket();
-        }
-      }}
       onContextMenu={
         onContextMenu
           ? (e) => {
@@ -352,45 +369,53 @@ function TicketRow({ row, workspace, onJump, onContextMenu }: RowProps) {
             }
           : undefined
       }
-      className="group flex w-full cursor-pointer items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
-      style={{ borderLeft: "1px solid transparent" }}
+      title={`${row.key} · ${row.summary}`}
+      className="group flex w-full items-center gap-2 rounded px-1 py-[5px] transition-colors duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:bg-octo-panel-2"
     >
-      <span
-        aria-label={row.statusCategory}
-        className={`h-[6px] w-[6px] flex-shrink-0 rounded-full ${STATUS_DOT_COLOR[row.statusCategory]}`}
-        style={{ background: "currentColor" }}
-      />
-      <span className={`flex-shrink-0 font-mono text-[11px] ${issueTypeToken(row)}`}>
-        {row.key}
-      </span>
-      {/* Summary's last ~24px fade out via mask-image so the text appears
-          to dissolve into the status pill instead of getting cut with an
-          ellipsis — the status itself stays pinned on the right (see
-          flex-shrink-0 below) and is always legible. */}
-      <span
-        className="min-w-0 flex-1 text-[12px] text-octo-sage"
-        style={{
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          maskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
-          WebkitMaskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
-        }}
+      <button
+        type="button"
+        onClick={openTicket}
+        aria-label={`Open ${row.key} · ${row.summary}`}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
       >
-        {row.summary}
-      </span>
-      {/* On rows that carry a jump chip, the status badge yields to the
-          expanding chip on hover so the summary keeps its room. */}
-      <span
-        className={`flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute ${
-          workspace && onJump ? "group-hover:hidden" : ""
-        }`}
-      >
-        {row.statusName}
-      </span>
+        <span
+          aria-label={row.statusCategory}
+          className={`h-[6px] w-[6px] flex-shrink-0 rounded-full ${STATUS_DOT_COLOR[row.statusCategory]}`}
+          style={{ background: "currentColor" }}
+        />
+        <span className={`flex-shrink-0 font-mono text-[11px] ${issueTypeToken(row)}`}>
+          {row.key}
+        </span>
+        {/* Summary's last ~24px fade out via mask-image so the text appears
+            to dissolve into the status pill instead of getting cut with an
+            ellipsis — the status itself stays pinned on the right (see
+            flex-shrink-0 below) and is always legible. */}
+        <span
+          className="min-w-0 flex-1 text-[12px] text-octo-sage"
+          style={{
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            maskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
+            WebkitMaskImage: "linear-gradient(to right, black calc(100% - 24px), transparent)",
+          }}
+        >
+          {row.summary}
+        </span>
+        {/* On rows that carry a jump chip, the status badge yields to the
+            expanding chip on hover/keyboard focus so the summary keeps its
+            room. */}
+        <span
+          className={`flex-shrink-0 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute ${
+            workspace && onJump ? "group-hover:hidden group-focus-within:hidden" : ""
+          }`}
+        >
+          {row.statusName}
+        </span>
+      </button>
       {workspace && onJump && <WorkspaceJumpChip workspace={workspace} onJump={onJump} />}
     </div>
   );
-}
+});
 
 /** Marker on rows whose ticket already has a workspace. At rest it's a quiet
  *  dot in the workspace's tint colour; on row hover it grows into a pill with
@@ -415,7 +440,9 @@ function WorkspaceJumpChip({
         e.stopPropagation();
         onJump(workspace.id);
       }}
-      className="flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent p-0 transition-all duration-[200ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:brightness-110 group-hover:w-auto group-hover:justify-start group-hover:border-[color:var(--tint-bd)] group-hover:bg-[color:var(--tint-bg)] group-hover:px-[7px] group-hover:py-[2px]"
+      // Expands on row hover AND keyboard focus within the row (the chip's
+      // own focus-visible included), so it isn't a mouse-only affordance.
+      className="flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent p-0 transition-all duration-[200ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:brightness-110 group-hover:w-auto group-hover:justify-start group-hover:border-[color:var(--tint-bd)] group-hover:bg-[color:var(--tint-bg)] group-hover:px-[7px] group-hover:py-[2px] group-focus-within:w-auto group-focus-within:justify-start group-focus-within:border-[color:var(--tint-bd)] group-focus-within:bg-[color:var(--tint-bg)] group-focus-within:px-[7px] group-focus-within:py-[2px] focus-visible:w-auto focus-visible:justify-start focus-visible:border-[color:var(--tint-bd)] focus-visible:bg-[color:var(--tint-bg)] focus-visible:px-[7px] focus-visible:py-[2px]"
       style={
         {
           color: accent,
@@ -433,9 +460,9 @@ function WorkspaceJumpChip({
       />
       <GitBranch
         size={11}
-        className="ml-0 w-0 opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:w-[11px] group-hover:opacity-100"
+        className="ml-0 w-0 opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:w-[11px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:w-[11px] group-focus-within:opacity-100"
       />
-      <span className="ml-0 max-w-0 overflow-hidden truncate font-mono text-[10px] leading-none opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:max-w-[120px] group-hover:opacity-100">
+      <span className="ml-0 max-w-0 overflow-hidden truncate font-mono text-[10px] leading-none opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:max-w-[120px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:max-w-[120px] group-focus-within:opacity-100">
         {workspace.name}
       </span>
     </button>

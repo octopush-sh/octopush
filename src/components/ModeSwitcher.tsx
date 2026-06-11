@@ -34,7 +34,10 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
     <div
       role="group"
       aria-label="Workspace mode"
-      className="relative inline-flex items-center self-end rounded-lg border border-octo-hairline bg-octo-panel p-1"
+      // No own border/bg: the group sits inside Companion's already-bordered
+      // header on the same panel surface — the gliding brass-ghost indicator
+      // alone marks the active mode. p-1 keeps the indicator's breathing room.
+      className="relative inline-flex items-center p-1"
     >
       {/* Gliding brass indicator. Translates by activeIndex * BUTTON_W. */}
       <div
@@ -64,7 +67,9 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
             }
             style={{ width: `${BUTTON_W}px` }}
             className={clsx(
-              "relative z-10 rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors",
+              // Label color glides on the same clock as the indicator (280ms)
+              // so the brass handoff and the rect arrive together.
+              "relative z-10 rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]",
               active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage",
               pulse && "animate-attention-pulse !text-octo-brass",
             )}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
@@ -11,6 +11,7 @@ import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
 import { ModeSwitcher } from "./ModeSwitcher";
+import { FadeSwap } from "./primitives/FadeSwap";
 import { useIssuesStore } from "../stores/issuesStore";
 import { selectElsewhereCount } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
@@ -67,8 +68,15 @@ export function Companion({
   reviewGitDiff,
   onJumpToFile,
 }: Props) {
-  const { issues } = useIssuesStore();
+  const issues = useIssuesStore((s) => s.issues);
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
+
+  // The elsewhere list is scoped to the current project — never let an
+  // open modal survive a project switch and show stale context.
+  const projectId = project?.id ?? null;
+  useEffect(() => {
+    setElsewhereOpen(false);
+  }, [projectId]);
 
   const branch = workspace?.branch ?? "";
   const manualKey = workspace?.linkedIssueKey ?? null;
@@ -103,6 +111,8 @@ export function Companion({
           <WorkContextPanel
             configured={issueTrackerConfigured}
             projectKey={projectKey}
+            projectId={projectId}
+            defaultCollapsed={mode !== "talk"}
             activeKey={activeKey}
             onTicketContextMenu={onBacklogTicketContextMenu}
           />
@@ -112,12 +122,12 @@ export function Companion({
         </>
       )}
 
-      {/* Mode-specific content — keyed so it crossfades when the mode changes,
-          following the gliding ModeSwitcher indicator. The shared header and
-          Jira block above stay outside this wrapper so they persist across
-          modes. flex/min-h-0/flex-1/flex-col preserve the review file-tree's
-          h-full height chain. */}
-      <div key={mode} className="octo-fade-in flex min-h-0 flex-1 flex-col">
+      {/* Mode-specific content — crossfades (exit 120ms, then enter) when the
+          mode changes, following the gliding ModeSwitcher indicator. The
+          shared header and Jira block above stay outside this wrapper so they
+          persist across modes. flex/min-h-0/flex-1/flex-col preserve the
+          review file-tree's h-full height chain. */}
+      <FadeSwap swapKey={mode} className="flex min-h-0 flex-1 flex-col">
         {mode === "talk" && (
           <div className="flex flex-col gap-4 p-4">
             <CompanionHistory {...historyProps} />
@@ -144,9 +154,9 @@ export function Companion({
         {mode === "direct" && workspaceId && (
           <CompanionRuns workspaceId={workspaceId} />
         )}
-      </div>
+      </FadeSwap>
 
-      {elsewhereOpen && (
+      {showJiraBlock && elsewhereOpen && (
         <ElsewhereModal
           issues={issues ?? []}
           activeProjectKey={projectKey}

@@ -33,6 +33,24 @@ describe("ElsewhereModal", () => {
     expect(screen.getByText("B-1")).toBeInTheDocument();
   });
 
+  it("lists only in-progress tickets, matching the footer's count", () => {
+    render(
+      <ElsewhereModal issues={issues} activeProjectKey="HERE" onClose={vi.fn()} />,
+    );
+    // A-2 is 'todo' — selectElsewhereCount ignores it, so the modal must too.
+    expect(screen.queryByText("A-2")).not.toBeInTheDocument();
+    expect(screen.getByText("A-1")).toBeInTheDocument();
+    expect(screen.getByText("B-1")).toBeInTheDocument();
+  });
+
+  it("excludes active-project tickets even when in progress", () => {
+    render(
+      <ElsewhereModal issues={issues} activeProjectKey="A" onClose={vi.fn()} />,
+    );
+    expect(screen.queryByText("A-1")).not.toBeInTheDocument();
+    expect(screen.getByText("B-1")).toBeInTheDocument();
+  });
+
   it("clicking a row opens the issue url", () => {
     render(
       <ElsewhereModal issues={issues} activeProjectKey="HERE" onClose={vi.fn()} />,

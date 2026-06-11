@@ -139,15 +139,25 @@ export function resolveEpicKey(
   return null;
 }
 
+/** In-progress tickets outside the active project. Single source of truth
+ *  for BOTH the ElsewhereFooter count and the ElsewhereModal list, so the
+ *  number on the footer always equals the rows in the modal. */
+export function selectElsewhereIssues(
+  allIssues: Issue[],
+  projectKey: string | null,
+): Issue[] {
+  if (projectKey == null) return [];
+  const prefix = projectKey + "-";
+  return allIssues.filter(
+    (i) => !i.key.startsWith(prefix) && i.statusCategory === "inProgress",
+  );
+}
+
 export function selectElsewhereCount(
   allIssues: Issue[],
   projectKey: string | null,
 ): number {
-  if (projectKey == null) return 0;
-  const prefix = projectKey + "-";
-  return allIssues.filter(
-    (i) => !i.key.startsWith(prefix) && i.statusCategory === "inProgress",
-  ).length;
+  return selectElsewhereIssues(allIssues, projectKey).length;
 }
 
 /** Map an issue (or a lightweight LinkedIssueRef) to a Tailwind text-color
