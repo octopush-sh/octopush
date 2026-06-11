@@ -33,7 +33,12 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     async (path: string, opts?: { force?: boolean }) => {
       if (!opts?.force && children[path] && children[path] !== "error") return; // already cached
       const gen = genRef.current;
-      setChildren((prev) => ({ ...prev, [path]: "loading" }));
+      // Stale-while-revalidate: when force-refetching a path that already has
+      // entries, keep the old rows visible until the new data lands.
+      const hasData = Array.isArray(children[path]);
+      if (!hasData) {
+        setChildren((prev) => ({ ...prev, [path]: "loading" }));
+      }
       try {
         const entries = await ipc.readDirectory(path, showIgnored);
         if (genRef.current !== gen) return; // toggle flipped mid-flight; discard
@@ -49,15 +54,18 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
   const prevRootRef = useRef(rootPath);
 
   // (Re)load on mount, on workspace switch, and when the show-ignored toggle
-  // flips: bump the generation (discarding in-flight responses), drop the
-  // cache, and force-refetch. A toggle refetches every expanded folder; a
-  // workspace switch resets expansion to the new root alone.
+  // flips: bump the generation (discarding in-flight responses) and
+  // force-refetch. A workspace switch drops the cache (old data is invalid)
+  // and resets expansion to the new root alone; a toggle keeps the cache and
+  // revalidates every expanded folder in place — old rows stay visible until
+  // fresh entries land (no full-tree flash).
   useEffect(() => {
     genRef.current += 1;
-    setChildren({});
     const rootChanged = prevRootRef.current !== rootPath;
     prevRootRef.current = rootPath;
     if (rootChanged) {
+      setChildren({});
+      setMenu(null);
       setExpanded(new Set([rootPath]));
       void fetchChildren(rootPath, { force: true });
       return;
@@ -98,23 +106,21 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     <section className="flex h-full min-h-0 flex-col">
       {/* Eyebrow — same height & padding as the canvas toolbar and the
           left rail's CHANGES eyebrow so the three top bars form one row. */}
-      <h3 className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-        Files
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4">
+        <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Files</h3>
         <button
           type="button"
           aria-label="Show ignored files"
           aria-pressed={showIgnored}
           title={showIgnored ? "Hide ignored files" : "Show ignored files"}
           onClick={() => toggleShowIgnored(rootPath)}
-          className="rounded-sm p-1 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+            showIgnored ? "text-octo-brass" : "text-octo-mute"
+          }`}
         >
-          {showIgnored ? (
-            <Eye size={12} className="text-octo-brass" />
-          ) : (
-            <EyeOff size={12} className="text-octo-mute" />
-          )}
+          {showIgnored ? <Eye size={12} /> : <EyeOff size={12} />}
         </button>
-      </h3>
+      </div>
 
       <div role="tree" aria-label="Workspace files" className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         <TreeNode
@@ -164,9 +170,8 @@ interface TreeNodeProps {
 }
 
 /** Returns the label color class for a file/folder based on state and depth. */
-function depthColorClass(depth: number, isChanged: boolean, isIgnored: boolean): string {
+function depthColorClass(depth: number, isChanged: boolean): string {
   if (isChanged) return "text-octo-ivory";
-  if (isIgnored) return "text-octo-mute";
   if (depth >= 4) return "text-octo-mute";
   return "text-octo-sage";
 }
@@ -204,7 +209,10 @@ function TreeNode({
         role="treeitem"
         aria-expanded={isDir ? isExpanded : undefined}
         tabIndex={0}
-        className="group relative flex cursor-pointer items-center gap-1 rounded-sm py-1 pr-1 transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        title={isIgnored ? "Ignored by .gitignore" : undefined}
+        className={`octo-rise-in group relative flex cursor-pointer items-center gap-1 rounded-sm py-1 pr-1 transition duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass${
+          isIgnored ? " opacity-60" : ""
+        }`}
         style={{
           paddingLeft: `${depth * 14 + 4}px`,
           background: "transparent",
@@ -244,20 +252,13 @@ function TreeNode({
           >
             ▶
           </span>
-        ) : isChanged ? (
-          <span
-            className="inline-flex w-3 shrink-0 items-center justify-center font-mono text-[10px]"
-            style={{ color: "var(--color-octo-brass)" }}
-          >
-            ●
-          </span>
         ) : (
           Icon && (
             <Icon
               size={12}
               aria-hidden="true"
-              className="shrink-0"
-              style={{ color: "var(--color-octo-mute)", opacity: isIgnored ? 0.6 : 1 }}
+              className="shrink-0 transition-colors duration-[220ms]"
+              style={{ color: isChanged ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
             />
           )
         )}
@@ -282,7 +283,7 @@ function TreeNode({
           </span>
         ) : (
           <span
-            className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged, isIgnored)}`}
+            className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}
           >
             {label}
           </span>
@@ -330,7 +331,7 @@ function TreeNode({
                 path={entry.path}
                 label={entry.name}
                 isDir={entry.isDir}
-                isIgnored={entry.isIgnored}
+                isIgnored={entry.isIgnored || isIgnored}
                 depth={depth + 1}
                 isRoot={false}
                 expanded={expanded}

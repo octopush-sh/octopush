@@ -102,20 +102,26 @@ describe("CompanionFileTree", () => {
     expect(mockReadDirectory).toHaveBeenCalledTimes(2); // ROOT + src once each
   });
 
-  it("shows brass dot for changed files", async () => {
+  it("changed files keep their type icon, tinted brass", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
 
     await userEvent.click(screen.getByText("src"));
     await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
 
-    // Main.java is in CHANGED — its row should contain ●
+    // Main.java is in CHANGED — its type icon is brass-tinted.
     const mainRow = screen.getByTestId("file-row-/repo/src/Main.java");
-    expect(mainRow.textContent).toContain("●");
+    const mainIcon = mainRow.querySelector("svg");
+    expect(mainIcon).not.toBeNull();
+    expect(mainIcon!.style.color).toContain("var(--color-octo-brass)");
+    // The changed label reads ivory.
+    expect(screen.getByText("Main.java").className).toContain("text-octo-ivory");
 
-    // Helper.java is NOT in CHANGED — its row should contain ◦ (or no ●)
+    // Helper.java is NOT in CHANGED — its type icon stays mute.
     const helperRow = screen.getByTestId("file-row-/repo/src/Helper.java");
-    expect(helperRow.textContent).not.toContain("●");
+    const helperIcon = helperRow.querySelector("svg");
+    expect(helperIcon).not.toBeNull();
+    expect(helperIcon!.style.color).toContain("var(--color-octo-mute)");
   });
 
   it("shows loading indicator while a folder fetch is in progress", async () => {
@@ -251,10 +257,17 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
     expect(mockReadDirectory).toHaveBeenLastCalledWith(ROOT, true);
 
-    // Ignored entries are dimmed but still clickable rows.
-    expect(screen.getByText("app.war").className).toContain("text-octo-mute");
-    expect(screen.getByText("build").className).toContain("text-octo-mute");
-    // Non-ignored entries keep their normal color.
+    // Ignored entries are dimmed at the row level and explained via tooltip.
+    const warRow = screen.getByText("app.war").closest('[role="treeitem"]') as HTMLElement;
+    expect(warRow.className).toContain("opacity-60");
+    expect(warRow).toHaveAttribute("title", "Ignored by .gitignore");
+    const buildRow = screen.getByText("build").closest('[role="treeitem"]') as HTMLElement;
+    expect(buildRow.className).toContain("opacity-60");
+    expect(buildRow).toHaveAttribute("title", "Ignored by .gitignore");
+    // Non-ignored entries are neither dimmed nor annotated, and keep their color.
+    const pomRow = screen.getByText("pom.xml").closest('[role="treeitem"]') as HTMLElement;
+    expect(pomRow.className).not.toContain("opacity-60");
+    expect(pomRow).not.toHaveAttribute("title");
     expect(screen.getByText("pom.xml").className).toContain("text-octo-sage");
   });
 
@@ -333,6 +346,73 @@ describe("CompanionFileTree", () => {
 
     await waitFor(() => expect(screen.getByText("gen.ts")).toBeInTheDocument());
     expect(mockReadDirectory).toHaveBeenCalledWith("/repo/src", true);
+  });
+
+  it("children of an ignored directory inherit the dimmed state", async () => {
+    mockReadDirectory.mockImplementation((path: string) => {
+      if (path === ROOT) {
+        return Promise.resolve([{ name: "build", path: "/repo/build", isDir: true, isIgnored: true }]);
+      }
+      if (path === "/repo/build") {
+        return Promise.resolve([{ name: "out.js", path: "/repo/build/out.js", isDir: false, isIgnored: false }]);
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={new Set()} />);
+    await waitFor(() => expect(screen.getByText("build")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByText("build"));
+    await waitFor(() => expect(screen.getByText("out.js")).toBeInTheDocument());
+
+    // out.js's own flag is false, but it inherits dimming from its ignored parent.
+    const row = screen.getByTestId("file-row-/repo/build/out.js");
+    expect(row.className).toContain("opacity-60");
+    expect(row).toHaveAttribute("title", "Ignored by .gitignore");
+  });
+
+  it("keeps old entries visible while a toggle refetch is pending (stale-while-revalidate)", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+
+    // Defer the refetch triggered by the eye toggle.
+    let resolveRefetch!: (v: unknown) => void;
+    mockReadDirectory.mockImplementation(
+      () =>
+        new Promise((res) => {
+          resolveRefetch = res;
+        }),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /show ignored files/i }));
+
+    // Old entries stay on screen — no full-tree "loading…" flash.
+    expect(screen.getByText("src")).toBeInTheDocument();
+    expect(screen.getByText("pom.xml")).toBeInTheDocument();
+    expect(screen.queryByText("loading…")).not.toBeInTheDocument();
+
+    // When the refetch lands, entries swap in place.
+    resolveRefetch([
+      ...ROOT_CHILDREN,
+      { name: "app.war", path: "/repo/app.war", isDir: false, isIgnored: true },
+    ]);
+    await waitFor(() => expect(screen.getByText("app.war")).toBeInTheDocument());
+    expect(screen.getByText("src")).toBeInTheDocument();
+  });
+
+  it("dismisses an open context menu when the workspace switches", async () => {
+    const { rerender } = render(
+      <CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />,
+    );
+    await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());
+
+    fireEvent.contextMenu(screen.getByTestId("file-row-/repo/pom.xml"));
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+
+    rerender(
+      <CompanionFileTree rootPath="/other" rootLabel="other-project" changedPaths={CHANGED} />,
+    );
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
   });
 
   it("right-clicking a file row opens the context menu with file items", async () => {
