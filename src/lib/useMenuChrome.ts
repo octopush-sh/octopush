@@ -56,10 +56,13 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
         onDismiss();
       }
     };
-    window.addEventListener("keydown", onKey);
+    // Capture phase so the menu wins over bubble-phase listeners registered
+    // earlier (e.g. WorkspaceCreator's Escape-to-cancel) — the menu must
+    // consume Escape before the creator sees it.
+    window.addEventListener("keydown", onKey, true);
     window.addEventListener("mousedown", onMouseDown, true);
     return () => {
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("mousedown", onMouseDown, true);
     };
   }, [onDismiss]);

@@ -11,6 +11,7 @@ describe("BaseBranchPicker", () => {
     const trigger = screen.getByRole("button", { name: /main/ });
     expect(trigger).toHaveAttribute("title", TRIGGER_TITLE);
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
     // The inner label span must NOT carry its own title — it would shadow
     // the button tooltip on hover.
     expect(trigger.querySelector("[title]")).toBeNull();
@@ -30,6 +31,10 @@ describe("BaseBranchPicker", () => {
     const menu = screen.getByRole("menu", { name: "Choose base branch" });
     expect(container.contains(menu)).toBe(false);
     expect(menu.className).toContain("fixed");
+    expect(screen.getByRole("button", { name: /main/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
   });
 
   it("renders one menuitem per branch", () => {

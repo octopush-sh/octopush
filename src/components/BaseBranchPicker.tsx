@@ -40,6 +40,7 @@ export function BaseBranchPicker({ branches, value, onSelect }: Props) {
       <button
         type="button"
         aria-haspopup="menu"
+        aria-expanded={menuAt !== null}
         title={`Base branch: ${label} — the new branch starts from here`}
         onClick={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();

@@ -227,6 +227,25 @@ describe("WorkspaceCreator", () => {
       expect(onCancel).toHaveBeenCalledTimes(1);
     });
 
+    it("Escape with the branch menu open dismisses only the menu; a second Escape cancels", async () => {
+      const onCancel = renderCreator();
+
+      // Wait for the mocked branches to load into the picker trigger.
+      const trigger = await screen.findByTitle(/^Base branch: main/);
+      fireEvent.click(trigger);
+      expect(screen.getByRole("menu", { name: "Choose base branch" })).toBeInTheDocument();
+
+      // Real ordering, no pre-prevented event: the menu's capture-phase
+      // listener must consume Escape before the creator's bubble listener.
+      fireEvent.keyDown(window, { key: "Escape", cancelable: true, bubbles: true });
+      expect(screen.queryByRole("menu", { name: "Choose base branch" })).toBeNull();
+      expect(onCancel).not.toHaveBeenCalled();
+
+      // With the menu gone, Escape now reaches the creator and cancels it.
+      fireEvent.keyDown(window, { key: "Escape", cancelable: true, bubbles: true });
+      expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
     it("an Escape already claimed by an inner layer (defaultPrevented) does NOT cancel", () => {
       const onCancel = renderCreator();
       // Simulate a menu layer (e.g. the branch picker's useMenuChrome) that

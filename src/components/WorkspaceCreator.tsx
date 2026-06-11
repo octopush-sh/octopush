@@ -196,7 +196,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
               <button
                 type="button"
                 onClick={onCancel}
-                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 Cancel
               </button>
