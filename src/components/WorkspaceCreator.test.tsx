@@ -10,6 +10,7 @@ vi.mock("../lib/ipc", () => ({
   ipc: {
     updateWorkspaceLink: vi.fn().mockResolvedValue(undefined),
     createWorkspace: vi.fn(),
+    listBranches: vi.fn(),
   },
 }));
 
@@ -43,6 +44,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Default: create resolves with the mock workspace
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
+  vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue(["main", "release/1.0"]);
 });
 
 describe("WorkspaceCreator", () => {
@@ -111,5 +113,75 @@ describe("WorkspaceCreator", () => {
       expect(onCreated).toHaveBeenCalled();
     });
     expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).not.toHaveBeenCalled();
+  });
+
+  describe("base branch", () => {
+    const TRIGGER_TITLE = "Base branch — the new branch starts from here";
+
+    function renderCreator(onCreated = vi.fn()) {
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask="Add dark mode"
+        />
+      );
+      return onCreated;
+    }
+
+    it("defaults to the first listed branch (the repo default) when creating", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      // Wait for branches to load into the picker trigger.
+      await waitFor(() => {
+        expect(screen.getByTitle(TRIGGER_TITLE)).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(screen.getByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][5]).toBe("main");
+    });
+
+    it("passes the picked branch as the base when creating", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      await waitFor(() => {
+        expect(screen.getByTitle(TRIGGER_TITLE)).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTitle(TRIGGER_TITLE));
+      fireEvent.click(screen.getByRole("menuitem", { name: /release\/1\.0/ }));
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(screen.getByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][5]).toBe("release/1.0");
+    });
+
+    it("still renders and creates with an empty base when listBranches fails", async () => {
+      vi.mocked(ipcModule.ipc.listBranches).mockRejectedValue(new Error("not a repo"));
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      // Creator renders fine — the picker degrades to a static label.
+      expect(screen.getByText("What are you setting out to do?")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(screen.getByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      // Empty string lets the backend resolve the repo default.
+      expect(mockCreate.mock.calls[0][5]).toBe("");
+    });
   });
 });

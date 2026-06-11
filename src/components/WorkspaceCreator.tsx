@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { BaseBranchPicker } from "./BaseBranchPicker";
 import { BrassRule } from "./BrassRule";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { ipc } from "../lib/ipc";
@@ -40,8 +41,23 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   const [setupScript, setSetupScript] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [branches, setBranches] = useState<string[]>([]);
+  const [base, setBase] = useState<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
+
+  // Load local branches for the base picker. The repo default comes first.
+  // On failure the picker degrades to a static label and creation still
+  // works: an empty base lets the backend resolve the repo default.
+  useEffect(() => {
+    ipc
+      .listBranches(projectPath)
+      .then((b) => {
+        setBranches(b);
+        setBase((cur) => cur ?? b[0] ?? null);
+      })
+      .catch(() => {});
+  }, [projectPath]);
 
   const branch = slugify(task) || "new-workspace";
   const workspaceName = branch;
@@ -53,7 +69,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     setError(null);
     let newWs;
     try {
-      newWs = await create(projectId, projectPath, workspaceName, task.trim(), branch, "main", setupScript);
+      newWs = await create(projectId, projectPath, workspaceName, task.trim(), branch, base ?? "", setupScript);
     } catch (e) {
       setError(String(e));
       setCreating(false);
@@ -146,7 +162,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 <span className="text-octo-mute">BRANCH</span>
                 <span className="text-octo-brass">{branch}</span>
                 <span className="text-octo-mute">from</span>
-                <span className="text-octo-sage">main</span>
+                <BaseBranchPicker branches={branches} value={base} onSelect={setBase} />
               </div>
             </div>
 
