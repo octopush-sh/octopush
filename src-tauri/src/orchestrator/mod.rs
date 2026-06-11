@@ -376,6 +376,13 @@ impl Orchestrator {
     /// Drive the run from its first non-done stage until it pauses, completes,
     /// or aborts. Returns the resulting run status.
     pub async fn run_to_pause(&self, run_id: &str) -> AppResult<RunStatus> {
+        self.run_to_pause_with(run_id, false).await
+    }
+
+    /// `skip_budget_once` lets the FIRST pending stage of this drive start past
+    /// the budget gate — set only when the user just approved a budget pause
+    /// (conscious override). The gate re-arms for every following stage.
+    async fn run_to_pause_with(&self, run_id: &str, skip_budget_once: bool) -> AppResult<RunStatus> {
         // Enforce single active drive.
         {
             let mut active = self.active.lock();
@@ -384,12 +391,34 @@ impl Orchestrator {
             }
             active.insert(run_id.to_string());
         }
-        let result = self.drive_inner(run_id).await;
+        let result = self.drive_inner(run_id, skip_budget_once).await;
         self.active.lock().remove(run_id);
         result
     }
 
-    async fn drive_inner(&self, run_id: &str) -> AppResult<RunStatus> {
+    /// Park a pending stage behind a checkpoint because spend reached the run
+    /// budget: stage → awaiting_checkpoint, run → paused, a notice in the
+    /// stage's journal, and the checkpoint event.
+    fn pause_for_budget(&self, run_id: &str, stage_id: &str, cost: f64, budget: f64) -> AppResult<()> {
+        self.db.lock().set_run_stage_status(stage_id, "awaiting_checkpoint")?;
+        self.db.lock().set_run_status(run_id, "paused", false)?;
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({
+                "runId": run_id,
+                "stageId": stage_id,
+                "entry": {
+                    "kind": "notice",
+                    "text": format!("budget reached — ${cost:.2} of ${budget:.2} spent"),
+                },
+            }),
+        );
+        self.emit_run_update(run_id);
+        self.emit_checkpoint(run_id, stage_id);
+        Ok(())
+    }
+
+    async fn drive_inner(&self, run_id: &str, mut skip_budget_once: bool) -> AppResult<RunStatus> {
         let run0 = self
             .db
             .lock()
@@ -435,6 +464,18 @@ impl Orchestrator {
                 self.emit_run_update(run_id);
                 return Ok(RunStatus::Paused);
             }
+
+            // Budget gate: a pending stage must not START once spend has
+            // reached the run's budget (stages are atomic — no mid-stage
+            // interruption). Approving the resulting checkpoint releases the
+            // parked stage past the gate once; it re-arms for the next stage.
+            if let Some(budget) = run.budget_usd {
+                if !skip_budget_once && budget > 0.0 && run.cost_usd >= budget {
+                    self.pause_for_budget(run_id, &stage.id, run.cost_usd, budget)?;
+                    return Ok(RunStatus::Paused);
+                }
+            }
+            skip_budget_once = false; // only the drive's first stage may bypass
 
             let stage = stage.clone();
             let (status, verdict) = self.run_stage_once(&run, &stage).await?;
@@ -503,6 +544,10 @@ impl Orchestrator {
             .find(|s| s.status == "awaiting_checkpoint" || s.status == "failed")
             .cloned();
 
+        // Approving a budget-parked stage (it never ran) is a conscious
+        // override: the re-drive lets that stage start past the budget gate.
+        let mut budget_override = false;
+
         match action {
             CheckpointAction::Abort => {
                 self.db.lock().set_run_status(run_id, "aborted", true)?;
@@ -512,7 +557,14 @@ impl Orchestrator {
             CheckpointAction::Approve | CheckpointAction::Edit => {
                 if let Some(s) = &blocked {
                     if s.status == "awaiting_checkpoint" {
-                        self.db.lock().set_run_stage_status(&s.id, "done")?;
+                        if s.started_at.is_none() && s.artifact.is_none() {
+                            // Budget-parked: the stage never ran. Release it to
+                            // pending so it actually executes (past the gate).
+                            self.db.lock().set_run_stage_status(&s.id, "pending")?;
+                            budget_override = true;
+                        } else {
+                            self.db.lock().set_run_stage_status(&s.id, "done")?;
+                        }
                     } else {
                         // A failed stage cannot be approved; treat as no-op pause.
                         return Ok(RunStatus::Paused);
@@ -579,7 +631,7 @@ impl Orchestrator {
             }
         }
 
-        self.run_to_pause(run_id).await
+        self.run_to_pause_with(run_id, budget_override).await
     }
 
     pub async fn abort_run(&self, run_id: &str) -> AppResult<()> {

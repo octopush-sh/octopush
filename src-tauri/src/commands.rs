@@ -905,13 +905,22 @@ pub async fn create_run(
 
 #[tauri::command]
 pub async fn start_run(
+    state: State<'_, AppState>,
     orch: State<'_, Arc<Orchestrator>>,
     run_id: String,
+    budget_usd: Option<f64>,
 ) -> AppResult<()> {
     if orch.has_concurrent_run(&run_id).await? {
         return Err(AppError::Other(
             "another run in this workspace is already executing".into(),
         ));
+    }
+    // Persist the optional spend cap before the drive starts. Only a finite
+    // positive budget is meaningful; anything else stays NULL (no budget).
+    if let Some(b) = budget_usd {
+        if b.is_finite() && b > 0.0 {
+            state.db.lock().set_run_budget(&run_id, Some(b))?;
+        }
     }
     Arc::clone(&*orch).start_run(run_id);
     Ok(())

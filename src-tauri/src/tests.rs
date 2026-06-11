@@ -2328,6 +2328,23 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn run_budget_persists_and_defaults_null() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        // Legacy/new runs have no budget.
+        assert_eq!(db.get_run(&run).unwrap().unwrap().budget_usd, None);
+        db.set_run_budget(&run, Some(1.25)).unwrap();
+        assert_eq!(db.get_run(&run).unwrap().unwrap().budget_usd, Some(1.25));
+        // list_runs carries the column too.
+        assert_eq!(db.list_runs(&ws).unwrap()[0].budget_usd, Some(1.25));
+        db.set_run_budget(&run, None).unwrap();
+        assert_eq!(db.get_run(&run).unwrap().unwrap().budget_usd, None);
+    }
+
+    #[test]
     fn stage_diff_snapshot_sets_and_reads_back() {
         let db = test_db();
         let ws = seed_workspace(&db);
@@ -3053,6 +3070,119 @@ mod orchestrator_tests {
         // Transition run_a to `completed` — no longer executing, run_b is free.
         db.lock().set_run_status(&run_a, "completed", true).unwrap();
         assert!(!orch.has_concurrent_run(&run_b).await.unwrap());
+    }
+
+    /// A runner that succeeds with a fixed per-stage cost (budget-gate fixtures).
+    struct CostRunner {
+        cost: f64,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CostRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageArtifact,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cost_usd: self.cost,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: None,
+            })
+        }
+    }
+
+    /// `n` checkpoint-free stages each costing `cost`, with an optional run
+    /// budget. The sink mirrors production wiring (PersistingSink) so budget
+    /// notices land in `stage_log`.
+    fn budgeted_run(n: i64, cost: f64, budget: Option<f64>) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Budgeted", "d", false).unwrap();
+        for i in 0..n {
+            db.lock().insert_pipeline_stage(&pid, i, "implement", "m", "api", false, None, 0, None).unwrap();
+        }
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        if let Some(b) = budget {
+            db.lock().set_run_budget(&run_id, Some(b)).unwrap();
+        }
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink, Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CostRunner { cost }));
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn budget_reached_parks_the_next_stage_like_a_checkpoint() {
+        // Stage 1 costs 0.02 against a 0.01 budget — stage 2 must not start.
+        let (orch, run_id, db) = budgeted_run(2, 0.02, Some(0.01));
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done");
+        assert_eq!(stages[1].status, "awaiting_checkpoint"); // parked…
+        assert_eq!(stages[1].started_at, None);              // …without ever starting
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+        // The explanation lives in the parked stage's journal.
+        let log = db.lock().list_stage_log(&stages[1].id).unwrap();
+        assert!(
+            log.iter().any(|e| e.contains("budget reached")),
+            "expected a budget notice in stage_log, got: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_budget_checkpoint_overrides_once_then_the_gate_rearms() {
+        let (orch, run_id, db) = budgeted_run(3, 0.02, Some(0.01));
+        orch.run_to_pause(&run_id).await.unwrap();
+        // Approve: the parked stage runs regardless of the exhausted budget…
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert!((stages[1].cost_usd - 0.02).abs() < 1e-9, "stage 2 actually ran");
+        // …and the gate fires again before the FOLLOWING stage.
+        assert_eq!(stages[2].status, "awaiting_checkpoint");
+        assert_eq!(stages[2].started_at, None);
+        // Approving again completes the run.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!((run.cost_usd - 0.06).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn no_budget_never_pauses() {
+        let (orch, run_id, db) = budgeted_run(2, 0.02, None);
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages.iter().all(|s| s.status == "done"));
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_budget_checkpoint_reparks_it() {
+        // Reject is not an override: the stage resets to pending, the drive
+        // re-parks it behind the budget gate.
+        let (orch, run_id, db) = budgeted_run(2, 0.02, Some(0.01));
+        orch.run_to_pause(&run_id).await.unwrap();
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Reject { feedback: None, model_override: None })
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].status, "awaiting_checkpoint");
+        assert_eq!(stages[1].started_at, None, "the parked stage must not have run");
     }
 }
 

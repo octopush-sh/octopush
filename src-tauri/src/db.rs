@@ -340,6 +340,8 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_cost_usd REAL NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_input_tokens INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_output_tokens INTEGER NOT NULL DEFAULT 0")?;
+        // Optional per-run spend cap; NULL = no budget.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN budget_usd REAL")?;
 
         // ── v6 Direct iteration history: persisted live journals ──
         // One row per `run://log` entry (including `{"kind":"reset"}` markers),
@@ -1720,7 +1722,7 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                        reference_model, linked_issue_key, created_at, finished_at
+                        reference_model, linked_issue_key, created_at, finished_at, budget_usd
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -1732,7 +1734,7 @@ impl Db {
     pub fn list_runs(&self, workspace_id: &str) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -1794,6 +1796,15 @@ impl Db {
         self.conn.execute(
             "UPDATE runs SET cost_usd = ?2, baseline_usd = ?3 WHERE id = ?1",
             params![run_id, cost_usd, baseline_usd],
+        )?;
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the run's optional spend cap.
+    pub fn set_run_budget(&self, run_id: &str, budget_usd: Option<f64>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET budget_usd = ?2 WHERE id = ?1",
+            params![run_id, budget_usd],
         )?;
         Ok(())
     }
@@ -2219,6 +2230,9 @@ pub struct RunRow {
     pub linked_issue_key: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// Optional spend cap — the orchestrator pauses before any stage that
+    /// would start at/over it. `None` = no budget.
+    pub budget_usd: Option<f64>,
 }
 
 fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
@@ -2234,6 +2248,7 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         linked_issue_key: r.get(8)?,
         created_at: r.get(9)?,
         finished_at: r.get(10)?,
+        budget_usd: r.get(11)?,
     })
 }
 
