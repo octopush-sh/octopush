@@ -89,4 +89,100 @@ describe("BaseBranchPicker", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();
   });
+
+  describe("scroll & filter", () => {
+    const MANY = [
+      "main",
+      "feat-a",
+      "feat-b",
+      "feat-c",
+      "feat-d",
+      "fix-e",
+      "fix-f",
+      "release/1.0",
+      "release/2.0",
+    ]; // 9 branches — above the filter threshold
+
+    function openMenu(branches: string[], value = branches[0]) {
+      render(<BaseBranchPicker branches={branches} value={value} onSelect={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button"));
+    }
+
+    it("the items container scrolls (max-height + overflow) so long lists never overflow the viewport", () => {
+      openMenu(MANY);
+      const menu = screen.getByRole("menu", { name: "Choose base branch" });
+      const scroller = menu.querySelector(".overflow-y-auto");
+      expect(scroller).not.toBeNull();
+      expect(scroller!.className).toContain("max-h-[40vh]");
+      // The menuitems live inside the scroll container.
+      expect(scroller!.querySelectorAll('[role="menuitem"]')).toHaveLength(MANY.length);
+    });
+
+    it("renders a filter input when there are more than 8 branches", () => {
+      openMenu(MANY);
+      expect(screen.getByPlaceholderText("Filter branches")).toBeInTheDocument();
+    });
+
+    it("hides the filter input at 8 branches or fewer", () => {
+      openMenu(MANY.slice(0, 8));
+      expect(screen.queryByPlaceholderText("Filter branches")).toBeNull();
+    });
+
+    it("typing in the filter narrows the items case-insensitively", () => {
+      openMenu(MANY);
+      fireEvent.change(screen.getByPlaceholderText("Filter branches"), {
+        target: { value: "RELEASE" },
+      });
+      const items = screen.getAllByRole("menuitem");
+      expect(items.map((i) => i.textContent)).toEqual(["release/1.0", "release/2.0"]);
+    });
+
+    it("shows a quiet 'No branches match' line when the filter eliminates everything", () => {
+      openMenu(MANY);
+      fireEvent.change(screen.getByPlaceholderText("Filter branches"), {
+        target: { value: "zzz-nope" },
+      });
+      expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+      expect(screen.getByText("No branches match")).toBeInTheDocument();
+    });
+
+    it("clearing the filter restores the full list", () => {
+      openMenu(MANY);
+      const input = screen.getByPlaceholderText("Filter branches");
+      fireEvent.change(input, { target: { value: "release" } });
+      expect(screen.getAllByRole("menuitem")).toHaveLength(2);
+      fireEvent.change(input, { target: { value: "" } });
+      expect(screen.getAllByRole("menuitem")).toHaveLength(MANY.length);
+    });
+
+    it("the filter input keeps focus on open (it wins over the menu's first-item autofocus)", () => {
+      openMenu(MANY);
+      expect(document.activeElement).toBe(screen.getByPlaceholderText("Filter branches"));
+    });
+
+    it("ArrowDown from the filter input moves focus into the first menuitem", () => {
+      openMenu(MANY);
+      const input = screen.getByPlaceholderText("Filter branches");
+      expect(document.activeElement).toBe(input);
+      fireEvent.keyDown(window, { key: "ArrowDown" });
+      const items = screen.getAllByRole("menuitem");
+      expect(document.activeElement).toBe(items[0]);
+    });
+
+    it("scrolls the selected branch into view on open", () => {
+      const spy = vi.fn();
+      const proto = window.HTMLElement.prototype as unknown as {
+        scrollIntoView?: (opts?: unknown) => void;
+      };
+      const original = proto.scrollIntoView;
+      proto.scrollIntoView = spy;
+      try {
+        openMenu(MANY, "release/2.0");
+        expect(spy).toHaveBeenCalledWith({ block: "nearest" });
+      } finally {
+        if (original) proto.scrollIntoView = original;
+        else delete proto.scrollIntoView;
+      }
+    });
+  });
 });

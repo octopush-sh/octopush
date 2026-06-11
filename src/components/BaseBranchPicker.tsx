@@ -1,7 +1,10 @@
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, GitBranch } from "lucide-react";
 import { useMenuChrome } from "../lib/useMenuChrome";
+
+/** Above this many branches the menu pins a filter input at the top. */
+const FILTER_THRESHOLD = 8;
 
 interface Props {
   /** Local branches, repo default first (as returned by `ipc.listBranches`). */
@@ -84,6 +87,27 @@ function BranchMenu({
   onDismiss: () => void;
 }) {
   const { ref, pos } = useMenuChrome(x, y, onDismiss);
+  const [query, setQuery] = useState("");
+  const filterable = branches.length > FILTER_THRESHOLD;
+  const q = query.trim().toLowerCase();
+  const visible = q ? branches.filter((b) => b.toLowerCase().includes(q)) : branches;
+
+  // useMenuChrome focuses the first menuitem on open; when the filter input
+  // exists it must win instead. This layout effect is registered after the
+  // hook's, so it runs after it and reclaims focus for the input.
+  const inputRef = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // Bring the currently selected branch into view when the menu opens — with
+  // a long, scrollable list it could otherwise sit below the fold.
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    listRef.current
+      ?.querySelector<HTMLElement>('[data-selected="true"]')
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, []);
 
   return createPortal(
     <div
@@ -93,26 +117,47 @@ function BranchMenu({
       className="octo-menu-enter fixed z-[60] w-[224px] rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
       style={{ left: pos.left, top: pos.top, transformOrigin: "top left" }}
     >
-      {branches.map((branch) => {
-        const selected = branch === value;
-        return (
-          <button
-            key={branch}
-            type="button"
-            role="menuitem"
-            title={branch}
-            onClick={() => onSelect(branch)}
-            className={`flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass ${
-              selected ? "text-octo-brass" : "text-octo-sage"
-            }`}
-          >
-            <span className="flex w-3 shrink-0 items-center justify-center">
-              {selected && <Check size={12} className="text-octo-brass" />}
-            </span>
-            <span className="truncate">{branch}</span>
-          </button>
-        );
-      })}
+      {filterable && (
+        <div className="border-b border-octo-hairline px-3 pb-1.5 pt-0.5">
+          <input
+            ref={inputRef}
+            autoFocus
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter branches"
+            aria-label="Filter branches"
+            className="w-full bg-transparent font-mono text-[11px] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute"
+          />
+        </div>
+      )}
+      <div ref={listRef} className="max-h-[40vh] overflow-y-auto">
+        {visible.map((branch) => {
+          const selected = branch === value;
+          return (
+            <button
+              key={branch}
+              type="button"
+              role="menuitem"
+              title={branch}
+              data-selected={selected || undefined}
+              onClick={() => onSelect(branch)}
+              className={`flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass ${
+                selected ? "text-octo-brass" : "text-octo-sage"
+              }`}
+            >
+              <span className="flex w-3 shrink-0 items-center justify-center">
+                {selected && <Check size={12} className="text-octo-brass" />}
+              </span>
+              <span className="truncate">{branch}</span>
+            </button>
+          );
+        })}
+        {visible.length === 0 && (
+          <div className="px-3 py-2 font-mono text-[11px] text-octo-mute">
+            No branches match
+          </div>
+        )}
+      </div>
     </div>,
     document.body,
   );
