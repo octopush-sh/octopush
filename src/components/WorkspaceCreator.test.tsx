@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { WorkspaceCreator } from "./WorkspaceCreator";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import * as ipcModule from "../lib/ipc";
 import type { Workspace } from "../lib/types";
 
@@ -42,6 +43,8 @@ const mockWorkspace: Workspace = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
+  useCompanionPrefs.setState({ setupScriptByProject: {} });
   // Default: create resolves with the mock workspace
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
   vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
@@ -316,6 +319,69 @@ describe("WorkspaceCreator", () => {
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][4]).toBe("main");
+    });
+  });
+
+  describe("per-project setup-script template", () => {
+    function renderCreator(onCreated = vi.fn()) {
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask="Add dark mode"
+        />
+      );
+      return onCreated;
+    }
+
+    it("prefills step II with the project's last-used setup script", async () => {
+      useCompanionPrefs.setState({
+        setupScriptByProject: { "proj-1": "npm install && npm run prepare" },
+      });
+      renderCreator();
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      expect(textarea.value).toBe("npm install && npm run prepare");
+    });
+
+    it("leaves step II empty when the project has no remembered script", async () => {
+      renderCreator();
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      expect(textarea.value).toBe("");
+    });
+
+    it("saves the script (even empty) back to the store on successful create", async () => {
+      useCompanionPrefs.setState({
+        setupScriptByProject: { "proj-1": "old script" },
+      });
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "" } });
+      fireEvent.click(screen.getByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBe("");
+    });
+
+    it("does not save the script when creation fails", async () => {
+      const mockCreate = vi.fn().mockRejectedValue(new Error("boom"));
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      renderCreator();
+
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "make setup" } });
+      fireEvent.click(screen.getByText("Begin"));
+
+      await screen.findByText(/boom/);
+      expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBeUndefined();
     });
   });
 

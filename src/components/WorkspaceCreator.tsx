@@ -4,6 +4,7 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { BrassRule } from "./BrassRule";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 
 interface Props {
@@ -40,7 +41,11 @@ function slugify(text: string): string {
 export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [task, setTask] = useState(initialTask ?? "");
-  const [setupScript, setSetupScript] = useState("");
+  // Step II prefills with the project's last-used setup script (saved back on
+  // successful create — a remembered template, not a live binding).
+  const [setupScript, setSetupScript] = useState(
+    () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
+  );
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
@@ -96,6 +101,8 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       setCreating(false);
       return;
     }
+    // Remember the script (possibly empty) as this project's template.
+    useCompanionPrefs.getState().setSetupScriptForProject(projectId, setupScript);
     if (linkIssueKeyOnCreate) {
       try {
         await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
