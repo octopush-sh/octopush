@@ -30,6 +30,7 @@ function makeStage(overrides = {}) {
     loopMaxIterations: 0,
     loopMode: null as null,
     loopIterations: 0,
+    diffSnapshot: null,
     ...overrides,
   };
 }

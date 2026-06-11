@@ -81,6 +81,8 @@ export interface RunStage {
   loopMaxIterations: number;
   loopMode: "gated" | "auto" | null;
   loopIterations: number;
+  /** Worktree diff captured when the stage finished; null for legacy runs. */
+  diffSnapshot: string | null;
 }
 export interface RunDetail {
   run: Run | null;
@@ -107,6 +109,8 @@ export interface StageIteration {
   /** The feedback that sent this attempt back (recorded on the review row). */
   closingFeedback: string | null;
   createdAt: string;
+  /** The worktree diff as THIS attempt saw it; null for pre-snapshot archives. */
+  diffSnapshot: string | null;
 }
 
 /** One live-activity entry streamed on `run://log` (see RUN_EVENTS.log). */

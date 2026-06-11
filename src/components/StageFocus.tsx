@@ -89,6 +89,20 @@ function buildJournalItems(entries: LiveEntry[]): ReactElement[] {
   return items;
 }
 
+/** A finished stage's frozen worktree diff. The label is deliberately honest:
+ *  the snapshot is the cumulative worktree state when the stage finished, not
+ *  the stage's isolated contribution. */
+function SnapshotDiff({ diff }: { diff: string }) {
+  return (
+    <>
+      <div className="mt-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
+        worktree when this stage finished
+      </div>
+      <DiffViewer diff={diff} />
+    </>
+  );
+}
+
 interface Props {
   stage: RunStage | null;
   workspacePath: string;
@@ -114,9 +128,14 @@ export function StageFocus({ stage, workspacePath }: Props) {
     }
   }, [stage?.artifact]);
 
+  // A terminal stage with a captured snapshot renders the frozen diff instead —
+  // the live worktree keeps mutating under later stages, so we never fetch it.
+  const terminal = stage?.status === "done" || stage?.status === "failed";
+  const snapshot = terminal ? stage?.diffSnapshot ?? null : null;
+
   useEffect(() => {
     let cancelled = false;
-    if (stage && artifact?.refsWorktree && workspacePath) {
+    if (stage && artifact?.refsWorktree && workspacePath && snapshot == null) {
       setDiff("");
       setDiffLoading(true);
       ipc.getGitDiff(workspacePath)
@@ -127,7 +146,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
       setDiffLoading(false);
     }
     return () => { cancelled = true; };
-  }, [stage?.id, stage?.status, artifact?.refsWorktree, workspacePath]);
+  }, [stage?.id, stage?.status, snapshot, artifact?.refsWorktree, workspacePath]);
 
   // Looking at a different stage = back to its current attempt.
   useEffect(() => { setViewedAttempt(null); }, [stage?.id]);
@@ -249,6 +268,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
                   {parseArtifactText(viewedRow.artifact) || "(no output text)"}
                 </div>
               )}
+              {viewedRow.diffSnapshot != null && <SnapshotDiff diff={viewedRow.diffSnapshot} />}
               <div className="octo-tabular font-mono text-[11px] text-octo-mute">
                 ${viewedRow.costUsd.toFixed(2)}
               </div>
@@ -271,19 +291,24 @@ export function StageFocus({ stage, workspacePath }: Props) {
                 <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
               </div>
               {journal.length > 0 && <div className="flex flex-col gap-2">{journal}</div>}
+              {snapshot != null && <SnapshotDiff diff={snapshot} />}
             </>
           ) : mode === "artifact" ? (
             <>
               <div className="whitespace-pre-wrap">
                 {artifact!.text || "(no output text)"}
                 {artifact!.refsWorktree && (
-                  <FadeSwap swapKey={diffLoading ? "loading" : "diff"}>
-                    {diffLoading ? (
-                      <div className="py-4 font-mono text-xs text-octo-mute">fetching the diff…</div>
-                    ) : (
-                      <DiffViewer diff={diff} />
-                    )}
-                  </FadeSwap>
+                  snapshot != null ? (
+                    <SnapshotDiff diff={snapshot} />
+                  ) : (
+                    <FadeSwap swapKey={diffLoading ? "loading" : "diff"}>
+                      {diffLoading ? (
+                        <div className="py-4 font-mono text-xs text-octo-mute">fetching the diff…</div>
+                      ) : (
+                        <DiffViewer diff={diff} />
+                      )}
+                    </FadeSwap>
+                  )
                 )}
               </div>
               {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
