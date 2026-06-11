@@ -442,7 +442,7 @@ function WorkspaceJumpChip({
       }}
       // Expands on row hover AND keyboard focus within the row (the chip's
       // own focus-visible included), so it isn't a mouse-only affordance.
-      className="flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent p-0 transition-all duration-[200ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:brightness-110 group-hover:w-auto group-hover:justify-start group-hover:border-[color:var(--tint-bd)] group-hover:bg-[color:var(--tint-bg)] group-hover:px-[7px] group-hover:py-[2px] group-focus-within:w-auto group-focus-within:justify-start group-focus-within:border-[color:var(--tint-bd)] group-focus-within:bg-[color:var(--tint-bg)] group-focus-within:px-[7px] group-focus-within:py-[2px] focus-visible:w-auto focus-visible:justify-start focus-visible:border-[color:var(--tint-bd)] focus-visible:bg-[color:var(--tint-bg)] focus-visible:px-[7px] focus-visible:py-[2px]"
+      className="flex h-[14px] w-[14px] flex-shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent p-0 transition-[width,padding,background-color,border-color,filter] duration-[200ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] hover:brightness-110 group-hover:w-auto group-hover:justify-start group-hover:border-[color:var(--tint-bd)] group-hover:bg-[color:var(--tint-bg)] group-hover:px-[7px] group-hover:py-[2px] group-focus-within:w-auto group-focus-within:justify-start group-focus-within:border-[color:var(--tint-bd)] group-focus-within:bg-[color:var(--tint-bg)] group-focus-within:px-[7px] group-focus-within:py-[2px] focus-visible:w-auto focus-visible:justify-start focus-visible:border-[color:var(--tint-bd)] focus-visible:bg-[color:var(--tint-bg)] focus-visible:px-[7px] focus-visible:py-[2px]"
       style={
         {
           color: accent,
@@ -460,9 +460,9 @@ function WorkspaceJumpChip({
       />
       <GitBranch
         size={11}
-        className="ml-0 w-0 opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:w-[11px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:w-[11px] group-focus-within:opacity-100"
+        className="ml-0 w-0 opacity-0 transition-[margin-left,width,opacity] duration-[200ms] group-hover:ml-[5px] group-hover:w-[11px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:w-[11px] group-focus-within:opacity-100"
       />
-      <span className="ml-0 max-w-0 overflow-hidden truncate font-mono text-[10px] leading-none opacity-0 transition-all duration-[200ms] group-hover:ml-[5px] group-hover:max-w-[120px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:max-w-[120px] group-focus-within:opacity-100">
+      <span className="ml-0 max-w-0 overflow-hidden truncate font-mono text-[10px] leading-none opacity-0 transition-[margin-left,max-width,opacity] duration-[200ms] group-hover:ml-[5px] group-hover:max-w-[120px] group-hover:opacity-100 group-focus-within:ml-[5px] group-focus-within:max-w-[120px] group-focus-within:opacity-100">
         {workspace.name}
       </span>
     </button>

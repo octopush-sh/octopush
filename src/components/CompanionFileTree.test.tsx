@@ -518,6 +518,50 @@ describe("CompanionFileTree", () => {
     expect(screen.getByText("Helper.java")).toBeInTheDocument();
   });
 
+  it("restores a workspace's expansion when switching away and back (A→B→A)", async () => {
+    const OTHER = "/other";
+    mockReadDirectory.mockImplementation((path: string) => {
+      if (path === ROOT) return Promise.resolve(ROOT_CHILDREN);
+      if (path === "/repo/src") return Promise.resolve(SRC_CHILDREN);
+      if (path === OTHER) {
+        return Promise.resolve([
+          { name: "lib", path: "/other/lib", isDir: true, isIgnored: false },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const { rerender } = render(
+      <CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />,
+    );
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+
+    // Switch to workspace B — B starts fresh at its own root.
+    rerender(
+      <CompanionFileTree rootPath={OTHER} rootLabel="other-project" changedPaths={new Set()} />,
+    );
+    await waitFor(() => expect(screen.getByText("lib")).toBeInTheDocument());
+    expect(screen.queryByText("Main.java")).not.toBeInTheDocument();
+
+    // Switch back to A — src/ is still expanded; its children render from
+    // A's cached snapshot (a silent revalidate refetch is fine).
+    rerender(
+      <CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />,
+    );
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+    expect(screen.getByText("Helper.java")).toBeInTheDocument();
+
+    // And B's snapshot survived the return trip too (not clobbered by the
+    // write-back racing the root switch).
+    rerender(
+      <CompanionFileTree rootPath={OTHER} rootLabel="other-project" changedPaths={new Set()} />,
+    );
+    await waitFor(() => expect(screen.getByText("lib")).toBeInTheDocument());
+    expect(screen.queryByText("src")).not.toBeInTheDocument();
+  });
+
   it("Shift+F10 opens the context menu for the focused row", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => expect(screen.getByText("pom.xml")).toBeInTheDocument());

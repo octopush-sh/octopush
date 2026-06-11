@@ -39,6 +39,37 @@ describe("ModalShell focus management", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it("does not steal focus from an autoFocus child, and still restores the opener", () => {
+    function AutoFocusHarness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>
+            open it
+          </button>
+          {open && (
+            <ModalShell onClose={() => setOpen(false)} ariaLabel="AF dialog">
+              <input autoFocus data-testid="af" />
+            </ModalShell>
+          )}
+        </>
+      );
+    }
+    render(<AutoFocusHarness />);
+    const trigger = screen.getByRole("button", { name: "open it" });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    // The child's autoFocus wins — the shell must not yank focus to itself.
+    expect(document.activeElement).toBe(screen.getByTestId("af"));
+
+    // And the recorded opener is the trigger (not the dialog's own input):
+    // closing hands focus back to it.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("traps Tab within the dialog", () => {
     render(<Harness />);
     fireEvent.click(screen.getByRole("button", { name: "open it" }));

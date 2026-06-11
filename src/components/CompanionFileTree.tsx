@@ -82,11 +82,12 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
       if (!opts?.force && children[path] && children[path] !== "error") return; // already cached
       const gen = genRef.current;
       // Stale-while-revalidate: when force-refetching a path that already has
-      // entries, keep the old rows visible until the new data lands.
-      const hasData = Array.isArray(children[path]);
-      if (!hasData) {
-        setChildren((prev) => ({ ...prev, [path]: "loading" }));
-      }
+      // entries, keep the old rows visible until the new data lands. Checked
+      // via functional update — the closure's `children` can be stale right
+      // after a root-switch cache hydration (same effect pass).
+      setChildren((prev) =>
+        Array.isArray(prev[path]) ? prev : { ...prev, [path]: "loading" },
+      );
       try {
         const entries = await ipc.readDirectory(path, showIgnored);
         if (genRef.current !== gen) return; // toggle flipped mid-flight; discard
@@ -104,10 +105,11 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
 
   // (Re)load on mount, on workspace switch, and when the show-ignored toggle
   // flips: bump the generation (discarding in-flight responses) and
-  // force-refetch. A workspace switch drops the cache (old data is invalid)
-  // and resets expansion to the new root alone; a toggle keeps the cache and
-  // revalidates every expanded folder in place — old rows stay visible until
-  // fresh entries land (no full-tree flash).
+  // force-refetch. A workspace switch hydrates the destination's cached
+  // snapshot (so A→B→A keeps A's expansion) and revalidates every expanded
+  // folder; without a snapshot it resets to the new root alone. A toggle
+  // keeps the cache and revalidates every expanded folder in place — old
+  // rows stay visible until fresh entries land (no full-tree flash).
   useEffect(() => {
     const firstRun = !didInitRef.current;
     didInitRef.current = true;
@@ -115,11 +117,20 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     const rootChanged = prevRootRef.current !== rootPath;
     prevRootRef.current = rootPath;
     if (rootChanged) {
-      setChildren({});
+      const cached = treeStateCache.get(rootPath);
+      // Children (and the focus target, which must point at a rendered row)
+      // are only reusable when they were fetched under the current
+      // show-ignored setting — same rule as the initial-mount hydration.
+      const sameIgnored = cached !== undefined && cached.showIgnored === showIgnored;
       setMenu(null);
-      setExpanded(new Set([rootPath]));
-      setFocusedPath(rootPath);
-      void fetchChildren(rootPath, { force: true });
+      setExpanded(cached ? new Set(cached.expanded) : new Set([rootPath]));
+      setChildren(sameIgnored ? cached.children : {});
+      setFocusedPath(sameIgnored ? cached.focusedPath : rootPath);
+      const toRevalidate = new Set(cached ? cached.expanded : []);
+      toRevalidate.add(rootPath);
+      for (const p of toRevalidate) {
+        void fetchChildren(p, { force: true });
+      }
       return;
     }
     // Toggling ignored files OFF may hide the focused row; reset the roving

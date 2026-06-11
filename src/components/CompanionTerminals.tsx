@@ -65,7 +65,9 @@ export function CompanionTerminals({ workspaceId }: Props) {
           <Plus size={12} />
         </button>
       </div>
-      <ul className="mt-2 space-y-1">
+      {/* Body inset matches CompanionFileTree's (px-2 py-2) — the bar above
+          stays full-bleed. */}
+      <ul className="space-y-1 px-2 py-2">
         {terminals.length === 0 && (
           <li className="px-2 py-1 text-[11px] text-octo-mute">No active terminals.</li>
         )}

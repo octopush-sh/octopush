@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface Props {
   /** Close handler (Escape, and backdrop click when closeOnBackdrop). */
@@ -37,6 +37,10 @@ export function ModalShell({
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const dialogRef = useRef<HTMLDivElement | null>(null);
+  // The element to hand focus back to on close. Captured at first render —
+  // before React applies any child's `autoFocus` — so it records the real
+  // opener (the trigger), not the dialog's own input.
+  const [opener] = useState<Element | null>(() => document.activeElement);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -49,15 +53,17 @@ export function ModalShell({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Focus management: move focus into the dialog on mount, hand it back to
-  // whatever opened it on unmount (if that element is still in the DOM).
+  // Focus management: move focus into the dialog on mount — unless a child
+  // already claimed it (e.g. an `autoFocus` input, which React focuses before
+  // this effect runs) — and hand it back to the opener on unmount (if that
+  // element is still in the DOM).
   useEffect(() => {
-    const opener =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    dialogRef.current?.focus();
+    const root = dialogRef.current;
+    if (root && !root.contains(document.activeElement)) root.focus();
     return () => {
-      if (opener && opener.isConnected) opener.focus();
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Tab trap: keep Tab / Shift+Tab cycling inside the dialog.

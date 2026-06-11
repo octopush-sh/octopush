@@ -128,16 +128,17 @@ export function Companion({
           persist across modes. flex/min-h-0/flex-1/flex-col preserve the
           review file-tree's h-full height chain. */}
       <FadeSwap swapKey={mode} className="flex min-h-0 flex-1 flex-col">
+        {/* Sections are full-bleed so their h-11 eyebrow bars (border-b
+            included) align edge-to-edge with the Review/Direct bars — body
+            insets live inside each panel, not on this wrapper. */}
         {mode === "talk" && (
-          <div className="flex flex-col gap-4 p-4">
+          <div className="flex flex-col">
             <CompanionHistory {...historyProps} />
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
           </div>
         )}
         {mode === "run" && workspaceId && (
-          <div className="p-4">
-            <CompanionTerminals workspaceId={workspaceId} />
-          </div>
+          <CompanionTerminals workspaceId={workspaceId} />
         )}
         {mode === "review" && (
           <div className="flex min-h-0 flex-1 flex-col">

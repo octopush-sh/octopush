@@ -26,39 +26,47 @@ export function CompanionContext({
   const spendingRows = buildSpendingRows(budgets, spend, workspaceId ?? "");
 
   return (
-    <section>
-      <h3 className="border-b border-octo-hairline pb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-        Context
-      </h3>
-      <div className="mt-2 space-y-1.5 text-[11px] text-octo-sage">
-        <Row label="tokens" value={`${formatThousands(tokensUsed)} / ${formatThousands(tokensLimit)}`} brass />
-        <div
-          className="h-[3px] rounded-sm"
-          style={{ background: "var(--color-octo-hairline)" }}
-        >
-          <div
-            className="h-full rounded-sm transition-[width] duration-[220ms]"
-            style={{ width: `${pct}%`, background: "var(--color-octo-brass)" }}
-          />
-        </div>
-        <Row label="unstaged" value={String(unstaged)} />
-        <Row label="tool calls" value={String(toolCalls)} />
+    <section className="border-t border-octo-hairline">
+      {/* Canonical eyebrow bar — full-bleed, converges on the
+          CompanionFileTree/CompanionHistory chrome. */}
+      <div className="flex h-11 shrink-0 items-center border-b border-octo-hairline px-4">
+        <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+          Context
+        </h3>
       </div>
-
-      {/* Spending block — rendered only when a budget exists; budget setup
-          lives in Settings, so an empty section earns no space here. */}
-      {spendingRows.length > 0 && (
-        <div className="mt-4">
-          <h3 className="border-b border-octo-hairline pb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-            Spending
-          </h3>
-          <div className="mt-2 space-y-2.5">
-            {spendingRows.map((row) => (
-              <SpendRow key={row.key} row={row} />
-            ))}
+      <div className="px-4 py-3">
+        <div className="space-y-1.5 text-[11px] text-octo-sage">
+          <Row label="tokens" value={`${formatThousands(tokensUsed)} / ${formatThousands(tokensLimit)}`} brass />
+          <div
+            className="h-[3px] rounded-sm"
+            style={{ background: "var(--color-octo-hairline)" }}
+          >
+            <div
+              className="h-full rounded-sm transition-[width] duration-[220ms]"
+              style={{ width: `${pct}%`, background: "var(--color-octo-brass)" }}
+            />
           </div>
+          <Row label="unstaged" value={String(unstaged)} />
+          <Row label="tool calls" value={String(toolCalls)} />
         </div>
-      )}
+
+        {/* Spending block — rendered only when a budget exists; budget setup
+            lives in Settings, so an empty section earns no space here. A
+            quieter sub-eyebrow (mute, no rule): the canonical brass bar above
+            owns the section, this just labels a sub-group inside the body. */}
+        {spendingRows.length > 0 && (
+          <div className="mt-4">
+            <h4 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+              Spending
+            </h4>
+            <div className="mt-2 space-y-2.5">
+              {spendingRows.map((row) => (
+                <SpendRow key={row.key} row={row} />
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     </section>
   );
 }

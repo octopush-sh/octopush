@@ -19,6 +19,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 --color-octo-mute:      #6d6354;  /* labels, meta */
 --color-octo-verdigris: #8fc9a8;  /* success / diff adds */
 --color-octo-rouge:     #d18b8b;  /* error / diff dels */
+--color-octo-warning:   #dfae4a;  /* amber — warning/caution, never the accent */
 ```
 
 **Alpha utilities:**
