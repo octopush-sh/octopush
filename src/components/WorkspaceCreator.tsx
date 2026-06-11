@@ -45,6 +45,8 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
   const [base, setBase] = useState<string | null>(null);
+  /** Explicit branch name typed by the user. null = follow the task slug. */
+  const [branchOverride, setBranchOverride] = useState<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
 
@@ -75,9 +77,10 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [creating, onCancel]);
 
-  const branch = slugify(task) || "new-workspace";
+  const branch = branchOverride ?? (slugify(task) || "new-workspace");
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
+  const branchCollides = branches.includes(branch);
 
   async function handleCreate() {
     if (!taskValid) return;
@@ -175,13 +178,32 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 />
               </Field>
 
-              {/* Branch preview */}
+              {/* Branch preview — the value is quietly editable */}
               <div className="mt-4 flex items-baseline gap-2 font-mono text-[10px] uppercase tracking-[0.2em]">
                 <span className="text-octo-mute">BRANCH</span>
-                <span className="text-octo-brass">{branch}</span>
+                <input
+                  value={branch}
+                  onChange={(e) => setBranchOverride(e.target.value)}
+                  onBlur={() => {
+                    if (branchOverride === null) return;
+                    const cleaned = slugify(branchOverride);
+                    setBranchOverride(cleaned || null);
+                  }}
+                  title="Branch name — edit to override the suggested slug"
+                  aria-label="Branch name"
+                  className="rounded-none border-b border-transparent bg-transparent font-mono text-[10px] normal-case tracking-[0.2em] text-octo-brass outline-none transition-colors duration-[220ms] focus:border-octo-brass"
+                  style={{
+                    width: `calc(${Math.max(branch.length, 4)}ch + ${Math.max(branch.length, 4) * 0.2}em)`,
+                  }}
+                />
                 <span className="text-octo-mute">from</span>
                 <BaseBranchPicker branches={branches} value={base} onSelect={setBase} />
               </div>
+              {branchCollides && (
+                <div className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-rouge">
+                  Branch exists — the workspace will reuse it
+                </div>
+              )}
             </div>
 
             <div className="mt-10 flex items-center gap-3">
