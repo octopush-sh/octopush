@@ -41,7 +41,7 @@ Status Index → open that stream's spec/plan → branch `feat/review-g<N>-<slug
 | G2 Editor Reliability | slice 1 done (merged to main, PR #18) | [design](../specs/2026-06-09-review-g2-editor-reliability-design.md) | [plan](2026-06-09-review-g2-editor-reliability.md) | merged |
 | G4 Staging & Commit | slice 1 done (merged to main, PR #20) | [design](../specs/2026-06-09-review-g4-staging-commit-design.md) | [plan](2026-06-09-review-g4-staging-commit.md) | merged |
 | G7 Git Operations Depth | slice 1 done (merged to main, PR #24) | [design](../specs/2026-06-09-review-g7-git-ops-design.md) | [plan](2026-06-09-review-g7-git-ops.md) | merged |
-| G6 File Explorer | not started | — | — | — |
+| G6 File Explorer | slice 1 done (merged to main, PR #29) | [design](../specs/2026-06-09-review-g6-file-explorer-design.md) | [plan](2026-06-09-review-g6-file-explorer.md) | merged |
 
 States: `not started` → `brainstorming` → `spec'd` → `planned` → `in progress` → `done (merged to trunk)`.
 
@@ -86,7 +86,10 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **Slice V — Advanced:** reset (soft/mixed/hard, guarded); clean untracked; cherry-pick; tags.
 - **Review notes:** expand the per-workspace `git_lock` to stage/unstage/discard (G7-s1 covers only pull/fetch/commit/amend); `aheadBehindKnown=false` currently conflates timeout with no-upstream (both hide the badge — fine, but a distinct signal would be cleaner); fetch/pull use sync `std::process::Command` in async fns (pre-existing pattern; `tokio::process` later).
 
----
+**From G6 slice 1 (deferred — slices II–III + review debt):**
+- **Slice II — File operations:** rename / new file / new folder / delete (new Rust commands + confirm flows) from the tree context menu. Prereq noted in review: the tree's cache has no external invalidation entry point — file ops (and agent runs creating files) need an `invalidate(path)` hook or a small store.
+- **Slice III — Scale & navigate:** filter/search in the tree; virtualization for huge trees. (Arrow-key nav + roving tabindex + Shift+F10 already shipped in slice 1's review round.)
+- **Review debt (cross-cutting, from the PR #29 review):** consolidate the 3 menu positioning idioms — `useMenuChrome` should own portal+fixed+z so Project/Workspace/FileTree menus stop diverging (ITEM/SEP strings now have 3 copies too; extract to a shared module or `<MenuItem>`); shared `copyToClipboard(text, title)` util (4th copy shipped, semantics already diverged on no-clipboard contexts); 3 extension tables in `src/lib` (fileIcons / languageDetection / editorLang) need one `getExtension()` + reconciled lists; `walk_one_level`'s walker config is the 3rd copy in commands.rs (list_workspace_files / search_workspace_text — extract a shared builder); per-workspace persisted prefs use 3 key schemes across stores (only workspaceStore prunes — `showIgnoredFiles` keys by rootPath, deletes on toggle-off but recycled paths can inherit an ON pref).
 
 ## Independence model (read first)
 
