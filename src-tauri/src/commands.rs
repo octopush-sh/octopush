@@ -1956,13 +1956,80 @@ pub struct DirectoryEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub is_ignored: bool,
 }
 
-/// Read one level of a directory, respecting `.gitignore`.
+/// One level of `base`: entry paths only (root itself and `.git` excluded).
+/// `apply_ignore_filters = true` is today's behavior (gitignore rules on);
+/// `false` disables every ignore source so gitignored entries appear too.
+fn walk_one_level(base: &std::path::Path, apply_ignore_filters: bool) -> Vec<std::path::PathBuf> {
+    let mut builder = ignore::WalkBuilder::new(base);
+    builder
+        .max_depth(Some(1))
+        .standard_filters(apply_ignore_filters)
+        .require_git(false) // apply .gitignore rules even outside a git repo
+        .hidden(false); // include dot-files like .gitignore itself (both modes)
+    let mut out = Vec::new();
+    for result in builder.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if entry.path().file_name().map(|n| n == ".git").unwrap_or(false) {
+            continue;
+        }
+        out.push(entry.path().to_path_buf());
+    }
+    out
+}
+
+/// Build a gitignore matcher for `base`, honoring every `.gitignore` from the
+/// repository root (nearest ancestor containing `.git`, or `base` itself when
+/// outside a repo) down to `base`, plus `.git/info/exclude`. Used by
+/// `read_directory`'s show-ignored mode to flag entries without a second walk.
+fn build_ignore_matcher(base: &std::path::Path) -> ignore::gitignore::Gitignore {
+    // Find the repo root: nearest ancestor (including base) containing `.git`
+    // (a dir in normal checkouts, a file in linked worktrees).
+    let root = base
+        .ancestors()
+        .find(|a| a.join(".git").exists())
+        .unwrap_or(base);
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    // Add .gitignore files from root down to base (outermost first; deeper
+    // files take precedence, matching git's semantics).
+    let dirs: Vec<&std::path::Path> = base
+        .ancestors()
+        .take_while(|a| a.starts_with(root))
+        .collect();
+    for dir in dirs.iter().rev() {
+        let gi = dir.join(".gitignore");
+        if gi.is_file() {
+            builder.add(gi);
+        }
+    }
+    let exclude = root.join(".git").join("info").join("exclude");
+    if exclude.is_file() {
+        builder.add(exclude);
+    }
+    builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
+/// Read one level of a directory. By default `.gitignore` rules apply (today's
+/// behavior). With `show_ignored = Some(true)`, a single unfiltered walk runs
+/// and each entry is flagged `is_ignored` via a gitignore matcher that honors
+/// every `.gitignore` from the repo root down to `base` (so children of an
+/// ignored directory are flagged too, and there is no two-walk race).
 /// Directories are returned first (alphabetical), then files (alphabetical).
 /// `.git` is always excluded.
 #[tauri::command]
-pub async fn read_directory(path: String) -> AppResult<Vec<DirectoryEntry>> {
+pub async fn read_directory(
+    path: String,
+    show_ignored: Option<bool>,
+) -> AppResult<Vec<DirectoryEntry>> {
     let path = expand_tilde(&path);
     let base = std::path::Path::new(&path);
 
@@ -1973,50 +2040,40 @@ pub async fn read_directory(path: String) -> AppResult<Vec<DirectoryEntry>> {
         return Err(AppError::Other(format!("Not a directory: {}", path)));
     }
 
+    // (path, is_ignored) pairs for this level.
+    let entries: Vec<(std::path::PathBuf, bool)> = if show_ignored.unwrap_or(false) {
+        let matcher = build_ignore_matcher(base);
+        walk_one_level(base, false)
+            .into_iter()
+            .map(|p| {
+                let is_dir = p.is_dir();
+                let ignored = matcher
+                    .matched_path_or_any_parents(&p, is_dir)
+                    .is_ignore();
+                (p, ignored)
+            })
+            .collect()
+    } else {
+        walk_one_level(base, true)
+            .into_iter()
+            .map(|p| (p, false))
+            .collect()
+    };
+
     let mut dirs: Vec<DirectoryEntry> = Vec::new();
     let mut files: Vec<DirectoryEntry> = Vec::new();
-
-    // WalkBuilder with max_depth(1) gives us the root entry + its direct children.
-    // standard_filters(true) enables .gitignore, .ignore, hidden-file filtering.
-    // We add_custom_ignore_filename(".gitignore") is already included in standard_filters.
-    let walker = ignore::WalkBuilder::new(base)
-        .max_depth(Some(1))
-        .standard_filters(true)
-        .require_git(false) // apply .gitignore rules even outside a git repo
-        .hidden(false) // include dot-files like .gitignore itself; gitignore rules handle exclusions
-        .build();
-
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // Skip the root itself (depth 0).
-        if entry.depth() == 0 {
-            continue;
-        }
-
-        let entry_path = entry.path();
+    for (entry_path, is_ignored) in entries {
         let name = entry_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-
-        // Always skip .git directory.
-        if name == ".git" {
-            continue;
-        }
-
-        let abs_path = entry_path.to_string_lossy().into_owned();
         let is_dir = entry_path.is_dir();
-
         let de = DirectoryEntry {
             name,
-            path: abs_path,
+            path: entry_path.to_string_lossy().into_owned(),
             is_dir,
+            is_ignored,
         };
-
         if is_dir {
             dirs.push(de);
         } else {

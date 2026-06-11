@@ -337,7 +337,8 @@ export const ipc = {
     invoke<{ mtime: number }>("write_file", { path, content }),
 
   // ─── Directory listing ─────────────────────────────────────────
-  readDirectory: (path: string) => invoke<DirectoryEntry[]>("read_directory", { path }),
+  readDirectory: (path: string, showIgnored?: boolean) =>
+    invoke<DirectoryEntry[]>("read_directory", { path, showIgnored }),
 
   // ─── Budgets ──────────────────────────────────────────────────
   listBudgets: () => invoke<Budget[]>("list_budgets"),

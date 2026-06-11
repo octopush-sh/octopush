@@ -1408,7 +1408,7 @@ mod read_directory_tests {
         fs::write(tmp.path().join("ignored.txt"), "nope").unwrap();
         fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
 
-        let entries = read_directory(root).await.expect("should succeed");
+        let entries = read_directory(root, None).await.expect("should succeed");
 
         // Should NOT include ignored.txt or .git
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1432,7 +1432,7 @@ mod read_directory_tests {
 
     #[tokio::test]
     async fn returns_error_for_nonexistent_path() {
-        let result = read_directory("/nonexistent/path/abc123".to_string()).await;
+        let result = read_directory("/nonexistent/path/abc123".to_string(), None).await;
         assert!(result.is_err(), "should return error for missing directory");
     }
 
@@ -1443,13 +1443,102 @@ mod read_directory_tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("deep.txt"), "x").unwrap();
 
-        let entries = read_directory(tmp.path().to_string_lossy().to_string())
+        let entries = read_directory(tmp.path().to_string_lossy().to_string(), None)
             .await
             .unwrap();
 
         // Should only see "a", not "a/b" or "a/b/deep.txt"
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn show_ignored_includes_and_flags_gitignored_entries() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("target")).unwrap();
+        fs::write(tmp.path().join("target").join("app.war"), "x").unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join(".gitignore"), "target/\nsecret.txt\n").unwrap();
+        fs::write(tmp.path().join("secret.txt"), "s").unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+
+        // Default mode: target absent, nothing flagged.
+        let entries = read_directory(root.clone(), None).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"target"), "default mode must hide gitignored dirs");
+        assert!(!names.contains(&"secret.txt"), "default mode must hide gitignored files");
+        assert!(entries.iter().all(|e| !e.is_ignored), "default mode never flags");
+
+        // Show-ignored mode: target present, flagged, still sorted dirs-first.
+        let entries = read_directory(root, Some(true)).await.unwrap();
+        let target = entries
+            .iter()
+            .find(|e| e.name == "target")
+            .expect("target must be visible in show-ignored mode");
+        assert!(target.is_ignored, "target must be flagged ignored");
+        assert!(target.is_dir);
+        let secret = entries
+            .iter()
+            .find(|e| e.name == "secret.txt")
+            .expect("secret.txt visible");
+        assert!(secret.is_ignored, "gitignored plain file must be flagged");
+        assert!(!secret.is_dir);
+        let main = entries.iter().find(|e| e.name == "main.rs").unwrap();
+        assert!(!main.is_ignored, "tracked files must not be flagged");
+        assert!(entries[0].is_dir, "dirs still sort before files");
+    }
+
+    #[tokio::test]
+    async fn git_dir_excluded_in_both_modes() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".git").join("HEAD"), "ref").unwrap();
+        fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+
+        for mode in [None, Some(false), Some(true)] {
+            let entries = read_directory(root.clone(), mode).await.unwrap();
+            assert!(
+                entries.iter().all(|e| e.name != ".git"),
+                ".git must be excluded for mode {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn children_of_ignored_dir_are_flagged() {
+        let tmp = TempDir::new().unwrap();
+        // Simulate a repo root: .git dir + .gitignore with target/
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        fs::create_dir(tmp.path().join("target")).unwrap();
+        fs::write(tmp.path().join("target").join("app.war"), "x").unwrap();
+        fs::create_dir(tmp.path().join("target").join("classes")).unwrap();
+
+        // Listing INSIDE the ignored dir: everything must be flagged.
+        let inside = tmp.path().join("target").to_string_lossy().to_string();
+        let entries = read_directory(inside, Some(true)).await.unwrap();
+        let war = entries.iter().find(|e| e.name == "app.war").expect("war visible");
+        assert!(war.is_ignored, "file inside gitignored dir must be flagged");
+        let classes = entries.iter().find(|e| e.name == "classes").expect("classes visible");
+        assert!(classes.is_ignored, "dir inside gitignored dir must be flagged");
+    }
+
+    #[tokio::test]
+    async fn nested_gitignore_rules_apply() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub").join(".gitignore"), "gen.txt\n").unwrap();
+        fs::write(tmp.path().join("sub").join("gen.txt"), "g").unwrap();
+        fs::write(tmp.path().join("sub").join("src.txt"), "s").unwrap();
+
+        let sub = tmp.path().join("sub").to_string_lossy().to_string();
+        let entries = read_directory(sub, Some(true)).await.unwrap();
+        let gen = entries.iter().find(|e| e.name == "gen.txt").unwrap();
+        assert!(gen.is_ignored, "nested .gitignore rule must flag gen.txt");
+        let src = entries.iter().find(|e| e.name == "src.txt").unwrap();
+        assert!(!src.is_ignored);
     }
 }
 
