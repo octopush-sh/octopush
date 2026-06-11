@@ -225,6 +225,7 @@ pub fn run() {
             commands::read_file,
             commands::read_file_checked,
             commands::write_file,
+            commands::file_meta,
             // File edits (Review canvas)
             commands::list_file_edits,
             commands::get_message,

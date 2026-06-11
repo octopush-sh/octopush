@@ -509,7 +509,7 @@ fn ensure_main_workspace(
     let id = uuid::Uuid::new_v4().to_string();
     // name = branch name so the rail shows "main" / "master" / whatever the
     // user's default branch is.
-    db.insert_workspace(&id, project_id, &branch, "", &branch, Some(project_path), "")?;
+    db.insert_workspace(&id, project_id, &branch, "", &branch, Some(project_path), "", None)?;
     Ok(())
 }
 
@@ -563,15 +563,30 @@ pub async fn create_workspace(
     state.db.lock().insert_workspace(
         &id, &project_id, &name, &task, &branch,
         Some(&wt_path.to_string_lossy()), &setup_script,
+        Some(&base), // the RESOLVED base, not the raw (possibly blank) request
     )?;
     let workspaces = state.db.lock().list_workspaces(&project_id)?;
     Ok(workspaces.into_iter().find(|w| w.id == id).unwrap())
 }
 
+/// Local + remote-tracking branches for the workspace creator's base picker.
+/// Locals keep their "default first" ordering; remotes come fully qualified
+/// (`origin/dev`) so the picker can pass them straight back as a base.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchList {
+    pub local: Vec<String>,
+    pub remote: Vec<String>,
+}
+
 #[tauri::command]
-pub async fn list_branches(path: String) -> AppResult<Vec<String>> {
+pub async fn list_branches(path: String) -> AppResult<BranchList> {
     let path = expand_tilde(&path);
-    crate::git_ops::list_branches(std::path::Path::new(&path))
+    let p = std::path::Path::new(&path);
+    Ok(BranchList {
+        local: crate::git_ops::list_branches(p)?,
+        remote: crate::git_ops::list_remote_branches(p)?,
+    })
 }
 
 #[tauri::command]
@@ -2182,6 +2197,34 @@ pub(crate) fn write_file_inner(path: &str, content: &str) -> AppResult<WriteResu
 pub async fn write_file(path: String, content: String) -> AppResult<WriteResult> {
     let path = expand_tilde(&path);
     write_file_inner(&path, &content)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMeta {
+    pub mtime_ms: i64,
+    pub size: u64,
+}
+
+/// Sync core of `file_meta` (testable without a tokio runtime).
+/// `Ok(None)` means the file does not exist (deleted under an open buffer).
+pub(crate) fn file_meta_inner(path: &str) -> AppResult<Option<FileMeta>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(FileMeta {
+            mtime_ms: mtime_millis(&meta),
+            size: meta.len(),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AppError::Other(format!("file_meta({path}): {e}"))),
+    }
+}
+
+/// Cheap stat for external-change detection: the editor compares this against
+/// the mtime tracked at open/save time before overwriting and on window focus.
+#[tauri::command]
+pub async fn file_meta(path: String) -> AppResult<Option<FileMeta>> {
+    let path = expand_tilde(&path);
+    file_meta_inner(&path)
 }
 
 // ─── File edits (Review canvas) ───────────────────────────────────

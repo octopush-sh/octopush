@@ -141,6 +141,9 @@ export interface Workspace {
   tint: TintName | null;
   testCommand?: string | null;
   linkedIssueKey: string | null;
+  /** Resolved base branch this workspace was created from (null for rows
+   *  predating the column and for the auto-created default-branch row). */
+  fromBranch: string | null;
 }
 
 // ─── File edits ───────────────────────────────────────────────────
@@ -230,6 +233,14 @@ export interface GitStatus {
   aheadBehindKnown: boolean;
   /** The in-progress multi-step operation, if any. */
   operation: "merge" | "rebase" | null;
+}
+
+/** Branches offered as a base for new workspaces. Locals come repo-default
+ *  first; remotes are fully qualified (`origin/dev`) and pass through to the
+ *  backend unchanged. */
+export interface BranchList {
+  local: string[];
+  remote: string[];
 }
 
 export interface FileChange {

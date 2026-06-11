@@ -61,6 +61,70 @@ describe("ConfirmDialog", () => {
     expect(screen.getByText("Go back")).toBeInTheDocument();
   });
 
+  it("renders no secondary button unless both label and handler are provided", () => {
+    render(
+      <ConfirmDialog
+        title="Delete?"
+        body="Irreversible."
+        destructiveLabel="Delete workspace"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    // Only Cancel + confirm.
+    expect(screen.getAllByRole("button")).toHaveLength(2);
+  });
+
+  it("renders the secondary button between Cancel and the confirm and calls onSecondary", () => {
+    const onSecondary = vi.fn();
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      <ConfirmDialog
+        title="File changed on disk"
+        body="Pick one."
+        destructiveLabel="Overwrite"
+        secondaryLabel="Reload from disk"
+        cancelLabel="Keep editing"
+        onSecondary={onSecondary}
+        onConfirm={onConfirm}
+        onCancel={onCancel}
+      />,
+    );
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Keep editing",
+      "Reload from disk",
+      "Overwrite",
+    ]);
+    fireEvent.click(screen.getByText("Reload from disk"));
+    expect(onSecondary).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it("Escape triggers onCancel — never the secondary or the confirm", () => {
+    const onSecondary = vi.fn();
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      <ConfirmDialog
+        title="File changed on disk"
+        body="Pick one."
+        destructiveLabel="Overwrite"
+        secondaryLabel="Reload from disk"
+        cancelLabel="Keep editing"
+        onSecondary={onSecondary}
+        onConfirm={onConfirm}
+        onCancel={onCancel}
+      />,
+    );
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalled();
+    expect(onSecondary).not.toHaveBeenCalled();
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
   it("calls onCancel on Escape key", () => {
     const onCancel = vi.fn();
     render(

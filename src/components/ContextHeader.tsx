@@ -166,7 +166,17 @@ export function ContextHeader({
       <div className="ml-auto flex flex-shrink-0 items-center gap-4">
         <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-octo-verdigris" aria-hidden />
-          <span>↳ {branch}</span>
+          <span>
+            ↳ {branch}
+            {workspace?.fromBranch && workspace.fromBranch !== branch && (
+              <span
+                title="Base branch this workspace was created from"
+                className="opacity-70"
+              >
+                {" "}from {workspace.fromBranch}
+              </span>
+            )}
+          </span>
           {unstaged > 0 && <span>· {unstaged} unstaged</span>}
         </div>
 

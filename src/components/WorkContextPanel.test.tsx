@@ -47,6 +47,7 @@ const workspace: Workspace = {
   tint: null,
   testCommand: null,
   linkedIssueKey: null,
+  fromBranch: null,
 } as Workspace;
 
 beforeEach(() => {

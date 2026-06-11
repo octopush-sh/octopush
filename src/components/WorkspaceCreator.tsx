@@ -4,6 +4,7 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { BrassRule } from "./BrassRule";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 
 interface Props {
@@ -40,11 +41,18 @@ function slugify(text: string): string {
 export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [task, setTask] = useState(initialTask ?? "");
-  const [setupScript, setSetupScript] = useState("");
+  // Step II prefills with the project's last-used setup script (saved back on
+  // successful create — a remembered template, not a live binding).
+  const [setupScript, setSetupScript] = useState(
+    () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
+  );
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
+  const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
   const [base, setBase] = useState<string | null>(null);
+  /** Explicit branch name typed by the user. null = follow the task slug. */
+  const [branchOverride, setBranchOverride] = useState<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
 
@@ -55,8 +63,9 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     ipc
       .listBranches(projectPath)
       .then((b) => {
-        setBranches(b);
-        setBase((cur) => cur ?? b[0] ?? null);
+        setBranches(b.local);
+        setRemoteBranches(b.remote);
+        setBase((cur) => cur ?? b.local[0] ?? null);
       })
       .catch(() => {});
   }, [projectPath]);
@@ -75,9 +84,10 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [creating, onCancel]);
 
-  const branch = slugify(task) || "new-workspace";
+  const branch = branchOverride ?? (slugify(task) || "new-workspace");
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
+  const branchCollides = branches.includes(branch);
 
   async function handleCreate() {
     if (!taskValid) return;
@@ -91,6 +101,8 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       setCreating(false);
       return;
     }
+    // Remember the script (possibly empty) as this project's template.
+    useCompanionPrefs.getState().setSetupScriptForProject(projectId, setupScript);
     if (linkIssueKeyOnCreate) {
       try {
         await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
@@ -175,13 +187,37 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 />
               </Field>
 
-              {/* Branch preview */}
+              {/* Branch preview — the value is quietly editable */}
               <div className="mt-4 flex items-baseline gap-2 font-mono text-[10px] uppercase tracking-[0.2em]">
                 <span className="text-octo-mute">BRANCH</span>
-                <span className="text-octo-brass">{branch}</span>
+                <input
+                  value={branch}
+                  onChange={(e) => setBranchOverride(e.target.value)}
+                  onBlur={() => {
+                    if (branchOverride === null) return;
+                    const cleaned = slugify(branchOverride);
+                    setBranchOverride(cleaned || null);
+                  }}
+                  title="Branch name — edit to override the suggested slug"
+                  aria-label="Branch name"
+                  className="rounded-none border-b border-transparent bg-transparent font-mono text-[10px] normal-case tracking-[0.2em] text-octo-brass outline-none transition-colors duration-[220ms] focus:border-octo-brass"
+                  style={{
+                    width: `calc(${Math.max(branch.length, 4)}ch + ${Math.max(branch.length, 4) * 0.2}em)`,
+                  }}
+                />
                 <span className="text-octo-mute">from</span>
-                <BaseBranchPicker branches={branches} value={base} onSelect={setBase} />
+                <BaseBranchPicker
+                  branches={branches}
+                  remoteBranches={remoteBranches}
+                  value={base}
+                  onSelect={setBase}
+                />
               </div>
+              {branchCollides && (
+                <div className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-rouge">
+                  Branch exists — the workspace will reuse it
+                </div>
+              )}
             </div>
 
             <div className="mt-10 flex items-center gap-3">

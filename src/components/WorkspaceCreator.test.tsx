@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { WorkspaceCreator } from "./WorkspaceCreator";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import * as ipcModule from "../lib/ipc";
 import type { Workspace } from "../lib/types";
 
@@ -38,13 +39,19 @@ const mockWorkspace: Workspace = {
   tint: null,
   testCommand: null,
   linkedIssueKey: null,
+  fromBranch: null,
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
+  useCompanionPrefs.setState({ setupScriptByProject: {} });
   // Default: create resolves with the mock workspace
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
-  vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue(["main", "release/1.0"]);
+  vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
+    local: ["main", "release/1.0"],
+    remote: ["origin/dev"],
+  });
 });
 
 describe("WorkspaceCreator", () => {
@@ -171,6 +178,26 @@ describe("WorkspaceCreator", () => {
       expect(mockCreate.mock.calls[0][5]).toBe("release/1.0");
     });
 
+    it("offers remote branches and passes the full origin-qualified name as the base", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      await waitFor(() => {
+        expect(screen.getByTitle(TRIGGER_TITLE)).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTitle(TRIGGER_TITLE));
+      expect(screen.getByText("REMOTE")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("menuitem", { name: "origin/dev" }));
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(await screen.findByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][5]).toBe("origin/dev");
+    });
+
     it("still renders and creates with an empty base when listBranches fails", async () => {
       vi.mocked(ipcModule.ipc.listBranches).mockRejectedValue(new Error("not a repo"));
       const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
@@ -187,6 +214,175 @@ describe("WorkspaceCreator", () => {
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       // Empty string lets the backend resolve the repo default.
       expect(mockCreate.mock.calls[0][5]).toBe("");
+    });
+  });
+
+  describe("editable branch name", () => {
+    const BRANCH_TITLE = "Branch name — edit to override the suggested slug";
+
+    function renderCreator(onCreated = vi.fn()) {
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask="Add dark mode"
+        />
+      );
+      return onCreated;
+    }
+
+    it("renders the branch as an editable input that follows the task slug", () => {
+      renderCreator();
+      const input = screen.getByTitle(BRANCH_TITLE) as HTMLInputElement;
+      expect(input.tagName).toBe("INPUT");
+      expect(input.value).toBe("add-dark-mode");
+
+      fireEvent.change(screen.getByPlaceholderText(/e\.g\. Add dark mode/i), {
+        target: { value: "Fix checkout bug" },
+      });
+      expect(input.value).toBe("fix-checkout-bug");
+    });
+
+    it("an edited branch override survives later task edits", () => {
+      renderCreator();
+      const branchInput = screen.getByTitle(BRANCH_TITLE) as HTMLInputElement;
+      fireEvent.change(branchInput, { target: { value: "my-branch" } });
+
+      fireEvent.change(screen.getByPlaceholderText(/e\.g\. Add dark mode/i), {
+        target: { value: "Something else entirely" },
+      });
+      expect(branchInput.value).toBe("my-branch");
+    });
+
+    it("slugify-validates the override on blur (lowercase, spaces to dashes)", () => {
+      renderCreator();
+      const branchInput = screen.getByTitle(BRANCH_TITLE) as HTMLInputElement;
+      fireEvent.change(branchInput, { target: { value: "My Fancy Branch" } });
+      fireEvent.blur(branchInput);
+      expect(branchInput.value).toBe("my-fancy-branch");
+    });
+
+    it("clearing the override on blur falls back to the task slug", () => {
+      renderCreator();
+      const branchInput = screen.getByTitle(BRANCH_TITLE) as HTMLInputElement;
+      fireEvent.change(branchInput, { target: { value: "my-branch" } });
+      fireEvent.change(branchInput, { target: { value: "" } });
+      fireEvent.blur(branchInput);
+      expect(branchInput.value).toBe("add-dark-mode");
+    });
+
+    it("passes the overridden branch (and name) when creating", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      const branchInput = screen.getByTitle(BRANCH_TITLE);
+      fireEvent.change(branchInput, { target: { value: "my-branch" } });
+      fireEvent.blur(branchInput);
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(await screen.findByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      // create(projectId, projectPath, name, task, branch, fromBranch, setupScript)
+      expect(mockCreate.mock.calls[0][2]).toBe("my-branch");
+      expect(mockCreate.mock.calls[0][4]).toBe("my-branch");
+    });
+
+    it("shows a quiet collision hint when the branch already exists, and clears it when it no longer collides", async () => {
+      renderCreator();
+      // Wait for the mocked branches (["main", "release/1.0"]) to load.
+      await screen.findByTitle(/^Base branch: main/);
+
+      const branchInput = screen.getByTitle(BRANCH_TITLE);
+      expect(screen.queryByText(/Branch exists/)).toBeNull();
+
+      fireEvent.change(branchInput, { target: { value: "main" } });
+      expect(
+        screen.getByText("Branch exists — the workspace will reuse it"),
+      ).toBeInTheDocument();
+
+      fireEvent.change(branchInput, { target: { value: "fresh-branch" } });
+      expect(screen.queryByText(/Branch exists/)).toBeNull();
+    });
+
+    it("a colliding branch does not block creation", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+      await screen.findByTitle(/^Base branch: main/);
+
+      fireEvent.change(screen.getByTitle(BRANCH_TITLE), { target: { value: "main" } });
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(await screen.findByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][4]).toBe("main");
+    });
+  });
+
+  describe("per-project setup-script template", () => {
+    function renderCreator(onCreated = vi.fn()) {
+      render(
+        <WorkspaceCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask="Add dark mode"
+        />
+      );
+      return onCreated;
+    }
+
+    it("prefills step II with the project's last-used setup script", async () => {
+      useCompanionPrefs.setState({
+        setupScriptByProject: { "proj-1": "npm install && npm run prepare" },
+      });
+      renderCreator();
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      expect(textarea.value).toBe("npm install && npm run prepare");
+    });
+
+    it("leaves step II empty when the project has no remembered script", async () => {
+      renderCreator();
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      expect(textarea.value).toBe("");
+    });
+
+    it("saves the script (even empty) back to the store on successful create", async () => {
+      useCompanionPrefs.setState({
+        setupScriptByProject: { "proj-1": "old script" },
+      });
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "" } });
+      fireEvent.click(screen.getByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBe("");
+    });
+
+    it("does not save the script when creation fails", async () => {
+      const mockCreate = vi.fn().mockRejectedValue(new Error("boom"));
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      renderCreator();
+
+      fireEvent.click(screen.getByText("Continue"));
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "make setup" } });
+      fireEvent.click(screen.getByText("Begin"));
+
+      await screen.findByText(/boom/);
+      expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBeUndefined();
     });
   });
 

@@ -70,7 +70,7 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 - **`o` open-at-line** (handed off from G3) now has the editor scroll-to-line primitive available — wire it.
 
 **From G2 slice 1 (deferred — slices II/III):**
-- **Slice II — External-change safety:** standalone `file_meta` (size+mtime) command; on window-focus and before-save, compare disk `mtime` vs the tracked `OpenFile.mtime` (Slice 1 already captures + refreshes it on save); if an agent/another app changed the file under the user, show a reload-or-overwrite `ConfirmDialog`. The scariest agentic-IDE gap. (Agents write directly via the chat tool executor `std::fs::write`, never notifying the editor.)
+- **Slice II — External-change safety: SHIPPED 2026-06-11** (feat/g2-safety-creator-findings): `file_meta`, save guard (deleted/changed → escape-safe 3-option dialog: Overwrite / Reload / Keep editing), silent focus reload for clean buffers (only-if-clean guard closes the typing race), persistent `disk changed` chip. Workspace-creator findings shipped in the same branch: scrollable+filterable branch picker (the urgent bug), editable branch name + collision hint, remote branches as base, per-project setup-script template, from_branch persisted + surfaced in ContextHeader. Still in tracker: create-from-PR.
 - **Slice III — Auto-save (optional):** `autoSave` toggle in `editorPrefsStore` + debounced save.
 - **Process lesson:** the stream's explore must grep for an EXISTING util before a plan says "create" one. `formatBytes` already existed (used by `PerfMonitorBar`); G2 recreated it and broke 4 tests before reverting to reuse. Check `src/lib/*` for collisions during explore.
 

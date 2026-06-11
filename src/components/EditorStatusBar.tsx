@@ -5,6 +5,8 @@ interface Props {
   col: number;
   selectionCount: number;
   lang: string;
+  /** Disk changed (or file deleted) under unsaved local edits. */
+  diskStale?: boolean;
 }
 
 const SEG =
@@ -12,7 +14,7 @@ const SEG =
 const CLICK =
   "transition-colors hover:bg-octo-panel hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
 
-export function EditorStatusBar({ line, col, selectionCount, lang }: Props) {
+export function EditorStatusBar({ line, col, selectionCount, lang, diskStale }: Props) {
   const wrap = useEditorPrefs((s) => s.wrap);
   const lineNumbers = useEditorPrefs((s) => s.lineNumbers);
   const tabWidth = useEditorPrefs((s) => s.tabWidth);
@@ -36,6 +38,17 @@ export function EditorStatusBar({ line, col, selectionCount, lang }: Props) {
 
       {selectionCount > 1 && (
         <div className={`${SEG} text-octo-brass`}>{selectionCount} selections</div>
+      )}
+
+      {diskStale && (
+        <div
+          className={`${SEG} octo-pop-in text-octo-rouge`}
+          data-testid="statusbar-disk-stale"
+          title="This file changed or was deleted on disk while you have unsaved edits. Saving will prompt before anything is overwritten or lost."
+        >
+          <span className="h-[5px] w-[5px] rounded-full bg-octo-rouge" />
+          disk changed
+        </div>
       )}
 
       <div className="ml-auto flex items-stretch">

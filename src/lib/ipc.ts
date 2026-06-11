@@ -129,6 +129,12 @@ export type FileReadResult =
   | { kind: "unsupportedEncoding"; size: number; mtime: number }
   | { kind: "tooLarge"; size: number };
 
+/** Cheap stat for external-change detection. `null` = file no longer exists. */
+export interface FileMeta {
+  mtimeMs: number;
+  size: number;
+}
+
 export type PullKind = "ok" | "diverged" | "conflict" | "error";
 export interface PullOutcome { kind: PullKind; output: string }
 
@@ -145,6 +151,7 @@ import type {
   BudgetPeriod,
   BudgetScope,
   BudgetStatus,
+  BranchList,
   BranchPr,
   EditorChoice,
   ChatMessage,
@@ -331,8 +338,9 @@ export const ipc = {
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
-  /** Local branch names — the repo's default branch first, then alphabetical. */
-  listBranches: (path: string) => invoke<string[]>("list_branches", { path }),
+  /** Local + remote-tracking branches. Locals come repo-default first, then
+   *  alphabetical; remotes are fully qualified (`origin/dev`). */
+  listBranches: (path: string) => invoke<BranchList>("list_branches", { path }),
   getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
     invoke<string>("get_git_diff", { path, ignoreWhitespace }),
 
@@ -347,6 +355,7 @@ export const ipc = {
     invoke<FileReadResult>("read_file_checked", { path, maxBytes }),
   writeFile: (path: string, content: string) =>
     invoke<{ mtime: number }>("write_file", { path, content }),
+  fileMeta: (path: string) => invoke<FileMeta | null>("file_meta", { path }),
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string, showIgnored?: boolean) =>

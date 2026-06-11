@@ -383,6 +383,11 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN diff_snapshot TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE stage_iterations ADD COLUMN diff_snapshot TEXT")?;
 
+        // ── v8 base-branch provenance ──────────────────────────────
+        // The RESOLVED base branch a workspace was created from (NULL for
+        // rows that predate the column or for the auto-created main row).
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN from_branch TEXT")?;
+
         Ok(())
     }
 
@@ -862,19 +867,20 @@ impl Db {
         branch: &str,
         worktree_path: Option<&str>,
         setup_script: &str,
+        from_branch: Option<&str>,
     ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO workspaces (id, project_id, name, task, branch, worktree_path, setup_script, created_at, last_active)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![id, project_id, name, task, branch, worktree_path, setup_script, now, now],
+            "INSERT INTO workspaces (id, project_id, name, task, branch, worktree_path, setup_script, created_at, last_active, from_branch)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id, project_id, name, task, branch, worktree_path, setup_script, now, now, from_branch],
         )?;
         Ok(())
     }
 
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
              FROM workspaces WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -893,6 +899,7 @@ impl Db {
                 tint: r.get(11)?,
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
+                from_branch: r.get(14)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -900,7 +907,7 @@ impl Db {
 
     pub fn get_workspace(&self, workspace_id: &str) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
              FROM workspaces WHERE id = ?1",
         )?;
         let row = stmt
@@ -920,6 +927,7 @@ impl Db {
                     tint: r.get(11)?,
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
+                    from_branch: r.get(14)?,
                 })
             })
             .optional()?;
@@ -965,7 +973,7 @@ impl Db {
     /// Archived workspaces for a project (status='archived'), newest first.
     pub fn list_archived_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
              FROM workspaces WHERE project_id = ?1 AND status = 'archived' ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -984,6 +992,7 @@ impl Db {
                 tint: r.get(11)?,
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
+                from_branch: r.get(14)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2072,6 +2081,9 @@ pub struct WorkspaceRow {
     pub tint: Option<String>,
     pub test_command: Option<String>,
     pub linked_issue_key: Option<String>,
+    /// The resolved base branch this workspace was created from. None for
+    /// rows predating the column and for the auto-created default-branch row.
+    pub from_branch: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]

@@ -161,7 +161,7 @@ mod workspace_tests {
     fn setup_workspace(db: &Db, project_id: &str, workspace_id: &str) {
         db.insert_project(project_id, "Test Project", &format!("/tmp/{}", project_id))
             .unwrap();
-        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "")
+        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "", None)
             .unwrap();
     }
 
@@ -203,7 +203,7 @@ mod workspace_tests {
         // order is stable creation-ascending (new at end) regardless of which
         // one was touched most recently.
         for id in ["ws-a", "ws-b", "ws-c"] {
-            db.insert_workspace(id, "proj-1", "ws", "", "main", None, "")
+            db.insert_workspace(id, "proj-1", "ws", "", "main", None, "", None)
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -217,9 +217,9 @@ mod workspace_tests {
     fn archive_hides_workspace_but_keeps_row() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/octo-arch-p").unwrap();
-        db.insert_workspace("w1", "p", "ws", "", "main", None, "")
+        db.insert_workspace("w1", "p", "ws", "", "main", None, "", None)
             .unwrap();
-        db.insert_workspace("w2", "p", "ws", "", "feat/keep", None, "")
+        db.insert_workspace("w2", "p", "ws", "", "feat/keep", None, "", None)
             .unwrap();
         assert_eq!(db.list_workspaces("p").unwrap().len(), 2);
 
@@ -236,7 +236,7 @@ mod workspace_tests {
     fn archive_then_list_archived_and_restore() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/octo-arch2-p").unwrap();
-        db.insert_workspace("w1", "p", "alpha", "", "feat/a", Some("/tmp/x/a"), "").unwrap();
+        db.insert_workspace("w1", "p", "alpha", "", "feat/a", Some("/tmp/x/a"), "", None).unwrap();
 
         db.archive_workspace("w1").unwrap();
         assert!(db.list_workspaces("p").unwrap().is_empty());
@@ -250,10 +250,32 @@ mod workspace_tests {
     }
 
     #[test]
+    fn from_branch_roundtrips_through_insert_list_get_and_archive() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-fb-p").unwrap();
+        db.insert_workspace("w1", "p", "ws", "", "feat-x", None, "", Some("develop"))
+            .unwrap();
+        db.insert_workspace("w2", "p", "ws", "", "feat-y", None, "", None)
+            .unwrap();
+
+        let rows = db.list_workspaces("p").unwrap();
+        assert_eq!(rows[0].from_branch.as_deref(), Some("develop"));
+        assert_eq!(rows[1].from_branch, None);
+        assert_eq!(
+            db.get_workspace("w1").unwrap().unwrap().from_branch.as_deref(),
+            Some("develop"),
+        );
+
+        db.archive_workspace("w1").unwrap();
+        let archived = db.list_archived_workspaces("p").unwrap();
+        assert_eq!(archived[0].from_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
     fn rename_workspace_updates_name() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/octo-rn-p").unwrap();
-        db.insert_workspace("w1", "p", "old", "", "main", None, "")
+        db.insert_workspace("w1", "p", "old", "", "main", None, "", None)
             .unwrap();
         db.rename_workspace("w1", "new name").unwrap();
         let rows = db.list_workspaces("p").unwrap();
@@ -347,7 +369,7 @@ mod workspace_tests {
         let db = test_db();
         db.insert_project("proj-link", "Test Project", "/tmp/proj-link")
             .unwrap();
-        db.insert_workspace("ws-link", "proj-link", "ws", "", "main", None, "")
+        db.insert_workspace("ws-link", "proj-link", "ws", "", "main", None, "", None)
             .unwrap();
 
         // Set linked_issue_key, then read back.
@@ -405,7 +427,7 @@ mod workspace_tests {
         let db = test_db();
         db.insert_project("proj-err", "Test Project", "/tmp/proj-err")
             .unwrap();
-        db.insert_workspace("ws-err", "proj-err", "ws", "", "main", None, "")
+        db.insert_workspace("ws-err", "proj-err", "ws", "", "main", None, "", None)
             .unwrap();
 
         db.insert_chat_message("ws-err", "user", "hello", None, None, None, None)
@@ -446,7 +468,7 @@ mod terminal_tests {
     fn setup_workspace(db: &Db, project_id: &str, workspace_id: &str) {
         db.insert_project(project_id, "Test Project", &format!("/tmp/{}", project_id))
             .unwrap();
-        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "")
+        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "", None)
             .unwrap();
     }
 
@@ -749,7 +771,7 @@ mod budget_tests {
     fn setup_project_and_workspace(db: &Db, project_id: &str, workspace_id: &str) {
         db.insert_project(project_id, "Test Project", &format!("/tmp/{}", project_id))
             .unwrap();
-        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "")
+        db.insert_workspace(workspace_id, project_id, "ws", "", "main", None, "", None)
             .unwrap();
     }
 
@@ -927,7 +949,7 @@ mod review_rethink_tests {
 
     fn setup_workspace(db: &Db) {
         db.insert_project("proj-r", "Test Project", "/tmp/proj-r").unwrap();
-        db.insert_workspace("ws-r", "proj-r", "ws", "", "feat/test", None, "").unwrap();
+        db.insert_workspace("ws-r", "proj-r", "ws", "", "feat/test", None, "", None).unwrap();
     }
 
     // ── file_edits CRUD ────────────────────────────────────────────
@@ -3476,6 +3498,30 @@ mod file_io_checked_tests {
         assert!(res.mtime > 0);
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "saved");
     }
+
+    #[test]
+    fn file_meta_existing_file_matches_fs() {
+        let f = temp_with_bytes(b"hello");
+        let meta = crate::commands::file_meta_inner(f.path().to_str().unwrap())
+            .unwrap()
+            .expect("existing file should yield Some(meta)");
+        let fs_meta = std::fs::metadata(f.path()).unwrap();
+        assert_eq!(meta.size, fs_meta.len());
+        assert_eq!(meta.size, 5);
+        assert!(meta.mtime_ms > 0, "mtime_ms should be a positive epoch-millis value");
+        // Serializes camelCase for the frontend.
+        let v = serde_json::to_value(&meta).unwrap();
+        assert!(v.get("mtimeMs").is_some());
+        assert!(v.get("size").is_some());
+    }
+
+    #[test]
+    fn file_meta_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        let res = crate::commands::file_meta_inner(missing.to_str().unwrap()).unwrap();
+        assert!(res.is_none(), "missing file should yield Ok(None)");
+    }
 }
 
 #[cfg(test)]
@@ -3930,7 +3976,7 @@ mod g7_timeout_tests {
 
 #[cfg(test)]
 mod branch_listing_tests {
-    use crate::git_ops::{list_branches, resolve_base};
+    use crate::git_ops::{create_branch, list_branches, list_remote_branches, resolve_base};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -3976,6 +4022,51 @@ mod branch_listing_tests {
         assert_eq!(resolve_base("", Some("main".into())).unwrap(), "main");
         assert!(resolve_base("", None).is_err(), "no explicit base and no HEAD must error");
         assert_eq!(resolve_base("dev", None).unwrap(), "dev");
+    }
+
+    #[test]
+    fn list_remote_branches_returns_full_names_sorted_and_excludes_head() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        // Simulate fetched remote-tracking refs without a network remote.
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+        let remotes = list_remote_branches(d).unwrap();
+        assert_eq!(remotes, vec!["origin/dev", "origin/main"]);
+    }
+
+    #[test]
+    fn list_remote_branches_is_empty_without_remote_refs() {
+        let tmp = repo_with_branches();
+        assert!(list_remote_branches(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_listing_is_unchanged_by_remote_refs() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        let branches = list_branches(d).unwrap();
+        assert_eq!(branches, vec!["main", "feat-x", "release/1.0"]);
+    }
+
+    #[test]
+    fn create_branch_accepts_a_remote_tracking_base() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        create_branch(d, "from-remote", "origin/dev").unwrap();
+        assert!(list_branches(d).unwrap().contains(&"from-remote".to_string()));
+    }
+
+    #[test]
+    fn create_branch_error_mentions_local_and_remote_namespaces() {
+        let tmp = repo_with_branches();
+        let err = create_branch(tmp.path(), "x", "nope").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refs/heads/nope"), "got: {msg}");
+        assert!(msg.contains("refs/remotes/nope"), "got: {msg}");
     }
 }
 

@@ -18,6 +18,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
     glyph: null,
     tint: null,
     linkedIssueKey: null,
+    fromBranch: null,
     ...overrides,
   };
 }

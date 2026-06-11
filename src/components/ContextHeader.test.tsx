@@ -37,6 +37,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
     tint: null,
     testCommand: null,
     linkedIssueKey: null,
+    fromBranch: null,
     ...overrides,
   };
 }
@@ -119,6 +120,30 @@ describe("ContextHeader", () => {
   });
 
 
+  describe("base branch provenance", () => {
+    it("appends a mute 'from {base}' segment next to the branch when present", () => {
+      renderHeader({
+        workspace: makeWorkspace({ branch: "feat-x", fromBranch: "develop" }),
+      });
+      const seg = screen.getByText(/from develop/);
+      expect(seg).toBeInTheDocument();
+      expect(seg).toHaveAttribute(
+        "title",
+        "Base branch this workspace was created from",
+      );
+    });
+
+    it("omits the segment when fromBranch is null", () => {
+      renderHeader({ workspace: makeWorkspace({ branch: "feat-x", fromBranch: null }) });
+      expect(screen.queryByText(/from /)).toBeNull();
+    });
+
+    it("omits the segment when fromBranch equals the branch itself", () => {
+      renderHeader({ workspace: makeWorkspace({ branch: "main", fromBranch: "main" }) });
+      expect(screen.queryByText(/from main/)).toBeNull();
+    });
+  });
+
   describe("ticket chip", () => {
     const issue = {
       key: "PROJ-123",
@@ -178,6 +203,7 @@ describe("ContextHeader", () => {
       const workspace = makeWorkspace({
         branch: "feat/IGNORED-9-foo",
         linkedIssueKey: "FORCED-1",
+        fromBranch: null,
       });
       useIssuesStore.setState({
         issues: [
@@ -193,6 +219,7 @@ describe("ContextHeader", () => {
       const workspace = makeWorkspace({
         branch: "main",
         linkedIssueKey: null,
+        fromBranch: null,
       });
       renderHeader({ workspace, issueTrackerConfigured: true });
       expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
@@ -206,6 +233,7 @@ describe("ContextHeader", () => {
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
       linkedIssueKey: null,
+      fromBranch: null,
     };
     useIssuesStore.setState({
       issues: [
@@ -235,6 +263,7 @@ describe("ContextHeader", () => {
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
       linkedIssueKey: null,
+      fromBranch: null,
     };
     useIssuesStore.setState({
       issues: null, loading: true, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -253,6 +282,7 @@ describe("ContextHeader", () => {
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
       linkedIssueKey: null,
+      fromBranch: null,
     };
     useIssuesStore.setState({
       issues: [], loading: false, error: null, load: vi.fn().mockResolvedValue(undefined),
@@ -273,6 +303,7 @@ describe("ContextHeader", () => {
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
       linkedIssueKey: null,
+      fromBranch: null,
     };
     useIssuesStore.setState({
       issues: [
@@ -499,6 +530,7 @@ describe("ContextHeader", () => {
       worktreePath: null, setupScript: "", status: "active",
       createdAt: "", lastActive: "", glyph: null, tint: null, testCommand: null,
       linkedIssueKey: null,
+      fromBranch: null,
     };
     const cases: Array<["todo" | "inProgress" | "done" | "unknown", string]> = [
       ["inProgress", "text-state-blue"],   // changed from text-octo-brass

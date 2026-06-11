@@ -29,6 +29,7 @@ function ws(overrides: Partial<Workspace> = {}): Workspace {
     tint: null,
     testCommand: null,
     linkedIssueKey: null,
+    fromBranch: null,
     ...overrides,
   };
 }

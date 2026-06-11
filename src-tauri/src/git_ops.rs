@@ -152,6 +152,23 @@ pub fn list_branches(path: &Path) -> AppResult<Vec<String>> {
     Ok(names)
 }
 
+/// Remote-tracking branch names, alphabetical (case-insensitive). Names come
+/// fully qualified after the `refs/remotes/` prefix — `origin/dev`, not `dev` —
+/// so they can be passed straight to `create_branch` as a base. Symbolic
+/// `*/HEAD` entries are excluded: they duplicate the remote's default branch.
+pub fn list_remote_branches(path: &Path) -> AppResult<Vec<String>> {
+    let repo = open_repo(path)?;
+    let mut names: Vec<String> = repo
+        .branches(Some(git2::BranchType::Remote))
+        .map_err(|e| AppError::Other(format!("list remote branches: {e}")))?
+        .filter_map(|b| b.ok())
+        .filter_map(|(b, _)| b.name().ok().flatten().map(String::from))
+        .filter(|n| !n.ends_with("/HEAD"))
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    Ok(names)
+}
+
 /// Resolve the base branch for a new workspace: an explicit non-blank choice
 /// wins; otherwise the repo's default branch; empty repos with no choice error.
 pub fn resolve_base(from_branch: &str, default: Option<String>) -> AppResult<String> {
@@ -358,8 +375,13 @@ pub fn create_branch(path: &Path, branch_name: &str, from: &str) -> AppResult<()
     if repo.find_reference(&format!("refs/heads/{branch_name}")).is_ok() {
         return Ok(());
     }
+    // A local branch wins; otherwise accept a remote-tracking base like
+    // `origin/dev` so workspaces can branch off unfetched-locally work.
     let from_ref = repo.find_reference(&format!("refs/heads/{from}"))
-        .map_err(|e| AppError::Other(format!("branch '{from}' not found: {e}")))?;
+        .or_else(|_| repo.find_reference(&format!("refs/remotes/{from}")))
+        .map_err(|e| AppError::Other(format!(
+            "base branch '{from}' not found (tried refs/heads/{from} and refs/remotes/{from}): {e}"
+        )))?;
     let commit = from_ref.peel_to_commit()
         .map_err(|e| AppError::Other(format!("peel: {e}")))?;
     repo.branch(branch_name, &commit, false)
