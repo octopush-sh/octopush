@@ -568,10 +568,24 @@ pub async fn create_workspace(
     Ok(workspaces.into_iter().find(|w| w.id == id).unwrap())
 }
 
+/// Local + remote-tracking branches for the workspace creator's base picker.
+/// Locals keep their "default first" ordering; remotes come fully qualified
+/// (`origin/dev`) so the picker can pass them straight back as a base.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchList {
+    pub local: Vec<String>,
+    pub remote: Vec<String>,
+}
+
 #[tauri::command]
-pub async fn list_branches(path: String) -> AppResult<Vec<String>> {
+pub async fn list_branches(path: String) -> AppResult<BranchList> {
     let path = expand_tilde(&path);
-    crate::git_ops::list_branches(std::path::Path::new(&path))
+    let p = std::path::Path::new(&path);
+    Ok(BranchList {
+        local: crate::git_ops::list_branches(p)?,
+        remote: crate::git_ops::list_remote_branches(p)?,
+    })
 }
 
 #[tauri::command]

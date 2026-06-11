@@ -232,6 +232,14 @@ export interface GitStatus {
   operation: "merge" | "rebase" | null;
 }
 
+/** Branches offered as a base for new workspaces. Locals come repo-default
+ *  first; remotes are fully qualified (`origin/dev`) and pass through to the
+ *  backend unchanged. */
+export interface BranchList {
+  local: string[];
+  remote: string[];
+}
+
 export interface FileChange {
   path: string;
   status: "new" | "modified" | "deleted" | "renamed" | "unknown" | "conflicted";

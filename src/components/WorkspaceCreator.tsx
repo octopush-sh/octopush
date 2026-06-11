@@ -44,6 +44,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
+  const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
   const [base, setBase] = useState<string | null>(null);
   /** Explicit branch name typed by the user. null = follow the task slug. */
   const [branchOverride, setBranchOverride] = useState<string | null>(null);
@@ -57,8 +58,9 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     ipc
       .listBranches(projectPath)
       .then((b) => {
-        setBranches(b);
-        setBase((cur) => cur ?? b[0] ?? null);
+        setBranches(b.local);
+        setRemoteBranches(b.remote);
+        setBase((cur) => cur ?? b.local[0] ?? null);
       })
       .catch(() => {});
   }, [projectPath]);
@@ -197,7 +199,12 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                   }}
                 />
                 <span className="text-octo-mute">from</span>
-                <BaseBranchPicker branches={branches} value={base} onSelect={setBase} />
+                <BaseBranchPicker
+                  branches={branches}
+                  remoteBranches={remoteBranches}
+                  value={base}
+                  onSelect={setBase}
+                />
               </div>
               {branchCollides && (
                 <div className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-rouge">

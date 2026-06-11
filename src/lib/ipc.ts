@@ -145,6 +145,7 @@ import type {
   BudgetPeriod,
   BudgetScope,
   BudgetStatus,
+  BranchList,
   BranchPr,
   EditorChoice,
   ChatMessage,
@@ -331,8 +332,9 @@ export const ipc = {
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
-  /** Local branch names — the repo's default branch first, then alphabetical. */
-  listBranches: (path: string) => invoke<string[]>("list_branches", { path }),
+  /** Local + remote-tracking branches. Locals come repo-default first, then
+   *  alphabetical; remotes are fully qualified (`origin/dev`). */
+  listBranches: (path: string) => invoke<BranchList>("list_branches", { path }),
   getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
     invoke<string>("get_git_diff", { path, ignoreWhitespace }),
 

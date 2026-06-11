@@ -169,6 +169,68 @@ describe("BaseBranchPicker", () => {
       expect(document.activeElement).toBe(items[0]);
     });
 
+    it("lists remote branches in a REMOTE section after the locals", () => {
+      render(
+        <BaseBranchPicker
+          branches={BRANCHES}
+          remoteBranches={["origin/dev", "origin/main"]}
+          value="main"
+          onSelect={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByText("REMOTE")).toBeInTheDocument();
+      const items = screen.getAllByRole("menuitem");
+      expect(items.map((i) => i.textContent)).toEqual([
+        ...BRANCHES,
+        "origin/dev",
+        "origin/main",
+      ]);
+    });
+
+    it("omits the REMOTE section when there are no remote branches", () => {
+      render(<BaseBranchPicker branches={BRANCHES} value="main" onSelect={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.queryByText("REMOTE")).toBeNull();
+    });
+
+    it("selecting a remote branch passes its full origin-qualified name", () => {
+      const onSelect = vi.fn();
+      render(
+        <BaseBranchPicker
+          branches={BRANCHES}
+          remoteBranches={["origin/dev"]}
+          value="main"
+          onSelect={onSelect}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button"));
+      fireEvent.click(screen.getByRole("menuitem", { name: "origin/dev" }));
+      expect(onSelect).toHaveBeenCalledWith("origin/dev");
+    });
+
+    it("counts remotes toward the filter threshold and filters across both sections", () => {
+      render(
+        <BaseBranchPicker
+          branches={["main", "feat-a", "feat-b", "feat-c", "feat-d"]}
+          remoteBranches={["origin/dev", "origin/feat-a", "origin/main", "origin/qa"]}
+          value="main"
+          onSelect={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button"));
+      const input = screen.getByPlaceholderText("Filter branches");
+      fireEvent.change(input, { target: { value: "feat-a" } });
+      const items = screen.getAllByRole("menuitem");
+      expect(items.map((i) => i.textContent)).toEqual(["feat-a", "origin/feat-a"]);
+      // Filtering all locals away hides the local section but keeps REMOTE.
+      fireEvent.change(input, { target: { value: "qa" } });
+      expect(screen.getAllByRole("menuitem").map((i) => i.textContent)).toEqual([
+        "origin/qa",
+      ]);
+      expect(screen.getByText("REMOTE")).toBeInTheDocument();
+    });
+
     it("scrolls the selected branch into view on open", () => {
       const spy = vi.fn();
       const proto = window.HTMLElement.prototype as unknown as {

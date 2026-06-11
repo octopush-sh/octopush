@@ -44,7 +44,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Default: create resolves with the mock workspace
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
-  vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue(["main", "release/1.0"]);
+  vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
+    local: ["main", "release/1.0"],
+    remote: ["origin/dev"],
+  });
 });
 
 describe("WorkspaceCreator", () => {
@@ -169,6 +172,26 @@ describe("WorkspaceCreator", () => {
 
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][5]).toBe("release/1.0");
+    });
+
+    it("offers remote branches and passes the full origin-qualified name as the base", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = renderCreator();
+
+      await waitFor(() => {
+        expect(screen.getByTitle(TRIGGER_TITLE)).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTitle(TRIGGER_TITLE));
+      expect(screen.getByText("REMOTE")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("menuitem", { name: "origin/dev" }));
+
+      fireEvent.click(screen.getByText("Continue"));
+      fireEvent.click(await screen.findByText("Begin"));
+
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][5]).toBe("origin/dev");
     });
 
     it("still renders and creates with an empty base when listBranches fails", async () => {

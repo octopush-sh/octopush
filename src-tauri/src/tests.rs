@@ -3930,7 +3930,7 @@ mod g7_timeout_tests {
 
 #[cfg(test)]
 mod branch_listing_tests {
-    use crate::git_ops::{list_branches, resolve_base};
+    use crate::git_ops::{create_branch, list_branches, list_remote_branches, resolve_base};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -3976,6 +3976,51 @@ mod branch_listing_tests {
         assert_eq!(resolve_base("", Some("main".into())).unwrap(), "main");
         assert!(resolve_base("", None).is_err(), "no explicit base and no HEAD must error");
         assert_eq!(resolve_base("dev", None).unwrap(), "dev");
+    }
+
+    #[test]
+    fn list_remote_branches_returns_full_names_sorted_and_excludes_head() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        // Simulate fetched remote-tracking refs without a network remote.
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+        let remotes = list_remote_branches(d).unwrap();
+        assert_eq!(remotes, vec!["origin/dev", "origin/main"]);
+    }
+
+    #[test]
+    fn list_remote_branches_is_empty_without_remote_refs() {
+        let tmp = repo_with_branches();
+        assert!(list_remote_branches(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_listing_is_unchanged_by_remote_refs() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        let branches = list_branches(d).unwrap();
+        assert_eq!(branches, vec!["main", "feat-x", "release/1.0"]);
+    }
+
+    #[test]
+    fn create_branch_accepts_a_remote_tracking_base() {
+        let tmp = repo_with_branches();
+        let d = tmp.path();
+        git(d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        create_branch(d, "from-remote", "origin/dev").unwrap();
+        assert!(list_branches(d).unwrap().contains(&"from-remote".to_string()));
+    }
+
+    #[test]
+    fn create_branch_error_mentions_local_and_remote_namespaces() {
+        let tmp = repo_with_branches();
+        let err = create_branch(tmp.path(), "x", "nope").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refs/heads/nope"), "got: {msg}");
+        assert!(msg.contains("refs/remotes/nope"), "got: {msg}");
     }
 }
 
