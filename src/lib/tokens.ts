@@ -28,6 +28,8 @@ export const tokens = {
   // Status
   verdigris: "#8fc9a8",
   rouge: "#d18b8b",
+  // Amber — distinct from brass: warning/caution, never the accent.
+  warning: "#dfae4a",
 } as const;
 
 export const fonts = {

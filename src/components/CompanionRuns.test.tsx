@@ -19,6 +19,7 @@ describe("CompanionRuns hub", () => {
   beforeEach(() => {
     useRunsStore.setState({
       runsByWs: { w1: [mkRun("rRun", "running"), mkRun("rDone", "completed")] },
+      loadedByWs: { w1: true },
       activeRunIdByWs: { w1: "rRun" }, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
     });
   });
@@ -29,9 +30,19 @@ describe("CompanionRuns hub", () => {
     expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rDone");
   });
 
-  it("'Begin a new run' selects the launcher (null)", () => {
+  it("renders a standard eyebrow bar with a plain Runs label (no count)", () => {
     render(<CompanionRuns workspaceId="w1" />);
-    fireEvent.click(screen.getByText(/Begin a new run/i));
+    const eyebrow = screen.getByText("Runs");
+    expect(eyebrow.className).toContain("tracking-[0.3em]");
+    expect(eyebrow.className).toContain("text-octo-brass");
+    expect(screen.queryByText(/· 2/)).not.toBeInTheDocument();
+  });
+
+  it("the new-run icon button selects the launcher (null)", () => {
+    render(<CompanionRuns workspaceId="w1" />);
+    const btn = screen.getByRole("button", { name: "Begin a new run" });
+    expect(btn).toHaveAttribute("title", "Begin a new run");
+    fireEvent.click(btn);
     expect(useRunsStore.getState().getViewedRunId("w1")).toBe(null);
   });
 
@@ -49,29 +60,72 @@ describe("CompanionRuns hub", () => {
     expect(saved.className).toContain("octo-tabular");
   });
 
+  it("counts only runs that actually saved in the ledger n", () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [
+        mkRun("a", "completed", { baselineUsd: 0.5, costUsd: 0.1 }),  // saved 0.40
+        mkRun("b", "completed", { baselineUsd: 0.2, costUsd: 0.35 }), // over baseline — saved nothing
+      ] },
+      activeRunIdByWs: {}, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
+    });
+    render(<CompanionRuns workspaceId="w1" />);
+    expect(screen.getByText(/across 1 run\b/)).toBeInTheDocument();
+    expect(screen.getByText("$0.40")).toBeInTheDocument();
+  });
+
   it("hides the ledger when no run has a baseline", () => {
     render(<CompanionRuns workspaceId="w1" />); // default rows have baselineUsd 0
     expect(screen.queryByText(/across/)).not.toBeInTheDocument();
   });
 
-  it("reserves the executing-dot slot on every row (S1)", () => {
+  it("hides the ledger when total savings round to $0.00", () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [mkRun("a", "completed", { baselineUsd: 0.102, costUsd: 0.1 })] }, // saved 0.002
+      activeRunIdByWs: {}, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
+    });
     render(<CompanionRuns workspaceId="w1" />);
-    const doneRow = screen.getByText("task rDone").closest("button")!;
-    const dot = doneRow.querySelector("span.text-transparent");
-    expect(dot).not.toBeNull(); // slot reserved even when not executing
-    expect(dot!.className).toContain("w-2");
-    expect(dot!.textContent).toBe("●");
-    const runRow = screen.getByText("task rRun").closest("button")!;
-    expect(runRow.querySelector("span.text-transparent")).toBeNull();
-    expect(runRow.querySelector("span.text-octo-brass")?.textContent).toBe("●");
+    expect(screen.queryByText(/across/)).not.toBeInTheDocument();
   });
 
-  it("uses the new empty-state copy", () => {
+  it("renders exactly one status glyph per row, in the fixed slot (S1)", () => {
+    render(<CompanionRuns workspaceId="w1" />);
+    const doneRow = screen.getByText("task rDone").closest("button")!;
+    const doneSlot = doneRow.querySelector("span.w-2")!;
+    expect(doneSlot.textContent).toBe("✓");
+    expect(doneSlot.className).toContain("text-octo-verdigris");
+    expect(doneRow.textContent).not.toContain("✓ done ✓"); // word carries no glyph
+    expect(doneRow.textContent).toContain("done");
+
+    const runRow = screen.getByText("task rRun").closest("button")!;
+    const runSlot = runRow.querySelector("span.w-2")!;
+    expect(runSlot.textContent).toBe("●");
+    expect(runSlot.className).toContain("text-octo-brass");
+    // The glyph appears once: in the slot, not duplicated beside the word.
+    expect((runRow.textContent!.match(/●/g) ?? []).length).toBe(1);
+    expect(runRow.textContent).toContain("running");
+  });
+
+  it("gives truncated task text a full-task tooltip", () => {
+    render(<CompanionRuns workspaceId="w1" />);
+    const row = screen.getByText("task rDone").closest("button")!;
+    expect(row).toHaveAttribute("title", "task rDone");
+  });
+
+  it("uses the new empty-state copy once loading has resolved", () => {
     useRunsStore.setState({
-      runsByWs: { w1: [] },
+      runsByWs: { w1: [] }, loadedByWs: { w1: true },
       activeRunIdByWs: {}, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
     });
     render(<CompanionRuns workspaceId="w1" />);
     expect(screen.getByText("No runs yet — direct your first.")).toBeInTheDocument();
+  });
+
+  it("does not flash the empty state before the first load resolves", () => {
+    useRunsStore.setState({
+      runsByWs: {}, loadedByWs: {},
+      activeRunIdByWs: {}, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
+    });
+    render(<CompanionRuns workspaceId="w1" />);
+    expect(screen.queryByText(/No runs yet/)).not.toBeInTheDocument();
   });
 });

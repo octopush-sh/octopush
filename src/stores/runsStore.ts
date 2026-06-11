@@ -21,6 +21,9 @@ const dirtyDetail = new Set<string>();
 
 interface RunsState {
   runsByWs: Record<string, Run[]>;
+  /** True once loadRuns has resolved for a workspace at least once this
+   *  session — lets panels distinguish "still loading" from "truly empty". */
+  loadedByWs: Record<string, boolean>;
   activeRunIdByWs: Record<string, string | null>;
   detailByRun: Record<string, RunDetail>;
   selectedStageByRun: Record<string, string | null>;
@@ -77,6 +80,7 @@ function replaceRunInList(list: Run[], run: Run): Run[] {
 
 export const useRunsStore = create<RunsState>((set, get) => ({
   runsByWs: {},
+  loadedByWs: {},
   activeRunIdByWs: {},
   detailByRun: {},
   selectedStageByRun: {},
@@ -131,6 +135,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     const active = runs.find((r) => !TERMINAL.has(r.status)) ?? null;
     set((s) => ({
       runsByWs: { ...s.runsByWs, [workspaceId]: runs },
+      loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
       activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
     }));
     if (active) await get().refreshDetail(active.id);
@@ -213,13 +218,26 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   applyCost: (runId, costUsd, baselineUsd) => {
     set((s) => {
       const prev = s.detailByRun[runId];
-      if (!prev?.run) return {};
-      const run = { ...prev.run, costUsd, baselineUsd };
-      const wsList = s.runsByWs[run.workspaceId] ?? EMPTY_RUNS;
-      return {
-        detailByRun: { ...s.detailByRun, [runId]: { ...prev, run } },
-        runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
-      };
+      if (prev?.run) {
+        const run = { ...prev.run, costUsd, baselineUsd };
+        const wsList = s.runsByWs[run.workspaceId] ?? EMPTY_RUNS;
+        return {
+          detailByRun: { ...s.detailByRun, [runId]: { ...prev, run } },
+          runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
+        };
+      }
+      // No detail loaded for this run (e.g. the panel listed runs but never
+      // opened it) — still apply the cost event to the run row itself so the
+      // ledger and row costs don't silently drop events. The payload carries
+      // no workspaceId, so find the row in whichever list holds it.
+      for (const [wsId, list] of Object.entries(s.runsByWs)) {
+        const idx = list.findIndex((r) => r.id === runId);
+        if (idx === -1) continue;
+        const next = list.slice();
+        next[idx] = { ...next[idx], costUsd, baselineUsd };
+        return { runsByWs: { ...s.runsByWs, [wsId]: next } };
+      }
+      return {};
     });
   },
 }));

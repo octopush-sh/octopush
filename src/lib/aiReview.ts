@@ -79,8 +79,10 @@ function extractJsonObject(s: string): Record<string, unknown> | null {
 }
 
 /** Tolerant: strips ```json fences + surrounding prose, parses the outermost
- *  object, validates shape, drops invalid findings. Throws if no parseable
- *  object is present. */
+ *  object, validates shape. Out-of-enum severities coerce to "medium" and
+ *  out-of-enum categories to "other" — a finding is only dropped when it has
+ *  no usable title, so a slightly off-spec model response never collapses
+ *  into a false "No issues found." Throws if no parseable object is present. */
 export function parseAiReview(text: string): AiReviewResult {
   const obj = extractJsonObject(text.trim());
   if (!obj) {
@@ -93,14 +95,12 @@ export function parseAiReview(text: string): AiReviewResult {
       (f): f is Record<string, unknown> =>
         !!f &&
         typeof f === "object" &&
-        SEVERITIES.has((f as any).severity) &&
-        CATEGORIES.has((f as any).category) &&
         typeof (f as any).title === "string" &&
         ((f as any).title as string).length > 0,
     )
     .map((f) => ({
-      severity: f.severity as Severity,
-      category: f.category as Category,
+      severity: SEVERITIES.has(f.severity as string) ? (f.severity as Severity) : "medium",
+      category: CATEGORIES.has(f.category as string) ? (f.category as Category) : "other",
       title: f.title as string,
       detail: typeof f.detail === "string" ? (f.detail as string) : "",
       file: typeof f.file === "string" && f.file ? (f.file as string) : null,

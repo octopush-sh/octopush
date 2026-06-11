@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { ipc } from "../lib/ipc";
 import type { Issue, StatusCategory } from "../lib/types";
+import { selectElsewhereIssues, issueTypeToken } from "../lib/issueTrackerSelectors";
 import { ModalShell } from "./ModalShell";
 
 const STATUS_DOT: Record<StatusCategory, string> = {
@@ -17,11 +18,12 @@ interface Props {
 }
 
 export function ElsewhereModal({ issues, activeProjectKey, onClose }: Props) {
+  // Same in-progress-elsewhere set the footer counts (selectElsewhereIssues)
+  // — the modal's rows always sum to the footer's number.
   const grouped = useMemo(() => {
     const map = new Map<string, Issue[]>();
-    for (const it of issues) {
+    for (const it of selectElsewhereIssues(issues, activeProjectKey)) {
       const prefix = it.key.split("-")[0];
-      if (activeProjectKey && prefix === activeProjectKey) continue;
       const list = map.get(prefix) ?? [];
       list.push(it);
       map.set(prefix, list);
@@ -52,7 +54,7 @@ export function ElsewhereModal({ issues, activeProjectKey, onClose }: Props) {
           )}
           {grouped.map(([prefix, items]) => (
             <div key={prefix} className="mb-4">
-              <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
+              <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
                 {prefix}
               </div>
               {items.map((it) => (
@@ -60,15 +62,17 @@ export function ElsewhereModal({ issues, activeProjectKey, onClose }: Props) {
                   key={it.key}
                   type="button"
                   onClick={() => ipc.openFileInSystem(it.url).catch(() => {})}
-                  className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left hover:bg-octo-panel-2"
+                  className="flex w-full items-center gap-2 rounded px-1 py-[5px] text-left transition-colors duration-[220ms] hover:bg-octo-panel-2"
                 >
                   <span
                     aria-label={it.statusCategory}
                     className={`h-[6px] w-[6px] rounded-full ${STATUS_DOT[it.statusCategory]}`}
                     style={{ background: "currentColor" }}
                   />
-                  <span className="font-mono text-[11px] text-octo-brass">{it.key}</span>
-                  <span className="flex-1 truncate text-[12px] text-octo-sage">{it.summary}</span>
+                  <span className={`font-mono text-[11px] ${issueTypeToken(it)}`}>{it.key}</span>
+                  <span className="flex-1 truncate text-[12px] text-octo-sage" title={it.summary}>
+                    {it.summary}
+                  </span>
                   <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute">
                     {it.statusName}
                   </span>

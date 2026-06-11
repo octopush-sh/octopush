@@ -45,6 +45,13 @@ vi.mock("../lib/ipc", () => ({
   ipc: mockIpc,
 }));
 
+// The store surfaces delete failures via toast; stub the toast API so the
+// test doesn't pull the Tauri event layer in.
+const mockPushToast = vi.fn();
+vi.mock("../components/Toasts", () => ({
+  pushToast: (t: unknown) => mockPushToast(t),
+}));
+
 const { useTerminalsStore } = await import("./terminalsStore");
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -317,6 +324,113 @@ describe("terminalsStore — deleteTerminal", () => {
     await useTerminalsStore.getState().deleteTerminal(ws, b.id);
 
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe(a.id);
+  });
+
+  it("IPC failure leaves the terminal in the store and surfaces a toast", async () => {
+    const ws = "ws-delete-fail";
+    mockIpc.deleteTerminal.mockRejectedValueOnce(new Error("daemon unreachable"));
+
+    const t = { id: "t-fail", label: "Main", position: 0, running: true, restored: false };
+    useTerminalsStore.setState({
+      terminalsByWs: { [ws]: [t] },
+      activeByWs: { [ws]: t.id },
+    });
+
+    await useTerminalsStore.getState().deleteTerminal(ws, t.id);
+
+    // State untouched: the terminal is still there and still active.
+    expect(useTerminalsStore.getState().getTerminals(ws)).toHaveLength(1);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].id).toBe(t.id);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe(t.id);
+
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "error", title: "Couldn't close terminal" }),
+    );
+  });
+});
+
+describe("terminalsStore — load/mutation races", () => {
+  beforeEach(() => resetStore());
+
+  it("discards a stale loadTerminals result after an interleaved delete", async () => {
+    const ws = "ws-stale-load";
+    const a = { id: "t-stale-a", label: "A", position: 0, running: false, restored: false };
+    const b = { id: "t-stale-b", label: "B", position: 1, running: false, restored: false };
+    useTerminalsStore.setState({
+      terminalsByWs: { [ws]: [a, b] },
+      activeByWs: { [ws]: a.id },
+    });
+
+    // loadTerminals starts, but its DB fetch hangs on a deferred promise.
+    let resolveList!: (records: TerminalRecord[]) => void;
+    mockIpc.listTerminals.mockReturnValueOnce(
+      new Promise<TerminalRecord[]>((res) => {
+        resolveList = res;
+      }),
+    );
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
+    const loadPromise = useTerminalsStore.getState().loadTerminals(ws);
+
+    // While the fetch is in flight, the user deletes B.
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, b.id);
+    expect(useTerminalsStore.getState().getTerminals(ws)).toHaveLength(1);
+
+    // The fetch finally resolves with the pre-delete snapshot (A and B).
+    resolveList([
+      { id: a.id, workspaceId: ws, label: "A", position: 0, createdAt: 0 },
+      { id: b.id, workspaceId: ws, label: "B", position: 1, createdAt: 0 },
+    ]);
+    await loadPromise;
+
+    // Stale snapshot discarded — B stays deleted.
+    const terminals = useTerminalsStore.getState().getTerminals(ws);
+    expect(terminals.map((t) => t.id)).toEqual([a.id]);
+  });
+
+  it("falls back to the first terminal when the preserved active id vanishes", async () => {
+    const ws = "ws-active-fallback";
+    // Active points at a terminal that the fresh DB list no longer contains.
+    useTerminalsStore.setState({
+      terminalsByWs: { [ws]: [] },
+      activeByWs: { [ws]: "t-ghost" },
+    });
+
+    const rec = makeRecord(ws, "Main", 0);
+    mockIpc.listTerminals.mockResolvedValueOnce([rec]);
+    mockIpc.listPtySessions.mockResolvedValueOnce([]);
+
+    await useTerminalsStore.getState().loadTerminals(ws);
+
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe(rec.id);
+  });
+});
+
+describe("terminalsStore — restored badge expiry", () => {
+  beforeEach(() => resetStore());
+
+  it("clears the restored flag 5 seconds after a reattach-load", async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = "ws-restored-expiry";
+      const rec = makeRecord(ws, "Main", 0);
+      mockIpc.listTerminals.mockResolvedValueOnce([rec]);
+      // Daemon reports the session alive — a restore.
+      mockIpc.listPtySessions.mockResolvedValueOnce([
+        { id: rec.id, running: true, startedAt: Date.now() },
+      ]);
+
+      await useTerminalsStore.getState().loadTerminals(ws);
+      expect(useTerminalsStore.getState().getTerminals(ws)[0].restored).toBe(true);
+
+      vi.advanceTimersByTime(5001);
+
+      const t = useTerminalsStore.getState().getTerminals(ws)[0];
+      expect(t.restored).toBe(false);
+      expect(t.running).toBe(true); // only the badge expires, not the state
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

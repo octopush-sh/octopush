@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { tokens, fonts, ease, dur } from "./tokens";
 
 describe("design tokens — Onyx & Brass", () => {
-  it("exports the 11 canonical color tokens with spec hex values", () => {
+  it("exports the canonical color tokens with spec hex values", () => {
     expect(tokens.onyx).toBe("#0c0a08");
     expect(tokens.panel).toBe("#14110d");
     expect(tokens.panel2).toBe("#1a160f");
@@ -14,6 +14,9 @@ describe("design tokens — Onyx & Brass", () => {
     expect(tokens.mute).toBe("#6d6354");
     expect(tokens.verdigris).toBe("#8fc9a8");
     expect(tokens.rouge).toBe("#d18b8b");
+    // Warning is amber — deliberately NOT the brass hex.
+    expect(tokens.warning).toBe("#dfae4a");
+    expect(tokens.warning).not.toBe(tokens.brass);
   });
 
   it("exposes brass alpha utilities", () => {

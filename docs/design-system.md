@@ -19,6 +19,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 --color-octo-mute:      #6d6354;  /* labels, meta */
 --color-octo-verdigris: #8fc9a8;  /* success / diff adds */
 --color-octo-rouge:     #d18b8b;  /* error / diff dels */
+--color-octo-warning:   #dfae4a;  /* amber — warning/caution, never the accent */
 ```
 
 **Alpha utilities:**
@@ -201,12 +202,28 @@ Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPan
 
 - ❌ `text-violet-400` or any Tailwind palette color from outside the `--color-octo-*` namespace.
 - ❌ Hardcoded hex (`#a78bfa`, `bg-[#101013]`). Tokens or nothing.
-- ❌ `text-2xl font-bold` for a "page title" — use `font-serif italic` H1 spec.
-- ❌ `"+ New Project"` CTA — should be `"Begin a new study"` or similar italic-serif phrase.
+- ❌ `text-2xl font-bold` for a "page title" — use the upright `font-serif` H1 spec (italics are retired, see §9).
+- ❌ `"+ New Project"` CTA — phrase CTAs are upright serif (`"Begin a new study"`), **never italic**; in compact chrome (panel headers) prefer the canonical icon button (§9) over a text CTA.
 - ❌ Adding a new tab system anywhere.
 - ❌ A 4th font. A 12th color. A new accent. (Update the spec instead.)
 - ❌ `transition: all` — be specific about what's animated.
 - ❌ Icons from outside `lucide-react` (we standardized).
+- ❌ Italics anywhere — buttons especially. `em, i { font-style: normal }` in styles.css enforces it; don't write `italic` classes that depend on the override.
+- ❌ Status/severity in brass. Brass marks *the active thing*; danger is rouge, caution is warning, quiet is mute.
+
+---
+
+## 9. Minimalism doctrine (2026-06-10)
+
+Binding norm: **reduce visual noise; give a sense of control and cleanliness — without losing features.** Simplify presentation, never capability.
+
+- **Zero italics, buttons especially.** Upright serif phrases are allowed for *moments*; controls never slant.
+- **Every element earns its place.** A state shown by a colored dot does not also get a text label (the dot gets a `title`). A count visible in a list is not repeated in its header. A percentage encoded by a bar's width is not printed next to it.
+- **One canonical chrome per concept.** Section header = the eyebrow bar (`flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass`). Quiet action = the icon button (`flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`, 12px lucide icon, always with `title`). Don't invent a third.
+- **Icons over text where an icon + `title` tooltip says the same.** Truncated or elided text always carries `title`.
+- **Boxes don't nest.** No border-inside-border-inside-border; if a container is already bounded, its children don't bring their own frame.
+- **Nothing appears or disappears abruptly.** Mode/state swaps use `FadeSwap`; rows enter with `octo-rise-in`; collapses use grid-rows; async content prefers stale-while-revalidate over blank-and-reload. Reserve layout slots (border/glyph widths) so state changes never shift content.
+- **Progressive disclosure over removal.** Secondary panels may default collapsed (persist the user's choice); features stay one click away.
 
 ---
 

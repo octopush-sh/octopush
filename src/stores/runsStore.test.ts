@@ -35,7 +35,7 @@ const STAGE: RunStage = {
 describe("runsStore", () => {
   beforeEach(() => {
     useRunsStore.setState({
-      runsByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
+      runsByWs: {}, loadedByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
       selectedRunIdByWs: {}, liveByStage: {},
     });
     vi.clearAllMocks();
@@ -121,6 +121,32 @@ describe("runsStore", () => {
     const d = useRunsStore.getState().getDetail("r1");
     expect(d?.run?.costUsd).toBe(0.12);
     expect(d?.run?.baselineUsd).toBe(0.4);
+  });
+
+  it("applyCost without a detail entry still updates the run row in runsByWs", () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, activeRunIdByWs: { w1: "r1" },
+      detailByRun: {}, selectedStageByRun: {}, // run listed but never opened
+    });
+    useRunsStore.getState().applyCost("r1", 0.12, 0.4);
+    const row = useRunsStore.getState().getRuns("w1")[0];
+    expect(row.costUsd).toBe(0.12);
+    expect(row.baselineUsd).toBe(0.4);
+    // No phantom detail entry was invented.
+    expect(useRunsStore.getState().getDetail("r1")).toBeUndefined();
+  });
+
+  it("applyCost for an unknown run is a no-op", () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] }, detailByRun: {} });
+    useRunsStore.getState().applyCost("ghost", 9, 9);
+    expect(useRunsStore.getState().getRuns("w1")[0].costUsd).toBe(0.05);
+  });
+
+  it("loadRuns marks the workspace as loaded", async () => {
+    (ipc.listRuns as any).mockResolvedValue([]);
+    expect((useRunsStore.getState() as any).loadedByWs["w1"]).toBeUndefined();
+    await useRunsStore.getState().loadRuns("w1");
+    expect((useRunsStore.getState() as any).loadedByWs["w1"]).toBe(true);
   });
 
   it("refreshDetail also syncs the run into runsByWs", async () => {

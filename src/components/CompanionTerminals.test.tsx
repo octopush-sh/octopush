@@ -74,18 +74,41 @@ describe("CompanionTerminals — rendering", () => {
     expect(screen.getByText(/no active terminals/i)).toBeInTheDocument();
   });
 
-  it("status dot is brass (var(--brass)) when running", () => {
+  it("status dot is brass with a Running title when running", () => {
     seedTerminals([{ id: "t-run", label: "Main", running: true }]);
     render(<CompanionTerminals workspaceId={WS} />);
     const dot = screen.getByTestId("status-dot-t-run");
-    expect(dot).toHaveStyle({ background: "var(--brass)" });
+    expect(dot).toHaveAttribute("title", "Running");
+    expect(dot.style.background).toContain("--color-octo-brass");
   });
 
-  it("status dot is muted when not running", () => {
+  it("status dot is muted with a Stopped title when not running", () => {
     seedTerminals([{ id: "t-stop", label: "Main", running: false }]);
     render(<CompanionTerminals workspaceId={WS} />);
     const dot = screen.getByTestId("status-dot-t-stop");
-    expect(dot).toHaveStyle({ background: "var(--octo-mute)" });
+    expect(dot).toHaveAttribute("title", "Stopped");
+    expect(dot.style.background).toContain("--color-octo-mute");
+  });
+
+  it("does not render a RUNNING/STOPPED meta line", () => {
+    seedTerminals([
+      { id: "t-r", label: "Main", running: true },
+      { id: "t-s", label: "Other", running: false },
+    ]);
+    render(<CompanionTerminals workspaceId={WS} />);
+    expect(screen.queryByText("RUNNING")).not.toBeInTheDocument();
+    expect(screen.queryByText("STOPPED")).not.toBeInTheDocument();
+  });
+
+  it("delete button is a sibling of the select button, not nested inside it", () => {
+    seedTerminals([{ id: "t-nest", label: "Main" }]);
+    render(<CompanionTerminals workspaceId={WS} />);
+    const deleteBtn = screen.getByTestId("delete-btn-t-nest");
+    // No button-in-button nesting: the delete button has no button ancestor.
+    expect(deleteBtn.parentElement?.closest("button")).toBeNull();
+    // And the select button (holding the label) does not contain it.
+    const selectBtn = screen.getByTestId("label-t-nest").closest("button")!;
+    expect(selectBtn.contains(deleteBtn)).toBe(false);
   });
 });
 
@@ -242,20 +265,18 @@ describe("CompanionTerminals — Restored badge", () => {
     expect(screen.queryByTestId("restored-badge-t-normal")).not.toBeInTheDocument();
   });
 
-  it("auto-dismisses Restored badge after 5 seconds", async () => {
-    vi.useFakeTimers();
+  it("removes the badge when the store clears the restored flag", () => {
+    // The 5s expiry timer now lives in the store (scheduled by loadTerminals,
+    // covered in terminalsStore.test.ts); the component just reflects state.
     seedTerminals([{ id: "t-dismiss", label: "Main", running: true, restored: true }]);
     render(<CompanionTerminals workspaceId={WS} />);
 
-    // Badge should be visible immediately.
     expect(screen.getByTestId("restored-badge-t-dismiss")).toBeInTheDocument();
 
-    // Advance timers past the 5s dismiss window.
-    await act(async () => {
-      vi.advanceTimersByTime(5001);
+    act(() => {
+      useTerminalsStore.getState().clearRestored(WS, "t-dismiss");
     });
 
     expect(screen.queryByTestId("restored-badge-t-dismiss")).not.toBeInTheDocument();
-    vi.useRealTimers();
   });
 });

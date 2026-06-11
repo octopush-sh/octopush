@@ -23,11 +23,22 @@ describe("parseAiReview", () => {
   it("ignores prose around the object", () => {
     expect(parseAiReview("Sure! Here:\n" + valid + "\nDone.").summary).toBe("Adds a word-diff");
   });
-  it("drops invalid findings (bad severity/category/missing title)", () => {
+  it("coerces unknown severity to medium and unknown category to other", () => {
+    const offSpec = JSON.stringify({ summary: "s", findings: [
+      { severity: "huge", category: "security", title: "sev coerced" },
+      { severity: "high", category: "nope", title: "cat coerced" },
+      { severity: "high", category: "bug", title: "kept", detail: "d" },
+    ]});
+    const r = parseAiReview(offSpec);
+    expect(r.findings).toHaveLength(3);
+    expect(r.findings[0]).toMatchObject({ severity: "medium", category: "security", title: "sev coerced" });
+    expect(r.findings[1]).toMatchObject({ severity: "high", category: "other", title: "cat coerced" });
+    expect(r.findings[2]).toMatchObject({ severity: "high", category: "bug", title: "kept" });
+  });
+  it("drops only findings without a usable title", () => {
     const bad = JSON.stringify({ summary: "s", findings: [
-      { severity: "huge", category: "security", title: "x" },
-      { severity: "high", category: "nope", title: "x" },
       { severity: "high", category: "bug" },
+      { severity: "high", category: "bug", title: "" },
       { severity: "high", category: "bug", title: "kept", detail: "d" },
     ]});
     const r = parseAiReview(bad);

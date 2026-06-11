@@ -3046,6 +3046,18 @@ pub fn build_ai_request(model: &str, system: String, prompt: String, max_tokens:
     }
 }
 
+/// Guard against responses truncated at the max_tokens cap. Truncated output is
+/// unusable for callers expecting structured (JSON) replies — surface a clear
+/// error instead of returning broken partial text. Unit-testable.
+pub fn ensure_not_truncated(stop_reason: &crate::providers::LlmStopReason) -> AppResult<()> {
+    if matches!(stop_reason, crate::providers::LlmStopReason::MaxTokens) {
+        return Err(AppError::Other(
+            "AI output hit the token limit before completing — try a smaller diff or raise max tokens.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generic one-shot model call — the shared G5 AI primitive. Returns text +
 /// token counts + computed cost. Does NOT record to the token DB in slice 1.
 #[tauri::command]
@@ -3059,6 +3071,7 @@ pub async fn ai_complete(
     let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192));
     let client = reqwest::Client::new();
     let resp = provider.complete(&api_base, api_key.as_deref(), &req, &client).await?;
+    ensure_not_truncated(&resp.stop_reason)?;
     let cost = crate::token_engine::compute_cost(&model, resp.input_tokens, resp.output_tokens, 0, 0);
     Ok(AiCompleteResult {
         text: resp.text,
@@ -3203,5 +3216,15 @@ mod ai_complete_tests {
             LlmContent::Text(t) => assert_eq!(t, "PROMPT"),
             _ => panic!("expected Text content"),
         }
+    }
+
+    #[test]
+    fn ensure_not_truncated_rejects_max_tokens_only() {
+        use crate::providers::LlmStopReason;
+        let err = super::ensure_not_truncated(&LlmStopReason::MaxTokens).unwrap_err();
+        assert!(err.to_string().contains("token limit"), "got: {err}");
+        assert!(super::ensure_not_truncated(&LlmStopReason::EndTurn).is_ok());
+        assert!(super::ensure_not_truncated(&LlmStopReason::ToolUse).is_ok());
+        assert!(super::ensure_not_truncated(&LlmStopReason::Other("stop".into())).is_ok());
     }
 }

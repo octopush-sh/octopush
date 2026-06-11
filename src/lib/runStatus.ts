@@ -27,14 +27,22 @@ export function stageStatusWord(status: RunStageStatus | string): string {
   }
 }
 
-export function runStatusMeta(status: RunStatus | string): StatusMeta {
+export interface RunStatusMeta {
+  /** Single status glyph — rendered in a row's fixed glyph slot. */
+  glyph: string;
+  /** Status word — rendered beside the glyph, never carrying its own glyph. */
+  word: string;
+  className: string;
+}
+
+export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
   switch (status) {
-    case "running": return { label: "● running", className: "text-octo-brass" };
-    case "paused": return { label: "◆ paused", className: "text-octo-brass" };
-    case "completed": return { label: "✓ done", className: "text-octo-verdigris" };
-    case "aborted": return { label: "■ aborted", className: "text-octo-mute" };
-    case "failed": return { label: "✕ failed", className: "text-octo-rouge" };
-    default: return { label: status, className: "text-octo-mute" };
+    case "running": return { glyph: "●", word: "running", className: "text-octo-brass" };
+    case "paused": return { glyph: "◆", word: "paused", className: "text-octo-brass" };
+    case "completed": return { glyph: "✓", word: "done", className: "text-octo-verdigris" };
+    case "aborted": return { glyph: "■", word: "aborted", className: "text-octo-mute" };
+    case "failed": return { glyph: "✕", word: "failed", className: "text-octo-rouge" };
+    default: return { glyph: "○", word: status, className: "text-octo-mute" };
   }
 }
 

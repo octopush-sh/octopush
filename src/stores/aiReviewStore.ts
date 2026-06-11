@@ -28,9 +28,14 @@ interface State {
   models: Record<string, string>;       // persisted (per workspace)
   reviews: Record<string, WsReview>;    // ephemeral
   runGen: Record<string, number>;       // ephemeral — per-ws run generation
+  /** Panel collapse, per workspace. Ephemeral on purpose: it only needs to
+   *  survive the mode-switch remount within a session, not a relaunch. */
+  collapsed: Record<string, boolean>;
   modelFor: (ws: string) => string;
   reviewFor: (ws: string) => WsReview;
+  collapsedFor: (ws: string) => boolean;
   setModel: (ws: string, model: string) => void;
+  setCollapsed: (ws: string, collapsed: boolean) => void;
   clearError: (ws: string) => void;
   run: (ws: string, gitDiff: string) => Promise<void>;
 }
@@ -41,9 +46,13 @@ export const useAiReview = create<State>()(
       models: {},
       reviews: {},
       runGen: {},
+      collapsed: {},
       modelFor: (ws) => get().models[ws] ?? DEFAULT_MODEL,
       reviewFor: (ws) => get().reviews[ws] ?? EMPTY,
+      collapsedFor: (ws) => get().collapsed[ws] ?? true,
       setModel: (ws, model) => set((s) => ({ models: { ...s.models, [ws]: model } })),
+      setCollapsed: (ws, collapsed) =>
+        set((s) => ({ collapsed: { ...s.collapsed, [ws]: collapsed } })),
       clearError: (ws) =>
         set((s) => ({ reviews: { ...s.reviews, [ws]: { ...(s.reviews[ws] ?? EMPTY), error: null } } })),
       run: async (ws, gitDiff) => {

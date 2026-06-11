@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
+import { pushToast } from "../components/Toasts";
 
 // ─── State shape ──────────────────────────────────────────────────
 
@@ -13,13 +14,27 @@ export interface TerminalState {
   /**
    * Transient flag: true when this terminal was reattached to a surviving
    * daemon session on startup (as opposed to a fresh spawn).  Cleared after
-   * 5 seconds by CompanionTerminals so the badge auto-dismisses.
+   * 5 seconds by a store-level timer so the badge auto-dismisses whether or
+   * not the Terminals panel is mounted.
    */
   restored: boolean;
 }
 
 // Stable empty list — returning a new array per call would bust React memo.
 const EMPTY_TERMINALS: TerminalState[] = [];
+
+// ─── Module-level bookkeeping ─────────────────────────────────────
+
+// Per-workspace load generation. Mutations (create/delete) bump it so a
+// `loadTerminals` whose IPC fetch was in flight across the mutation discards
+// its now-stale snapshot instead of resurrecting deleted rows.
+const loadGenByWs = new Map<string, number>();
+const bumpLoadGen = (workspaceId: string) =>
+  loadGenByWs.set(workspaceId, (loadGenByWs.get(workspaceId) ?? 0) + 1);
+
+// Guard against double-scheduling the 5s restored-badge expiry when a
+// workspace is re-loaded while a timer is already pending.
+const restoredExpiryScheduled = new Set<string>();
 
 // ─── Store interface ──────────────────────────────────────────────
 
@@ -61,11 +76,17 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   // ── Actions ───────────────────────────────────────────────────
 
   loadTerminals: async (workspaceId) => {
+    // Capture the generation before the fetch; a create/delete that lands
+    // while the IPC round-trip is in flight bumps it, marking us stale.
+    const gen = loadGenByWs.get(workspaceId) ?? 0;
+
     // Fetch DB records and live daemon sessions in parallel.
     const [records, liveSessions] = await Promise.all([
       ipc.listTerminals(workspaceId),
       ipc.listPtySessions().catch(() => [] as import("../lib/types").PtySession[]),
     ]);
+
+    if ((loadGenByWs.get(workspaceId) ?? 0) !== gen) return; // stale; discard
 
     // Build a fast lookup of daemon-live ids.
     const liveRunningIds = new Set(
@@ -106,9 +127,11 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         };
       });
 
+      // Preserve the active selection only if it still exists in the fresh
+      // list; otherwise fall back to the first terminal (or null).
       const currentActive = s.activeByWs[workspaceId] ?? null;
       const newActive =
-        currentActive !== null
+        currentActive !== null && terminals.some((t) => t.id === currentActive)
           ? currentActive
           : terminals.length > 0
             ? terminals[0].id
@@ -118,6 +141,19 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         activeByWs: { ...s.activeByWs, [workspaceId]: newActive },
       };
     });
+
+    // Auto-expire `restored` badges after 5s — store-level so the badge
+    // clears even if the Terminals panel is never mounted.
+    for (const t of get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS) {
+      if (!t.restored) continue;
+      const key = `${workspaceId}:${t.id}`;
+      if (restoredExpiryScheduled.has(key)) continue;
+      restoredExpiryScheduled.add(key);
+      setTimeout(() => {
+        restoredExpiryScheduled.delete(key);
+        get().clearRestored(workspaceId, t.id);
+      }, 5000);
+    }
   },
 
   createTerminal: async (workspaceId, labelOverride) => {
@@ -127,6 +163,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       (existing.length === 0 ? "Main" : `Terminal ${existing.length + 1}`);
 
     const record = await ipc.createTerminal(workspaceId, label);
+    bumpLoadGen(workspaceId); // invalidate any in-flight loadTerminals snapshot
     const newTerminal: TerminalState = {
       id: record.id,
       label: record.label,
@@ -169,6 +206,17 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   },
 
   deleteTerminal: async (workspaceId, id) => {
+    // Confirm with the backend FIRST — an optimistic removal would leave the
+    // UI lying about a terminal that still exists if the IPC call fails.
+    try {
+      await ipc.deleteTerminal(id);
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't close terminal", body: String(e) });
+      return; // state untouched
+    }
+
+    bumpLoadGen(workspaceId); // invalidate any in-flight loadTerminals snapshot
+
     const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const remaining = prev.filter((t) => t.id !== id);
 
@@ -186,8 +234,6 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       terminalsByWs: { ...s.terminalsByWs, [workspaceId]: remaining },
       activeByWs: { ...s.activeByWs, [workspaceId]: nextActive },
     }));
-
-    await ipc.deleteTerminal(id);
   },
 
   setActive: (workspaceId, id) =>

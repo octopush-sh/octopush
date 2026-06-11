@@ -36,7 +36,7 @@
   --color-octo-accent:     #d4a574;
   --color-octo-accent-dim: #e8c39a;
   --color-octo-success:    #8fc9a8;
-  --color-octo-warning:    #d4a574;
+  --color-octo-warning:    #dfae4a; /* amber — distinct from brass: warning/caution, never the accent */
   --color-octo-danger:     #d18b8b;
 }
 

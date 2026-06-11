@@ -19,4 +19,19 @@ describe("AiFindingCard", () => {
     const { queryByRole } = render(<AiFindingCard finding={noFile} onJump={() => {}} />);
     expect(queryByRole("button")).toBeNull();
   });
+  it("carries severity via colored dot + tooltip, with no text label and no brass", () => {
+    const { getByRole, queryByText, container } = render(<AiFindingCard finding={f} onJump={() => {}} />);
+    const dot = getByRole("img", { name: "severity: high" });
+    expect(dot).toHaveAttribute("title", "severity: high");
+    expect(dot.style.background).toContain("var(--color-octo-rouge)");
+    expect(queryByText(/·\s*high/)).toBeNull(); // the old "category · severity" label is gone
+    const card = container.firstElementChild as HTMLElement;
+    expect(card.style.borderLeftColor).toBe("var(--color-octo-rouge)");
+  });
+  it("maps medium to warning and low to mute", () => {
+    const med = render(<AiFindingCard finding={{ ...f, severity: "medium" }} onJump={() => {}} />);
+    expect((med.container.firstElementChild as HTMLElement).style.borderLeftColor).toBe("var(--color-octo-warning)");
+    const low = render(<AiFindingCard finding={noFile} onJump={() => {}} />);
+    expect((low.container.firstElementChild as HTMLElement).style.borderLeftColor).toBe("var(--color-octo-mute)");
+  });
 });

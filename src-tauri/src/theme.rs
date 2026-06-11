@@ -51,7 +51,9 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             accent: "#d4a574".into(),
             accent_dim: "#e8c39a".into(),
             success: "#8fc9a8".into(),
-            warning: "#d4a574".into(),
+            // Amber — distinct from brass: warning/caution, never the accent.
+            // Mirrors --color-octo-warning in src/styles.css.
+            warning: "#dfae4a".into(),
             danger: "#d18b8b".into(),
             text: "#f4ecdb".into(),
             text_dim: "#95897a".into(),

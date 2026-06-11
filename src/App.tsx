@@ -69,27 +69,62 @@ interface ChatRef {
 
 type AppView = "project" | "new-project";
 
+/**
+ * Locate the rendered diff row for a new-file line number inside a
+ * `review-file-*` section. The diff rows (FileDiffSection → DiffLines) don't
+ * carry line-level ids, so we match the rendered line-number gutter text:
+ * unified mode rows have [oldLine, newLine, marker] spans (newLine is the
+ * 2nd); side-by-side renders the new file in the 2nd `[data-sbs-col]` column
+ * whose rows have a single line-number span. Returns null when the line
+ * isn't part of any visible hunk — callers fall back to the file header.
+ */
+function findDiffRowByNewLine(fileEl: HTMLElement, line: number): HTMLElement | null {
+  const target = String(line);
+  const cols = fileEl.querySelectorAll("[data-sbs-col]");
+  if (cols.length >= 2) {
+    for (const row of cols[1].querySelectorAll<HTMLElement>("[data-diff-row]")) {
+      if (row.querySelector("span")?.textContent?.trim() === target) return row;
+    }
+    return null;
+  }
+  for (const row of fileEl.querySelectorAll<HTMLElement>("[data-diff-row]")) {
+    const spans = row.querySelectorAll(":scope > span");
+    if (spans.length >= 2 && spans[1].textContent?.trim() === target) return row;
+  }
+  return null;
+}
+
+// Workspace ids whose terminal hydration is currently in flight. Guards the
+// "auto-create Main when empty" branch against double-creation: StrictMode's
+// double-effect (and fast A→B→A switches) can resolve two loadTerminals()
+// calls that BOTH see an empty list and both create. Module-level so the
+// guard survives remounts of <App>.
+const terminalInitInFlight = new Set<string>();
+
 function App() {
   const project = useProjectStore((s) => s.current);
   const loadTheme = useThemeStore((s) => s.load);
   const refreshTokens = useTokenStore((s) => s.refresh);
-  const { loadAll: loadBudgets, refreshAllSpend, budgets, spend } = useBudgetsStore();
-  const {
-    workspaces,
-    activeId: activeWorkspaceId,
-    load: loadWorkspaces,
-    loadAllWorkspaces,
-    updateCustomization,
-    select: selectWorkspace,
-    rememberActiveForProject,
-    remove: removeWorkspace,
-    workspacesByProjectId,
-    pruneProject,
-    gitSummaryByWs,
-    loadGitSummaries,
-    prByWs,
-    loadProjectPrs,
-  } = useWorkspaceStore();
+  // Narrow per-field selectors (codebase norm) — a bare `useStore()` call
+  // subscribes App to EVERY store change and re-renders the whole shell.
+  const loadBudgets = useBudgetsStore((s) => s.loadAll);
+  const refreshAllSpend = useBudgetsStore((s) => s.refreshAllSpend);
+  const budgets = useBudgetsStore((s) => s.budgets);
+  const spend = useBudgetsStore((s) => s.spend);
+  const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeId);
+  const loadWorkspaces = useWorkspaceStore((s) => s.load);
+  const loadAllWorkspaces = useWorkspaceStore((s) => s.loadAllWorkspaces);
+  const updateCustomization = useWorkspaceStore((s) => s.updateCustomization);
+  const selectWorkspace = useWorkspaceStore((s) => s.select);
+  const rememberActiveForProject = useWorkspaceStore((s) => s.rememberActiveForProject);
+  const removeWorkspace = useWorkspaceStore((s) => s.remove);
+  const workspacesByProjectId = useWorkspaceStore((s) => s.workspacesByProjectId);
+  const pruneProject = useWorkspaceStore((s) => s.pruneProject);
+  const gitSummaryByWs = useWorkspaceStore((s) => s.gitSummaryByWs);
+  const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
+  const prByWs = useWorkspaceStore((s) => s.prByWs);
+  const loadProjectPrs = useWorkspaceStore((s) => s.loadProjectPrs);
 
   const [appView, setAppView] = useState<AppView>("project");
 
@@ -479,12 +514,20 @@ function App() {
       prev[activeWorkspaceId] ? prev : { ...prev, [activeWorkspaceId]: activeWorkspaceId },
     );
     // Hydrate terminals from DB; auto-create "Main" if the workspace is empty.
-    loadTerminals(activeWorkspaceId).then(() => {
-      const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
-      if (list.length === 0) {
-        createTerminal(activeWorkspaceId, "Main").catch(console.error);
-      }
-    }).catch(console.error);
+    // The in-flight guard prevents two concurrent resolutions from both seeing
+    // an empty list and creating duplicate "Main" terminals.
+    if (terminalInitInFlight.has(activeWorkspaceId)) return;
+    terminalInitInFlight.add(activeWorkspaceId);
+    loadTerminals(activeWorkspaceId)
+      .then(() => {
+        const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
+        if (list.length === 0) {
+          // Return the promise so the guard stays held until creation lands.
+          return createTerminal(activeWorkspaceId, "Main");
+        }
+      })
+      .catch(console.error)
+      .finally(() => terminalInitInFlight.delete(activeWorkspaceId));
   }, [activeWorkspaceId, loadTerminals, createTerminal]);
 
   // ── Refresh git status + diff on workspace change AND on a 3s interval ──
@@ -500,6 +543,18 @@ function App() {
   // Review whitespace pref — when it flips, the review diff is re-fetched
   // (the effect below depends on it) so the canvas honours the toggle.
   const ignoreWs = useReviewPrefs((s) => s.ignoreWhitespace);
+
+  // Reset the git snapshot the moment the workspace identity changes — the
+  // refresh below is async, and without this the review surfaces (and the AI
+  // review panel) would keep running against the PREVIOUS workspace's diff
+  // while the new fetch is in flight. Keyed on the id only, so mode/pref
+  // changes within a workspace don't blank the canvas.
+  useEffect(() => {
+    setGitStatus(null);
+    setGitDiff("");
+    gitSigRef.current = "";
+    gitDiffRef.current = "";
+  }, [activeWorkspaceId]);
 
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
@@ -545,9 +600,14 @@ function App() {
     refresh(); // immediate on workspace/mode change
     // Live polling only where file changes matter (run/review); talk mode
     // refreshes on window focus instead of a tight interval.
+    // Skip ticks while the window is hidden — no one is looking, and the
+    // focus listener below catches up the moment the user returns.
     const id =
       activeMode !== "talk" && activeMode !== "direct"
-        ? setInterval(refresh, 3_000)
+        ? setInterval(() => {
+            if (document.visibilityState !== "visible") return;
+            void refresh();
+          }, 3_000)
         : undefined;
     const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
@@ -623,15 +683,20 @@ function App() {
   const handleNewChat = useCallback(() => {
     if (!activeWorkspaceId) return;
     const newId = crypto.randomUUID();
-    const list = chatsPerWorkspace[activeWorkspaceId] ?? [];
-    const chat: ChatRef = {
-      id: newId,
-      title: `Conversation ${list.length + 1}`,
-      meta: "NOW",
-    };
-    setChatsPerWorkspace((p) => ({ ...p, [activeWorkspaceId]: [chat, ...list] }));
+    // Derive everything inside the functional updater — a closure-captured
+    // list goes stale under rapid double-clicks (two chats, same label,
+    // second prepend clobbering the first).
+    setChatsPerWorkspace((p) => {
+      const list = p[activeWorkspaceId] ?? [];
+      const chat: ChatRef = {
+        id: newId,
+        title: `Conversation ${list.length + 1}`,
+        meta: "NOW",
+      };
+      return { ...p, [activeWorkspaceId]: [chat, ...list] };
+    });
     setActiveChatPerWorkspace((p) => ({ ...p, [activeWorkspaceId]: newId }));
-  }, [activeWorkspaceId, chatsPerWorkspace]);
+  }, [activeWorkspaceId]);
 
   const handleSelectChat = useCallback(
     (id: string) => {
@@ -860,7 +925,11 @@ function App() {
 
   // Re-derive titles whenever new messages arrive — title comes from the
   // first user message, meta comes from the relative time of the latest.
-  const allChatMessages = useChatStore((s) => s.messagesByWs);
+  // Select ONLY the active workspace's slice: subscribing to the whole
+  // messagesByWs map re-renders App on every message in ANY workspace.
+  const activeWsPrimaryMessages = useChatStore((s) =>
+    activeWorkspaceId ? s.messagesByWs[activeWorkspaceId] : undefined,
+  );
   // Tick once per minute so "5M AGO" / "1H AGO" stay current without
   // requiring a full re-render of the chat itself.
   const [tickerNow, setTickerNow] = useState(() => new Date());
@@ -879,8 +948,10 @@ function App() {
       // Derive its title + meta from those messages so the history row
       // becomes self-describing instead of the literal "Conversation · NOW".
       const chats = rawChats.map((c) => {
+        // Only the primary chat (id === workspace id) derives from messages,
+        // so the active workspace's slice is the only one we need.
         if (c.id !== activeWorkspaceId) return c;
-        const msgs = allChatMessages[c.id] ?? [];
+        const msgs = activeWsPrimaryMessages ?? [];
         return {
           ...c,
           title: deriveChatTitle(msgs),
@@ -902,7 +973,7 @@ function App() {
       handleSelectChat,
       handleNewChat,
       handleDeleteChat,
-      allChatMessages,
+      activeWsPrimaryMessages,
       tickerNow,
     ],
   );
@@ -936,9 +1007,12 @@ function App() {
    * @param view  "editor" → switches to the in-canvas Editor and opens the
    *              file as a tab. "diff" → switches to the Diff view and
    *              scrolls the canvas to that file's hunks.
+   * @param line  Optional new-file line number (e.g. from an AI review
+   *              finding). In diff view we scroll to the matching diff row
+   *              when it's visible, falling back to the file header.
    */
   const navigateToFile = useCallback(
-    (path: string, view: ReviewViewMode = "editor") => {
+    (path: string, view: ReviewViewMode = "editor", line?: number | null) => {
       if (!activeWorkspace) return;
       const rootPath = activeWorkspace.worktreePath || project!.path;
       const absolute = path.startsWith("/") ? path : `${rootPath}/${path}`;
@@ -961,10 +1035,32 @@ function App() {
         // Diff view — scroll to the anchor for that file. Defer one frame so
         // the canvas has switched modes before we try to find the anchor.
         requestAnimationFrame(() => {
-          const el = document.getElementById(
-            `review-file-${encodeURIComponent(relative)}`,
-          );
-          el?.scrollIntoView({ behavior: "smooth", block: "start" });
+          // AI reviews sometimes echo git's `a/`/`b/` path prefixes — try the
+          // raw path first, then the normalized one.
+          const candidates = [relative, relative.replace(/^[ab]\//, "")];
+          let el: HTMLElement | null = null;
+          for (const candidate of candidates) {
+            el = document.getElementById(
+              `review-file-${encodeURIComponent(candidate)}`,
+            );
+            if (el) break;
+          }
+          if (!el) {
+            // File isn't in the current diff (committed, reverted, or the
+            // model hallucinated a path) — say so instead of doing nothing.
+            pushToast({
+              level: "info",
+              title: "Not in the current diff",
+              body: path,
+            });
+            return;
+          }
+          const row = line != null ? findDiffRowByNewLine(el, line) : null;
+          if (row) {
+            row.scrollIntoView({ behavior: "smooth", block: "center" });
+          } else {
+            el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
         });
       }
     },
@@ -1185,6 +1281,18 @@ function App() {
       setCustomizingProjectId(null);
     }
   };
+
+  // Stable handlers for the Companion — inline arrows defeat memoized rows
+  // (WorkContextPanel's TicketRow memo relies on this identity).
+  const handleBacklogTicketContextMenu = useCallback(
+    (issue: Issue, x: number, y: number) => setBacklogTicketMenu({ issue, x, y }),
+    [],
+  );
+
+  const handleJumpToFile = useCallback(
+    (file: string, line: number | null) => navigateToFile(file, "diff", line),
+    [navigateToFile],
+  );
 
   // ── Backlog ticket → create workspace orchestration ──
   async function continueCreateForTicket(ticketKey: string, summary: string) {
@@ -1571,10 +1679,10 @@ function App() {
             workspace={activeWorkspace ?? null}
             project={activeProject ?? null}
             issueTrackerConfigured={issueTrackerConfigured}
-            onBacklogTicketContextMenu={(issue, x, y) => setBacklogTicketMenu({ issue, x, y })}
+            onBacklogTicketContextMenu={handleBacklogTicketContextMenu}
             onModeChange={setMode}
             reviewGitDiff={gitDiff}
-            onJumpToFile={(file) => navigateToFile(file, "diff")}
+            onJumpToFile={handleJumpToFile}
           />
         </div>
         </div>
