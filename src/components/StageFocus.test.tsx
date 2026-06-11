@@ -25,6 +25,7 @@ const baseStage = {
   substrate: "api", checkpoint: false, status: "running", inputTokens: 0, outputTokens: 0,
   costUsd: 0, artifact: null, feedback: null, error: null, startedAt: null, finishedAt: null,
   loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
+  diffSnapshot: null,
 } as any;
 
 describe("StageFocus live journal", () => {
@@ -108,7 +109,7 @@ const archiveRow = {
   agentModel: "haiku", status: "done",
   artifact: JSON.stringify({ kind: "note", text: "first attempt artifact" }),
   error: null, costUsd: 0.07, inputTokens: 10, outputTokens: 20,
-  closingFeedback: "needs more tests", createdAt: "t",
+  closingFeedback: "needs more tests", createdAt: "t", diffSnapshot: null,
 };
 
 describe("StageFocus iteration navigation (D5)", () => {
@@ -171,6 +172,79 @@ describe("StageFocus iteration navigation (D5)", () => {
     await waitFor(() => expect(screen.getByText("attempt exploded")).toBeInTheDocument());
     expect(screen.getByText("✕ stage halted")).toBeInTheDocument();
     expect(screen.queryByText("sent back with")).not.toBeInTheDocument();
+  });
+});
+
+const snapshotDiff = [
+  "diff --git a/src/foo.ts b/src/foo.ts",
+  "--- a/src/foo.ts",
+  "+++ b/src/foo.ts",
+  "@@ -1,2 +1,3 @@",
+  " keep",
+  "+added by stage",
+].join("\n");
+
+describe("StageFocus diff snapshots", () => {
+  beforeEach(() => {
+    useRunsStore.setState({ liveByStage: {} });
+    vi.mocked(ipc.getGitDiff).mockClear();
+    vi.mocked(ipc.getStageLog).mockResolvedValue([]);
+    vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
+  });
+
+  const worktreeArtifact = JSON.stringify({
+    kind: "diff", text: "implemented it", refsWorktree: true,
+  });
+
+  it("renders the snapshot with its label and never fetches the live diff", async () => {
+    render(
+      <StageFocus
+        stage={{ ...baseStage, status: "done", artifact: worktreeArtifact, diffSnapshot: snapshotDiff }}
+        workspacePath="/tmp"
+      />,
+    );
+    expect(screen.getByText("worktree when this stage finished")).toBeInTheDocument();
+    expect(screen.getByText("src/foo.ts")).toBeInTheDocument();      // DiffViewer file header
+    expect(screen.getByText("+added by stage")).toBeInTheDocument(); // DiffViewer body line
+    await waitFor(() => expect(ipc.listStageIterations).toHaveBeenCalledWith("st1"));
+    expect(ipc.getGitDiff).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the live diff fetch when the snapshot is null (legacy runs)", async () => {
+    render(
+      <StageFocus
+        stage={{ ...baseStage, status: "done", artifact: worktreeArtifact, diffSnapshot: null }}
+        workspacePath="/tmp"
+      />,
+    );
+    await waitFor(() => expect(ipc.getGitDiff).toHaveBeenCalledWith("/tmp"));
+    expect(screen.queryByText("worktree when this stage finished")).not.toBeInTheDocument();
+  });
+
+  it("shows a failed stage's snapshot beneath the error banner", () => {
+    render(
+      <StageFocus
+        stage={{ ...baseStage, status: "failed", error: "agent exploded", diffSnapshot: snapshotDiff }}
+        workspacePath="/tmp"
+      />,
+    );
+    expect(screen.getByText("✕ stage halted")).toBeInTheDocument();
+    expect(screen.getByText("worktree when this stage finished")).toBeInTheDocument();
+    expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
+    expect(ipc.getGitDiff).not.toHaveBeenCalled();
+  });
+
+  it("renders an archived attempt's own snapshot beneath its artifact", async () => {
+    vi.mocked(ipc.listStageIterations).mockResolvedValue([
+      { ...archiveRow, diffSnapshot: snapshotDiff },
+    ]);
+    const artifact = JSON.stringify({ kind: "note", text: "current artifact text" });
+    render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Previous attempt" }));
+    await waitFor(() => expect(screen.getByText("first attempt artifact")).toBeInTheDocument());
+    expect(screen.getByText("worktree when this stage finished")).toBeInTheDocument();
+    expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
+    expect(screen.getByText("+added by stage")).toBeInTheDocument();
   });
 });
 

@@ -21,6 +21,22 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Max bytes of worktree diff persisted per stage snapshot.
+pub(crate) const DIFF_SNAPSHOT_CAP_BYTES: usize = 512 * 1024;
+
+/// Cap diff text at [`DIFF_SNAPSHOT_CAP_BYTES`], truncating on a char boundary
+/// and appending a visible marker.
+pub(crate) fn cap_diff(text: &str) -> String {
+    if text.len() <= DIFF_SNAPSHOT_CAP_BYTES {
+        return text.to_string();
+    }
+    let mut end = DIFF_SNAPSHOT_CAP_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… (diff truncated)", &text[..end])
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -153,6 +169,25 @@ impl Orchestrator {
             .ok_or_else(|| AppError::Other("workspace has no worktree_path".into()))
     }
 
+    /// Best-effort: persist the worktree diff onto a just-finished stage, so the
+    /// focus pane can show the worktree as THIS stage left it instead of the
+    /// live (still-mutating) one. The snapshot is forensic, never load-bearing —
+    /// any capture failure is logged and swallowed, and an empty diff is skipped.
+    fn capture_stage_diff_snapshot(&self, run: &crate::db::RunRow, stage_id: &str) {
+        let result: AppResult<()> = (|| {
+            let path = self.workspace_path(run)?;
+            let diff = crate::git_ops::get_diff_text(&path, false)?;
+            let capped = cap_diff(&diff);
+            if !capped.is_empty() {
+                self.db.lock().set_stage_diff_snapshot(stage_id, &capped)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(stage_id = %stage_id, "diff snapshot capture failed: {e}");
+        }
+    }
+
     /// Execute one stage and persist its outcome + cost/baseline.
     async fn run_stage_once(
         &self,
@@ -233,6 +268,9 @@ impl Orchestrator {
                     outcome.cost_usd,
                     Some(&artifact_json),
                 )?;
+                if outcome.artifact.refs_worktree {
+                    self.capture_stage_diff_snapshot(run, &stage.id);
+                }
                 self.recompute_run_cost(&run.id)?;
                 Ok((StageStatus::Done, verdict))
             }
@@ -253,6 +291,15 @@ impl Orchestrator {
                     self.recompute_run_cost(&run.id)?;
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
+                // A failed code/test stage may still have touched the worktree —
+                // keep the evidence. The failed artifact isn't persisted, so fall
+                // back to the role's artifact kind when it doesn't ref the worktree.
+                let kind = crate::orchestrator::runner::artifact_kind_for(&stage.role);
+                if outcome.artifact.refs_worktree
+                    || matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests)
+                {
+                    self.capture_stage_diff_snapshot(run, &stage.id);
+                }
                 Ok((StageStatus::Failed, None))
             }
         }

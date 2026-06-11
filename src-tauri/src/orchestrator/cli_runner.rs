@@ -25,6 +25,10 @@ struct CliResult {
     result: String,
     #[serde(default)]
     is_error: bool,
+    /// "success" on a clean finish; "error_max_turns"/"error_during_execution"
+    /// otherwise — sometimes with `is_error: false` (a success-shaped failure).
+    #[serde(default)]
+    subtype: Option<String>,
     #[serde(default)]
     total_cost_usd: f64,
     #[serde(default)]
@@ -159,7 +163,9 @@ pub fn parse_cli_result(
         AppError::Other(format!("could not parse claude output: {e}; got: {preview}"))
     })?;
 
-    if parsed.is_error || !exit_success {
+    let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
+    let subtype_only = !parsed.is_error && exit_success;
+    if parsed.is_error || !exit_success || bad_subtype.is_some() {
         return Ok(StageOutcome {
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -172,10 +178,13 @@ pub fn parse_cli_result(
             cost_usd: parsed.total_cost_usd,
             status: StageStatus::Failed,
             tool_calls: vec![],
-            error: Some(if parsed.result.is_empty() {
-                "claude exited with an error".to_string()
-            } else {
-                parsed.result.clone()
+            // Prefix the subtype only when it was the sole failure signal (the
+            // success-shaped case); explicit errors keep their own message.
+            error: Some(match (subtype_only, bad_subtype, parsed.result.is_empty()) {
+                (true, Some(st), true) => format!("claude stopped early ({st}) — review the work journal, then re-run or abort"),
+                (true, Some(st), false) => format!("claude stopped early ({st}): {}", parsed.result),
+                (_, _, true) => "claude exited with an error".to_string(),
+                (_, _, false) => parsed.result.clone(),
             }),
             verdict: None,
         });

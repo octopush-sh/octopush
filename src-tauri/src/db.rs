@@ -375,6 +375,12 @@ impl Db {
             "#,
         )?;
 
+        // ── v7 per-stage diff snapshots ────────────────────────────
+        // The worktree diff text captured the moment a stage finished, so the
+        // focus pane can show what THAT stage saw instead of the live worktree.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN diff_snapshot TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE stage_iterations ADD COLUMN diff_snapshot TEXT")?;
+
         Ok(())
     }
 
@@ -1737,7 +1743,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
-                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations
+                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1762,6 +1768,7 @@ impl Db {
                 loop_max_iterations: r.get(17)?,
                 loop_mode: r.get(18)?,
                 loop_iterations: r.get(19)?,
+                diff_snapshot: r.get(20)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1858,7 +1865,7 @@ impl Db {
         self.conn.execute(
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
-                 started_at = NULL, finished_at = NULL,
+                 started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],
@@ -1904,6 +1911,16 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(Into::into)
+    }
+
+    /// Persist the worktree diff captured the moment a stage finished. The
+    /// orchestrator calls this best-effort right after the outcome lands.
+    pub fn set_stage_diff_snapshot(&self, stage_id: &str, diff: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET diff_snapshot = ?2 WHERE id = ?1",
+            params![stage_id, diff],
+        )?;
+        Ok(())
     }
 
     pub fn set_run_stage_artifact(&self, stage_id: &str, artifact_json: &str) -> AppResult<()> {
@@ -1964,8 +1981,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO stage_iterations
                 (id, run_id, stage_id, iteration, role, agent_model, status, artifact, error,
-                 cost_usd, input_tokens, output_tokens, closing_feedback, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 cost_usd, input_tokens, output_tokens, closing_feedback, created_at, diff_snapshot)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 id,
                 stage.run_id,
@@ -1980,7 +1997,8 @@ impl Db {
                 stage.input_tokens,
                 stage.output_tokens,
                 closing_feedback,
-                now
+                now,
+                stage.diff_snapshot
             ],
         )?;
         Ok(())
@@ -1990,7 +2008,7 @@ impl Db {
     pub fn list_stage_iterations(&self, stage_id: &str) -> AppResult<Vec<StageIterationRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, stage_id, iteration, role, agent_model, status, artifact, error,
-                    cost_usd, input_tokens, output_tokens, closing_feedback, created_at
+                    cost_usd, input_tokens, output_tokens, closing_feedback, created_at, diff_snapshot
              FROM stage_iterations WHERE stage_id = ?1 ORDER BY iteration",
         )?;
         let rows = stmt.query_map(params![stage_id], |r| {
@@ -2009,6 +2027,7 @@ impl Db {
                 output_tokens: r.get(11)?,
                 closing_feedback: r.get(12)?,
                 created_at: r.get(13)?,
+                diff_snapshot: r.get(14)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2241,6 +2260,9 @@ pub struct RunStageRow {
     pub loop_max_iterations: i64,
     pub loop_mode: Option<String>,
     pub loop_iterations: i64,
+    /// Worktree diff text captured when this stage finished (done or failed);
+    /// None for legacy runs and stages whose artifact doesn't ref the worktree.
+    pub diff_snapshot: Option<String>,
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /
@@ -2262,6 +2284,9 @@ pub struct StageIterationRow {
     pub output_tokens: i64,
     pub closing_feedback: Option<String>,
     pub created_at: String,
+    /// The worktree diff as THIS attempt saw it (copied from the stage row at
+    /// archive time); None for attempts archived before snapshots existed.
+    pub diff_snapshot: Option<String>,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {
