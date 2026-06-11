@@ -163,6 +163,14 @@ export interface CommitInfo {
   timestampMs: number;
 }
 
+/** One stash entry (G7 slice IV). Index 0 is the most recent (`stash@{0}`). */
+export interface StashInfo {
+  index: number;
+  /** Full message as git records it ("On main: …" / "WIP on main: …"). */
+  message: string;
+  timestampMs: number;
+}
+
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
@@ -506,6 +514,52 @@ export const ipc = {
 
   pull: (workspacePath: string, strategy: "ffOnly" | "rebase" | "merge") =>
     invoke<PullOutcome>("pull", { workspacePath, strategy }),
+
+  // ─── Branch & stash (G7 slice IV) ─────────────────────────────
+  /** Switch to an existing local branch. Worktree-aware errors are friendly. */
+  switchBranch: (workspacePath: string, name: string) =>
+    invoke<string>("switch_branch", { workspacePath, name }),
+
+  /** Create `name` off `base` and switch to it. */
+  createAndSwitchBranch: (workspacePath: string, name: string, base: string) =>
+    invoke<string>("create_and_switch_branch", { workspacePath, name, base }),
+
+  /** Stash the working tree, untracked included. Empty message → git default. */
+  stashPush: (workspacePath: string, message: string) =>
+    invoke<void>("stash_push", { workspacePath, message }),
+
+  /** The stash stack, most recent first. */
+  stashList: (workspacePath: string) =>
+    invoke<StashInfo[]>("stash_list", { workspacePath }),
+
+  /** Apply + drop one stash entry (by stack index). */
+  stashPop: (workspacePath: string, index: number) =>
+    invoke<void>("stash_pop", { workspacePath, index }),
+
+  /** Discard one stash entry without applying it. */
+  stashDrop: (workspacePath: string, index: number) =>
+    invoke<void>("stash_drop", { workspacePath, index }),
+
+  // ─── Advanced git ops (G7 slice V) ────────────────────────────
+  /** `git reset --<mode> <target>`; target defaults to HEAD. Confirm in the UI. */
+  resetHead: (workspacePath: string, mode: "soft" | "mixed" | "hard", target?: string) =>
+    invoke<string>("reset_head", { workspacePath, mode, target }),
+
+  /** `git clean -fd` — returns the removed paths. Confirm in the UI first. */
+  cleanUntracked: (workspacePath: string) =>
+    invoke<string[]>("clean_untracked", { workspacePath }),
+
+  /** Cherry-pick one commit onto HEAD. `conflict` is a tagged outcome —
+   *  the conflict section takes over (continue/abort work for cherry-pick). */
+  cherryPick: (workspacePath: string, sha: string) =>
+    invoke<PullOutcome>("cherry_pick", { workspacePath, sha }),
+
+  /** Create a lightweight tag at `sha` (HEAD when omitted). */
+  createTag: (workspacePath: string, name: string, sha?: string) =>
+    invoke<void>("create_tag", { workspacePath, name, sha }),
+
+  /** All tag names, alphabetical. */
+  listTags: (workspacePath: string) => invoke<string[]>("list_tags", { workspacePath }),
 
   /** Returns the trimmed git-push output (combined stdout+stderr). */
   pushBranch: (workspacePath: string) =>

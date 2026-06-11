@@ -31,6 +31,7 @@ import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ModalShell } from "./ModalShell";
 import { ConflictAiModal } from "./ConflictAiModal";
+import { GitOpsMenu } from "./GitOpsMenu";
 import { HistoryModal } from "./HistoryModal";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { useWorkspaceStore } from "../stores/workspaceStore";
@@ -393,6 +394,16 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           </span>
         )}
         <span className="ml-auto flex items-center gap-1.5">
+          <GitOpsMenu
+            projectPath={projectPath}
+            branch={branchName}
+            dirty={files.length > 0}
+            untrackedCount={files.filter((f) => f.status === "new" && f.unstaged && !f.staged).length}
+            onChanged={() => {
+              void refresh();
+              onChange?.();
+            }}
+          />
           <button
             type="button"
             onClick={() => setShowHistory(true)}
@@ -666,7 +677,14 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       )}
 
       {showHistory && (
-        <HistoryModal projectPath={projectPath} onClose={() => setShowHistory(false)} />
+        <HistoryModal
+          projectPath={projectPath}
+          onClose={() => setShowHistory(false)}
+          onRepoChanged={() => {
+            void refresh();
+            onChange?.();
+          }}
+        />
       )}
 
       {abortConfirm && operation && (
