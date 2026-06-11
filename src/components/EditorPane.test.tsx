@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 
 // Shared ref so tests can reach the live EditorView mock instance.
 const hoisted = vi.hoisted(() => ({ lastView: null as unknown as { setState: ReturnType<typeof vi.fn> } | null }));
@@ -99,9 +99,31 @@ vi.mock("../lib/diffParser", () => ({
   parseDiffForFile: vi.fn(() => []),
 }));
 
+// ─── Mock ConfirmDialog (ModalShell won't animate in JSDOM) ───────
+vi.mock("./ConfirmDialog", () => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ConfirmDialog: (p: any) => (
+    <div data-testid="confirm-dialog">
+      <span data-testid="confirm-title">{p.title}</span>
+      <button onClick={() => p.onConfirm()}>{p.destructiveLabel}</button>
+      <button onClick={() => p.onCancel()}>{p.cancelLabel}</button>
+    </div>
+  ),
+}));
+
 // ─── Mock editorStore ─────────────────────────────────────────────
 
-const mockSaveActive = vi.fn();
+const mockSaveActive = vi.fn().mockResolvedValue(undefined);
+const mockCloseFile = vi.fn();
+const mockReloadFromDisk = vi.fn().mockResolvedValue(true);
+const mockCheckActiveAgainstDisk = vi.fn().mockResolvedValue(undefined);
+const mockClearSaveConflict = vi.fn();
+
+const mockStore = {
+  saveConflict: null as
+    | { workspaceId: string; path: string; kind: "changed" | "deleted" }
+    | null,
+};
 
 vi.mock("../stores/editorStore", () => ({
   useEditorStore: vi.fn((selector: (s: unknown) => unknown) => {
@@ -110,12 +132,17 @@ vi.mock("../stores/editorStore", () => ({
         wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
       getFiles: (wsId: string) =>
         wsId === "ws-active"
-          ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5 }]
+          ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
           : wsId === "ws-binary"
-          ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048 }]
+          ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048, version: 0, diskStale: false }]
           : [],
       setContent: vi.fn(),
       saveActive: mockSaveActive,
+      closeFile: mockCloseFile,
+      reloadFromDisk: mockReloadFromDisk,
+      checkActiveAgainstDisk: mockCheckActiveAgainstDisk,
+      saveConflict: mockStore.saveConflict,
+      clearSaveConflict: mockClearSaveConflict,
     };
     return selector(state);
   }),
@@ -125,6 +152,10 @@ import { EditorPane } from "./EditorPane";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockSaveActive.mockResolvedValue(undefined);
+  mockReloadFromDisk.mockResolvedValue(true);
+  mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
+  mockStore.saveConflict = null;
 });
 
 describe("EditorPane", () => {
@@ -178,5 +209,63 @@ describe("EditorPane", () => {
     ).toBeInTheDocument();
     // The swap effect cleared the view (an extra setState after the close).
     expect(view.setState.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+});
+
+describe("EditorPane — save-conflict dialog", () => {
+  it("renders nothing when there is no conflict", () => {
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(screen.queryByTestId("confirm-dialog")).not.toBeInTheDocument();
+  });
+
+  it("ignores a conflict that belongs to another workspace", () => {
+    mockStore.saveConflict = { workspaceId: "ws-other", path: "/repo/file.ts", kind: "changed" };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(screen.queryByTestId("confirm-dialog")).not.toBeInTheDocument();
+  });
+
+  it("changed conflict: Overwrite force-saves; Reload from disk reloads", () => {
+    mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "changed" };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(screen.getByTestId("confirm-title")).toHaveTextContent("File changed on disk");
+
+    fireEvent.click(screen.getByText("Overwrite"));
+    expect(mockClearSaveConflict).toHaveBeenCalled();
+    expect(mockSaveActive).toHaveBeenCalledWith("ws-active", { force: true });
+
+    fireEvent.click(screen.getByText("Reload from disk"));
+    expect(mockReloadFromDisk).toHaveBeenCalledWith("ws-active", "/repo/file.ts");
+    expect(mockCloseFile).not.toHaveBeenCalled();
+  });
+
+  it("deleted conflict: Save anyway force-saves; Close tab closes the file", () => {
+    mockStore.saveConflict = { workspaceId: "ws-active", path: "/repo/file.ts", kind: "deleted" };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(screen.getByTestId("confirm-title")).toHaveTextContent("File deleted on disk");
+
+    fireEvent.click(screen.getByText("Save anyway"));
+    expect(mockSaveActive).toHaveBeenCalledWith("ws-active", { force: true });
+
+    fireEvent.click(screen.getByText("Close tab"));
+    expect(mockCloseFile).toHaveBeenCalledWith("ws-active", "/repo/file.ts");
+    expect(mockReloadFromDisk).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditorPane — focus / visibility disk check", () => {
+  it("checks the active buffer against the disk when the window regains focus", () => {
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(mockCheckActiveAgainstDisk).not.toHaveBeenCalled();
+    fireEvent(window, new Event("focus"));
+    expect(mockCheckActiveAgainstDisk).toHaveBeenCalledWith("ws-active");
+  });
+
+  it("stops listening after unmount", () => {
+    const { unmount } = render(
+      <EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />,
+    );
+    unmount();
+    fireEvent(window, new Event("focus"));
+    expect(mockCheckActiveAgainstDisk).not.toHaveBeenCalled();
   });
 });

@@ -25,6 +25,7 @@ import { useEditorStore } from "../stores/editorStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorBinaryPane } from "./EditorBinaryPane";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface Props {
   workspaceId: string;
@@ -118,6 +119,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const files = useEditorStore((s) => s.getFiles(workspaceId));
   const setContent = useEditorStore((s) => s.setContent);
   const saveActive = useEditorStore((s) => s.saveActive);
+  const closeFile = useEditorStore((s) => s.closeFile);
+  const reloadFromDisk = useEditorStore((s) => s.reloadFromDisk);
+  const checkActiveAgainstDisk = useEditorStore((s) => s.checkActiveAgainstDisk);
+  const saveConflict = useEditorStore((s) => s.saveConflict);
+  const clearSaveConflict = useEditorStore((s) => s.clearSaveConflict);
 
   const wrap = useEditorPrefs((s) => s.wrap);
   const fontSize = useEditorPrefs((s) => s.fontSize);
@@ -126,6 +132,13 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const prefs: Prefs = { wrap, fontSize, tabWidth, lineNumbers: lineNumbersPref };
 
   const activeFile = activePath ? files.find((f) => f.path === activePath) ?? null : null;
+
+  // A blocked save for this workspace — resolved by the dialog below.
+  const conflict =
+    saveConflict && saveConflict.workspaceId === workspaceId ? saveConflict : null;
+  const conflictName = conflict
+    ? conflict.path.split("/").pop() ?? conflict.path
+    : "";
 
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -189,6 +202,36 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath, workspaceId]);
 
+  // Replace the document when the active buffer was reloaded from disk
+  // (version bump): the swap effect only fires on path changes, so an
+  // external reload of the *current* tab needs its own refresh.
+  const activeVersion = activeFile?.kind === "text" ? activeFile.version : 0;
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !activeFile || activeFile.kind !== "text") return;
+    if (activeFile.version === 0) return; // never reloaded
+    if (view.state.doc.toString() === activeFile.content) return;
+    stateCache.current.delete(activeFile.path); // drop the stale doc
+    view.setState(freshState(activeFile));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVersion, activePath]);
+
+  // External-change watch: when the window regains focus (or the tab becomes
+  // visible again), compare the active buffer against the disk. Agents and
+  // tree file ops write underneath open buffers — this catches it early.
+  useEffect(() => {
+    const check = () => { checkActiveAgainstDisk(workspaceId).catch(() => {}); };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    window.addEventListener("focus", check);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [workspaceId, checkActiveAgainstDisk]);
+
   // Evict cache entries for files that are no longer open.
   useEffect(() => {
     const open = new Set(files.map((f) => f.path));
@@ -244,6 +287,36 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           col={pos.col}
           selectionCount={pos.selections}
           lang={activeFile.lang}
+          diskStale={activeFile.diskStale}
+        />
+      )}
+      {conflict && (
+        <ConfirmDialog
+          title={
+            conflict.kind === "changed"
+              ? "File changed on disk"
+              : "File deleted on disk"
+          }
+          body={
+            conflict.kind === "changed"
+              ? `${conflictName} was modified outside the editor. Overwrite with your version, or reload and lose your unsaved edits?`
+              : `${conflictName} was deleted on disk. Save your version anyway, or close the tab?`
+          }
+          destructiveLabel={conflict.kind === "changed" ? "Overwrite" : "Save anyway"}
+          cancelLabel={conflict.kind === "changed" ? "Reload from disk" : "Close tab"}
+          onConfirm={() => {
+            clearSaveConflict();
+            saveActive(workspaceId, { force: true }).catch(console.error);
+          }}
+          onCancel={() => {
+            const { kind, path } = conflict;
+            clearSaveConflict();
+            if (kind === "changed") {
+              reloadFromDisk(workspaceId, path).catch(console.error);
+            } else {
+              closeFile(workspaceId, path);
+            }
+          }}
         />
       )}
     </div>

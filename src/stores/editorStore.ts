@@ -16,6 +16,19 @@ export interface OpenFile {
   binaryReason?: BinaryReason;
   mtime: number;
   size: number;
+  /** Bumped whenever the buffer is replaced from disk (reload). The editor
+   *  view watches this to rebuild its document state. */
+  version: number;
+  /** Disk changed (or file deleted) under a dirty buffer — surfaced as a
+   *  quiet status-bar signal; the save guard owns the actual dialog. */
+  diskStale: boolean;
+}
+
+/** A blocked save: the disk changed or vanished under the buffer. */
+export interface SaveConflict {
+  workspaceId: string;
+  path: string;
+  kind: "changed" | "deleted";
 }
 
 /** Async confirm injected by the UI so the store stays React-free. */
@@ -30,6 +43,8 @@ const EMPTY_FILES: OpenFile[] = [];
 interface EditorStore {
   filesByWs: Record<string, OpenFile[]>;
   activeByWs: Record<string, string | null>;
+  /** Set when a save was blocked by an external change; a dialog resolves it. */
+  saveConflict: SaveConflict | null;
 
   // Selectors
   getFiles: (workspaceId: string) => OpenFile[];
@@ -41,14 +56,42 @@ interface EditorStore {
   closeFile: (workspaceId: string, path: string) => void;
   setActive: (workspaceId: string, path: string) => void;
   setContent: (workspaceId: string, path: string, content: string) => void;
-  saveActive: (workspaceId: string) => Promise<void>;
+  saveActive: (workspaceId: string, opts?: { force?: boolean }) => Promise<void>;
+  clearSaveConflict: () => void;
+  /** Replace the buffer with the disk contents (clears dirty + stale). */
+  reloadFromDisk: (workspaceId: string, path: string) => Promise<boolean>;
+  /** Window-focus check: silently reload a clean stale buffer; flag a dirty one. */
+  checkActiveAgainstDisk: (workspaceId: string) => Promise<void>;
 }
+
+const fileName = (path: string) => path.split("/").pop() ?? path;
 
 // ─── Implementation ───────────────────────────────────────────────
 
-export const useEditorStore = create<EditorStore>((set, get) => ({
+export const useEditorStore = create<EditorStore>((set, get) => {
+  /** Immutably patch one open file in one workspace. */
+  const patchFile = (
+    workspaceId: string,
+    path: string,
+    patch: (f: OpenFile) => OpenFile,
+  ) =>
+    set((s) => {
+      const prev = s.filesByWs[workspaceId] ?? EMPTY_FILES;
+      return {
+        filesByWs: {
+          ...s.filesByWs,
+          [workspaceId]: prev.map((f) => (f.path === path ? patch(f) : f)),
+        },
+      };
+    });
+
+  const findFile = (workspaceId: string, path: string) =>
+    (get().filesByWs[workspaceId] ?? EMPTY_FILES).find((f) => f.path === path);
+
+  return {
   filesByWs: {},
   activeByWs: {},
+  saveConflict: null,
 
   // ── Selectors ─────────────────────────────────────────────────
 
@@ -95,6 +138,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         kind: "binary",
         binaryReason: res.kind === "binary" ? "binary" : "unsupportedEncoding",
         mtime: res.mtime, size: res.size,
+        version: 0, diskStale: false,
       };
     } else if (res.kind === "tooLarge") {
       return; // re-read above already handled; a second tooLarge is unreachable
@@ -107,6 +151,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         path, content: res.content, savedContent: res.content,
         lang: langForExtension(path), kind: "text",
         mtime: res.mtime, size: res.size,
+        version: 0, diskStale: false,
       };
     }
 
@@ -158,36 +203,135 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       };
     }),
 
-  saveActive: async (workspaceId) => {
+  saveActive: async (workspaceId, opts) => {
     const activePath = get().getActivePath(workspaceId);
     if (!activePath) return;
 
-    const file = (get().filesByWs[workspaceId] ?? EMPTY_FILES).find(
-      (f) => f.path === activePath,
-    );
+    const file = findFile(workspaceId, activePath);
     if (!file || file.kind === "binary") return;
 
     try {
-      const { mtime } = await ipc.writeFile(activePath, file.content);
-      set((s) => {
-        const prev = s.filesByWs[workspaceId] ?? EMPTY_FILES;
-        return {
-          filesByWs: {
-            ...s.filesByWs,
-            [workspaceId]: prev.map((f) =>
-              f.path === activePath ? { ...f, savedContent: f.content, mtime } : f,
-            ),
-          },
-        };
-      });
+      // External-change guard: refuse to blind-write over a file that was
+      // changed or deleted under the buffer (agents, tree file ops, conflict
+      // resolutions all write directly to disk). The UI resolves the conflict
+      // via a dialog and re-enters with `force`.
+      if (!opts?.force) {
+        const meta = await ipc.fileMeta(activePath);
+        if (meta === null) {
+          set({ saveConflict: { workspaceId, path: activePath, kind: "deleted" } });
+          return;
+        }
+        if (meta.mtimeMs > file.mtime) {
+          set({ saveConflict: { workspaceId, path: activePath, kind: "changed" } });
+          return;
+        }
+      }
+
+      // Re-read the buffer after the await — the user may have kept typing.
+      const latest = findFile(workspaceId, activePath) ?? file;
+      const { mtime } = await ipc.writeFile(activePath, latest.content);
+      patchFile(workspaceId, activePath, (f) => ({
+        ...f, savedContent: f.content, mtime, diskStale: false,
+      }));
+      set((s) => ({
+        saveConflict: s.saveConflict?.path === activePath ? null : s.saveConflict,
+      }));
     } catch (e) {
-      const name = activePath.split("/").pop() ?? activePath;
       pushToast({
         level: "error",
         title: "Couldn't save file",
-        body: `${name}: ${e instanceof Error ? e.message : String(e)}`,
+        body: `${fileName(activePath)}: ${e instanceof Error ? e.message : String(e)}`,
         timeout: 7000,
       });
     }
   },
-}));
+
+  clearSaveConflict: () => set({ saveConflict: null }),
+
+  reloadFromDisk: async (workspaceId, path) => {
+    const file = findFile(workspaceId, path);
+    if (!file || file.kind === "binary") return false;
+
+    try {
+      const res = await ipc.readFileChecked(path);
+      if (res.kind !== "text") {
+        pushToast({
+          level: "error",
+          title: "Couldn't reload file",
+          body: `${fileName(path)}: no longer readable as text.`,
+          timeout: 7000,
+        });
+        return false;
+      }
+      patchFile(workspaceId, path, (f) => ({
+        ...f,
+        content: res.content,
+        savedContent: res.content,
+        mtime: res.mtime,
+        size: res.size,
+        diskStale: false,
+        version: f.version + 1,
+      }));
+      return true;
+    } catch (e) {
+      pushToast({
+        level: "error",
+        title: "Couldn't reload file",
+        body: `${fileName(path)}: ${e instanceof Error ? e.message : String(e)}`,
+        timeout: 7000,
+      });
+      return false;
+    }
+  },
+
+  checkActiveAgainstDisk: async (workspaceId) => {
+    const activePath = get().getActivePath(workspaceId);
+    if (!activePath) return;
+
+    const file = findFile(workspaceId, activePath);
+    if (!file || file.kind !== "text") return;
+
+    let meta;
+    try {
+      meta = await ipc.fileMeta(activePath);
+    } catch {
+      return; // stat failure: stay quiet, the save guard will catch real trouble
+    }
+
+    const setStale = (stale: boolean) => {
+      if (file.diskStale !== stale)
+        patchFile(workspaceId, activePath, (f) => ({ ...f, diskStale: stale }));
+    };
+
+    if (meta === null) {
+      // Deleted on disk. Never auto-close or auto-clear the buffer — flag it
+      // and let the save guard prompt when the user actually saves.
+      setStale(true);
+      return;
+    }
+    if (meta.mtimeMs === file.mtime) {
+      setStale(false); // disk matches again (e.g. checkout back)
+      return;
+    }
+
+    const dirty = file.content !== file.savedContent;
+    if (dirty) {
+      // Unsaved local edits + external change: quiet signal only; the
+      // reload-or-overwrite dialog appears when they save.
+      setStale(true);
+      return;
+    }
+
+    // Clean buffer: silently refresh it from disk.
+    const ok = await get().reloadFromDisk(workspaceId, activePath);
+    if (ok) {
+      pushToast({
+        level: "info",
+        title: "Reloaded — changed on disk",
+        body: fileName(activePath),
+        timeout: 4000,
+      });
+    }
+  },
+  };
+});
