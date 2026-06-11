@@ -27,7 +27,7 @@ export function CompanionContext({
 
   return (
     <section>
-      <h3 className="border-b border-octo-hairline pb-2 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
+      <h3 className="border-b border-octo-hairline pb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
         Context
       </h3>
       <div className="mt-2 space-y-1.5 text-[11px] text-octo-sage">
@@ -37,7 +37,7 @@ export function CompanionContext({
           style={{ background: "var(--color-octo-hairline)" }}
         >
           <div
-            className="h-full rounded-sm"
+            className="h-full rounded-sm transition-[width] duration-[220ms]"
             style={{ width: `${pct}%`, background: "var(--color-octo-brass)" }}
           />
         </div>
@@ -45,23 +45,20 @@ export function CompanionContext({
         <Row label="tool calls" value={String(toolCalls)} />
       </div>
 
-      {/* Spending block */}
-      <div className="mt-4">
-        <h3 className="border-b border-octo-hairline pb-2 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
-          Spending
-        </h3>
-        {spendingRows.length === 0 ? (
-          <div className="mt-2 text-[10px] text-octo-mute">
-            <em className="font-serif">No budget configured · Configure in Settings · Usage</em>
-          </div>
-        ) : (
+      {/* Spending block — rendered only when a budget exists; budget setup
+          lives in Settings, so an empty section earns no space here. */}
+      {spendingRows.length > 0 && (
+        <div className="mt-4">
+          <h3 className="border-b border-octo-hairline pb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+            Spending
+          </h3>
           <div className="mt-2 space-y-2.5">
             {spendingRows.map((row) => (
               <SpendRow key={row.key} row={row} />
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -122,9 +119,7 @@ function SpendRow({ row }: { row: SpendRowData }) {
   const barColor = pct >= 100
     ? "var(--color-octo-rouge)"
     : pct >= 80
-    ? "var(--color-octo-warning, #d4a250)"
-    : pct >= 50
-    ? "var(--color-octo-warning, #d4a250)"
+    ? "var(--color-octo-warning)"
     : "var(--color-octo-brass)";
 
   return (
@@ -133,7 +128,6 @@ function SpendRow({ row }: { row: SpendRowData }) {
         <span className="text-octo-sage">{row.label}</span>
         <span className="font-mono text-octo-ivory">
           ${row.costUsd.toFixed(2)} / ${row.limitUsd.toFixed(2)}
-          <span className="ml-1 text-octo-mute">{pct.toFixed(0)}%</span>
         </span>
       </div>
       <div
@@ -141,7 +135,7 @@ function SpendRow({ row }: { row: SpendRowData }) {
         style={{ background: "var(--color-octo-hairline)" }}
       >
         <div
-          className="h-full rounded-sm transition-all"
+          className="h-full rounded-sm transition-[width] duration-[220ms]"
           style={{ width: `${pct}%`, background: barColor }}
         />
       </div>

@@ -14,9 +14,22 @@ const baseProps = {
 };
 
 describe("CompanionContext spending block", () => {
-  it("shows empty state when no budgets configured", () => {
+  it("renders no Spending section when no budgets are configured", () => {
     render(<CompanionContext {...baseProps} budgets={[]} spend={{}} />);
-    expect(screen.getByText(/No budget configured/i)).toBeTruthy();
+    // No header, no nag — budget setup lives in Settings.
+    expect(screen.queryByText("Spending")).toBeNull();
+    expect(screen.queryByText(/No budget configured/i)).toBeNull();
+  });
+
+  it("omits the percentage text from spend rows (the bar encodes it)", () => {
+    const budgets: Budget[] = [
+      { scopeType: "global", scopeId: "", period: "daily", limitUsd: 5.0, updatedAt: "" },
+    ];
+    const spend: Record<string, SpendSnapshot> = {
+      "global::daily": { costUsd: 1.5, tokens: 10000 },
+    };
+    render(<CompanionContext {...baseProps} budgets={budgets} spend={spend} />);
+    expect(screen.queryByText(/30%/)).toBeNull();
   });
 
   it("renders spending rows when global daily budget is set", () => {
