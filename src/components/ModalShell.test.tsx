@@ -98,6 +98,49 @@ describe("ModalShell focus management", () => {
     );
   });
 
+  it("Escape closes only the topmost of stacked modals", () => {
+    const outerClose = vi.fn();
+    const innerClose = vi.fn();
+    function StackedHarness() {
+      const [innerOpen, setInnerOpen] = useState(false);
+      return (
+        <ModalShell onClose={outerClose} ariaLabel="Outer dialog">
+          <div>
+            <button type="button" onClick={() => setInnerOpen(true)}>
+              open inner
+            </button>
+            {innerOpen && (
+              <ModalShell
+                onClose={() => {
+                  innerClose();
+                  setInnerOpen(false);
+                }}
+                ariaLabel="Inner dialog"
+              >
+                <div>inner content</div>
+              </ModalShell>
+            )}
+          </div>
+        </ModalShell>
+      );
+    }
+    render(<StackedHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "open inner" }));
+    expect(screen.getByRole("dialog", { name: "Inner dialog" })).toBeInTheDocument();
+
+    // First Escape: only the inner (topmost) modal closes.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(innerClose).toHaveBeenCalledTimes(1);
+    expect(outerClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Inner dialog" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Outer dialog" })).toBeInTheDocument();
+
+    // Second Escape: now the outer modal is topmost and closes.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(outerClose).toHaveBeenCalledTimes(1);
+    expect(innerClose).toHaveBeenCalledTimes(1);
+  });
+
   it("does not break backdrop click-to-close", () => {
     const onClose = vi.fn();
     render(

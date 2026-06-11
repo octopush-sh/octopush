@@ -10,6 +10,10 @@ import {
   FileText,
   type LucideIcon,
 } from "lucide-react";
+import { getExtension } from "./getExtension";
+
+// Extension table 1 of 3 — see getExtension.ts for the cross-reference
+// (languageDetection.ts and editorLang.ts hold the other two).
 
 const CODE = new Set([
   "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "java", "py", "go", "rb", "c",
@@ -31,8 +35,7 @@ const LOCKFILE_NAMES = new Set(["cargo.lock", "package-lock.json", "yarn.lock", 
 export function fileIcon(name: string): LucideIcon {
   const lower = name.toLowerCase();
   if (LOCKFILE_NAMES.has(lower)) return FileLock;
-  const dot = lower.lastIndexOf(".");
-  const ext = dot >= 0 ? lower.slice(dot + 1) : "";
+  const ext = getExtension(name);
   if (CODE.has(ext)) return FileCode;
   if (DATA.has(ext)) return FileJson;
   if (TEXT.has(ext)) return FileText;

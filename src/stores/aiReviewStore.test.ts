@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../lib/ipc", () => ({
-  ipc: { aiComplete: vi.fn() },
+  ipc: { aiComplete: vi.fn(), listProviders: vi.fn() },
 }));
+vi.mock("../components/Toasts", () => ({ pushToast: vi.fn() }));
 import { ipc } from "../lib/ipc";
-import { useAiReview, diffHash } from "./aiReviewStore";
+import { pushToast } from "../components/Toasts";
+import { useAiReview, diffHash, reconcileAiReviewModels, _resetReconcileForTests } from "./aiReviewStore";
 
 const okJson = JSON.stringify({ summary: "s", findings: [{ severity: "high", category: "bug", title: "t", detail: "d", file: "a.ts", line: 3 }] });
 
@@ -33,6 +35,13 @@ describe("aiReviewStore", () => {
     expect(r.result?.findings).toHaveLength(1);
     expect(r.diffHash).toBe(diffHash("DIFF"));
   });
+  it("run attributes the spend to the workspace and requests guaranteed-shape JSON", async () => {
+    (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    await useAiReview.getState().run("w1", "DIFF");
+    const opts = (ipc.aiComplete as any).mock.calls[0][3];
+    expect(opts).toMatchObject({ workspaceId: "w1" });
+    expect(opts.jsonSchema).toMatchObject({ type: "object", required: ["summary", "findings"] });
+  });
   it("run sets error on ipc failure", async () => {
     (ipc.aiComplete as any).mockRejectedValue(new Error("no key"));
     await useAiReview.getState().run("w1", "DIFF");
@@ -43,6 +52,60 @@ describe("aiReviewStore", () => {
   it("diffHash changes with the diff (freshness)", () => {
     expect(diffHash("a")).not.toBe(diffHash("b"));
   });
+  describe("persisted-model reconciliation", () => {
+    const catalog = [
+      { name: "anthropic", enabled: true, models: [{ id: "claude-sonnet-4-6" }, { id: "claude-opus-4-6" }] },
+      { name: "old-corp", enabled: false, models: [{ id: "disabled-model" }] },
+    ];
+    beforeEach(() => {
+      _resetReconcileForTests();
+      (ipc.listProviders as any).mockReset().mockResolvedValue(catalog);
+      (pushToast as any).mockReset();
+    });
+
+    it("retired ids fall back to the default with a one-time info toast", async () => {
+      useAiReview.setState({ models: { w1: "claude-3-retired", w2: "claude-opus-4-6" } });
+      await reconcileAiReviewModels();
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+      expect(useAiReview.getState().modelFor("w2")).toBe("claude-opus-4-6"); // valid id untouched
+      expect(pushToast).toHaveBeenCalledTimes(1);
+      expect((pushToast as any).mock.calls[0][0]).toMatchObject({ level: "info" });
+      expect((pushToast as any).mock.calls[0][0].body).toContain("claude-3-retired");
+    });
+
+    it("models from disabled providers are treated as retired", async () => {
+      useAiReview.setState({ models: { w1: "disabled-model" } });
+      await reconcileAiReviewModels();
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+    });
+
+    it("runs once per session and never fetches when nothing is persisted", async () => {
+      useAiReview.setState({ models: {} });
+      await reconcileAiReviewModels();
+      expect(ipc.listProviders).not.toHaveBeenCalled();
+      useAiReview.setState({ models: { w1: "claude-3-retired" } });
+      await reconcileAiReviewModels(); // second call — guard already latched
+      expect(ipc.listProviders).not.toHaveBeenCalled();
+      expect(pushToast).not.toHaveBeenCalled();
+    });
+
+    it("is quiet when every persisted id is still in the catalog", async () => {
+      useAiReview.setState({ models: { w1: "claude-opus-4-6" } });
+      await reconcileAiReviewModels();
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-opus-4-6");
+      expect(pushToast).not.toHaveBeenCalled();
+    });
+
+    it("a catalog failure re-arms the guard for a later retry", async () => {
+      (ipc.listProviders as any).mockRejectedValueOnce(new Error("ipc down"));
+      useAiReview.setState({ models: { w1: "claude-3-retired" } });
+      await reconcileAiReviewModels();
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-3-retired"); // untouched
+      await reconcileAiReviewModels(); // retry succeeds
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+    });
+  });
+
   it("a stale run does not overwrite a newer run's result", async () => {
     const stale = JSON.stringify({ summary: "stale", findings: [] });
     const fresh = JSON.stringify({ summary: "fresh", findings: [] });

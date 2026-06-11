@@ -26,6 +26,12 @@ vi.mock("./ConflictAiModal", () => ({
     <div data-testid="conflict-ai-modal">{file}:{model}</div>
   ),
 }));
+// The history browser has its own test file — here we only assert the wiring.
+vi.mock("./HistoryModal", () => ({
+  HistoryModal: ({ projectPath }: { projectPath: string }) => (
+    <div data-testid="history-modal">{projectPath}</div>
+  ),
+}));
 
 import { ChangesPanel } from "./ChangesPanel";
 
@@ -131,6 +137,14 @@ describe("ChangesPanel G4", () => {
     });
     render(<ChangesPanel projectPath="/repo" />);
     expect(await screen.findByText(/2 conflicts/i)).toBeInTheDocument();
+  });
+
+  it("History button in the header opens the commit-history browser", async () => {
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText("main");
+    expect(screen.queryByTestId("history-modal")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /commit history/i }));
+    expect(screen.getByTestId("history-modal")).toHaveTextContent("/repo");
   });
 
   it("hides the ahead/behind badge when aheadBehindKnown is false", async () => {
@@ -257,7 +271,46 @@ describe("ChangesPanel G7 conflicts", () => {
     render(<ChangesPanel projectPath="/repo" />);
     await userEvent.click(await screen.findByRole("button", { name: /continue merge/i }));
     await waitFor(() =>
-      expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "success" })),
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "success", title: "Merge completed" }),
+      ),
+    );
+  });
+
+  it("Continue during a rebase toasts 'Rebase continued'", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...RESOLVED_PENDING_STATUS, operation: "rebase" });
+    ipcMock.continueOperation.mockResolvedValue({ kind: "ok", output: "Done." });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /continue rebase/i }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "success", title: "Rebase continued" }),
+      ),
+    );
+  });
+
+  it("Continue during a cherry-pick toasts 'Cherry-pick continued'", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...RESOLVED_PENDING_STATUS, operation: "cherry-pick" });
+    ipcMock.continueOperation.mockResolvedValue({ kind: "ok", output: "Done." });
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /continue cherry-pick/i }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "success", title: "Cherry-pick continued" }),
+      ),
+    );
+  });
+
+  it("Abort during a cherry-pick toasts 'Cherry-pick aborted'", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...RESOLVED_PENDING_STATUS, operation: "cherry-pick" });
+    ipcMock.abortOperation.mockResolvedValue("ok");
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /^abort$/i }));
+    await userEvent.click(screen.getByRole("button", { name: /abort cherry-pick/i }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "success", title: "Cherry-pick aborted" }),
+      ),
     );
   });
 

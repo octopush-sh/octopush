@@ -143,6 +143,34 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
+/** One line of per-line blame (G7 slice III). Lines are 1-based and refer
+ *  to the committed (HEAD) version of the file. */
+export interface BlameLine {
+  line: number;
+  shaShort: string;
+  authorName: string;
+  timestampMs: number;
+  summary: string;
+}
+
+/** One row of the commit history browser (G7 slice III). */
+export interface CommitInfo {
+  sha: string;
+  shaShort: string;
+  summary: string;
+  authorName: string;
+  /** Author time, ms since epoch — format relatively in the UI. */
+  timestampMs: number;
+}
+
+/** One stash entry (G7 slice IV). Index 0 is the most recent (`stash@{0}`). */
+export interface StashInfo {
+  index: number;
+  /** Full message as git records it ("On main: …" / "WIP on main: …"). */
+  message: string;
+  timestampMs: number;
+}
+
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AdapterInfo,
@@ -164,6 +192,7 @@ import type {
   ModelSuggestion,
   ModelWithProvider,
   Pr,
+  PrInfo,
   PerfStats,
   ProjectInfo,
   ProviderConfig,
@@ -439,6 +468,15 @@ export const ipc = {
     invoke<string>("amend_commit", { workspacePath, message }),
   getLastCommit: (workspacePath: string) =>
     invoke<LastCommit | null>("get_last_commit", { workspacePath }),
+  /** Newest-first commit page from HEAD; `skip` offsets for pagination. */
+  gitLog: (path: string, limit: number, skip: number) =>
+    invoke<CommitInfo[]>("git_log", { path, limit, skip }),
+  /** Unified diff of one commit vs its first parent (root: vs empty tree). */
+  commitDiff: (path: string, sha: string) =>
+    invoke<string>("commit_diff", { path, sha }),
+  /** Per-line blame of a workdir-relative file against HEAD. */
+  blameFile: (path: string, file: string) =>
+    invoke<BlameLine[]>("blame_file", { path, file }),
   discardFile: (workspacePath: string, filePath: string) =>
     invoke<void>("discard_file", { workspacePath, filePath }),
 
@@ -478,6 +516,52 @@ export const ipc = {
   pull: (workspacePath: string, strategy: "ffOnly" | "rebase" | "merge") =>
     invoke<PullOutcome>("pull", { workspacePath, strategy }),
 
+  // ─── Branch & stash (G7 slice IV) ─────────────────────────────
+  /** Switch to an existing local branch. Worktree-aware errors are friendly. */
+  switchBranch: (workspacePath: string, name: string) =>
+    invoke<string>("switch_branch", { workspacePath, name }),
+
+  /** Create `name` off `base` and switch to it. */
+  createAndSwitchBranch: (workspacePath: string, name: string, base: string) =>
+    invoke<string>("create_and_switch_branch", { workspacePath, name, base }),
+
+  /** Stash the working tree, untracked included. Empty message → git default. */
+  stashPush: (workspacePath: string, message: string) =>
+    invoke<void>("stash_push", { workspacePath, message }),
+
+  /** The stash stack, most recent first. */
+  stashList: (workspacePath: string) =>
+    invoke<StashInfo[]>("stash_list", { workspacePath }),
+
+  /** Apply + drop one stash entry (by stack index). */
+  stashPop: (workspacePath: string, index: number) =>
+    invoke<void>("stash_pop", { workspacePath, index }),
+
+  /** Discard one stash entry without applying it. */
+  stashDrop: (workspacePath: string, index: number) =>
+    invoke<void>("stash_drop", { workspacePath, index }),
+
+  // ─── Advanced git ops (G7 slice V) ────────────────────────────
+  /** `git reset --<mode> <target>`; target defaults to HEAD. Confirm in the UI. */
+  resetHead: (workspacePath: string, mode: "soft" | "mixed" | "hard", target?: string) =>
+    invoke<string>("reset_head", { workspacePath, mode, target }),
+
+  /** `git clean -fd` — returns the removed paths. Confirm in the UI first. */
+  cleanUntracked: (workspacePath: string) =>
+    invoke<string[]>("clean_untracked", { workspacePath }),
+
+  /** Cherry-pick one commit onto HEAD. `conflict` is a tagged outcome —
+   *  the conflict section takes over (continue/abort work for cherry-pick). */
+  cherryPick: (workspacePath: string, sha: string) =>
+    invoke<PullOutcome>("cherry_pick", { workspacePath, sha }),
+
+  /** Create a lightweight tag at `sha` (HEAD when omitted). */
+  createTag: (workspacePath: string, name: string, sha?: string) =>
+    invoke<void>("create_tag", { workspacePath, name, sha }),
+
+  /** All tag names, alphabetical. */
+  listTags: (workspacePath: string) => invoke<string[]>("list_tags", { workspacePath }),
+
   /** Returns the trimmed git-push output (combined stdout+stderr). */
   pushBranch: (workspacePath: string) =>
     invoke<string>("push_branch", { workspacePath }),
@@ -508,6 +592,16 @@ export const ipc = {
 
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
+
+  /** Open pull requests for the project, for "start a workspace from a PR".
+   *  Rejects with a friendly message when the GitHub CLI is missing or not
+   *  authenticated — the UI maps any failure to a quiet empty state. */
+  listPrs: (path: string) => invoke<PrInfo[]>("list_prs", { path }),
+
+  /** Fetch a PR's head ref as a local branch (no-op if it already exists),
+   *  so it can serve as the base of a new workspace. */
+  ensurePrBranch: (path: string, number: number, headRefName: string) =>
+    invoke<void>("ensure_pr_branch", { path, number, headRefName }),
 
   // ─── Test runner ──────────────────────────────────────────────
   runTestCommand: (workspacePath: string, command: string) =>
@@ -628,10 +722,29 @@ export const ipc = {
     }),
 
   // ─── AI primitive (G5) ────────────────────────────────────────
-  aiComplete: (model: string, system: string, prompt: string, maxTokens?: number) =>
+  aiComplete: (
+    model: string,
+    system: string,
+    prompt: string,
+    opts?: {
+      maxTokens?: number;
+      /** Attributes the spend to this workspace in Usage dashboards. */
+      workspaceId?: string;
+      /** Forces a schema'd tool call — the returned `text` is then
+       *  guaranteed-shape JSON matching this schema. */
+      jsonSchema?: unknown;
+    },
+  ) =>
     invoke<{ text: string; inputTokens: number; outputTokens: number; costUsd: number }>(
       "ai_complete",
-      { model, system, prompt, maxTokens: maxTokens ?? null },
+      {
+        model,
+        system,
+        prompt,
+        maxTokens: opts?.maxTokens ?? null,
+        workspaceId: opts?.workspaceId ?? null,
+        jsonSchema: opts?.jsonSchema ?? null,
+      },
     ),
 };
 

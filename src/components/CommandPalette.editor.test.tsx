@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
+import { useBlameStore } from "../stores/blameStore";
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
@@ -37,6 +38,7 @@ afterAll(() => {
 
 function resetPrefs() {
   useEditorPrefs.setState({ wrap: false, fontSize: 13, tabWidth: 2, lineNumbers: true });
+  useBlameStore.setState({ enabled: false, linesByPath: {}, errorByPath: {} });
 }
 
 async function renderPalette(onClose = vi.fn()) {
@@ -67,6 +69,14 @@ describe("CommandPalette · Editor group", () => {
     expect(screen.getByText("Decrease font size")).toBeInTheDocument();
     expect(screen.getByText("Cycle tab width — 2 spaces")).toBeInTheDocument();
     expect(screen.getByText("Toggle line numbers — on")).toBeInTheDocument();
+    expect(screen.getByText("Toggle blame — off")).toBeInTheDocument();
+  });
+
+  it("toggle blame flips the blame store and closes the palette", async () => {
+    const onClose = await renderPalette();
+    fireEvent.click(screen.getByText("Toggle blame — off"));
+    expect(useBlameStore.getState().enabled).toBe(true);
+    expect(onClose).toHaveBeenCalled();
   });
 
   it("labels react to the store", async () => {

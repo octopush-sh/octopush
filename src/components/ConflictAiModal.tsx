@@ -17,6 +17,8 @@ import { CONFLICT_SYSTEM, buildConflictPrompt, stripFences } from "../lib/aiConf
 interface Props {
   /** Workspace (worktree) root — joined with `file` for read/write. */
   workspacePath: string;
+  /** Optional workspace id — attributes the AI spend in Usage dashboards. */
+  workspaceId?: string;
   /** Repo-relative path of the conflicted file. */
   file: string;
   /** Resolved review model id (from the aiReview store). */
@@ -31,7 +33,7 @@ type Phase =
   | { kind: "preview"; text: string; hasMarkers: boolean }
   | { kind: "error"; message: string };
 
-export function ConflictAiModal({ workspacePath, file, model, onClose, onResolved }: Props) {
+export function ConflictAiModal({ workspacePath, workspaceId, file, model, onClose, onResolved }: Props) {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [applying, setApplying] = useState(false);
   const absPath = `${workspacePath}/${file}`;
@@ -53,7 +55,7 @@ export function ConflictAiModal({ workspacePath, file, model, onClose, onResolve
           return;
         }
         const prompt = buildConflictPrompt(file, read.content);
-        const res = await ipc.aiComplete(model, CONFLICT_SYSTEM, prompt);
+        const res = await ipc.aiComplete(model, CONFLICT_SYSTEM, prompt, { workspaceId });
         if (cancelled) return;
         const text = stripFences(res.text);
         setPhase({ kind: "preview", text, hasMarkers: text.includes("<<<<<<<") });

@@ -85,6 +85,9 @@ pub fn build_request(req: &LlmRequest) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
+    if let Some(name) = &req.tool_choice {
+        body["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
+    }
     body
 }
 

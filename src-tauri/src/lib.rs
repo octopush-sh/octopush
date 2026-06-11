@@ -241,6 +241,9 @@ pub fn run() {
             commands::commit_changes,
             commands::get_staged_diff,
             commands::get_last_commit,
+            commands::git_log,
+            commands::commit_diff,
+            commands::blame_file,
             commands::amend_commit,
             commands::discard_file,
             // File operations (G6 slice II)
@@ -256,8 +259,23 @@ pub fn run() {
             commands::mark_conflict_resolved,
             commands::continue_operation,
             commands::abort_operation,
+            // Branch & stash (G7 slice IV)
+            commands::switch_branch,
+            commands::create_and_switch_branch,
+            commands::stash_push,
+            commands::stash_list,
+            commands::stash_pop,
+            commands::stash_drop,
+            // Advanced git ops (G7 slice V)
+            commands::reset_head,
+            commands::clean_untracked,
+            commands::cherry_pick,
+            commands::create_tag,
+            commands::list_tags,
             commands::find_pr_for_branch,
             commands::open_prs_for_project,
+            commands::list_prs,
+            commands::ensure_pr_branch,
             // Workspace-wide file & text search
             commands::list_workspace_files,
             commands::search_workspace_text,

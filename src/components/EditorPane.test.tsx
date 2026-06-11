@@ -103,6 +103,29 @@ vi.mock("../components/editor/diffGutter", () => ({
   diffGutter: vi.fn(() => ({})),
 }));
 
+const { blameGutterMock } = vi.hoisted(() => ({
+  blameGutterMock: vi.fn(() => ({ blame: true })),
+}));
+vi.mock("./editor/blameGutter", () => ({ blameGutter: blameGutterMock }));
+
+// Controllable blame store — EditorPane reads enabled/linesByPath via
+// selector and calls getState().load() to fetch.
+const mockBlameLoad = vi.fn().mockResolvedValue(undefined);
+const mockBlameState = {
+  enabled: false,
+  linesByPath: {} as Record<string, unknown>,
+  errorByPath: {} as Record<string, string>,
+  load: mockBlameLoad,
+  toggle: vi.fn(),
+  invalidate: vi.fn(),
+};
+vi.mock("../stores/blameStore", () => ({
+  useBlameStore: Object.assign(
+    vi.fn((selector: (s: unknown) => unknown) => selector(mockBlameState)),
+    { getState: () => mockBlameState },
+  ),
+}));
+
 vi.mock("../lib/diffParser", () => ({
   parseDiffForFile: vi.fn(() => []),
 }));
@@ -175,6 +198,9 @@ beforeEach(() => {
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
   mockStore.saveConflict = null;
   mockStore.pendingReveal = null;
+  mockBlameState.enabled = false;
+  mockBlameState.linesByPath = {};
+  mockBlameLoad.mockResolvedValue(undefined);
 });
 
 describe("EditorPane", () => {
@@ -228,6 +254,35 @@ describe("EditorPane", () => {
     ).toBeInTheDocument();
     // The swap effect cleared the view (an extra setState after the close).
     expect(view.setState.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+});
+
+describe("EditorPane — blame gutter (G7 slice III)", () => {
+  const LINES = [
+    { line: 1, shaShort: "abc1234", authorName: "Ada", timestampMs: 1, summary: "first" },
+  ];
+
+  it("blame off: no fetch, no gutter extension built", () => {
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(mockBlameLoad).not.toHaveBeenCalled();
+    expect(blameGutterMock).not.toHaveBeenCalled();
+  });
+
+  it("blame on: fetches blame for the active file and installs the gutter via the compartment", () => {
+    mockBlameState.enabled = true;
+    mockBlameState.linesByPath = { "/repo/file.ts": LINES };
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(mockBlameLoad).toHaveBeenCalledWith("/repo", "/repo/file.ts");
+    expect(blameGutterMock).toHaveBeenCalledWith(LINES);
+    // The reconfigure landed on the live view.
+    const view = hoisted.lastView as unknown as { dispatch: ReturnType<typeof vi.fn> };
+    expect(view.dispatch).toHaveBeenCalled();
+  });
+
+  it("blame on without an active file: no fetch", () => {
+    mockBlameState.enabled = true;
+    render(<EditorPane workspaceId="ws-no-active" workspacePath="/repo" diffText="" />);
+    expect(mockBlameLoad).not.toHaveBeenCalled();
   });
 });
 

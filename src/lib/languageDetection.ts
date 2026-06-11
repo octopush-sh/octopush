@@ -1,11 +1,9 @@
-export function detectLanguageFromName(filename: string): string {
-  // Extract extension from filename
-  const parts = filename.split('.');
-  if (parts.length < 2) {
-    return 'plaintext';
-  }
+import { getExtension } from './getExtension';
 
-  const extension = parts[parts.length - 1].toLowerCase();
+// Extension table 2 of 3 — see getExtension.ts for the cross-reference
+// (fileIcons.ts and editorLang.ts hold the other two).
+export function detectLanguageFromName(filename: string): string {
+  const extension = getExtension(filename);
 
   // Map of extensions to language identifiers
   const extensionMap: Record<string, string> = {

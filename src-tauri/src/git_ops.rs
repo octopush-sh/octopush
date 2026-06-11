@@ -84,12 +84,16 @@ pub fn classify_pull(success: bool, combined: &str) -> PullKind {
 }
 
 /// Map a libgit2 repository state to the operation name the UI cares about.
+/// `cherry-pick` slots into the same continue/abort machinery: both
+/// `git cherry-pick --continue` and `--abort` are valid verbs.
 fn state_to_operation(state: git2::RepositoryState) -> Option<&'static str> {
     match state {
         git2::RepositoryState::Merge => Some("merge"),
         git2::RepositoryState::Rebase
         | git2::RepositoryState::RebaseInteractive
         | git2::RepositoryState::RebaseMerge => Some("rebase"),
+        git2::RepositoryState::CherryPick
+        | git2::RepositoryState::CherryPickSequence => Some("cherry-pick"),
         _ => None,
     }
 }
@@ -591,6 +595,386 @@ pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     Ok(Some((short_sha, subject, body)))
 }
 
+// ─── G7 slice III: history + blame ─────────────────────────────────
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub sha: String,
+    pub sha_short: String,
+    pub summary: String,
+    pub author_name: String,
+    /// Author time in milliseconds since the epoch — the UI formats it
+    /// relatively ("3h ago") so locales/clock-skew stay a frontend concern.
+    pub timestamp_ms: i64,
+}
+
+/// First-parent-ordered commit page from HEAD: newest first, `skip` commits
+/// offset, at most `limit` entries. An empty repo (no HEAD) yields `[]`.
+pub fn git_log(path: &Path, limit: usize, skip: usize) -> AppResult<Vec<CommitInfo>> {
+    let repo = open_repo(path)?;
+    if repo.head().is_err() {
+        return Ok(Vec::new()); // no commits yet
+    }
+    let mut walk = repo
+        .revwalk()
+        .map_err(|e| AppError::Other(format!("revwalk: {e}")))?;
+    walk.push_head()
+        .map_err(|e| AppError::Other(format!("revwalk head: {e}")))?;
+    let mut out = Vec::with_capacity(limit.min(256));
+    for oid in walk.filter_map(|o| o.ok()).skip(skip).take(limit) {
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+        out.push(commit_info(&commit));
+    }
+    Ok(out)
+}
+
+fn commit_info(commit: &git2::Commit) -> CommitInfo {
+    let sha = commit.id().to_string();
+    CommitInfo {
+        sha_short: sha[..7].to_string(),
+        sha,
+        summary: commit.summary().unwrap_or("").to_string(),
+        author_name: commit.author().name().unwrap_or("").to_string(),
+        timestamp_ms: commit.time().seconds() * 1000,
+    }
+}
+
+/// Unified diff of one commit against its first parent (a root commit diffs
+/// against the empty tree). Capped by the shared `diff_to_text` 1 MiB guard.
+pub fn commit_diff_text(path: &Path, sha: &str) -> AppResult<String> {
+    let repo = open_repo(path)?;
+    let oid = git2::Oid::from_str(sha)
+        .map_err(|e| AppError::Other(format!("bad commit sha '{sha}': {e}")))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|e| AppError::Other(format!("commit {sha} not found: {e}")))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| AppError::Other(format!("commit tree: {e}")))?;
+    // First parent, or None (empty tree) for a root commit.
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(
+            parent
+                .tree()
+                .map_err(|e| AppError::Other(format!("parent tree: {e}")))?,
+        ),
+        Err(_) => None,
+    };
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(|e| AppError::Other(format!("commit diff: {e}")))?;
+    diff_to_text(&diff)
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameLine {
+    /// 1-based line number in the committed (HEAD) version of the file.
+    pub line: u32,
+    pub sha_short: String,
+    pub author_name: String,
+    pub timestamp_ms: i64,
+    pub summary: String,
+}
+
+/// Per-line blame of `file` (workdir-relative) against HEAD. Errors friendly
+/// when the file has no committed history yet or is too large to blame.
+pub fn blame_file(path: &Path, file: &str) -> AppResult<Vec<BlameLine>> {
+    const MAX_BLAME_BYTES: usize = 1_048_576; // 1 MiB — keep the gutter snappy
+
+    let repo = open_repo(path)?;
+    let head_tree = repo
+        .head()
+        .and_then(|h| h.peel_to_tree())
+        .map_err(|_| AppError::Other("this repository has no commits yet".into()))?;
+    let entry = head_tree.get_path(Path::new(file)).map_err(|_| {
+        AppError::Other(format!("'{file}' has no committed history yet"))
+    })?;
+    let blob = repo
+        .find_blob(entry.id())
+        .map_err(|_| AppError::Other(format!("'{file}' is not a blameable file")))?;
+    if blob.size() > MAX_BLAME_BYTES {
+        return Err(AppError::Other(format!(
+            "'{file}' is too large to blame (over 1 MiB)"
+        )));
+    }
+
+    let blame = repo
+        .blame_file(Path::new(file), None)
+        .map_err(|e| AppError::Other(format!("blame '{file}': {e}")))?;
+
+    // Cache the summary per commit — hunks repeat commits constantly.
+    let mut summaries: std::collections::HashMap<git2::Oid, String> =
+        std::collections::HashMap::new();
+    let mut out: Vec<BlameLine> = Vec::new();
+    for hunk in blame.iter() {
+        let oid = hunk.final_commit_id();
+        let summary = summaries
+            .entry(oid)
+            .or_insert_with(|| {
+                repo.find_commit(oid)
+                    .ok()
+                    .and_then(|c| c.summary().map(String::from))
+                    .unwrap_or_default()
+            })
+            .clone();
+        let sig = hunk.final_signature();
+        let author_name = sig.name().unwrap_or("").to_string();
+        let timestamp_ms = sig.when().seconds() * 1000;
+        let sha = oid.to_string();
+        let sha_short = sha[..7].to_string();
+        let start = hunk.final_start_line();
+        for i in 0..hunk.lines_in_hunk() {
+            out.push(BlameLine {
+                line: (start + i) as u32,
+                sha_short: sha_short.clone(),
+                author_name: author_name.clone(),
+                timestamp_ms,
+                summary: summary.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|l| l.line);
+    Ok(out)
+}
+
+// ─── G7 slice IV: branch ops ───────────────────────────────────────
+
+/// Friendly message for a failed `git switch`. Pure. The worktree-aware
+/// case matters most here: workspaces ARE worktrees, so a branch that is
+/// checked out in another workspace can never be checked out in this one —
+/// git's raw "fatal: '<name>' is already used by worktree at <path>" gets
+/// rephrased in product language.
+pub fn friendly_switch_error(name: &str, combined: &str) -> String {
+    let s = combined.to_lowercase();
+    if s.contains("already checked out") || s.contains("already used by worktree") {
+        format!(
+            "'{name}' is checked out in another workspace — switch to that workspace instead, or create a new branch from it here."
+        )
+    } else if s.contains("would be overwritten by checkout") {
+        format!(
+            "Switching to '{name}' would overwrite local changes — commit or stash them first."
+        )
+    } else {
+        combined.trim().to_string()
+    }
+}
+
+/// `git switch <name>` via the user's login shell (gitconfig, hooks and
+/// filters behave like the user's terminal). Returns the trimmed combined
+/// output; failures come back as friendly errors via `friendly_switch_error`.
+pub fn switch_branch(path: &Path, name: &str) -> AppResult<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("git switch '{}' 2>&1", name.replace('\'', "'\\''"));
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git switch: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(friendly_switch_error(name, &combined)));
+    }
+    Ok(combined)
+}
+
+/// Create `name` off `base` (idempotent, reuses `create_branch`) and switch
+/// to it. The two steps share the caller's git_lock guard.
+pub fn create_and_switch_branch(path: &Path, name: &str, base: &str) -> AppResult<String> {
+    create_branch(path, name, base)?;
+    switch_branch(path, name)
+}
+
+// ─── G7 slice IV: stash ────────────────────────────────────────────
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StashInfo {
+    /// Position in the stash stack — 0 is the most recent (`stash@{0}`).
+    pub index: usize,
+    /// Full stash message as git records it ("On main: …" / "WIP on main: …").
+    pub message: String,
+    /// Stash creation time, ms since epoch — formatted relatively in the UI.
+    pub timestamp_ms: i64,
+}
+
+fn stash_signature(repo: &Repository) -> AppResult<git2::Signature<'static>> {
+    repo.signature()
+        .or_else(|_| git2::Signature::now("Octopush", "octopush@localhost"))
+        .map_err(|e| AppError::Other(format!("git signature: {e}")))
+}
+
+/// `git stash push -u [-m <message>]` equivalent (untracked files included).
+/// A clean tree errors friendly instead of with libgit2's raw ENOTFOUND.
+pub fn stash_push(path: &Path, message: &str) -> AppResult<()> {
+    let mut repo = open_repo(path)?;
+    let sig = stash_signature(&repo)?;
+    let msg = message.trim();
+    let flags = git2::StashFlags::INCLUDE_UNTRACKED;
+    repo.stash_save2(&sig, if msg.is_empty() { None } else { Some(msg) }, Some(flags))
+        .map_err(|e| {
+            if e.code() == git2::ErrorCode::NotFound {
+                AppError::Other("Nothing to stash — the working tree is clean.".into())
+            } else {
+                AppError::Other(format!("git stash push: {e}"))
+            }
+        })?;
+    Ok(())
+}
+
+/// The stash stack, most recent first (index 0 = `stash@{0}`).
+pub fn stash_list(path: &Path) -> AppResult<Vec<StashInfo>> {
+    let mut repo = open_repo(path)?;
+    let mut raw: Vec<(usize, String, git2::Oid)> = Vec::new();
+    repo.stash_foreach(|index, message, oid| {
+        raw.push((index, message.to_string(), *oid));
+        true
+    })
+    .map_err(|e| AppError::Other(format!("git stash list: {e}")))?;
+    Ok(raw
+        .into_iter()
+        .map(|(index, message, oid)| {
+            let timestamp_ms = repo
+                .find_commit(oid)
+                .map(|c| c.time().seconds() * 1000)
+                .unwrap_or(0);
+            StashInfo { index, message, timestamp_ms }
+        })
+        .collect())
+}
+
+/// `git stash pop stash@{index}` — apply then drop on success. Apply
+/// conflicts surface as errors and leave the stash entry intact (git's
+/// own pop semantics).
+pub fn stash_pop(path: &Path, index: usize) -> AppResult<()> {
+    let mut repo = open_repo(path)?;
+    repo.stash_pop(index, None)
+        .map_err(|e| AppError::Other(format!("git stash pop: {e}")))?;
+    Ok(())
+}
+
+/// `git stash drop stash@{index}` — discard one stash entry.
+pub fn stash_drop(path: &Path, index: usize) -> AppResult<()> {
+    let mut repo = open_repo(path)?;
+    repo.stash_drop(index)
+        .map_err(|e| AppError::Other(format!("git stash drop: {e}")))?;
+    Ok(())
+}
+
+// ─── G7 slice V: advanced ops ──────────────────────────────────────
+
+/// `git reset --<mode> <target>`. `mode` ∈ soft|mixed|hard (validated);
+/// `target` defaults to HEAD and is typically a SHA from the history
+/// browser. Returns the trimmed combined output.
+pub fn reset_head(path: &Path, mode: &str, target: Option<&str>) -> AppResult<String> {
+    if !matches!(mode, "soft" | "mixed" | "hard") {
+        return Err(AppError::Other(format!(
+            "invalid reset mode '{mode}' — expected \"soft\", \"mixed\" or \"hard\""
+        )));
+    }
+    let target = target.unwrap_or("HEAD");
+    if target.starts_with('-') {
+        return Err(AppError::Other(format!("invalid reset target '{target}'")));
+    }
+    let output = std::process::Command::new("git")
+        .arg("reset")
+        .arg(format!("--{mode}"))
+        .arg(target)
+        .current_dir(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git reset: {e}")))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+    .trim()
+    .to_string();
+    if !output.status.success() {
+        return Err(AppError::Other(format!("git reset failed: {combined}")));
+    }
+    Ok(combined)
+}
+
+/// `git clean -fd` — remove untracked files and directories. Returns the
+/// removed paths (as git reports them, e.g. `docs/` for a directory).
+pub fn clean_untracked(path: &Path) -> AppResult<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["clean", "-fd"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to run git clean: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Other(format!("git clean failed: {}", stderr.trim())));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("Removing "))
+        .map(String::from)
+        .collect())
+}
+
+/// `git cherry-pick <sha>` via the user's login shell (the resulting commit
+/// honours gitconfig identity/signing like a terminal run). Conflicts are a
+/// tagged outcome, not an error — the repo enters the cherry-pick state and
+/// the existing conflict section (resolve / continue / abort) takes over.
+/// `classify_pull` is reused: cherry-pick output never matches its diverged
+/// patterns, so the kinds collapse to Ok / Conflict / Error.
+pub fn cherry_pick(path: &Path, sha: &str) -> AppResult<PullOutcome> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!(
+        "git -c core.editor=true cherry-pick '{}' 2>&1",
+        sha.replace('\'', "'\\''")
+    );
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git cherry-pick: {e}")))?;
+    let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let kind = classify_pull(output.status.success(), &combined);
+    Ok(PullOutcome { kind, output: combined })
+}
+
+/// Create a lightweight tag `name` at `sha` (or HEAD when None).
+pub fn create_tag(path: &Path, name: &str, sha: Option<&str>) -> AppResult<()> {
+    let repo = open_repo(path)?;
+    let oid = match sha {
+        Some(s) => git2::Oid::from_str(s)
+            .map_err(|e| AppError::Other(format!("bad commit sha '{s}': {e}")))?,
+        None => repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .ok_or_else(|| AppError::Other("this repository has no commits yet".into()))?,
+    };
+    let obj = repo
+        .find_object(oid, None)
+        .map_err(|e| AppError::Other(format!("commit {oid} not found: {e}")))?;
+    repo.tag_lightweight(name, &obj, false).map_err(|e| {
+        if e.code() == git2::ErrorCode::Exists {
+            AppError::Other(format!("Tag '{name}' already exists."))
+        } else {
+            AppError::Other(format!("create tag: {e}"))
+        }
+    })?;
+    Ok(())
+}
+
+/// All tag names, as git lists them (alphabetical).
+pub fn list_tags(path: &Path) -> AppResult<Vec<String>> {
+    let repo = open_repo(path)?;
+    Ok(repo
+        .tag_names(None)
+        .map_err(|e| AppError::Other(format!("list tags: {e}")))?
+        .iter()
+        .filter_map(|t| t.map(String::from))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +1096,381 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).unwrap();
         assert!(last_commit(dir.path()).unwrap().is_none());
+    }
+
+    // ── G7 slice III: log / commit diff ───────────────────────────
+
+    #[test]
+    fn git_log_returns_newest_first_and_paginates() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "two\n", "second");
+        commit_file(dir.path(), "a.txt", "three\n", "third");
+
+        let all = git_log(dir.path(), 10, 0).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].summary, "third");
+        assert_eq!(all[1].summary, "second");
+        assert_eq!(all[2].summary, "first");
+        assert_eq!(all[0].sha_short.len(), 7);
+        assert_eq!(all[0].sha.len(), 40);
+        assert_eq!(all[0].author_name, "Test");
+        assert!(all[0].timestamp_ms > 0);
+
+        // Pagination: limit caps the page, skip offsets into the walk.
+        let page1 = git_log(dir.path(), 2, 0).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].summary, "third");
+        let page2 = git_log(dir.path(), 2, 2).unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].summary, "first");
+    }
+
+    #[test]
+    fn git_log_empty_repo_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        assert!(git_log(dir.path(), 10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_diff_shows_change_vs_first_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let second = commit_file(dir.path(), "a.txt", "two\n", "second");
+        let diff = commit_diff_text(dir.path(), &second.to_string()).unwrap();
+        assert!(diff.contains("-one"), "diff shows removed line: {diff}");
+        assert!(diff.contains("+two"), "diff shows added line: {diff}");
+    }
+
+    #[test]
+    fn commit_diff_root_commit_diffs_against_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let root = commit_file(dir.path(), "a.txt", "one\n", "first");
+        let diff = commit_diff_text(dir.path(), &root.to_string()).unwrap();
+        assert!(diff.contains("+one"), "root commit diffs vs empty tree: {diff}");
+    }
+
+    #[test]
+    fn commit_diff_bad_sha_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        assert!(commit_diff_text(dir.path(), "not-a-sha").is_err());
+    }
+
+    // ── G7 slice III: blame ───────────────────────────────────────
+
+    #[test]
+    fn blame_file_attributes_lines_to_their_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "one\ntwo\n", "second");
+
+        let lines = blame_file(dir.path(), "a.txt").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, 1);
+        assert_eq!(lines[0].summary, "first");
+        assert_eq!(lines[1].line, 2);
+        assert_eq!(lines[1].summary, "second");
+        assert_ne!(lines[0].sha_short, lines[1].sha_short);
+        assert_eq!(lines[0].sha_short.len(), 7);
+        assert_eq!(lines[0].author_name, "Test");
+        assert!(lines[0].timestamp_ms > 0);
+    }
+
+    #[test]
+    fn blame_file_uncommitted_path_errors_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        std::fs::write(dir.path().join("new.txt"), "x\n").unwrap();
+        let err = blame_file(dir.path(), "new.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("committed"),
+            "friendly message about no committed history: {err}"
+        );
+    }
+
+    #[test]
+    fn blame_file_caps_huge_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let big = "x".repeat(70).repeat(20_000); // ~1.4 MiB
+        commit_file(dir.path(), "big.txt", &big, "huge");
+        let err = blame_file(dir.path(), "big.txt").unwrap_err();
+        assert!(err.to_string().contains("too large"), "friendly cap message: {err}");
+    }
+
+    // ── G7 slice IV: branch ops ───────────────────────────────────
+
+    #[test]
+    fn friendly_switch_error_rephrases_worktree_collisions() {
+        let msg = friendly_switch_error(
+            "feat/x",
+            "fatal: 'feat/x' is already used by worktree at '/tmp/wt'",
+        );
+        assert!(msg.contains("another workspace"), "friendly: {msg}");
+        let msg2 = friendly_switch_error(
+            "main",
+            "fatal: 'main' is already checked out at '/tmp/main'",
+        );
+        assert!(msg2.contains("another workspace"), "friendly: {msg2}");
+        let msg3 = friendly_switch_error(
+            "dev",
+            "error: Your local changes to the following files would be overwritten by checkout:",
+        );
+        assert!(msg3.contains("stash"), "friendly dirty-tree: {msg3}");
+        // Unrecognized output passes through trimmed.
+        assert_eq!(
+            friendly_switch_error("x", "  fatal: invalid reference: x\n"),
+            "fatal: invalid reference: x",
+        );
+    }
+
+    #[test]
+    fn switch_branch_switches_and_reports_current() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "side", &base).unwrap();
+
+        switch_branch(dir.path(), "side").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "side");
+
+        switch_branch(dir.path(), &base).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), base);
+    }
+
+    #[test]
+    fn switch_branch_to_unknown_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        assert!(switch_branch(dir.path(), "no-such-branch").is_err());
+    }
+
+    #[test]
+    fn switch_branch_checked_out_in_worktree_errors_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "wt-branch", &base).unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("wt-branch");
+        create_worktree(dir.path(), "wt-branch", &wt_path).unwrap();
+
+        let err = switch_branch(dir.path(), "wt-branch").unwrap_err();
+        assert!(
+            err.to_string().contains("another workspace"),
+            "friendly worktree-collision message: {err}"
+        );
+    }
+
+    #[test]
+    fn create_and_switch_branch_lands_on_the_new_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+
+        create_and_switch_branch(dir.path(), "feat/fresh", &base).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "feat/fresh");
+    }
+
+    // ── G7 slice IV: stash ────────────────────────────────────────
+
+    #[test]
+    fn stash_push_list_pop_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+
+        // Dirty the tree: one tracked edit + one untracked file (-u behavior).
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+
+        stash_push(dir.path(), "wip: experiment").unwrap();
+
+        // Tree is clean again; the untracked file went into the stash too.
+        assert!(!is_dirty(dir.path()).unwrap(), "stash -u leaves a clean tree");
+        assert!(!dir.path().join("untracked.txt").exists());
+
+        let list = stash_list(dir.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].index, 0);
+        assert!(list[0].message.contains("wip: experiment"), "msg: {}", list[0].message);
+        assert!(list[0].timestamp_ms > 0);
+
+        stash_pop(dir.path(), 0).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "edited\n");
+        assert!(dir.path().join("untracked.txt").exists(), "untracked file restored");
+        assert!(stash_list(dir.path()).unwrap().is_empty(), "pop drops the entry");
+    }
+
+    #[test]
+    fn stash_push_clean_tree_errors_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let err = stash_push(dir.path(), "").unwrap_err();
+        assert!(err.to_string().contains("Nothing to stash"), "friendly: {err}");
+    }
+
+    #[test]
+    fn stash_drop_discards_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        stash_push(dir.path(), "older").unwrap();
+        fs::write(dir.path().join("a.txt"), "three\n").unwrap();
+        stash_push(dir.path(), "newer").unwrap();
+
+        let list = stash_list(dir.path()).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].message.contains("newer"), "stack is newest-first");
+
+        stash_drop(dir.path(), 0).unwrap();
+        let after = stash_list(dir.path()).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].message.contains("older"));
+        // The dropped stash is gone — its changes are NOT in the tree.
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+    }
+
+    // ── G7 slice V: advanced ops ──────────────────────────────────
+
+    #[test]
+    fn reset_soft_moves_head_but_keeps_changes_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let first = commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "two\n", "second");
+
+        reset_head(dir.path(), "soft", Some(&first.to_string())).unwrap();
+
+        let lc = last_commit(dir.path()).unwrap().unwrap();
+        assert_eq!(lc.1, "first", "HEAD moved back to the first commit");
+        // The second commit's content survives in the tree (staged).
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two\n");
+        assert!(is_dirty(dir.path()).unwrap(), "soft reset leaves staged changes");
+    }
+
+    #[test]
+    fn reset_hard_discards_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let first = commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "two\n", "second");
+        fs::write(dir.path().join("a.txt"), "uncommitted\n").unwrap();
+
+        reset_head(dir.path(), "hard", Some(&first.to_string())).unwrap();
+
+        let lc = last_commit(dir.path()).unwrap().unwrap();
+        assert_eq!(lc.1, "first");
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+        assert!(!is_dirty(dir.path()).unwrap(), "hard reset leaves a clean tree");
+    }
+
+    #[test]
+    fn reset_validates_mode_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let err = reset_head(dir.path(), "yolo", None).unwrap_err();
+        assert!(err.to_string().contains("invalid reset mode"), "{err}");
+        assert!(reset_head(dir.path(), "hard", Some("--evil")).is_err());
+    }
+
+    #[test]
+    fn clean_untracked_removes_untracked_only() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        // A tracked edit must survive; untracked file + dir must go.
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        fs::write(dir.path().join("loose.txt"), "x\n").unwrap();
+        fs::create_dir(dir.path().join("junk")).unwrap();
+        fs::write(dir.path().join("junk/b.txt"), "y\n").unwrap();
+
+        let removed = clean_untracked(dir.path()).unwrap();
+
+        assert!(removed.iter().any(|p| p.contains("loose.txt")), "{removed:?}");
+        assert!(removed.iter().any(|p| p.contains("junk")), "{removed:?}");
+        assert!(!dir.path().join("loose.txt").exists());
+        assert!(!dir.path().join("junk").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "edited\n",
+            "tracked modification untouched"
+        );
+    }
+
+    #[test]
+    fn cherry_pick_applies_a_clean_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_and_switch_branch(dir.path(), "side", &base).unwrap();
+        let side_commit = commit_file(dir.path(), "b.txt", "side\n", "side: add b");
+        switch_branch(dir.path(), &base).unwrap();
+        assert!(!dir.path().join("b.txt").exists());
+
+        let r = cherry_pick(dir.path(), &side_commit.to_string()).unwrap();
+        assert_eq!(r.kind, PullKind::Ok, "output: {}", r.output);
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "side\n");
+        let lc = last_commit(dir.path()).unwrap().unwrap();
+        assert_eq!(lc.1, "side: add b");
+    }
+
+    #[test]
+    fn cherry_pick_conflict_is_classified_and_enters_the_operation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_and_switch_branch(dir.path(), "side", &base).unwrap();
+        let side_commit = commit_file(dir.path(), "a.txt", "side\n", "side edit");
+        switch_branch(dir.path(), &base).unwrap();
+        commit_file(dir.path(), "a.txt", "main\n", "main edit");
+
+        let r = cherry_pick(dir.path(), &side_commit.to_string()).unwrap();
+        assert_eq!(r.kind, PullKind::Conflict, "output: {}", r.output);
+        // The existing conflict machinery takes over: operation + conflicted files.
+        assert_eq!(operation_state(dir.path()).unwrap(), Some("cherry-pick"));
+        let status = get_status(dir.path()).unwrap();
+        assert!(status.conflicted > 0, "conflicted files reported");
+    }
+
+    #[test]
+    fn tag_create_and_list_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        let first = commit_file(dir.path(), "a.txt", "one\n", "first");
+        commit_file(dir.path(), "a.txt", "two\n", "second");
+
+        create_tag(dir.path(), "v0.1.0", None).unwrap();
+        create_tag(dir.path(), "v0.0.1", Some(&first.to_string())).unwrap();
+
+        let tags = list_tags(dir.path()).unwrap();
+        assert_eq!(tags, vec!["v0.0.1".to_string(), "v0.1.0".to_string()]);
+
+        let err = create_tag(dir.path(), "v0.1.0", None).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "friendly: {err}");
+        let bad = create_tag(dir.path(), "vX", Some("not-a-sha")).unwrap_err();
+        assert!(bad.to_string().contains("bad commit sha"), "{bad}");
     }
 
     #[test]

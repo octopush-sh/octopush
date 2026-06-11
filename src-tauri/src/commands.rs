@@ -1991,31 +1991,40 @@ pub struct DirectoryEntry {
     pub is_ignored: bool,
 }
 
+/// The one workspace walker. Shared by `walk_one_level` (read_directory),
+/// `list_workspace_files` and `search_workspace_text`:
+///  - `apply_ignore_filters = true` turns the standard ignore sources on
+///    (`.gitignore`, `.ignore`, global excludes); `false` disables them all
+///    so gitignored entries appear too,
+///  - `.gitignore` rules apply even outside a git checkout (`require_git(false)`),
+///  - dot-files like `.gitignore` itself are included (`hidden(false)`),
+///  - `.git` directories are pruned at every depth — the single place this
+///    exclusion is implemented.
+/// Callers keep their own depth-0 skip and file-type filtering.
+pub(crate) fn workspace_walker(
+    base: &std::path::Path,
+    max_depth: Option<usize>,
+    apply_ignore_filters: bool,
+) -> ignore::Walk {
+    let mut builder = ignore::WalkBuilder::new(base);
+    builder
+        .max_depth(max_depth)
+        .standard_filters(apply_ignore_filters)
+        .require_git(false)
+        .hidden(false)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    builder.build()
+}
+
 /// One level of `base`: entry paths only (root itself and `.git` excluded).
 /// `apply_ignore_filters = true` is today's behavior (gitignore rules on);
 /// `false` disables every ignore source so gitignored entries appear too.
 fn walk_one_level(base: &std::path::Path, apply_ignore_filters: bool) -> Vec<std::path::PathBuf> {
-    let mut builder = ignore::WalkBuilder::new(base);
-    builder
-        .max_depth(Some(1))
-        .standard_filters(apply_ignore_filters)
-        .require_git(false) // apply .gitignore rules even outside a git repo
-        .hidden(false); // include dot-files like .gitignore itself (both modes)
-    let mut out = Vec::new();
-    for result in builder.build() {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.depth() == 0 {
-            continue;
-        }
-        if entry.path().file_name().map(|n| n == ".git").unwrap_or(false) {
-            continue;
-        }
-        out.push(entry.path().to_path_buf());
-    }
-    out
+    workspace_walker(base, Some(1), apply_ignore_filters)
+        .filter_map(|result| result.ok())
+        .filter(|entry| entry.depth() > 0)
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
 }
 
 /// Build a gitignore matcher for `base`, honoring every `.gitignore` from the
@@ -2604,6 +2613,80 @@ pub(crate) fn parse_open_pr_list(values: &[serde_json::Value]) -> Vec<BranchPr> 
         .collect()
 }
 
+/// List open pull requests for the repo at `path`, for the workspace
+/// creator's "start from a pull request" menu. Runs `gh pr list` in the
+/// user's login shell (same pattern as `try_gh_cli`) so PATH and keychain
+/// credentials behave like in a terminal.
+///
+/// `gh` missing, unauthenticated, or pointed at a non-GitHub remote all
+/// surface as a friendly error — the UI maps any failure to a quiet
+/// "GitHub CLI not available" empty state.
+#[tauri::command]
+pub async fn list_prs(path: String) -> AppResult<Vec<crate::github::PrInfo>> {
+    let path = expand_tilde(&path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c")
+        .arg("gh pr list --json number,title,headRefName,author --limit 30")
+        .current_dir(&path)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.trim().chars().take(200).collect();
+        return Err(AppError::Other(format!("GitHub CLI not available: {snippet}")));
+    }
+
+    crate::github::pr_infos_from_json(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
+}
+
+/// Make a PR's head ref available as a local branch so it can serve as a
+/// workspace base. No-op when the branch already exists locally; otherwise
+/// `git fetch origin pull/<n>/head:<headRefName>` in the login shell (works
+/// for same-repo and fork PRs alike — GitHub exposes every PR head under
+/// `pull/<n>/head` regardless of where the branch lives).
+#[tauri::command]
+pub async fn ensure_pr_branch(
+    path: String,
+    number: u64,
+    head_ref_name: String,
+) -> AppResult<()> {
+    let path = expand_tilde(&path);
+
+    // Already fetched (or it's a same-repo branch the user has locally)?
+    // Scoped so the !Send `Repository` handle drops before any await.
+    {
+        if let Ok(repo) = crate::git_ops::open_repo(std::path::Path::new(&path)) {
+            if repo
+                .find_reference(&format!("refs/heads/{head_ref_name}"))
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    let _guard = crate::git_lock::git_lock(&path).await;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = crate::github::pr_fetch_command(number, &head_ref_name);
+    let output = std::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(&path)
+        .output()
+        .map_err(|e| AppError::Other(format!("failed to spawn git fetch: {e}")))?;
+
+    if !output.status.success() {
+        let combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(AppError::Other(format!(
+            "fetching the head of PR #{number} failed: {combined}"
+        )));
+    }
+    Ok(())
+}
+
 /// Ask the `gh` CLI for the most recent PR on `branch` (any state). Returns
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave
@@ -2904,6 +2987,130 @@ pub async fn pull(workspace_path: String, strategy: String) -> AppResult<crate::
     Ok(crate::git_ops::PullOutcome { kind, output: combined })
 }
 
+// ─── G7 slice IV: branch ops ──────────────────────────────────────
+
+/// Switch the workspace to an existing local branch. Worktree-aware: a
+/// branch checked out in another workspace errors with a friendly message
+/// (workspaces are worktrees — git forbids double checkouts).
+#[tauri::command]
+pub async fn switch_branch(workspace_path: String, name: String) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::switch_branch(std::path::Path::new(&workspace_path), &name)
+}
+
+/// Create `name` off `base` and switch to it, under one git_lock guard.
+#[tauri::command]
+pub async fn create_and_switch_branch(
+    workspace_path: String,
+    name: String,
+    base: String,
+) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::create_and_switch_branch(
+        std::path::Path::new(&workspace_path),
+        &name,
+        &base,
+    )
+}
+
+// ─── G7 slice IV: stash ───────────────────────────────────────────
+
+/// Stash the working tree (untracked included) with an optional message.
+#[tauri::command]
+pub async fn stash_push(workspace_path: String, message: String) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::stash_push(std::path::Path::new(&workspace_path), &message)
+}
+
+/// The stash stack, most recent first. Read-only — no git_lock needed.
+#[tauri::command]
+pub async fn stash_list(workspace_path: String) -> AppResult<Vec<crate::git_ops::StashInfo>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    crate::git_ops::stash_list(std::path::Path::new(&workspace_path))
+}
+
+/// Apply + drop one stash entry.
+#[tauri::command]
+pub async fn stash_pop(workspace_path: String, index: usize) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::stash_pop(std::path::Path::new(&workspace_path), index)
+}
+
+/// Discard one stash entry without applying it.
+#[tauri::command]
+pub async fn stash_drop(workspace_path: String, index: usize) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::stash_drop(std::path::Path::new(&workspace_path), index)
+}
+
+// ─── G7 slice V: advanced ops ─────────────────────────────────────
+
+/// `git reset --soft|--mixed|--hard [target]` (target defaults to HEAD;
+/// typically a SHA from the history browser). Mode is validated; the UI
+/// confirm-gates hard resets.
+#[tauri::command]
+pub async fn reset_head(
+    workspace_path: String,
+    mode: String,
+    target: Option<String>,
+) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::reset_head(
+        std::path::Path::new(&workspace_path),
+        &mode,
+        target.as_deref(),
+    )
+}
+
+/// `git clean -fd` — returns the removed paths for the confirmation toast.
+#[tauri::command]
+pub async fn clean_untracked(workspace_path: String) -> AppResult<Vec<String>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::clean_untracked(std::path::Path::new(&workspace_path))
+}
+
+/// Cherry-pick one commit onto HEAD. Conflict is a tagged outcome (the
+/// conflict section takes over), never an Err.
+#[tauri::command]
+pub async fn cherry_pick(
+    workspace_path: String,
+    sha: String,
+) -> AppResult<crate::git_ops::PullOutcome> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::cherry_pick(std::path::Path::new(&workspace_path), &sha)
+}
+
+/// Create a lightweight tag at `sha` (or HEAD when omitted).
+#[tauri::command]
+pub async fn create_tag(
+    workspace_path: String,
+    name: String,
+    sha: Option<String>,
+) -> AppResult<()> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    crate::git_ops::create_tag(
+        std::path::Path::new(&workspace_path),
+        &name,
+        sha.as_deref(),
+    )
+}
+
+/// All tag names. Read-only — no git_lock needed.
+#[tauri::command]
+pub async fn list_tags(workspace_path: String) -> AppResult<Vec<String>> {
+    let workspace_path = expand_tilde(&workspace_path);
+    crate::git_ops::list_tags(std::path::Path::new(&workspace_path))
+}
+
 // ─── Test runner ──────────────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -3011,22 +3218,15 @@ pub async fn list_workspace_files(workspace_path: String) -> AppResult<Vec<Strin
     // blocking task so we don't park the tokio runtime.
     let result = tokio::task::spawn_blocking(move || {
         let mut files = Vec::with_capacity(1024);
-        let walker = ignore::WalkBuilder::new(&base)
-            .standard_filters(true)
-            .require_git(false)
-            .hidden(false)
-            .build();
-        for entry in walker {
+        // workspace_walker prunes `.git` at every depth.
+        for entry in workspace_walker(&base, None, true) {
             let Ok(entry) = entry else { continue };
             if entry.depth() == 0 {
                 continue;
             }
-            // Skip directories and any path that crosses through `.git`.
+            // Skip directories — only real files are listed.
             let path = entry.path();
             if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
-                continue;
-            }
-            if path.components().any(|c| c.as_os_str() == ".git") {
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(&base) {
@@ -3072,13 +3272,8 @@ pub async fn search_workspace_text(
 
     let hits = tokio::task::spawn_blocking(move || {
         let mut hits: Vec<SearchHit> = Vec::new();
-        let walker = ignore::WalkBuilder::new(&base)
-            .standard_filters(true)
-            .require_git(false)
-            .hidden(false)
-            .build();
-
-        for entry in walker {
+        // workspace_walker prunes `.git` at every depth.
+        for entry in workspace_walker(&base, None, true) {
             if hits.len() >= SEARCH_RESULT_CAP {
                 break;
             }
@@ -3088,9 +3283,6 @@ pub async fn search_workspace_text(
             }
             let path = entry.path();
             if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
-                continue;
-            }
-            if path.components().any(|c| c.as_os_str() == ".git") {
                 continue;
             }
             // Skip oversized files outright.
@@ -3207,14 +3399,49 @@ pub struct AiCompleteResult {
     pub cost_usd: f64,
 }
 
-/// Pure request builder — one user/text message, no tools. Unit-testable.
-pub fn build_ai_request(model: &str, system: String, prompt: String, max_tokens: u32) -> LlmRequest {
+/// Name of the forced tool used for guaranteed-shape (JSON-schema) output.
+pub(crate) const AI_RESULT_TOOL: &str = "emit_result";
+
+/// Pure request builder — one user/text message. With `json_schema` the
+/// request carries a single forced tool whose input IS the schema, so the
+/// provider returns guaranteed-shape JSON instead of prose to scrape.
+/// Unit-testable.
+pub fn build_ai_request(
+    model: &str,
+    system: String,
+    prompt: String,
+    max_tokens: u32,
+    json_schema: Option<serde_json::Value>,
+) -> LlmRequest {
+    let (tools, tool_choice) = match json_schema {
+        Some(schema) => (
+            vec![crate::providers::LlmTool {
+                name: AI_RESULT_TOOL.to_string(),
+                description: "Return the final result. Call this tool exactly once with the complete answer.".to_string(),
+                input_schema: schema,
+            }],
+            Some(AI_RESULT_TOOL.to_string()),
+        ),
+        None => (vec![], None),
+    };
     LlmRequest {
         model: model.to_string(),
         max_tokens,
         system,
         messages: vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(prompt) }],
-        tools: vec![],
+        tools,
+        tool_choice,
+    }
+}
+
+/// Pick the caller-visible text out of an LLM response: a forced-tool call
+/// yields its input serialized as JSON (the guaranteed-shape path); anything
+/// else falls back to the prose text, which callers may still scrape.
+/// Unit-testable.
+pub(crate) fn ai_response_text(resp: crate::providers::LlmResponse) -> String {
+    match resp.tool_uses.into_iter().next() {
+        Some(u) => u.input.to_string(),
+        None => resp.text,
     }
 }
 
@@ -3230,25 +3457,69 @@ pub fn ensure_not_truncated(stop_reason: &crate::providers::LlmStopReason) -> Ap
     Ok(())
 }
 
+/// Build the `token_events` row for a one-shot AI call. Session attribution
+/// reuses the workspace id (the same convention ChatEngine uses); callers
+/// without a workspace (e.g. commit drafting from a bare project path) land
+/// in a shared "ai-adhoc" bucket so the spend still shows up in Usage.
+/// `timestamp` stays empty — `TokenEngine::record` stamps now(). Unit-testable.
+pub(crate) fn ai_token_event(
+    workspace_id: Option<&str>,
+    model: &str,
+    resp: &crate::providers::LlmResponse,
+    cost_usd: f64,
+) -> TokenEvent {
+    TokenEvent {
+        id: None,
+        session_id: workspace_id.unwrap_or("ai-adhoc").to_string(),
+        timestamp: String::new(),
+        input_tokens: resp.input_tokens,
+        output_tokens: resp.output_tokens,
+        cache_read_tokens: resp.cache_read_tokens,
+        cache_creation_tokens: resp.cache_creation_tokens,
+        model: model.to_string(),
+        cost_usd,
+    }
+}
+
 /// Generic one-shot model call — the shared G5 AI primitive. Returns text +
-/// token counts + computed cost. Does NOT record to the token DB in slice 1.
+/// token counts + computed cost, and records the usage to `token_events`
+/// (attributed to `workspace_id` when given) so Usage dashboards see
+/// AI-review / draft / conflict spend. With `json_schema` the model is
+/// forced through a schema'd tool call, so `text` is guaranteed-shape JSON
+/// (callers keep their prose-scrape parser as a fallback).
 #[tauri::command]
 pub async fn ai_complete(
+    state: State<'_, AppState>,
     model: String,
     system: String,
     prompt: String,
     max_tokens: Option<u32>,
+    workspace_id: Option<String>,
+    json_schema: Option<serde_json::Value>,
 ) -> AppResult<AiCompleteResult> {
     let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&model)?;
-    let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192));
-    let client = reqwest::Client::new();
-    let resp = provider.complete(&api_base, api_key.as_deref(), &req, &client).await?;
+    let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192), json_schema);
+    let client = crate::chat_engine::shared_http_client();
+    let resp = provider.complete(&api_base, api_key.as_deref(), &req, client).await?;
     ensure_not_truncated(&resp.stop_reason)?;
-    let cost = crate::token_engine::compute_cost(&model, resp.input_tokens, resp.output_tokens, 0, 0);
+    let cost = crate::token_engine::compute_cost(
+        &model,
+        resp.input_tokens,
+        resp.output_tokens,
+        resp.cache_read_tokens,
+        resp.cache_creation_tokens,
+    );
+    if resp.input_tokens > 0 || resp.output_tokens > 0 {
+        // Best-effort: a recording failure must not fail the AI call itself.
+        if let Err(e) = state.tokens.record(ai_token_event(workspace_id.as_deref(), &model, &resp, cost)) {
+            tracing::warn!(error = %e, "failed to record ai_complete token event");
+        }
+    }
+    let (input_tokens, output_tokens) = (resp.input_tokens, resp.output_tokens);
     Ok(AiCompleteResult {
-        text: resp.text,
-        input_tokens: resp.input_tokens,
-        output_tokens: resp.output_tokens,
+        text: ai_response_text(resp),
+        input_tokens,
+        output_tokens,
         cost_usd: cost,
     })
 }
@@ -3270,6 +3541,30 @@ pub async fn get_last_commit(workspace_path: String) -> AppResult<Option<LastCom
     let workspace_path = expand_tilde(&workspace_path);
     Ok(crate::git_ops::last_commit(std::path::Path::new(&workspace_path))?
         .map(|(short_sha, subject, body)| LastCommit { short_sha, subject, body }))
+}
+
+// ─── G7 slice III: history ────────────────────────────────────────
+
+#[tauri::command]
+pub async fn git_log(
+    path: String,
+    limit: usize,
+    skip: usize,
+) -> AppResult<Vec<crate::git_ops::CommitInfo>> {
+    let path = expand_tilde(&path);
+    crate::git_ops::git_log(std::path::Path::new(&path), limit, skip)
+}
+
+#[tauri::command]
+pub async fn commit_diff(path: String, sha: String) -> AppResult<String> {
+    let path = expand_tilde(&path);
+    crate::git_ops::commit_diff_text(std::path::Path::new(&path), &sha)
+}
+
+#[tauri::command]
+pub async fn blame_file(path: String, file: String) -> AppResult<Vec<crate::git_ops::BlameLine>> {
+    let path = expand_tilde(&path);
+    crate::git_ops::blame_file(std::path::Path::new(&path), &file)
 }
 
 #[tauri::command]
@@ -3508,17 +3803,64 @@ mod ai_complete_tests {
 
     #[test]
     fn build_ai_request_makes_one_user_text_message_no_tools() {
-        let req = super::build_ai_request("claude-sonnet-4-6", "SYS".into(), "PROMPT".into(), 8192);
+        let req = super::build_ai_request("claude-sonnet-4-6", "SYS".into(), "PROMPT".into(), 8192, None);
         assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, 8192);
         assert_eq!(req.system, "SYS");
         assert_eq!(req.tools.len(), 0);
+        assert_eq!(req.tool_choice, None);
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, LlmRole::User);
         match &req.messages[0].content {
             LlmContent::Text(t) => assert_eq!(t, "PROMPT"),
             _ => panic!("expected Text content"),
         }
+    }
+
+    #[test]
+    fn build_ai_request_with_schema_forces_the_emit_result_tool() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" } },
+            "required": ["summary"]
+        });
+        let req = super::build_ai_request("m", "SYS".into(), "PROMPT".into(), 100, Some(schema.clone()));
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, super::AI_RESULT_TOOL);
+        assert_eq!(req.tools[0].input_schema, schema);
+        assert_eq!(req.tool_choice.as_deref(), Some(super::AI_RESULT_TOOL));
+    }
+
+    #[test]
+    fn ai_response_text_prefers_the_tool_input_then_falls_back_to_prose() {
+        use crate::providers::{LlmResponse, LlmStopReason, LlmToolUse};
+        let structured = LlmResponse {
+            text: "ignored preamble".into(),
+            tool_uses: vec![LlmToolUse {
+                id: "tu_1".into(),
+                name: super::AI_RESULT_TOOL.into(),
+                input: serde_json::json!({ "summary": "ok", "findings": [] }),
+            }],
+            stop_reason: LlmStopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let text = super::ai_response_text(structured);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["summary"], "ok");
+
+        let prose = LlmResponse {
+            text: "plain answer".into(),
+            tool_uses: vec![],
+            stop_reason: LlmStopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert_eq!(super::ai_response_text(prose), "plain answer");
     }
 
     #[test]

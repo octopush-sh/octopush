@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Eye, EyeOff } from "lucide-react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
+import { Eye, EyeOff, Search } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { DirectoryEntry } from "../lib/types";
 import { fileIcon } from "../lib/fileIcons";
@@ -8,6 +8,11 @@ import { FileTreeContextMenu } from "./FileTreeContextMenu";
 import { FileNameDialog } from "./FileNameDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { pushToast } from "./Toasts";
+import { useVirtualRows } from "../lib/useVirtualRows";
+
+/** Every row (node or placeholder) renders at exactly this height — the
+ *  fixed-row contract the windowing math depends on. */
+const ROW_HEIGHT = 24;
 
 interface Props {
   rootPath: string;
@@ -39,6 +44,134 @@ export function clearTreeStateCache(): void {
   treeStateCache.clear();
 }
 
+// ─── Flat row model ──────────────────────────────────────────────
+//
+// The tree renders from a flat list, not a recursive component: flattening is
+// what makes both filtering (visibility is a property of the whole walk) and
+// windowed rendering (a slice of an array) tractable.
+
+interface NodeRow {
+  kind: "node";
+  path: string;
+  label: string;
+  isDir: boolean;
+  isIgnored: boolean;
+  depth: number;
+  isRoot: boolean;
+  isExpanded: boolean;
+  /** [start, end) of the filter match inside `label`, when filtering. */
+  match?: readonly [number, number];
+}
+
+interface PlaceholderRow {
+  kind: "placeholder";
+  key: string;
+  depth: number;
+  state: "loading" | "error" | "empty";
+}
+
+type FlatRow = NodeRow | PlaceholderRow;
+
+/** Document-order walk of the expanded tree (no filter). */
+function flattenVisible(
+  rootPath: string,
+  rootLabel: string,
+  expanded: Set<string>,
+  childrenMap: Record<string, ChildState>,
+): FlatRow[] {
+  const out: FlatRow[] = [];
+  const visit = (
+    path: string,
+    label: string,
+    isDir: boolean,
+    isIgnored: boolean,
+    depth: number,
+    isRoot: boolean,
+  ) => {
+    const isExpanded = isDir && expanded.has(path);
+    out.push({ kind: "node", path, label, isDir, isIgnored, depth, isRoot, isExpanded });
+    if (!isExpanded) return;
+    const state = childrenMap[path];
+    if (!state || state === "loading") {
+      out.push({ kind: "placeholder", key: `${path}::loading`, depth: depth + 1, state: "loading" });
+      return;
+    }
+    if (state === "error") {
+      out.push({ kind: "placeholder", key: `${path}::error`, depth: depth + 1, state: "error" });
+      return;
+    }
+    if (state.length === 0) {
+      out.push({ kind: "placeholder", key: `${path}::empty`, depth: depth + 1, state: "empty" });
+      return;
+    }
+    for (const entry of state) {
+      visit(entry.path, entry.name, entry.isDir, entry.isIgnored || isIgnored, depth + 1, false);
+    }
+  };
+  visit(rootPath, rootLabel, true, false, 0, true);
+  return out;
+}
+
+/** Filtered walk over everything LOADED (the tree is lazy — unloaded folders
+ *  cannot match): a node is visible iff its name matches (case-insensitive
+ *  substring) or it has a visible descendant. Ancestors of matches therefore
+ *  stay visible; everything else collapses away. The caller's `expanded` set
+ *  is deliberately not consulted — and not mutated — so clearing the filter
+ *  restores the prior expansion untouched. */
+function flattenFiltered(
+  rootPath: string,
+  rootLabel: string,
+  childrenMap: Record<string, ChildState>,
+  query: string,
+): { rows: FlatRow[]; matchCount: number } {
+  const q = query.toLowerCase();
+  let matchCount = 0;
+  const visit = (
+    path: string,
+    label: string,
+    isDir: boolean,
+    isIgnored: boolean,
+    depth: number,
+    isRoot: boolean,
+  ): FlatRow[] | null => {
+    const idx = isRoot ? -1 : label.toLowerCase().indexOf(q);
+    const selfMatch = idx >= 0;
+    if (selfMatch) matchCount += 1;
+    const childRows: FlatRow[] = [];
+    if (isDir) {
+      const state = childrenMap[path];
+      if (Array.isArray(state)) {
+        for (const entry of state) {
+          const sub = visit(
+            entry.path,
+            entry.name,
+            entry.isDir,
+            entry.isIgnored || isIgnored,
+            depth + 1,
+            false,
+          );
+          if (sub) childRows.push(...sub);
+        }
+      }
+    }
+    if (!isRoot && !selfMatch && childRows.length === 0) return null;
+    const row: NodeRow = {
+      kind: "node",
+      path,
+      label,
+      isDir,
+      isIgnored,
+      depth,
+      isRoot,
+      isExpanded: isDir && childRows.length > 0,
+      match: selfMatch ? ([idx, idx + q.length] as const) : undefined,
+    };
+    return [row, ...childRows];
+  };
+  const rows = visit(rootPath, rootLabel, true, false, 0, true) ?? [];
+  return { rows, matchCount };
+}
+
 export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileClick }: Props) {
   const showIgnored = useReviewPrefs((s) => !!s.showIgnoredFiles[rootPath]);
   const toggleShowIgnored = useReviewPrefs((s) => s.toggleShowIgnored);
@@ -65,8 +198,12 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     name: string;
     isDir: boolean;
   } | null>(null);
+  // Tree filter: a quiet input below the eyebrow bar. The query filters what
+  // is LOADED — `expanded` is left untouched so clearing restores the view.
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterQuery, setFilterQuery] = useState("");
   // Roving tabindex: exactly one row (the focused one) is tabbable; arrows
-  // move within the tree. Invariant: focusedPath always points at a rendered
+  // move within the tree. Invariant: focusedPath always points at a visible
   // row — collapsing an ancestor or hiding ignored files resets it to root.
   const [focusedPath, setFocusedPath] = useState(() => {
     const cached = treeStateCache.get(rootPath);
@@ -75,6 +212,20 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     return cached && cached.showIgnored === showIgnored ? cached.focusedPath : rootPath;
   });
   const genRef = useRef(0);
+  // Mounted row elements, keyed by path — focus targets for keyboard nav.
+  const rowEls = useRef(new Map<string, HTMLElement>());
+  // A focus move requested before the target row was mounted/re-rendered;
+  // applied (then cleared) by the layout effect below.
+  const pendingFocusRef = useRef<string | null>(null);
+  // The focused row scrolled out of the window while it held DOM focus;
+  // re-apply focus when it scrolls back in (it is unmounted in between).
+  const lostFocusRef = useRef<string | null>(null);
+  const focusedPathRef = useRef(focusedPath);
+  focusedPathRef.current = focusedPath;
+  // Paths whose data has already been on screen (or inside the flat list) —
+  // rise-in is reserved for newly appearing DATA, not for rows that merely
+  // mount because the window scrolled over them.
+  const seenPathsRef = useRef(new Set<string>());
 
   // Write the snapshot back on every state change. Skipped for the render
   // where rootPath just changed: that render's state still belongs to the
@@ -207,6 +358,10 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
       const sameIgnored = cached !== undefined && cached.showIgnored === showIgnored;
       setMenu(null);
       setFileOp(null);
+      setFilterOpen(false);
+      setFilterQuery("");
+      seenPathsRef.current = new Set(); // the new root's rows get their entrance
+      lostFocusRef.current = null;
       setExpanded(cached ? new Set(cached.expanded) : new Set([rootPath]));
       setChildren(sameIgnored ? cached.children : {});
       setFocusedPath(sameIgnored ? cached.focusedPath : rootPath);
@@ -263,44 +418,270 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     [openMenuAt],
   );
 
+  // ─── Flat rows ──────────────────────────────────────────────────
+
+  const trimmedQuery = filterQuery.trim();
+  const filterActive = filterOpen && trimmedQuery !== "";
+
+  const { rows: flatRows, matchCount } = useMemo(() => {
+    if (filterActive) return flattenFiltered(rootPath, rootLabel, children, trimmedQuery);
+    return {
+      rows: flattenVisible(rootPath, rootLabel, expanded, children),
+      matchCount: 0,
+    };
+  }, [filterActive, rootPath, rootLabel, children, expanded, trimmedQuery]);
+
+  /** Node rows only — the keyboard-navigation order (placeholders skipped). */
+  const nodeRows = useMemo(
+    () => flatRows.filter((r): r is NodeRow => r.kind === "node"),
+    [flatRows],
+  );
+
+  // Filtering (or any data change) may hide the focus target; keep the
+  // invariant that focusedPath points at a visible row.
+  useEffect(() => {
+    if (!nodeRows.some((r) => r.path === focusedPath)) setFocusedPath(rootPath);
+  }, [nodeRows, focusedPath, rootPath]);
+
+  // ─── Windowing ──────────────────────────────────────────────────
+
+  const treeRef = useRef<HTMLDivElement>(null);
+  const { start, end, topPad, bottomPad, scrollToRow } = useVirtualRows(
+    treeRef,
+    flatRows.length,
+    ROW_HEIGHT,
+  );
+  const windowRows = useMemo(() => flatRows.slice(start, end), [flatRows, start, end]);
+
+  // Mark every path currently in the (full) flat list as seen — from the
+  // next commit on, mounting such a row is windowing, not new data.
+  useEffect(() => {
+    for (const r of flatRows) {
+      if (r.kind === "node") seenPathsRef.current.add(r.path);
+    }
+  }, [flatRows]);
+
+  // Apply a deferred focus move once the target row exists in the DOM.
+  useLayoutEffect(() => {
+    const want = pendingFocusRef.current;
+    if (!want) return;
+    const el = rowEls.current.get(want);
+    if (el) {
+      pendingFocusRef.current = null;
+      el.focus({ preventScroll: true });
+      el.scrollIntoView?.({ block: "nearest" });
+    }
+  });
+
+  const focusNodeAt = useCallback(
+    (idx: number) => {
+      const target = nodeRows[idx];
+      if (!target) return;
+      pendingFocusRef.current = target.path;
+      setFocusedPath(target.path);
+      // Bring the target inside the window — it may not be mounted yet; the
+      // layout effect above applies the focus once it is.
+      scrollToRow(flatRows.indexOf(target));
+      const el = rowEls.current.get(target.path);
+      if (el) {
+        pendingFocusRef.current = null;
+        el.focus({ preventScroll: true });
+        el.scrollIntoView?.({ block: "nearest" });
+      }
+    },
+    [nodeRows, flatRows, scrollToRow],
+  );
+
+  /** Keyboard model over the flat list (visual order = array order). */
+  const onRowKeyDown = useCallback(
+    (e: React.KeyboardEvent, row: NodeRow) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (row.isDir) toggleExpand(row.path);
+        else onFileClick?.(row.path);
+        return;
+      }
+      // Keyboard route to the context menu (WAI-ARIA: Shift+F10 / Menu key).
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+        e.preventDefault();
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+        openMenuAt(r.left + 8, r.bottom, row.path, row.label, row.isDir);
+        return;
+      }
+      if (!["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) {
+        return;
+      }
+      e.preventDefault();
+      const idx = nodeRows.findIndex((r) => r.path === row.path);
+      if (idx < 0) return;
+      switch (e.key) {
+        case "ArrowDown":
+          focusNodeAt(idx + 1);
+          break;
+        case "ArrowUp":
+          focusNodeAt(idx - 1);
+          break;
+        case "ArrowRight":
+          if (!row.isDir) break;
+          if (!row.isExpanded) toggleExpand(row.path);
+          else focusNodeAt(idx + 1); // first child in visual order
+          break;
+        case "ArrowLeft":
+          if (row.isDir && row.isExpanded) {
+            toggleExpand(row.path);
+            break;
+          }
+          // Focus the parent: first preceding row with a smaller depth.
+          for (let i = idx - 1; i >= 0; i--) {
+            if (nodeRows[i].depth < row.depth) {
+              focusNodeAt(i);
+              break;
+            }
+          }
+          break;
+        case "Home":
+          focusNodeAt(0);
+          break;
+        case "End":
+          focusNodeAt(nodeRows.length - 1);
+          break;
+      }
+    },
+    [nodeRows, focusNodeAt, toggleExpand, onFileClick, openMenuAt],
+  );
+
+  const registerRowEl = useCallback((path: string, el: HTMLElement | null) => {
+    if (el) {
+      rowEls.current.set(path, el);
+      // The roving-focus row scrolled back into the window after being
+      // unmounted mid-focus: reclaim, but only if focus genuinely fell to
+      // the body (never steal from the filter input or another control).
+      if (
+        lostFocusRef.current === path &&
+        (document.activeElement === document.body || document.activeElement === null)
+      ) {
+        lostFocusRef.current = null;
+        el.focus({ preventScroll: true });
+      }
+    } else {
+      const prev = rowEls.current.get(path);
+      rowEls.current.delete(path);
+      // Unmounting the focused row drops DOM focus to the body; remember it
+      // so the attach branch above can re-apply when it scrolls back in.
+      if (
+        path === focusedPathRef.current &&
+        (document.activeElement === prev || document.activeElement === document.body)
+      ) {
+        lostFocusRef.current = path;
+      }
+    }
+  }, []);
+
+  const toggleFilter = useCallback(() => {
+    setFilterOpen((open) => {
+      if (open) setFilterQuery("");
+      return !open;
+    });
+  }, []);
+
   return (
     <section className="flex h-full min-h-0 flex-col">
       {/* Eyebrow — same height & padding as the canvas toolbar and the
           left rail's CHANGES eyebrow so the three top bars form one row. */}
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4">
         <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Files</h3>
-        <button
-          type="button"
-          aria-label="Show ignored files"
-          aria-pressed={showIgnored}
-          title={showIgnored ? "Hide ignored files" : "Show ignored files"}
-          onClick={() => toggleShowIgnored(rootPath)}
-          className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
-            showIgnored ? "text-octo-brass" : "text-octo-mute"
-          }`}
-        >
-          {showIgnored ? <Eye size={12} /> : <EyeOff size={12} />}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            aria-label="Filter files"
+            aria-pressed={filterOpen}
+            title="Filter files"
+            onClick={toggleFilter}
+            className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              filterOpen ? "text-octo-brass" : "text-octo-mute"
+            }`}
+          >
+            <Search size={12} />
+          </button>
+          <button
+            type="button"
+            aria-label="Show ignored files"
+            aria-pressed={showIgnored}
+            title={showIgnored ? "Hide ignored files" : "Show ignored files"}
+            onClick={() => toggleShowIgnored(rootPath)}
+            className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              showIgnored ? "text-octo-brass" : "text-octo-mute"
+            }`}
+          >
+            {showIgnored ? <Eye size={12} /> : <EyeOff size={12} />}
+          </button>
+        </div>
       </div>
 
-      <div role="tree" aria-label="Workspace files" className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-        <TreeNode
-          path={rootPath}
-          label={rootLabel}
-          isDir={true}
-          isIgnored={false}
-          depth={0}
-          isRoot={true}
-          expanded={expanded}
-          children={children}
-          changedPaths={changedPaths}
-          focusedPath={focusedPath}
-          onToggle={toggleExpand}
-          onFileClick={onFileClick}
-          onRowContextMenu={onRowContextMenu}
-          onRowFocus={setFocusedPath}
-          onShowMenuAt={openMenuAt}
-        />
+      {/* Filter strip — appears below the eyebrow, calm rise-in. */}
+      {filterOpen && (
+        <div className="octo-rise-in shrink-0 border-b border-octo-hairline px-4 py-2">
+          <input
+            type="text"
+            value={filterQuery}
+            onChange={(e) => setFilterQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                // Swallow before App-level / overlay Escape handlers see it
+                // (the context-menu listener is capture-phase and never
+                // coexists with a focused filter input).
+                e.preventDefault();
+                e.stopPropagation();
+                setFilterQuery("");
+                setFilterOpen(false);
+              }
+            }}
+            aria-label="Filter files"
+            title="Searches loaded folders"
+            placeholder="Filter by name"
+            autoFocus
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            className="w-full bg-transparent font-mono text-[11px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
+          />
+          {filterActive && (
+            <p className="mt-1 font-mono text-[10px] text-octo-mute">
+              {matchCount === 1 ? "1 match" : `${matchCount} matches`}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div
+        ref={treeRef}
+        role="tree"
+        aria-label="Workspace files"
+        className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+      >
+        {topPad > 0 && <div aria-hidden="true" style={{ height: `${topPad}px` }} />}
+        {windowRows.map((row) =>
+          row.kind === "node" ? (
+            <TreeRow
+              key={row.path}
+              row={row}
+              isChanged={!row.isDir && changedPaths.has(row.path)}
+              isFocused={row.path === focusedPath}
+              isNew={!seenPathsRef.current.has(row.path)}
+              onActivate={() => {
+                if (row.isDir) toggleExpand(row.path);
+                else onFileClick?.(row.path);
+              }}
+              onKeyDown={onRowKeyDown}
+              onContextMenu={(e) => onRowContextMenu(e, row.path, row.label, row.isDir)}
+              onFocusRow={setFocusedPath}
+              registerEl={registerRowEl}
+            />
+          ) : (
+            <PlaceholderLine key={row.key} row={row} />
+          ),
+        )}
+        {bottomPad > 0 && <div aria-hidden="true" style={{ height: `${bottomPad}px` }} />}
       </div>
 
       {menu && (
@@ -350,23 +731,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
   );
 }
 
-interface TreeNodeProps {
-  path: string;
-  label: string;
-  isDir: boolean;
-  isIgnored: boolean;
-  depth: number;
-  isRoot: boolean;
-  expanded: Set<string>;
-  children: Record<string, ChildState>;
-  changedPaths: Set<string>;
-  focusedPath: string;
-  onToggle: (path: string) => void;
-  onFileClick?: (absPath: string) => void;
-  onRowContextMenu: (e: React.MouseEvent, path: string, name: string, isDir: boolean) => void;
-  onRowFocus: (path: string) => void;
-  onShowMenuAt: (x: number, y: number, path: string, name: string, isDir: boolean) => void;
-}
+// ─── Rows ────────────────────────────────────────────────────────
 
 /** Returns the label color class for a file/folder based on state and depth. */
 function depthColorClass(depth: number, isChanged: boolean): string {
@@ -375,233 +740,140 @@ function depthColorClass(depth: number, isChanged: boolean): string {
   return "text-octo-sage";
 }
 
-function TreeNode({
-  path,
-  label,
-  isDir,
-  isIgnored,
-  depth,
-  isRoot,
-  expanded,
-  children,
-  changedPaths,
-  focusedPath,
-  onToggle,
-  onFileClick,
-  onRowContextMenu,
-  onRowFocus,
-  onShowMenuAt,
-}: TreeNodeProps) {
-  const isExpanded = expanded.has(path);
-  const isChanged = !isDir && changedPaths.has(path);
-  const Icon = !isDir ? fileIcon(label) : null;
+interface TreeRowProps {
+  row: NodeRow;
+  isChanged: boolean;
+  isFocused: boolean;
+  /** True only in the commit where this path's data first appears — gates
+   *  the rise-in entrance so scrolling never replays it. */
+  isNew: boolean;
+  onActivate: () => void;
+  onKeyDown: (e: React.KeyboardEvent, row: NodeRow) => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  onFocusRow: (path: string) => void;
+  registerEl: (path: string, el: HTMLElement | null) => void;
+}
 
-  const activate = () => {
-    if (isDir) {
-      onToggle(path);
-    } else if (onFileClick) {
-      onFileClick(path);
-    }
-  };
+function TreeRow({
+  row,
+  isChanged,
+  isFocused,
+  isNew,
+  onActivate,
+  onKeyDown,
+  onContextMenu,
+  onFocusRow,
+  registerEl,
+}: TreeRowProps) {
+  const { path, label, isDir, isIgnored, depth, isRoot, isExpanded, match } = row;
+  const Icon = !isDir ? fileIcon(label) : null;
+  // Freeze the entrance decision for the lifetime of this mounted instance:
+  // re-renders within the animation window must not strip the class
+  // mid-flight, and a remount via scrolling arrives with isNew=false.
+  const riseIn = useRef(isNew).current;
 
   return (
-    <div>
-      {/* Row */}
-      <div
-        role="treeitem"
-        aria-expanded={isDir ? isExpanded : undefined}
-        tabIndex={path === focusedPath ? 0 : -1}
-        data-depth={depth}
-        onFocus={() => onRowFocus(path)}
-        title={isIgnored ? "Ignored by .gitignore" : undefined}
-        className={`octo-rise-in group relative flex cursor-pointer items-center gap-1 rounded-sm py-1 pr-1 transition duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass${
-          isIgnored ? " opacity-60" : ""
-        }`}
-        style={{
-          paddingLeft: `${depth * 14 + 4}px`,
-          background: "transparent",
-        }}
-        onMouseEnter={(e) => {
-          (e.currentTarget as HTMLElement).style.background = "var(--brass-ghost)";
-        }}
-        onMouseLeave={(e) => {
-          (e.currentTarget as HTMLElement).style.background = "transparent";
-        }}
-        onClick={activate}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            activate();
-            return;
-          }
-          // Keyboard route to the context menu (WAI-ARIA: Shift+F10 / Menu key).
-          if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
-            e.preventDefault();
-            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-            onShowMenuAt(r.left + 8, r.bottom, path, label, isDir);
-            return;
-          }
-          if (!["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) {
-            return;
-          }
-          e.preventDefault();
-          // Document order of treeitem rows = visual order of the tree.
-          const rows = Array.from(
-            (e.currentTarget.closest('[role="tree"]') as HTMLElement | null)
-              ?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? [],
-          );
-          const idx = rows.indexOf(e.currentTarget as HTMLElement);
-          switch (e.key) {
-            case "ArrowDown":
-              rows[idx + 1]?.focus();
-              break;
-            case "ArrowUp":
-              rows[idx - 1]?.focus();
-              break;
-            case "ArrowRight":
-              if (!isDir) break;
-              if (!isExpanded) onToggle(path);
-              else rows[idx + 1]?.focus(); // first child in document order
-              break;
-            case "ArrowLeft":
-              if (isDir && isExpanded) {
-                onToggle(path);
-                break;
-              }
-              // Focus the parent: first preceding row with a smaller depth.
-              for (let i = idx - 1; i >= 0; i--) {
-                if (Number(rows[i].dataset.depth) < depth) {
-                  rows[i].focus();
-                  break;
-                }
-              }
-              break;
-            case "Home":
-              rows[0]?.focus();
-              break;
-            case "End":
-              rows[rows.length - 1]?.focus();
-              break;
-          }
-        }}
-        onContextMenu={(e) => onRowContextMenu(e, path, label, isDir)}
-        data-testid={!isDir ? `file-row-${path}` : undefined}
-      >
-        {/* Indent guides — one 1px hairline per depth level */}
-        {depth > 0 && (
-          <IndentGuides depth={depth} />
-        )}
+    <div
+      role="treeitem"
+      aria-expanded={isDir ? isExpanded : undefined}
+      aria-level={depth + 1}
+      tabIndex={isFocused ? 0 : -1}
+      data-depth={depth}
+      ref={(el) => registerEl(path, el)}
+      onFocus={() => onFocusRow(path)}
+      title={isIgnored ? "Ignored by .gitignore" : undefined}
+      className={`${riseIn ? "octo-rise-in " : ""}group relative flex cursor-pointer items-center gap-1 rounded-sm pr-1 transition duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass${
+        isIgnored ? " opacity-60" : ""
+      }`}
+      style={{
+        height: `${ROW_HEIGHT}px`,
+        paddingLeft: `${depth * 14 + 4}px`,
+        background: "transparent",
+      }}
+      onMouseEnter={(e) => {
+        (e.currentTarget as HTMLElement).style.background = "var(--brass-ghost)";
+      }}
+      onMouseLeave={(e) => {
+        (e.currentTarget as HTMLElement).style.background = "transparent";
+      }}
+      onClick={onActivate}
+      onKeyDown={(e) => onKeyDown(e, row)}
+      onContextMenu={onContextMenu}
+      data-testid={!isDir ? `file-row-${path}` : undefined}
+    >
+      {/* Indent guides — one 1px hairline per depth level */}
+      {depth > 0 && <IndentGuides depth={depth} />}
 
-        {/* Chevron (dirs) or dot indicator (files) */}
-        {isDir ? (
-          <span
-            className="shrink-0 font-mono text-[9px] group-hover:text-octo-brass"
-            data-testid={isExpanded ? "chevron-expanded" : "chevron-collapsed"}
-            style={{
-              color: isExpanded ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
-              transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-              display: "inline-block",
-              transition: "transform 220ms cubic-bezier(0.2,0.8,0.3,1), color 220ms",
-            }}
-          >
-            ▶
-          </span>
-        ) : (
-          Icon && (
-            <Icon
-              size={12}
-              aria-hidden="true"
-              className="shrink-0 transition-colors duration-[220ms]"
-              style={{ color: isChanged ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
-            />
-          )
-        )}
-
-        {/* § glyph for folders (quiet brand mark, not for root) */}
-        {isDir && !isRoot && (
-          <span
+      {/* Chevron (dirs) or dot indicator (files) */}
+      {isDir ? (
+        <span
+          className="shrink-0 font-mono text-[9px] group-hover:text-octo-brass"
+          data-testid={isExpanded ? "chevron-expanded" : "chevron-collapsed"}
+          style={{
+            color: isExpanded ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
+            transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+            display: "inline-block",
+            transition: "transform 220ms cubic-bezier(0.2,0.8,0.3,1), color 220ms",
+          }}
+        >
+          ▶
+        </span>
+      ) : (
+        Icon && (
+          <Icon
+            size={12}
             aria-hidden="true"
-            className="shrink-0 font-mono text-[10px]"
-            style={{ color: "var(--brass-dim)" }}
-          >
-            §
-          </span>
-        )}
-
-        {/* Label */}
-        {isRoot ? (
-          <span
-            className="min-w-0 truncate font-serif text-[13px] text-octo-ivory"
-          >
-            {label}
-          </span>
-        ) : (
-          <span
-            className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}
-          >
-            {label}
-          </span>
-        )}
-      </div>
-
-      {/* Children (only if dir + expanded) */}
-      {isDir && isExpanded && (
-        <div role="group">
-          {(() => {
-            const state = children[path];
-            if (!state || state === "loading") {
-              return (
-                <div
-                  className="py-[2px] font-serif text-[11px] text-octo-mute"
-                  style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
-                >
-                  loading…
-                </div>
-              );
-            }
-            if (state === "error") {
-              return (
-                <div
-                  className="py-[2px] font-serif text-[11px] text-octo-rouge"
-                  style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
-                >
-                  error reading directory.
-                </div>
-              );
-            }
-            if (state.length === 0) {
-              return (
-                <div
-                  className="py-[2px] font-serif text-[11px] text-octo-mute"
-                  style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
-                >
-                  empty.
-                </div>
-              );
-            }
-            return state.map((entry) => (
-              <TreeNode
-                key={entry.path}
-                path={entry.path}
-                label={entry.name}
-                isDir={entry.isDir}
-                isIgnored={entry.isIgnored || isIgnored}
-                depth={depth + 1}
-                isRoot={false}
-                expanded={expanded}
-                children={children}
-                changedPaths={changedPaths}
-                focusedPath={focusedPath}
-                onToggle={onToggle}
-                onFileClick={onFileClick}
-                onRowContextMenu={onRowContextMenu}
-                onRowFocus={onRowFocus}
-                onShowMenuAt={onShowMenuAt}
-              />
-            ));
-          })()}
-        </div>
+            className="shrink-0 transition-colors duration-[220ms]"
+            style={{ color: isChanged ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
+          />
+        )
       )}
+
+      {/* § glyph for folders (quiet brand mark, not for root) */}
+      {isDir && !isRoot && (
+        <span
+          aria-hidden="true"
+          className="shrink-0 font-mono text-[10px]"
+          style={{ color: "var(--brass-dim)" }}
+        >
+          §
+        </span>
+      )}
+
+      {/* Label */}
+      {isRoot ? (
+        <span className="min-w-0 truncate font-serif text-[13px] text-octo-ivory">{label}</span>
+      ) : (
+        <span className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}>
+          {match ? <HighlightedLabel label={label} match={match} /> : label}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Filter-match emphasis: the matched substring alone reads brass. */
+function HighlightedLabel({ label, match }: { label: string; match: readonly [number, number] }) {
+  const [start, end] = match;
+  return (
+    <>
+      {label.slice(0, start)}
+      <span className="text-octo-brass">{label.slice(start, end)}</span>
+      {label.slice(end)}
+    </>
+  );
+}
+
+function PlaceholderLine({ row }: { row: PlaceholderRow }) {
+  const text = row.state === "loading" ? "loading…" : row.state === "error" ? "error reading directory." : "empty.";
+  return (
+    <div
+      className={`flex items-center font-serif text-[11px] ${
+        row.state === "error" ? "text-octo-rouge" : "text-octo-mute"
+      }`}
+      style={{ height: `${ROW_HEIGHT}px`, paddingLeft: `${row.depth * 14 + 4}px` }}
+    >
+      {text}
     </div>
   );
 }

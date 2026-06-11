@@ -81,9 +81,9 @@ States: `not started` → `brainstorming` → `spec'd` → `planned` → `in pro
 
 **From G7 slice 1 (deferred — slices II–V):**
 - **Slice II — Conflict resolution: SHIPPED 2026-06-11** (feat/review-g7-conflicts): take ours/theirs (rebase-aware UPSTREAM/MINE labels), mark-resolved, continue/abort with outcome classification, AI resolution with preview. Follow-ups from its review: graceful exit animation when the conflict section unmounts (op completes); refresh open editor buffers after resolve/take/abort (G2 mtime seam — a conflicted file open in the editor goes stale after an AI apply; a blind Cmd+S would overwrite the resolution).
-- **Slice III — Inspect:** log/history browser; per-line blame gutter.
-- **Slice IV — Branch & stash:** branch list/switch/create; stash push/pop/list.
-- **Slice V — Advanced:** reset (soft/mixed/hard, guarded); clean untracked; cherry-pick; tags.
+- **Slice III — Inspect: SHIPPED 2026-06-11** (omnibus): git_log/commit_diff/blame backends, HistoryModal with inline diffs + per-commit cherry-pick/tag/reset actions, blame gutter (run-collapsed, palette toggle).
+- **Slice IV — Branch & stash: SHIPPED 2026-06-11** (omnibus): switch/create+switch (friendly worktree/dirty errors), stash push/list/pop/drop, GitOpsMenu in ChangesPanel.
+- **Slice V — Advanced: SHIPPED 2026-06-11** (omnibus): reset soft/mixed/hard (DANGER-guarded, flag-injection guard), clean untracked (confirm), cherry-pick (conflicts flow into the existing resolution section via CherryPick state), tags. Follow-up: BacklogRowContextMenu still hand-rolls positioning (not a useMenuChrome consumer).
 - **Review notes:** expand the per-workspace `git_lock` to stage/unstage/discard (G7-s1 covers only pull/fetch/commit/amend); `aheadBehindKnown=false` currently conflates timeout with no-upstream (both hide the badge — fine, but a distinct signal would be cleaner); fetch/pull use sync `std::process::Command` in async fns (pre-existing pattern; `tokio::process` later).
 
 **From G6 slice 1 (deferred — slices II–III + review debt):**

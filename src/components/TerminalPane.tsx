@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
+import { copyToClipboard } from "../lib/clipboard";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -166,7 +167,7 @@ export function TerminalPane({
         ) {
           const sel = term.getSelection();
           if (sel) {
-            void navigator.clipboard?.writeText(sel);
+            void copyToClipboard(sel); // implicit copy — silent on success
             e.preventDefault();
             return false; // handled — don't forward Cmd-C to the PTY
           }
@@ -178,7 +179,7 @@ export function TerminalPane({
     const onContextMenu = (e: MouseEvent) => {
       const sel = term.getSelection?.();
       if (sel) {
-        void navigator.clipboard?.writeText(sel);
+        void copyToClipboard(sel); // implicit copy — silent on success
         e.preventDefault(); // suppress the native "copy word under cursor"
       }
     };

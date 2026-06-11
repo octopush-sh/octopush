@@ -18,6 +18,9 @@ pub struct LlmRequest {
     pub system: String,
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<LlmTool>,
+    /// Force the model to call this named tool (guaranteed-shape structured
+    /// output — the schema-call primitive). `None` leaves tool use optional.
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]

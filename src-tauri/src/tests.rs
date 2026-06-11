@@ -4388,3 +4388,252 @@ mod g6_fileops_tests {
         assert!(fs_delete_inner(&ws, "no-such-file.txt").is_err());
     }
 }
+
+#[cfg(test)]
+mod workspace_walker_tests {
+    use crate::commands::workspace_walker;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Collect yielded paths relative to `base`, skipping the root entry
+    /// (depth 0) the way every caller does.
+    fn walk(base: &std::path::Path, max_depth: Option<usize>, filters: bool) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = workspace_walker(base, max_depth, filters)
+            .filter_map(|r| r.ok())
+            .filter(|e| e.depth() > 0)
+            .map(|e| e.path().strip_prefix(base).unwrap().to_path_buf())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn fixture() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(root.join("kept.txt"), "k").unwrap();
+        fs::write(root.join("ignored.txt"), "i").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("nested.txt"), "n").unwrap();
+        // A nested `.git` (e.g. a vendored repo) must be pruned too.
+        fs::create_dir(root.join("sub").join(".git")).unwrap();
+        fs::write(root.join("sub").join(".git").join("config"), "x").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn excludes_git_dirs_at_every_depth() {
+        let tmp = fixture();
+        let paths = walk(tmp.path(), None, true);
+        assert!(
+            paths.iter().all(|p| p.components().all(|c| c.as_os_str() != ".git")),
+            "no yielded path may touch .git: {paths:?}"
+        );
+        assert!(paths.contains(&PathBuf::from("sub/nested.txt")));
+    }
+
+    #[test]
+    fn honors_gitignore_when_filters_are_on_even_outside_a_repo_checkout() {
+        let tmp = fixture();
+        let paths = walk(tmp.path(), None, true);
+        assert!(paths.contains(&PathBuf::from("kept.txt")));
+        assert!(!paths.contains(&PathBuf::from("ignored.txt")));
+        // Dot-files themselves are visible (hidden(false)).
+        assert!(paths.contains(&PathBuf::from(".gitignore")));
+    }
+
+    #[test]
+    fn yields_ignored_entries_when_filters_are_off_but_still_prunes_git() {
+        let tmp = fixture();
+        let paths = walk(tmp.path(), None, false);
+        assert!(paths.contains(&PathBuf::from("ignored.txt")));
+        assert!(paths.iter().all(|p| p.components().all(|c| c.as_os_str() != ".git")));
+    }
+
+    #[test]
+    fn respects_max_depth_one() {
+        let tmp = fixture();
+        let paths = walk(tmp.path(), Some(1), true);
+        assert!(paths.contains(&PathBuf::from("sub")));
+        assert!(!paths.contains(&PathBuf::from("sub/nested.txt")));
+    }
+}
+
+// ─── Shared HTTP client (G5 follow-up) ────────────────────────────────
+
+mod shared_http_client_tests {
+    /// Every call must hand back the SAME pooled client — `ai_complete`,
+    /// ChatEngine, and the orchestrator all share one connection pool
+    /// instead of paying a fresh TLS handshake per call.
+    #[test]
+    fn returns_the_same_instance_every_time() {
+        let a = crate::chat_engine::shared_http_client();
+        let b = crate::chat_engine::shared_http_client();
+        assert!(std::ptr::eq(a, b));
+    }
+}
+
+// ─── ai_complete token recording (G5 follow-up) ───────────────────────
+
+mod ai_token_event_tests {
+    use crate::db::Db;
+    use crate::providers::{LlmResponse, LlmStopReason};
+    use crate::token_engine::TokenEngine;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn response() -> LlmResponse {
+        LlmResponse {
+            text: "{}".into(),
+            tool_uses: vec![],
+            stop_reason: LlmStopReason::EndTurn,
+            input_tokens: 1200,
+            output_tokens: 340,
+            cache_read_tokens: 5000,
+            cache_creation_tokens: 700,
+        }
+    }
+
+    #[test]
+    fn event_carries_workspace_model_cache_counts_and_cost() {
+        let ev = crate::commands::ai_token_event(Some("ws-42"), "claude-sonnet-4-6", &response(), 0.123);
+        assert_eq!(ev.session_id, "ws-42");
+        assert_eq!(ev.model, "claude-sonnet-4-6");
+        assert_eq!(ev.input_tokens, 1200);
+        assert_eq!(ev.output_tokens, 340);
+        assert_eq!(ev.cache_read_tokens, 5000);
+        assert_eq!(ev.cache_creation_tokens, 700);
+        assert_eq!(ev.cost_usd, 0.123);
+    }
+
+    #[test]
+    fn missing_workspace_falls_back_to_adhoc_bucket() {
+        let ev = crate::commands::ai_token_event(None, "m", &response(), 0.01);
+        assert_eq!(ev.session_id, "ai-adhoc");
+    }
+
+    /// The seam ai_complete uses: recording must persist a token_events row
+    /// (visible to Usage dashboards) even when the workspace has no sessions
+    /// row — increment_session_tokens is then a 0-row UPDATE, not an error.
+    #[test]
+    fn record_persists_a_token_event_without_a_sessions_row() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+
+        let ev = crate::commands::ai_token_event(Some("ws-no-session"), "claude-sonnet-4-6", &response(), 0.5);
+        engine.record(ev).unwrap();
+
+        let rows = db.lock().list_token_events("ws-no-session").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 1200);
+        assert_eq!(rows[0].cache_read_tokens, 5000);
+        assert_eq!(rows[0].cost_usd, 0.5);
+        assert!(!rows[0].timestamp.is_empty(), "record() must stamp a timestamp");
+
+        // And it rolls up into the aggregate report the dashboards read.
+        let report = engine.report(None).unwrap();
+        assert_eq!(report.total_input, 1200);
+        assert_eq!(report.total_output, 340);
+        assert!(report.total_cost_usd > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod workspace_from_pr_tests {
+    use crate::github::{pr_fetch_command, pr_infos_from_json};
+
+    #[test]
+    fn parses_a_gh_pr_list_fixture() {
+        // Shape of `gh pr list --json number,title,headRefName,author`:
+        // author is an object with a `login` (and may be absent entirely).
+        let raw = r#"[
+            {"number": 42, "title": "Add dark mode", "headRefName": "feat/dark-mode",
+             "author": {"id": "U_1", "is_bot": false, "login": "octocat", "name": "The Octocat"}},
+            {"number": 7, "title": "Fix checkout bug", "headRefName": "fix/checkout"}
+        ]"#;
+        let prs = pr_infos_from_json(raw).unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].title, "Add dark mode");
+        assert_eq!(prs[0].head_ref_name, "feat/dark-mode");
+        assert_eq!(prs[0].author.as_deref(), Some("octocat"));
+        assert_eq!(prs[1].number, 7);
+        assert_eq!(prs[1].author, None);
+    }
+
+    #[test]
+    fn skips_rows_missing_number_or_head_ref() {
+        let raw = r#"[
+            {"title": "no number", "headRefName": "x"},
+            {"number": 3, "title": "no head"},
+            {"number": 4, "title": "ok", "headRefName": "feat/ok"}
+        ]"#;
+        let prs = pr_infos_from_json(raw).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 4);
+    }
+
+    #[test]
+    fn non_json_gh_output_is_an_error() {
+        // e.g. `gh` printing auth guidance to stdout.
+        assert!(pr_infos_from_json("To get started with GitHub CLI, run: gh auth login").is_err());
+        assert!(pr_infos_from_json("").is_err());
+    }
+
+    #[test]
+    fn pr_info_serializes_camel_case_for_the_frontend() {
+        let prs = pr_infos_from_json(
+            r#"[{"number": 1, "title": "t", "headRefName": "feat/a", "author": {"login": "me"}}]"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&prs[0]).unwrap();
+        assert_eq!(json["headRefName"], "feat/a");
+        assert_eq!(json["author"], "me");
+    }
+
+    #[test]
+    fn fetch_command_targets_the_pr_head_ref() {
+        assert_eq!(
+            pr_fetch_command(42, "feat/dark-mode"),
+            "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
+        );
+    }
+
+    #[test]
+    fn fetch_command_escapes_single_quotes_in_the_branch() {
+        assert_eq!(
+            pr_fetch_command(1, "weird'name"),
+            "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
+        );
+    }
+
+    #[test]
+    fn ensure_pr_branch_skips_the_fetch_when_the_branch_exists_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let base = crate::git_ops::default_branch(dir.path()).unwrap().unwrap();
+        crate::git_ops::create_branch(dir.path(), "feat/already-here", &base).unwrap();
+
+        // No `origin` remote exists, so a real fetch would fail — succeeding
+        // proves the local-branch short-circuit kicked in.
+        tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            "feat/already-here".into(),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn pr_commands_are_registered_in_the_invoke_handler() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("commands::list_prs"));
+        assert!(lib.contains("commands::ensure_pr_branch"));
+    }
+}

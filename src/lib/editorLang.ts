@@ -1,6 +1,11 @@
+import { getExtension } from "./getExtension";
+
 /**
  * Maps a file path's extension to a CodeMirror language identifier.
  * Used by EditorPane to pick the correct language support extension.
+ *
+ * Extension table 3 of 3 — see getExtension.ts for the cross-reference
+ * (fileIcons.ts and languageDetection.ts hold the other two).
  */
 
 export type LangId =
@@ -17,9 +22,8 @@ export type LangId =
   | "plaintext";
 
 export function langForExtension(path: string): LangId {
-  const dot = path.lastIndexOf(".");
-  if (dot === -1) return "plaintext";
-  const ext = path.slice(dot + 1).toLowerCase();
+  const ext = getExtension(path);
+  if (ext === "") return "plaintext";
 
   switch (ext) {
     case "js":

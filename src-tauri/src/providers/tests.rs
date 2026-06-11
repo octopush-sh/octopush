@@ -26,6 +26,7 @@ fn sample_request() -> LlmRequest {
                 input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
             },
         ],
+        tool_choice: None,
     }
 }
 
@@ -113,6 +114,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
             },
         }],
         tools: vec![],
+        tool_choice: None,
     };
     let body = openai_compat::build_request(&req);
     let m = &body["messages"][0];
@@ -141,6 +143,7 @@ fn openai_tool_results_become_role_tool_messages() {
             ]),
         }],
         tools: vec![],
+        tool_choice: None,
     };
     let body = openai_compat::build_request(&req);
     let msgs = body["messages"].as_array().unwrap();
@@ -204,4 +207,36 @@ fn openai_parse_response_ollama_no_finish_reason() {
     }));
     assert_eq!(resp.text, "ok");
     assert_eq!(resp.stop_reason, LlmStopReason::EndTurn);
+}
+
+// ─── tool_choice (forced structured output, G5 follow-up) ───────────────
+
+#[test]
+fn anthropic_build_request_omits_tool_choice_by_default() {
+    let body = anthropic::build_request(&sample_request());
+    assert!(body.get("tool_choice").is_none());
+}
+
+#[test]
+fn anthropic_build_request_forces_named_tool() {
+    let mut req = sample_request();
+    req.tool_choice = Some("emit_result".into());
+    let body = anthropic::build_request(&req);
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "emit_result");
+}
+
+#[test]
+fn openai_build_request_omits_tool_choice_by_default() {
+    let body = openai_compat::build_request(&sample_request());
+    assert!(body.get("tool_choice").is_none());
+}
+
+#[test]
+fn openai_build_request_forces_named_function() {
+    let mut req = sample_request();
+    req.tool_choice = Some("emit_result".into());
+    let body = openai_compat::build_request(&req);
+    assert_eq!(body["tool_choice"]["type"], "function");
+    assert_eq!(body["tool_choice"]["function"]["name"], "emit_result");
 }

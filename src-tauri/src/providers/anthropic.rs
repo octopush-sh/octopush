@@ -60,13 +60,17 @@ pub fn build_request(req: &LlmRequest) -> Value {
         "input_schema": t.input_schema,
     })).collect();
 
-    json!({
+    let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
         "system": req.system,
         "tools": tools,
         "messages": messages,
-    })
+    });
+    if let Some(name) = &req.tool_choice {
+        body["tool_choice"] = json!({ "type": "tool", "name": name });
+    }
+    body
 }
 
 fn message_to_anthropic(msg: &LlmMessage) -> Value {

@@ -247,6 +247,17 @@ pub(crate) fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json
 
 // ─── Provider helpers ─────────────────────────────────────────────
 
+/// Process-wide pooled HTTP client. `reqwest::Client` holds an internal
+/// connection pool behind an `Arc`, so cloning it shares the pool — every
+/// LLM caller (ChatEngine, `ai_complete`, orchestrator) should go through
+/// this instead of `Client::new()`, which would pay a fresh TLS handshake
+/// on every call.
+static SHARED_HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+pub(crate) fn shared_http_client() -> &'static Client {
+    SHARED_HTTP.get_or_init(Client::new)
+}
+
 /// Build the static tool list as normalized `LlmTool[]`.
 pub(crate) fn build_llm_tools() -> Vec<LlmTool> {
     let defs = tool_definitions();
@@ -299,7 +310,8 @@ pub struct ChatEngine {
 impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>) -> Self {
         Self {
-            client: Client::new(),
+            // Clone of the process-wide client — shares its connection pool.
+            client: shared_http_client().clone(),
             db,
         }
     }
@@ -441,6 +453,7 @@ impl ChatEngine {
                 system: system_prompt.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
+                tool_choice: None,
             };
 
             let response = match provider

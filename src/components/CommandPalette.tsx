@@ -7,6 +7,7 @@ import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { useThemeStore } from "../stores/themeStore";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
+import { useBlameStore } from "../stores/blameStore";
 import { ModalShell } from "./ModalShell";
 
 interface Props {
@@ -31,6 +32,7 @@ export function CommandPalette({
   const editorFontSize = useEditorPrefs((s) => s.fontSize);
   const editorTabWidth = useEditorPrefs((s) => s.tabWidth);
   const editorLineNumbers = useEditorPrefs((s) => s.lineNumbers);
+  const blameOn = useBlameStore((s) => s.enabled);
 
   useEffect(() => {
     if (open) {
@@ -261,6 +263,11 @@ export function CommandPalette({
                 glyph="#"
                 label={`Toggle line numbers — ${editorLineNumbers ? "on" : "off"}`}
                 onSelect={() => run(() => useEditorPrefs.getState().toggleLineNumbers())}
+              />
+              <Item
+                glyph="@"
+                label={`Toggle blame — ${blameOn ? "on" : "off"}`}
+                onSelect={() => run(() => useBlameStore.getState().toggle())}
               />
             </Group>
 

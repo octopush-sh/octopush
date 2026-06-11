@@ -25,6 +25,10 @@ interface Props {
 const FOCUSABLE_SELECTOR =
   'a, button, input, textarea, select, [tabindex]:not([tabindex="-1"])';
 
+/** Mounted-shell stack so Escape only dismisses the topmost (most recently
+ *  opened) modal when dialogs are stacked, instead of all of them at once. */
+const escStack: symbol[] = [];
+
 export function ModalShell({
   onClose,
   children,
@@ -43,14 +47,20 @@ export function ModalShell({
   const [opener] = useState<Element | null>(() => document.activeElement);
 
   useEffect(() => {
+    const id = Symbol("modal-shell");
+    escStack.push(id);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && escStack[escStack.length - 1] === id) {
         e.preventDefault();
         onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      const idx = escStack.indexOf(id);
+      if (idx !== -1) escStack.splice(idx, 1);
+    };
   }, []);
 
   // Focus management: move focus into the dialog on mount — unless a child

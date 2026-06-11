@@ -42,6 +42,19 @@ describe("EditorStatusBar", () => {
     expect(screen.getByText("3 selections")).toBeInTheDocument();
   });
 
+  it("shows the blame saved-version note only when asked", () => {
+    const { rerender } = render(
+      <EditorStatusBar line={1} col={1} selectionCount={1} lang="rust" />,
+    );
+    expect(screen.queryByTestId("statusbar-blame-saved")).not.toBeInTheDocument();
+    rerender(
+      <EditorStatusBar line={1} col={1} selectionCount={1} lang="rust" blameSavedNote />,
+    );
+    expect(screen.getByTestId("statusbar-blame-saved")).toHaveTextContent(
+      "blame: saved version",
+    );
+  });
+
   it("clicking the wrap segment toggles wrap", async () => {
     render(<EditorStatusBar line={1} col={1} selectionCount={1} lang="rust" />);
     await userEvent.click(screen.getByTestId("statusbar-wrap"));

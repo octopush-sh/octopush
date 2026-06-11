@@ -1,5 +1,6 @@
 import { useState, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
+import { copyToClipboard } from "../lib/clipboard";
 import type { ToolExecution } from "../stores/chatStore";
 
 interface Props {
@@ -244,7 +245,8 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
               role="button"
               tabIndex={0}
               onClick={() => {
-                navigator.clipboard.writeText(tool.result);
+                // Inline "copied" label is the success feedback; no toast.
+                void copyToClipboard(tool.result);
                 setCopied(true);
                 setTimeout(() => setCopied(false), 1500);
               }}

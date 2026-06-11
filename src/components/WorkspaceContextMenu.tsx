@@ -11,7 +11,14 @@ import {
   Link2Off,
   Trash2,
 } from "lucide-react";
-import { useMenuChrome } from "../lib/useMenuChrome";
+import { MenuSurface } from "./MenuSurface";
+import {
+  MENU_DANGER,
+  MENU_HEADER,
+  MENU_ITEM,
+  MENU_ITEM_MULTILINE,
+  MENU_SEP,
+} from "../lib/menuStyles";
 
 interface Props {
   x: number;
@@ -37,13 +44,10 @@ interface Props {
   onUnlinkJira?: () => void;
 }
 
-const ITEM =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
-const ITEM_MULTILINE =
-  "flex w-full items-start gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
-const DANGER =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-rouge transition hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge";
-const SEP = "h-px bg-octo-hairline";
+const ITEM = MENU_ITEM;
+const ITEM_MULTILINE = MENU_ITEM_MULTILINE;
+const DANGER = MENU_DANGER;
+const SEP = MENU_SEP;
 
 export function WorkspaceContextMenu({
   x,
@@ -66,21 +70,14 @@ export function WorkspaceContextMenu({
   onChangeJira,
   onUnlinkJira,
 }: Props) {
-  const { ref, pos } = useMenuChrome(x, y, onClose);
   const run = (fn: () => void) => () => {
     fn();
     onClose();
   };
 
   return (
-    <div
-      ref={ref}
-      role="menu"
-      aria-label="Workspace actions"
-      className="octo-menu-enter absolute z-50 w-[230px] rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
-      style={{ left: pos.left, top: pos.top, transformOrigin: "top left" }}
-    >
-      <div className="truncate px-3 pb-1 pt-1 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+    <MenuSurface x={x} y={y} ariaLabel="Workspace actions" onDismiss={onClose} widthClass="w-[230px]">
+      <div className={MENU_HEADER}>
         {workspaceName}
         {ticketKey ? ` · ${ticketKey}` : ""}
       </div>
@@ -146,6 +143,6 @@ export function WorkspaceContextMenu({
           </button>
         </>
       )}
-    </div>
+    </MenuSurface>
   );
 }

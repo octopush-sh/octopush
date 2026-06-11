@@ -35,6 +35,7 @@ describe("ConflictAiModal", () => {
     render(
       <ConflictAiModal
         workspacePath="/repo"
+        workspaceId="ws-1"
         file="src/a.ts"
         model="claude-sonnet-4-6"
         onClose={onClose}
@@ -48,6 +49,7 @@ describe("ConflictAiModal", () => {
       "claude-sonnet-4-6",
       CONFLICT_SYSTEM,
       expect.stringContaining("src/a.ts"),
+      { workspaceId: "ws-1" }, // spend attribution (G5 follow-up)
     );
     expect(ipcMock.aiComplete.mock.calls[0][2]).toContain(CONFLICTED);
 

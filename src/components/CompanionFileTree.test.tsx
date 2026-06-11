@@ -760,4 +760,192 @@ describe("CompanionFileTree", () => {
       ),
     );
   });
+
+  // ─── Tree filter (G6 slice III) ─────────────────────────────────
+
+  /** Renders the tree, expands src/, opens the filter input, and types `query`. */
+  async function setUpFilter(query: string) {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("src"));
+    await waitFor(() => expect(screen.getByText("Main.java")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /filter files/i }));
+    const input = screen.getByRole("textbox", { name: /filter files/i });
+    await userEvent.type(input, query);
+    return input;
+  }
+
+  it("filter shows matching files plus their ancestors; non-matches are hidden", async () => {
+    await setUpFilter("main");
+
+    // Match + ancestors stay.
+    await waitFor(() =>
+      expect(screen.getByTestId("file-row-/repo/src/Main.java")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("src")).toBeInTheDocument();
+    expect(screen.getByText("my-project")).toBeInTheDocument();
+
+    // Non-matching siblings collapse away.
+    expect(screen.queryByText("Helper.java")).not.toBeInTheDocument();
+    expect(screen.queryByText("pom.xml")).not.toBeInTheDocument();
+    expect(screen.queryByText("docs")).not.toBeInTheDocument();
+  });
+
+  it("filter is case-insensitive and highlights the matched substring in brass", async () => {
+    await setUpFilter("MAIN");
+
+    const row = await screen.findByTestId("file-row-/repo/src/Main.java");
+    const brass = row.querySelector("span.text-octo-brass");
+    expect(brass).not.toBeNull();
+    expect(brass!.textContent).toBe("Main");
+  });
+
+  it("filter shows a mute match count line", async () => {
+    await setUpFilter("java");
+    // Main.java + Helper.java
+    expect(await screen.findByText("2 matches")).toBeInTheDocument();
+    expect(screen.getByText("2 matches").className).toContain("text-octo-mute");
+
+    const input = screen.getByRole("textbox", { name: /filter files/i });
+    await userEvent.clear(input);
+    await userEvent.type(input, "helper");
+    expect(await screen.findByText("1 match")).toBeInTheDocument();
+
+    await userEvent.clear(input);
+    await userEvent.type(input, "zzz-nothing");
+    expect(await screen.findByText("0 matches")).toBeInTheDocument();
+  });
+
+  it("the filter input advertises that it searches loaded folders", async () => {
+    const input = await setUpFilter("x");
+    expect(input).toHaveAttribute("title", "Searches loaded folders");
+  });
+
+  it("Escape clears the filter, closes the input, and does not reach other handlers", async () => {
+    const input = await setUpFilter("main");
+    await waitFor(() => expect(screen.queryByText("pom.xml")).not.toBeInTheDocument());
+
+    const bubbleSpy = vi.fn();
+    window.addEventListener("keydown", bubbleSpy);
+    fireEvent.keyDown(input, { key: "Escape" });
+    window.removeEventListener("keydown", bubbleSpy);
+
+    // Swallowed before it bubbles to window-level Escape handlers.
+    expect(bubbleSpy).not.toHaveBeenCalled();
+    // Input closed; full tree restored.
+    expect(screen.queryByRole("textbox", { name: /filter files/i })).not.toBeInTheDocument();
+    expect(screen.getByText("pom.xml")).toBeInTheDocument();
+  });
+
+  it("clearing the filter restores the prior expansion (src stays expanded)", async () => {
+    const input = await setUpFilter("pom");
+
+    // src has no matching descendants → collapsed away while filtering.
+    await waitFor(() => expect(screen.queryByText("Main.java")).not.toBeInTheDocument());
+    // (The match's label is split by the highlight span — query by testid.)
+    expect(screen.getByTestId("file-row-/repo/pom.xml")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    // Expansion was never destroyed: src's children are back without a click.
+    expect(screen.getByText("Main.java")).toBeInTheDocument();
+    expect(screen.getByText("Helper.java")).toBeInTheDocument();
+  });
+
+  it("toggling the filter button off clears the query too", async () => {
+    await setUpFilter("main");
+    await waitFor(() => expect(screen.queryByText("pom.xml")).not.toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /filter files/i }));
+    expect(screen.queryByRole("textbox", { name: /filter files/i })).not.toBeInTheDocument();
+    expect(screen.getByText("pom.xml")).toBeInTheDocument();
+  });
+
+  it("a matching directory name stays visible even without matching children", async () => {
+    await setUpFilter("docs");
+    await waitFor(() => expect(screen.queryByText("pom.xml")).not.toBeInTheDocument());
+    expect(screen.getByText("docs")).toBeInTheDocument();
+    expect(screen.getByText("1 match")).toBeInTheDocument();
+  });
+
+  // ─── Windowed rendering for large directories (G6 slice III) ───
+
+  const HUGE = Array.from({ length: 1000 }, (_, i) => ({
+    name: `file${String(i).padStart(4, "0")}.txt`,
+    path: `/repo/file${String(i).padStart(4, "0")}.txt`,
+    isDir: false,
+    isIgnored: false,
+  }));
+
+  function mockHugeRoot() {
+    mockReadDirectory.mockImplementation((path: string) =>
+      Promise.resolve(path === ROOT ? HUGE : []),
+    );
+  }
+
+  it("with 1000 entries only a window of rows is mounted", async () => {
+    mockHugeRoot();
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={new Set()} />);
+    await waitFor(() => expect(screen.getByText("file0000.txt")).toBeInTheDocument());
+
+    const rows = screen.getAllByRole("treeitem");
+    expect(rows.length).toBeGreaterThan(20); // a real window, not a stub
+    expect(rows.length).toBeLessThan(100); // …but nowhere near 1001
+    expect(screen.queryByText("file0500.txt")).not.toBeInTheDocument();
+  });
+
+  it("scrolling mounts later rows and unmounts early ones", async () => {
+    mockHugeRoot();
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={new Set()} />);
+    await waitFor(() => expect(screen.getByText("file0000.txt")).toBeInTheDocument());
+
+    fireEvent.scroll(screen.getByRole("tree"), { target: { scrollTop: 12000 } });
+
+    await waitFor(() => expect(screen.getByText("file0500.txt")).toBeInTheDocument());
+    expect(screen.queryByText("file0000.txt")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("treeitem").length).toBeLessThan(100);
+  });
+
+  it("End jumps focus to the last row even when it is far outside the window", async () => {
+    mockHugeRoot();
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={new Set()} />);
+    await waitFor(() => expect(screen.getByText("file0000.txt")).toBeInTheDocument());
+
+    const rootRow = screen.getByText("my-project").closest('[role="treeitem"]') as HTMLElement;
+    rootRow.focus();
+    fireEvent.keyDown(rootRow, { key: "End" });
+
+    const last = await screen.findByTestId("file-row-/repo/file0999.txt");
+    expect(document.activeElement).toBe(last);
+    // The window followed the focus: early rows are gone.
+    expect(screen.queryByText("file0000.txt")).not.toBeInTheDocument();
+
+    // …and ArrowUp keeps walking from there, across the (new) window.
+    fireEvent.keyDown(last, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(screen.getByTestId("file-row-/repo/file0998.txt"));
+
+    // Home returns to the root row at the top.
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Home" });
+    expect(document.activeElement).toBe(
+      screen.getByText("my-project").closest('[role="treeitem"]') as HTMLElement,
+    );
+  });
+
+  it("rise-in plays for newly loaded rows but not for rows mounted by scrolling", async () => {
+    mockHugeRoot();
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={new Set()} />);
+    await waitFor(() => expect(screen.getByText("file0000.txt")).toBeInTheDocument());
+
+    // Newly loaded data animates in.
+    expect(screen.getByTestId("file-row-/repo/file0000.txt").className).toContain("octo-rise-in");
+
+    fireEvent.scroll(screen.getByRole("tree"), { target: { scrollTop: 12000 } });
+    await waitFor(() => expect(screen.getByText("file0500.txt")).toBeInTheDocument());
+
+    // Rows that appear merely because the window moved do NOT replay it.
+    expect(screen.getByTestId("file-row-/repo/file0500.txt").className).not.toContain(
+      "octo-rise-in",
+    );
+  });
 });

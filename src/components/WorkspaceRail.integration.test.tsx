@@ -53,7 +53,7 @@ describe("WorkspaceRail - Integration Tests", () => {
   });
 
   it("INTEGRATION: Rendering WorkspaceContextMenu should show it in DOM", async () => {
-    const { container } = render(
+    render(
       <WorkspaceContextMenu
         x={100}
         y={200}
@@ -72,9 +72,8 @@ describe("WorkspaceRail - Integration Tests", () => {
       />,
     );
 
-    // Menu should exist in DOM
-    const menu = container.querySelector('[role="menu"]');
-    expect(menu).toBeDefined();
+    // Menu should exist in DOM (MenuSurface portals it to document.body).
+    const menu = screen.getByRole("menu", { name: "Workspace actions" });
     expect(menu).toBeInTheDocument();
 
     // Menu should be positioned at x, y

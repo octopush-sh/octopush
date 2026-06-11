@@ -58,7 +58,7 @@ impl Orchestrator {
             db,
             events,
             test_runner: None,
-            client: reqwest::Client::new(),
+            client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -73,7 +73,7 @@ impl Orchestrator {
             db,
             events,
             test_runner: Some(runner),
-            client: reqwest::Client::new(),
+            client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
         }
     }

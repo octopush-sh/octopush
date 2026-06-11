@@ -13,6 +13,9 @@ interface Props {
   /** Called with the trimmed, validated name. The caller closes the dialog. */
   onSubmit: (name: string) => void;
   onClose: () => void;
+  /** Override the default file-name validation (branch names allow slashes,
+   *  stash messages allow anything). Return an error string or null. */
+  validate?: (name: string) => string | null;
 }
 
 function validateName(name: string): string | null {
@@ -27,13 +30,21 @@ function validateName(name: string): string | null {
  * tree's New file / New folder / Rename flows. Validation is inline (rouge,
  * rises in) and blocks submit; the backend re-validates regardless.
  */
-export function FileNameDialog({ title, label, initial = "", confirmLabel, onSubmit, onClose }: Props) {
+export function FileNameDialog({
+  title,
+  label,
+  initial = "",
+  confirmLabel,
+  onSubmit,
+  onClose,
+  validate = validateName,
+}: Props) {
   const [value, setValue] = useState(initial);
   const [error, setError] = useState<string | null>(null);
 
   const submit = () => {
     const name = value.trim();
-    const problem = validateName(name);
+    const problem = validate(name);
     if (problem) {
       setError(problem);
       return;

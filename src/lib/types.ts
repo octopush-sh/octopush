@@ -232,7 +232,7 @@ export interface GitStatus {
   /** False when ahead/behind timed out (huge graph); UI hides the ↑/↓ badge. */
   aheadBehindKnown: boolean;
   /** The in-progress multi-step operation, if any. */
-  operation: "merge" | "rebase" | null;
+  operation: "merge" | "rebase" | "cherry-pick" | null;
 }
 
 /** Branches offered as a base for new workspaces. Locals come repo-default
@@ -268,6 +268,17 @@ export interface Pr {
 
 /** @deprecated Use `Pr` instead. */
 export type OpenPr = Pr;
+
+/** A pull request candidate for "start a workspace from a PR"
+ *  (from `list_prs`, backed by the GitHub CLI). */
+export interface PrInfo {
+  number: number;
+  title: string;
+  /** The PR's head branch name — becomes the workspace base after fetching. */
+  headRefName: string;
+  /** Author login; null for deleted accounts or when gh omits it. */
+  author: string | null;
+}
 
 /** A branch and its open PR, from open_prs_for_project (rail PR indicator). */
 export interface BranchPr {
