@@ -20,6 +20,12 @@ vi.mock("./Toasts", () => ({ pushToast: (...a: unknown[]) => pushToast(...a) }))
 // Stores referenced by handleCommitOrAmend — actual import paths used in ChangesPanel.tsx.
 vi.mock("../stores/projectStore", () => ({ useProjectStore: { getState: () => ({ current: null }) } }));
 vi.mock("../stores/workspaceStore", () => ({ useWorkspaceStore: { getState: () => ({ loadGitSummaries: vi.fn() }) } }));
+// The AI modal has its own test file — here we only assert the wiring.
+vi.mock("./ConflictAiModal", () => ({
+  ConflictAiModal: ({ file, model }: { file: string; model: string }) => (
+    <div data-testid="conflict-ai-modal">{file}:{model}</div>
+  ),
+}));
 
 import { ChangesPanel } from "./ChangesPanel";
 
@@ -246,6 +252,15 @@ describe("ChangesPanel G7 conflicts", () => {
         expect.objectContaining({ level: "error", body: "fatal: oops" }),
       ),
     );
+  });
+
+  it("Sparkles opens the AI resolution modal for that file with the review model", async () => {
+    ipcMock.getGitStatus.mockResolvedValue(CONFLICT_STATUS);
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await screen.findByText(/2 conflicts · merge/i);
+    await userEvent.click(screen.getAllByRole("button", { name: /resolve with ai/i })[0]);
+    const modal = await screen.findByTestId("conflict-ai-modal");
+    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-4-6");
   });
 
   it("Pencil routes through the panel's file-open path", async () => {

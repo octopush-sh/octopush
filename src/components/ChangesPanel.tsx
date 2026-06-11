@@ -29,12 +29,17 @@ import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ModalShell } from "./ModalShell";
+import { ConflictAiModal } from "./ConflictAiModal";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useAiReview } from "../stores/aiReviewStore";
 
 interface Props {
   projectPath: string;
+  /** Optional workspace id — keys the per-workspace review model used by
+   *  AI conflict resolution. Falls back to the store default when absent. */
+  workspaceId?: string;
   /** Diff text — drives the +/- line summary in the eyebrow. */
   diff?: string;
   /** Optional: called when a file row is clicked. The parent typically
@@ -60,7 +65,7 @@ const CONFLICT_CHIP =
 const CONFLICT_ICON_BTN =
   "shrink-0 rounded p-1 text-octo-sage transition-colors hover:text-octo-brass disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
 
-export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, registerFocusCommit }: Props) {
+export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick, onChange, registerFocusCommit }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
@@ -75,7 +80,12 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
   const [resolvingPath, setResolvingPath] = useState<string | null>(null);
   const [abortConfirm, setAbortConfirm] = useState(false);
   const [opBusy, setOpBusy] = useState(false);
+  const [aiTarget, setAiTarget] = useState<string | null>(null);
   const commitRef = useRef<HTMLTextAreaElement>(null);
+  const modelFor = useAiReview((s) => s.modelFor);
+  // Per-workspace review model; modelFor falls back to its default for
+  // unknown keys, so the projectPath fallback is always safe.
+  const aiModel = modelFor(workspaceId ?? projectPath);
 
   useEffect(() => {
     registerFocusCommit?.(() => commitRef.current?.focus());
@@ -430,8 +440,9 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
                   </button>
                   <button
                     type="button"
-                    disabled
-                    title="AI resolution — coming in this slice"
+                    onClick={() => setAiTarget(f.path)}
+                    disabled={resolvingPath === f.path}
+                    title="Resolve with AI"
                     aria-label="Resolve with AI"
                     className={CONFLICT_ICON_BTN}
                   >
@@ -612,6 +623,19 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
           cancelLabel="Cancel"
           onConfirm={confirmDiscard}
           onCancel={() => setDiscardTarget(null)}
+        />
+      )}
+
+      {aiTarget && (
+        <ConflictAiModal
+          workspacePath={projectPath}
+          file={aiTarget}
+          model={aiModel}
+          onClose={() => setAiTarget(null)}
+          onResolved={() => {
+            setAiTarget(null);
+            void refresh().then(() => onChange?.());
+          }}
         />
       )}
 

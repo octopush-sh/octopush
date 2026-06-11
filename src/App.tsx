@@ -1530,6 +1530,7 @@ function App() {
                     <div className="w-[260px] shrink-0 border-r border-octo-hairline">
                       <ChangesPanel
                         projectPath={activeWorkspace.worktreePath || project.path}
+                        workspaceId={activeWorkspaceId!}
                         diff={gitDiff}
                         onFileClick={(filePath) => navigateToFile(filePath, "diff")}
                         registerFocusCommit={registerFocusCommit}
