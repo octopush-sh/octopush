@@ -430,6 +430,20 @@ export const ipc = {
   discardFile: (workspacePath: string, filePath: string) =>
     invoke<void>("discard_file", { workspacePath, filePath }),
 
+  // ─── File operations (G6 slice II) ────────────────────────────
+  /** Rename/move an entry. Both paths are containment-checked; `to` must not exist. */
+  fsRename: (workspacePath: string, from: string, to: string) =>
+    invoke<void>("fs_rename", { workspacePath, from, to }),
+  /** Create an empty file `name` inside `parent` (relative to the workspace). */
+  fsCreateFile: (workspacePath: string, parent: string, name: string) =>
+    invoke<void>("fs_create_file", { workspacePath, parent, name }),
+  /** Create a directory `name` inside `parent` (relative to the workspace). */
+  fsCreateDir: (workspacePath: string, parent: string, name: string) =>
+    invoke<void>("fs_create_dir", { workspacePath, parent, name }),
+  /** Permanently delete a file or directory (recursive). Confirm in the UI first. */
+  fsDelete: (workspacePath: string, target: string) =>
+    invoke<void>("fs_delete", { workspacePath, target }),
+
   // ─── Conflict resolution ──────────────────────────────────────
   /** Take one side of a conflicted file wholesale (checkout --ours/--theirs + add). */
   resolveConflictTake: (workspacePath: string, file: string, side: "ours" | "theirs") =>

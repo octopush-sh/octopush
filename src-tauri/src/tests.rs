@@ -3958,3 +3958,179 @@ mod conflict_resolution_tests {
         assert!(crate::commands::abort_operation(path).await.is_err());
     }
 }
+
+// ─── G6 slice II: contained file operations ───────────────────────
+#[cfg(test)]
+mod g6_fileops_tests {
+    use crate::commands::{
+        contained_path, fs_create_dir_inner, fs_create_file_inner, fs_delete_inner,
+        fs_rename_inner,
+    };
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn ws() -> (TempDir, String) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        (tmp, path)
+    }
+
+    // ── contained_path helper ──
+
+    #[test]
+    fn contained_path_resolves_relative_targets_inside_the_workspace() {
+        let (tmp, ws) = ws();
+        let p = contained_path(&ws, "notes.txt").unwrap();
+        assert_eq!(p, tmp.path().canonicalize().unwrap().join("notes.txt"));
+    }
+
+    #[test]
+    fn contained_path_refuses_escapes_git_and_the_root_itself() {
+        let (_tmp, ws) = ws();
+        assert!(contained_path(&ws, "../outside.txt").is_err(), "escape must be refused");
+        assert!(contained_path(&ws, ".git").is_err(), ".git itself must be refused");
+        assert!(contained_path(&ws, ".git/config").is_err(), "paths inside .git must be refused");
+        assert!(contained_path(&ws, &ws).is_err(), "the workspace root must be refused");
+        assert!(contained_path(&ws, "").is_err(), "empty target resolves to the root — refused");
+    }
+
+    // ── fs_rename ──
+
+    #[test]
+    fn rename_moves_a_file_within_the_workspace() {
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        fs_rename_inner(&ws, "a.txt", "b.txt").unwrap();
+        assert!(!tmp.path().join("a.txt").exists());
+        assert_eq!(fs::read_to_string(tmp.path().join("b.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn rename_moves_a_directory_too() {
+        let (tmp, ws) = ws();
+        fs::create_dir(tmp.path().join("old")).unwrap();
+        fs::write(tmp.path().join("old/f.txt"), "x").unwrap();
+        fs_rename_inner(&ws, "old", "new").unwrap();
+        assert!(tmp.path().join("new/f.txt").exists());
+    }
+
+    #[test]
+    fn rename_refuses_when_the_destination_already_exists() {
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        let err = fs_rename_inner(&ws, "a.txt", "b.txt").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        assert_eq!(fs::read_to_string(tmp.path().join("b.txt")).unwrap(), "b");
+    }
+
+    #[test]
+    fn rename_refuses_containment_escapes_on_either_side() {
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        assert!(fs_rename_inner(&ws, "../outside.txt", "b.txt").is_err());
+        assert!(fs_rename_inner(&ws, "a.txt", "../outside.txt").is_err());
+        assert!(tmp.path().join("a.txt").exists(), "source must be untouched");
+    }
+
+    #[test]
+    fn rename_refuses_git_and_the_workspace_root() {
+        let (tmp, ws) = ws();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(fs_rename_inner(&ws, ".git", "not-git").is_err());
+        assert!(fs_rename_inner(&ws, &ws, "elsewhere").is_err());
+        assert!(tmp.path().join(".git").exists());
+    }
+
+    // ── fs_create_file / fs_create_dir ──
+
+    #[test]
+    fn create_file_makes_an_empty_file_in_the_parent() {
+        let (tmp, ws) = ws();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs_create_file_inner(&ws, "sub", "new.txt").unwrap();
+        assert_eq!(fs::read_to_string(tmp.path().join("sub/new.txt")).unwrap(), "");
+        // Root parent ("" → the workspace itself) works too.
+        fs_create_file_inner(&ws, "", "top.txt").unwrap();
+        assert!(tmp.path().join("top.txt").exists());
+    }
+
+    #[test]
+    fn create_dir_makes_a_directory() {
+        let (tmp, ws) = ws();
+        fs_create_dir_inner(&ws, "", "newdir").unwrap();
+        assert!(tmp.path().join("newdir").is_dir());
+    }
+
+    #[test]
+    fn create_refuses_when_the_entry_already_exists() {
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        let err = fs_create_file_inner(&ws, "", "f.txt").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        assert!(fs_create_dir_inner(&ws, "", "d").is_err());
+        assert_eq!(fs::read_to_string(tmp.path().join("f.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn create_refuses_bad_names() {
+        let (_tmp, ws) = ws();
+        for bad in ["", "  ", "a/b", "a\\b", ".", ".."] {
+            assert!(fs_create_file_inner(&ws, "", bad).is_err(), "file name {bad:?} must be refused");
+            assert!(fs_create_dir_inner(&ws, "", bad).is_err(), "dir name {bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn create_refuses_escaping_or_git_parents() {
+        let (tmp, ws) = ws();
+        assert!(fs_create_file_inner(&ws, "..", "outside.txt").is_err());
+        assert!(fs_create_dir_inner(&ws, "..", "outside-dir").is_err());
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(fs_create_file_inner(&ws, ".git", "hook").is_err());
+        assert!(fs_create_dir_inner(&ws, ".git", "hooks").is_err());
+        assert!(!tmp.path().join("../outside.txt").exists());
+    }
+
+    // ── fs_delete ──
+
+    #[test]
+    fn delete_removes_a_file() {
+        let (tmp, ws) = ws();
+        fs::write(tmp.path().join("gone.txt"), "x").unwrap();
+        fs_delete_inner(&ws, "gone.txt").unwrap();
+        assert!(!tmp.path().join("gone.txt").exists());
+    }
+
+    #[test]
+    fn delete_removes_a_directory_recursively() {
+        let (tmp, ws) = ws();
+        fs::create_dir_all(tmp.path().join("dir/nested")).unwrap();
+        fs::write(tmp.path().join("dir/nested/f.txt"), "x").unwrap();
+        fs_delete_inner(&ws, "dir").unwrap();
+        assert!(!tmp.path().join("dir").exists());
+    }
+
+    #[test]
+    fn delete_refuses_escapes_git_and_the_root() {
+        let (tmp, ws) = ws();
+        let outside = tmp.path().parent().unwrap().join("g6-outside-probe.txt");
+        fs::write(&outside, "keep").unwrap();
+        assert!(fs_delete_inner(&ws, "../g6-outside-probe.txt").is_err());
+        assert!(outside.exists(), "escape target must survive");
+        fs::remove_file(&outside).unwrap();
+
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(fs_delete_inner(&ws, ".git").is_err());
+        assert!(tmp.path().join(".git").exists());
+        assert!(fs_delete_inner(&ws, &ws).is_err(), "the workspace root must be refused");
+        assert!(tmp.path().exists());
+    }
+
+    #[test]
+    fn delete_errors_on_a_missing_target() {
+        let (_tmp, ws) = ws();
+        assert!(fs_delete_inner(&ws, "no-such-file.txt").is_err());
+    }
+}
