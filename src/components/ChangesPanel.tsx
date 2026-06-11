@@ -20,6 +20,8 @@ import {
   Check,
   Loader2,
   GitCommit,
+  Pencil,
+  Sparkles,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
@@ -50,6 +52,14 @@ const POLL_MS = 5_000;
 
 const MAX_VISIBLE_FILES = 200;
 
+// Quiet conflict-row chips — rouge is the conflict hue; the tint only
+// surfaces on hover/focus so the section stays calm.
+const CONFLICT_CHIP =
+  "shrink-0 rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-sage transition-colors hover:border-[color:var(--rouge-border)] hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-rouge";
+
+const CONFLICT_ICON_BTN =
+  "shrink-0 rounded p-1 text-octo-sage transition-colors hover:text-octo-brass disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
+
 export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, registerFocusCommit }: Props) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
@@ -62,6 +72,9 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
   const [discardTarget, setDiscardTarget] = useState<string | null>(null);
   const [reconcile, setReconcile] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [resolvingPath, setResolvingPath] = useState<string | null>(null);
+  const [abortConfirm, setAbortConfirm] = useState(false);
+  const [opBusy, setOpBusy] = useState(false);
   const commitRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -92,6 +105,8 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
   const conflicted = gitStatus?.conflicted ?? 0;
   const aheadBehindKnown = gitStatus?.aheadBehindKnown ?? true;
   const branchName = gitStatus?.branch ?? null;
+  const operation = gitStatus?.operation ?? null;
+  const conflictFiles = files.filter((f) => f.conflicted);
 
   // +/− line totals derived from the diff.
   const addCount = diff
@@ -260,6 +275,66 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
     await runPull(strategy);
   }
 
+  // ─── Conflict resolution (G7 slice II) ───────────────────────────
+
+  async function takeSide(file: string, side: "ours" | "theirs") {
+    setResolvingPath(file);
+    try {
+      await ipc.resolveConflictTake(projectPath, file, side);
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't resolve the conflict", body: String(e) });
+    } finally {
+      setResolvingPath(null);
+    }
+  }
+
+  async function handleContinue() {
+    if (!operation) return;
+    setOpBusy(true);
+    try {
+      const r = await ipc.continueOperation(projectPath);
+      if (r.kind === "ok") {
+        pushToast({
+          level: "success",
+          title: operation === "merge" ? "Merge completed" : "Rebase continued",
+          body: r.output.trim().split("\n").slice(-1)[0] || undefined,
+        });
+      } else if (r.kind === "moreConflicts") {
+        pushToast({
+          level: "warning",
+          title: "Next step has conflicts",
+          body: "Resolve the new conflicts, then continue again.",
+        });
+      } else {
+        pushToast({ level: "error", title: "Continue failed", body: r.output });
+      }
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Continue failed", body: String(e) });
+    } finally {
+      setOpBusy(false);
+    }
+  }
+
+  async function confirmAbort() {
+    setAbortConfirm(false);
+    if (!operation) return;
+    setOpBusy(true);
+    try {
+      await ipc.abortOperation(projectPath);
+      pushToast({ level: "success", title: operation === "merge" ? "Merge aborted" : "Rebase aborted" });
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      pushToast({ level: "error", title: "Abort failed", body: String(e) });
+    } finally {
+      setOpBusy(false);
+    }
+  }
+
   const canCommit = commitMessage.trim().length > 0 && (amend || staged.length > 0) && !committing;
   // Push enabled when:
   //  - there are commits ahead of upstream (normal case), OR
@@ -299,9 +374,97 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
             style={{ border: "1px solid var(--brass-dim)" }}>Pull</button>
         </span>
       </header>
-      {conflicted > 0 && (
-        <div className="shrink-0 border-b border-octo-hairline px-4 py-2 text-[11px] text-octo-rouge">
-          {conflicted} conflict{conflicted !== 1 ? "s" : ""} — resolve them in your terminal for now; in-app resolution is coming next.
+      {(conflicted > 0 || operation) && (
+        <div className="octo-rise-in shrink-0 border-b border-octo-hairline" data-testid="conflict-section">
+          {conflicted > 0 ? (
+            <div className="flex items-center px-4 py-1.5" style={{ background: "var(--rouge-ghost)" }}>
+              <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">
+                {conflicted} conflict{conflicted !== 1 ? "s" : ""}
+                {operation ? ` · ${operation}` : ""}
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center px-4 py-1.5">
+              <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-sage">
+                All conflicts resolved{operation ? ` · ${operation}` : ""}
+              </span>
+            </div>
+          )}
+
+          {conflictFiles.length > 0 && (
+            <ul className="pb-1.5 pt-0.5">
+              {conflictFiles.map((f) => (
+                <li key={f.path} className="flex items-center gap-1.5 px-4 py-1">
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-ivory"
+                    title={f.path}
+                  >
+                    {shortenPath(f.path)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => takeSide(f.path, "ours")}
+                    disabled={resolvingPath === f.path}
+                    title="Keep our version — git checkout --ours"
+                    className={CONFLICT_CHIP}
+                  >
+                    OURS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => takeSide(f.path, "theirs")}
+                    disabled={resolvingPath === f.path}
+                    title="Keep their version — git checkout --theirs"
+                    className={CONFLICT_CHIP}
+                  >
+                    THEIRS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onFileClick?.(f.path)}
+                    title="Open in editor"
+                    aria-label="Open in editor"
+                    className={CONFLICT_ICON_BTN}
+                  >
+                    <Pencil size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    disabled
+                    title="AI resolution — coming in this slice"
+                    aria-label="Resolve with AI"
+                    className={CONFLICT_ICON_BTN}
+                  >
+                    <Sparkles size={12} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {conflicted === 0 && operation && (
+            <div className="flex items-center gap-2 px-4 pb-2">
+              <button
+                type="button"
+                onClick={handleContinue}
+                disabled={opBusy}
+                title={`Run git ${operation} --continue`}
+                className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-brass transition-colors disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                style={{ border: "1px solid var(--brass-dim)", background: "var(--brass-ghost)" }}
+              >
+                {opBusy ? "…" : `Continue ${operation}`}
+              </button>
+              <button
+                type="button"
+                onClick={() => setAbortConfirm(true)}
+                disabled={opBusy}
+                title={`Abort the ${operation} and return to the previous state`}
+                className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-rouge opacity-70 transition-opacity hover:opacity-100 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-rouge focus-visible:opacity-100"
+              >
+                Abort
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -449,6 +612,17 @@ export function ChangesPanel({ projectPath, diff = "", onFileClick, onChange, re
           cancelLabel="Cancel"
           onConfirm={confirmDiscard}
           onCancel={() => setDiscardTarget(null)}
+        />
+      )}
+
+      {abortConfirm && operation && (
+        <ConfirmDialog
+          title={`Abort ${operation}`}
+          body={`Abort the ${operation}? Conflict resolutions in progress are discarded.`}
+          destructiveLabel={`Abort ${operation}`}
+          cancelLabel="Cancel"
+          onConfirm={confirmAbort}
+          onCancel={() => setAbortConfirm(false)}
         />
       )}
 
