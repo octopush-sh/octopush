@@ -144,6 +144,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 | Roman numerals| Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; also Direct run-track stage numbers |
 | Italic phrases| CTAs and placeholders are **phrases in Spectral italic**, not labels|
 | `⟜` in brass | Direct run-track checkpoint gate — pauses the pipeline for human approval |
+| `⟳` in **amber** (`--color-octo-warning`) | Direct mode transient halt — a stage stalled on a recoverable substrate fault (rate limit, overload, dropped connection) and awaits **Resume**. Amber = caution, never brass: a transient stall is not a hard `✕` failure. Used consistently on the run-track card, the focus banner, and the checkpoint strip |
 | Substrate pills | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
 
 ---

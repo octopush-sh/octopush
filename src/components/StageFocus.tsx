@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { LiveEntry, RunStage, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
+import { isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "./RunTrack";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -289,12 +290,24 @@ export function StageFocus({ stage, workspacePath }: Props) {
           ) : mode === "failed" ? (
             <>
               {/* Sticky: the halt stays visible however far the journal has scrolled.
-                  The onyx layer keeps the rouge-ghost tint opaque over scrolled lines. */}
+                  The onyx layer keeps the ghost tint opaque over scrolled lines.
+                  A transient fault (rate limit, overload, dropped connection) reads
+                  in amber as a recoverable caution, not a rouge hard failure. */}
               <div className="sticky top-0 z-10 rounded-md bg-octo-onyx">
-                <div className="octo-rise-in rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2">
-                  <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</div>
-                  <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
-                </div>
+                {isTransientHalt(stage.error) ? (
+                  <div className="octo-rise-in rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2">
+                    <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-warning">⟳ awaiting retry</div>
+                    <div className="mb-2 font-serif text-[13px] leading-snug text-octo-sage">
+                      The model substrate was briefly unavailable and automatic retries were exhausted. Your changes are preserved — resume the stage to pick up where it stalled.
+                    </div>
+                    <div className="whitespace-pre-wrap text-octo-warning">{stage.error}</div>
+                  </div>
+                ) : (
+                  <div className="octo-rise-in rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2">
+                    <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</div>
+                    <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
+                  </div>
+                )}
               </div>
               {journal.length > 0 && <div className="flex flex-col gap-2">{journal}</div>}
               {snapshot != null && <SnapshotDiff diff={snapshot} />}

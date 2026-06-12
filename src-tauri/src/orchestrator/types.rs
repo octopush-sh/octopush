@@ -213,6 +213,12 @@ pub enum CheckpointAction {
     SendBack {
         feedback: Option<String>,
     },
+    /// Re-run a stage that halted on a *transient* fault (rate limit, overload,
+    /// 5xx, dropped connection). Unlike `Reject`, it carries no feedback or model
+    /// change — the work wasn't wrong, the substrate was briefly unavailable. The
+    /// prior attempt's spend is retired (kept truthful) and the worktree is left
+    /// intact so a code stage continues from the files already on disk.
+    Resume,
     /// Artifact was edited out-of-band; continue.
     Edit,
     Abort,

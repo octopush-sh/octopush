@@ -645,6 +645,30 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
+            CheckpointAction::Resume => {
+                // Recover a transient/infra halt: re-run the SAME stage without
+                // treating its output as wrong. Only a failed stage can resume —
+                // an awaiting_checkpoint stage isn't a failure, so this is a no-op
+                // there. The prior attempt is archived (evidence) and its spend
+                // retired so the cost meter stays truthful, then the stage resets
+                // to pending and the drive re-runs it. The worktree is untouched,
+                // so a code stage picks up from the files already on disk.
+                if let Some(s) = &blocked {
+                    if s.status == "failed" {
+                        if s.artifact.is_some() || s.error.is_some() {
+                            self.db.lock().archive_stage_attempt(s, None)?;
+                        }
+                        self.db.lock().retire_stage_cost(
+                            run_id,
+                            s.cost_usd,
+                            s.input_tokens,
+                            s.output_tokens,
+                        )?;
+                        self.db.lock().reset_run_stage(&s.id, None, None)?;
+                        self.recompute_run_cost(run_id)?;
+                    }
+                }
+            }
             CheckpointAction::SendBack { feedback } => {
                 if let Some(review) = &blocked {
                     // Only a review parked at its checkpoint can be sent back. A failed

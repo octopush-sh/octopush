@@ -240,3 +240,129 @@ fn openai_build_request_forces_named_function() {
     assert_eq!(body["tool_choice"]["type"], "function");
     assert_eq!(body["tool_choice"]["function"]["name"], "emit_result");
 }
+
+// ─── complete_with_retry: transient-failure resilience ──────────────────────────
+
+mod retry {
+    use super::super::{complete_with_retry, LlmProvider, LlmResponse, LlmStopReason};
+    use crate::error::{AppError, AppResult, ProviderErrorKind};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    /// One scripted outcome per call: `Ok` succeeds, `Err(kind, retry_after)`
+    /// fails as a classified provider error.
+    type Turn = Result<(), (ProviderErrorKind, Option<u64>)>;
+
+    struct ScriptedProvider {
+        turns: Mutex<VecDeque<Turn>>,
+        calls: AtomicU32,
+    }
+
+    impl ScriptedProvider {
+        fn new(turns: Vec<Turn>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into()),
+                calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    fn ok_response() -> LlmResponse {
+        LlmResponse {
+            text: "done".into(),
+            tool_uses: vec![],
+            stop_reason: LlmStopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            rate_limit: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn complete(
+            &self,
+            _api_base: &str,
+            _api_key: Option<&str>,
+            _req: &super::super::LlmRequest,
+            _client: &reqwest::Client,
+        ) -> AppResult<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.turns.lock().unwrap().pop_front().expect("scripted provider ran out of turns") {
+                Ok(()) => Ok(ok_response()),
+                Err((kind, retry_after)) => Err(AppError::Provider {
+                    kind,
+                    retry_after,
+                    message: format!("{kind:?}"),
+                }),
+            }
+        }
+    }
+
+    async fn drive(provider: &ScriptedProvider, cancel: &AtomicBool, max_retries: u32) -> (AppResult<LlmResponse>, u32) {
+        let client = reqwest::Client::new();
+        let retries = AtomicU32::new(0);
+        let mut on_retry = |_a: u32, _d: u64, _k: ProviderErrorKind| {
+            retries.fetch_add(1, Ordering::Relaxed);
+        };
+        let req = super::sample_request();
+        let res = complete_with_retry(
+            provider, "http://x", None, &req, &client, cancel, max_retries, &mut on_retry,
+        )
+        .await;
+        (res, retries.load(Ordering::Relaxed))
+    }
+
+    // retry_after: Some(0) keeps the backoff wait at zero so these stay fast.
+    #[tokio::test]
+    async fn retries_transient_then_succeeds() {
+        let p = ScriptedProvider::new(vec![
+            Err((ProviderErrorKind::RateLimit, Some(0))),
+            Err((ProviderErrorKind::Overloaded, Some(0))),
+            Ok(()),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let (res, retries) = drive(&p, &cancel, 5).await;
+        assert!(res.is_ok());
+        assert_eq!(p.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(retries, 2, "two waits narrated before the success");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_retries() {
+        let p = ScriptedProvider::new(vec![
+            Err((ProviderErrorKind::RateLimit, Some(0))),
+            Err((ProviderErrorKind::RateLimit, Some(0))),
+            Err((ProviderErrorKind::RateLimit, Some(0))),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let (res, _retries) = drive(&p, &cancel, 2).await;
+        assert!(matches!(res, Err(AppError::Provider { .. })));
+        // initial attempt + 2 retries = 3 calls
+        assert_eq!(p.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn non_transient_returns_immediately() {
+        let p = ScriptedProvider::new(vec![Err((ProviderErrorKind::Auth, None))]);
+        let cancel = AtomicBool::new(false);
+        let (res, retries) = drive(&p, &cancel, 5).await;
+        assert!(res.is_err());
+        assert_eq!(p.calls.load(Ordering::Relaxed), 1, "auth failures are not retried");
+        assert_eq!(retries, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_the_backoff() {
+        // A long retry_after would normally park the call; a raised cancel must
+        // break out of the wait without further attempts.
+        let p = ScriptedProvider::new(vec![Err((ProviderErrorKind::RateLimit, Some(300)))]);
+        let cancel = AtomicBool::new(true);
+        let (res, _retries) = drive(&p, &cancel, 5).await;
+        assert!(res.is_err());
+        assert_eq!(p.calls.load(Ordering::Relaxed), 1, "no retry after a cancel");
+    }
+}

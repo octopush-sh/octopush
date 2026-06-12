@@ -1893,6 +1893,7 @@ mod agentic_loop_tests {
                     output_tokens: 10,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    rate_limit: None,
                 },
                 LlmResponse {
                     text: "All done.".into(),
@@ -1902,6 +1903,7 @@ mod agentic_loop_tests {
                     output_tokens: 5,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    rate_limit: None,
                 },
             ]),
         };
@@ -3820,7 +3822,8 @@ mod live_tests {
     }
     fn resp(text: &str, tools: Vec<LlmToolUse>, stop: LlmStopReason) -> LlmResponse {
         LlmResponse { text: text.into(), tool_uses: tools, stop_reason: stop,
-            input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 }
+            input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0,
+            rate_limit: None }
     }
 
     #[tokio::test]
@@ -4729,6 +4732,7 @@ mod ai_token_event_tests {
             output_tokens: 340,
             cache_read_tokens: 5000,
             cache_creation_tokens: 700,
+            rate_limit: None,
         }
     }
 
