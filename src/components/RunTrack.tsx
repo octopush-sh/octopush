@@ -94,7 +94,7 @@ export function RunTrack({ run, stages, selectedStageId, onSelectStage, onStopSt
               onClick={onRunAgain}
               className="octo-fade-in font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-ivory"
             >
-              ⟶ Run it again
+              Run it again
             </button>
           )}
         </div>

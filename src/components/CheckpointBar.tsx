@@ -84,7 +84,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
               // catch the gaps. Outlined — the bar keeps at most one solid brass.
               <button type="button" onClick={onApprove}
                 className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                Accept &amp; continue ⟶
+                Accept &amp; continue
               </button>
             ) : (
               <button type="button" onClick={onApprove}
@@ -95,7 +95,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
             {canSendBack && (
               <button type="button" onClick={() => setMode("sendback")}
                 className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                Send back to {loopTargetRole} ⟜
+                Send back to {loopTargetRole}
               </button>
             )}
             <button type="button" onClick={() => setMode("reject")}
@@ -119,7 +119,7 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
             <div className="flex gap-2">
               <button type="button" onClick={submitFeedback}
                 className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi">
-                {mode === "reject" ? "Re-run the stage ⟶" : "Send back ⟶"}
+                {mode === "reject" ? "Re-run the stage" : "Send back"}
               </button>
               <button type="button"
                 onClick={() => { setMode("decide"); setFeedback(""); }}

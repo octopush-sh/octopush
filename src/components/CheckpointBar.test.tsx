@@ -98,7 +98,7 @@ describe("CheckpointBar", () => {
     fireEvent.change(textarea, { target: { value: "Please fix the lint errors" } });
 
     // Submit via the "Send back" button in the panel
-    fireEvent.click(screen.getByText(/Send back ⟶/i));
+    fireEvent.click(screen.getByText(/^Send back$/));
 
     expect(onSendBack).toHaveBeenCalledWith("Please fix the lint errors");
   });

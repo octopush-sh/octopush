@@ -316,7 +316,7 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
       </div>
       <button type="button" onClick={addStage}
         className="mb-8 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-ivory">
-        ⟶ Add another stage
+        Add another stage
       </button>
 
       <Reveal open={error !== null}>
@@ -328,7 +328,7 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
       <div className="sticky bottom-0 -mx-8 flex items-center gap-2 border-t border-octo-hairline bg-octo-panel px-8 py-3">
         <button type="button" disabled={saving || !name.trim()} onClick={() => void onSave()}
           className="rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40">
-          {isBuiltin ? "Save as my copy ⟶" : "Save pipeline ⟶"}
+          {isBuiltin ? "Save as my copy" : "Save pipeline"}
         </button>
         <button type="button" onClick={onClose}
           className="rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage">

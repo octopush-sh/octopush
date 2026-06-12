@@ -139,7 +139,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 | Detail        | Where to use                                                        |
 |---------------|---------------------------------------------------------------------|
 | `&` in brass  | "Octopus & you" branding moments (welcome, about)                   |
-| `⟶` in brass | Terminal prompt, command palette prompt, input nudges; also the Direct run-track stage connector |
+| `⟶` in brass | Terminal prompt, command palette prompt, input nudges; also the Direct run-track stage connector. **Never as button/CTA decoration** — buttons carry the phrase alone (user rule, 2026-06-11: structural flow glyphs yes, ornamental arrows on actions no) |
 | `§` in brass  | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; also Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER` |
 | Roman numerals| Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; also Direct run-track stage numbers |
 | Italic phrases| CTAs and placeholders are **phrases in Spectral italic**, not labels|

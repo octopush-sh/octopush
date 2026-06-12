@@ -113,7 +113,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
         ) : (
           <button type="button" onClick={() => onEditPipeline(null)}
             className="mb-4 block w-full rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-6 text-center font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)]">
-            No pipelines yet — compose your first ⟶
+            No pipelines yet — compose your first
           </button>
         )
       ) : (
@@ -146,7 +146,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
       )}
       <button type="button" onClick={() => onEditPipeline(null)}
         className="mb-8 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-ivory">
-        ⟶ Compose a new pipeline
+        Compose a new pipeline
       </button>
 
       {selected && (
@@ -214,7 +214,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                 onClick={() => onBegin(selected.pipeline.id, task.trim(), overrideTuples(), parseBudget(budgetText))}
                 className="rounded-lg bg-octo-brass px-5 py-2.5 font-serif text-base text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
               >
-                Begin the run ⟶
+                Begin the run
               </button>
               <p className="m-0 h-4 font-mono text-[10px] text-octo-mute">
                 {executingRun ? "A run is in progress — finish or abort it before starting another." : ""}

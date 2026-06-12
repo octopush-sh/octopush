@@ -167,7 +167,7 @@ describe("RunTrack liveness", () => {
       />,
     );
     const again = screen.getByRole("button", { name: /Run it again/ });
-    expect(again.textContent).toContain("⟶");
+    expect(again.textContent).toContain("Run it again");
     fireEvent.click(again);
     expect(onRunAgain).toHaveBeenCalledTimes(1);
     unmount();
