@@ -19,6 +19,8 @@ export interface PipelineStage {
   loopTargetPosition: number | null;
   loopMaxIterations: number;
   loopMode: "gated" | "auto" | null;
+  /** Per-stage tool-turn budget (1..=100; default 25). */
+  maxIterations: number;
 }
 export interface Pipeline {
   id: string;
@@ -40,6 +42,8 @@ export interface StageDraft {
   loopTargetPosition: number | null;
   loopMaxIterations: number;
   loopMode: "gated" | "auto" | null;
+  /** Per-stage tool-turn budget (1..=100). */
+  maxIterations: number;
 }
 export interface PipelineDraft {
   pipelineId: string | null; // null = create; a builtin id = fork; a custom id = update
@@ -86,6 +90,8 @@ export interface RunStage {
   loopIterations: number;
   /** Worktree diff captured when the stage finished; null for legacy runs. */
   diffSnapshot: string | null;
+  /** Per-stage tool-turn budget (copied from the template; default 25). */
+  maxIterations: number;
 }
 export interface RunDetail {
   run: Run | null;

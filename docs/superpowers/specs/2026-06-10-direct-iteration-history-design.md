@@ -46,3 +46,23 @@ Per-iteration worktree/diff snapshots (still the next candidate); CLI substrate 
 ## Tests
 
 Rust: sink persists entries + reset markers; `loop_back` archives artifacts with ordinals and composed feedback reaches the target's `feedback` column; Reject archives the failed attempt; send-back composition (findings+note / findings-only / note-only). Vitest: focus-follow clears only running→terminal selections; iteration nav renders archive + segment; hydration fills the journal drawer for terminal stages with empty memory.
+
+## Halt recovery (2026-06-11)
+
+Live testing of the iteration cap (an `implement` stage burning all its tool turns → failed by design) surfaced four gaps, fixed as F1–F4 on top of this design:
+
+### F1 — The cap explains itself
+
+`run_agentic_loop` emits a terminal notice — `iteration cap reached — N of N tool turns used` — into the journal at exhaustion, before returning the unfinished result. The journal no longer just stops.
+
+### F2 — The halt is visible without scrolling
+
+The StageFocus failed banner is `sticky top-0 z-10` inside the journal scroll container, layered over an opaque `bg-octo-onyx` wrapper so the rouge-ghost tint never lets scrolled lines bleed through. The CheckpointBar failed strip replaces the generic copy with the error's first line — `<role> halted: <firstLine(error)>`, truncated, full text in the hover `title`.
+
+### F3 — Accept & continue (the pipeline-native recovery)
+
+Approving a FAILED blocked stage in `resolve_checkpoint` now accepts the partial work instead of no-op pausing: it synthesizes a role-shaped artifact (`(accepted by the director after a halt: <first error line>)`, `refs_worktree` for diff/tests kinds), completes the stage as **done** via `complete_run_stage` preserving the burned tokens/cost, then drives on — the next stage runs against the worktree as the halted agent left it, and the following review catches gaps and loops back. Budget-parked and awaiting-checkpoint Approve behavior is unchanged. The failed checkpoint strip gains a primary brass-outlined serif action: `Accept & continue ⟶`; Re-run and Abort remain.
+
+### F4 — Per-stage tool-turn budget
+
+`max_iterations INTEGER NOT NULL DEFAULT 25` on **both** `pipeline_stages` and `run_stages` (`add_column_if_missing`; the default backfills existing rows with the former hard cap). Plumbed through `insert_pipeline_stage`/seeder, `save_pipeline`, `create_run` (copied per run stage), `StageDraft.maxIterations` (validated **1..=100**), and `StageSpec` — `ApiRunner` feeds it to `run_agentic_loop` (the cap error reports the real value) and `CliRunner` uses it for `--max-turns` (replacing the fixed 30). The builder's stage card gains a quiet `max turns` Stepper (5–100, default 25) after the gate pill; `toStageDrafts` serializes it; loop-target-by-identity logic untouched.

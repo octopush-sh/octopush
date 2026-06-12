@@ -131,6 +131,11 @@ pub async fn run_agentic_loop(
         });
     }
 
+    // Exhaustion: close the journal with a terminal notice so the stage's end
+    // explains itself instead of just stopping mid-stream.
+    emitter.notice(&format!(
+        "iteration cap reached — {max_iterations} of {max_iterations} tool turns used"
+    ));
     out.text = format!("(agentic loop hit {max_iterations} iterations without finishing)");
     Ok(out)
 }

@@ -215,6 +215,7 @@ impl Orchestrator {
             loop_max: stage.loop_max_iterations,
             loop_mode: stage.loop_mode.as_deref().and_then(crate::orchestrator::types::LoopMode::from_db),
             loop_iterations: stage.loop_iterations,
+            max_iterations: stage.max_iterations,
         };
 
         // Input artifact = the previous done stage's artifact, or a seed Note from the task.
@@ -566,8 +567,36 @@ impl Orchestrator {
                             self.db.lock().set_run_stage_status(&s.id, "done")?;
                         }
                     } else {
-                        // A failed stage cannot be approved; treat as no-op pause.
-                        return Ok(RunStatus::Paused);
+                        // A FAILED stage: approving accepts the partial work.
+                        // Synthesize an honest artifact so the next stage has an
+                        // input and runs against the worktree as the halted agent
+                        // left it — the following review stage catches any gaps
+                        // and loops back (the pipeline-native recovery).
+                        let kind = crate::orchestrator::runner::artifact_kind_for(&s.role);
+                        let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
+                        let reason = s
+                            .error
+                            .as_deref()
+                            .and_then(|e| e.lines().next())
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or("stage halted");
+                        let artifact = StageArtifact {
+                            kind,
+                            text: format!("(accepted by the director after a halt: {reason})"),
+                            payload: None,
+                            refs_worktree,
+                        };
+                        let json = serde_json::to_string(&artifact)?;
+                        // Preserve the failed attempt's spend — only status/artifact change.
+                        self.db.lock().complete_run_stage(
+                            &s.id,
+                            "done",
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.cost_usd,
+                            Some(&json),
+                        )?;
                     }
                 }
             }

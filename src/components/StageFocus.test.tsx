@@ -24,7 +24,7 @@ const baseStage = {
   id: "st1", runId: "r1", position: 0, role: "code_review", agentModel: "haiku",
   substrate: "api", checkpoint: false, status: "running", inputTokens: 0, outputTokens: 0,
   costUsd: 0, artifact: null, feedback: null, error: null, startedAt: null, finishedAt: null,
-  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
+  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
   diffSnapshot: null,
 } as any;
 
@@ -68,6 +68,18 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("agent exploded")).toBeInTheDocument();
     expect(screen.getByText("evidence line")).toBeInTheDocument(); // journal is evidence…
     expect(container.querySelector(".opacity-70")).toBeNull();     // …shown at full opacity
+  });
+
+  it("pins the failed banner to the top of the scroll container, opaque (F2)", () => {
+    render(
+      <StageFocus stage={{ ...baseStage, status: "failed", error: "agent exploded" }} workspacePath="/tmp" />,
+    );
+    const banner = screen.getByText("✕ stage halted").closest(".sticky");
+    expect(banner).not.toBeNull(); // sticky wrapper exists
+    expect(banner!.className).toContain("top-0");
+    expect(banner!.className).toContain("z-10");
+    // Opaque layer under the rouge tint so scrolled journal lines never show through.
+    expect(banner!.className).toContain("bg-octo-onyx");
   });
 
   it("uses the serif empty state", () => {

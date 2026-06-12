@@ -26,7 +26,7 @@ const mkStage = (id: string, position: number, status: string) => ({
   id, runId: "r1", position, role: "implement", agentModel: "haiku",
   substrate: "api", checkpoint: false, status, inputTokens: 0, outputTokens: 0,
   costUsd: 0, artifact: null, feedback: null, error: null, startedAt: null, finishedAt: null,
-  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
+  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
 }) as any;
 
 describe("DirectCanvas viewed-run routing", () => {
@@ -115,7 +115,7 @@ describe("DirectCanvas viewed-run routing", () => {
       substrate: "api", checkpoint: true, status: "awaiting_checkpoint",
       inputTokens: 0, outputTokens: 0, costUsd: 0, artifact: null, feedback: null,
       error: null, startedAt: null, finishedAt: null,
-      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
+      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
     } as any;
     useRunsStore.setState({ detailByRun: { r1: { run: { ...run, status: "paused" }, stages: [blocked] } } });
     useRunsStore.getState().selectRun("w1", "r1");

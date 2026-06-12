@@ -10,7 +10,7 @@ function stage(over: Record<string, unknown>) {
     substrate: "api", checkpoint: false, status: "pending", inputTokens: 0, outputTokens: 0,
     costUsd: 0, artifact: null, feedback: null, error: null,
     startedAt: null, finishedAt: null,
-    loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
+    loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
     ...over,
   } as any;
 }

@@ -16,7 +16,6 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-const MAX_CLI_TURNS: u32 = 30;
 const CLI_TIMEOUT_SECS: u64 = 900; // 15-minute wall-clock backstop for a hung CLI
 
 #[derive(Deserialize, Debug, Default)]
@@ -214,7 +213,7 @@ pub fn parse_cli_result(
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
 /// independently and non-JSON log lines are simply skipped.
-pub fn build_cli_args(model: &str, system_prompt: &str) -> Vec<String> {
+pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<String> {
     vec![
         "-p".to_string(),
         "--output-format".to_string(),
@@ -227,7 +226,7 @@ pub fn build_cli_args(model: &str, system_prompt: &str) -> Vec<String> {
         "--permission-mode".to_string(),
         "bypassPermissions".to_string(),
         "--max-turns".to_string(),
-        MAX_CLI_TURNS.to_string(),
+        max_turns.max(1).to_string(),
     ]
 }
 
@@ -250,7 +249,7 @@ impl AgentRunner for CliRunner {
     ) -> AppResult<StageOutcome> {
         let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
-        let args = build_cli_args(&stage.agent_model, &system);
+        let args = build_cli_args(&stage.agent_model, &system, stage.max_iterations);
 
         let path_env = resolved_cli_path();
         let program: std::ffi::OsString = resolve_executable("claude", &path_env)

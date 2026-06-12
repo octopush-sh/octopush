@@ -40,8 +40,13 @@ const MODE_OPTIONS = [
   { value: "gated" as const, label: "Gated" },
   { value: "auto" as const, label: "Auto" },
 ];
-// Keep the default model in sync with the seeder's choices in db.rs seed_builtin_pipelines.
-const DEFAULT_STAGE = { role: "implement", agentModel: "claude-sonnet-4-6", substrate: "api" as const, checkpoint: false };
+// Keep the default model in sync with the seeder's choices in db.rs seed_builtin_pipelines,
+// and the default turn budget with the max_iterations DB default (25).
+const DEFAULT_MAX_TURNS = 25;
+const DEFAULT_STAGE = {
+  role: "implement", agentModel: "claude-sonnet-4-6", substrate: "api" as const,
+  checkpoint: false, maxIterations: DEFAULT_MAX_TURNS,
+};
 
 /** Builder-local stage: loop target tracked by stage IDENTITY (key), not position. */
 interface DraftStage {
@@ -54,6 +59,8 @@ interface DraftStage {
   loopMaxIterations: number;
   loopMode: "gated" | "auto" | null;
   loopCleared: boolean; // show the one-line notice after a normalize cleared the loop
+  /** Per-stage tool-turn budget (validated 1..=100 backend-side). */
+  maxIterations: number;
 }
 
 function newKey(): string {
@@ -79,6 +86,7 @@ function draftsFrom(pipeline: PipelineWithStages | null): DraftStage[] {
     loopMaxIterations: s.loopMaxIterations,
     loopMode: s.loopMode as "gated" | "auto" | null,
     loopCleared: false,
+    maxIterations: s.maxIterations ?? DEFAULT_MAX_TURNS,
   })));
 }
 
@@ -107,6 +115,7 @@ function toStageDrafts(stages: DraftStage[]): StageDraft[] {
       loopTargetPosition: hasLoop ? targetIdx : null,
       loopMaxIterations: hasLoop ? s.loopMaxIterations : 0,
       loopMode: hasLoop ? s.loopMode : null,
+      maxIterations: s.maxIterations,
     };
   });
 }
@@ -243,6 +252,10 @@ export function PipelineBuilder({ pipeline, onClose }: Props) {
               </div>
               <SegmentedControl options={SUBSTRATE_OPTIONS} value={s.substrate} onChange={(v) => patch(s.key, { substrate: v })} ariaLabel="Execution substrate" />
               <TogglePill on={s.checkpoint} onChange={(v) => patch(s.key, { checkpoint: v })} label="⟜ gate" ariaLabel="Approval gate" />
+              <label className="flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-[0.1em] text-octo-mute">
+                max turns
+                <Stepper value={s.maxIterations} min={1} max={100} onChange={(v) => patch(s.key, { maxIterations: v })} ariaLabel="Max turns" />
+              </label>
               <div className="ml-auto flex items-center gap-1">
                 <IconButton label="Move up" disabled={i === 0} onClick={() => move(i, -1)}><ChevronUp size={12} /></IconButton>
                 <IconButton label="Move down" disabled={i === stages.length - 1} onClick={() => move(i, 1)}><ChevronDown size={12} /></IconButton>

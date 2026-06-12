@@ -288,9 +288,13 @@ export function StageFocus({ stage, workspacePath }: Props) {
             </>
           ) : mode === "failed" ? (
             <>
-              <div className="octo-rise-in rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2">
-                <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</div>
-                <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
+              {/* Sticky: the halt stays visible however far the journal has scrolled.
+                  The onyx layer keeps the rouge-ghost tint opaque over scrolled lines. */}
+              <div className="sticky top-0 z-10 rounded-md bg-octo-onyx">
+                <div className="octo-rise-in rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2">
+                  <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</div>
+                  <div className="whitespace-pre-wrap text-octo-rouge">{stage.error}</div>
+                </div>
               </div>
               {journal.length > 0 && <div className="flex flex-col gap-2">{journal}</div>}
               {snapshot != null && <SnapshotDiff diff={snapshot} />}
