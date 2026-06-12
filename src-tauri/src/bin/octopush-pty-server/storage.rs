@@ -85,10 +85,10 @@ pub fn read_pty_log(id: &str) -> Result<Vec<u8>> {
 /// Deletes the on-disk log for a PTY session. Missing file is not an error.
 pub fn delete_pty_log(id: &str) -> Result<()> {
     let path = pty_log_path(id)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => Ok(r?),
     }
-    Ok(())
 }
 
 /// Removes all orphan log files (any `.log` in pty-state that has no corresponding

@@ -35,6 +35,11 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// v2: `remove` request + eager fd release for exited sessions. The bump
 /// forces a one-time daemon replacement on update so the fd-leak fixes
 /// actually deploy (the daemon is otherwise immortal by design).
+///
+/// Caveat: builds expecting different protocol versions fight over the
+/// single daemon (each replaces the other's on its self-heal path), killing
+/// terminals on both sides. Avoid running a pre-v2 Octopush and a v2 dev
+/// build at the same time.
 const EXPECTED_PROTOCOL_VERSION: u32 = 2;
 
 /// Return the path to the PTY daemon's Unix socket, starting the daemon

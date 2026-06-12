@@ -209,6 +209,22 @@ fn raise_fd_limit() {
         };
         if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
             info!(from = lim.rlim_cur, to = target, "raised RLIMIT_NOFILE soft limit");
+            return;
+        }
+        // Some platforms reject very large soft values (e.g. Linux caps at
+        // fs.nr_open even below rlim_max). Retry with a conservative cap so
+        // the daemon still escapes a tiny inherited limit.
+        let fallback = 10_240u64.min(lim.rlim_max as u64) as libc::rlim_t;
+        if fallback > lim.rlim_cur
+            && libc::setrlimit(
+                libc::RLIMIT_NOFILE,
+                &libc::rlimit {
+                    rlim_cur: fallback,
+                    rlim_max: lim.rlim_max,
+                },
+            ) == 0
+        {
+            info!(from = lim.rlim_cur, to = fallback, "raised RLIMIT_NOFILE soft limit (fallback cap)");
         } else {
             warn!(
                 from = lim.rlim_cur,

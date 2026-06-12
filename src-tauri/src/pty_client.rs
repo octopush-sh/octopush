@@ -61,11 +61,12 @@ type ReqMap = HashMap<u64, stdmpsc::SyncSender<Value>>;
 type EventMap = HashMap<String, stdmpsc::SyncSender<TermEvent>>;
 
 struct Inner {
-    writer: Box<dyn Write + Send>,
-    /// Clone of the connection's socket, kept so a reconnect can `shutdown()`
-    /// the old connection. Without it the old reader thread stays blocked in
-    /// `read()` forever, pinning the half-open socket — leaking one fd here
-    /// and two in the daemon per reconnect. `None` for the stub client.
+    /// The connection's socket. Requests are written through it directly
+    /// (`Write` is implemented for `&UnixStream`), and a reconnect calls
+    /// `shutdown()` on it to unblock the superseded reader thread — without
+    /// that, the old reader stays parked in `read()` forever, pinning the
+    /// half-open socket: one leaked fd here and two in the daemon per
+    /// reconnect. `None` for the stub client (daemon unavailable).
     stream: Option<UnixStream>,
     /// Pending per-reqid response waiters.
     pending: Arc<Mutex<ReqMap>>,
@@ -82,6 +83,11 @@ struct Inner {
 pub struct DaemonClient {
     inner: Mutex<Inner>,
     next_reqid: AtomicU64,
+    /// Bumped by every reconnect. Each reader thread remembers the value it
+    /// was spawned with and, on EOF, only runs its broken/drain epilogue if
+    /// it is still the CURRENT generation — a reader woken by the reconnect's
+    /// `shutdown()` must not poison the fresh connection's shared state.
+    reader_generation: Arc<AtomicU64>,
 }
 
 impl DaemonClient {
@@ -102,26 +108,15 @@ impl DaemonClient {
         let events: Arc<Mutex<EventMap>> = Arc::new(Mutex::new(HashMap::new()));
         let broken = Arc::new(AtomicBool::new(true)); // pre-broken
 
-        // Use a dummy writer (writes are immediately discarded).
-        struct NullWriter;
-        impl Write for NullWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         Arc::new(Self {
             inner: Mutex::new(Inner {
-                writer: Box::new(NullWriter),
                 stream: None,
                 pending,
                 events,
                 broken,
             }),
             next_reqid: AtomicU64::new(1),
+            reader_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -134,33 +129,31 @@ impl DaemonClient {
         let events: Arc<Mutex<EventMap>> = Arc::new(Mutex::new(HashMap::new()));
         let broken = Arc::new(AtomicBool::new(false));
 
-        let writer = stream
-            .try_clone()
-            .map_err(|e| AppError::Other(format!("clone socket: {e}")))?;
-        let shutdown_handle = stream
+        let reader_stream = stream
             .try_clone()
             .map_err(|e| AppError::Other(format!("clone socket: {e}")))?;
 
+        let reader_generation = Arc::new(AtomicU64::new(0));
         let client = Arc::new(Self {
             inner: Mutex::new(Inner {
-                writer: Box::new(writer),
-                stream: Some(shutdown_handle),
+                stream: Some(stream),
                 pending: Arc::clone(&pending),
                 events: Arc::clone(&events),
                 broken: Arc::clone(&broken),
             }),
             next_reqid: AtomicU64::new(1),
+            reader_generation: Arc::clone(&reader_generation),
         });
 
-        // Start reader thread.
-        let reader = BufReader::new(stream);
+        // Start reader thread (generation 0 — the value the counter holds).
+        let reader = BufReader::new(reader_stream);
         let pending2 = Arc::clone(&pending);
         let events2 = Arc::clone(&events);
         let broken2 = Arc::clone(&broken);
         std::thread::Builder::new()
             .name("daemon-reader".into())
             .spawn(move || {
-                run_reader(reader, pending2, events2, broken2);
+                run_reader(reader, pending2, events2, broken2, 0, reader_generation);
             })
             .map_err(|e| AppError::Other(format!("spawn reader thread: {e}")))?;
 
@@ -302,14 +295,18 @@ impl DaemonClient {
     /// Permanently delete a terminal: the daemon kills the shell if running,
     /// drops the session (releasing its fds) and deletes its scrollback log.
     pub fn remove(&self, id: &str) -> AppResult<()> {
+        // Drop the event listener first, unconditionally — the terminal is
+        // being deleted, so a stale subscriber must not linger even when the
+        // daemon no longer knows the id (e.g. it restarted in between).
+        {
+            let inner_guard = self.inner.lock();
+            let mut ev = inner_guard.events.lock();
+            ev.remove(id);
+        }
         self.send_request(serde_json::json!({
             "method": "remove",
             "id": id,
         }))?;
-        // Drop any event listener for this terminal.
-        let inner_guard = self.inner.lock();
-        let mut ev = inner_guard.events.lock();
-        ev.remove(id);
         Ok(())
     }
 
@@ -326,34 +323,42 @@ impl DaemonClient {
         let sock_path = pty_daemon::ensure_daemon_running()?;
         let stream = UnixStream::connect(&sock_path)
             .map_err(|e| AppError::Other(format!("reconnect to daemon: {e}")))?;
-        let writer = stream
-            .try_clone()
-            .map_err(|e| AppError::Other(format!("clone reconnected socket: {e}")))?;
-        let shutdown_handle = stream
+        let reader_stream = stream
             .try_clone()
             .map_err(|e| AppError::Other(format!("clone reconnected socket: {e}")))?;
 
         let mut inner = self.inner.lock();
+
+        // Supersede the old reader BEFORE waking it: its EOF epilogue checks
+        // the generation under the pending lock, so after this bump a reader
+        // woken by the shutdown below exits silently instead of re-marking
+        // the fresh connection broken and draining its pending waiters.
+        {
+            let _pend = inner.pending.lock();
+            self.reader_generation.fetch_add(1, Ordering::SeqCst);
+        }
+
         // Tear down the old connection fully: shutdown() unblocks the old
         // reader thread (it sees EOF and exits, dropping its socket clone),
         // which lets the daemon close its side too. Merely replacing the
-        // writer would leave the old socket half-open forever.
+        // stream would leave the old socket half-open forever.
         if let Some(old) = inner.stream.take() {
             let _ = old.shutdown(std::net::Shutdown::Both);
         }
-        inner.writer = Box::new(writer);
-        inner.stream = Some(shutdown_handle);
+        inner.stream = Some(stream);
         inner.broken.store(false, Ordering::SeqCst);
 
-        // Restart reader thread.
+        // Restart reader thread with the current generation.
+        let my_gen = self.reader_generation.load(Ordering::SeqCst);
+        let generation = Arc::clone(&self.reader_generation);
         let pending2 = Arc::clone(&inner.pending);
         let events2 = Arc::clone(&inner.events);
         let broken2 = Arc::clone(&inner.broken);
-        let reader = BufReader::new(stream);
+        let reader = BufReader::new(reader_stream);
         std::thread::Builder::new()
             .name("daemon-reader-reconnect".into())
             .spawn(move || {
-                run_reader(reader, pending2, events2, broken2);
+                run_reader(reader, pending2, events2, broken2, my_gen, generation);
             })
             .map_err(|e| AppError::Other(format!("spawn reconnect reader: {e}")))?;
 
@@ -404,9 +409,12 @@ impl DaemonClient {
         let mut line = serde_json::to_vec(&payload)?;
         line.push(b'\n');
         {
-            let mut inner = self.inner.lock();
-            let write_result = inner.writer.write_all(&line);
-            if let Err(ref e) = write_result {
+            let inner = self.inner.lock();
+            let Some(stream) = inner.stream.as_ref() else {
+                return Err(AppError::Other("daemon unavailable".into()));
+            };
+            let mut w = stream; // Write is implemented for &UnixStream
+            if let Err(e) = w.write_all(&line) {
                 inner.broken.store(true, Ordering::SeqCst);
                 return Err(AppError::Other(format!("write to daemon: {e}")));
             }
@@ -436,6 +444,8 @@ fn run_reader(
     pending: Arc<Mutex<ReqMap>>,
     events: Arc<Mutex<EventMap>>,
     broken: Arc<AtomicBool>,
+    my_gen: u64,
+    generation: Arc<AtomicU64>,
 ) {
     use base64::Engine as _;
 
@@ -509,11 +519,20 @@ fn run_reader(
         }
     }
 
+    // EOF epilogue. The generation check (under the pending lock, which
+    // try_reconnect holds while bumping) distinguishes a genuine connection
+    // loss from this reader being superseded by a reconnect: a superseded
+    // reader was woken by the reconnect's shutdown() and must exit silently —
+    // the broken flag and pending map now belong to the new connection.
+    let mut pend = pending.lock();
+    if generation.load(Ordering::SeqCst) != my_gen {
+        tracing::debug!("daemon reader: superseded by reconnect — exiting");
+        return;
+    }
     tracing::warn!("daemon reader: EOF — connection lost");
     broken.store(true, Ordering::SeqCst);
 
     // Wake all pending waiters with an error so callers don't block forever.
-    let mut pend = pending.lock();
     for (_, tx) in pend.drain() {
         let _ = tx.send(serde_json::json!({
             "type": "error",
