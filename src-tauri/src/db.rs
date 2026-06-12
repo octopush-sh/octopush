@@ -388,6 +388,12 @@ impl Db {
         // rows that predate the column or for the auto-created main row).
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN from_branch TEXT")?;
 
+        // ── v9 per-stage tool-turn budget (Direct halt recovery F4) ─
+        // How many agentic tool turns a stage may burn before it halts.
+        // DEFAULT 25 backfills every pre-existing row (the former hard cap).
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 25")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 25")?;
+
         Ok(())
     }
 
@@ -1438,7 +1444,7 @@ impl Db {
     pub fn get_pipeline_stages(&self, pipeline_id: &str) -> AppResult<Vec<PipelineStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
-                    loop_target_position, loop_max_iterations, loop_mode
+                    loop_target_position, loop_max_iterations, loop_mode, max_iterations
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -1453,6 +1459,7 @@ impl Db {
                 loop_target_position: r.get(7)?,
                 loop_max_iterations: r.get(8)?,
                 loop_mode: r.get(9)?,
+                max_iterations: r.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1486,15 +1493,16 @@ impl Db {
         loop_target_position: Option<i64>,
         loop_max_iterations: i64,
         loop_mode: Option<&str>,
+        max_iterations: i64,
     ) -> AppResult<String> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
             "INSERT INTO pipeline_stages
                 (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
-                 loop_target_position, loop_max_iterations, loop_mode)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 loop_target_position, loop_max_iterations, loop_mode, max_iterations)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![id, pipeline_id, position, role, agent_model, substrate, checkpoint as i64,
-                    loop_target_position, loop_max_iterations, loop_mode],
+                    loop_target_position, loop_max_iterations, loop_mode, max_iterations],
         )?;
         Ok(id)
     }
@@ -1556,7 +1564,7 @@ impl Db {
             }
             let pid = self.insert_pipeline(name, desc, true)?;
             for (i, (role, model, substrate, checkpoint, lt, lm, lmode)) in stages.iter().enumerate() {
-                self.insert_pipeline_stage(&pid, i as i64, role, model, substrate, *checkpoint, *lt, *lm, *lmode)?;
+                self.insert_pipeline_stage(&pid, i as i64, role, model, substrate, *checkpoint, *lt, *lm, *lmode, 25)?;
             }
         }
 
@@ -1645,11 +1653,12 @@ impl Db {
             tx.execute(
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
-                     loop_target_position, loop_max_iterations, loop_mode)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
-                        s.loop_target_position, s.loop_max_iterations, s.loop_mode],
+                        s.loop_target_position, s.loop_max_iterations, s.loop_mode,
+                        s.max_iterations],
             )?;
         }
         tx.commit()?;
@@ -1718,10 +1727,11 @@ impl Db {
             self.conn.execute(
                 "INSERT INTO run_stages
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
-                     loop_target_position, loop_max_iterations, loop_mode)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10)",
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
-                        s.loop_target_position, s.loop_max_iterations, s.loop_mode],
+                        s.loop_target_position, s.loop_max_iterations, s.loop_mode,
+                        s.max_iterations],
             )?;
         }
         Ok(id)
@@ -1754,7 +1764,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
-                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot
+                    loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
+                    max_iterations
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1780,6 +1791,7 @@ impl Db {
                 loop_mode: r.get(18)?,
                 loop_iterations: r.get(19)?,
                 diff_snapshot: r.get(20)?,
+                max_iterations: r.get(21)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2153,6 +2165,13 @@ pub struct StageDraft {
     pub loop_target_position: Option<i64>,
     pub loop_max_iterations: i64,
     pub loop_mode: Option<String>,
+    /// Per-stage tool-turn budget (1..=100). Defaults to 25 when absent.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: i64,
+}
+
+fn default_max_iterations() -> i64 {
+    25
 }
 
 // Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
@@ -2177,6 +2196,13 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
         }
         if s.agent_model.trim().is_empty() {
             return Err(AppError::Other(format!("stage {} has no model", i + 1)));
+        }
+        if !(1..=100).contains(&s.max_iterations) {
+            return Err(AppError::Other(format!(
+                "stage {} max turns must be between 1 and 100 (got {})",
+                i + 1,
+                s.max_iterations
+            )));
         }
         match s.loop_target_position {
             Some(target) => {
@@ -2226,6 +2252,8 @@ pub struct PipelineStageRow {
     pub loop_target_position: Option<i64>,
     pub loop_max_iterations: i64,
     pub loop_mode: Option<String>,
+    /// Per-stage tool-turn budget (1..=100; default 25).
+    pub max_iterations: i64,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -2290,6 +2318,8 @@ pub struct RunStageRow {
     /// Worktree diff text captured when this stage finished (done or failed);
     /// None for legacy runs and stages whose artifact doesn't ref the worktree.
     pub diff_snapshot: Option<String>,
+    /// Per-stage tool-turn budget (copied from the pipeline template; default 25).
+    pub max_iterations: i64,
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /

@@ -4,9 +4,9 @@ import { fireEvent, render, screen } from "@testing-library/react";
 const PIPE = { pipeline: { id: "p1", name: "Feature Factory", description: "d", isBuiltin: true, createdAt: "t" },
   stages: [
     { id: "s0", pipelineId: "p1", position: 0, role: "plan", agentModel: "m", substrate: "api", checkpoint: false,
-      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null },
+      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25 },
     { id: "s1", pipelineId: "p1", position: 1, role: "implement", agentModel: "m", substrate: "api", checkpoint: false,
-      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null },
+      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25 },
   ] };
 
 const storeState = vi.hoisted(() => ({

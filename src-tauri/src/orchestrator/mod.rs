@@ -215,6 +215,7 @@ impl Orchestrator {
             loop_max: stage.loop_max_iterations,
             loop_mode: stage.loop_mode.as_deref().and_then(crate::orchestrator::types::LoopMode::from_db),
             loop_iterations: stage.loop_iterations,
+            max_iterations: stage.max_iterations,
         };
 
         // Input artifact = the previous done stage's artifact, or a seed Note from the task.

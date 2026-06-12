@@ -2070,7 +2070,23 @@ mod pipeline_crud_tests {
         crate::db::StageDraft {
             role: role.into(), agent_model: "claude-haiku-4-5".into(), substrate: "api".into(),
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25,
         }
+    }
+
+    #[test]
+    fn validate_pipeline_stages_bounds_the_tool_turn_budget() {
+        use crate::db::validate_pipeline_stages;
+        // F4: per-stage max_iterations must be 1..=100.
+        let mut zero = draft("plan"); zero.max_iterations = 0;
+        assert!(validate_pipeline_stages(&[zero]).is_err());
+        let mut over = draft("plan"); over.max_iterations = 101;
+        assert!(validate_pipeline_stages(&[over]).is_err());
+        let mut ok = draft("plan"); ok.max_iterations = 25;
+        assert!(validate_pipeline_stages(&[ok]).is_ok());
+        let mut edge_lo = draft("plan"); edge_lo.max_iterations = 1;
+        let mut edge_hi = draft("plan"); edge_hi.max_iterations = 100;
+        assert!(validate_pipeline_stages(&[edge_lo, edge_hi]).is_ok());
     }
 
     #[test]
@@ -2286,8 +2302,8 @@ mod run_crud_tests {
     fn pipeline_stage_loop_config_roundtrips() {
         let db = test_db();
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
-        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated")).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated"), 25).unwrap();
         let stages = db.get_pipeline_stages(&pid).unwrap();
         assert_eq!(stages[0].loop_target_position, None);
         assert_eq!(stages[0].loop_max_iterations, 0);
@@ -2302,8 +2318,8 @@ mod run_crud_tests {
         let db = test_db();
         let ws = seed_workspace(&db);
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
-        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated")).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "code_review", "m", "api", true, Some(0), 2, Some("gated"), 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
 
         let stages = db.list_run_stages(&run).unwrap();
@@ -2318,11 +2334,29 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn max_iterations_roundtrips_and_copies_to_run_stages() {
+        // F4: the per-stage tool-turn budget persists on the template, defaults
+        // to 25 for seeded builtins, and is copied onto every run stage.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 40).unwrap();
+        assert_eq!(db.get_pipeline_stages(&pid).unwrap()[0].max_iterations, 40);
+
+        db.seed_builtin_pipelines().unwrap();
+        let ff = db.list_pipelines().unwrap().into_iter().find(|p| p.name == "Feature Factory").unwrap();
+        assert!(db.get_pipeline_stages(&ff.id).unwrap().iter().all(|s| s.max_iterations == 25));
+
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].max_iterations, 40);
+    }
+
+    #[test]
     fn retire_stage_cost_accumulates_on_the_run() {
         let db = test_db();
         let ws = seed_workspace(&db);
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         assert_eq!(db.get_retired_cost(&run).unwrap(), (0.0, 0, 0));
 
@@ -2354,7 +2388,7 @@ mod run_crud_tests {
         let db = test_db();
         let ws = seed_workspace(&db);
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         // Legacy/new runs have no budget.
         assert_eq!(db.get_run(&run).unwrap().unwrap().budget_usd, None);
@@ -2371,7 +2405,7 @@ mod run_crud_tests {
         let db = test_db();
         let ws = seed_workspace(&db);
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let stage = db.list_run_stages(&run).unwrap().remove(0);
         assert_eq!(stage.diff_snapshot, None);
@@ -2386,7 +2420,7 @@ mod run_crud_tests {
         let db = test_db();
         let ws = seed_workspace(&db);
         let pid = db.insert_pipeline("P", "d", false).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let stage_id = db.list_run_stages(&run).unwrap()[0].id.clone();
         db.complete_run_stage(&stage_id, "done", 10, 5, 0.1, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
@@ -2410,9 +2444,9 @@ mod run_crud_tests {
         let db = test_db();
         // Simulate an old install: seed a builtin-shaped pipeline with NO loop config.
         let pid = db.insert_pipeline("Feature Factory", "d", true).unwrap();
-        db.insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None).unwrap();
-        db.insert_pipeline_stage(&pid, 1, "implement", "m", "api", true, None, 0, None).unwrap();
-        db.insert_pipeline_stage(&pid, 2, "code_review", "m", "api", true, None, 0, None).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "m", "api", true, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 2, "code_review", "m", "api", true, None, 0, None, 25).unwrap();
         // Running the seeder backfills the review stage (seeding itself is skipped — name exists).
         db.seed_builtin_pipelines().unwrap();
         let stages = db.get_pipeline_stages(&pid).unwrap();
@@ -2545,7 +2579,7 @@ mod orchestrator_tests {
         runner: Box<dyn AgentRunner>,
     ) -> String {
         let pid = db.lock().insert_pipeline("Snap", "d", false).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run_id = db.lock().create_run(ws, &pid, "t", None, None, &[]).unwrap();
         let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
         let orch = Orchestrator::new_with_runner(Arc::clone(db), sink, runner);
@@ -2777,8 +2811,8 @@ mod orchestrator_tests {
     fn looped_run(max_iter: i64) -> (Orchestrator, String, Arc<Mutex<Db>>) {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("Looped", "d", false).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), max_iter, Some("gated")).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), max_iter, Some("gated"), 25).unwrap();
         let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
         let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
@@ -2841,8 +2875,8 @@ mod orchestrator_tests {
         // tokens preserved) and the drive continues into the next stage.
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("Halt", "d", false).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 1, "test", "m", "api", false, None, 0, None).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "test", "m", "api", false, None, 0, None, 25).unwrap();
         let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
 
@@ -3061,8 +3095,8 @@ mod orchestrator_tests {
     fn auto_run(verdict: &'static str, max_iter: i64) -> (Orchestrator, String, Arc<Mutex<Db>>) {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("Auto", "d", false).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), max_iter, Some("auto")).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), max_iter, Some("auto"), 25).unwrap();
         let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
         let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(VerdictRunner { verdict }));
@@ -3171,7 +3205,7 @@ mod orchestrator_tests {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("Budgeted", "d", false).unwrap();
         for i in 0..n {
-            db.lock().insert_pipeline_stage(&pid, i, "implement", "m", "api", false, None, 0, None).unwrap();
+            db.lock().insert_pipeline_stage(&pid, i, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         }
         let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         if let Some(b) = budget {
@@ -3333,7 +3367,7 @@ mod cli_args_tests {
 
     #[test]
     fn args_include_model_format_and_permission() {
-        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.");
+        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40);
         assert!(args.contains(&"-p".to_string()));
         let i = args.iter().position(|a| a == "--output-format").unwrap();
         assert_eq!(args[i + 1], "stream-json");
@@ -3345,7 +3379,9 @@ mod cli_args_tests {
         assert_eq!(args[s + 1], "You are a planner.");
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(args.contains(&"bypassPermissions".to_string()));
-        assert!(args.contains(&"--max-turns".to_string()));
+        // F4: the per-stage tool-turn budget drives --max-turns.
+        let t = args.iter().position(|a| a == "--max-turns").unwrap();
+        assert_eq!(args[t + 1], "40");
     }
 }
 

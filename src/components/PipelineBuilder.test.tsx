@@ -15,7 +15,7 @@ const { PipelineBuilder } = await import("./PipelineBuilder");
 const stage = (over: Record<string, unknown>) => ({
   id: "s", pipelineId: "p1", position: 0, role: "plan", agentModel: "claude-haiku-4-5",
   substrate: "api", checkpoint: false,
-  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, ...over,
+  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25, ...over,
 });
 const builtin = {
   pipeline: { id: "p1", name: "Feature Factory", description: "d", isBuiltin: true, createdAt: "t" },
@@ -84,6 +84,32 @@ describe("PipelineBuilder", () => {
     expect(draft.name).toBe("Feature Factory (custom)");
     expect(draft.stages[1].loopTargetPosition).toBe(0);
     expect(draft.stages[1].loopMode).toBe("gated");
+    // F4: the per-stage tool-turn budget is serialized too.
+    expect(draft.stages[0].maxIterations).toBe(25);
+    expect(draft.stages[1].maxIterations).toBe(25);
+  });
+
+  it("loads a stored max turns value, steps it, and serializes the change (F4)", async () => {
+    const tuned = {
+      pipeline: { id: "p5", name: "Tuned", description: "d", isBuiltin: false, createdAt: "t" },
+      stages: [stage({ id: "s0", position: 0, role: "implement", maxIterations: 40 })],
+    } as any;
+    render(<PipelineBuilder pipeline={tuned} onClose={vi.fn()} />);
+    // The stage card shows a quiet labeled stepper with the stored value.
+    const stepper = screen.getByLabelText("Max turns");
+    expect(stepper.textContent).toContain("40");
+    fireEvent.click(screen.getByRole("button", { name: "Increase" }));
+    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
+    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
+    expect(saveMock.mock.calls[0][0].stages[0].maxIterations).toBe(41);
+  });
+
+  it("new stages default max turns to 25 (F4)", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Pipeline name"), { target: { value: "Fresh" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
+    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
+    expect(saveMock.mock.calls[0][0].stages[0].maxIterations).toBe(25);
   });
 
   it("add stage appends a card", () => {

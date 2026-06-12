@@ -170,6 +170,9 @@ pub struct StageSpec {
     pub loop_max: i64,
     pub loop_mode: Option<LoopMode>,
     pub loop_iterations: i64,
+    /// Per-stage tool-turn budget: the agentic loop's iteration cap (API) and
+    /// `--max-turns` (CLI). Validated 1..=100 at save time; default 25.
+    pub max_iterations: i64,
 }
 
 /// A single tool invocation, captured for the run-event log.

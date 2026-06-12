@@ -8,8 +8,6 @@ use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageOutcome, Stag
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const MAX_STAGE_ITERATIONS: usize = 25;
-
 /// Everything a runner needs to execute one stage, beyond the `StageSpec`.
 pub struct StageContext {
     pub workspace_path: PathBuf,
@@ -163,6 +161,9 @@ impl AgentRunner for ApiRunner {
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
+        // The per-stage tool-turn budget (validated 1..=100 at save time);
+        // clamp defensively so a corrupt row can never yield a zero-turn loop.
+        let max_iterations = stage.max_iterations.max(1) as usize;
         let result = run_agentic_loop(
             provider.as_ref(),
             &api_base,
@@ -172,7 +173,7 @@ impl AgentRunner for ApiRunner {
             &system,
             &user,
             &ctx.workspace_path,
-            MAX_STAGE_ITERATIONS,
+            max_iterations,
             &emitter,
         )
         .await;
@@ -204,7 +205,7 @@ impl AgentRunner for ApiRunner {
                         status: StageStatus::Failed,
                         tool_calls: r.tool_calls,
                         error: Some(format!(
-                            "agentic loop hit {MAX_STAGE_ITERATIONS} iterations without finishing — review the work journal, then re-run or abort"
+                            "agentic loop hit {max_iterations} iterations without finishing — review the work journal, then re-run or abort"
                         )),
                         verdict: None,
                     });
