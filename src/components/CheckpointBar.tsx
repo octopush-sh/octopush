@@ -20,6 +20,12 @@ interface Props {
   onSendBack: (feedback: string) => void;
 }
 
+/** First non-empty line of a stage error, for the one-line decision strip. */
+function firstLine(error: string | null): string {
+  const line = (error ?? "").split("\n")[0].trim();
+  return line || "stage halted";
+}
+
 export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loopTargetRole, loopState, onSendBack }: Props) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
   const [feedback, setFeedback] = useState("");
@@ -63,9 +69,12 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
             <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${failed ? "text-octo-rouge" : "text-octo-brass"}`}>
               {failed ? "✕ stage halted" : "⟜ checkpoint"}
             </span>
-            <span className="flex-1 text-sm text-octo-sage">
+            <span
+              className="min-w-0 flex-1 truncate text-sm text-octo-sage"
+              title={failed ? blockedStage.error ?? undefined : undefined}
+            >
               {failed ? (
-                <>Stage <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted. Re-run it or abort the run.</>
+                <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
               ) : (
                 <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
               )}

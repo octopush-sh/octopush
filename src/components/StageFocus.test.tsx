@@ -70,6 +70,18 @@ describe("StageFocus live journal", () => {
     expect(container.querySelector(".opacity-70")).toBeNull();     // …shown at full opacity
   });
 
+  it("pins the failed banner to the top of the scroll container, opaque (F2)", () => {
+    render(
+      <StageFocus stage={{ ...baseStage, status: "failed", error: "agent exploded" }} workspacePath="/tmp" />,
+    );
+    const banner = screen.getByText("✕ stage halted").closest(".sticky");
+    expect(banner).not.toBeNull(); // sticky wrapper exists
+    expect(banner!.className).toContain("top-0");
+    expect(banner!.className).toContain("z-10");
+    // Opaque layer under the rouge tint so scrolled journal lines never show through.
+    expect(banner!.className).toContain("bg-octo-onyx");
+  });
+
   it("uses the serif empty state", () => {
     render(<StageFocus stage={null} workspacePath="/tmp" />);
     expect(screen.getByText("Pick a stage above to see its work.")).toBeInTheDocument();

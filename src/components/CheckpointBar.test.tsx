@@ -176,6 +176,28 @@ describe("CheckpointBar", () => {
     expect(screen.getByText(/loop exhausted/i).className).toContain("text-octo-brass");
   });
 
+  it("shows the failed stage's actual error (first line) in the decision strip (F2)", () => {
+    const error =
+      "agentic loop hit 25 iterations without finishing — review the work journal, then re-run or abort\nsecond line detail";
+    render(
+      <CheckpointBar
+        blockedStage={makeStage({ status: "failed", role: "implement", error })}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onAbort={vi.fn()}
+        loopTargetRole={null}
+        loopState={null}
+        onSendBack={vi.fn()}
+      />,
+    );
+    // The strip carries the error's first line, not the generic copy.
+    expect(screen.getByText(/agentic loop hit 25 iterations/)).toBeInTheDocument();
+    expect(screen.queryByText(/Re-run it or abort the run/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/second line detail/)).not.toBeInTheDocument(); // first line only
+    // The full text stays reachable via the hover title.
+    expect(screen.getByTitle(/second line detail/)).toBeInTheDocument();
+  });
+
   it("resets the feedback editor when a new checkpoint arrives (bar stays mounted in the Reveal dock)", () => {
     vi.useFakeTimers();
     const props = {
