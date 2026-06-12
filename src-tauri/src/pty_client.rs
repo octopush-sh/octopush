@@ -62,6 +62,11 @@ type EventMap = HashMap<String, stdmpsc::SyncSender<TermEvent>>;
 
 struct Inner {
     writer: Box<dyn Write + Send>,
+    /// Clone of the connection's socket, kept so a reconnect can `shutdown()`
+    /// the old connection. Without it the old reader thread stays blocked in
+    /// `read()` forever, pinning the half-open socket — leaking one fd here
+    /// and two in the daemon per reconnect. `None` for the stub client.
+    stream: Option<UnixStream>,
     /// Pending per-reqid response waiters.
     pending: Arc<Mutex<ReqMap>>,
     /// Per-terminal event subscribers.
@@ -111,6 +116,7 @@ impl DaemonClient {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 writer: Box::new(NullWriter),
+                stream: None,
                 pending,
                 events,
                 broken,
@@ -131,10 +137,14 @@ impl DaemonClient {
         let writer = stream
             .try_clone()
             .map_err(|e| AppError::Other(format!("clone socket: {e}")))?;
+        let shutdown_handle = stream
+            .try_clone()
+            .map_err(|e| AppError::Other(format!("clone socket: {e}")))?;
 
         let client = Arc::new(Self {
             inner: Mutex::new(Inner {
                 writer: Box::new(writer),
+                stream: Some(shutdown_handle),
                 pending: Arc::clone(&pending),
                 events: Arc::clone(&events),
                 broken: Arc::clone(&broken),
@@ -289,6 +299,20 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Permanently delete a terminal: the daemon kills the shell if running,
+    /// drops the session (releasing its fds) and deletes its scrollback log.
+    pub fn remove(&self, id: &str) -> AppResult<()> {
+        self.send_request(serde_json::json!({
+            "method": "remove",
+            "id": id,
+        }))?;
+        // Drop any event listener for this terminal.
+        let inner_guard = self.inner.lock();
+        let mut ev = inner_guard.events.lock();
+        ev.remove(id);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Connection healing
     // -----------------------------------------------------------------------
@@ -305,9 +329,20 @@ impl DaemonClient {
         let writer = stream
             .try_clone()
             .map_err(|e| AppError::Other(format!("clone reconnected socket: {e}")))?;
+        let shutdown_handle = stream
+            .try_clone()
+            .map_err(|e| AppError::Other(format!("clone reconnected socket: {e}")))?;
 
         let mut inner = self.inner.lock();
+        // Tear down the old connection fully: shutdown() unblocks the old
+        // reader thread (it sees EOF and exits, dropping its socket clone),
+        // which lets the daemon close its side too. Merely replacing the
+        // writer would leave the old socket half-open forever.
+        if let Some(old) = inner.stream.take() {
+            let _ = old.shutdown(std::net::Shutdown::Both);
+        }
         inner.writer = Box::new(writer);
+        inner.stream = Some(shutdown_handle);
         inner.broken.store(false, Ordering::SeqCst);
 
         // Restart reader thread.

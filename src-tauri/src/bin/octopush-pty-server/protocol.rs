@@ -13,7 +13,10 @@ use std::collections::HashMap;
 /// updates (and the daemon is only force-replaced on a protocol break).
 ///
 /// MUST stay in sync with `EXPECTED_PROTOCOL_VERSION` in `src/pty_daemon.rs`.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: added the `remove` request (delete a session and release its fds);
+///     exited sessions now release their PTY fds and log handle eagerly.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -46,6 +49,11 @@ pub enum RequestPayload {
     Write(WriteParams),
     Resize(ResizeParams),
     Kill(KillParams),
+    /// Permanently delete a session: kill the shell if running, drop the
+    /// session from the registry (releasing its PTY fds + log handle) and
+    /// delete its scrollback log from disk. Sent when the user deletes a
+    /// terminal — unlike `kill`, the session cannot be reattached afterwards.
+    Remove(RemoveParams),
     Shutdown,
     /// Compile-time version of the daemon binary. Clients use this to
     /// detect a stale daemon left over from an older Octopush bundle
@@ -95,6 +103,11 @@ pub struct KillParams {
     pub id: String,
     /// `"KILL"` for SIGKILL; anything else (or absent) defaults to SIGTERM.
     pub signal: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoveParams {
+    pub id: String,
 }
 
 // ---------------------------------------------------------------------------

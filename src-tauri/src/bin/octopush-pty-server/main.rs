@@ -93,6 +93,13 @@ fn run() -> Result<()> {
 
     info!(version = env!("CARGO_PKG_VERSION"), "octopush-pty-server starting");
 
+    // ---- File-descriptor limit ----
+    // GUI-spawned processes inherit macOS's default soft limit of 256 open
+    // files. The daemon holds several fds per terminal plus two per client
+    // connection, so 256 is exhaustible in normal use — and once exhausted,
+    // every spawn fails with EMFILE and accept() starts rejecting clients.
+    raise_fd_limit();
+
     // ---- PID file double-start protection ----
     let pid_path = base.join("pty-server.pid");
     if !acquire_pid_file(&pid_path)? {
@@ -155,6 +162,61 @@ fn run() -> Result<()> {
     let _ = fs::remove_file(&sock_path);
     info!("daemon exiting cleanly");
     Ok(())
+}
+
+/// Raise `RLIMIT_NOFILE`'s soft limit to the effective maximum.
+///
+/// On macOS `rlim_max` is typically `RLIM_INFINITY`, but the kernel rejects
+/// soft values above `kern.maxfilesperproc`, so we cap at that sysctl (falling
+/// back to 10240, the historical `OPEN_MAX`, if the sysctl is unreadable).
+fn raise_fd_limit() {
+    // SAFETY: getrlimit/setrlimit/sysctlbyname are called with properly sized,
+    // initialized out-params and never retain the pointers past the call.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            warn!("getrlimit(RLIMIT_NOFILE) failed; keeping inherited fd limit");
+            return;
+        }
+        let mut target = lim.rlim_max;
+        #[cfg(target_os = "macos")]
+        {
+            let mut maxfiles: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>();
+            let rc = libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                &mut maxfiles as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            );
+            let cap = if rc == 0 && maxfiles > 0 {
+                maxfiles as libc::rlim_t
+            } else {
+                10_240
+            };
+            target = target.min(cap);
+        }
+        if target <= lim.rlim_cur {
+            return; // already at or above the achievable maximum
+        }
+        let new = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: lim.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+            info!(from = lim.rlim_cur, to = target, "raised RLIMIT_NOFILE soft limit");
+        } else {
+            warn!(
+                from = lim.rlim_cur,
+                attempted = target,
+                "setrlimit(RLIMIT_NOFILE) failed; keeping inherited fd limit"
+            );
+        }
+    }
 }
 
 /// Tries to acquire the PID file.
@@ -537,6 +599,254 @@ mod tests {
             // Whether acquired or not depends on name matching; just verify no panic.
             let _ = acquired;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: exited sessions release their PTY handles (fd-leak regression).
+    //
+    // The daemon used to keep the master PTY fd + writer dup + log handle of
+    // every exited session forever, eventually exhausting RLIMIT_NOFILE
+    // ("spawn: Too many open files"). After exit, `handles` must be empty for
+    // that id while the session itself remains for scrollback replay.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[serial]
+    fn exited_session_releases_handles() {
+        let _lock = test_lock();
+        let (_home, base) = isolated_home();
+        let sock_path = base.join("test-exit-fds.sock");
+        let (state, _handle) = start_daemon_on(sock_path.clone(), Duration::from_secs(3600));
+
+        let ctrl = UnixStream::connect(&sock_path).unwrap();
+        let ctrl2 = ctrl.try_clone().unwrap();
+        let mut ctrl_w = ctrl;
+        let mut ctrl_r = BufReader::new(ctrl2);
+
+        let spawn_req = serde_json::json!({
+            "method": "spawn", "id": "t-exit-fds",
+            "cwd": "/tmp", "env": {}, "shell": "/bin/sh", "rows": 24, "cols": 80
+        });
+        let resp = send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+        assert_eq!(resp["type"], "spawned", "spawn: {resp}");
+
+        let wr = serde_json::json!({ "method": "write", "id": "t-exit-fds",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"exit\n") });
+        send_recv(&mut ctrl_w, &mut ctrl_r, &wr.to_string());
+
+        // Poll until the reader thread observes EOF and marks the exit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            {
+                let st = state.lock();
+                let exited = st
+                    .sessions
+                    .get("t-exit-fds")
+                    .map(|s| !s.running)
+                    .unwrap_or(false);
+                if exited {
+                    assert!(
+                        !st.handles.contains_key("t-exit-fds"),
+                        "exited session must not retain PTY handles"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell did not exit within timeout"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: respawning an id whose shell exited replaces the stale session.
+    //
+    // Without replacement, a terminal whose shell exited could never be
+    // restarted in place ("terminal <id> already exists") because sessions
+    // are kept for scrollback replay.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[serial]
+    fn respawn_after_exit_replaces_session() {
+        let _lock = test_lock();
+        let (_home, base) = isolated_home();
+        let sock_path = base.join("test-respawn.sock");
+        let (state, _handle) = start_daemon_on(sock_path.clone(), Duration::from_secs(3600));
+
+        let ctrl = UnixStream::connect(&sock_path).unwrap();
+        let ctrl2 = ctrl.try_clone().unwrap();
+        let mut ctrl_w = ctrl;
+        let mut ctrl_r = BufReader::new(ctrl2);
+
+        let spawn_req = serde_json::json!({
+            "method": "spawn", "id": "t-respawn",
+            "cwd": "/tmp", "env": {}, "shell": "/bin/sh", "rows": 24, "cols": 80
+        });
+        let resp = send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+        assert_eq!(resp["type"], "spawned", "first spawn: {resp}");
+
+        // A second spawn while the shell is alive must still be refused.
+        let dup = send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+        assert_eq!(dup["type"], "error", "duplicate live spawn must fail: {dup}");
+
+        let wr = serde_json::json!({ "method": "write", "id": "t-respawn",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"exit\n") });
+        send_recv(&mut ctrl_w, &mut ctrl_r, &wr.to_string());
+
+        // Wait for exit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            {
+                let st = state.lock();
+                if st.sessions.get("t-respawn").map(|s| !s.running).unwrap_or(false) {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Respawn with the same id must now succeed.
+        let resp2 = send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+        assert_eq!(resp2["type"], "spawned", "respawn after exit: {resp2}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: `remove` deletes the session, its handles and its disk log.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[serial]
+    fn remove_deletes_session_and_log() {
+        let _lock = test_lock();
+        let (_home, base) = isolated_home();
+        let sock_path = base.join("test-remove.sock");
+        let (state, _handle) = start_daemon_on(sock_path.clone(), Duration::from_secs(3600));
+
+        let ctrl = UnixStream::connect(&sock_path).unwrap();
+        let ctrl2 = ctrl.try_clone().unwrap();
+        let mut ctrl_w = ctrl;
+        let mut ctrl_r = BufReader::new(ctrl2);
+
+        let spawn_req = serde_json::json!({
+            "method": "spawn", "id": "t-remove",
+            "cwd": "/tmp", "env": {}, "shell": "/bin/sh", "rows": 24, "cols": 80
+        });
+        let resp = send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+        assert_eq!(resp["type"], "spawned", "spawn: {resp}");
+
+        // Produce some output so the log file exists and has content.
+        let wr = serde_json::json!({ "method": "write", "id": "t-remove",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"echo marker\n") });
+        send_recv(&mut ctrl_w, &mut ctrl_r, &wr.to_string());
+        std::thread::sleep(Duration::from_millis(300));
+
+        let log_path = crate::storage::pty_log_path("t-remove").unwrap();
+        assert!(log_path.exists(), "log file should exist while session lives");
+
+        let rm = serde_json::json!({ "method": "remove", "id": "t-remove" });
+        let rr = send_recv(&mut ctrl_w, &mut ctrl_r, &rm.to_string());
+        assert_eq!(rr["type"], "ok", "remove: {rr}");
+
+        {
+            let st = state.lock();
+            assert!(!st.sessions.contains_key("t-remove"), "session must be gone");
+            assert!(!st.handles.contains_key("t-remove"), "handles must be gone");
+        }
+        assert!(!log_path.exists(), "scrollback log must be deleted");
+
+        // Removing again reports not-found.
+        let rr2 = send_recv(&mut ctrl_w, &mut ctrl_r, &rm.to_string());
+        assert_eq!(rr2["type"], "error", "second remove must fail: {rr2}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: a disconnecting client only detaches ITS OWN attachments.
+    //
+    // Regression: the per-connection cleanup used to detach EVERY session,
+    // so any transient connection (version probe, script) silently froze all
+    // live terminal streams until reattach.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[serial]
+    fn unrelated_disconnect_keeps_attachment() {
+        let _lock = test_lock();
+        let (_home, base) = isolated_home();
+        let sock_path = base.join("test-detach.sock");
+        let (state, _handle) = start_daemon_on(sock_path.clone(), Duration::from_secs(3600));
+
+        // Control connection: spawn.
+        let ctrl = UnixStream::connect(&sock_path).unwrap();
+        let ctrl2 = ctrl.try_clone().unwrap();
+        let mut ctrl_w = ctrl;
+        let mut ctrl_r = BufReader::new(ctrl2);
+        let spawn_req = serde_json::json!({
+            "method": "spawn", "id": "t-detach",
+            "cwd": "/tmp", "env": {}, "shell": "/bin/sh", "rows": 24, "cols": 80
+        });
+        send_recv(&mut ctrl_w, &mut ctrl_r, &spawn_req.to_string());
+
+        // Event connection: attach.
+        let ev = UnixStream::connect(&sock_path).unwrap();
+        let ev2 = ev.try_clone().unwrap();
+        ev2.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        let mut ev_w = ev;
+        let mut ev_r = BufReader::new(ev2);
+        let ar = send_recv(&mut ev_w, &mut ev_r,
+            &serde_json::json!({ "method": "attach", "id": "t-detach", "since_seq": 0 }).to_string());
+        assert_eq!(ar["type"], "ok", "attach: {ar}");
+
+        // Unrelated transient connection: list_terminals, then disconnect.
+        {
+            let probe = UnixStream::connect(&sock_path).unwrap();
+            let probe2 = probe.try_clone().unwrap();
+            let mut probe_w = probe;
+            let mut probe_r = BufReader::new(probe2);
+            send_recv(&mut probe_w, &mut probe_r,
+                &serde_json::json!({ "method": "list_terminals" }).to_string());
+        } // probe drops → connection closes
+
+        // Give the daemon a moment to run the probe connection's cleanup,
+        // then verify the unrelated attachment survived it.
+        std::thread::sleep(Duration::from_millis(400));
+        {
+            let st = state.lock();
+            let attached = st
+                .sessions
+                .get("t-detach")
+                .map(|s| s.has_client())
+                .unwrap_or(false);
+            assert!(attached, "probe disconnect must not detach other clients");
+        }
+
+        // The attached client must still receive live output end-to-end.
+        let wr = serde_json::json!({ "method": "write", "id": "t-detach",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"echo STILL_ALIVE\n") });
+        send_recv(&mut ctrl_w, &mut ctrl_r, &wr.to_string());
+
+        let mut seen = false;
+        let read_deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while std::time::Instant::now() < read_deadline {
+            let mut line = String::new();
+            match ev_r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v["event"] == "data" {
+                let b = base64::engine::general_purpose::STANDARD
+                    .decode(v["bytes"].as_str().unwrap_or(""))
+                    .unwrap_or_default();
+                if String::from_utf8_lossy(&b).contains("STILL_ALIVE") {
+                    seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(seen, "attached client stopped receiving after unrelated disconnect");
     }
 
     // -----------------------------------------------------------------------

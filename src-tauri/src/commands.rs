@@ -1383,8 +1383,9 @@ pub async fn delete_terminal(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<()> {
-    // Kill the live PTY if one exists; ignore "not found".
-    let _ = state.pty.lock().kill(&id);
+    // Remove the daemon session entirely (kills the shell, releases its fds,
+    // deletes the scrollback log); ignore "not found".
+    let _ = state.pty.lock().remove(&id);
     state.db.lock().delete_terminal(&id)
 }
 

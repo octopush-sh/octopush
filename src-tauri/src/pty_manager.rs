@@ -206,6 +206,14 @@ impl PtyManager {
         self.client.kill(id, "TERM")
     }
 
+    /// Permanently delete a terminal in the daemon: kills the shell if
+    /// running, releases the session's fds and deletes its scrollback log.
+    /// Used when the user deletes a terminal (vs. merely closing the pane).
+    pub fn remove(&mut self, id: &str) -> AppResult<()> {
+        self.active.remove(id);
+        self.client.remove(id)
+    }
+
     /// Query the daemon for all live PTY sessions.
     ///
     /// Used by [`crate::commands::list_pty_sessions`] to reconcile DB-persisted

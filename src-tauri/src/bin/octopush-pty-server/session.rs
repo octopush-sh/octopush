@@ -184,8 +184,14 @@ impl Session {
     }
 
     /// Mark the PTY as exited and notify attached client.
+    ///
+    /// Also closes the disk-log handle: an exited session only serves
+    /// scrollback replays, which read the log from disk by path. Keeping the
+    /// fd open would leak it for the daemon's lifetime (sessions outlive
+    /// their shells so reattach keeps working across app restarts).
     pub fn mark_exit(&mut self, code: Option<i32>) {
         self.running = false;
+        self.log_file = None;
         if let Some(ref tx) = self.attached {
             let event = Event::Exit {
                 id: self.id.clone(),
@@ -219,6 +225,14 @@ impl Session {
     /// Returns whether there is an attached client.
     pub fn has_client(&self) -> bool {
         self.attached.is_some()
+    }
+
+    /// Returns whether the attached client (if any) sends through the same
+    /// channel as `tx` — i.e. whether `tx`'s connection owns the attachment.
+    pub fn is_attached_to(&self, tx: &ClientSender) -> bool {
+        self.attached
+            .as_ref()
+            .is_some_and(|a| a.same_channel(tx))
     }
 
     /// Returns the current highest seq (0 if nothing received yet).
