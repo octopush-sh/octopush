@@ -1,11 +1,12 @@
 //! Anthropic Messages API implementation of the LlmProvider trait.
 
 use super::{
-    LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
-    LlmStopReason, LlmToolUse,
+    network_error, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
+    LlmStopReason, LlmToolUse, RateLimitSnapshot,
 };
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 pub struct AnthropicProvider;
@@ -35,19 +36,70 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("Anthropic request failed: {e}")))?;
+            // A request that never reached the server is transient — let the
+            // retry layer ride it out rather than halting the stage.
+            .map_err(|e| network_error(format!("Anthropic request failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            // Read `retry-after` BEFORE the body consumes the response.
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Other(format!("Anthropic API error {status}: {text}")));
+            return Err(AppError::Provider {
+                kind: ProviderErrorKind::from_http_status(status.as_u16()),
+                retry_after,
+                // Keep the historical message shape — the UI and journals
+                // already key off the embedded status + body text.
+                message: format!("Anthropic API error {status}: {text}"),
+            });
         }
 
-        let response: Value = resp.json().await
+        // Snapshot the rate-limit headers before the body consumes `resp`.
+        let rate_limit = parse_rate_limit(resp.headers());
+        let response: Value = resp
+            .json()
+            .await
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
-        Ok(parse_response(response))
+        let mut parsed = parse_response(response);
+        parsed.rate_limit = rate_limit;
+        Ok(parsed)
     }
+}
+
+/// Parse a `retry-after` header (delta-seconds form, per RFC 9110) into a
+/// whole-second delay. Anthropic sends an integer-seconds value on 429.
+fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Extract Anthropic's input-token rate-limit headroom: how many input tokens
+/// remain in the current window, and how long until it resets (converted from
+/// the absolute RFC3339 `*-reset` timestamp to a forward-looking delay).
+fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    let input_tokens_remaining = header_str("anthropic-ratelimit-input-tokens-remaining")
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    let reset_after_secs = header_str("anthropic-ratelimit-input-tokens-reset")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|reset| {
+            let delta = reset.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+            // Never report a negative (already-passed) reset as a wait.
+            (delta as f64 / 1000.0).max(0.0)
+        });
+
+    if input_tokens_remaining.is_none() && reset_after_secs.is_none() {
+        return None;
+    }
+    Some(RateLimitSnapshot {
+        input_tokens_remaining,
+        reset_after_secs,
+    })
 }
 
 /// Build the Anthropic Messages API JSON body from a normalized `LlmRequest`.
@@ -167,5 +219,7 @@ pub fn parse_response(response: Value) -> LlmResponse {
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        // Filled by `complete()` from response headers; the pure parser has none.
+        rate_limit: None,
     }
 }

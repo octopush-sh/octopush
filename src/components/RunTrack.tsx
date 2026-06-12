@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { LiveEntry, Run, RunStage } from "../lib/ipc";
-import { stageStatusGlyph, stageStatusWord } from "../lib/runStatus";
+import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { Reveal } from "./primitives/Reveal";
@@ -133,7 +133,15 @@ function StageCard({ stage: s, index, selected, onSelect }: {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
   const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
   const running = s.status === "running";
-  const { label: glyph, className: cls } = stageStatusGlyph(s.status);
+  // A transient halt is a recoverable caution — amber ⟳, not the rouge ✕ of a
+  // hard failure. Mirrors the StageFocus banner and CheckpointBar treatment.
+  const transientHalt = s.status === "failed" && isTransientHalt(s.error);
+  const base = stageStatusGlyph(s.status);
+  const glyph = transientHalt ? "⟳" : base.label;
+  const cls = transientHalt ? "text-octo-warning" : base.className;
+  // "stalled", not "paused": the run-level brass "◆ paused" is a deliberate
+  // human checkpoint gate — this amber state is an infra stall awaiting Resume.
+  const word = transientHalt ? "stalled" : stageStatusWord(s.status);
 
   // S1: ONE fixed-height live line; content picked by status, geometry constant.
   const verdict = s.status === "done" ? lastNotice(entries) : "";
@@ -152,15 +160,17 @@ function StageCard({ stage: s, index, selected, onSelect }: {
       }${
         selected
           ? "border-octo-brass bg-[var(--brass-ghost)]"
-          : s.status === "failed"
-            ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
-            : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
+          : transientHalt
+            ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
+            : s.status === "failed"
+              ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
+              : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
       }`}
     >
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
         <span className="text-octo-brass">{ROMAN[index] ?? index + 1}</span>
-        <span key={s.status} className={`octo-pop-in ${cls}`}>{glyph}</span>
-        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{stageStatusWord(s.status)}</span>
+        <span key={`${s.status}-${transientHalt}`} className={`octo-pop-in ${cls}`}>{glyph}</span>
+        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
         <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-brass">{running ? elapsed : ""}</span>
       </span>
       <span className="h-5 truncate font-serif text-sm leading-5 text-octo-ivory">{labelForRole(s.role)}</span>

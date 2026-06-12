@@ -148,6 +148,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
               blockedStage={barStage}
               onApprove={() => void resolve(run.id, "approve")}
               onReject={(feedback) => void resolve(run.id, "reject", feedback || undefined)}
+              onResume={() => void resolve(run.id, "resume")}
               onAbort={() => void abort(run.id)}
               loopTargetRole={loopTargetRole}
               loopState={loopState}

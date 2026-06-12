@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { RunStage } from "../lib/ipc";
+import { isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "./RunTrack";
 import { FadeSwap } from "./primitives/FadeSwap";
 
@@ -13,6 +14,8 @@ interface Props {
   onApprove: () => void;
   onReject: (feedback: string) => void;
   onAbort: () => void;
+  /** Re-run a transient halt as-is (no feedback, spend kept) — see CheckpointAction::Resume. */
+  onResume: () => void;
   /** Human-readable label for the loop target stage, or null when no loop applies. */
   loopTargetRole: string | null;
   /** Current loop iteration state, or null when no loop applies. */
@@ -26,10 +29,14 @@ function firstLine(error: string | null): string {
   return line || "stage halted";
 }
 
-export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loopTargetRole, loopState, onSendBack }: Props) {
+export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, onResume, loopTargetRole, loopState, onSendBack }: Props) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
   const [feedback, setFeedback] = useState("");
   const failed = blockedStage.status === "failed";
+  // A transient halt (rate limit, overload, 5xx, dropped connection) isn't a
+  // wrong result — the substrate was briefly unavailable. It gets its own calmer
+  // amber treatment and a Resume affordance, not the rouge accept/re-run choice.
+  const transient = failed && isTransientHalt(blockedStage.error);
 
   // The bar stays mounted inside the Reveal dock across pauses — a new
   // checkpoint must never inherit the previous one's editor mode or text.
@@ -47,8 +54,14 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
     setFeedback("");
   }
 
+  const tone = transient
+    ? "border-[var(--warning-border)] bg-[var(--warning-ghost)]"
+    : failed
+      ? "border-octo-rouge bg-[var(--rouge-ghost)]"
+      : "border-[var(--brass-dim)] bg-[var(--brass-faint)]";
+
   return (
-    <div className={`border-t px-4 py-3 ${failed ? "border-octo-rouge bg-[var(--rouge-ghost)]" : "border-[var(--brass-dim)] bg-[var(--brass-faint)]"}`}>
+    <div className={`border-t px-4 py-3 ${tone}`}>
       {loopState !== null && (
         <div className="mb-2 h-4 font-mono text-[10px] uppercase tracking-[0.25em]">
           {atCap ? (
@@ -66,20 +79,29 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, loop
       <FadeSwap swapKey={mode}>
         {mode === "decide" ? (
           <div className="flex items-center gap-3">
-            <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${failed ? "text-octo-rouge" : "text-octo-brass"}`}>
-              {failed ? "✕ stage halted" : "⟜ checkpoint"}
+            <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
+              {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
             </span>
             <span
               className="min-w-0 flex-1 truncate text-sm text-octo-sage"
               title={failed ? blockedStage.error ?? undefined : undefined}
             >
-              {failed ? (
+              {transient ? (
+                <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
+              ) : failed ? (
                 <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
               ) : (
                 <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
               )}
             </span>
-            {failed ? (
+            {transient ? (
+              // The work isn't wrong — the substrate hiccuped. Resume re-runs the
+              // stage as-is (worktree intact, spend kept). Amber, never brass.
+              <button type="button" onClick={onResume}
+                className="rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]">
+                Resume the stage
+              </button>
+            ) : failed ? (
               // Accept the partial work and let the pipeline's next review
               // catch the gaps. Outlined — the bar keeps at most one solid brass.
               <button type="button" onClick={onApprove}

@@ -5,10 +5,10 @@
 //! (vllm, llama.cpp server, LMStudio, LocalAI, etc.).
 
 use super::{
-    LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
+    network_error, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
     LlmStopReason, LlmToolUse,
 };
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -38,12 +38,22 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
 
         let resp = request.send().await
-            .map_err(|e| AppError::Other(format!("OpenAI-compat request failed: {e}")))?;
+            // A request that never reached the server is transient.
+            .map_err(|e| network_error(format!("OpenAI-compat request failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Other(format!("OpenAI-compat API error {status}: {text}")));
+            return Err(AppError::Provider {
+                kind: ProviderErrorKind::from_http_status(status.as_u16()),
+                retry_after,
+                message: format!("OpenAI-compat API error {status}: {text}"),
+            });
         }
 
         let response: Value = resp.json().await
@@ -202,5 +212,7 @@ pub fn parse_response(response: Value) -> LlmResponse {
         // OpenAI / DeepSeek / Ollama don't expose Anthropic-style cache fields.
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        // Header-based rate-limit hints are Anthropic-specific; none here.
+        rate_limit: None,
     }
 }

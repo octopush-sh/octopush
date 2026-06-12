@@ -46,6 +46,32 @@ export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
   }
 }
 
+/** Whether a halted stage's error is a *transient* substrate fault (rate
+ *  limit, overload, 5xx, dropped connection) — recoverable by simply waiting
+ *  and resuming — versus a standing fault the work itself caused.
+ *
+ *  Mirrors the backend's `ProviderErrorKind::is_transient` taxonomy, read off
+ *  the persisted error string (the only failure signal the row carries). The
+ *  backend already auto-retries transient calls in-loop, so a stage only halts
+ *  *transient* after retries are exhausted — a sustained outage, where Resume is
+ *  the right affordance rather than Re-run-from-scratch or accept-partial-work. */
+export function isTransientHalt(error: string | null): boolean {
+  if (!error) return false;
+  const e = error.toLowerCase();
+  return (
+    /\brate[\s_-]?limit/.test(e) ||
+    /\boverloaded\b/.test(e) ||
+    // HTTP status codes, but ONLY inside our providers' "… API error <code> …"
+    // framing. Matching a bare number would misread byte/line/token counts in a
+    // FATAL error as transient — hiding "Accept & continue" behind "Resume".
+    /api error (429|529|50[0-4])\b/.test(e) ||
+    // Connection-level failures (reqwest "request failed", timeouts, DNS).
+    /request failed/.test(e) ||
+    /\btimed?\s?out\b|\btimeout\b/.test(e) ||
+    /connection (reset|closed|refused)|dns/.test(e)
+  );
+}
+
 export function savingsVsBaseline(
   costUsd: number,
   baselineUsd: number,

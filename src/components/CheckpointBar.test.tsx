@@ -48,6 +48,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole={null}
         loopState={null}
         onSendBack={vi.fn()}
@@ -66,6 +67,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole="Implement"
         loopState={{ iteration: 0, max: 2 }}
         onSendBack={vi.fn()}
@@ -83,6 +85,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole="Implement"
         loopState={{ iteration: 0, max: 2 }}
         onSendBack={onSendBack}
@@ -110,6 +113,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole={null}
         loopState={null}
         onSendBack={vi.fn()}
@@ -125,6 +129,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole="Implement"
         loopState={{ iteration: 2, max: 2 }}
         onSendBack={vi.fn()}
@@ -141,6 +146,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole="Implement"
         loopState={{ iteration: 1, max: 2 }}
         onSendBack={vi.fn()}
@@ -152,7 +158,7 @@ describe("CheckpointBar", () => {
 
   it("renders loop numerals tabular and turns the meter brass at cap (S2)", () => {
     const props = {
-      onApprove: vi.fn(), onReject: vi.fn(), onAbort: vi.fn(),
+      onApprove: vi.fn(), onReject: vi.fn(), onAbort: vi.fn(), onResume: vi.fn(),
       loopTargetRole: "Implement", onSendBack: vi.fn(),
     };
     const { rerender } = render(
@@ -186,6 +192,7 @@ describe("CheckpointBar", () => {
         onApprove={vi.fn()}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole={null}
         loopState={null}
         onSendBack={vi.fn()}
@@ -207,6 +214,7 @@ describe("CheckpointBar", () => {
         onApprove={onApprove}
         onReject={vi.fn()}
         onAbort={vi.fn()}
+        onResume={vi.fn()}
         loopTargetRole={null}
         loopState={null}
         onSendBack={vi.fn()}
@@ -223,10 +231,58 @@ describe("CheckpointBar", () => {
     expect(screen.getByText(/^Abort$/)).toBeInTheDocument();
   });
 
+  it("transient halt offers Resume (amber) instead of Accept, wired to onResume", () => {
+    const onResume = vi.fn();
+    const error =
+      "Anthropic API error 429 Too Many Requests: rate_limit_error — 450,000 input tokens per minute";
+    render(
+      <CheckpointBar
+        blockedStage={makeStage({ status: "failed", role: "implement", error })}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onAbort={vi.fn()}
+        onResume={onResume}
+        loopTargetRole={null}
+        loopState={null}
+        onSendBack={vi.fn()}
+      />,
+    );
+    // A transient fault reads as a recoverable caution, not a hard failure.
+    expect(screen.getByText(/awaiting retry/i)).toBeInTheDocument();
+    const resume = screen.getByRole("button", { name: /Resume the stage/ });
+    // Amber, never brass — and never the solid CTA.
+    expect(resume.className).toContain("border-octo-warning");
+    expect(resume.className).not.toContain("bg-octo-brass");
+    fireEvent.click(resume);
+    expect(onResume).toHaveBeenCalledTimes(1);
+    // Accept & continue is withheld — accepting half-done infra-halted work is a footgun.
+    expect(screen.queryByText(/Accept & continue/)).not.toBeInTheDocument();
+    // Re-run (feedback path) and Abort remain available.
+    expect(screen.getByText(/^Re-run$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Abort$/)).toBeInTheDocument();
+  });
+
+  it("a non-transient (fatal) halt keeps Accept & continue, not Resume", () => {
+    render(
+      <CheckpointBar
+        blockedStage={makeStage({ status: "failed", role: "implement", error: "agentic loop hit 25 iterations without finishing" })}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onAbort={vi.fn()}
+        onResume={vi.fn()}
+        loopTargetRole={null}
+        loopState={null}
+        onSendBack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/Accept & continue/)).toBeInTheDocument();
+    expect(screen.queryByText(/Resume the stage/)).not.toBeInTheDocument();
+  });
+
   it("resets the feedback editor when a new checkpoint arrives (bar stays mounted in the Reveal dock)", () => {
     vi.useFakeTimers();
     const props = {
-      onApprove: vi.fn(), onReject: vi.fn(), onAbort: vi.fn(),
+      onApprove: vi.fn(), onReject: vi.fn(), onAbort: vi.fn(), onResume: vi.fn(),
       loopTargetRole: null, loopState: null, onSendBack: vi.fn(),
     };
     const { rerender } = render(<CheckpointBar blockedStage={makeStage()} {...props} />);

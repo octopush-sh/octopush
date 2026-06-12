@@ -973,6 +973,7 @@ pub async fn resolve_checkpoint(
         "edit" => CheckpointAction::Edit,
         "abort" => CheckpointAction::Abort,
         "reject" => CheckpointAction::Reject { feedback, model_override },
+        "resume" => CheckpointAction::Resume,
         "send_back" => CheckpointAction::SendBack { feedback },
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
@@ -3856,6 +3857,7 @@ mod ai_complete_tests {
             output_tokens: 1,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            rate_limit: None,
         };
         let text = super::ai_response_text(structured);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3869,6 +3871,7 @@ mod ai_complete_tests {
             output_tokens: 1,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            rate_limit: None,
         };
         assert_eq!(super::ai_response_text(prose), "plain answer");
     }

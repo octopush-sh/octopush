@@ -78,6 +78,11 @@
   --rouge-disabled-bg: rgba(209, 139, 139, 0.05);
   --rouge-border:      rgba(209, 139, 139, 0.3);
 
+  /* Amber (warning/caution) alpha utilities — a transient halt is a caution,
+     not a hard failure, so it reads in amber rather than rouge. Never the accent. */
+  --warning-ghost:     rgba(223, 174, 74, 0.08);
+  --warning-border:    rgba(223, 174, 74, 0.3);
+
   /* Motion */
   --ease-octo:    cubic-bezier(0.2, 0.8, 0.3, 1);
   --dur-quick:    220ms;

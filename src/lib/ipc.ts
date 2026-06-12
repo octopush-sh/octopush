@@ -97,7 +97,7 @@ export interface RunDetail {
   run: Run | null;
   stages: RunStage[];
 }
-export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back";
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume";
 
 /** An archived stage attempt — a snapshot taken just before a loop-back /
  *  reject reset wiped the live stage row (matches Rust `StageIterationRow`). */
