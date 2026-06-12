@@ -711,6 +711,11 @@ export const ipc = {
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),
 
+  /** Stop the run's in-flight stage (real cancellation). The stage lands in
+   *  the normal failed/decision-strip recovery flow; the run itself survives. */
+  stopStage: (runId: string) =>
+    invoke<void>("stop_stage", { runId }),
+
   /** The persisted live journal for a stage, oldest first. Entries are
    *  LiveEntry-shaped JSON plus `{kind:"reset"}` marker objects that split
    *  the log into per-attempt segments. */

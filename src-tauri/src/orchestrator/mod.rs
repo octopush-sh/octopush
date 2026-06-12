@@ -46,6 +46,10 @@ pub struct Orchestrator {
     client: reqwest::Client,
     /// Set of run_ids with an in-flight drive (enforces one active drive per run).
     active: Mutex<std::collections::HashSet<String>>,
+    /// Per-run cancel flags for the stage currently in flight. A FRESH flag is
+    /// installed by `run_stage_once` before each stage and removed after it, so
+    /// a stop only ever lands on the stage the director is watching.
+    cancels: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Orchestrator {
@@ -60,6 +64,7 @@ impl Orchestrator {
             test_runner: None,
             client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
+            cancels: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -75,6 +80,7 @@ impl Orchestrator {
             test_runner: Some(runner),
             client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
+            cancels: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -229,6 +235,11 @@ impl Orchestrator {
         );
         self.emit_run_update(&run.id);
 
+        // Install a FRESH cancel flag for this run before the stage starts —
+        // `stop_current_stage`/`abort_run` set it to interrupt in-flight work.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancels.lock().insert(run.id.clone(), Arc::clone(&cancel));
+
         // Build the context and run the agent. ANY hard error here (missing worktree,
         // unresolved provider, unavailable CLI substrate) is converted into a failed
         // stage so the run converges to a clean paused/recoverable state instead of
@@ -241,6 +252,7 @@ impl Orchestrator {
                 events: Arc::clone(&self.events),
                 run_id: run.id.clone(),
                 stage_id: stage.id.clone(),
+                cancel,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,
@@ -248,6 +260,9 @@ impl Orchestrator {
             }
         }
         .await;
+
+        // The stage is no longer in flight — a stop after this point is a no-op.
+        self.cancels.lock().remove(&run.id);
 
         let outcome = match run_result {
             Ok(o) => o,
@@ -482,6 +497,19 @@ impl Orchestrator {
             let (status, verdict) = self.run_stage_once(&run, &stage).await?;
             self.emit_run_update(run_id);
 
+            // An abort issued WHILE the stage was in flight wins over whatever
+            // the stage produced — never downgrade the terminal aborted status
+            // back to paused-for-recovery.
+            let aborted_mid_stage = self
+                .db
+                .lock()
+                .get_run(run_id)?
+                .map(|r| r.status == "aborted")
+                .unwrap_or(false);
+            if aborted_mid_stage {
+                return Ok(RunStatus::Aborted);
+            }
+
             match status {
                 StageStatus::Failed => {
                     self.db.lock().set_run_status(run_id, "paused", false)?;
@@ -667,8 +695,21 @@ impl Orchestrator {
         self.run_to_pause_with(run_id, budget_override).await
     }
 
+    /// Signal the run's in-flight stage (if any) to stop. The substrate halts
+    /// at its next cancel check; the stage lands as failed in the existing
+    /// halt-recovery flow. No-op when nothing is in flight.
+    pub fn stop_current_stage(&self, run_id: &str) -> AppResult<()> {
+        if let Some(flag) = self.cancels.lock().get(run_id) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub async fn abort_run(&self, run_id: &str) -> AppResult<()> {
         self.db.lock().set_run_status(run_id, "aborted", true)?;
+        // Aborting must kill in-flight work, not just mark the DB: the drive
+        // loop only checks the status BETWEEN stages.
+        self.stop_current_stage(run_id)?;
         self.emit_run_update(run_id);
         Ok(())
     }

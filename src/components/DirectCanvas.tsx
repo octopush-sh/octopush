@@ -30,6 +30,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const begin = useRunsStore((s) => s.begin);
   const resolve = useRunsStore((s) => s.resolve);
   const abort = useRunsStore((s) => s.abort);
+  const stopStage = useRunsStore((s) => s.stopStage);
 
   // Builder: undefined = closed; null = compose new; a pipelineId = edit that one.
   const [builder, setBuilder] = useState<undefined | null | string>(undefined);
@@ -119,7 +120,14 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
     body = (
       <div className="flex min-h-0 flex-1 flex-col">
-        <RunTrack run={run} stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
+        <RunTrack
+          run={run}
+          stages={stages}
+          selectedStageId={shownStageId}
+          onSelectStage={(id) => selectStage(run.id, id)}
+          onStopStage={() => void stopStage(run.id)}
+          onAbort={() => void abort(run.id)}
+        />
         <StageFocus stage={shownStage} workspacePath={workspacePath} />
         <RunLedger run={run} stages={stages} />
         <Reveal open={checkpointOpen}>

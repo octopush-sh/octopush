@@ -1918,6 +1918,7 @@ mod agentic_loop_tests {
             "do something",
             tmp.path(),
             25,
+            &std::sync::atomic::AtomicBool::new(false),
             &emitter,
         )
         .await
@@ -1981,6 +1982,19 @@ mod runner_helpers_tests {
             assert!(p.contains("pipeline"), "role {role} missing pipeline framing");
             assert!(p.contains("git"), "role {role} missing git-ownership note");
         }
+    }
+
+    #[test]
+    fn unfinished_error_maps_cancel_vs_iteration_cap() {
+        use crate::orchestrator::runner::unfinished_stage_error;
+        let stopped = unfinished_stage_error(true, 25);
+        assert_eq!(
+            stopped,
+            "stopped by the director — review the work journal, then accept, re-run, or abort"
+        );
+        let capped = unfinished_stage_error(false, 25);
+        assert!(capped.contains("25 iterations"), "{capped}");
+        assert!(capped.contains("re-run or abort"), "{capped}");
     }
 
     #[test]
@@ -2535,6 +2549,119 @@ mod orchestrator_tests {
                 verdict: None,
             })
         }
+    }
+
+    /// Captures the stage's cancel flag, then waits (bounded) for it to be set —
+    /// mirroring a real substrate that gets interrupted mid-flight. When set, it
+    /// returns the same failed outcome the substrates produce on a director stop.
+    struct CancelWaitingRunner {
+        captured: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CancelWaitingRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageArtifact,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            *self.captured.lock() = Some(Arc::clone(&ctx.cancel));
+            for _ in 0..200 {
+                if ctx.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: String::new(),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                status: StageStatus::Failed,
+                tool_calls: vec![],
+                error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                verdict: None,
+            })
+        }
+    }
+
+    /// Drive a single-stage run with a CancelWaitingRunner in the background and
+    /// hand back (orchestrator, run_id, captured-flag slot, drive handle).
+    async fn spawn_cancellable_run() -> (
+        Arc<Mutex<Db>>,
+        Arc<Orchestrator>,
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<crate::error::AppResult<RunStatus>>,
+    ) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Stoppable", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CancelWaitingRunner { captured: Arc::clone(&captured) }),
+        ));
+        let drive = tokio::spawn({
+            let orch = Arc::clone(&orch);
+            let rid = run_id.clone();
+            async move { orch.run_to_pause(&rid).await }
+        });
+        // Wait until the stage is in flight (it has captured its cancel flag).
+        let flag = loop {
+            if let Some(f) = captured.lock().clone() {
+                break f;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        (db, orch, run_id, flag, drive)
+    }
+
+    #[tokio::test]
+    async fn stop_current_stage_sets_the_live_cancel_flag() {
+        let (db, orch, run_id, flag, drive) = spawn_cancellable_run().await;
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        orch.stop_current_stage(&run_id).unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "stop_current_stage must set the in-flight stage's cancel flag"
+        );
+        // The stopped stage lands in the existing halt-recovery flow: failed + paused.
+        assert_eq!(drive.await.unwrap().unwrap(), RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "failed");
+        assert!(stages[0].error.as_deref().unwrap().contains("stopped by the director"));
+    }
+
+    #[tokio::test]
+    async fn stop_current_stage_without_inflight_stage_is_a_noop() {
+        let (db, _ws) = db_with_workspace();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        orch.stop_current_stage("no-such-run").unwrap(); // Ok, no panic
+    }
+
+    #[tokio::test]
+    async fn abort_run_also_cancels_the_inflight_stage() {
+        let (db, orch, run_id, flag, drive) = spawn_cancellable_run().await;
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        orch.abort_run(&run_id).await.unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "abort_run must kill in-flight work, not just mark the DB"
+        );
+        // The aborted status wins over the failed stage: the drive sees it and stops.
+        assert_eq!(drive.await.unwrap().unwrap(), RunStatus::Aborted);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert_eq!(run.status, "aborted");
     }
 
     fn db_with_workspace() -> (Arc<Mutex<Db>>, String) {
@@ -3713,7 +3840,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &em).await.unwrap();
+                                   "sys", "do it", dir.path(), 10,
+                                   &std::sync::atomic::AtomicBool::new(false), &em).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -3742,7 +3870,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 2, &em).await.unwrap();
+                                   "sys", "do it", dir.path(), 2,
+                                   &std::sync::atomic::AtomicBool::new(false), &em).await.unwrap();
 
         assert!(!out.finished, "iteration exhaustion must not read as success");
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
@@ -3755,6 +3884,30 @@ mod live_tests {
         let last = &events.last().expect("exhaustion must emit entries").1["entry"];
         assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
         assert_eq!(last["text"], "iteration cap reached — 2 of 2 tool turns used");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_cancel_flag_stops_before_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted turns: a single provider call would panic — the pre-set
+        // cancel flag must stop the loop before it ever talks to the model.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::new()) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 10, &cancel, &em).await.unwrap();
+
+        assert!(!out.finished, "a director stop must not read as success");
+        assert_eq!(out.text, "(stopped by the director)");
+        assert_eq!(out.input_tokens, 0);
+        assert_eq!(out.tool_calls.len(), 0);
+        // The journal must END with a notice explaining why the stage stopped.
+        let events = rec.events.lock();
+        let last = &events.last().expect("cancel must close the journal").1["entry"];
+        assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
+        assert_eq!(last["text"], "stopped by the director");
     }
 
     struct Recorder { events: Mutex<Vec<(String, Value)>> }

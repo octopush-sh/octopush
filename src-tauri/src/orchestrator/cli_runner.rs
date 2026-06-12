@@ -340,18 +340,37 @@ impl AgentRunner for CliRunner {
             (result_line, tail)
         };
 
-        let (result_line, tail) = match tokio::time::timeout(
-            std::time::Duration::from_secs(CLI_TIMEOUT_SECS),
-            read_loop,
-        )
-        .await
-        {
-            Ok(out) => out,
-            // child is dropped on return → kill_on_drop terminates the process.
-            Err(_) => {
+        // Race the child's output against the director's stop signal: poll the
+        // cancel flag every ~500ms and, when set, kill the child and fail the
+        // stage with the director message (zero usage — the burned spend is
+        // unknowable mid-flight). The 15-minute wall-clock backstop still applies.
+        let cancel = std::sync::Arc::clone(&ctx.cancel);
+        let cancel_watch = async move {
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        };
+        let (result_line, tail) = tokio::select! {
+            out = tokio::time::timeout(
+                std::time::Duration::from_secs(CLI_TIMEOUT_SECS),
+                read_loop,
+            ) => match out {
+                Ok(out) => out,
+                // child is dropped on return → kill_on_drop terminates the process.
+                Err(_) => {
+                    return Ok(failed_stage(
+                        "claude stage timed out (no result within 15 minutes)",
+                    ))
+                }
+            },
+            _ = cancel_watch => {
+                let _ = child.kill().await;
                 return Ok(failed_stage(
-                    "claude stage timed out (no result within 15 minutes)",
-                ))
+                    &crate::orchestrator::runner::unfinished_stage_error(true, 0),
+                ));
             }
         };
 

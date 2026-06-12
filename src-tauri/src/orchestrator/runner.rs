@@ -18,6 +18,21 @@ pub struct StageContext {
     pub events: Arc<dyn EventSink>,
     pub run_id: String,
     pub stage_id: String,
+    /// Director stop signal: set by `stop_current_stage`/`abort_run` while the
+    /// stage is in flight. Substrates must check it and halt promptly.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The error message for a stage whose agentic work ended without a final
+/// answer: a director stop, or iteration exhaustion.
+pub fn unfinished_stage_error(cancelled: bool, max_iterations: usize) -> String {
+    if cancelled {
+        "stopped by the director — review the work journal, then accept, re-run, or abort".to_string()
+    } else {
+        format!(
+            "agentic loop hit {max_iterations} iterations without finishing — review the work journal, then re-run or abort"
+        )
+    }
 }
 
 /// Uniform execution contract — both API and (future) CLI substrates implement it.
@@ -174,6 +189,7 @@ impl AgentRunner for ApiRunner {
             &user,
             &ctx.workspace_path,
             max_iterations,
+            ctx.cancel.as_ref(),
             &emitter,
         )
         .await;
@@ -187,11 +203,13 @@ impl AgentRunner for ApiRunner {
                     r.cache_read_tokens,
                     r.cache_creation_tokens,
                 );
-                // Iteration exhaustion is a failure, not a thin success: the
+                // An unfinished loop is a failure, not a thin success: the
                 // stage never produced a final answer, so don't hand its
                 // placeholder text to the next stage. Usage is preserved for
                 // cost accounting; the live journal stays as the evidence.
+                // A director stop reads differently from iteration exhaustion.
                 if !r.finished {
+                    let cancelled = ctx.cancel.load(std::sync::atomic::Ordering::Relaxed);
                     return Ok(StageOutcome {
                         artifact: StageArtifact {
                             kind: ArtifactKind::Note,
@@ -204,9 +222,7 @@ impl AgentRunner for ApiRunner {
                         cost_usd: cost,
                         status: StageStatus::Failed,
                         tool_calls: r.tool_calls,
-                        error: Some(format!(
-                            "agentic loop hit {max_iterations} iterations without finishing — review the work journal, then re-run or abort"
-                        )),
+                        error: Some(unfinished_stage_error(cancelled, max_iterations)),
                         verdict: None,
                     });
                 }

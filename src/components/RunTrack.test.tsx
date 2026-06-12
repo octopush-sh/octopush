@@ -122,6 +122,39 @@ describe("RunTrack liveness", () => {
     expect(full.closest("[aria-hidden]")!.getAttribute("aria-hidden")).toBe("true");
   });
 
+  it("offers Stop the stage + Abort only while the run is running (R2)", () => {
+    const onStopStage = vi.fn();
+    const onAbort = vi.fn();
+    const { unmount } = render(
+      <RunTrack
+        run={run}
+        stages={[stage({ status: "running", startedAt: "2026-06-09T00:00:00Z" })]}
+        selectedStageId={null}
+        onSelectStage={() => {}}
+        onStopStage={onStopStage}
+        onAbort={onAbort}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Stop the stage" }));
+    expect(onStopStage).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    unmount();
+
+    render(
+      <RunTrack
+        run={{ ...run, status: "paused" }}
+        stages={[stage({ status: "failed" })]}
+        selectedStageId={null}
+        onSelectStage={() => {}}
+        onStopStage={onStopStage}
+        onAbort={onAbort}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Stop the stage" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Abort" })).not.toBeInTheDocument();
+  });
+
   it("dims connectors after pending stages and brightens them after done stages", () => {
     const second = stage({ id: "st2", position: 1, role: "implement" });
     const { unmount } = render(

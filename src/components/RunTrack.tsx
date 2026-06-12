@@ -12,6 +12,10 @@ interface Props {
   stages: RunStage[];
   selectedStageId: string | null;
   onSelectStage: (stageId: string) => void;
+  /** Stop the in-flight stage (shown only while the run is `running`). */
+  onStopStage?: () => void;
+  /** Abort the whole run (shown only while the run is `running`). */
+  onAbort?: () => void;
 }
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
@@ -32,7 +36,7 @@ function lastNotice(entries: LiveEntry[]): string {
   return "";
 }
 
-export function RunTrack({ run, stages, selectedStageId, onSelectStage }: Props) {
+export function RunTrack({ run, stages, selectedStageId, onSelectStage, onStopStage, onAbort }: Props) {
   const doneCount = stages.filter((s) => s.status === "done").length;
   const [briefOpen, setBriefOpen] = useState(false);
 
@@ -58,6 +62,28 @@ export function RunTrack({ run, stages, selectedStageId, onSelectStage }: Props)
             {run.task}
           </span>
         </button>
+        {/* S1: the control slot is always reserved so buttons appearing or
+            leaving never shift the header geometry. */}
+        <div className="flex h-9 w-[190px] shrink-0 items-center justify-end gap-2 self-center">
+          {run.status === "running" && (
+            <span key="running-controls" className="octo-fade-in flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onStopStage}
+                className="rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
+              >
+                Stop the stage
+              </button>
+              <button
+                type="button"
+                onClick={onAbort}
+                className="rounded-md border border-transparent px-2.5 py-1 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge"
+              >
+                Abort
+              </button>
+            </span>
+          )}
+        </div>
       </div>
       <Reveal open={briefOpen}>
         <p

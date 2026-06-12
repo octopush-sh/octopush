@@ -9,6 +9,7 @@ use crate::providers::{
     LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmStopReason, LlmToolResult,
 };
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Aggregate result of a headless agentic run.
 #[derive(Clone, Debug, Default)]
@@ -25,7 +26,11 @@ pub struct AgenticResult {
 }
 
 /// Run the tool-use loop against `provider` until it returns a final answer
-/// (or `max_iterations` is hit). Tools execute in `workspace_path`.
+/// (or `max_iterations` is hit, or `cancel` is set). Tools execute in
+/// `workspace_path`. The cancel flag is checked at the top of each iteration:
+/// when set, the loop stops before the next model turn, closes the journal
+/// with a notice, and returns an UNFINISHED result (the caller maps it to a
+/// failed stage that lands in the normal halt-recovery flow).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agentic_loop(
     provider: &dyn LlmProvider,
@@ -37,6 +42,7 @@ pub async fn run_agentic_loop(
     initial_user: &str,
     workspace_path: &Path,
     max_iterations: usize,
+    cancel: &AtomicBool,
     emitter: &crate::orchestrator::live::LiveEmitter<'_>,
 ) -> AppResult<AgenticResult> {
     let tools = build_llm_tools();
@@ -47,6 +53,11 @@ pub async fn run_agentic_loop(
     let mut out = AgenticResult::default();
 
     for _ in 0..max_iterations {
+        if cancel.load(Ordering::Relaxed) {
+            emitter.notice("stopped by the director");
+            out.text = "(stopped by the director)".to_string();
+            return Ok(out);
+        }
         let req = LlmRequest {
             model: model.to_string(),
             max_tokens: 32768,

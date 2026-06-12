@@ -64,6 +64,8 @@ interface RunsState {
     modelOverride?: string,
   ) => Promise<void>;
   abort: (runId: string) => Promise<void>;
+  /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
+  stopStage: (runId: string) => Promise<void>;
   /** null clears a manual pin — the canvas falls back to the active stage. */
   selectStage: (runId: string, stageId: string | null) => void;
 
@@ -196,6 +198,10 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   abort: async (runId) => {
     await ipc.abortRun(runId);
     await get().refreshDetail(runId);
+  },
+
+  stopStage: async (runId) => {
+    await ipc.stopStage(runId);
   },
 
   selectStage: (runId, stageId) =>

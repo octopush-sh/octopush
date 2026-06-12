@@ -989,6 +989,16 @@ pub async fn abort_run(
     Arc::clone(&*orch).abort_run(&run_id).await
 }
 
+/// Stop the run's in-flight stage without aborting the run: the stage halts
+/// and lands in the normal failed/decision-strip recovery flow.
+#[tauri::command]
+pub async fn stop_stage(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+) -> AppResult<()> {
+    orch.stop_current_stage(&run_id)
+}
+
 /// The persisted live journal for a stage, oldest first. Rows that fail to
 /// parse (shouldn't happen — we wrote them) are skipped rather than erroring.
 #[tauri::command]

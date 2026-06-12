@@ -180,6 +180,7 @@ pub fn run() {
             commands::list_runs,
             commands::resolve_checkpoint,
             commands::abort_run,
+            commands::stop_stage,
             commands::estimate_run_cost,
             commands::get_stage_log,
             commands::list_stage_iterations,

@@ -13,6 +13,7 @@ vi.mock("../lib/ipc", async () => {
       startRun: vi.fn(),
       resolveCheckpoint: vi.fn(),
       abortRun: vi.fn(),
+      stopStage: vi.fn(),
     },
   };
 });
@@ -212,6 +213,12 @@ describe("runsStore", () => {
     (ipc.listRuns as any).mockResolvedValue([]);
     await useRunsStore.getState().begin("w1", "p", "t", []);
     expect(ipc.startRun).toHaveBeenCalledWith("rNew", null);
+  });
+
+  it("stopStage fires the stop_stage IPC for the run (R2)", async () => {
+    (ipc.stopStage as any).mockResolvedValue(undefined);
+    await useRunsStore.getState().stopStage("r1");
+    expect(ipc.stopStage).toHaveBeenCalledWith("r1");
   });
 
   it("begin aborts the draft and does not select it when startRun is rejected", async () => {
