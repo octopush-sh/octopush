@@ -66,3 +66,19 @@ Approving a FAILED blocked stage in `resolve_checkpoint` now accepts the partial
 ### F4 — Per-stage tool-turn budget
 
 `max_iterations INTEGER NOT NULL DEFAULT 25` on **both** `pipeline_stages` and `run_stages` (`add_column_if_missing`; the default backfills existing rows with the former hard cap). Plumbed through `insert_pipeline_stage`/seeder, `save_pipeline`, `create_run` (copied per run stage), `StageDraft.maxIterations` (validated **1..=100**), and `StageSpec` — `ApiRunner` feeds it to `run_agentic_loop` (the cap error reports the real value) and `CliRunner` uses it for `--max-turns` (replacing the fixed 30). The builder's stage card gains a quiet `max turns` Stepper (5–100, default 25) after the gate pill; `toStageDrafts` serializes it; loop-target-by-identity logic untouched.
+
+## Run control & provenance (2026-06-11)
+
+User findings from live runs — the brief vanishes after launch, an in-flight stage can't be stopped (`abort_run` only flips the DB status that the drive loop checks BETWEEN stages, so the agent keeps spending), and a finished pipeline can't be re-run — fixed as R1–R3 on top of this design:
+
+### R1 — The brief is always visible
+
+RunTrack's header row gains, beside `stage n/m`, a `the brief` eyebrow (mono 10px, mute) over the run task as a truncated one-line serif text (full text in the hover `title`). Clicking it toggles a `<Reveal>` under the header with the full task — `whitespace-pre-wrap`, sage, selectable. Uses the `run` prop the component already received.
+
+### R2 — Stop the stage in course (real cancellation)
+
+The Orchestrator keeps per-run cancel flags (`cancels: Mutex<HashMap<String, Arc<AtomicBool>>>`): `run_stage_once` installs a FRESH flag before each stage, hands it to the substrate via `StageContext.cancel`, and removes it after. `stop_current_stage(run_id)` sets the live flag (no-op when idle); `abort_run` ALSO sets it — aborting kills in-flight work, not just the DB row. `run_agentic_loop` checks the flag at the top of every iteration: when set it closes the journal with a `stopped by the director` notice and returns unfinished; `ApiRunner` maps unfinished+cancelled to `stopped by the director — review the work journal, then accept, re-run, or abort` (vs the iteration-cap message) via the shared `unfinished_stage_error` helper. `CliRunner` races the child's NDJSON stream against a 500ms cancel poll (`tokio::select!`) and on stop kills the child and fails the stage with the same message, zero usage; the 15-minute backstop stays. `drive_inner` never downgrades an abort issued mid-stage back to `paused`. IPC: `stop_stage(run_id)` → `ipc.stopStage` → `runsStore.stopStage`. UI: while the run is `running`, a reserved RunTrack header slot (S1) shows two quiet mono controls — `Stop the stage` (hairline, hover ivory) and `Abort` (mute, hover rouge). The stopped stage lands in the EXISTING failed/decision-strip recovery (Accept & continue / Re-run / Abort) — no new recovery UI.
+
+### R3 — Run it again
+
+`runsStore.launcherPrefill` (`{ task, pipelineId, overrides: [position, agentModel][] }`) with `setLauncherPrefill` and a consume-once getter. Terminal runs (completed/aborted/failed) show `⟶ Run it again` (serif, brass) in the same reserved header slot; DirectCanvas builds the prefill from the run — every stage's `[position, agentModel]` — and navigates to the launcher (`selectRun(ws, null)`). PipelineSetup consumes the prefill once pipelines are loaded: task always applies; pipeline + crew only when that pipeline still exists (stale overrides never leak onto a different pipeline; `overrideTuples()` already drops models equal to the pipeline default at Begin).
