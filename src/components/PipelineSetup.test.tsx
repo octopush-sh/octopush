@@ -97,8 +97,11 @@ describe("PipelineSetup budget field", () => {
 });
 
 describe("PipelineSetup designed states", () => {
-  // The ceremony header ("Direct the work" + the eyebrow) now lives on the
-  // DirectDashboard that hosts this composer — see DirectDashboard.test.tsx.
+  it("renders the ceremony header", () => {
+    render(<PipelineSetup defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect(screen.getByRole("heading", { name: "Direct the work" })).toBeInTheDocument();
+    expect(screen.getByText("— direct")).toBeInTheDocument(); // the brass eyebrow
+  });
 
   it("shows skeletons while pipelines load, not the error card", () => {
     storeState.loaded = false;
@@ -117,11 +120,12 @@ describe("PipelineSetup designed states", () => {
     expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument(); // no zero flash
   });
 
-  it("renders the pipeline mini-map on each card", () => {
+  it("draws the selected pipeline as a stage flow (Roman numerals + connector)", () => {
     render(<PipelineSetup defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     expect(screen.getByText("I")).toBeInTheDocument();
     expect(screen.getByText("II")).toBeInTheDocument();
-    expect(screen.getByText("⟶")).toBeInTheDocument(); // connector between the numerals
+    // ⟶ appears both as the brief's prompt glyph and as the flow connector.
+    expect(screen.getAllByText("⟶").length).toBeGreaterThan(0);
   });
 
   it("leads the estimate with savings", async () => {

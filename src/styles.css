@@ -426,3 +426,10 @@ button:not(:disabled),
 }
 
 .octo-flow .react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-octo-brass, #d4a574); }
+
+/* Direct launcher — the stage-flow horizontal scroll. A thin, themed scrollbar
+   so a long ensemble scrolls without a heavy OS bar interrupting the canvas. */
+.octo-flow-scroll { scrollbar-width: thin; scrollbar-color: var(--color-octo-hairline, #2a2419) transparent; }
+.octo-flow-scroll::-webkit-scrollbar { height: 6px; }
+.octo-flow-scroll::-webkit-scrollbar-thumb { background: var(--color-octo-hairline, #2a2419); border-radius: 9999px; }
+.octo-flow-scroll::-webkit-scrollbar-track { background: transparent; }

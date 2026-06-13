@@ -2,10 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import type { Run } from "../lib/ipc";
 
-// DirectCanvas renders DirectDashboard for the launcher state; stub it — its
-// real children (RecentRuns/DirectOverview) reach ipc, absent in jsdom.
-vi.mock("./direct/DirectDashboard", () => ({
-  DirectDashboard: ({ onEditPipeline }: any) => (
+// DirectCanvas renders PipelineSetup (the launcher); stub it — its real form
+// reaches ipc/stores, absent in jsdom.
+vi.mock("./PipelineSetup", () => ({
+  PipelineSetup: ({ onEditPipeline }: any) => (
     <div>
       LAUNCHER
       <button onClick={() => onEditPipeline(null)}>compose</button>
