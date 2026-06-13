@@ -30,7 +30,7 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
       >
         <div className="flex items-center gap-1.5">
           {isBuiltin && (
-            <span className="font-serif text-[13px] italic leading-none text-octo-brass" title="An Octopush original">
+            <span className="font-serif text-[13px] leading-none text-octo-brass" title="An Octopush original">
               &amp;
             </span>
           )}

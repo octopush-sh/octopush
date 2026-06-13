@@ -242,14 +242,14 @@ function BuilderInner({ pipeline, onClose }: Props) {
           onChange={(e) => setName(e.target.value)}
           placeholder="Name this pipeline"
           aria-label="Pipeline name"
-          className="mb-1 w-full border-b border-transparent bg-transparent pb-1 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:italic placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
+          className="mb-1 w-full border-b border-transparent bg-transparent pb-1 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
         />
         <input
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="When should the team reach for it?"
           aria-label="Pipeline description"
-          className="w-full border-b border-transparent bg-transparent pb-1 font-mono text-xs text-octo-sage outline-none transition-colors duration-[180ms] placeholder:italic placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
+          className="w-full border-b border-transparent bg-transparent pb-1 font-mono text-xs text-octo-sage outline-none transition-colors duration-[180ms] placeholder:text-octo-mute hover:border-octo-hairline focus:border-[var(--brass-dim)]"
         />
       </div>
 

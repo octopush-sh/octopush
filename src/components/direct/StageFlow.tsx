@@ -11,34 +11,32 @@ interface Props {
   onOverride: (position: number, model: string) => void;
 }
 
-/** The selected pipeline drawn as a readable, horizontally-scrolling flow of
- *  stage cards — the launcher's centerpiece. It speaks the builder's node
- *  language (archetype icon, Roman numeral, substrate, tools, gate/loop) AND
- *  doubles as the crew editor: each card's model chip overrides that stage in
- *  place, so there is no separate "team" table. Cards are fixed-width and scroll
- *  rather than collapse, so a stage is always legible at any canvas width. */
+/** The selected pipeline drawn as a readable flow of stage cards — the
+ *  launcher's centerpiece. It speaks the builder's node language (archetype
+ *  icon, Roman numeral, substrate, tools, gate/loop) AND doubles as the crew
+ *  editor: each card's model chip overrides that stage in place, so there is no
+ *  separate "team" table. Cards are fixed-width and WRAP (never collapsed, never
+ *  scroll-hidden), so every stage stays legible and visible at any width. */
 export function StageFlow({ stages, overrides, onOverride }: Props) {
   const sorted = [...stages].sort((a, b) => a.position - b.position);
 
   return (
-    <div className="octo-flow-scroll relative -mx-1 overflow-x-auto px-1 pb-2">
-      <div className="flex items-stretch gap-0">
-        {sorted.map((s, i) => (
-          <div key={s.id} className="flex items-center">
-            {i > 0 && (
-              <span className="px-2 text-octo-brass/70" title={sorted[i - 1].checkpoint ? "Gated handoff" : "Hands off to"}>
-                {sorted[i - 1].checkpoint ? "⟜" : "⟶"}
-              </span>
-            )}
-            <FlowStageCard
-              stage={s}
-              index={i}
-              model={overrides[s.position] ?? s.agentModel}
-              onModel={(m) => onOverride(s.position, m)}
-            />
-          </div>
-        ))}
-      </div>
+    <div className="flex flex-wrap items-stretch gap-y-3">
+      {sorted.map((s, i) => (
+        <div key={s.id} className="flex items-center">
+          {i > 0 && (
+            <span className="px-2 text-octo-brass/70" title={sorted[i - 1].checkpoint ? "Gated handoff" : "Hands off to"}>
+              {sorted[i - 1].checkpoint ? "⟜" : "⟶"}
+            </span>
+          )}
+          <FlowStageCard
+            stage={s}
+            index={i}
+            model={overrides[s.position] ?? s.agentModel}
+            onModel={(m) => onOverride(s.position, m)}
+          />
+        </div>
+      ))}
     </div>
   );
 }
@@ -69,7 +67,7 @@ function FlowStageCard({
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
     >
       <div className="flex items-center gap-2">
-        <span className="text-octo-brass">
+        <span className="text-octo-sage">
           <Icon size={14} strokeWidth={1.75} />
         </span>
         <span className="min-w-0 flex-1 truncate font-serif text-[14px] text-octo-ivory" title={stageTitle(stage)}>
@@ -102,7 +100,7 @@ function FlowStageCard({
           {TOOLS.map((t) => (
             <span
               key={t.id}
-              className={`h-1.5 w-1.5 rounded-full ${granted(t.id) ? "bg-octo-brass" : "border border-octo-hairline"}`}
+              className={`h-1.5 w-1.5 rounded-full ${granted(t.id) ? "bg-octo-sage" : "border border-octo-hairline"}`}
             />
           ))}
         </span>

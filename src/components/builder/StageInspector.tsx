@@ -103,7 +103,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           onChange={(e) => onPatch({ customName: e.target.value })}
           placeholder={a.label}
           aria-label="Stage name"
-          className="w-full rounded-sm border border-octo-hairline bg-octo-onyx px-2 py-1.5 font-serif text-[13px] text-octo-ivory outline-none transition-colors duration-[150ms] placeholder:italic placeholder:text-octo-mute focus:border-[var(--brass-dim)]"
+          className="w-full rounded-sm border border-octo-hairline bg-octo-onyx px-2 py-1.5 font-serif text-[13px] text-octo-ivory outline-none transition-colors duration-[150ms] placeholder:text-octo-mute focus:border-[var(--brass-dim)]"
         />
       </label>
 
@@ -176,7 +176,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           placeholder="Shape this stage in your own words…"
           aria-label="Stage instructions"
           rows={3}
-          className="w-full resize-y rounded-sm border border-octo-hairline bg-octo-onyx px-2 py-1.5 font-mono text-[11px] leading-relaxed text-octo-ivory outline-none transition-colors duration-[150ms] placeholder:italic placeholder:text-octo-mute focus:border-[var(--brass-dim)]"
+          className="w-full resize-y rounded-sm border border-octo-hairline bg-octo-onyx px-2 py-1.5 font-mono text-[11px] leading-relaxed text-octo-ivory outline-none transition-colors duration-[150ms] placeholder:text-octo-mute focus:border-[var(--brass-dim)]"
         />
       </label>
 

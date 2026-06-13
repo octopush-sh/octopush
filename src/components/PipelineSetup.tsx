@@ -91,7 +91,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
       <div className="mx-auto max-w-[940px]">
         {/* Ceremony */}
         <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— direct</p>
-        <h1 className="m-0 mb-2 font-serif text-[22px] italic tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
+        <h1 className="m-0 mb-2 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
         <div className="animate-brass-grow mb-9 h-px bg-gradient-to-r from-octo-brass to-transparent" style={{ width: 28 }} />
 
         {/* I — The brief (hero). The ⟶ glyph reads as intent entering the ensemble. */}
@@ -103,7 +103,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
             onChange={(e) => setTask(e.target.value)}
             placeholder="What should the ensemble take on?"
             aria-label="The brief"
-            className="h-20 w-full resize-none bg-transparent font-serif text-[16px] leading-relaxed text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
+            className="h-20 w-full resize-none bg-transparent font-serif text-[16px] leading-relaxed text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
           />
         </div>
 
@@ -126,7 +126,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
             </div>
           ) : (
             <button type="button" onClick={() => onEditPipeline(null)}
-              className="mb-10 block w-full rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-7 text-center font-serif italic text-sm text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)]">
+              className="mb-10 block w-full rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-7 text-center font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)]">
               No ensembles yet — compose your first
             </button>
           )
@@ -147,9 +147,9 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
               <button
                 type="button"
                 onClick={() => onEditPipeline(null)}
-                className="flex w-[184px] shrink-0 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-octo-hairline px-3.5 py-3 font-serif italic text-[13px] text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass-hi"
+                className="flex w-[184px] shrink-0 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-octo-hairline px-3.5 py-3 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass-hi"
               >
-                <span className="font-mono text-base not-italic">＋</span>
+                <span className="font-mono text-base">＋</span>
                 Compose a new one
               </button>
             </div>
@@ -157,7 +157,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
             {selected && (
               <div className="mt-5">
                 {selected.pipeline.description && (
-                  <p className="mb-3 font-serif text-[13px] italic text-octo-sage">{selected.pipeline.description}</p>
+                  <p className="mb-3 font-serif text-[13px] text-octo-sage">{selected.pipeline.description}</p>
                 )}
                 <StageFlow
                   stages={selected.stages}
@@ -204,7 +204,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                     value={budgetText}
                     onChange={(e) => setBudgetText(e.target.value)}
                     placeholder="no budget"
-                    className="octo-tabular w-20 bg-transparent font-mono text-xs text-octo-ivory outline-none placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
+                    className="octo-tabular w-20 bg-transparent font-mono text-xs text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
                   />
                 </div>
               </div>
@@ -214,7 +214,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                   type="button"
                   disabled={!task.trim() || executingRun}
                   onClick={() => onBegin(selected.pipeline.id, task.trim(), overrideTuples(), parseBudget(budgetText))}
-                  className="rounded-lg bg-octo-brass px-6 py-2.5 font-serif text-base italic text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
+                  className="rounded-lg bg-octo-brass px-6 py-2.5 font-serif text-base text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
                 >
                   Begin the run
                 </button>
