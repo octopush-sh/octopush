@@ -311,7 +311,7 @@ export function ModelPicker({
                 </div>
 
                 {/* Recommended — intent-based picks. Three rows max, each
-                    prefaced by the intent (italic-serif) and showing the
+                    prefaced by the intent (serif) and showing the
                     matching model row. Always visible regardless of filters. */}
                 {recommendations.length > 0 && (
                   <>
@@ -446,7 +446,7 @@ function ModelRow({
         style={{ backgroundColor: dot }}
       />
       <span className="text-[12px]">{label}</span>
-      {/* Tags — small italic-serif pills surfacing the curated label. */}
+      {/* Tags — small serif pills surfacing the curated label. */}
       {model.tags && model.tags.length > 0 && (
         <span className="flex shrink-0 items-center gap-1">
           {model.tags.map((tag) => (

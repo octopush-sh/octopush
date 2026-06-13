@@ -1,3 +1,20 @@
+/* ── Spectral font — local WOFF2 bundles, upright (no italic) ───────── */
+@font-face {
+  font-family: "Spectral";
+  src: url('./assets/fonts/Spectral-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Spectral";
+  src: url('./assets/fonts/Spectral-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
 
@@ -89,6 +106,11 @@
   --dur-standard: 280ms;
   --dur-slow:     320ms;
   --dur-reveal:   600ms;
+
+  /* Font synthesis lock — prevent browser font-synthesis from fabricating
+     italic or bold variants, ensuring the Spectral upright faces always
+     render correctly even if an element mistakenly requests italic/bold. */
+  font-synthesis: none;
 }
 
 /* ── Diff syntax token classes — used by diffHighlight.ts ───────

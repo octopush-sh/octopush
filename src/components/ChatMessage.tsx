@@ -42,7 +42,7 @@ const MODEL_DISPLAY: Record<string, string> = {
 };
 
 // Markdown renderers using Onyx & Brass design tokens. Body text only —
-// the lead sentence (key phrase) is rendered separately above as italic serif.
+// the lead sentence (key phrase) is rendered separately above as upright serif.
 function makeMarkdownComponents(
   onOpenInEditor?: (path: string) => void,
 ): Components {

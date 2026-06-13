@@ -76,7 +76,7 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.getByText(/Files/i)).toBeInTheDocument());
   });
 
-  it("renders root label in italic serif", async () => {
+  it("renders root label in serif", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => {
       const label = screen.getByText("my-project");
