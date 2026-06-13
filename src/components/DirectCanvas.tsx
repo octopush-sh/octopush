@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactElement } from "react";
 import type { RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { usePipelineStore } from "../stores/pipelineStore";
-import { PipelineSetup } from "./PipelineSetup";
+import { DirectDashboard } from "./direct/DirectDashboard";
 import { PipelineBuilder } from "./PipelineBuilder";
 import { RunTrack, labelForRole } from "./RunTrack";
 import { StageFocus } from "./StageFocus";
@@ -87,7 +87,8 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     );
   } else if (!viewedId || !run) {
     body = (
-      <PipelineSetup
+      <DirectDashboard
+        workspaceId={workspaceId}
         defaultTask={defaultTask}
         onBegin={(pipelineId, task, stageOverrides, budgetUsd) =>
           void begin(workspaceId, pipelineId, task, stageOverrides, linkedIssueKey ?? undefined, budgetUsd)

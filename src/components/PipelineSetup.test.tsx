@@ -96,12 +96,9 @@ describe("PipelineSetup budget field", () => {
   });
 });
 
-describe("PipelineSetup ceremony & designed states", () => {
-  it("renders the ceremony header", () => {
-    render(<PipelineSetup defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
-    expect(screen.getByRole("heading", { name: "Direct the work" })).toBeInTheDocument();
-    expect(screen.getByText("direct")).toBeInTheDocument(); // DIRECT eyebrow (uppercased by CSS)
-  });
+describe("PipelineSetup designed states", () => {
+  // The ceremony header ("Direct the work" + the eyebrow) now lives on the
+  // DirectDashboard that hosts this composer — see DirectDashboard.test.tsx.
 
   it("shows skeletons while pipelines load, not the error card", () => {
     storeState.loaded = false;
