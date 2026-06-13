@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ipc, type PipelineWithStages } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
-import { labelForRole, ROMAN } from "./RunTrack";
+import { ROMAN, stageTitle } from "./RunTrack";
 import { ModelPicker } from "./ModelPicker";
 import { savingsVsBaseline } from "../lib/runStatus";
 
@@ -155,7 +155,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
           <div className="mb-8 overflow-hidden rounded-lg border border-octo-hairline">
             {selected.stages.map((s) => (
               <div key={s.id} className="flex items-center gap-3 border-b border-octo-hairline bg-octo-panel-2 px-3 py-2.5 last:border-b-0">
-                <span className="w-28 shrink-0 truncate font-serif text-sm text-octo-ivory">{labelForRole(s.role)}</span>
+                <span className="w-28 shrink-0 truncate font-serif text-sm text-octo-ivory">{stageTitle(s)}</span>
                 <div className="min-w-0 flex-1">
                   <ModelPicker
                     activeModel={overrides[s.position] ?? s.agentModel}

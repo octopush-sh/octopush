@@ -1,0 +1,190 @@
+import { describe, it, expect } from "vitest";
+import {
+  graphToStageDrafts,
+  draftToGraph,
+  validateGraph,
+  newStageData,
+  loopEdge,
+  type StageNode,
+  type StageEdge,
+} from "./graph";
+import type { PipelineWithStages, PipelineStage } from "../../lib/ipc";
+
+function node(id: string, role: string, x = 0, y = 0): StageNode {
+  return { id, type: "stage", position: { x, y }, data: { ...newStageData(role) } };
+}
+function flow(source: string, target: string): StageEdge {
+  return { id: `f-${source}-${target}`, source, target, type: "flow", data: { kind: "flow" } };
+}
+
+describe("graphToStageDrafts", () => {
+  it("topologically orders a linear chain and records single parents", () => {
+    const nodes = [node("a", "plan", 0, 0), node("b", "implement", 0, 150), node("c", "test", 0, 300)];
+    const edges = [flow("a", "b"), flow("b", "c")];
+    const drafts = graphToStageDrafts(nodes, edges);
+    expect(drafts.map((d) => d.role)).toEqual(["plan", "implement", "test"]);
+    expect(drafts[0].parents).toEqual([]);
+    expect(drafts[1].parents).toEqual([0]);
+    expect(drafts[2].parents).toEqual([1]);
+  });
+
+  it("records both parents at a join and isolates sibling branches", () => {
+    // a → b, a → c, (b,c) → d
+    const nodes = [
+      node("a", "plan", 0, 0),
+      node("b", "implement", -100, 150),
+      node("c", "test", 100, 150),
+      node("d", "code_review", 0, 300),
+    ];
+    const edges = [flow("a", "b"), flow("a", "c"), flow("b", "d"), flow("c", "d")];
+    const drafts = graphToStageDrafts(nodes, edges);
+    const join = drafts[drafts.length - 1];
+    expect(join.role).toBe("code_review");
+    expect(join.parents).toEqual([1, 2]);
+    // siblings each see only the entry
+    const b = drafts.find((d) => d.role === "implement")!;
+    const c = drafts.find((d) => d.role === "test")!;
+    expect(b.parents).toEqual([0]);
+    expect(c.parents).toEqual([0]);
+  });
+
+  it("breaks ties by canvas Y then X for a stable, readable order", () => {
+    // two independent entries; lower-Y one must come first
+    const nodes = [node("low", "plan", 0, 300), node("high", "repro", 0, 50)];
+    const drafts = graphToStageDrafts(nodes, []);
+    expect(drafts.map((d) => d.role)).toEqual(["repro", "plan"]);
+  });
+
+  it("derives loop fields from a loop edge on the review stage", () => {
+    const nodes = [node("a", "implement", 0, 0), node("b", "code_review", 0, 150)];
+    const edges: StageEdge[] = [flow("a", "b"), loopEdge("b", "a", 3, "auto")];
+    const drafts = graphToStageDrafts(nodes, edges);
+    expect(drafts[1].loopTargetPosition).toBe(0);
+    expect(drafts[1].loopMaxIterations).toBe(3);
+    expect(drafts[1].loopMode).toBe("auto");
+    // the loop back-edge is NOT a data parent
+    expect(drafts[1].parents).toEqual([0]);
+  });
+
+  it("throws on a cycle in the flow", () => {
+    const nodes = [node("a", "plan"), node("b", "implement")];
+    const edges = [flow("a", "b"), flow("b", "a")];
+    expect(() => graphToStageDrafts(nodes, edges)).toThrow(/cycle/);
+  });
+
+  it("trims custom name / instructions and nulls empties", () => {
+    const nodes = [node("a", "plan")];
+    nodes[0].data.customName = "  Scout  ";
+    nodes[0].data.instructions = "   ";
+    const [d] = graphToStageDrafts(nodes, []);
+    expect(d.customName).toBe("Scout");
+    expect(d.instructions).toBeNull();
+  });
+});
+
+describe("draftToGraph", () => {
+  const baseStage = (over: Partial<PipelineStage>): PipelineStage => ({
+    id: over.id ?? "x",
+    pipelineId: "p",
+    position: over.position ?? 0,
+    role: over.role ?? "plan",
+    agentModel: "claude-sonnet-4-6",
+    substrate: "api",
+    checkpoint: false,
+    loopTargetPosition: over.loopTargetPosition ?? null,
+    loopMaxIterations: over.loopMaxIterations ?? 0,
+    loopMode: over.loopMode ?? null,
+    maxIterations: 25,
+    posX: over.posX ?? null,
+    posY: over.posY ?? null,
+    parents: over.parents ?? [],
+    tools: over.tools ?? null,
+    customName: over.customName ?? null,
+    instructions: over.instructions ?? null,
+  });
+
+  it("starts a fresh pipeline with a single node", () => {
+    const { nodes, edges } = draftToGraph(null);
+    expect(nodes).toHaveLength(1);
+    expect(edges).toHaveLength(0);
+  });
+
+  it("auto-chains a legacy pipeline with no recorded parents", () => {
+    const pipeline: PipelineWithStages = {
+      pipeline: { id: "p", name: "Legacy", description: "", isBuiltin: true, createdAt: "" },
+      stages: [baseStage({ position: 0, role: "plan" }), baseStage({ position: 1, role: "implement" }), baseStage({ position: 2, role: "test" })],
+    };
+    const { nodes, edges } = draftToGraph(pipeline);
+    expect(nodes).toHaveLength(3);
+    // a linear chain of 2 flow edges, no loops
+    expect(edges.filter((e) => e.data?.kind === "flow")).toHaveLength(2);
+  });
+
+  it("round-trips parents and a loop edge", () => {
+    const pipeline: PipelineWithStages = {
+      pipeline: { id: "p", name: "Graph", description: "", isBuiltin: false, createdAt: "" },
+      stages: [
+        baseStage({ position: 0, role: "implement", posX: 0, posY: 0 }),
+        baseStage({ position: 1, role: "code_review", posX: 0, posY: 150, parents: [0], loopTargetPosition: 0, loopMaxIterations: 2, loopMode: "gated" }),
+      ],
+    };
+    const { nodes, edges } = draftToGraph(pipeline);
+    expect(nodes).toHaveLength(2);
+    expect(edges.filter((e) => e.data?.kind === "flow")).toHaveLength(1);
+    const loop = edges.find((e) => e.data?.kind === "loop");
+    expect(loop?.data?.loopMode).toBe("gated");
+    // compiling it back preserves the loop target
+    const drafts = graphToStageDrafts(nodes, edges);
+    expect(drafts[1].loopTargetPosition).toBe(0);
+  });
+});
+
+describe("validateGraph", () => {
+  it("flags an empty graph", () => {
+    expect(validateGraph([], []).ok).toBe(false);
+  });
+
+  it("accepts a clean linear pipeline", () => {
+    const nodes = [node("a", "plan", 0, 0), node("b", "implement", 0, 150)];
+    const v = validateGraph(nodes, [flow("a", "b")]);
+    expect(v.ok).toBe(true);
+  });
+
+  it("blocks a cycle", () => {
+    const nodes = [node("a", "plan"), node("b", "implement")];
+    const v = validateGraph(nodes, [flow("a", "b"), flow("b", "a")]);
+    expect(v.ok).toBe(false);
+    expect(v.blocking.some((i) => /cycle/.test(i.message))).toBe(true);
+  });
+
+  it("blocks a loop from a non-review archetype", () => {
+    const nodes = [node("a", "plan", 0, 0), node("b", "implement", 0, 150)];
+    const edges = [flow("a", "b"), loopEdge("b", "a", 2, "gated")];
+    const v = validateGraph(nodes, edges);
+    expect(v.ok).toBe(false);
+    expect(v.byNode["b"]?.error).toMatch(/only review stages/);
+  });
+
+  it("blocks a loop that does not return to an ancestor", () => {
+    // c reviews but loops to a sibling branch node it never depended on
+    const nodes = [node("a", "plan", 0, 0), node("b", "implement", -100, 150), node("c", "code_review", 100, 150)];
+    const edges = [flow("a", "b"), flow("a", "c"), loopEdge("c", "b", 2, "gated")];
+    const v = validateGraph(nodes, edges);
+    expect(v.ok).toBe(false);
+    expect(v.byNode["c"]?.error).toMatch(/earlier stage on its own path/);
+  });
+
+  it("warns about an implement stage with no write tool", () => {
+    const nodes = [node("a", "implement", 0, 0)];
+    nodes[0].data.tools = ["read_file", "list_files"];
+    const v = validateGraph(nodes, []);
+    expect(v.ok).toBe(true); // soft
+    expect(v.byNode["a"]?.warning).toMatch(/can't write files/);
+  });
+
+  it("warns about an orphan node in a multi-node graph", () => {
+    const nodes = [node("a", "plan", 0, 0), node("b", "implement", 0, 150), node("c", "test", 400, 0)];
+    const v = validateGraph(nodes, [flow("a", "b")]);
+    expect(v.byNode["c"]?.warning).toMatch(/isn't connected/);
+  });
+});
