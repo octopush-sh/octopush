@@ -173,7 +173,7 @@ function StageCard({ stage: s, index, selected, onSelect }: {
         <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
         <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-brass">{running ? elapsed : ""}</span>
       </span>
-      <span className="h-5 truncate font-serif text-sm leading-5 text-octo-ivory">{labelForRole(s.role)}</span>
+      <span className="h-5 truncate font-serif text-sm leading-5 text-octo-ivory">{stageTitle(s)}</span>
       <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-sage">
         <span className="truncate">{s.agentModel}</span>
         <SubstratePill substrate={s.substrate} />
@@ -198,6 +198,13 @@ function SubstratePill({ substrate }: { substrate: string }) {
       {substrate}
     </span>
   );
+}
+
+/** The stage's display title: the author's custom name when set, else the
+ *  archetype label. Keeps the run view in step with names chosen in the builder. */
+export function stageTitle(s: { role: string; customName?: string | null }): string {
+  const custom = s.customName?.trim();
+  return custom && custom.length > 0 ? custom : labelForRole(s.role);
 }
 
 export function labelForRole(role: string): string {

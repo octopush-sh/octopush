@@ -31,7 +31,7 @@ const STAGE: RunStage = {
   checkpoint: false, status: "running", inputTokens: 0, outputTokens: 0, costUsd: 0,
   artifact: null, feedback: null, error: null, startedAt: null, finishedAt: null,
   loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
-  diffSnapshot: null,
+  diffSnapshot: null, parents: [], tools: null, customName: null, instructions: null,
 };
 
 describe("runsStore", () => {

@@ -187,14 +187,30 @@ const VERDICT_INSTRUCTION: &str = "\n\nThis is an automated review. After your f
     or `VERDICT: CHANGES_REQUESTED` if they must be revised. Emit nothing after that line.";
 
 /// `system_prompt_for(role)` plus the auto-mode verdict instruction when this is
-/// an auto-loop stage.
+/// an auto-loop stage. Convenience wrapper for [`compose_system_prompt`] with no
+/// author instructions.
 pub fn system_prompt_with_loop(role: &str, loop_mode: Option<crate::orchestrator::types::LoopMode>) -> String {
-    let base = system_prompt_for(role);
-    if matches!(loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)) {
-        format!("{base}{VERDICT_INSTRUCTION}")
-    } else {
-        base
+    compose_system_prompt(role, loop_mode, None)
+}
+
+/// The full system prompt for a stage: the archetype body, then the pipeline
+/// author's free-form `instructions` (their creative shaping), then — last, so
+/// "emit nothing after the verdict line" still holds — the auto-mode verdict
+/// instruction when applicable.
+pub fn compose_system_prompt(
+    role: &str,
+    loop_mode: Option<crate::orchestrator::types::LoopMode>,
+    instructions: Option<&str>,
+) -> String {
+    let mut s = system_prompt_for(role);
+    if let Some(instr) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
+        s.push_str("\n\nAdditional instructions for this stage, from the pipeline author:\n");
+        s.push_str(instr);
     }
+    if matches!(loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)) {
+        s.push_str(VERDICT_INSTRUCTION);
+    }
+    s
 }
 
 /// Parse the LAST `VERDICT: PASS|CHANGES_REQUESTED` line from a review stage's
@@ -232,7 +248,7 @@ impl AgentRunner for ApiRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
-        let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
+        let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
@@ -252,6 +268,7 @@ impl AgentRunner for ApiRunner {
             max_iterations,
             ctx.cancel.as_ref(),
             &emitter,
+            stage.tools.as_deref(),
         )
         .await;
 

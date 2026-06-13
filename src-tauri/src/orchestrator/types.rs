@@ -205,6 +205,13 @@ pub struct StageSpec {
     /// Per-stage tool-turn budget: the agentic loop's iteration cap (API) and
     /// `--max-turns` (CLI). Validated 1..=100 at save time; default 25.
     pub max_iterations: i64,
+    /// Tool allowlist over the workspace tools. `None` ⇒ the full set; `Some`
+    /// restricts the agent (e.g. a review stage to read-only). API substrate
+    /// only — the CLI substrate owns its own tools.
+    pub tools: Option<Vec<String>>,
+    /// Free-form instructions appended to the archetype's system prompt — the
+    /// pipeline author's per-stage shaping.
+    pub instructions: Option<String>,
 }
 
 /// A single tool invocation, captured for the run-event log.

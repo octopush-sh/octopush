@@ -1922,6 +1922,7 @@ mod agentic_loop_tests {
             25,
             &std::sync::atomic::AtomicBool::new(false),
             &emitter,
+            None,
         )
         .await
         .unwrap();
@@ -2174,6 +2175,8 @@ mod pipeline_crud_tests {
             role: role.into(), agent_model: "claude-haiku-4-5".into(), substrate: "api".into(),
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25,
+            pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
+            custom_name: None, instructions: None,
         }
     }
 
@@ -2288,6 +2291,87 @@ mod pipeline_crud_tests {
         assert!(db.save_pipeline(Some("nope".into()), "x", "d", &[draft("plan")]).is_err());
         // Empty name → error.
         assert!(db.save_pipeline(None, "   ", "d", &[draft("plan")]).is_err());
+    }
+
+    #[test]
+    fn validate_pipeline_stages_enforces_graph_fields() {
+        use crate::db::validate_pipeline_stages;
+
+        // parents must reference strictly-earlier stages.
+        let mut a = draft("plan");
+        let mut b = draft("implement");
+        b.parents = vec![0]; // ok: 0 < 1
+        assert!(validate_pipeline_stages(&[a.clone(), b.clone()]).is_ok());
+        let mut fwd = draft("implement");
+        fwd.parents = vec![1]; // a parent at its own position
+        assert!(validate_pipeline_stages(&[draft("plan"), fwd]).is_err());
+        let mut neg = draft("implement");
+        neg.parents = vec![-1];
+        assert!(validate_pipeline_stages(&[draft("plan"), neg]).is_err());
+        let mut dup = draft("implement");
+        dup.parents = vec![0, 0]; // same upstream twice
+        assert!(validate_pipeline_stages(&[draft("plan"), dup]).is_err());
+
+        // tools: a non-empty subset of the known set; empty or unknown → error.
+        a.tools = Some(vec!["read_file".into(), "list_files".into()]);
+        assert!(validate_pipeline_stages(&[a.clone()]).is_ok());
+        let mut empty_tools = draft("plan");
+        empty_tools.tools = Some(vec![]);
+        assert!(validate_pipeline_stages(&[empty_tools]).is_err());
+        let mut bad_tool = draft("plan");
+        bad_tool.tools = Some(vec!["telepathy".into()]);
+        assert!(validate_pipeline_stages(&[bad_tool]).is_err());
+
+        // instructions: long but bounded.
+        let mut long = draft("plan");
+        long.instructions = Some("x".repeat(9_000));
+        assert!(validate_pipeline_stages(&[long]).is_err());
+        let mut ok_instr = draft("plan");
+        ok_instr.instructions = Some("Focus on the auth module.".into());
+        assert!(validate_pipeline_stages(&[ok_instr]).is_ok());
+
+        // In an authored graph, a loop must return to an ANCESTOR of the review,
+        // not merely an earlier position (a sibling branch).
+        let p = draft("plan"); // pos 0
+        let mut ia = draft("implement"); ia.parents = vec![0]; // pos 1 (branch A)
+        let mut ib = draft("implement"); ib.parents = vec![0]; // pos 2 (branch B, sibling)
+        let mut rv = draft("code_review");
+        rv.parents = vec![1];
+        rv.loop_max_iterations = 2;
+        rv.loop_mode = Some("gated".into());
+        rv.loop_target_position = Some(2); // sibling branch B — NOT an ancestor of the review
+        assert!(validate_pipeline_stages(&[p.clone(), ia.clone(), ib.clone(), rv.clone()]).is_err());
+        let mut rv_ok = rv.clone();
+        rv_ok.loop_target_position = Some(0); // the shared ancestor — fine
+        assert!(validate_pipeline_stages(&[p, ia, ib, rv_ok]).is_ok());
+    }
+
+    #[test]
+    fn save_pipeline_round_trips_graph_fields() {
+        let db = test_db();
+        let mut entry = draft("plan");
+        entry.pos_x = Some(40.0);
+        entry.pos_y = Some(10.0);
+        let mut worker = draft("implement");
+        worker.parents = vec![0];
+        worker.tools = Some(vec!["read_file".into(), "write_file".into(), "run_command".into()]);
+        worker.custom_name = Some("  Build it  ".into()); // trimmed on save
+        worker.instructions = Some("Keep diffs minimal.".into());
+        worker.pos_x = Some(40.0);
+        worker.pos_y = Some(180.0);
+
+        let id = db.save_pipeline(None, "Graph", "d", &[entry, worker]).unwrap();
+        let stages = db.get_pipeline_stages(&id).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].parents, Vec::<i64>::new());
+        assert_eq!(stages[1].parents, vec![0]);
+        assert_eq!(stages[1].tools.as_deref().unwrap().len(), 3);
+        assert_eq!(stages[1].custom_name.as_deref(), Some("Build it"));
+        assert_eq!(stages[1].instructions.as_deref(), Some("Keep diffs minimal."));
+        assert_eq!(stages[1].pos_y, Some(180.0));
+        // A stage with no custom name / tools round-trips as None (archetype default).
+        assert!(stages[0].custom_name.is_none());
+        assert!(stages[0].tools.is_none());
     }
 
     #[test]
@@ -4130,7 +4214,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -4160,7 +4244,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 2,
-                                   &std::sync::atomic::AtomicBool::new(false), &em).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None).await.unwrap();
 
         assert!(!out.finished, "iteration exhaustion must not read as success");
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
@@ -4186,7 +4270,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &cancel, &em).await.unwrap();
+                                   "sys", "do it", dir.path(), 10, &cancel, &em, None).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -5159,5 +5243,83 @@ mod workspace_from_pr_tests {
         let lib = include_str!("lib.rs");
         assert!(lib.contains("commands::list_prs"));
         assert!(lib.contains("commands::ensure_pr_branch"));
+    }
+}
+
+#[cfg(test)]
+mod ancestry_tests {
+    use crate::db::RunStageRow;
+    use crate::orchestrator::ancestors_of;
+
+    /// Minimal RunStageRow carrying only the fields ancestry cares about
+    /// (position + parents); everything else is dummy.
+    fn rs(position: i64, parents: Vec<i64>) -> RunStageRow {
+        RunStageRow {
+            id: format!("s{position}"),
+            run_id: "r".into(),
+            position,
+            role: "plan".into(),
+            agent_model: "m".into(),
+            substrate: "api".into(),
+            checkpoint: false,
+            status: "pending".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            artifact: None,
+            feedback: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            loop_target_position: None,
+            loop_max_iterations: 0,
+            loop_mode: None,
+            loop_iterations: 0,
+            diff_snapshot: None,
+            max_iterations: 25,
+            parents,
+            tools: None,
+            custom_name: None,
+            instructions: None,
+        }
+    }
+
+    #[test]
+    fn ancestors_follow_parents_transitively_and_isolate_branches() {
+        // 0 ─┬─> 1 ─┐
+        //    └─> 2 ─┴─> 3   (3 joins branches 1 and 2; 1 and 2 are siblings)
+        let stages = vec![
+            rs(0, vec![]),
+            rs(1, vec![0]),
+            rs(2, vec![0]),
+            rs(3, vec![1, 2]),
+        ];
+
+        // The join sees the whole graph above it.
+        let a3 = ancestors_of(&stages, 3);
+        assert_eq!(a3, [0, 1, 2].into_iter().collect());
+
+        // A branch sees only its own lineage — never its sibling.
+        let a1 = ancestors_of(&stages, 1);
+        assert_eq!(a1, [0].into_iter().collect());
+        assert!(!a1.contains(&2), "branch 1 must not see sibling branch 2");
+
+        // The entry has no ancestors.
+        assert!(ancestors_of(&stages, 0).is_empty());
+    }
+
+    #[test]
+    fn independent_roots_stay_isolated_until_they_join() {
+        // Two independent entries (both parentless) feed one join. This is the
+        // regression case for the multi-root leak: a parentless stage at a
+        // non-zero position must have EMPTY ancestors (it feeds from nothing),
+        // and the join must see both roots.
+        let stages = vec![
+            rs(0, vec![]),       // root A
+            rs(1, vec![]),       // root B — parentless but NOT position 0
+            rs(2, vec![0, 1]),   // join
+        ];
+        assert!(ancestors_of(&stages, 1).is_empty(), "a second root must not inherit the first root");
+        assert_eq!(ancestors_of(&stages, 2), [0, 1].into_iter().collect());
     }
 }

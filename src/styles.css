@@ -342,3 +342,56 @@ button:not(:disabled),
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.5; transform: scale(0.85); }
 }
+
+/* ── Direct · node-based pipeline builder — @xyflow theming ──────────────────
+   Scoped under .octo-flow so the canvas wears Onyx & Brass instead of the
+   library's default light chrome. Nodes/edges are fully custom components;
+   these rules only retheme the handles, controls, minimap, and connection
+   line that @xyflow renders itself. */
+.octo-flow .react-flow__handle {
+  width: 9px;
+  height: 9px;
+  background: var(--color-octo-onyx, #0c0a08);
+  border: 1.5px solid var(--brass-dim);
+  border-radius: 9999px;
+  transition: border-color var(--dur-quick) var(--ease-octo), background var(--dur-quick) var(--ease-octo);
+}
+.octo-flow .react-flow__handle:hover,
+.octo-flow .react-flow__handle-connecting,
+.octo-flow .react-flow__handle-valid {
+  border-color: var(--color-octo-brass, #d4a574);
+  background: var(--brass-ghost);
+}
+.octo-flow .react-flow__node:focus,
+.octo-flow .react-flow__node:focus-visible { outline: none; }
+
+.octo-flow .react-flow__connectionline path,
+.octo-flow .react-flow__connection-path {
+  stroke: var(--brass-dim);
+  stroke-width: 1.5;
+}
+
+.octo-flow .react-flow__controls {
+  box-shadow: none;
+  border: 1px solid var(--color-octo-hairline, #2a2419);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--color-octo-panel, #14110d);
+}
+.octo-flow .react-flow__controls-button {
+  background: var(--color-octo-panel, #14110d);
+  border-bottom: 1px solid var(--color-octo-hairline, #2a2419);
+  width: 26px;
+  height: 26px;
+}
+.octo-flow .react-flow__controls-button:hover { background: var(--brass-ghost); }
+.octo-flow .react-flow__controls-button svg { fill: var(--color-octo-sage, #95897a); }
+.octo-flow .react-flow__controls-button:hover svg { fill: var(--color-octo-brass, #d4a574); }
+
+.octo-flow .react-flow__minimap {
+  background: var(--color-octo-panel, #14110d);
+  border: 1px solid var(--color-octo-hairline, #2a2419);
+  border-radius: 8px;
+}
+
+.octo-flow .react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-octo-brass, #d4a574); }

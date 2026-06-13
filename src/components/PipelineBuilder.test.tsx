@@ -1,9 +1,59 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+
+// @xyflow/react can't lay out / measure in jsdom, so stub it to a thin shell.
+// The builder's logic we care about (graph → drafts on save, header, save bar,
+// palette, delete) all lives outside the canvas; node/edge rendering is covered
+// by graph.test.ts. The stubbed node-state hooks stay stateful so the initial
+// graph flows through to the save() call.
+vi.mock("@xyflow/react", async () => {
+  const React = await import("react");
+  const Frag = ({ children }: any) => React.createElement(React.Fragment, null, children);
+  return {
+    // Render the real custom node components through nodeTypes so a node that
+    // reads context (useBuilder) is exercised — catches provider-scope bugs.
+    ReactFlow: ({ children, nodes, nodeTypes }: any) =>
+      React.createElement(
+        "div",
+        { "data-testid": "flow" },
+        (nodes ?? []).map((n: any) => {
+          const Comp = nodeTypes?.[n.type];
+          return Comp ? React.createElement(Comp, { key: n.id, id: n.id, data: n.data, selected: false }) : null;
+        }),
+        children,
+      ),
+    ReactFlowProvider: Frag,
+    Background: () => null,
+    BackgroundVariant: { Dots: "dots" },
+    Controls: () => null,
+    MiniMap: () => null,
+    Panel: ({ children }: any) => React.createElement("div", null, children),
+    MarkerType: { ArrowClosed: "arrowclosed" },
+    Handle: () => null,
+    Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
+    BaseEdge: () => null,
+    EdgeLabelRenderer: Frag,
+    getSmoothStepPath: () => ["M0,0", 0, 0],
+    useNodesState: (init: any) => {
+      const [n, setN] = React.useState(init);
+      return [n, setN, () => {}];
+    },
+    useEdgesState: (init: any) => {
+      const [e, setE] = React.useState(init);
+      return [e, setE, () => {}];
+    },
+    useReactFlow: () => ({
+      screenToFlowPosition: (p: any) => p,
+      deleteElements: async () => {},
+      fitView: () => {},
+    }),
+  };
+});
 
 vi.mock("./ModelPicker", () => ({
   ModelPicker: ({ activeModel }: any) => <div data-testid="model">{activeModel}</div>,
 }));
+
 const saveMock = vi.fn().mockResolvedValue("saved-id");
 const removeMock = vi.fn().mockResolvedValue(undefined);
 vi.mock("../stores/pipelineStore", () => ({
@@ -15,7 +65,8 @@ const { PipelineBuilder } = await import("./PipelineBuilder");
 const stage = (over: Record<string, unknown>) => ({
   id: "s", pipelineId: "p1", position: 0, role: "plan", agentModel: "claude-haiku-4-5",
   substrate: "api", checkpoint: false,
-  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25, ...over,
+  loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25,
+  posX: null, posY: null, parents: [], tools: null, customName: null, instructions: null, ...over,
 });
 const builtin = {
   pipeline: { id: "p1", name: "Feature Factory", description: "d", isBuiltin: true, createdAt: "t" },
@@ -28,31 +79,15 @@ const custom = {
   pipeline: { id: "p2", name: "Mine", description: "d", isBuiltin: false, createdAt: "t" },
   stages: [stage({ id: "s0", position: 0, role: "plan" })],
 } as any;
-// A review stage with NO loop target — the linear case for the S1 stability test.
-const linearReview = {
-  pipeline: { id: "p4", name: "Linear", description: "d", isBuiltin: false, createdAt: "t" },
-  stages: [
-    stage({ id: "s0", position: 0, role: "implement" }),
-    stage({ id: "s1", position: 1, role: "code_review" }),
-  ],
-} as any;
 
-/** The loop-cleared notice now lives in fixed Reveal slots that stay mounted
- *  (hidden via aria-hidden when collapsed), so assert on *visible* notices only.
- *  Exact-text match so ancestor containers don't match. */
-const visibleLoopNotices = () =>
-  screen
-    .getAllByText("Loop target removed — review is linear again.")
-    .filter((el) => !el.closest('[aria-hidden="true"]'));
-
-describe("PipelineBuilder", () => {
+describe("PipelineBuilder (node canvas)", () => {
   beforeEach(() => { saveMock.mockClear(); removeMock.mockClear(); });
 
   it("a builtin opens with the fork label and a pre-filled copy name", () => {
     render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
     expect(screen.getByDisplayValue("Feature Factory (custom)")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Save as my copy/ })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Delete$/ })).not.toBeInTheDocument(); // no delete on builtins
+    expect(screen.queryByRole("button", { name: /^Delete$/ })).not.toBeInTheDocument();
   });
 
   it("a custom opens with its own name, Save label, and Delete", () => {
@@ -62,133 +97,45 @@ describe("PipelineBuilder", () => {
     expect(screen.getByRole("button", { name: /^Delete$/ })).toBeInTheDocument();
   });
 
-  it("compose-new starts with one default stage and Save label", () => {
+  it("composing a new pipeline starts with an empty name and the stage palette", () => {
     render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /Save pipeline/ })).toBeInTheDocument();
-    expect(screen.getAllByTestId("model").length).toBe(1); // one default stage
+    expect(screen.getByLabelText("Pipeline name")).toHaveValue("");
+    // The palette offers archetypes to drop.
+    expect(screen.getByText("Stages")).toBeInTheDocument();
+    expect(screen.getByText("Code review")).toBeInTheDocument();
   });
 
-  it("moving the loop target below its review clears the loop with a notice", () => {
-    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-    // implement (0) ↓ → becomes index 1, after the review → loop must clear
-    fireEvent.click(screen.getAllByRole("button", { name: "Move down" })[0]);
-    expect(visibleLoopNotices().length).toBe(1);
+  it("renders the stage nodes inside the builder context (no provider-scope crash)", () => {
+    // The default new-pipeline node is an "Implement" stage; it must render
+    // without throwing from useBuilder (provider must wrap ReactFlow's nodes).
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // "Implement" appears both in the palette and as the node title.
+    expect(screen.getAllByText("Implement").length).toBeGreaterThanOrEqual(2);
   });
 
-  it("save serializes loop targets to positions and calls store.save", async () => {
-    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
+  it("save compiles the canvas graph into topologically-ordered drafts", async () => {
+    const onClose = vi.fn();
+    render(<PipelineBuilder pipeline={builtin} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /Save as my copy/ }));
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
+    await waitFor(() => expect(saveMock).toHaveBeenCalledTimes(1));
     const draft = saveMock.mock.calls[0][0];
-    expect(draft.pipelineId).toBe("p1"); // backend decides the fork
+    expect(draft.pipelineId).toBe("p1"); // backend forks builtins
     expect(draft.name).toBe("Feature Factory (custom)");
+    expect(draft.stages).toHaveLength(2);
+    expect(draft.stages[0].role).toBe("implement");
+    expect(draft.stages[1].role).toBe("code_review");
+    expect(draft.stages[1].parents).toEqual([0]);
     expect(draft.stages[1].loopTargetPosition).toBe(0);
     expect(draft.stages[1].loopMode).toBe("gated");
-    // F4: the per-stage tool-turn budget is serialized too.
-    expect(draft.stages[0].maxIterations).toBe(25);
-    expect(draft.stages[1].maxIterations).toBe(25);
+    expect(onClose).toHaveBeenCalled();
   });
 
-  it("loads a stored max turns value, steps it, and serializes the change (F4)", async () => {
-    const tuned = {
-      pipeline: { id: "p5", name: "Tuned", description: "d", isBuiltin: false, createdAt: "t" },
-      stages: [stage({ id: "s0", position: 0, role: "implement", maxIterations: 40 })],
-    } as any;
-    render(<PipelineBuilder pipeline={tuned} onClose={vi.fn()} />);
-    // The stage card shows a quiet labeled stepper with the stored value.
-    const stepper = screen.getByLabelText("Max turns");
-    expect(stepper.textContent).toContain("40");
-    fireEvent.click(screen.getByRole("button", { name: "Increase" }));
-    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
-    expect(saveMock.mock.calls[0][0].stages[0].maxIterations).toBe(41);
-  });
-
-  it("new stages default max turns to 25 (F4)", async () => {
-    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText("Pipeline name"), { target: { value: "Fresh" } });
-    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
-    expect(saveMock.mock.calls[0][0].stages[0].maxIterations).toBe(25);
-  });
-
-  it("add stage appends a card", () => {
-    render(<PipelineBuilder pipeline={custom} onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: /Add another stage/ }));
-    expect(screen.getAllByTestId("model").length).toBe(2);
-  });
-
-  it("a stored forward loop target loads normalized (cleared) and saves a valid draft", async () => {
-    const corrupt = {
-      pipeline: { id: "p3", name: "Corrupt", description: "d", isBuiltin: false, createdAt: "t" },
-      stages: [
-        stage({ id: "s0", position: 0, role: "code_review", loopTargetPosition: 1, loopMaxIterations: 2, loopMode: "gated" }),
-        stage({ id: "s1", position: 1, role: "implement" }),
-      ],
-    } as any;
-    render(<PipelineBuilder pipeline={corrupt} onClose={vi.fn()} />);
-    expect(visibleLoopNotices().length).toBe(1);
-    fireEvent.click(screen.getByRole("button", { name: /Save pipeline/ }));
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
-    expect(saveMock.mock.calls[0][0].stages[0].loopTargetPosition).toBe(null); // cleared, valid
-  });
-
-  it("changing a review role to a non-review role clears the loop with a visible notice", () => {
-    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-    // open the second stage's role Listbox, pick "Implement"
-    fireEvent.click(screen.getAllByRole("button", { name: "Stage role" })[1]);
-    fireEvent.click(screen.getByRole("option", { name: /^Implement/ }));
-    expect(visibleLoopNotices().length).toBe(1);
-  });
-
-  it("picking '— linear —' in the loop target clears the loop on save", async () => {
-    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Loop target" }));
-    fireEvent.click(screen.getByRole("option", { name: "— linear —" }));
-    fireEvent.click(screen.getByRole("button", { name: /Save as my copy/ }));
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalled());
-    const draft = saveMock.mock.calls[0][0];
-    expect(draft.stages[1].loopTargetPosition).toBe(null);
-    expect(draft.stages[1].loopMode).toBe(null);
-  });
-
-  it("renders the live preview rail with loop-back annotation", () => {
-    render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-    // the builtin's code_review loops back to stage I with ×2
-    expect(screen.getByText("⟜ back to I · ×2")).toBeInTheDocument();
-  });
-
-  it("keeps loop sub-controls mounted but inert when linear (S1)", () => {
-    render(<PipelineBuilder pipeline={linearReview} onClose={vi.fn()} />);
-    // Steppers stay mounted (hidden:true — the dim wrapper is aria-hidden while linear);
-    // scope to the one inside the OPEN review loop panel (Reveal aria-hidden="false").
-    const incs = screen.getAllByRole("button", { name: "Increase", hidden: true });
-    const inOpenPanel = incs.filter((b) => b.closest('[aria-hidden="false"]'));
-    expect(inOpenPanel.length).toBe(1);
-    const wrapper = inOpenPanel[0].closest(".pointer-events-none");
-    expect(wrapper).not.toBeNull();
-    expect(wrapper!.className).toContain("opacity-30");
-  });
-
-  it("removing a stage fades it out, then deletes it after the exit timer", () => {
-    vi.useFakeTimers();
-    try {
-      render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);
-      fireEvent.click(screen.getAllByRole("button", { name: "Remove stage" })[1]);
-      expect(screen.getAllByTestId("model").length).toBe(2); // still mounted during the exit fade
-      act(() => { vi.advanceTimersByTime(130); });
-      expect(screen.getAllByTestId("model").length).toBe(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("two-step delete still works", async () => {
+  it("delete asks for confirmation, then removes the custom pipeline", async () => {
     const onClose = vi.fn();
     render(<PipelineBuilder pipeline={custom} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
     fireEvent.click(screen.getByRole("button", { name: /Confirm delete/ }));
-    await vi.waitFor(() => expect(removeMock).toHaveBeenCalledWith("p2"));
+    await waitFor(() => expect(removeMock).toHaveBeenCalledWith("p2"));
     expect(onClose).toHaveBeenCalled();
   });
 });

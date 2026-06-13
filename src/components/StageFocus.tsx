@@ -4,7 +4,7 @@ import type { LiveEntry, RunStage, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
-import { labelForRole } from "./RunTrack";
+import { stageTitle } from "./RunTrack";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -226,7 +226,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
         <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
           § {stage.role.replace(/_/g, " ").toUpperCase()}
         </span>
-        <span className="font-serif text-sm text-octo-ivory">{labelForRole(stage.role)}</span>
+        <span className="font-serif text-sm text-octo-ivory">{stageTitle(stage)}</span>
         <span className="truncate font-mono text-[10px] text-octo-mute">{stage.agentModel}</span>
         {iterations.length > 0 && (
           <span className="flex shrink-0 items-center gap-1.5">
