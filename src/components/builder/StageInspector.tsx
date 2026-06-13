@@ -29,6 +29,9 @@ interface Props {
   /** Valid loop targets (this node's flow-ancestors), for the "Return to" list. */
   ancestors: { value: string; label: string }[];
   loop: LoopState;
+  /** This stage's first validation error / caution, surfaced inline so the
+   *  amber/rouge ring on the node always has a stated reason. */
+  issue?: { error?: string; warning?: string };
   onPatch: (partial: Partial<StageNodeData>) => void;
   onSetLoop: (next: LoopState) => void;
   onClose: () => void;
@@ -38,7 +41,7 @@ interface Props {
  *  substrate, tools, gate, turn budget, free-form instructions, and (for review
  *  archetypes) the loop. The archetype is the operability anchor; everything
  *  else is the author's to shape. */
-export function StageInspector({ node, ancestors, loop, onPatch, onSetLoop, onClose }: Props) {
+export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
   const a = archetypeFor(data.role);
   const isCli = data.substrate === "cli";
@@ -80,6 +83,17 @@ export function StageInspector({ node, ancestors, loop, onPatch, onSetLoop, onCl
           <X size={13} />
         </button>
       </div>
+
+      {/* Why this stage is flagged — the cause behind the node's ring/icon. */}
+      {issue?.error ? (
+        <div className="rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2 font-mono text-[11px] leading-relaxed text-octo-rouge">
+          {issue.error}
+        </div>
+      ) : issue?.warning ? (
+        <div className="rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2 font-mono text-[11px] leading-relaxed text-octo-warning">
+          {issue.warning}
+        </div>
+      ) : null}
 
       {/* Name */}
       <label className="flex flex-col gap-1">

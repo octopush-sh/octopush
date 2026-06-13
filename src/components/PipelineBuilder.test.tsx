@@ -79,6 +79,12 @@ const custom = {
   pipeline: { id: "p2", name: "Mine", description: "d", isBuiltin: false, createdAt: "t" },
   stages: [stage({ id: "s0", position: 0, role: "plan" })],
 } as any;
+// A gated implement stage with no write tool — triggers the "can't write files"
+// caution AND a gate, the case where the node icon used to be hidden.
+const flaggedGated = {
+  pipeline: { id: "p3", name: "Flagged", description: "d", isBuiltin: false, createdAt: "t" },
+  stages: [stage({ id: "s0", position: 0, role: "implement", checkpoint: true, tools: ["read_file", "list_files"] })],
+} as any;
 
 describe("PipelineBuilder (node canvas)", () => {
   beforeEach(() => { saveMock.mockClear(); removeMock.mockClear(); });
@@ -128,6 +134,15 @@ describe("PipelineBuilder (node canvas)", () => {
     expect(draft.stages[1].loopTargetPosition).toBe(0);
     expect(draft.stages[1].loopMode).toBe("gated");
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("states a stage's caution on the node and in the save bar, even when it gates", () => {
+    render(<PipelineBuilder pipeline={flaggedGated} onClose={vi.fn()} />);
+    // The node carries the reason on its warning marker (which now coexists
+    // with the gate marker instead of being hidden by it).
+    expect(screen.getByLabelText(/can't write files/i)).toBeInTheDocument();
+    // And the save bar states the cause, not just a count.
+    expect(screen.getByText(/can't write files/i)).toBeInTheDocument();
   });
 
   it("delete asks for confirmation, then removes the custom pipeline", async () => {

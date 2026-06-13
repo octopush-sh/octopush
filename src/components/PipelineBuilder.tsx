@@ -299,6 +299,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
                   node={selectedNode}
                   ancestors={loopTargets}
                   loop={loopState}
+                  issue={validation.byNode[selectedNode.id]}
                   onPatch={(p) => patchData(selectedNode.id, p)}
                   onSetLoop={setLoop}
                   onClose={() => setSelectedId(null)}
@@ -326,7 +327,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
           Cancel
         </button>
 
-        {/* Live validation read-out: the first blocker, else a warning count. */}
+        {/* Live validation read-out: the first blocker, else the first caution
+            (stated, not just counted), else a ready note. */}
         <div className="min-w-0 flex-1 truncate font-mono text-[11px]">
           {error ? (
             <span className="text-octo-rouge">{error}</span>
@@ -336,7 +338,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
             </span>
           ) : warnCount > 0 ? (
             <span className="text-octo-warning" title={validation.warnings.map((w) => w.message).join("\n")}>
-              {warnCount} {warnCount === 1 ? "caution" : "cautions"} — review the amber stages
+              {validation.warnings[0].message}
+              {warnCount > 1 ? ` (+${warnCount - 1} more)` : ""}
             </span>
           ) : (
             <span className="text-octo-mute">{nodes.length === 1 ? "1 stage" : `${nodes.length} stages`} · ready</span>

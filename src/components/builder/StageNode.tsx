@@ -92,18 +92,26 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
             />
           ))}
         </span>
-        {/* Gate marker */}
-        {data.checkpoint && (
-          <span className="ml-auto font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass" title="Pauses for your approval">
-            ⟜ gate
-          </span>
-        )}
-        {/* Validation marker (when there's no gate sharing the right slot) */}
-        {!data.checkpoint && issue?.warning && !issue.error && (
-          <span className="ml-auto text-octo-warning" title={issue.warning}>
-            <AlertTriangle size={11} strokeWidth={1.75} />
-          </span>
-        )}
+        {/* Right cluster — gate and the validation marker coexist (each in its
+            own slot) so a flagged stage is never silent just because it gates.
+            The icon's tooltip names the cause; selecting the node shows it in
+            full in the inspector. */}
+        <span className="ml-auto flex items-center gap-2">
+          {data.checkpoint && (
+            <span className="font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass" title="Pauses for your approval">
+              ⟜ gate
+            </span>
+          )}
+          {issue?.error ? (
+            <span className="text-octo-rouge" title={issue.error} aria-label={issue.error}>
+              <AlertTriangle size={11} strokeWidth={1.75} />
+            </span>
+          ) : issue?.warning ? (
+            <span className="text-octo-warning" title={issue.warning} aria-label={issue.warning}>
+              <AlertTriangle size={11} strokeWidth={1.75} />
+            </span>
+          ) : null}
+        </span>
       </div>
     </div>
   );
