@@ -81,8 +81,9 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
 
   return (
     // The launch composer. The Direct dashboard provides the page chrome
-    // (ceremony header, padding, scroll); this is just the compose column.
-    <div className="octo-fade-in">
+    // (ceremony header, padding, scroll, and the entrance fade); this is just
+    // the compose column.
+    <div>
       <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">I · The brief</p>
       <textarea
         value={task}

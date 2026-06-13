@@ -15,6 +15,10 @@ export function RunCard({ run, pipelineName, selected, onSelect }: Props) {
   const meta = runStatusMeta(run.status);
   const { saved, pct } = savingsVsBaseline(run.costUsd, run.baselineUsd);
   const showSaved = run.baselineUsd > 0 && saved > 0;
+  // Guard a malformed/legacy timestamp so the slot reads "—" rather than the
+  // literal "Invalid Date" formatRelTime would yield from NaN.
+  const createdMs = Date.parse(run.createdAt);
+  const when = Number.isNaN(createdMs) ? "—" : formatRelTime(createdMs);
 
   return (
     <button
@@ -50,7 +54,7 @@ export function RunCard({ run, pipelineName, selected, onSelect }: Props) {
           )}
         </span>
         <span className="octo-tabular shrink-0 text-octo-mute" title="Started">
-          {formatRelTime(Date.parse(run.createdAt))}
+          {when}
         </span>
       </div>
 

@@ -1,5 +1,5 @@
 import { useRunsStore } from "../../stores/runsStore";
-import { savingsVsBaseline } from "../../lib/runStatus";
+import { aggregateSavings } from "../../lib/runStatus";
 
 interface Props {
   workspaceId: string;
@@ -20,12 +20,8 @@ export function DirectOverview({ workspaceId }: Props) {
   const runs = useRunsStore((s) => s.getRuns(workspaceId));
   if (runs.length === 0) return null;
 
-  let saved = 0;
-  let inFlight = 0;
-  for (const r of runs) {
-    if (r.baselineUsd > 0) saved += savingsVsBaseline(r.costUsd, r.baselineUsd).saved;
-    if (r.status === "running" || r.status === "paused") inFlight += 1;
-  }
+  const { saved } = aggregateSavings(runs);
+  const inFlight = runs.filter((r) => r.status === "running" || r.status === "paused").length;
 
   return (
     <div className="octo-fade-in flex flex-wrap items-center gap-x-5 gap-y-1.5 font-mono">

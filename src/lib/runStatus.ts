@@ -83,3 +83,22 @@ export function savingsVsBaseline(
   const pct = baselineUsd > 0 ? Math.round((saved / baselineUsd) * 100) : 0;
   return { saved, pct };
 }
+
+/** Aggregate savings across a workspace's runs: total dollars saved vs baseline
+ *  and `n`, the count of runs that actually came in under baseline. The single
+ *  source the Direct overview and the Companion runs ledger both read, so the
+ *  two never disagree on the same workspace's figure. */
+export function aggregateSavings(
+  runs: { costUsd: number; baselineUsd: number }[],
+): { saved: number; n: number } {
+  let saved = 0;
+  let n = 0;
+  for (const r of runs) {
+    if (r.baselineUsd > 0) {
+      const s = savingsVsBaseline(r.costUsd, r.baselineUsd).saved;
+      saved += s;
+      if (s > 0) n += 1;
+    }
+  }
+  return { saved, n };
+}

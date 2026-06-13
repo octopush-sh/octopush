@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { Plus } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
-import { runStatusMeta, savingsVsBaseline } from "../lib/runStatus";
+import { runStatusMeta, aggregateSavings } from "../lib/runStatus";
 
 interface Props { workspaceId: string; }
 
@@ -15,18 +15,8 @@ export function CompanionRuns({ workspaceId }: Props) {
   useEffect(() => { void loadRuns(workspaceId); }, [workspaceId, loadRuns]);
 
   // Ledger: total saved across runs with a baseline; n counts only the runs
-  // that actually came in under baseline (an over-baseline run saved nothing).
-  const totals = runs.reduce(
-    (acc, r) => {
-      if (r.baselineUsd > 0) {
-        const { saved } = savingsVsBaseline(r.costUsd, r.baselineUsd);
-        acc.saved += saved;
-        if (saved > 0) acc.n += 1;
-      }
-      return acc;
-    },
-    { saved: 0, n: 0 },
-  );
+  // that actually came in under baseline (shared with the Direct overview).
+  const totals = aggregateSavings(runs);
   // Below half a cent the line would render "saved $0.00" — say nothing instead.
   const showLedger = totals.saved >= 0.005;
 
