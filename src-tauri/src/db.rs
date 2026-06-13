@@ -19,6 +19,25 @@ fn add_column_if_missing(conn: &rusqlite::Connection, alter_sql: &str) -> rusqli
     }
 }
 
+/// Parse a stage's `parents` JSON column (a list of upstream positions) into a
+/// vec. A NULL or malformed value reads as "no recorded parents" — the caller
+/// then treats the stage as part of a legacy linear chain.
+fn parse_parents(raw: Option<String>) -> Vec<i64> {
+    raw.and_then(|t| serde_json::from_str::<Vec<i64>>(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Parse a stage's `tools` JSON column (an allowlist) into an optional vec.
+/// NULL/malformed ⇒ `None`, meaning "use the archetype's default tool set".
+fn parse_tools(raw: Option<String>) -> Option<Vec<String>> {
+    raw.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+}
+
+/// Serialize an optional tool allowlist back to JSON text for storage.
+fn tools_to_json(tools: &Option<Vec<String>>) -> Option<String> {
+    tools.as_ref().and_then(|t| serde_json::to_string(t).ok())
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -393,6 +412,27 @@ impl Db {
         // DEFAULT 25 backfills every pre-existing row (the former hard cap).
         add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 25")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 25")?;
+
+        // ── v10 node-based builder: canvas layout + per-stage agent config ─
+        // pos_x/pos_y carry the canvas coordinates (builder-only; execution
+        // ignores them). `parents` is a JSON array of upstream stage positions
+        // (the flow-edge dependencies); empty/NULL ⇒ legacy linear chain.
+        // `tools` is a JSON array allowlist over the workspace tools (NULL ⇒
+        // archetype default). `custom_name` is a free display label, and
+        // `instructions` are free-form additions to the archetype prompt.
+        // All nullable: pre-existing rows keep behaving exactly as before.
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN pos_x REAL")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN pos_y REAL")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN parents TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN tools TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN custom_name TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN instructions TEXT")?;
+        // run_stages mirrors only the execution-relevant fields (the run view
+        // stays linear, so it needs no canvas coordinates).
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN parents TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN tools TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN custom_name TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN instructions TEXT")?;
 
         Ok(())
     }
@@ -1444,7 +1484,8 @@ impl Db {
     pub fn get_pipeline_stages(&self, pipeline_id: &str) -> AppResult<Vec<PipelineStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
-                    loop_target_position, loop_max_iterations, loop_mode, max_iterations
+                    loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                    pos_x, pos_y, parents, tools, custom_name, instructions
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -1460,6 +1501,12 @@ impl Db {
                 loop_max_iterations: r.get(8)?,
                 loop_mode: r.get(9)?,
                 max_iterations: r.get(10)?,
+                pos_x: r.get(11)?,
+                pos_y: r.get(12)?,
+                parents: parse_parents(r.get(13)?),
+                tools: parse_tools(r.get(14)?),
+                custom_name: r.get(15)?,
+                instructions: r.get(16)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1650,15 +1697,21 @@ impl Db {
             }
         };
         for (i, s) in stages.iter().enumerate() {
+            let parents_json = serde_json::to_string(&s.parents).ok();
+            let tools_json = tools_to_json(&s.tools);
+            let custom_name = s.custom_name.as_deref().map(str::trim).filter(|t| !t.is_empty());
+            let instructions = s.instructions.as_deref().map(str::trim).filter(|t| !t.is_empty());
             tx.execute(
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
-                     loop_target_position, loop_max_iterations, loop_mode, max_iterations)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                     pos_x, pos_y, parents, tools, custom_name, instructions)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
-                        s.max_iterations],
+                        s.max_iterations,
+                        s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions],
             )?;
         }
         tx.commit()?;
@@ -1724,14 +1777,18 @@ impl Db {
                 .map(|(_, m)| m.as_str())
                 .unwrap_or(s.agent_model.as_str());
             let sid = Uuid::new_v4().to_string();
+            let parents_json = serde_json::to_string(&s.parents).ok();
+            let tools_json = tools_to_json(&s.tools);
             self.conn.execute(
                 "INSERT INTO run_stages
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
-                     loop_target_position, loop_max_iterations, loop_mode, max_iterations)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11)",
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                     parents, tools, custom_name, instructions)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
-                        s.max_iterations],
+                        s.max_iterations,
+                        parents_json, tools_json, s.custom_name, s.instructions],
             )?;
         }
         Ok(id)
@@ -1765,7 +1822,7 @@ impl Db {
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
-                    max_iterations
+                    max_iterations, parents, tools, custom_name, instructions
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1792,6 +1849,10 @@ impl Db {
                 loop_iterations: r.get(19)?,
                 diff_snapshot: r.get(20)?,
                 max_iterations: r.get(21)?,
+                parents: parse_parents(r.get(22)?),
+                tools: parse_tools(r.get(23)?),
+                custom_name: r.get(24)?,
+                instructions: r.get(25)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2225,11 +2286,37 @@ pub struct StageDraft {
     /// Per-stage tool-turn budget (1..=100). Defaults to 25 when absent.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: i64,
+    /// Canvas coordinates (builder layout; round-tripped, never executed on).
+    #[serde(default)]
+    pub pos_x: Option<f64>,
+    #[serde(default)]
+    pub pos_y: Option<f64>,
+    /// Upstream stage positions (flow-edge dependencies), each < this stage's
+    /// position after the builder's topological sort. Empty ⇒ legacy chain.
+    #[serde(default)]
+    pub parents: Vec<i64>,
+    /// Tool allowlist; `None` ⇒ the archetype's default tool set.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Free display label; `None`/empty ⇒ the archetype's label.
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    /// Free-form additions appended to the archetype's system prompt.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 fn default_max_iterations() -> i64 {
     25
 }
+
+/// Hard cap on free-form stage instructions (defensive: keeps a pasted essay
+/// from blowing up every prompt this stage runs).
+const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
+
+/// The workspace tools a stage's agent may be granted. Keep in sync with
+/// `tool_definitions()` in chat_engine.rs and `ARCHETYPES` in the builder.
+pub const KNOWN_TOOLS: &[&str] = &["read_file", "list_files", "write_file", "run_command"];
 
 // Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
 const KNOWN_ROLES: &[&str] = &[
@@ -2260,6 +2347,50 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
                 i + 1,
                 s.max_iterations
             )));
+        }
+        // Flow-edge parents: each must reference a strictly-earlier stage (the
+        // builder topo-sorts before saving, so a valid DAG always satisfies
+        // this) and must be distinct. This is what keeps the graph acyclic and
+        // makes the ancestry-aware dossier well-defined.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for &p in &s.parents {
+                if p < 0 || p >= i as i64 {
+                    return Err(AppError::Other(format!(
+                        "stage {} has an upstream link to a non-earlier stage — the flow must be acyclic",
+                        i + 1
+                    )));
+                }
+                if !seen.insert(p) {
+                    return Err(AppError::Other(format!(
+                        "stage {} lists the same upstream stage twice",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        // Tool allowlist, when set, must be a non-empty subset of the known
+        // workspace tools — an empty list would leave the agent unable to act.
+        if let Some(tools) = &s.tools {
+            if tools.is_empty() {
+                return Err(AppError::Other(format!(
+                    "stage {} has an empty tool list — give it at least one tool",
+                    i + 1
+                )));
+            }
+            for t in tools {
+                if !KNOWN_TOOLS.contains(&t.as_str()) {
+                    return Err(AppError::Other(format!("unknown tool '{t}'")));
+                }
+            }
+        }
+        if let Some(instr) = &s.instructions {
+            if instr.chars().count() > MAX_INSTRUCTIONS_CHARS {
+                return Err(AppError::Other(format!(
+                    "stage {} instructions are too long (max {MAX_INSTRUCTIONS_CHARS} characters)",
+                    i + 1
+                )));
+            }
         }
         match s.loop_target_position {
             Some(target) => {
@@ -2311,6 +2442,17 @@ pub struct PipelineStageRow {
     pub loop_mode: Option<String>,
     /// Per-stage tool-turn budget (1..=100; default 25).
     pub max_iterations: i64,
+    /// Canvas coordinates (builder layout; `None` for legacy rows).
+    pub pos_x: Option<f64>,
+    pub pos_y: Option<f64>,
+    /// Upstream stage positions (flow-edge dependencies). Empty ⇒ legacy chain.
+    pub parents: Vec<i64>,
+    /// Tool allowlist; `None` ⇒ the archetype's default tool set.
+    pub tools: Option<Vec<String>>,
+    /// Free display label; `None` ⇒ the archetype's label.
+    pub custom_name: Option<String>,
+    /// Free-form additions appended to the archetype's system prompt.
+    pub instructions: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -2377,6 +2519,15 @@ pub struct RunStageRow {
     pub diff_snapshot: Option<String>,
     /// Per-stage tool-turn budget (copied from the pipeline template; default 25).
     pub max_iterations: i64,
+    /// Upstream stage positions (flow-edge dependencies), copied from the
+    /// template. Empty ⇒ legacy run: the dossier falls back to "all earlier".
+    pub parents: Vec<i64>,
+    /// Tool allowlist copied from the template; `None` ⇒ archetype default.
+    pub tools: Option<Vec<String>>,
+    /// Free display label copied from the template; `None` ⇒ archetype label.
+    pub custom_name: Option<String>,
+    /// Free-form prompt additions copied from the template.
+    pub instructions: Option<String>,
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /

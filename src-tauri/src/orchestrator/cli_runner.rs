@@ -7,7 +7,7 @@
 //! human control point.
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::runner::{artifact_kind_for, parse_verdict, system_prompt_with_loop, user_input_for, AgentRunner, StageContext};
+use crate::orchestrator::runner::{artifact_kind_for, compose_system_prompt, parse_verdict, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageInput, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
 use serde_json::Value;
@@ -247,7 +247,10 @@ impl AgentRunner for CliRunner {
         input: &StageInput,
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
-        let system = system_prompt_with_loop(&stage.role, stage.loop_mode.clone());
+        // The CLI substrate (Claude Code) owns its own tool surface, so the
+        // per-stage tool allowlist does not apply here; the author's free-form
+        // instructions still shape the stage via the system prompt.
+        let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
         let args = build_cli_args(&stage.agent_model, &system, stage.max_iterations);
 

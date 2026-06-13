@@ -96,8 +96,15 @@ pub async fn run_agentic_loop(
     max_iterations: usize,
     cancel: &AtomicBool,
     emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+    // Per-stage tool allowlist. `None` grants the full workspace tool set;
+    // `Some(list)` restricts the agent to exactly those tools (a review stage
+    // runs read-only, an implementer gets write/run, etc.).
+    allowed_tools: Option<&[String]>,
 ) -> AppResult<AgenticResult> {
-    let tools = build_llm_tools();
+    let mut tools = build_llm_tools();
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|t| allowed.iter().any(|a| a == &t.name));
+    }
     let mut messages: Vec<LlmMessage> = vec![LlmMessage {
         role: LlmRole::User,
         content: LlmContent::Text(initial_user.to_string()),

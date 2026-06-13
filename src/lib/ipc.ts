@@ -21,6 +21,17 @@ export interface PipelineStage {
   loopMode: "gated" | "auto" | null;
   /** Per-stage tool-turn budget (1..=100; default 25). */
   maxIterations: number;
+  /** Canvas coordinates (builder layout). Null for legacy linear pipelines. */
+  posX: number | null;
+  posY: number | null;
+  /** Upstream stage positions (flow-edge dependencies). Empty = linear chain. */
+  parents: number[];
+  /** Tool allowlist; null = the archetype's default tool set. */
+  tools: string[] | null;
+  /** Free display label; null = the archetype's label. */
+  customName: string | null;
+  /** Free-form additions appended to the archetype's system prompt. */
+  instructions: string | null;
 }
 export interface Pipeline {
   id: string;
@@ -33,7 +44,7 @@ export interface PipelineWithStages {
   pipeline: Pipeline;
   stages: PipelineStage[];
 }
-/** A builder-authored stage (position = array index). */
+/** A builder-authored stage (position = array index, after topological sort). */
 export interface StageDraft {
   role: string;
   agentModel: string;
@@ -44,6 +55,17 @@ export interface StageDraft {
   loopMode: "gated" | "auto" | null;
   /** Per-stage tool-turn budget (1..=100). */
   maxIterations: number;
+  /** Canvas coordinates, round-tripped so the graph reopens as it was drawn. */
+  posX: number | null;
+  posY: number | null;
+  /** Upstream stage positions (flow-edge deps), each < this stage's position. */
+  parents: number[];
+  /** Tool allowlist; null = the archetype's default tool set. */
+  tools: string[] | null;
+  /** Free display label; null/empty = the archetype's label. */
+  customName: string | null;
+  /** Free-form additions appended to the archetype's system prompt. */
+  instructions: string | null;
 }
 export interface PipelineDraft {
   pipelineId: string | null; // null = create; a builtin id = fork; a custom id = update
@@ -92,6 +114,14 @@ export interface RunStage {
   diffSnapshot: string | null;
   /** Per-stage tool-turn budget (copied from the template; default 25). */
   maxIterations: number;
+  /** Upstream stage positions (flow-edge deps), copied from the template. */
+  parents: number[];
+  /** Tool allowlist copied from the template; null = archetype default. */
+  tools: string[] | null;
+  /** Free display label copied from the template; null = archetype label. */
+  customName: string | null;
+  /** Free-form prompt additions copied from the template. */
+  instructions: string | null;
 }
 export interface RunDetail {
   run: Run | null;

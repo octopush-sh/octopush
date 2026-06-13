@@ -37,6 +37,32 @@ pub(crate) fn cap_diff(text: &str) -> String {
     format!("{}\n… (diff truncated)", &text[..end])
 }
 
+/// The transitive ancestors of the stage at `position`, following the recorded
+/// `parents` (flow-edge) links. Excludes `position` itself. Cycle-safe (the
+/// `seen` set bounds the walk) even though saved graphs are acyclic.
+pub(crate) fn ancestors_of(
+    stages: &[crate::db::RunStageRow],
+    position: i64,
+) -> std::collections::HashSet<i64> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let parents: HashMap<i64, &Vec<i64>> =
+        stages.iter().map(|s| (s.position, &s.parents)).collect();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    if let Some(ps) = parents.get(&position) {
+        queue.extend(ps.iter().copied());
+    }
+    while let Some(p) = queue.pop_front() {
+        if !seen.insert(p) {
+            continue;
+        }
+        if let Some(ps) = parents.get(&p) {
+            queue.extend(ps.iter().copied());
+        }
+    }
+    seen
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -252,6 +278,8 @@ impl Orchestrator {
             loop_mode: stage.loop_mode.as_deref().and_then(crate::orchestrator::types::LoopMode::from_db),
             loop_iterations: stage.loop_iterations,
             max_iterations: stage.max_iterations,
+            tools: stage.tools.clone(),
+            instructions: stage.instructions.clone(),
         };
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
@@ -360,14 +388,32 @@ impl Orchestrator {
     fn assemble_stage_input(&self, run_id: &str, position: i64) -> AppResult<StageInput> {
         let stages = self.db.lock().list_run_stages(run_id)?;
 
-        // Freshest artifact per kind among stages strictly before `position`.
+        // Which earlier stages feed THIS one? With an authored graph, a stage's
+        // working context is its transitive ancestors — the branch that leads
+        // to it — so a sibling branch never leaks into its prompt and a join
+        // node legitimately sees the freshest artifacts of BOTH upstream
+        // branches. A legacy run (no recorded `parents` on any stage) falls
+        // back to "every earlier stage", preserving the original linear
+        // behavior byte-for-byte. The breadcrumb below still maps the whole run.
+        let ancestor_filter: Option<std::collections::HashSet<i64>> = stages
+            .iter()
+            .find(|s| s.position == position)
+            .filter(|c| !c.parents.is_empty())
+            .map(|_| ancestors_of(&stages, position));
+        let feeds = |p: i64| match &ancestor_filter {
+            Some(set) => set.contains(&p),
+            None => p < position,
+        };
+
+        // Freshest artifact per kind among the stages that feed `position`.
         // `stages` is position-ordered, so a plain overwrite keeps the latest.
-        // The worktree flag is OR'd across ALL artifacts, not just retained
-        // sections — an empty-text code artifact still means "changes on disk".
+        // The worktree flag is OR'd across ALL feeding artifacts, not just
+        // retained sections — an empty-text code artifact still means "changes
+        // on disk".
         let mut latest: std::collections::HashMap<&'static str, InputSection> =
             std::collections::HashMap::new();
         let mut refs_worktree = false;
-        for s in stages.iter().filter(|s| s.position < position) {
+        for s in stages.iter().filter(|s| feeds(s.position)) {
             let Some(json) = &s.artifact else { continue };
             let Ok(a) = serde_json::from_str::<StageArtifact>(json) else { continue };
             refs_worktree |= a.refs_worktree;
