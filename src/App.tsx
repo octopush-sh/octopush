@@ -1049,6 +1049,12 @@ function App() {
     [activeWorkspace, project, openFileInEditor, setMode, confirmLargeFile],
   );
 
+  // Companion provenance chips jump into the diff at the file (best-effort line).
+  const handleJumpToFile = useCallback(
+    (file: string, line: number | null) => navigateToFile(file, "diff", line),
+    [navigateToFile],
+  );
+
   const fileTreeProps = useMemo(() => {
     if (!activeWorkspace) return undefined;
     const rootPath = activeWorkspace.worktreePath || project!.path;
@@ -1667,6 +1673,16 @@ function App() {
             issueTrackerConfigured={issueTrackerConfigured}
             onBacklogTicketContextMenu={handleBacklogTicketContextMenu}
             onModeChange={setMode}
+            reviewProps={
+              activeWorkspace
+                ? {
+                    gitStatus,
+                    gitDiff,
+                    workspacePath: activeWorkspace.worktreePath || activeProject?.path || "",
+                  }
+                : null
+            }
+            onJumpToFile={handleJumpToFile}
             collapsed={isCompanionCollapsed}
             onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
           />

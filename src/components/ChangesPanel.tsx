@@ -128,7 +128,6 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
   const hasUpstream = gitStatus?.hasUpstream ?? false;
   const behind = gitStatus?.behind ?? 0;
   const conflicted = gitStatus?.conflicted ?? 0;
-  const aheadBehindKnown = gitStatus?.aheadBehindKnown ?? true;
   const branchName = gitStatus?.branch ?? null;
   const operation = gitStatus?.operation ?? null;
   const conflictFiles = files.filter((f) => f.conflicted);
@@ -393,45 +392,12 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           </span>
         )}
         {(addCount > 0 || delCount > 0) && (
-          <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+          <span className="ml-auto font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
             <span className="text-octo-verdigris">+{addCount}</span>
             <span className="px-1 opacity-50">/</span>
             <span className="text-octo-rouge">−{delCount}</span>
           </span>
         )}
-        {branchName && <span className="font-mono text-[10px] text-octo-sage">{branchName}</span>}
-        {aheadBehindKnown && (ahead > 0 || behind > 0) && (
-          <span data-testid="ahead-behind" className="font-mono text-[10px] text-octo-mute">
-            {ahead > 0 && <span className="text-octo-brass">↑{ahead}</span>}
-            {behind > 0 && <span className="ml-1 text-octo-sage">↓{behind}</span>}
-          </span>
-        )}
-        <span className="ml-auto flex items-center gap-1.5">
-          <GitOpsMenu
-            projectPath={projectPath}
-            branch={branchName}
-            dirty={files.length > 0}
-            untrackedCount={files.filter((f) => f.status === "new" && f.unstaged && !f.staged).length}
-            onChanged={() => {
-              void refresh();
-              onChange?.();
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => setShowHistory(true)}
-            title="Commit history"
-            aria-label="Commit history"
-            className="flex items-center justify-center rounded p-1 text-octo-sage transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-          >
-            <History size={12} />
-          </button>
-          <button type="button" onClick={handleFetch} disabled={syncing} title="Fetch from remote"
-            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-sage disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass">Fetch</button>
-          <button type="button" onClick={() => runPull("ffOnly")} disabled={syncing || behind === 0} title="Pull from remote"
-            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-brass disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-            style={{ border: "1px solid var(--brass-dim)" }}>Pull</button>
-        </span>
       </header>
       {(conflicted > 0 || operation) && (
         <div className="octo-rise-in shrink-0 border-b border-octo-hairline" data-testid="conflict-section">
@@ -575,6 +541,37 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
 
       {/* Commit + Publish actions */}
       <div className="space-y-2 border-t border-octo-hairline p-3">
+        {/* Sync row — git operations live with commit/push, not in the header,
+            so the navigator's eyebrow stays a clean Changes|Files switch. */}
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute">sync</span>
+          <button type="button" onClick={handleFetch} disabled={syncing} title="Fetch from remote"
+            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass">Fetch</button>
+          <button type="button" onClick={() => runPull("ffOnly")} disabled={syncing || behind === 0} title={behind > 0 ? `Pull ${behind} commit${behind !== 1 ? "s" : ""} from remote` : "Pull from remote"}
+            className="rounded px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-brass disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            style={{ border: "1px solid var(--brass-dim)" }}>Pull</button>
+          <span className="ml-auto flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setShowHistory(true)}
+              title="Commit history"
+              aria-label="Commit history"
+              className="flex items-center justify-center rounded p-1 text-octo-sage transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <History size={12} />
+            </button>
+            <GitOpsMenu
+              projectPath={projectPath}
+              branch={branchName}
+              dirty={files.length > 0}
+              untrackedCount={files.filter((f) => f.status === "new" && f.unstaged && !f.staged).length}
+              onChanged={() => {
+                void refresh();
+                onChange?.();
+              }}
+            />
+          </span>
+        </div>
         <div className="relative">
           <textarea
             ref={commitRef}

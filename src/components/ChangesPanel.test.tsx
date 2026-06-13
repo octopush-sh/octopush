@@ -139,21 +139,21 @@ describe("ChangesPanel G4", () => {
     expect(await screen.findByText(/2 conflicts/i)).toBeInTheDocument();
   });
 
-  it("History button in the header opens the commit-history browser", async () => {
+  it("History button opens the commit-history browser", async () => {
     render(<ChangesPanel projectPath="/repo" />);
-    await screen.findByText("main");
+    const historyBtn = await screen.findByRole("button", { name: /commit history/i });
     expect(screen.queryByTestId("history-modal")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: /commit history/i }));
+    await userEvent.click(historyBtn);
     expect(screen.getByTestId("history-modal")).toHaveTextContent("/repo");
   });
 
-  it("hides the ahead/behind badge when aheadBehindKnown is false", async () => {
+  it("never renders an ahead/behind badge in the header (it lives in the companion now)", async () => {
     ipcMock.getGitStatus.mockResolvedValue({
-      branch: "main", ahead: 0, behind: 0, hasUpstream: true,
-      conflicted: 0, aheadBehindKnown: false, changedFiles: [],
+      branch: "main", ahead: 3, behind: 1, hasUpstream: true,
+      conflicted: 0, aheadBehindKnown: true, changedFiles: [],
     });
     render(<ChangesPanel projectPath="/repo" />);
-    await screen.findByText("main");
+    await screen.findByRole("button", { name: /fetch/i });
     expect(screen.queryByTestId("ahead-behind")).not.toBeInTheDocument();
   });
 });

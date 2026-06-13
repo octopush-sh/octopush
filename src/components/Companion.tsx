@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { PanelRightClose, PanelRightOpen, SquareTerminal, MessagesSquare, GitCompare, Workflow } from "lucide-react";
 import { MODES, MODE_LABELS, type WorkspaceMode } from "../lib/modes";
-import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue } from "../lib/types";
+import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
+import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionRuns } from "./CompanionRuns";
@@ -42,6 +43,10 @@ interface Props {
   issueTrackerConfigured: boolean;
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
   onModeChange: (next: WorkspaceMode) => void;
+  /** Review-mode context for the companion cockpit (scope, provenance, sync). */
+  reviewProps?: { gitStatus: GitStatus | null; gitDiff: string; workspacePath: string } | null;
+  /** Jump to a file in the diff from the companion (e.g. a provenance chip). */
+  onJumpToFile?: (file: string, line: number | null) => void;
   /** Collapsed state is owned by the parent (App), mirroring the rail. When
    *  collapsed the companion shrinks to a slim strip that still carries the
    *  mode switcher, so the user trades panel content for canvas room. */
@@ -67,6 +72,8 @@ export function Companion({
   issueTrackerConfigured,
   onBacklogTicketContextMenu,
   onModeChange,
+  reviewProps,
+  onJumpToFile,
   collapsed,
   onToggleCollapsed,
 }: Props) {
@@ -196,10 +203,10 @@ export function Companion({
       {/* Mode-specific content — crossfades (exit 120ms, then enter) when the
           mode changes, following the gliding ModeSwitcher indicator. The
           shared header and Jira block above stay outside this wrapper so they
-          persist across modes. Review mode keeps no companion content of its
-          own: its Changes/Files navigator lives on the left and AI review
-          lives inside the diff, so the companion can simply be collapsed for
-          more canvas. */}
+          persist across modes. Review mode shows a "change intelligence"
+          cockpit (readiness, provenance, branch/publish) — the Changes/Files
+          navigator lives on the left and AI review inside the diff, so the
+          companion answers the questions those surfaces can't. */}
       <FadeSwap swapKey={mode} className="flex min-h-0 flex-1 flex-col">
         {mode === "talk" && (
           <div className="flex flex-col">
@@ -209,6 +216,15 @@ export function Companion({
         )}
         {mode === "run" && workspaceId && (
           <CompanionTerminals workspaceId={workspaceId} />
+        )}
+        {mode === "review" && workspaceId && reviewProps && (
+          <CompanionReview
+            workspaceId={workspaceId}
+            workspacePath={reviewProps.workspacePath}
+            gitStatus={reviewProps.gitStatus}
+            gitDiff={reviewProps.gitDiff}
+            onJump={onJumpToFile}
+          />
         )}
         {mode === "direct" && workspaceId && (
           <CompanionRuns workspaceId={workspaceId} />

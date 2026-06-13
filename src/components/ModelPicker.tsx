@@ -76,7 +76,7 @@ export function ModelPicker({
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{
-    left: number; top?: number; bottom?: number; maxHeight: number;
+    left: number; top?: number; bottom?: number; width: number; maxHeight: number;
     placement: "below" | "above";
   } | null>(null);
 
@@ -86,20 +86,26 @@ export function ModelPicker({
     });
   }, []);
 
-  const PANEL_MIN_W = 260;
+  const PANEL_W = 300;
   const updatePosition = useCallback(() => {
     const el = buttonRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const gap = 6, margin = 8;
     const vw = window.innerWidth, vh = window.innerHeight;
+    // Width is bounded by the viewport so the panel never clips horizontally
+    // (the picker can live inside a narrow drawer hard against the right edge).
+    const width = Math.min(PANEL_W, vw - 2 * margin);
+    // Align to the button, then shift left so the right edge stays on-screen.
+    let left = rect.left;
+    if (left + width > vw - margin) left = vw - width - margin;
+    left = Math.max(margin, left);
     const spaceBelow = vh - rect.bottom - gap - margin;
     const spaceAbove = rect.top - gap - margin;
-    const left = Math.min(Math.max(margin, rect.left), Math.max(margin, vw - PANEL_MIN_W - margin));
     if (spaceBelow >= 260 || spaceBelow >= spaceAbove) {
-      setPos({ left, top: rect.bottom + gap, maxHeight: Math.max(140, spaceBelow), placement: "below" });
+      setPos({ left, top: rect.bottom + gap, width, maxHeight: Math.max(140, spaceBelow), placement: "below" });
     } else {
-      setPos({ left, bottom: vh - rect.top + gap, maxHeight: Math.max(140, spaceAbove), placement: "above" });
+      setPos({ left, bottom: vh - rect.top + gap, width, maxHeight: Math.max(140, spaceAbove), placement: "above" });
     }
   }, []);
 
@@ -237,7 +243,7 @@ export function ModelPicker({
         aria-haspopup="listbox"
         aria-expanded={open}
         className={clsx(
-          "flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors",
+          "flex min-w-0 max-w-[200px] items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors",
           open
             ? "border-octo-brass/40 bg-octo-brass/8 text-octo-brass"
             : "border-octo-hairline text-octo-sage hover:border-octo-brass/30 hover:text-octo-brass",
@@ -248,10 +254,10 @@ export function ModelPicker({
           className="h-1.5 w-1.5 shrink-0 rounded-full"
           style={{ backgroundColor: dotColor }}
         />
-        <span>{activeInfo.displayName}</span>
+        <span className="min-w-0 truncate">{activeInfo.displayName}</span>
         <span
           aria-hidden
-          className="ml-0.5 text-[9px] opacity-60"
+          className="ml-0.5 shrink-0 text-[9px] opacity-60"
         >
           ▾
         </span>
@@ -267,11 +273,12 @@ export function ModelPicker({
             ref={panelRef}
             role="listbox"
             aria-label="Select model"
-            className="octo-menu-enter fixed z-[60] min-w-[260px] overflow-y-auto rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
+            className="octo-menu-enter fixed z-[60] overflow-y-auto overflow-x-hidden rounded-lg border border-octo-hairline bg-octo-panel shadow-xl"
             style={{
               left: pos.left,
               top: pos.top,
               bottom: pos.bottom,
+              width: pos.width,
               maxHeight: pos.maxHeight,
               transformOrigin: pos.placement === "below" ? "top left" : "bottom left",
             }}
@@ -433,22 +440,26 @@ function ModelRow({
       aria-selected={isActive}
       onClick={onClick}
       className={clsx(
-        "flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors",
+        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
         isActive
           ? "border-l-2 bg-octo-brass/8 text-octo-brass"
           : "border-l-2 border-transparent text-octo-ivory hover:bg-octo-onyx/60",
       )}
       style={isActive ? { borderLeftColor: "var(--color-octo-brass)" } : undefined}
     >
-      <span
-        aria-hidden
-        className="h-1.5 w-1.5 shrink-0 rounded-full"
-        style={{ backgroundColor: dot }}
-      />
-      <span className="text-[12px]">{label}</span>
-      {/* Tags — small serif pills surfacing the curated label. */}
+      {/* Line 1 — dot · name (truncates) · cost/ctx (right) */}
+      <span className="flex w-full items-center gap-2">
+        <span
+          aria-hidden
+          className="h-1.5 w-1.5 shrink-0 rounded-full"
+          style={{ backgroundColor: dot }}
+        />
+        <span className="min-w-0 flex-1 truncate text-[12px]">{label}</span>
+        <span className="shrink-0 font-mono text-[9px] text-octo-mute">{meta}</span>
+      </span>
+      {/* Line 2 — curated tag pills, wrapping under the name. */}
       {model.tags && model.tags.length > 0 && (
-        <span className="flex shrink-0 items-center gap-1">
+        <span className="flex flex-wrap items-center gap-1 pl-3.5">
           {model.tags.map((tag) => (
             <span
               key={tag}
@@ -463,9 +474,6 @@ function ModelRow({
           ))}
         </span>
       )}
-      <span className="ml-auto shrink-0 font-mono text-[9px] text-octo-mute">
-        {meta}
-      </span>
     </button>
   );
 }
