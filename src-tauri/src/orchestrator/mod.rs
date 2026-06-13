@@ -176,8 +176,21 @@ impl Orchestrator {
     fn loop_back(&self, run_id: &str, review: &crate::db::RunStageRow, feedback: Option<&str>) -> AppResult<()> {
         let target_pos = review.loop_target_position.expect("loop_back requires a target");
         let stages = self.db.lock().list_run_stages(run_id)?;
+        // In an authored graph the [target..=review] position window can span a
+        // sibling branch that doesn't feed the review; resetting it would wipe
+        // valid, unrelated work. Restrict the re-run to the review's own lineage
+        // (its ancestors) plus the review itself. A legacy linear run has no
+        // recorded parents (ancestors are empty), so it keeps the original
+        // full-contiguous reset — every stage in the window is on the path.
+        let authored = stages.iter().any(|s| !s.parents.is_empty());
+        let on_path = if authored { Some(ancestors_of(&stages, review.position)) } else { None };
         for s in &stages {
-            if s.position >= target_pos && s.position <= review.position {
+            let in_window = s.position >= target_pos && s.position <= review.position;
+            let feeds_review = match &on_path {
+                Some(anc) => s.id == review.id || anc.contains(&s.position),
+                None => true,
+            };
+            if in_window && feeds_review {
                 // Archive the attempt before the reset wipes it. Pending/unstarted
                 // stages (no artifact, no error) aren't attempts. The feedback that
                 // closed the iteration is recorded on the review row only.
@@ -391,15 +404,18 @@ impl Orchestrator {
         // Which earlier stages feed THIS one? With an authored graph, a stage's
         // working context is its transitive ancestors — the branch that leads
         // to it — so a sibling branch never leaks into its prompt and a join
-        // node legitimately sees the freshest artifacts of BOTH upstream
-        // branches. A legacy run (no recorded `parents` on any stage) falls
-        // back to "every earlier stage", preserving the original linear
-        // behavior byte-for-byte. The breadcrumb below still maps the whole run.
-        let ancestor_filter: Option<std::collections::HashSet<i64>> = stages
-            .iter()
-            .find(|s| s.position == position)
-            .filter(|c| !c.parents.is_empty())
-            .map(|_| ancestors_of(&stages, position));
+        // node sees the freshest artifacts from its upstream branches. A legacy
+        // run (NO stage records any `parents`) falls back to "every earlier
+        // stage", preserving the original linear behavior byte-for-byte.
+        //
+        // The authored/legacy choice is made once at the RUN level, not per
+        // stage: in an authored graph a parentless node is a genuine ENTRY and
+        // must feed from nothing, never from "everything before it" — otherwise
+        // a second independent root would silently inherit the first root's
+        // branch. The breadcrumb below still maps the whole run for orientation.
+        let authored = stages.iter().any(|s| !s.parents.is_empty());
+        let ancestor_filter: Option<std::collections::HashSet<i64>> =
+            if authored { Some(ancestors_of(&stages, position)) } else { None };
         let feeds = |p: i64| match &ancestor_filter {
             Some(set) => set.contains(&p),
             None => p < position,
@@ -409,7 +425,9 @@ impl Orchestrator {
         // `stages` is position-ordered, so a plain overwrite keeps the latest.
         // The worktree flag is OR'd across ALL feeding artifacts, not just
         // retained sections — an empty-text code artifact still means "changes
-        // on disk".
+        // on disk". NOTE: the dossier is bounded to one section per kind, so a
+        // join fed by two same-kind branches (e.g. two reviews) keeps only the
+        // later one — the deliberate token-cost ceiling, not a per-branch fan-in.
         let mut latest: std::collections::HashMap<&'static str, InputSection> =
             std::collections::HashMap::new();
         let mut refs_worktree = false;

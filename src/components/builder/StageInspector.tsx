@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { X } from "lucide-react";
 import { ModelPicker } from "../ModelPicker";
 import { Listbox } from "../controls/Listbox";
@@ -42,6 +43,14 @@ export function StageInspector({ node, ancestors, loop, onPatch, onSetLoop, onCl
   const a = archetypeFor(data.role);
   const isCli = data.substrate === "cli";
   const grantedSet = new Set(data.tools ?? TOOLS.map((t) => t.id));
+
+  // Remember the last real loop config so toggling "don't loop" and back
+  // doesn't silently reset the cap/mode to the defaults.
+  const lastLoop = useRef<{ max: number; mode: "gated" | "auto" }>({ max: loop.max, mode: loop.mode });
+  const applyLoop = (next: LoopState) => {
+    if (next.target !== null) lastLoop.current = { max: next.max, mode: next.mode };
+    onSetLoop(next);
+  };
 
   const toggleTool = (toolId: string) => {
     const next = new Set(grantedSet);
@@ -166,7 +175,13 @@ export function StageInspector({ node, ancestors, loop, onPatch, onSetLoop, onCl
             <Listbox
               value={loop.target ?? ""}
               options={[{ value: "", label: "— don't loop —" }, ...ancestors]}
-              onChange={(v) => onSetLoop({ ...loop, target: v || null })}
+              onChange={(v) =>
+                applyLoop(
+                  v
+                    ? { target: v, max: lastLoop.current.max, mode: lastLoop.current.mode }
+                    : { ...loop, target: null },
+                )
+              }
               placeholder="— don't loop —"
               ariaLabel="Loop target"
               className="w-full"
@@ -176,9 +191,9 @@ export function StageInspector({ node, ancestors, loop, onPatch, onSetLoop, onCl
             <div className="flex items-center justify-between gap-2 pt-1">
               <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-mute">
                 max ×
-                <Stepper value={loop.max} min={1} max={9} onChange={(v) => onSetLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
+                <Stepper value={loop.max} min={1} max={9} onChange={(v) => applyLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
               </label>
-              <SegmentedControl options={MODE_OPTIONS} value={loop.mode} onChange={(v) => onSetLoop({ ...loop, mode: v })} ariaLabel="Loop mode" />
+              <SegmentedControl options={MODE_OPTIONS} value={loop.mode} onChange={(v) => applyLoop({ ...loop, mode: v })} ariaLabel="Loop mode" />
             </div>
           </Reveal>
         </div>

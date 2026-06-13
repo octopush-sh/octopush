@@ -79,6 +79,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // Cascades click-to-add nodes so repeated palette clicks don't stack at one point.
+  const addCascade = useRef(0);
 
   const validation = useMemo(() => validateGraph(nodes, edges), [nodes, edges]);
 
@@ -100,7 +102,9 @@ function BuilderInner({ pipeline, onClose }: Props) {
         (() => {
           const rect = wrapperRef.current?.getBoundingClientRect();
           if (!rect) return { x: 0, y: 0 };
-          return rf.screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+          const center = rf.screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+          const k = addCascade.current++ % 6; // step each click-add off the center
+          return { x: center.x + k * 30, y: center.y + k * 30 };
         })();
       const node: StageNodeT = { id: newId(), type: "stage", position: pos, data: newStageData(role) };
       setNodes((ns) => ns.concat(node));
@@ -250,57 +254,59 @@ function BuilderInner({ pipeline, onClose }: Props) {
       </div>
 
       <div ref={wrapperRef} className="octo-flow relative min-h-0 flex-1" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
-        <ReactFlow<StageNodeT, StageEdge>
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onBeforeDelete={onBeforeDelete}
-          onNodesDelete={onNodesDelete}
-          onNodeClick={(_, n) => setSelectedId(n.id)}
-          onPaneClick={() => setSelectedId(null)}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          defaultEdgeOptions={defaultEdgeOptions}
-          minZoom={0.4}
-          maxZoom={1.75}
-          fitView
-          fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
-          proOptions={{ hideAttribution: true }}
-          className="bg-transparent"
+        {/* The provider must wrap ReactFlow so the custom node components it
+            renders can read validation / selection / the remove handler. */}
+        <BuilderProvider
+          value={{ validation: validation.byNode, selectedId, onRemove: removeNode, canRemove: nodes.length > 1 }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
-          <Controls showInteractive={false} className="octo-flow-controls" />
-          <MiniMap
-            pannable
-            zoomable
-            className="octo-flow-minimap"
-            maskColor="rgba(12,10,8,0.72)"
-            nodeColor={() => tokens.hairline}
-            nodeStrokeColor={() => tokens.brassDim}
-          />
-          <BuilderProvider
-            value={{ validation: validation.byNode, selectedId, onRemove: removeNode, canRemove: nodes.length > 1 }}
+          <ReactFlow<StageNodeT, StageEdge>
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            onBeforeDelete={onBeforeDelete}
+            onNodesDelete={onNodesDelete}
+            onNodeClick={(_, n) => setSelectedId(n.id)}
+            onPaneClick={() => setSelectedId(null)}
+            nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            defaultEdgeOptions={defaultEdgeOptions}
+            minZoom={0.4}
+            maxZoom={1.75}
+            fitView
+            fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+            proOptions={{ hideAttribution: true }}
+            className="bg-transparent"
           >
+            <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
+            <Controls showInteractive={false} className="octo-flow-controls" />
+            <MiniMap
+              pannable
+              zoomable
+              className="octo-flow-minimap"
+              maskColor="rgba(12,10,8,0.72)"
+              nodeColor={() => tokens.hairline}
+              nodeStrokeColor={() => tokens.brassDim}
+            />
             <Panel position="top-left">
               <NodePalette onAdd={addNode} />
             </Panel>
-          </BuilderProvider>
-          {selectedNode && (
-            <Panel position="top-right" className="!m-3 max-h-[calc(100%-1.5rem)]">
-              <StageInspector
-                key={selectedNode.id}
-                node={selectedNode}
-                ancestors={loopTargets}
-                loop={loopState}
-                onPatch={(p) => patchData(selectedNode.id, p)}
-                onSetLoop={setLoop}
-                onClose={() => setSelectedId(null)}
-              />
-            </Panel>
-          )}
-        </ReactFlow>
+            {selectedNode && (
+              <Panel position="top-right" className="!m-3 max-h-[calc(100%-1.5rem)]">
+                <StageInspector
+                  key={selectedNode.id}
+                  node={selectedNode}
+                  ancestors={loopTargets}
+                  loop={loopState}
+                  onPatch={(p) => patchData(selectedNode.id, p)}
+                  onSetLoop={setLoop}
+                  onClose={() => setSelectedId(null)}
+                />
+              </Panel>
+            )}
+          </ReactFlow>
+        </BuilderProvider>
       </div>
 
       <div className="flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-8 py-3">

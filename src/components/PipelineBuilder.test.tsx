@@ -10,7 +10,18 @@ vi.mock("@xyflow/react", async () => {
   const React = await import("react");
   const Frag = ({ children }: any) => React.createElement(React.Fragment, null, children);
   return {
-    ReactFlow: ({ children }: any) => React.createElement("div", { "data-testid": "flow" }, children),
+    // Render the real custom node components through nodeTypes so a node that
+    // reads context (useBuilder) is exercised — catches provider-scope bugs.
+    ReactFlow: ({ children, nodes, nodeTypes }: any) =>
+      React.createElement(
+        "div",
+        { "data-testid": "flow" },
+        (nodes ?? []).map((n: any) => {
+          const Comp = nodeTypes?.[n.type];
+          return Comp ? React.createElement(Comp, { key: n.id, id: n.id, data: n.data, selected: false }) : null;
+        }),
+        children,
+      ),
     ReactFlowProvider: Frag,
     Background: () => null,
     BackgroundVariant: { Dots: "dots" },
@@ -92,6 +103,14 @@ describe("PipelineBuilder (node canvas)", () => {
     // The palette offers archetypes to drop.
     expect(screen.getByText("Stages")).toBeInTheDocument();
     expect(screen.getByText("Code review")).toBeInTheDocument();
+  });
+
+  it("renders the stage nodes inside the builder context (no provider-scope crash)", () => {
+    // The default new-pipeline node is an "Implement" stage; it must render
+    // without throwing from useBuilder (provider must wrap ReactFlow's nodes).
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // "Implement" appears both in the palette and as the node title.
+    expect(screen.getAllByText("Implement").length).toBeGreaterThanOrEqual(2);
   });
 
   it("save compiles the canvas graph into topologically-ordered drafts", async () => {

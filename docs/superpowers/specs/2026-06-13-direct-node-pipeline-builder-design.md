@@ -75,7 +75,18 @@ do not feed each other are *isolated in context*. We make this honest by moving
 the dossier from "every earlier position" to **"my ancestors only"** (§5). A
 critic on branch B never sees a sibling branch A's artifact unless A is an
 actual ancestor. Joins are real: a node with two incoming flow edges receives
-the freshest artifact of each kind from *both* upstream branches.
+the freshest artifact of each kind from its upstream branches (bounded to one
+section per artifact kind — the existing token ceiling, so two same-kind
+branches collapse to the latest).
+
+The authored-vs-legacy choice is made **once per run**, not per stage: a run is
+"authored" if *any* stage records parents. In an authored run a parentless node
+is a genuine entry and feeds from nothing — so multiple independent entry roots
+are allowed (parallel starts that converge at a join), and a second root never
+inherits the first. A legacy run (no parents anywhere) keeps the original
+"every earlier stage" behavior byte-for-byte. The same per-run rule governs
+`loop_back`: in an authored graph it re-runs only the review's lineage (its
+ancestors) within the position window, never a sibling branch.
 
 ### Save = compile the graph to the existing linear model
 
@@ -195,9 +206,12 @@ Option<String>`.
 
 ## 6. Validation rules (live badges + save block)
 
-Hard (block save): empty graph; no name; a flow cycle; more than one entry
-(unreachable nodes); a node missing a model; max turns ∉ 1..100; a loop edge
-from a non-review archetype or to a non-ancestor; tool list empty when set.
+Hard (block save): empty graph; no name; a flow cycle; a node missing a model;
+max turns ∉ 1..100; a loop edge from a non-review archetype or to a node that
+is not a flow-ancestor of the review; tool list empty when set. (The
+ancestry rule is enforced on both the TS side and authoritatively in
+`validate_pipeline_stages`.) Multiple entry roots are allowed — they model
+parallel starts that converge at a join.
 
 Soft (warn, non-blocking, brass-amber badge + tooltip): `implement`/`fix`/`test`
 without a write or run tool; an `auto` loop (verdict parsing caveat, as today);

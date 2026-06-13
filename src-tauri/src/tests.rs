@@ -2329,6 +2329,21 @@ mod pipeline_crud_tests {
         let mut ok_instr = draft("plan");
         ok_instr.instructions = Some("Focus on the auth module.".into());
         assert!(validate_pipeline_stages(&[ok_instr]).is_ok());
+
+        // In an authored graph, a loop must return to an ANCESTOR of the review,
+        // not merely an earlier position (a sibling branch).
+        let p = draft("plan"); // pos 0
+        let mut ia = draft("implement"); ia.parents = vec![0]; // pos 1 (branch A)
+        let mut ib = draft("implement"); ib.parents = vec![0]; // pos 2 (branch B, sibling)
+        let mut rv = draft("code_review");
+        rv.parents = vec![1];
+        rv.loop_max_iterations = 2;
+        rv.loop_mode = Some("gated".into());
+        rv.loop_target_position = Some(2); // sibling branch B — NOT an ancestor of the review
+        assert!(validate_pipeline_stages(&[p.clone(), ia.clone(), ib.clone(), rv.clone()]).is_err());
+        let mut rv_ok = rv.clone();
+        rv_ok.loop_target_position = Some(0); // the shared ancestor — fine
+        assert!(validate_pipeline_stages(&[p, ia, ib, rv_ok]).is_ok());
     }
 
     #[test]
@@ -5291,5 +5306,20 @@ mod ancestry_tests {
 
         // The entry has no ancestors.
         assert!(ancestors_of(&stages, 0).is_empty());
+    }
+
+    #[test]
+    fn independent_roots_stay_isolated_until_they_join() {
+        // Two independent entries (both parentless) feed one join. This is the
+        // regression case for the multi-root leak: a parentless stage at a
+        // non-zero position must have EMPTY ancestors (it feeds from nothing),
+        // and the join must see both roots.
+        let stages = vec![
+            rs(0, vec![]),       // root A
+            rs(1, vec![]),       // root B — parentless but NOT position 0
+            rs(2, vec![0, 1]),   // join
+        ];
+        assert!(ancestors_of(&stages, 1).is_empty(), "a second root must not inherit the first root");
+        assert_eq!(ancestors_of(&stages, 2), [0, 1].into_iter().collect());
     }
 }

@@ -2325,12 +2325,30 @@ const KNOWN_ROLES: &[&str] = &[
 ];
 const REVIEW_ROLES: &[&str] = &["plan_review", "code_review", "critique", "verify"];
 
+/// Transitive flow-ancestors of stage `idx`, following `parents` (positions).
+/// Assumes parents reference earlier indices (validated before this is used).
+fn draft_ancestors(stages: &[StageDraft], idx: usize) -> std::collections::HashSet<i64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<i64> = stages[idx].parents.clone();
+    while let Some(p) = stack.pop() {
+        if p < 0 || p as usize >= stages.len() || !seen.insert(p) {
+            continue;
+        }
+        stack.extend(stages[p as usize].parents.iter().copied());
+    }
+    seen
+}
+
 /// Validate a pipeline's stage drafts (the §3.7 builder contract). Pure.
 pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResult<()> {
     use crate::error::AppError;
     if stages.is_empty() {
         return Err(AppError::Other("a pipeline needs at least one stage".into()));
     }
+    // An authored graph records parents; a legacy/linear draft does not. The
+    // loop-target-is-ancestor rule only applies to authored graphs (a linear
+    // draft has no parents, so "earlier position" is the right contract there).
+    let authored = stages.iter().any(|s| !s.parents.is_empty());
     for (i, s) in stages.iter().enumerate() {
         if !KNOWN_ROLES.contains(&s.role.as_str()) {
             return Err(AppError::Other(format!("unknown stage role '{}'", s.role)));
@@ -2399,6 +2417,14 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
                 }
                 if target < 0 || target >= i as i64 {
                     return Err(AppError::Other("loop target must be an earlier stage".into()));
+                }
+                // In an authored graph the loop must return to a stage on the
+                // review's own path; otherwise loop_back can't re-run it (the
+                // dossier and reset both follow ancestry, not raw position).
+                if authored && !draft_ancestors(stages, i).contains(&target) {
+                    return Err(AppError::Other(
+                        "loop target must be an earlier stage on the review's own path".into(),
+                    ));
                 }
                 if s.loop_max_iterations < 1 {
                     return Err(AppError::Other("loop max iterations must be at least 1".into()));

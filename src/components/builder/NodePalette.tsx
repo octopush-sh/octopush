@@ -1,13 +1,5 @@
-import { FileText, Eye, Code2, FlaskConical, StickyNote } from "lucide-react";
-import { ARCHETYPES, type ArtifactKind } from "./graph";
-
-const ARTIFACT_ICON: Record<ArtifactKind, typeof FileText> = {
-  plan: FileText,
-  review: Eye,
-  diff: Code2,
-  tests: FlaskConical,
-  note: StickyNote,
-};
+import { ARCHETYPES } from "./graph";
+import { ARTIFACT_ICON } from "./icons";
 
 export const ARCHETYPE_DND_MIME = "application/octopush-archetype";
 

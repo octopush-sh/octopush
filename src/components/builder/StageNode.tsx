@@ -1,16 +1,9 @@
 import { memo } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { FileText, Eye, Code2, FlaskConical, StickyNote, X, AlertTriangle } from "lucide-react";
-import { archetypeFor, stageLabel, TOOLS, type ArtifactKind, type StageNode as StageNodeT } from "./graph";
+import { X, AlertTriangle } from "lucide-react";
+import { archetypeFor, stageLabel, TOOLS, type StageNode as StageNodeT } from "./graph";
+import { ARTIFACT_ICON } from "./icons";
 import { useBuilder } from "./BuilderContext";
-
-const ARTIFACT_ICON: Record<ArtifactKind, typeof FileText> = {
-  plan: FileText,
-  review: Eye,
-  diff: Code2,
-  tests: FlaskConical,
-  note: StickyNote,
-};
 
 /** A short, human model id: drop the provider prefix and date suffix noise. */
 function shortModel(model: string): string {
@@ -32,9 +25,13 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
         ? "border-octo-warning"
         : "border-octo-hairline";
 
-  const granted = (toolId: string) => data.tools === null || data.tools.includes(toolId);
-  const toolSummary =
-    data.tools === null
+  // The CLI agent manages its own tools, so the allowlist doesn't apply there —
+  // show it as "managed" rather than implying a restriction we don't enforce.
+  const cliManaged = data.substrate === "cli";
+  const granted = (toolId: string) => cliManaged || data.tools === null || data.tools.includes(toolId);
+  const toolSummary = cliManaged
+    ? "Managed by the CLI agent"
+    : data.tools === null
       ? "All tools"
       : TOOLS.filter((t) => granted(t.id)).map((t) => t.label).join(" · ") || "No tools";
 

@@ -256,7 +256,9 @@ export function graphToStageDrafts(nodes: StageNode[], edges: StageEdge[]): Stag
       posX: n.position.x,
       posY: n.position.y,
       parents,
-      tools: d.tools && d.tools.length > 0 ? d.tools : null,
+      // The CLI substrate owns its own tools, so a tool allowlist is meaningless
+      // there — persist null rather than a list the runner silently ignores.
+      tools: d.substrate === "cli" ? null : d.tools && d.tools.length > 0 ? d.tools : null,
       customName: name && name.length > 0 ? name : null,
       instructions: instr && instr.length > 0 ? instr : null,
     };
@@ -361,6 +363,8 @@ export function validateGraph(nodes: StageNode[], edges: StageEdge[]): GraphVali
     const a = archetypeFor(n.data.role);
     if (!n.data.agentModel || n.data.agentModel.trim() === "") {
       addErr(n.id, `${stageLabel(n.data)} has no model.`);
+    } else if (n.data.substrate === "cli" && !/claude/i.test(n.data.agentModel)) {
+      addWarn(n.id, `${stageLabel(n.data)} runs on the CLI (Claude Code) — pick a Claude model.`);
     }
     if (n.data.maxIterations < 1 || n.data.maxIterations > 100) {
       addErr(n.id, `${stageLabel(n.data)}: max turns must be 1–100.`);

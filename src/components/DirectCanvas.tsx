@@ -72,8 +72,10 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     watchedStage.current = { stageId, status };
   }, [selectedStageId, detail, viewedId, selectStage]); // eslint-disable-line react-hooks/exhaustive-deps -- stages derives from detail
 
+  // Key the builder on its target so switching which pipeline is edited
+  // remounts the canvas (its node/edge state is seeded once on mount).
   const canvasKey =
-    builder !== undefined ? "builder" : !viewedId || !run ? "launcher" : `run:${viewedId}`;
+    builder !== undefined ? `builder:${builder ?? "new"}` : !viewedId || !run ? "launcher" : `run:${viewedId}`;
 
   let body: ReactElement;
   if (builder !== undefined) {
