@@ -1,5 +1,5 @@
 // Splits assistant content into a lead "key phrase" (rendered as Spectral
-// italic display) and a body (rendered as markdown).
+// upright serif display) and a body (rendered as markdown).
 //
 // Returns `keyPhrase: null` when the parse should be skipped — content
 // starts with a code block, heading, list, has no sentence terminator,

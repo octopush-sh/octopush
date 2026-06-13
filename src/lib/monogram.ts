@@ -5,7 +5,7 @@
 import type { Workspace, TintName } from "./types";
 
 export interface MonogramConfig {
-  /** Single character to render (Spectral italic). */
+  /** Single character to render (Spectral upright serif). */
   glyph: string;
   /** Tint preset name — controls the icon's accent + background only. */
   tint: TintName;
