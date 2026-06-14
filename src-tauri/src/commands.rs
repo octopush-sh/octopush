@@ -852,6 +852,14 @@ pub async fn list_chat_messages(
     state.db.lock().list_chat_messages(&workspace_id)
 }
 
+/// Request that the in-flight agentic turn for this workspace stop. The loop
+/// halts before its next iteration (or next tool) and emits the done event.
+#[tauri::command]
+pub async fn cancel_chat(state: State<'_, AppState>, workspace_id: String) -> AppResult<()> {
+    state.chat.cancel(&workspace_id);
+    Ok(())
+}
+
 // ─── Direct-mode orchestration commands ──────────────────────────
 
 #[tauri::command]

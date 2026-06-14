@@ -29,10 +29,12 @@ vi.mock("../lib/ipc", () => ({
   ipc: {
     sendChatMessage: vi.fn().mockResolvedValue(undefined),
     listChatMessages: vi.fn().mockResolvedValue([]),
+    cancelChat: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
-const { useChatStore } = await import("./chatStore");
+const { useChatStore, EFFORT_MAX_TOKENS } = await import("./chatStore");
+const { ipc } = await import("../lib/ipc");
 
 function emit(eventName: string, payload: unknown) {
   const h = handlers[eventName];
@@ -309,6 +311,34 @@ describe("chatStore — assistant_tool_use rendering", () => {
     // Only the user message survives — the bookkeeping row is hidden.
     expect(timeline).toHaveLength(1);
     expect(timeline[0].kind).toBe("message");
+  });
+});
+
+describe("chatStore — stop + effort (P3)", () => {
+  beforeEach(() => {
+    resetStore();
+    useChatStore.setState({ effort: "standard" });
+    vi.clearAllMocks();
+  });
+
+  it("stop() calls ipc.cancelChat for the workspace", () => {
+    useChatStore.getState().stop("ws-1");
+    expect(ipc.cancelChat).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("send() uses the effort's max-tokens budget", async () => {
+    useChatStore.getState().setEffort("deep");
+    await useChatStore.getState().send("ws-1", "/tmp", "hi");
+    expect(ipc.sendChatMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ maxTokens: EFFORT_MAX_TOKENS.deep }),
+    );
+
+    vi.clearAllMocks();
+    useChatStore.getState().setEffort("swift");
+    await useChatStore.getState().send("ws-1", "/tmp", "hi");
+    expect(ipc.sendChatMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ maxTokens: EFFORT_MAX_TOKENS.swift }),
+    );
   });
 });
 

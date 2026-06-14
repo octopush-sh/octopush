@@ -45,6 +45,16 @@ interface ToolEndEvent {
   durationMs: number;
 }
 
+/** Generation effort presets — map to the output-token budget (and, later,
+ *  thinking budget). Swift is cheap/snappy; Deep gives the model more room. */
+export type Effort = "swift" | "standard" | "deep";
+
+export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
+  swift: 8192,
+  standard: 32768,
+  deep: 64000,
+};
+
 /** A display item in the conversation — either a regular message, tool execution, or persisted error. */
 export type ConversationItem =
   | { kind: "message"; message: ChatMessage }
@@ -120,6 +130,8 @@ interface ChatState {
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
+  /** Global generation-effort preference (maps to the output-token budget). */
+  effort: Effort;
 
   // Selectors (read-only, scoped by workspaceId)
   getMessages: (workspaceId: string) => ChatMessage[];
@@ -138,6 +150,10 @@ interface ChatState {
     systemPrompt?: string,
   ) => Promise<void>;
   setModel: (model: string) => void;
+  setEffort: (effort: Effort) => void;
+  /** Stop the in-flight turn for this workspace (best-effort; backend halts
+   *  before its next iteration/tool and emits the done event). */
+  stop: (workspaceId: string) => void;
   clear: (workspaceId: string) => void;
   clearError: (workspaceId: string) => void;
 }
@@ -287,6 +303,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     errorByWs: {},
     liveToolsByWs: {},
     model: "claude-sonnet-4-6",
+    effort: "standard",
 
     getMessages: (workspaceId) => get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES,
     getStreaming: (workspaceId) => get().streamingByWs[workspaceId] ?? false,
@@ -333,7 +350,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           model: get().model,
           userMessage: content,
           system: systemPrompt,
-          maxTokens: 8192,
+          maxTokens: EFFORT_MAX_TOKENS[get().effort],
         });
       } catch (e) {
         set((s) => ({
@@ -345,6 +362,13 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     setModel: (model) => set({ model }),
+    setEffort: (effort) => set({ effort }),
+
+    stop: (workspaceId) => {
+      // Fire-and-forget; the backend emits `chat://stream` done which clears
+      // the streaming flag, so we don't optimistically flip it here.
+      void ipc.cancelChat(workspaceId).catch(() => {});
+    },
 
     clear: (workspaceId) =>
       set((s) => ({

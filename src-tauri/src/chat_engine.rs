@@ -19,7 +19,9 @@ use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use chrono;
@@ -324,9 +326,27 @@ pub(crate) fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, 
 
 // ─── Engine ───────────────────────────────────────────────────────
 
+/// Removes a workspace's cancel flag from the registry when the turn ends,
+/// no matter which of `send_agentic`'s many exit paths is taken.
+struct CancelGuard {
+    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    key: String,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.cancels.lock().remove(&self.key);
+    }
+}
+
 pub struct ChatEngine {
     client: Client,
     db: Arc<Mutex<Db>>,
+    /// Per-workspace cancellation flags. A live `send_agentic` registers its
+    /// flag here for the duration of the turn; `cancel` raises it so the
+    /// agentic loop stops before its next iteration. Mirrors the orchestrator's
+    /// cancel registry.
+    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl ChatEngine {
@@ -335,7 +355,48 @@ impl ChatEngine {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
             db,
+            cancels: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Request cancellation of the in-flight turn for `workspace_id`, if any.
+    /// No-op when nothing is running. The loop checks the flag between
+    /// iterations and after each tool, then stops cleanly.
+    pub fn cancel(&self, workspace_id: &str) {
+        if let Some(flag) = self.cancels.lock().get(workspace_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Persist a brief "stopped" note and emit the done event so the frontend
+    /// clears its streaming state when a turn is cancelled mid-flight.
+    fn finish_stopped(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        model: &str,
+        total_input: u64,
+        total_output: u64,
+    ) -> AppResult<()> {
+        let cost = token_engine::compute_cost(model, total_input, total_output, 0, 0);
+        self.insert_and_emit_message(
+            app,
+            workspace_id,
+            "assistant",
+            "Generation stopped.",
+            Some(model),
+            Some(total_input as i64),
+            Some(total_output as i64),
+            Some(cost),
+        )?;
+        let _ = app.emit("chat://stream", &ChatStreamEvent {
+            workspace_id: workspace_id.to_string(),
+            delta: String::new(),
+            done: true,
+            input_tokens: Some(total_input),
+            output_tokens: Some(total_output),
+        });
+        Ok(())
     }
 
     /// Insert a message into the DB and emit a `chat://message-added` event
@@ -380,6 +441,18 @@ impl ChatEngine {
         let (provider, api_base, api_key) = resolve_provider(&request.model)?;
 
         let workspace_path = std::path::PathBuf::from(&request.workspace_path);
+
+        // Register a fresh cancellation flag for this turn. The guard removes it
+        // from the registry on every exit path (Drop). Replaces any stale flag
+        // from a previous turn for the same workspace.
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels
+            .lock()
+            .insert(request.workspace_id.clone(), Arc::clone(&cancel));
+        let _cancel_guard = CancelGuard {
+            cancels: Arc::clone(&self.cancels),
+            key: request.workspace_id.clone(),
+        };
 
         // Persist user message and emit message-added so the frontend learns the DB id.
         self.insert_and_emit_message(
@@ -469,9 +542,19 @@ impl ChatEngine {
 
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..MAX_TOOL_ITERATIONS {
+            // Stop cleanly if the user cancelled this turn (checked here and
+            // after each tool — the in-flight request itself isn't aborted).
+            if cancel.load(Ordering::Relaxed) {
+                self.finish_stopped(&app, &request.workspace_id, &request.model, total_input, total_output)?;
+                return Ok(());
+            }
+
             let llm_req = LlmRequest {
                 model: request.model.clone(),
-                max_tokens: 32768_u32.max(request.max_tokens),
+                // Honor the caller's requested budget (the EffortSelector sets
+                // it) with a sane floor; the old code force-clamped to 32768,
+                // silently ignoring the request.
+                max_tokens: request.max_tokens.max(4096),
                 system: system_prompt.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
@@ -648,6 +731,12 @@ impl ChatEngine {
             // Execute each tool, persist to DB, and collect results.
             let mut tool_results: Vec<LlmToolResult> = Vec::new();
             for u in &response.tool_uses {
+                // Honor a cancel that landed between tools — stop before
+                // kicking off another (possibly long) tool.
+                if cancel.load(Ordering::Relaxed) {
+                    self.finish_stopped(&app, &request.workspace_id, &request.model, total_input, total_output)?;
+                    return Ok(());
+                }
                 tracing::info!(tool = %u.name, "executing tool");
 
                 // Build the display-safe input ONCE, up front: strip large

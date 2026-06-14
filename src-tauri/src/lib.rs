@@ -173,6 +173,7 @@ pub fn run() {
             // Chat
             commands::send_chat_message,
             commands::list_chat_messages,
+            commands::cancel_chat,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,

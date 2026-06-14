@@ -400,6 +400,8 @@ export const ipc = {
     maxTokens: number;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (workspaceId: string) => invoke<ChatMessage[]>("list_chat_messages", { workspaceId }),
+  /** Stop the in-flight agentic turn for this workspace. */
+  cancelChat: (workspaceId: string) => invoke<void>("cancel_chat", { workspaceId }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
