@@ -3075,6 +3075,7 @@ mod orchestrator_tests {
         let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
             feedback: Some("tighten it".into()),
             model_override: None,
+            max_turns_override: None,
         }).await.unwrap();
         assert_eq!(status, RunStatus::Paused);
         let stages = db.lock().list_run_stages(&run_id).unwrap();
@@ -3551,6 +3552,7 @@ mod orchestrator_tests {
         orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
             feedback: Some("tighten it".into()),
             model_override: None,
+            max_turns_override: None,
         }).await.unwrap();
 
         let iters = db.lock().list_stage_iterations(&refine_id).unwrap();
@@ -3849,7 +3851,7 @@ mod orchestrator_tests {
         let (orch, run_id, db) = budgeted_run(2, 0.02, Some(0.01));
         orch.run_to_pause(&run_id).await.unwrap();
         let status = orch
-            .resolve_checkpoint(&run_id, CheckpointAction::Reject { feedback: None, model_override: None })
+            .resolve_checkpoint(&run_id, CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None })
             .await
             .unwrap();
         assert_eq!(status, RunStatus::Paused);

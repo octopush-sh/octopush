@@ -848,12 +848,17 @@ impl Orchestrator {
             CheckpointAction::Reject {
                 feedback,
                 model_override,
+                max_turns_override,
             } => {
                 if let Some(s) = &blocked {
                     // Archive the rejected attempt before the reset wipes it.
                     if s.artifact.is_some() || s.error.is_some() {
                         self.db.lock().archive_stage_attempt(s, feedback.as_deref())?;
                     }
+                    if let Some(mt) = max_turns_override {
+                        self.db.lock().set_stage_max_iterations(&s.id, mt)?;
+                    }
+                    self.db.lock().set_stage_resume_pending(&s.id, false)?;
                     self.db.lock().reset_run_stage(
                         &s.id,
                         model_override.as_deref(),
@@ -862,7 +867,7 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
-            CheckpointAction::Resume => {
+            CheckpointAction::Resume { max_turns_override } => {
                 // Recover a transient/infra halt: re-run the SAME stage without
                 // treating its output as wrong. Only a failed stage can resume —
                 // an awaiting_checkpoint stage isn't a failure, so this is a no-op
@@ -870,6 +875,8 @@ impl Orchestrator {
                 // retired so the cost meter stays truthful, then the stage resets
                 // to pending and the drive re-runs it. The worktree is untouched,
                 // so a code stage picks up from the files already on disk.
+                // For a CLI stage with a session id, resume_pending is set so the
+                // next run uses `--resume` to continue the same Claude session.
                 if let Some(s) = &blocked {
                     if s.status == "failed" {
                         if s.artifact.is_some() || s.error.is_some() {
@@ -881,8 +888,28 @@ impl Orchestrator {
                             s.input_tokens,
                             s.output_tokens,
                         )?;
+                        if let Some(mt) = max_turns_override {
+                            self.db.lock().set_stage_max_iterations(&s.id, mt)?;
+                        }
+                        let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                        self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
+                    }
+                }
+            }
+            CheckpointAction::Discard => {
+                // Revert the worktree to the failed stage's baseline commit,
+                // dropping only the changes this stage introduced. The stage
+                // stays failed and the run stays paused at the same checkpoint
+                // (drive_inner sees the failed stage and returns Paused immediately).
+                if let Some(s) = &blocked {
+                    if let Some(baseline) = s.baseline_commit.clone() {
+                        let run = self.db.lock().get_run(run_id)?
+                            .ok_or_else(|| crate::error::AppError::Other("run not found".into()))?;
+                        let ws = self.workspace_path(&run)?;
+                        crate::orchestrator::git_baseline::restore_baseline(&ws, &baseline)?;
+                        self.record_halt(run_id, &s.id, "changes discarded — worktree reverted to the stage baseline");
                     }
                 }
             }

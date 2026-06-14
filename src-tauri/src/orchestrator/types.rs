@@ -249,18 +249,22 @@ pub enum CheckpointAction {
     Reject {
         feedback: Option<String>,
         model_override: Option<String>,
+        max_turns_override: Option<i64>,
     },
     /// Route work back to the review stage's `loop_target` (re-run the target +
     /// intervening stages with the reviewer's findings), bounded by the cap.
     SendBack {
         feedback: Option<String>,
     },
-    /// Re-run a stage that halted on a *transient* fault (rate limit, overload,
-    /// 5xx, dropped connection). Unlike `Reject`, it carries no feedback or model
-    /// change — the work wasn't wrong, the substrate was briefly unavailable. The
-    /// prior attempt's spend is retired (kept truthful) and the worktree is left
-    /// intact so a code stage continues from the files already on disk.
-    Resume,
+    /// Recover a halted stage. For a CLI stage with a session id, the re-run
+    /// `--resume`s that session; otherwise it is a fresh re-run (worktree
+    /// preserved). `max_turns_override` raises the tool-turn budget.
+    Resume {
+        max_turns_override: Option<i64>,
+    },
+    /// Revert the worktree to the failed stage's baseline (drop only this
+    /// stage's changes). The stage stays failed; the checkpoint stays open.
+    Discard,
     /// Artifact was edited out-of-band; continue.
     Edit,
     Abort,
