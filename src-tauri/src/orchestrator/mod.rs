@@ -3,9 +3,10 @@
 
 pub mod agentic;
 pub mod cli_runner;
-pub mod live;
 pub mod cost;
 pub mod events;
+pub mod git_baseline;
+pub mod live;
 pub mod persist;
 pub mod runner;
 pub mod types;

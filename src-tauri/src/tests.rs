@@ -5433,3 +5433,55 @@ mod cli_result_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod git_baseline_tests {
+    #[test]
+    fn baseline_round_trip_reverts_only_stage_changes() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| { Command::new("git").args(args).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("keep.txt"), "from fix\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("keep.txt"), "from fix EDITED\n").unwrap();
+        std::fs::write(dir.join("preexisting_untracked.txt"), "user file\n").unwrap();
+
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        std::fs::write(dir.join("keep.txt"), "verify CLOBBERED\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/new.rs"), "half edit\n").unwrap();
+
+        restore_baseline(&dir, &baseline).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "from fix EDITED\n", "fix's work preserved");
+        assert_eq!(std::fs::read_to_string(dir.join("preexisting_untracked.txt")).unwrap(), "user file\n", "pre-existing untracked preserved");
+        assert!(!dir.join("sub/new.rs").exists(), "verify's new file removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_restores_a_file_deleted_during_the_stage() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| { Command::new("git").args(a).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]); git(&["config","user.email","t@t"]); git(&["config","user.name","t"]);
+        std::fs::write(dir.join("a.txt"), "A\n").unwrap();
+        git(&["add","-A"]); git(&["commit","-qm","init"]);
+        let baseline = capture_baseline(&dir).unwrap().unwrap();
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        restore_baseline(&dir, &baseline).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "A\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
