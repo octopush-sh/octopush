@@ -917,22 +917,6 @@ pub struct AttachmentData {
 pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
     use base64::Engine as _;
     let p = std::path::Path::new(&path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let media_type = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        other => {
-            return Err(crate::error::AppError::Other(format!(
-                "Unsupported attachment type: .{other} (images only)"
-            )))
-        }
-    };
     let bytes = std::fs::read(p)
         .map_err(|e| crate::error::AppError::Other(format!("Failed to read {path}: {e}")))?;
     if bytes.len() > 5_000_000 {
@@ -940,6 +924,29 @@ pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
             "Image too large (max 5 MB).".into(),
         ));
     }
+    // Detect the media type from the file's MAGIC BYTES (robust to a misleading
+    // extension, which the API would otherwise reject). Fall back to the
+    // extension only when the bytes don't match a known image signature.
+    let media_type = sniff_image_media_type(&bytes)
+        .or_else(|| {
+            match p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("png") => Some("image/png"),
+                Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+                Some("gif") => Some("image/gif"),
+                Some("webp") => Some("image/webp"),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            crate::error::AppError::Other(
+                "Unsupported attachment (images only: png, jpeg, gif, webp).".into(),
+            )
+        })?;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let name = p
         .file_name()
@@ -951,6 +958,21 @@ pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
         data,
         name,
     })
+}
+
+/// Identify a supported image type from its leading bytes, or None.
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 // ─── Direct-mode orchestration commands ──────────────────────────

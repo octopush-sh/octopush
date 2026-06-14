@@ -228,9 +228,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }
 
   function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    const imgs = Array.from(e.clipboardData.files).filter((f) =>
-      f.type.startsWith("image/"),
-    );
+    // Pasted screenshots live in clipboardData.items (kind 'file'), NOT in
+    // .files (which is empty for clipboard images in Chromium/WebKit).
+    const imgs = Array.from(e.clipboardData.items)
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => f != null);
     if (imgs.length > 0) {
       e.preventDefault();
       void addFiles(imgs);
@@ -278,7 +281,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
   const handleSend = useCallback(() => {
     const trimmed = inputRef.current.trim();
-    if (!trimmed || streaming || expandingRef.current) return;
+    // Allow an image-only send (attachments, no text).
+    const hasAttachments =
+      useChatStore.getState().getAttachments(workspaceId).length > 0;
+    if ((!trimmed && !hasAttachments) || streaming || expandingRef.current) return;
     setInput("");
     historyIdxRef.current = -1;
     closeMention();
@@ -405,7 +411,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const canSend =
     !streaming &&
     !expanding &&
-    input.trim().length > 0 &&
+    (input.trim().length > 0 || attachments.length > 0) &&
     (!isBudgetError || overrideActive);
 
   return (

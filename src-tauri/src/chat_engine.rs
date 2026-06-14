@@ -553,9 +553,16 @@ impl ChatEngine {
         // multimodal block carrying the text + image blocks. Attachments aren't
         // persisted, so they only ride along on the turn that sent them.
         if !request.attachments.is_empty() {
-            if let Some(last) = messages.last_mut() {
-                if last.role == LlmRole::User {
-                    let mut blocks = vec![LlmBlock::Text(request.user_message.clone())];
+            // The just-persisted user message is the last entry. Guard on its
+            // role; warn (rather than silently drop) if it's somehow not a user
+            // turn. The text block is omitted when empty (image-only sends),
+            // since providers reject empty text blocks.
+            match messages.last_mut() {
+                Some(last) if last.role == LlmRole::User => {
+                    let mut blocks: Vec<LlmBlock> = Vec::new();
+                    if !request.user_message.trim().is_empty() {
+                        blocks.push(LlmBlock::Text(request.user_message.clone()));
+                    }
                     for att in &request.attachments {
                         blocks.push(LlmBlock::Image {
                             media_type: att.media_type.clone(),
@@ -564,6 +571,9 @@ impl ChatEngine {
                     }
                     last.content = LlmContent::Multimodal(blocks);
                 }
+                _ => tracing::warn!(
+                    "attachments present but the last message isn't a user turn; images dropped"
+                ),
             }
         }
 

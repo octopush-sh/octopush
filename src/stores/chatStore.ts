@@ -501,6 +501,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
           streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
           errorByWs: { ...s.errorByWs, [workspaceId]: String(e) },
+          // Restore the staged attachments so a failed turn doesn't lose them.
+          attachmentsByWs: attachments.length
+            ? { ...s.attachmentsByWs, [workspaceId]: attachments }
+            : s.attachmentsByWs,
         }));
       }
     },
