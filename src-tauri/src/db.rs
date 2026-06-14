@@ -2146,6 +2146,10 @@ impl Db {
 
     /// Reset a stage to pending (for re-run), optionally overriding its model and
     /// recording reviewer feedback. Clears the prior artifact/error/finish time.
+    /// NOTE: `session_id`, `resume_pending`, and `baseline_commit` are intentionally
+    /// preserved — the UPDATE below does not list them. `resume_pending` is cleared
+    /// separately by the Resume action handler after it sets it, and `session_id` /
+    /// `baseline_commit` carry forward for the next run's `--resume` / Discard path.
     pub fn reset_run_stage(
         &self,
         stage_id: &str,
@@ -2232,6 +2236,24 @@ impl Db {
         self.conn.execute(
             "UPDATE run_stages SET session_id = ?2 WHERE id = ?1",
             params![stage_id, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark that the next run of this stage should `--resume` its session_id.
+    pub fn set_stage_resume_pending(&self, stage_id: &str, pending: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_pending = ?2 WHERE id = ?1",
+            params![stage_id, pending as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).
+    pub fn set_stage_max_iterations(&self, stage_id: &str, max_iterations: i64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET max_iterations = ?2 WHERE id = ?1",
+            params![stage_id, max_iterations.clamp(1, 100)],
         )?;
         Ok(())
     }
