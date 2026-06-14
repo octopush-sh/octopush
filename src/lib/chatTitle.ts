@@ -40,8 +40,13 @@ export function deriveChatTitle(messages: ChatMessage[]): string {
 export function deriveChatMeta(messages: ChatMessage[], now: Date = new Date()): string {
   const last = messages[messages.length - 1];
   if (!last) return "NEW";
+  return formatRelTime(last.createdAt, now);
+}
 
-  const then = new Date(last.createdAt);
+/** Short uppercase relative time (`JUST NOW`, `5M AGO`, `YESTERDAY`, a date)
+ *  from an ISO timestamp. Shared by the chat meta line and the thread list. */
+export function formatRelTime(iso: string, now: Date = new Date()): string {
+  const then = new Date(iso);
   if (Number.isNaN(then.getTime())) return "";
 
   const diffMs = now.getTime() - then.getTime();

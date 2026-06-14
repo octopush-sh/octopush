@@ -847,17 +847,53 @@ pub async fn send_chat_message(
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,
-    workspace_id: String,
+    thread_id: String,
 ) -> AppResult<Vec<crate::db::ChatMessageRow>> {
-    state.db.lock().list_chat_messages(&workspace_id)
+    state.db.lock().list_chat_messages(&thread_id)
 }
 
-/// Request that the in-flight agentic turn for this workspace stop. The loop
+/// Request that the in-flight agentic turn for this thread stop. The loop
 /// halts before its next iteration (or next tool) and emits the done event.
 #[tauri::command]
-pub async fn cancel_chat(state: State<'_, AppState>, workspace_id: String) -> AppResult<()> {
-    state.chat.cancel(&workspace_id);
+pub async fn cancel_chat(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    state.chat.cancel(&thread_id);
     Ok(())
+}
+
+// ─── Chat threads (conversations) ─────────────────────────────────
+
+#[tauri::command]
+pub async fn list_chat_threads(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Vec<crate::db::ChatThreadRow>> {
+    state.db.lock().list_chat_threads(&workspace_id)
+}
+
+#[tauri::command]
+pub async fn create_chat_thread(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    title: Option<String>,
+) -> AppResult<crate::db::ChatThreadRow> {
+    state
+        .db
+        .lock()
+        .create_chat_thread(&workspace_id, title.as_deref().unwrap_or("New conversation"))
+}
+
+#[tauri::command]
+pub async fn rename_chat_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    title: String,
+) -> AppResult<()> {
+    state.db.lock().rename_chat_thread(&thread_id, &title)
+}
+
+#[tauri::command]
+pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    state.db.lock().delete_chat_thread(&thread_id)
 }
 
 // ─── Direct-mode orchestration commands ──────────────────────────

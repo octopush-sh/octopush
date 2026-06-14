@@ -423,6 +423,34 @@ mod workspace_tests {
     }
 
     #[test]
+    fn chat_threads_crud_and_scoping() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+
+        // Two independent threads in one workspace.
+        let a = db.create_chat_thread("ws", "First").unwrap();
+        let b = db.create_chat_thread("ws", "Second").unwrap();
+        db.insert_chat_message("ws", &a.id, "user", "in A", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &b.id, "user", "in B", None, None, None, None).unwrap();
+
+        // list_chat_messages is scoped per thread.
+        assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 1);
+        assert_eq!(db.list_chat_messages(&a.id).unwrap()[0].content, "in A");
+        assert_eq!(db.list_chat_messages(&b.id).unwrap().len(), 1);
+
+        // Both threads listed for the workspace.
+        assert_eq!(db.list_chat_threads("ws").unwrap().len(), 2);
+
+        // Rename + delete (delete also removes the thread's messages).
+        db.rename_chat_thread(&a.id, "Renamed").unwrap();
+        assert!(db.list_chat_threads("ws").unwrap().iter().any(|t| t.title == "Renamed"));
+        db.delete_chat_thread(&a.id).unwrap();
+        assert_eq!(db.list_chat_threads("ws").unwrap().len(), 1);
+        assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 0);
+    }
+
+    #[test]
     fn insert_and_list_error_message() {
         let db = test_db();
         db.insert_project("proj-err", "Test Project", "/tmp/proj-err")
@@ -430,10 +458,12 @@ mod workspace_tests {
         db.insert_workspace("ws-err", "proj-err", "ws", "", "main", None, "", None)
             .unwrap();
 
-        db.insert_chat_message("ws-err", "user", "hello", None, None, None, None)
+        let thread = db.create_chat_thread("ws-err", "Conversation").unwrap();
+        db.insert_chat_message("ws-err", &thread.id, "user", "hello", None, None, None, None)
             .unwrap();
         db.insert_chat_message(
             "ws-err",
+            &thread.id,
             "error",
             "401 unauthorized — API key not configured",
             None,
@@ -443,7 +473,7 @@ mod workspace_tests {
         )
         .unwrap();
 
-        let messages = db.list_chat_messages("ws-err").unwrap();
+        let messages = db.list_chat_messages(&thread.id).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(
             messages.iter().any(|m| m.role == "error"),

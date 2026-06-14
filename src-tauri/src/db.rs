@@ -434,6 +434,69 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN custom_name TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN instructions TEXT")?;
 
+        // ── v11 chat threads: multiple conversations per workspace ──
+        // A `chat_threads` table + a nullable `thread_id` on chat_messages.
+        // Then a one-time backfill: every workspace that still has un-threaded
+        // messages gets one default thread, and its messages are assigned to it.
+        // The backfill is guarded by a COUNT so it's a no-op on every run after
+        // the first — consistent with the idempotent, user_version-free style
+        // used throughout this migrate().
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_threads (
+                id           TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                title        TEXT NOT NULL DEFAULT 'New conversation',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_threads_ws ON chat_threads(workspace_id, updated_at DESC);
+            "#,
+        )?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN thread_id TEXT")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
+        )?;
+        self.backfill_default_threads()?;
+
+        Ok(())
+    }
+
+    /// One-time backfill assigning a default thread to every workspace that has
+    /// pre-thread chat messages. No-op once every message is threaded.
+    fn backfill_default_threads(&self) -> AppResult<()> {
+        let pending: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE thread_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if pending == 0 {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let workspaces: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT workspace_id FROM chat_messages WHERE thread_id IS NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for ws in workspaces {
+            let tid = uuid::Uuid::new_v4().to_string();
+            self.conn.execute(
+                "INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at)
+                 VALUES (?1, ?2, 'Conversation', ?3, ?3)",
+                rusqlite::params![tid, ws, now],
+            )?;
+            self.conn.execute(
+                "UPDATE chat_messages SET thread_id = ?1 WHERE workspace_id = ?2 AND thread_id IS NULL",
+                rusqlite::params![tid, ws],
+            )?;
+        }
         Ok(())
     }
 
@@ -1070,6 +1133,7 @@ impl Db {
     pub fn insert_chat_message(
         &self,
         workspace_id: &str,
+        thread_id: &str,
         role: &str,
         content: &str,
         model: Option<&str>,
@@ -1079,11 +1143,70 @@ impl Db {
     ) -> AppResult<i64> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO chat_messages (workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![workspace_id, role, content, model, input_tokens, output_tokens, cost, now],
+            "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost, now],
         )?;
+        // Bump the thread's recency so the history list sorts most-recent-first.
+        let _ = self.conn.execute(
+            "UPDATE chat_threads SET updated_at = ?1 WHERE id = ?2",
+            params![now, thread_id],
+        );
         Ok(self.conn.last_insert_rowid())
+    }
+
+    // ─── Chat threads ─────────────────────────────────────────────
+
+    /// Create a new conversation thread for a workspace, returning its row.
+    pub fn create_chat_thread(&self, workspace_id: &str, title: &str) -> AppResult<ChatThreadRow> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?4)",
+            params![id, workspace_id, title, now],
+        )?;
+        Ok(ChatThreadRow {
+            id,
+            workspace_id: workspace_id.to_string(),
+            title: title.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// List a workspace's threads, most-recently-active first.
+    pub fn list_chat_threads(&self, workspace_id: &str) -> AppResult<Vec<ChatThreadRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, title, created_at, updated_at
+             FROM chat_threads WHERE workspace_id = ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![workspace_id], |r| {
+            Ok(ChatThreadRow {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                title: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn rename_chat_thread(&self, thread_id: &str, title: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_threads SET title = ?1 WHERE id = ?2",
+            params![title, thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a thread and its messages (messages are removed explicitly since
+    /// chat_messages has no FK to chat_threads).
+    pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
+        self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
+        Ok(())
     }
 
     // ─── Terminals ────────────────────────────────────────────────
@@ -1442,12 +1565,14 @@ impl Db {
         Ok(row)
     }
 
-    pub fn list_chat_messages(&self, workspace_id: &str) -> AppResult<Vec<ChatMessageRow>> {
+    /// List a single thread's messages in chronological order. (Scoped by
+    /// thread, not workspace — a workspace can hold several conversations.)
+    pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at
-             FROM chat_messages WHERE workspace_id = ?1 ORDER BY created_at",
+             FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(params![workspace_id], |r| {
+        let rows = stmt.query_map(params![thread_id], |r| {
             Ok(ChatMessageRow {
                 id: r.get(0)?,
                 workspace_id: r.get(1)?,
@@ -2249,6 +2374,16 @@ pub struct ChatMessageRow {
     pub output_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub created_at: String,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatThreadRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]

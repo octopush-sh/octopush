@@ -41,6 +41,7 @@ pub struct ChatMsg {
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequest {
     pub workspace_id: String,
+    pub thread_id: String, // The conversation this turn belongs to
     pub workspace_path: String, // The directory where tools execute
     pub model: String,
     pub user_message: String,
@@ -52,6 +53,7 @@ pub struct ChatRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ChatStreamEvent {
     pub workspace_id: String,
+    pub thread_id: String,
     pub delta: String,
     pub done: bool,
     pub input_tokens: Option<u64>,
@@ -67,6 +69,7 @@ pub struct ChatStreamEvent {
 #[serde(rename_all = "camelCase")]
 pub struct ToolStartEvent {
     pub workspace_id: String,
+    pub thread_id: String,
     pub call_id: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
@@ -80,6 +83,7 @@ pub struct ToolStartEvent {
 #[serde(rename_all = "camelCase")]
 pub struct ToolEndEvent {
     pub workspace_id: String,
+    pub thread_id: String,
     pub call_id: String,
     pub ok: bool,
     pub duration_ms: u64,
@@ -94,6 +98,7 @@ pub struct ToolEndEvent {
 #[serde(rename_all = "camelCase")]
 pub struct MessageAddedEvent {
     pub workspace_id: String,
+    pub thread_id: String,
     pub id: i64,
     pub role: String,
     pub content: String,
@@ -359,11 +364,12 @@ impl ChatEngine {
         }
     }
 
-    /// Request cancellation of the in-flight turn for `workspace_id`, if any.
+    /// Request cancellation of the in-flight turn for `thread_id`, if any.
     /// No-op when nothing is running. The loop checks the flag between
-    /// iterations and after each tool, then stops cleanly.
-    pub fn cancel(&self, workspace_id: &str) {
-        if let Some(flag) = self.cancels.lock().get(workspace_id) {
+    /// iterations and after each tool, then stops cleanly. Keyed by thread so
+    /// two conversations in one workspace can be cancelled independently.
+    pub fn cancel(&self, thread_id: &str) {
+        if let Some(flag) = self.cancels.lock().get(thread_id) {
             flag.store(true, Ordering::Relaxed);
         }
     }
@@ -375,10 +381,12 @@ impl ChatEngine {
     /// the history builder only replays user/assistant/tool rows, so a stopped
     /// marker never re-enters the model's context as something it "said"; and
     /// the frontend renders it as a quiet system note, not a model bubble.
+    #[allow(clippy::too_many_arguments)]
     fn finish_stopped(
         &self,
         app: &AppHandle,
         workspace_id: &str,
+        thread_id: &str,
         model: &str,
         total_input: u64,
         total_output: u64,
@@ -387,6 +395,7 @@ impl ChatEngine {
         self.insert_and_emit_message(
             app,
             workspace_id,
+            thread_id,
             "stopped",
             "Generation stopped.",
             Some(model),
@@ -396,6 +405,7 @@ impl ChatEngine {
         )?;
         let _ = app.emit("chat://stream", &ChatStreamEvent {
             workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
             delta: String::new(),
             done: true,
             input_tokens: Some(total_input),
@@ -406,10 +416,12 @@ impl ChatEngine {
 
     /// Insert a message into the DB and emit a `chat://message-added` event
     /// carrying the full row (including the DB-assigned id).
+    #[allow(clippy::too_many_arguments)]
     fn insert_and_emit_message(
         &self,
         app: &AppHandle,
         workspace_id: &str,
+        thread_id: &str,
         role: &str,
         content: &str,
         model: Option<&str>,
@@ -419,10 +431,11 @@ impl ChatEngine {
     ) -> AppResult<i64> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let id = self.db.lock().insert_chat_message(
-            workspace_id, role, content, model, input_tokens, output_tokens, cost_usd,
+            workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost_usd,
         )?;
         let _ = app.emit("chat://message-added", &MessageAddedEvent {
             workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
             id,
             role: role.to_string(),
             content: content.to_string(),
@@ -447,31 +460,31 @@ impl ChatEngine {
 
         let workspace_path = std::path::PathBuf::from(&request.workspace_path);
 
-        // Register a fresh cancellation flag for this turn. The guard removes it
-        // from the registry on every exit path (Drop). Replaces any stale flag
-        // from a previous turn for the same workspace.
+        // Register a fresh cancellation flag for this turn, keyed by thread. The
+        // guard removes it from the registry on every exit path (Drop).
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
-            .insert(request.workspace_id.clone(), Arc::clone(&cancel));
+            .insert(request.thread_id.clone(), Arc::clone(&cancel));
         let _cancel_guard = CancelGuard {
             cancels: Arc::clone(&self.cancels),
-            key: request.workspace_id.clone(),
+            key: request.thread_id.clone(),
         };
 
         // Persist user message and emit message-added so the frontend learns the DB id.
         self.insert_and_emit_message(
             &app,
             &request.workspace_id,
+            &request.thread_id,
             "user",
             &request.user_message,
             None, None, None, None,
         )?;
 
-        // Build conversation history as normalized LlmMessage[].
-        // We include user + assistant messages for the API, and inject tool
-        // summaries into assistant messages so the model remembers what it did.
-        let history = self.db.lock().list_chat_messages(&request.workspace_id)?;
+        // Build conversation history (this thread only) as normalized
+        // LlmMessage[]. Tool summaries are injected into assistant messages so
+        // the model remembers what it did.
+        let history = self.db.lock().list_chat_messages(&request.thread_id)?;
         let mut messages: Vec<LlmMessage> = Vec::new();
         let mut pending_tool_summary = Vec::new();
 
@@ -550,7 +563,7 @@ impl ChatEngine {
             // Stop cleanly if the user cancelled this turn (checked here and
             // after each tool — the in-flight request itself isn't aborted).
             if cancel.load(Ordering::Relaxed) {
-                self.finish_stopped(&app, &request.workspace_id, &request.model, total_input, total_output)?;
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
                 return Ok(());
             }
 
@@ -581,6 +594,7 @@ impl ChatEngine {
                     if let Err(persist_err) = self.insert_and_emit_message(
                         &app,
                         &request.workspace_id,
+                        &request.thread_id,
                         "error",
                         &error_text,
                         None, None, None, None,
@@ -634,6 +648,7 @@ impl ChatEngine {
             if is_final && !response.text.is_empty() {
                 let _ = app.emit("chat://stream", &ChatStreamEvent {
                     workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
                     delta: response.text.clone(),
                     done: false,
                     input_tokens: None,
@@ -677,6 +692,7 @@ impl ChatEngine {
                     self.insert_and_emit_message(
                         &app,
                         &request.workspace_id,
+                        &request.thread_id,
                         "assistant",
                         &final_text,
                         Some(&request.model),
@@ -690,6 +706,7 @@ impl ChatEngine {
                 // via the chat://message-added event above.
                 let _ = app.emit("chat://stream", &ChatStreamEvent {
                     workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
                     delta: String::new(),
                     done: true,
                     input_tokens: Some(total_input),
@@ -716,6 +733,7 @@ impl ChatEngine {
                 };
                 match self.db.lock().insert_chat_message(
                     &request.workspace_id,
+                    &request.thread_id,
                     "assistant_tool_use",
                     &content,
                     Some(&request.model),
@@ -744,7 +762,7 @@ impl ChatEngine {
                 // Honor a cancel that landed between tools — stop before
                 // kicking off another (possibly long) tool.
                 if cancel.load(Ordering::Relaxed) {
-                    self.finish_stopped(&app, &request.workspace_id, &request.model, total_input, total_output)?;
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
                     return Ok(());
                 }
                 tracing::info!(tool = %u.name, "executing tool");
@@ -768,6 +786,7 @@ impl ChatEngine {
                 let call_started = std::time::Instant::now();
                 let _ = app.emit("chat://tool-start", &ToolStartEvent {
                     workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
                     call_id: u.id.clone(),
                     tool_name: u.name.clone(),
                     tool_input: input_for_display.clone(),
@@ -779,6 +798,7 @@ impl ChatEngine {
                 // ── Live card: announce completion (timing + status) ──
                 let _ = app.emit("chat://tool-end", &ToolEndEvent {
                     workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
                     call_id: u.id.clone(),
                     ok,
                     duration_ms: call_started.elapsed().as_millis() as u64,
@@ -814,6 +834,7 @@ impl ChatEngine {
                 if let Err(e) = self.insert_and_emit_message(
                     &app,
                     &request.workspace_id,
+                    &request.thread_id,
                     "tool",
                     &tool_record.to_string(),
                     None, None, None, None,
@@ -893,6 +914,7 @@ impl ChatEngine {
         if let Err(persist_err) = self.insert_and_emit_message(
             &app,
             &request.workspace_id,
+            &request.thread_id,
             "error",
             &error_text,
             None, None, None, None,

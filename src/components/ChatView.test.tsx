@@ -37,6 +37,14 @@ vi.mock("../lib/ipc", () => ({
     listWorkspaceFiles: vi.fn().mockResolvedValue([]),
     readFileChecked: vi.fn().mockResolvedValue({ kind: "text", content: "", size: 0, mtime: 0 }),
     cancelChat: vi.fn().mockResolvedValue(undefined),
+    listChatThreads: vi.fn().mockResolvedValue([
+      { id: "t1", workspaceId: "ws-1", title: "Conversation", createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z" },
+    ]),
+    createChatThread: vi.fn().mockResolvedValue(
+      { id: "t1", workspaceId: "ws-1", title: "New conversation", createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z" },
+    ),
+    renameChatThread: vi.fn().mockResolvedValue(undefined),
+    deleteChatThread: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -53,6 +61,9 @@ function resetStore() {
     streamingByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
+    liveToolsByWs: {},
+    threadsByWs: {},
+    activeThreadByWs: {},
   });
   useBudgetsStore.setState({
     budgets: [],

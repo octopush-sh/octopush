@@ -219,6 +219,7 @@ import type {
   BranchPr,
   EditorChoice,
   ChatMessage,
+  ChatThread,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -393,15 +394,26 @@ export const ipc = {
   // ─── Chat ───────────────────────────────────────────────────────
   sendChatMessage: (request: {
     workspaceId: string;
+    threadId: string;
     workspacePath: string;
     model: string;
     userMessage: string;
     system?: string;
     maxTokens: number;
   }) => invoke<void>("send_chat_message", { request }),
-  listChatMessages: (workspaceId: string) => invoke<ChatMessage[]>("list_chat_messages", { workspaceId }),
-  /** Stop the in-flight agentic turn for this workspace. */
-  cancelChat: (workspaceId: string) => invoke<void>("cancel_chat", { workspaceId }),
+  listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  /** Stop the in-flight agentic turn for this thread. */
+  cancelChat: (threadId: string) => invoke<void>("cancel_chat", { threadId }),
+
+  // ─── Chat threads (conversations) ────────────────────────────────
+  listChatThreads: (workspaceId: string) =>
+    invoke<ChatThread[]>("list_chat_threads", { workspaceId }),
+  createChatThread: (workspaceId: string, title?: string) =>
+    invoke<ChatThread>("create_chat_thread", { workspaceId, title }),
+  renameChatThread: (threadId: string, title: string) =>
+    invoke<void>("rename_chat_thread", { threadId, title }),
+  deleteChatThread: (threadId: string) =>
+    invoke<void>("delete_chat_thread", { threadId }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),

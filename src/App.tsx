@@ -51,7 +51,7 @@ import { useChatStore } from "./stores/chatStore";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
-import { deriveChatTitle, deriveChatMeta } from "./lib/chatTitle";
+import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
 import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
@@ -63,11 +63,6 @@ import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
 import { revealDiffTarget, stripDiffPrefix } from "./lib/diffJump";
 
-interface ChatRef {
-  id: string;
-  title: string;
-  meta: string;
-}
 
 type AppView = "project" | "new-project";
 
@@ -105,10 +100,9 @@ function App() {
 
   const [appView, setAppView] = useState<AppView>("project");
 
-  // Per-workspace state — modes, chats.
+  // Per-workspace state — modes. (Conversation threads now live in chatStore:
+  // threadsByWs / activeThreadByWs, persisted in the DB via real chat_threads.)
   const [modePerWorkspace, setModePerWorkspace] = useState<Record<string, WorkspaceMode>>({});
-  const [chatsPerWorkspace, setChatsPerWorkspace] = useState<Record<string, ChatRef[]>>({});
-  const [activeChatPerWorkspace, setActiveChatPerWorkspace] = useState<Record<string, string>>({});
 
   // Terminal store selectors.
   // Important: always call the store's getTerminals/getActiveId selectors with
@@ -495,18 +489,8 @@ function App() {
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
     if (!activeWorkspaceId) return;
-    setChatsPerWorkspace((prev) => {
-      if (prev[activeWorkspaceId]) return prev;
-      const initial: ChatRef = {
-        id: activeWorkspaceId, // first chat uses workspace id as conversationId
-        title: "Conversation",
-        meta: "NOW",
-      };
-      return { ...prev, [activeWorkspaceId]: [initial] };
-    });
-    setActiveChatPerWorkspace((prev) =>
-      prev[activeWorkspaceId] ? prev : { ...prev, [activeWorkspaceId]: activeWorkspaceId },
-    );
+    // Chat threads are hydrated lazily by the Talk canvas (chatStore.loadHistory
+    // ensures a default thread exists), so no seeding is needed here.
     // Hydrate terminals from DB; auto-create "Main" if the workspace is empty.
     // The in-flight guard prevents two concurrent resolutions from both seeing
     // an empty list and creating duplicate "Main" terminals.
@@ -674,59 +658,26 @@ function App() {
   );
 
   // ── Chat / terminal handlers wired to Companion ──
+  // Conversation-thread handlers delegate to chatStore, which persists threads
+  // in the DB (real multi-conversation per workspace) and keeps the active
+  // thread's messages loaded.
   const handleNewChat = useCallback(() => {
     if (!activeWorkspaceId) return;
-    const newId = crypto.randomUUID();
-    // Derive everything inside the functional updater — a closure-captured
-    // list goes stale under rapid double-clicks (two chats, same label,
-    // second prepend clobbering the first).
-    setChatsPerWorkspace((p) => {
-      const list = p[activeWorkspaceId] ?? [];
-      const chat: ChatRef = {
-        id: newId,
-        title: `Conversation ${list.length + 1}`,
-        meta: "NOW",
-      };
-      return { ...p, [activeWorkspaceId]: [chat, ...list] };
-    });
-    setActiveChatPerWorkspace((p) => ({ ...p, [activeWorkspaceId]: newId }));
+    void useChatStore.getState().newThread(activeWorkspaceId).catch(console.error);
   }, [activeWorkspaceId]);
 
   const handleSelectChat = useCallback(
     (id: string) => {
       if (!activeWorkspaceId) return;
-      setActiveChatPerWorkspace((p) => ({ ...p, [activeWorkspaceId]: id }));
+      void useChatStore.getState().selectThread(activeWorkspaceId, id).catch(console.error);
     },
     [activeWorkspaceId],
   );
 
-  // Delete any chat. There's no "primary" protection: just like Terminals,
-  // you can empty the History section and the workspace's init effect will
-  // re-seed a fresh chat the next time you re-enter the workspace.
   const handleDeleteChat = useCallback(
     (id: string) => {
       if (!activeWorkspaceId) return;
-      void ipc.deleteSession(id).catch(console.error);
-      let nextActive: string | undefined;
-      setChatsPerWorkspace((p) => {
-        const list = p[activeWorkspaceId] ?? [];
-        const remaining = list.filter((c) => c.id !== id);
-        // If the list ends up empty we drop the workspace key so the init
-        // effect's "no entry yet" branch fires on next workspace activation
-        // and seeds a fresh primary conversation.
-        if (remaining.length === 0) {
-          const { [activeWorkspaceId]: _drop, ...rest } = p;
-          return rest;
-        }
-        nextActive = remaining[0]?.id;
-        return { ...p, [activeWorkspaceId]: remaining };
-      });
-      setActiveChatPerWorkspace((p) => {
-        if (p[activeWorkspaceId] !== id) return p;
-        if (nextActive) return { ...p, [activeWorkspaceId]: nextActive };
-        const { [activeWorkspaceId]: _drop, ...rest } = p;
-        return rest;
-      });
+      void useChatStore.getState().deleteThread(activeWorkspaceId, id).catch(console.error);
     },
     [activeWorkspaceId],
   );
@@ -839,9 +790,13 @@ function App() {
   // ── Computed values ──
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
   const activeProject = recentProjects.find((p) => p.id === activeWorkspace?.projectId) ?? (project?.id === activeWorkspace?.projectId ? project : null) ?? null;
-  const activeChatId = activeWorkspaceId
-    ? activeChatPerWorkspace[activeWorkspaceId] ?? activeWorkspaceId
-    : null;
+  // Chat state in chatStore is keyed by the real workspace id (the store tracks
+  // which thread is active internally). `activeChatId` is therefore the
+  // workspace id; the active *thread* id (for highlighting the History row) is
+  // read separately below.
+  const activeChatId = activeWorkspaceId;
+  const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
+  const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
 
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
@@ -934,36 +889,31 @@ function App() {
 
   const companionHistoryProps = useMemo(
     () => {
-      const rawChats = activeWorkspaceId
-        ? chatsPerWorkspace[activeWorkspaceId] ?? []
-        : [];
-      // The "primary" chat for a workspace uses the workspace id as its
-      // own id — that's the one whose messages are persisted in the DB.
-      // Derive its title + meta from those messages so the history row
-      // becomes self-describing instead of the literal "Conversation · NOW".
-      const chats = rawChats.map((c) => {
-        // Only the primary chat (id === workspace id) derives from messages,
-        // so the active workspace's slice is the only one we need.
-        if (c.id !== activeWorkspaceId) return c;
-        const msgs = activeWsPrimaryMessages ?? [];
-        return {
-          ...c,
-          title: deriveChatTitle(msgs),
-          meta: deriveChatMeta(msgs, tickerNow),
-        };
+      // Real conversation threads from chatStore (persisted in the DB). The
+      // ACTIVE thread's row derives its title + meta live from its loaded
+      // messages so it's self-describing; other rows use their stored title.
+      const chats = workspaceThreads.map((t) => {
+        if (t.id === activeThreadId) {
+          const msgs = activeWsPrimaryMessages ?? [];
+          return {
+            id: t.id,
+            title: deriveChatTitle(msgs) || t.title,
+            meta: deriveChatMeta(msgs, tickerNow),
+          };
+        }
+        return { id: t.id, title: t.title, meta: formatRelTime(t.updatedAt, tickerNow) };
       });
       return {
         chats,
-        activeChatId,
+        activeChatId: activeThreadId,
         onSelectChat: handleSelectChat,
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
       };
     },
     [
-      activeWorkspaceId,
-      chatsPerWorkspace,
-      activeChatId,
+      workspaceThreads,
+      activeThreadId,
       handleSelectChat,
       handleNewChat,
       handleDeleteChat,

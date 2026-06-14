@@ -196,6 +196,14 @@ export interface PtyAttentionEvent {
 
 // ─── Chat ─────────────────────────────────────────────────────────
 
+export interface ChatThread {
+  id: string;
+  workspaceId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;
@@ -210,6 +218,7 @@ export interface ChatMessage {
 
 export interface ChatStreamEvent {
   workspaceId: string;
+  threadId?: string;
   delta: string;
   done: boolean;
   inputTokens: number | null;

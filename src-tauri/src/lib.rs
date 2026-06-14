@@ -174,6 +174,10 @@ pub fn run() {
             commands::send_chat_message,
             commands::list_chat_messages,
             commands::cancel_chat,
+            commands::list_chat_threads,
+            commands::create_chat_thread,
+            commands::rename_chat_thread,
+            commands::delete_chat_thread,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,

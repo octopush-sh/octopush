@@ -30,6 +30,13 @@ vi.mock("../lib/ipc", () => ({
     sendChatMessage: vi.fn().mockResolvedValue(undefined),
     listChatMessages: vi.fn().mockResolvedValue([]),
     cancelChat: vi.fn().mockResolvedValue(undefined),
+    listChatThreads: vi.fn().mockResolvedValue([]),
+    createChatThread: vi.fn().mockResolvedValue({
+      id: "t1", workspaceId: "ws-1", title: "New conversation",
+      createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z",
+    }),
+    renameChatThread: vi.fn().mockResolvedValue(undefined),
+    deleteChatThread: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -49,6 +56,8 @@ function resetStore() {
     streamBufferByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
+    threadsByWs: {},
+    activeThreadByWs: {},
   });
 }
 
@@ -321,9 +330,10 @@ describe("chatStore — stop + effort (P3)", () => {
     vi.clearAllMocks();
   });
 
-  it("stop() calls ipc.cancelChat for the workspace", () => {
+  it("stop() cancels the workspace's active thread", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
     useChatStore.getState().stop("ws-1");
-    expect(ipc.cancelChat).toHaveBeenCalledWith("ws-1");
+    expect(ipc.cancelChat).toHaveBeenCalledWith("t1");
   });
 
   it("send() uses the effort's max-tokens budget", async () => {
@@ -339,6 +349,62 @@ describe("chatStore — stop + effort (P3)", () => {
     expect(ipc.sendChatMessage).toHaveBeenCalledWith(
       expect.objectContaining({ maxTokens: EFFORT_MAX_TOKENS.swift }),
     );
+  });
+});
+
+describe("chatStore — conversation threads (P5)", () => {
+  beforeEach(() => {
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  it("loadHistory ensures a thread, sets it active, and loads its messages", async () => {
+    (ipc.listChatThreads as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    (ipc.listChatMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    await useChatStore.getState().loadHistory("ws-1");
+    // No threads existed → one was created and made active.
+    expect(ipc.createChatThread).toHaveBeenCalledWith("ws-1", "New conversation");
+    expect(useChatStore.getState().getActiveThread("ws-1")).toBe("t1");
+    expect(useChatStore.getState().getThreads("ws-1")).toHaveLength(1);
+  });
+
+  it("newThread prepends, activates, and clears the view", async () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [{ id: 9 } as never] },
+      threadsByWs: { "ws-1": [{ id: "old", workspaceId: "ws-1", title: "Old", createdAt: "", updatedAt: "" }] },
+      activeThreadByWs: { "ws-1": "old" },
+    });
+    await useChatStore.getState().newThread("ws-1");
+    expect(useChatStore.getState().getActiveThread("ws-1")).toBe("t1");
+    expect(useChatStore.getState().getThreads("ws-1")[0].id).toBe("t1");
+    expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(0);
+  });
+
+  it("events for a non-active thread are ignored (filtered by threadId)", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "active" } });
+    // An event for a DIFFERENT thread must not append to the shown view.
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "bg", threadId: "other" }));
+    expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(0);
+    // An event for the active thread applies.
+    emit("chat://message-added", makeMsg({ id: 2, role: "user", content: "fg", threadId: "active" }));
+    expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(1);
+  });
+
+  it("deleteThread falls back to the remaining thread when the active one is removed", async () => {
+    useChatStore.setState({
+      threadsByWs: {
+        "ws-1": [
+          { id: "a", workspaceId: "ws-1", title: "A", createdAt: "", updatedAt: "" },
+          { id: "b", workspaceId: "ws-1", title: "B", createdAt: "", updatedAt: "" },
+        ],
+      },
+      activeThreadByWs: { "ws-1": "a" },
+    });
+    (ipc.listChatMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    await useChatStore.getState().deleteThread("ws-1", "a");
+    expect(ipc.deleteChatThread).toHaveBeenCalledWith("a");
+    expect(useChatStore.getState().getThreads("ws-1").map((t) => t.id)).toEqual(["b"]);
+    expect(useChatStore.getState().getActiveThread("ws-1")).toBe("b");
   });
 });
 
