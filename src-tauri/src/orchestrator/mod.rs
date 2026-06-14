@@ -76,6 +76,10 @@ pub struct Orchestrator {
     /// installed by `run_stage_once` before each stage and removed after it, so
     /// a stop only ever lands on the stage the director is watching.
     cancels: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Run ids the director asked to pause. Consumed at the next stage boundary:
+    /// the next pending stage is parked (awaiting_checkpoint) exactly like the
+    /// budget gate, so the existing approve-a-parked-stage path resumes it.
+    pause_requests: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Orchestrator {
@@ -91,6 +95,7 @@ impl Orchestrator {
             client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
             cancels: Mutex::new(std::collections::HashMap::new()),
+            pause_requests: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -107,6 +112,7 @@ impl Orchestrator {
             client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
             cancels: Mutex::new(std::collections::HashMap::new()),
+            pause_requests: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -570,6 +576,31 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Ask a running run to pause at its next stage boundary. Consumed once, in
+    /// `drive_inner`. A no-op if the run isn't driving (the flag is harmless).
+    pub fn request_pause(&self, run_id: &str) {
+        self.pause_requests.lock().insert(run_id.to_string());
+    }
+
+    /// Park the next pending stage because the director asked to pause — same
+    /// shape as the budget gate, so the existing "approve a never-started parked
+    /// stage" resume path releases it with no new checkpoint logic.
+    fn pause_for_director(&self, run_id: &str, stage_id: &str) -> AppResult<()> {
+        self.db.lock().set_run_stage_status(stage_id, "awaiting_checkpoint")?;
+        self.db.lock().set_run_status(run_id, "paused", false)?;
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({
+                "runId": run_id,
+                "stageId": stage_id,
+                "entry": { "kind": "notice", "text": "paused by the director" },
+            }),
+        );
+        self.emit_run_update(run_id);
+        self.emit_checkpoint(run_id, stage_id);
+        Ok(())
+    }
+
     async fn drive_inner(&self, run_id: &str, mut skip_budget_once: bool) -> AppResult<RunStatus> {
         let run0 = self
             .db
@@ -628,6 +659,13 @@ impl Orchestrator {
                 }
             }
             skip_budget_once = false; // only the drive's first stage may bypass
+
+            // Director pause: park this next pending stage at the boundary (same
+            // mechanism as the budget gate). Approving the parked stage resumes.
+            if self.pause_requests.lock().remove(run_id) {
+                self.pause_for_director(run_id, &stage.id)?;
+                return Ok(RunStatus::Paused);
+            }
 
             let stage = stage.clone();
             let (status, verdict) = self.run_stage_once(&run, &stage).await?;

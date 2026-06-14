@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Plus } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
 import { runStatusMeta, aggregateSavings } from "../lib/runStatus";
+import { CompanionCurrentRun } from "./CompanionCurrentRun";
 
 interface Props { workspaceId: string; }
 
@@ -34,6 +35,7 @@ export function CompanionRuns({ workspaceId }: Props) {
           <Plus size={12} />
         </button>
       </div>
+      <CompanionCurrentRun workspaceId={workspaceId} />
       {showLedger && (
         <div className="octo-rise-in px-3.5 py-2 font-mono text-[10px] text-octo-mute">
           saved <span className="octo-tabular text-octo-verdigris">${totals.saved.toFixed(2)}</span> across {totals.n} run{totals.n === 1 ? "" : "s"}

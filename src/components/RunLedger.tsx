@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Run, RunStage } from "../lib/ipc";
 import { savingsVsBaseline } from "../lib/runStatus";
-import { labelForRole } from "./RunTrack";
+import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 
 interface Props {
@@ -15,6 +15,8 @@ interface Props {
 export function RunLedger({ run, stages }: Props) {
   const { saved, pct } = savingsVsBaseline(run.costUsd, run.baselineUsd);
   const fillPct = run.baselineUsd > 0 ? Math.min(100, (run.costUsd / run.baselineUsd) * 100) : 0;
+  const tokIn = stages.reduce((a, s) => a + s.inputTokens, 0);
+  const tokOut = stages.reduce((a, s) => a + s.outputTokens, 0);
   const [expanded, setExpanded] = useState(false);
   const [moment, setMoment] = useState(false);
   const prevStatus = useRef(run.status);
@@ -63,6 +65,11 @@ export function RunLedger({ run, stages }: Props) {
             · budget ${run.budgetUsd.toFixed(2)}
           </span>
         )}
+        {(tokIn > 0 || tokOut > 0) && (
+          <span className="octo-tabular text-octo-mute" title="input / output tokens">
+            · ↑{fmtTokens(tokIn)} ↓{fmtTokens(tokOut)}
+          </span>
+        )}
         <span className="font-mono text-[9px] text-octo-mute">{expanded ? "▾" : "▸"}</span>
       </button>
       <div className="mx-4 h-0.5 overflow-hidden rounded-sm bg-octo-onyx">
@@ -76,6 +83,9 @@ export function RunLedger({ run, stages }: Props) {
           {billed.map((s) => (
             <span key={s.id}>
               {labelForRole(s.role)} <span className="octo-tabular text-octo-sage">${s.costUsd.toFixed(2)}</span>
+              {(s.inputTokens > 0 || s.outputTokens > 0) && (
+                <span className="octo-tabular text-octo-mute"> · ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}</span>
+              )}
             </span>
           ))}
           {billed.length === 0 && <span>no billed stages yet</span>}
