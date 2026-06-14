@@ -443,7 +443,14 @@ impl AgentRunner for CliRunner {
         } else {
             child.wait().await.map(|s| s.success()).unwrap_or(true)
         };
-        let stderr_out = stderr_task.await.unwrap_or_default();
+        let stderr_out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stderr_task,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
 
         match result_line {
             Some(line) => match parse_cli_result(&line, exit_success, &stage.role, &stderr_out) {

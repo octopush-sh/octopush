@@ -5572,4 +5572,68 @@ mod git_baseline_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Regression test: after restore_baseline the REAL git index must be
+    /// resynced to HEAD so that any staged entries left by a failed stage
+    /// (e.g. from `git add -A` in custom instructions) don't survive as
+    /// phantom staged changes in `git diff --cached`.
+    #[test]
+    fn baseline_restore_clears_staged_index() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "octo-baseline-idx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git_out = |a: &[&str]| {
+            Command::new("git").args(a).current_dir(&dir).output().unwrap()
+        };
+        let git = |a: &[&str]| { git_out(a); };
+
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("initial.txt"), "initial\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Capture the baseline (mimics stage start).
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        // Simulate a stage that modifies a file AND stages those changes into
+        // the real index via `git add -A` (as custom stage instructions might).
+        std::fs::write(dir.join("initial.txt"), "modified by stage\n").unwrap();
+        std::fs::write(dir.join("stage_new.txt"), "created by stage\n").unwrap();
+        git(&["add", "-A"]);
+
+        // Verify the real index really has staged changes before restore.
+        let before = git_out(&["diff", "--cached", "--name-only"]);
+        let before_stdout = String::from_utf8_lossy(&before.stdout);
+        assert!(
+            !before_stdout.trim().is_empty(),
+            "pre-condition: real index must have staged changes before restore"
+        );
+
+        // Discard the failed stage.
+        restore_baseline(&dir, &baseline).unwrap();
+
+        // After restore, `git diff --cached --name-only` must be empty: the
+        // real index must have been resynced to HEAD (mixed reset).
+        let after = git_out(&["diff", "--cached", "--name-only"]);
+        let after_stdout = String::from_utf8_lossy(&after.stdout);
+        assert!(
+            after_stdout.trim().is_empty(),
+            "after restore_baseline the real index must show no staged changes; got: {after_stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

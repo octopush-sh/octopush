@@ -112,5 +112,12 @@ pub fn restore_baseline(ws: &Path, baseline: &str) -> AppResult<()> {
             } else { break; }
         }
     }
+
+    // Resync the REAL index to HEAD so the failed stage's staged entries (if it
+    // ran `git add`) don't survive as phantom staged changes. Mixed reset never
+    // touches the worktree we just restored. Best-effort: a clean worktree is
+    // the contract; an index resync hiccup must not fail the discard.
+    let _ = git(ws, None, &["reset", "-q"]);
+
     Ok(())
 }
