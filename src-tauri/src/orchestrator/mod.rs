@@ -3,9 +3,10 @@
 
 pub mod agentic;
 pub mod cli_runner;
-pub mod live;
 pub mod cost;
 pub mod events;
+pub mod git_baseline;
+pub mod live;
 pub mod persist;
 pub mod runner;
 pub mod types;
@@ -269,6 +270,22 @@ impl Orchestrator {
         }
     }
 
+    /// Append a terminal entry to the stage's work journal so the journal
+    /// explains the halt instead of just stopping mid-action. Persisted AND
+    /// emitted live (best-effort — a journal write must never mask the failure).
+    fn record_halt(&self, run_id: &str, stage_id: &str, error: &str) {
+        let first = error.lines().next().unwrap_or("stage halted").trim();
+        let entry = serde_json::json!({ "kind": "notice", "text": format!("⏹ Stage halted — {first}") });
+        let json = entry.to_string();
+        if let Err(e) = self.db.lock().append_stage_log(run_id, stage_id, &json) {
+            tracing::warn!(stage_id = %stage_id, "halt journal write failed: {e}");
+        }
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run_id, "stageId": stage_id, "entry": entry }),
+        );
+    }
+
     /// Execute one stage and persist its outcome + cost/baseline.
     async fn run_stage_once(
         &self,
@@ -282,6 +299,7 @@ impl Orchestrator {
                     &stage.id,
                     &format!("unknown substrate '{}'", stage.substrate),
                 )?;
+                self.record_halt(&run.id, &stage.id, &format!("unknown substrate '{}'", stage.substrate));
                 return Ok((StageStatus::Failed, None));
             }
         };
@@ -299,7 +317,14 @@ impl Orchestrator {
             max_iterations: stage.max_iterations,
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
+            resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            stage_id: stage.id.clone(),
         };
+
+        // Clear resume_pending once the run starts so a second re-run is always fresh.
+        if stage.resume_pending {
+            self.db.lock().set_stage_resume_pending(&stage.id, false)?;
+        }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
         let input = self.assemble_stage_input(&run.id, stage.position)?;
@@ -311,6 +336,16 @@ impl Orchestrator {
             serde_json::json!({ "runId": run.id, "stageId": stage.id, "reset": true }),
         );
         self.emit_run_update(&run.id);
+
+        // Snapshot the worktree NOW so a later Discard reverts only this stage's
+        // edits. Best-effort & forensic: a capture failure never blocks the run.
+        if let Ok(ws) = self.workspace_path(run) {
+            match crate::orchestrator::git_baseline::capture_baseline(&ws) {
+                Ok(Some(sha)) => { let _ = self.db.lock().set_stage_baseline(&stage.id, Some(&sha)); }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(stage_id = %stage.id, "baseline capture failed: {e}"),
+            }
+        }
 
         // Install a FRESH cancel flag for this run before the stage starts —
         // `stop_current_stage`/`abort_run` set it to interrupt in-flight work.
@@ -344,10 +379,16 @@ impl Orchestrator {
         let outcome = match run_result {
             Ok(o) => o,
             Err(e) => {
-                self.db.lock().fail_run_stage(&stage.id, &e.to_string())?;
+                let err_str = e.to_string();
+                self.db.lock().fail_run_stage(&stage.id, &err_str)?;
+                self.record_halt(&run.id, &stage.id, &err_str);
                 return Ok((StageStatus::Failed, None));
             }
         };
+
+        if outcome.session_id.is_some() {
+            self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
+        }
 
         match outcome.status {
             StageStatus::Done => {
@@ -371,6 +412,8 @@ impl Orchestrator {
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
+                // Read before outcome.error is (partially) moved below.
+                let outcome_no_new_session = outcome.session_id.is_none();
                 let err = outcome.error.unwrap_or_else(|| "stage failed".into());
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
@@ -387,6 +430,13 @@ impl Orchestrator {
                     self.recompute_run_cost(&run.id)?;
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
+                self.record_halt(&run.id, &stage.id, &err);
+                // A resume attempt that produced no new session likely hit a
+                // dead/expired session — clear it so the next recovery re-runs
+                // fresh instead of looping on `--resume <dead id>`.
+                if stage.resume_pending && outcome_no_new_session {
+                    let _ = self.db.lock().set_stage_session(&stage.id, None);
+                }
                 // A failed stage may still have touched the worktree — keep the
                 // evidence (best-effort; empty diffs are skipped internally).
                 self.capture_stage_diff_snapshot(run, &stage.id);
@@ -813,12 +863,17 @@ impl Orchestrator {
             CheckpointAction::Reject {
                 feedback,
                 model_override,
+                max_turns_override,
             } => {
                 if let Some(s) = &blocked {
                     // Archive the rejected attempt before the reset wipes it.
                     if s.artifact.is_some() || s.error.is_some() {
                         self.db.lock().archive_stage_attempt(s, feedback.as_deref())?;
                     }
+                    if let Some(mt) = max_turns_override {
+                        self.db.lock().set_stage_max_iterations(&s.id, mt)?;
+                    }
+                    self.db.lock().set_stage_resume_pending(&s.id, false)?;
                     self.db.lock().reset_run_stage(
                         &s.id,
                         model_override.as_deref(),
@@ -827,7 +882,7 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
-            CheckpointAction::Resume => {
+            CheckpointAction::Resume { max_turns_override } => {
                 // Recover a transient/infra halt: re-run the SAME stage without
                 // treating its output as wrong. Only a failed stage can resume —
                 // an awaiting_checkpoint stage isn't a failure, so this is a no-op
@@ -835,6 +890,8 @@ impl Orchestrator {
                 // retired so the cost meter stays truthful, then the stage resets
                 // to pending and the drive re-runs it. The worktree is untouched,
                 // so a code stage picks up from the files already on disk.
+                // For a CLI stage with a session id, resume_pending is set so the
+                // next run uses `--resume` to continue the same Claude session.
                 if let Some(s) = &blocked {
                     if s.status == "failed" {
                         if s.artifact.is_some() || s.error.is_some() {
@@ -846,8 +903,30 @@ impl Orchestrator {
                             s.input_tokens,
                             s.output_tokens,
                         )?;
+                        if let Some(mt) = max_turns_override {
+                            self.db.lock().set_stage_max_iterations(&s.id, mt)?;
+                        }
+                        let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                        self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
+                    }
+                }
+            }
+            CheckpointAction::Discard => {
+                // Revert the worktree to the failed stage's baseline commit,
+                // dropping only the changes this stage introduced. The stage
+                // stays failed and the run stays paused at the same checkpoint
+                // (drive_inner sees the failed stage and returns Paused immediately).
+                if let Some(s) = &blocked {
+                    if let Some(baseline) = s.baseline_commit.clone() {
+                        let run = self.db.lock().get_run(run_id)?
+                            .ok_or_else(|| crate::error::AppError::Other("run not found".into()))?;
+                        let ws = self.workspace_path(&run)?;
+                        match crate::orchestrator::git_baseline::restore_baseline(&ws, &baseline) {
+                            Ok(()) => self.record_halt(run_id, &s.id, "changes discarded — worktree reverted to the stage baseline"),
+                            Err(e) => self.record_halt(run_id, &s.id, &format!("discard failed — {e}")),
+                        }
                     }
                 }
             }

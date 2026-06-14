@@ -122,12 +122,16 @@ export interface RunStage {
   customName: string | null;
   /** Free-form prompt additions copied from the template. */
   instructions: string | null;
+  /** CLI session id from the stage's last run; enables --resume. Null for API stages and legacy rows. */
+  sessionId: string | null;
+  /** Git commit SHA captured before the stage ran (enables Discard). Null when capture failed or non-repo. */
+  baselineCommit: string | null;
 }
 export interface RunDetail {
   run: Run | null;
   stages: RunStage[];
 }
-export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume";
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
 
 /** An archived stage attempt — a snapshot taken just before a loop-back /
  *  reject reset wiped the live stage row (matches Rust `StageIterationRow`). */
@@ -762,12 +766,14 @@ export const ipc = {
     action: CheckpointActionName,
     feedback?: string,
     modelOverride?: string,
+    maxTurnsOverride?: number,
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
       action,
       feedback: feedback ?? null,
       modelOverride: modelOverride ?? null,
+      maxTurnsOverride: maxTurnsOverride ?? null,
     }),
 
   abortRun: (runId: string) =>

@@ -434,6 +434,17 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN custom_name TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN instructions TEXT")?;
 
+        // ── v12 Direct halt recovery: session resume + per-stage baseline ──
+        // session_id: the Claude Code CLI session id from the stage's last
+        //   attempt — enables `--resume` and is shown in the halt diagnostics.
+        // resume_pending: 1 ⇒ the next run of this stage should `--resume`
+        //   session_id (set by a Resume action, cleared when the run starts).
+        // baseline_commit: dangling commit SHA snapshotting the worktree at the
+        //   stage's start, so Discard reverts only this stage's changes.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN session_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_pending INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN baseline_commit TEXT")?;
+
         // ── v11 chat threads: multiple conversations per workspace ──
         // A `chat_threads` table + a nullable `thread_id` on chat_messages.
         // Then a one-time backfill: every workspace that still has un-threaded
@@ -1953,7 +1964,8 @@ impl Db {
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
-                    max_iterations, parents, tools, custom_name, instructions
+                    max_iterations, parents, tools, custom_name, instructions,
+                    session_id, resume_pending, baseline_commit
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1984,6 +1996,9 @@ impl Db {
                 tools: parse_tools(r.get(23)?),
                 custom_name: r.get(24)?,
                 instructions: r.get(25)?,
+                session_id: r.get(26)?,
+                resume_pending: r.get::<_, i64>(27)? != 0,
+                baseline_commit: r.get(28)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2131,6 +2146,10 @@ impl Db {
 
     /// Reset a stage to pending (for re-run), optionally overriding its model and
     /// recording reviewer feedback. Clears the prior artifact/error/finish time.
+    /// NOTE: `session_id`, `resume_pending`, and `baseline_commit` are intentionally
+    /// preserved — the UPDATE below does not list them. `resume_pending` is cleared
+    /// separately by the Resume action handler after it sets it, and `session_id` /
+    /// `baseline_commit` carry forward for the next run's `--resume` / Discard path.
     pub fn reset_run_stage(
         &self,
         stage_id: &str,
@@ -2208,6 +2227,43 @@ impl Db {
         self.conn.execute(
             "UPDATE run_stages SET artifact = ?2 WHERE id = ?1",
             params![stage_id, artifact_json],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the CLI session id from a stage's attempt (done or failed).
+    pub fn set_stage_session(&self, stage_id: &str, session_id: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET session_id = ?2 WHERE id = ?1",
+            params![stage_id, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark that the next run of this stage should `--resume` its session_id.
+    pub fn set_stage_resume_pending(&self, stage_id: &str, pending: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_pending = ?2 WHERE id = ?1",
+            params![stage_id, pending as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).
+    pub fn set_stage_max_iterations(&self, stage_id: &str, max_iterations: i64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET max_iterations = ?2 WHERE id = ?1",
+            params![stage_id, max_iterations.clamp(1, 100)],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the pre-stage worktree commit SHA captured at stage start.
+    /// Used by Discard to revert only this stage's edits.
+    pub fn set_stage_baseline(&self, stage_id: &str, baseline: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET baseline_commit = ?2 WHERE id = ?1",
+            params![stage_id, baseline],
         )?;
         Ok(())
     }
@@ -2695,6 +2751,13 @@ pub struct RunStageRow {
     pub custom_name: Option<String>,
     /// Free-form prompt additions copied from the template.
     pub instructions: Option<String>,
+    /// Claude Code CLI session id from the stage's last attempt (CLI substrate
+    /// only); enables `--resume`. None for legacy rows and API stages.
+    pub session_id: Option<String>,
+    /// 1 ⇒ the next run of this stage should resume `session_id`.
+    pub resume_pending: bool,
+    /// Dangling commit SHA snapshotting the worktree at this stage's start.
+    pub baseline_commit: Option<String>,
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /

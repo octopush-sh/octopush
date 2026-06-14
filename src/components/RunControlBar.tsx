@@ -1,9 +1,13 @@
 import { useEffect, useState } from "react";
-import { Pause, CircleStop, Ban, RotateCcw } from "lucide-react";
+import { Pause, CircleStop, Ban, RotateCcw, ChevronRight } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "../lib/stageMeta";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { Reveal } from "./primitives/Reveal";
+import { Stepper } from "./controls/Stepper";
+import { ModalShell } from "./ModalShell";
+import { haltCause } from "../lib/stageHalt";
 
 interface LoopState {
   iteration: number;
@@ -21,8 +25,9 @@ interface Props {
   onStopStage: () => void;
   onAbort: () => void;
   onApprove: () => void;
-  onReject: (feedback: string) => void;
-  onResume: () => void;
+  onReject: (feedback: string, maxTurns?: number) => void;
+  onResume: (maxTurns?: number) => void;
+  onDiscard: () => void;
   onSendBack: (feedback: string) => void;
   onRunAgain: () => void;
 }
@@ -126,25 +131,38 @@ function DecisionBar({
   onApprove,
   onReject,
   onResume,
+  onDiscard,
   onSendBack,
   onAbort,
 }: Props & { blockedStage: RunStage }) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
   const [feedback, setFeedback] = useState("");
+  const [showWhy, setShowWhy] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const defaultTurns = Math.min(100, Math.max(5, Math.round((blockedStage.maxIterations * 2) / 5) * 5));
+  const [turns, setTurns] = useState(() => defaultTurns);
+
   const failed = blockedStage.status === "failed";
   const transient = failed && isTransientHalt(blockedStage.error);
+  const canResume = blockedStage.substrate === "cli" && !!blockedStage.sessionId;
+  const canDiscard = !!blockedStage.baselineCommit;
+  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
 
   // Reset the editor whenever a new checkpoint arrives (the bar stays mounted).
   useEffect(() => {
     setMode("decide");
     setFeedback("");
-  }, [blockedStage.id]);
+    setShowWhy(false);
+    setConfirmDiscard(false);
+    setTurns(defaultTurns);
+  }, [blockedStage.id, blockedStage.maxIterations]);
 
   const atCap = loopState !== null && loopState.iteration >= loopState.max;
   const canSendBack = loopTargetRole !== null && !atCap;
 
   function submitFeedback() {
-    (mode === "reject" ? onReject : onSendBack)(feedback);
+    if (mode === "reject") onReject(feedback, failed ? turns : undefined);
+    else onSendBack(feedback);
     setMode("decide");
     setFeedback("");
   }
@@ -173,53 +191,134 @@ function DecisionBar({
 
       <FadeSwap swapKey={mode}>
         {mode === "decide" ? (
-          <div className="flex items-center gap-3">
-            <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
-              {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
-            </span>
-            <span
-              className="min-w-0 flex-1 truncate text-sm text-octo-sage"
-              title={failed ? blockedStage.error ?? undefined : undefined}
-            >
-              {transient ? (
-                <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
-              ) : failed ? (
-                <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
-              ) : (
-                <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
+          failed && !transient ? (
+            /* ── Option A: failed-stage halt banner ── */
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-3">
+                <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</span>
+                <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined}>
+                  <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {cause.title}
+                </span>
+                <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                  className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+                  {canResume ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
+                </button>
+                {canResume && (
+                  <button type="button" onClick={() => setMode("reject")}
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Re-run
+                  </button>
+                )}
+                <button type="button" onClick={onAbort}
+                  className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
+                  Abort
+                </button>
+              </div>
+
+              <button type="button" onClick={() => setShowWhy((v) => !v)}
+                aria-expanded={showWhy} aria-controls="halt-why-panel"
+                className="flex w-fit items-center gap-1.5 font-mono text-[11px] text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage">
+                <ChevronRight size={12} className="transition-transform duration-[180ms]" style={{ transform: showWhy ? "rotate(90deg)" : "none" }} />
+                why this halted
+              </button>
+
+              <Reveal open={showWhy}>
+                <div id="halt-why-panel" className="mt-1 rounded-md border border-octo-hairline bg-octo-panel-2 px-3 py-3">
+                  {cause.remedy && <p className="mb-2 text-xs text-octo-sage">{cause.remedy}</p>}
+                  <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute">
+                    {blockedStage.sessionId && <span>session {blockedStage.sessionId.slice(0, 8)}</span>}
+                    <span className="octo-tabular">{(blockedStage.inputTokens + blockedStage.outputTokens).toLocaleString()} tokens</span>
+                    <span className="octo-tabular">${blockedStage.costUsd.toFixed(2)}</span>
+                  </div>
+                  <pre className="mb-3 max-h-32 overflow-auto rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-2 font-mono text-[11px] text-octo-mute whitespace-pre-wrap">{blockedStage.error ?? "no detail"}</pre>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="flex items-center gap-2 font-mono text-[11px] text-octo-mute">
+                      turn budget
+                      <Stepper value={turns} min={5} max={100} step={5} ariaLabel="Turn budget" onChange={setTurns} />
+                    </span>
+                    <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                      className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+                      {canResume ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
+                    </button>
+                    <button type="button" onClick={onApprove}
+                      className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                      Accept partial work
+                    </button>
+                    <span className="flex-1" />
+                    {canDiscard && (
+                      <button type="button" onClick={() => setConfirmDiscard(true)}
+                        className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">
+                        Discard changes
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </Reveal>
+
+              {confirmDiscard && (
+                <ModalShell onClose={() => setConfirmDiscard(false)} closeOnBackdrop={false} ariaLabel="Confirm discard"
+                  panelClassName="w-[420px] rounded-lg border border-octo-hairline bg-octo-panel p-6">
+                  <p className="font-sans text-[15px] font-semibold text-octo-ivory">Discard this stage's changes?</p>
+                  <p className="mt-2 text-sm text-octo-sage">This discards the changes from <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>'s latest attempt and reverts the worktree to the last good state. Earlier stages' work is preserved. This cannot be undone.</p>
+                  <div className="mt-4 flex justify-end gap-2">
+                    <button type="button" onClick={() => setConfirmDiscard(false)}
+                      className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory">Cancel</button>
+                    <button type="button" onClick={() => { setConfirmDiscard(false); onDiscard(); }}
+                      className="rounded-md border border-octo-rouge px-3 py-1.5 font-mono text-xs text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Discard changes</button>
+                  </div>
+                </ModalShell>
               )}
-            </span>
-            {transient ? (
-              <button type="button" onClick={onResume}
-                className="rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]">
-                Resume the stage
+            </div>
+          ) : (
+            /* ── Transient or checkpoint decide row ── */
+            <div className="flex items-center gap-3">
+              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
+                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
+              </span>
+              <span
+                className="min-w-0 flex-1 truncate text-sm text-octo-sage"
+                title={failed ? blockedStage.error ?? undefined : undefined}
+              >
+                {transient ? (
+                  <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
+                ) : failed ? (
+                  <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
+                ) : (
+                  <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
+                )}
+              </span>
+              {transient ? (
+                <button type="button" onClick={() => onResume()}
+                  className="rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]">
+                  Resume the stage
+                </button>
+              ) : failed ? (
+                <button type="button" onClick={onApprove}
+                  className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+                  Accept &amp; continue
+                </button>
+              ) : (
+                <button type="button" onClick={onApprove}
+                  className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi">
+                  Approve &amp; continue
+                </button>
+              )}
+              {canSendBack && (
+                <button type="button" onClick={() => setMode("sendback")}
+                  className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+                  Send back to {loopTargetRole}
+                </button>
+              )}
+              <button type="button" onClick={() => setMode("reject")}
+                className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                {failed ? "Re-run" : "Reject"}
               </button>
-            ) : failed ? (
-              <button type="button" onClick={onApprove}
-                className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                Accept &amp; continue
+              <button type="button" onClick={onAbort}
+                className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
+                Abort
               </button>
-            ) : (
-              <button type="button" onClick={onApprove}
-                className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi">
-                Approve &amp; continue
-              </button>
-            )}
-            {canSendBack && (
-              <button type="button" onClick={() => setMode("sendback")}
-                className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                Send back to {loopTargetRole}
-              </button>
-            )}
-            <button type="button" onClick={() => setMode("reject")}
-              className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
-              {failed ? "Re-run" : "Reject"}
-            </button>
-            <button type="button" onClick={onAbort}
-              className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
-              Abort
-            </button>
-          </div>
+            </div>
+          )
         ) : (
           <div className="flex flex-col gap-2">
             <textarea

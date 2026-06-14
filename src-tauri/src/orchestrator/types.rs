@@ -212,6 +212,10 @@ pub struct StageSpec {
     /// Free-form instructions appended to the archetype's system prompt — the
     /// pipeline author's per-stage shaping.
     pub instructions: Option<String>,
+    /// CLI session to `--resume` on this run (set only by a Resume action).
+    pub resume_session: Option<String>,
+    /// The stage id, so the runner can clear `resume_pending` once it starts.
+    pub stage_id: String,
 }
 
 /// A single tool invocation, captured for the run-event log.
@@ -237,6 +241,9 @@ pub struct StageOutcome {
     pub error: Option<String>,
     /// Parsed `VERDICT:` sentinel from a review stage's output (auto mode only).
     pub verdict: Option<ReviewVerdict>,
+    /// The CLI session ID from the `type:"result"` event, when the CLI substrate
+    /// was used. `None` for API-substrate stages.
+    pub session_id: Option<String>,
 }
 
 /// What the user chose at a checkpoint.
@@ -246,18 +253,22 @@ pub enum CheckpointAction {
     Reject {
         feedback: Option<String>,
         model_override: Option<String>,
+        max_turns_override: Option<i64>,
     },
     /// Route work back to the review stage's `loop_target` (re-run the target +
     /// intervening stages with the reviewer's findings), bounded by the cap.
     SendBack {
         feedback: Option<String>,
     },
-    /// Re-run a stage that halted on a *transient* fault (rate limit, overload,
-    /// 5xx, dropped connection). Unlike `Reject`, it carries no feedback or model
-    /// change — the work wasn't wrong, the substrate was briefly unavailable. The
-    /// prior attempt's spend is retired (kept truthful) and the worktree is left
-    /// intact so a code stage continues from the files already on disk.
-    Resume,
+    /// Recover a halted stage. For a CLI stage with a session id, the re-run
+    /// `--resume`s that session; otherwise it is a fresh re-run (worktree
+    /// preserved). `max_turns_override` raises the tool-turn budget.
+    Resume {
+        max_turns_override: Option<i64>,
+    },
+    /// Revert the worktree to the failed stage's baseline (drop only this
+    /// stage's changes). The stage stays failed; the checkpoint stays open.
+    Discard,
     /// Artifact was edited out-of-band; continue.
     Edit,
     Abort,

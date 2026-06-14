@@ -73,6 +73,7 @@ interface RunsState {
     action: CheckpointActionName,
     feedback?: string,
     modelOverride?: string,
+    maxTurnsOverride?: number,
   ) => Promise<void>;
   abort: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
@@ -207,8 +208,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  resolve: async (runId, action, feedback, modelOverride) => {
-    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride);
+  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
+    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride);
     await get().refreshDetail(runId);
   },
 

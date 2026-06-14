@@ -157,8 +157,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onStopStage={() => void stopStage(run.id)}
           onAbort={() => void abort(run.id)}
           onApprove={() => void resolve(run.id, "approve")}
-          onReject={(fb) => void resolve(run.id, "reject", fb || undefined)}
-          onResume={() => void resolve(run.id, "resume")}
+          onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns)}
+          onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns)}
+          onDiscard={() => void resolve(run.id, "discard")}
           onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
           onRunAgain={onRunAgain}
         />

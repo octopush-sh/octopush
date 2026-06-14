@@ -2718,6 +2718,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -2750,6 +2751,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: if self.fail { Some("ran out of iterations".into()) } else { None },
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -2789,6 +2791,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3072,6 +3075,7 @@ mod orchestrator_tests {
         let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
             feedback: Some("tighten it".into()),
             model_override: None,
+            max_turns_override: None,
         }).await.unwrap();
         assert_eq!(status, RunStatus::Paused);
         let stages = db.lock().list_run_stages(&run_id).unwrap();
@@ -3125,6 +3129,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3547,6 +3552,7 @@ mod orchestrator_tests {
         orch.resolve_checkpoint(&run_id, CheckpointAction::Reject {
             feedback: Some("tighten it".into()),
             model_override: None,
+            max_turns_override: None,
         }).await.unwrap();
 
         let iters = db.lock().list_stage_iterations(&refine_id).unwrap();
@@ -3644,6 +3650,7 @@ mod orchestrator_tests {
                 status: StageStatus::Done, tool_calls: vec![],
                 error: None,
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: None,
             })
         }
     }
@@ -3750,6 +3757,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3843,7 +3851,7 @@ mod orchestrator_tests {
         let (orch, run_id, db) = budgeted_run(2, 0.02, Some(0.01));
         orch.run_to_pause(&run_id).await.unwrap();
         let status = orch
-            .resolve_checkpoint(&run_id, CheckpointAction::Reject { feedback: None, model_override: None })
+            .resolve_checkpoint(&run_id, CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None })
             .await
             .unwrap();
         assert_eq!(status, RunStatus::Paused);
@@ -3874,7 +3882,7 @@ mod cli_runner_tests {
 
     #[test]
     fn parses_success_into_done_outcome() {
-        let outcome = parse_cli_result(SUCCESS, true, "implement").unwrap();
+        let outcome = parse_cli_result(SUCCESS, true, "implement", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Done);
         assert_eq!(outcome.artifact.text, "Implemented the feature.");
         assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
@@ -3887,20 +3895,20 @@ mod cli_runner_tests {
 
     #[test]
     fn is_error_flag_yields_failed_outcome() {
-        let outcome = parse_cli_result(ERRORED, true, "implement").unwrap();
+        let outcome = parse_cli_result(ERRORED, true, "implement", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("Budget exceeded."));
+        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
     }
 
     #[test]
     fn nonzero_exit_yields_failed_even_if_json_ok() {
-        let outcome = parse_cli_result(SUCCESS, false, "plan").unwrap();
+        let outcome = parse_cli_result(SUCCESS, false, "plan", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
     }
 
     #[test]
     fn unparseable_output_is_an_error() {
-        assert!(parse_cli_result("not json", true, "plan").is_err());
+        assert!(parse_cli_result("not json", true, "plan", "").is_err());
     }
 
     #[test]
@@ -3909,7 +3917,7 @@ mod cli_runner_tests {
         // historically with is_error=false — a success-shaped failure.
         const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"","is_error":false,
             "total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let outcome = parse_cli_result(MAX_TURNS, true, "implement").unwrap();
+        let outcome = parse_cli_result(MAX_TURNS, true, "implement", "").unwrap();
         assert!(matches!(outcome.status, crate::orchestrator::types::StageStatus::Failed));
         assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
         assert_eq!(outcome.cost_usd, 1.25);
@@ -3919,7 +3927,7 @@ mod cli_runner_tests {
 
 #[cfg(test)]
 mod cli_args_tests {
-    use crate::orchestrator::cli_runner::build_cli_args;
+    use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume};
 
     #[test]
     fn args_include_model_format_and_permission() {
@@ -3938,6 +3946,13 @@ mod cli_args_tests {
         // F4: the per-stage tool-turn budget drives --max-turns.
         let t = args.iter().position(|a| a == "--max-turns").unwrap();
         assert_eq!(args[t + 1], "40");
+    }
+
+    #[test]
+    fn build_cli_args_resume_uses_resume_flag() {
+        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50);
+        assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
     }
 }
 
@@ -5338,6 +5353,9 @@ mod ancestry_tests {
             tools: None,
             custom_name: None,
             instructions: None,
+            session_id: None,
+            resume_pending: false,
+            baseline_commit: None,
         }
     }
 
@@ -5378,5 +5396,244 @@ mod ancestry_tests {
         ];
         assert!(ancestors_of(&stages, 1).is_empty(), "a second root must not inherit the first root");
         assert_eq!(ancestors_of(&stages, 2), [0, 1].into_iter().collect());
+    }
+}
+
+/// Tests for parse_cli_result diagnostics (Tasks 2, 3, 4).
+#[cfg(test)]
+mod cli_result_tests {
+    use crate::orchestrator::cli_runner::parse_cli_result;
+    use crate::orchestrator::types::StageStatus;
+
+    /// Task 2: subtype is surfaced even when is_error is true.
+    #[test]
+    fn parse_cli_result_names_subtype_when_is_error() {
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let out = parse_cli_result(line, true, "verify", "").unwrap();
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.unwrap();
+        assert!(err.contains("error_max_turns"), "got: {err}");
+    }
+
+    /// Task 3: stderr tail is folded into the failure message.
+    #[test]
+    fn parse_cli_result_appends_stderr_tail() {
+        let line = r#"{"type":"result","is_error":true,"result":"","usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let stderr = "line one\noverloaded_error: server is busy\n";
+        let out = parse_cli_result(line, false, "fix", stderr).unwrap();
+        let err = out.error.unwrap();
+        assert!(err.contains("overloaded_error"), "got: {err}");
+    }
+
+    /// Task 4: session_id is extracted from the result event.
+    #[test]
+    fn parse_cli_result_extracts_session_id() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc-123","usage":{"input_tokens":1,"output_tokens":2}}"#;
+        let out = parse_cli_result(line, true, "fix", "").unwrap();
+        assert_eq!(out.session_id.as_deref(), Some("abc-123"));
+    }
+
+    /// Task 7: idle and absolute-cap timeout messages are distinct user-facing strings.
+    #[test]
+    fn idle_and_abscap_messages_are_distinct() {
+        assert_ne!(
+            "claude timed out — no output for 5 minutes",
+            "claude exceeded the 60-minute cap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_baseline_tests {
+    #[test]
+    fn baseline_round_trip_reverts_only_stage_changes() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| { Command::new("git").args(args).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("keep.txt"), "from fix\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("keep.txt"), "from fix EDITED\n").unwrap();
+        std::fs::write(dir.join("preexisting_untracked.txt"), "user file\n").unwrap();
+
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        std::fs::write(dir.join("keep.txt"), "verify CLOBBERED\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/new.rs"), "half edit\n").unwrap();
+
+        restore_baseline(&dir, &baseline).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "from fix EDITED\n", "fix's work preserved");
+        assert_eq!(std::fs::read_to_string(dir.join("preexisting_untracked.txt")).unwrap(), "user file\n", "pre-existing untracked preserved");
+        assert!(!dir.join("sub/new.rs").exists(), "verify's new file removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_restores_a_file_deleted_during_the_stage() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| { Command::new("git").args(a).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]); git(&["config","user.email","t@t"]); git(&["config","user.name","t"]);
+        std::fs::write(dir.join("a.txt"), "A\n").unwrap();
+        git(&["add","-A"]); git(&["commit","-qm","init"]);
+        let baseline = capture_baseline(&dir).unwrap().unwrap();
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        restore_baseline(&dir, &baseline).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "A\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_deletes_a_unicode_named_stage_file() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-uni-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| { Command::new("git").args(a).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]); git(&["config","user.email","t@t"]); git(&["config","user.name","t"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add","-A"]); git(&["commit","-qm","init"]);
+        let baseline = capture_baseline(&dir).unwrap().unwrap();
+        std::fs::write(dir.join("café_new.txt"), "stage file\n").unwrap(); // unicode name created during stage
+        restore_baseline(&dir, &baseline).unwrap();
+        assert!(!dir.join("café_new.txt").exists(), "unicode-named stage file should be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the case-insensitive deletion guard (Fix 2).
+    ///
+    /// Simulates a stage that does `git mv File.txt file.txt` (case-only rename):
+    /// after restore the file must exist with the BASELINE content, not be deleted.
+    ///
+    /// On a case-sensitive FS (Linux CI) the rename produces two distinct entries
+    /// so the guard is still exercised without triggering actual deletion. On a
+    /// case-insensitive FS (macOS) this reproduces the data-loss bug the fix
+    /// addresses.
+    #[test]
+    fn baseline_case_only_rename_preserves_file() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "octo-baseline-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| {
+            Command::new("git").args(a).current_dir(&dir).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Baseline: file tracked as "File.txt"
+        std::fs::write(dir.join("File.txt"), "baseline content\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        // Simulate the stage doing a case-only rename (mv File.txt file.txt).
+        // On a case-insensitive FS the OS sees it as the same file; on a
+        // case-sensitive FS we emulate by removing the old name and writing the new.
+        git(&["mv", "File.txt", "file.txt"]);
+        // On a case-insensitive FS `git mv` changes only the index entry; on a
+        // case-sensitive FS both names exist temporarily. Either way, after
+        // restore the file must contain the baseline content.
+
+        restore_baseline(&dir, &baseline).unwrap();
+
+        // On a case-insensitive FS the file lives under whichever case the OS
+        // chose; on a case-sensitive FS it's restored as "File.txt". Check both.
+        let content = std::fs::read_to_string(dir.join("File.txt"))
+            .or_else(|_| std::fs::read_to_string(dir.join("file.txt")))
+            .expect("file should exist after restore (baseline must not be deleted)");
+        assert_eq!(
+            content, "baseline content\n",
+            "restored file must contain the baseline content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: after restore_baseline the REAL git index must be
+    /// resynced to HEAD so that any staged entries left by a failed stage
+    /// (e.g. from `git add -A` in custom instructions) don't survive as
+    /// phantom staged changes in `git diff --cached`.
+    #[test]
+    fn baseline_restore_clears_staged_index() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "octo-baseline-idx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git_out = |a: &[&str]| {
+            Command::new("git").args(a).current_dir(&dir).output().unwrap()
+        };
+        let git = |a: &[&str]| { git_out(a); };
+
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("initial.txt"), "initial\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Capture the baseline (mimics stage start).
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        // Simulate a stage that modifies a file AND stages those changes into
+        // the real index via `git add -A` (as custom stage instructions might).
+        std::fs::write(dir.join("initial.txt"), "modified by stage\n").unwrap();
+        std::fs::write(dir.join("stage_new.txt"), "created by stage\n").unwrap();
+        git(&["add", "-A"]);
+
+        // Verify the real index really has staged changes before restore.
+        let before = git_out(&["diff", "--cached", "--name-only"]);
+        let before_stdout = String::from_utf8_lossy(&before.stdout);
+        assert!(
+            !before_stdout.trim().is_empty(),
+            "pre-condition: real index must have staged changes before restore"
+        );
+
+        // Discard the failed stage.
+        restore_baseline(&dir, &baseline).unwrap();
+
+        // After restore, `git diff --cached --name-only` must be empty: the
+        // real index must have been resynced to HEAD (mixed reset).
+        let after = git_out(&["diff", "--cached", "--name-only"]);
+        let after_stdout = String::from_utf8_lossy(&after.stdout);
+        assert!(
+            after_stdout.trim().is_empty(),
+            "after restore_baseline the real index must show no staged changes; got: {after_stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

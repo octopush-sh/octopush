@@ -16,7 +16,11 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-const CLI_TIMEOUT_SECS: u64 = 900; // 15-minute wall-clock backstop for a hung CLI
+/// Fail a CLI stage if it emits NO output for this long — a hung CLI, not a
+/// busy one. A stage that keeps streaming (a long build/release) stays alive.
+const IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes of silence
+/// Absolute backstop: even a trickle of output can't run forever.
+const ABS_CAP_SECS: u64 = 3600; // 60 minutes total
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -32,6 +36,9 @@ struct CliResult {
     total_cost_usd: f64,
     #[serde(default)]
     usage: CliUsage,
+    /// The CLI session ID from the result event — carries forward for resume.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -150,12 +157,14 @@ fn resolved_cli_path() -> String {
 }
 
 /// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
-/// A non-zero exit OR `is_error: true` produces a Failed outcome. Returns
-/// `Err` only when the line isn't parseable at all.
+/// A non-zero exit OR `is_error: true` produces a Failed outcome. `stderr_text`
+/// is appended to the failure message when the result itself gives no detail.
+/// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
     exit_success: bool,
     role: &str,
+    stderr_text: &str,
 ) -> AppResult<StageOutcome> {
     let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| {
         let preview: String = stdout.chars().take(300).collect();
@@ -163,8 +172,17 @@ pub fn parse_cli_result(
     })?;
 
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
-    let subtype_only = !parsed.is_error && exit_success;
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
+        let error = match (bad_subtype, parsed.result.is_empty()) {
+            (Some(st), true) => format!(
+                "claude stopped early ({st}) — review the work journal, then resume or re-run"
+            ),
+            (Some(st), false) => format!("claude stopped early ({st}): {}", parsed.result),
+            (None, true) => "claude exited with an error".to_string(),
+            (None, false) => parsed.result.clone(),
+        };
+        let tail = stderr_tail(stderr_text, 10);
+        let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
         return Ok(StageOutcome {
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -177,15 +195,9 @@ pub fn parse_cli_result(
             cost_usd: parsed.total_cost_usd,
             status: StageStatus::Failed,
             tool_calls: vec![],
-            // Prefix the subtype only when it was the sole failure signal (the
-            // success-shaped case); explicit errors keep their own message.
-            error: Some(match (subtype_only, bad_subtype, parsed.result.is_empty()) {
-                (true, Some(st), true) => format!("claude stopped early ({st}) — review the work journal, then re-run or abort"),
-                (true, Some(st), false) => format!("claude stopped early ({st}): {}", parsed.result),
-                (_, _, true) => "claude exited with an error".to_string(),
-                (_, _, false) => parsed.result.clone(),
-            }),
+            error: Some(error),
             verdict: None,
+            session_id: parsed.session_id.clone(),
         });
     }
 
@@ -205,6 +217,7 @@ pub fn parse_cli_result(
         tool_calls: vec![],
         error: None,
         verdict: parse_verdict(&parsed.result),
+        session_id: parsed.session_id.clone(),
     })
 }
 
@@ -230,10 +243,32 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<S
     ]
 }
 
+/// Argv for resuming an existing headless session: continue the same
+/// conversation (`--resume <id>`) with a fresh turn budget. The continuation
+/// nudge is supplied via stdin by the caller.
+pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        "--output-format".to_string(), "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--model".to_string(), model.to_string(),
+        "--resume".to_string(), session_id.to_string(),
+        "--permission-mode".to_string(), "bypassPermissions".to_string(),
+        "--max-turns".to_string(), max_turns.max(1).to_string(),
+    ]
+}
+
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
 /// text, cost, usage, and `is_error`). Parsed via [`parse_cli_result`].
 pub fn is_result_event(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("result")
+}
+
+/// How the stdout read loop ended — drives the post-loop handling.
+enum ReadEnd {
+    Eof(Option<String>, std::collections::VecDeque<String>),
+    Idle(Option<String>, std::collections::VecDeque<String>),
+    AbsCap(Option<String>, std::collections::VecDeque<String>),
 }
 
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
@@ -251,8 +286,17 @@ impl AgentRunner for CliRunner {
         // per-stage tool allowlist does not apply here; the author's free-form
         // instructions still shape the stage via the system prompt.
         let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
-        let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
-        let args = build_cli_args(&stage.agent_model, &system, stage.max_iterations);
+        let (args, user) = match stage.resume_session.as_deref() {
+            Some(sid) => (
+                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
+                "Continue the task from where you left off. You have a fresh turn budget; \
+                 finish the remaining work, then stop.".to_string(),
+            ),
+            None => (
+                build_cli_args(&stage.agent_model, &system, stage.max_iterations),
+                user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
+            ),
+        };
 
         let path_env = resolved_cli_path();
         let program: std::ffi::OsString = resolve_executable("claude", &path_env)
@@ -314,12 +358,22 @@ impl AgentRunner for CliRunner {
             let mut result_line: Option<String> = None;
             let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
             let mut raw: Vec<u8> = Vec::new();
+            let started = std::time::Instant::now();
             loop {
+                if started.elapsed().as_secs() >= ABS_CAP_SECS {
+                    return ReadEnd::AbsCap(result_line, tail);
+                }
                 raw.clear();
-                match reader.read_until(b'\n', &mut raw).await {
-                    Ok(0) => break,  // EOF
-                    Ok(_) => {}
-                    Err(_) => break, // read error → stop streaming, use what we have
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+                    reader.read_until(b'\n', &mut raw),
+                )
+                .await;
+                match read {
+                    Err(_) => return ReadEnd::Idle(result_line, tail), // no line within IDLE
+                    Ok(Ok(0)) => break,                                 // EOF
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => break,                                // read error
                 }
                 let line = String::from_utf8_lossy(&raw);
                 let trimmed = line.trim();
@@ -340,13 +394,14 @@ impl AgentRunner for CliRunner {
                     emitter.emit_raw_entry(entry);
                 }
             }
-            (result_line, tail)
+            ReadEnd::Eof(result_line, tail)
         };
 
         // Race the child's output against the director's stop signal: poll the
         // cancel flag every ~500ms and, when set, kill the child and fail the
         // stage with the director message (zero usage — the burned spend is
-        // unknowable mid-flight). The 15-minute wall-clock backstop still applies.
+        // unknowable mid-flight). An idle timeout fires when NO output arrives
+        // for IDLE_TIMEOUT_SECS; an absolute cap fires after ABS_CAP_SECS total.
         let cancel = std::sync::Arc::clone(&ctx.cancel);
         let cancel_watch = async move {
             loop {
@@ -356,19 +411,8 @@ impl AgentRunner for CliRunner {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         };
-        let (result_line, tail) = tokio::select! {
-            out = tokio::time::timeout(
-                std::time::Duration::from_secs(CLI_TIMEOUT_SECS),
-                read_loop,
-            ) => match out {
-                Ok(out) => out,
-                // child is dropped on return → kill_on_drop terminates the process.
-                Err(_) => {
-                    return Ok(failed_stage(
-                        "claude stage timed out (no result within 15 minutes)",
-                    ))
-                }
-            },
+        let read_end = tokio::select! {
+            end = read_loop => end,
             _ = cancel_watch => {
                 let _ = child.kill().await;
                 return Ok(failed_stage(
@@ -376,15 +420,40 @@ impl AgentRunner for CliRunner {
                 ));
             }
         };
+        let (result_line, tail, salvaged) = match read_end {
+            ReadEnd::Eof(r, t) => (r, t, false),
+            ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
+            ReadEnd::Idle(None, _) => {
+                stderr_task.abort();
+                return Ok(failed_stage("claude timed out — no output for 5 minutes"));
+            }
+            ReadEnd::AbsCap(None, _) => {
+                stderr_task.abort();
+                return Ok(failed_stage("claude exceeded the 60-minute cap"));
+            }
+        };
 
-        // We got a result event from claude (it ran to completion); trust its
-        // own `is_error` over a rare `wait()` hiccup, so default a wait error to
-        // success rather than failing a stage that actually succeeded.
-        let exit_success = child.wait().await.map(|s| s.success()).unwrap_or(true);
-        let stderr_out = stderr_task.await.unwrap_or_default();
+        // When we salvaged a result from a slow-EOF idle/cap, the child may still
+        // be lingering — kill it instead of blocking on wait(), and trust the
+        // result event's own is_error (same rationale as the existing wait-hiccup
+        // comment). Otherwise (clean EOF) wait normally.
+        let exit_success = if salvaged {
+            let _ = child.kill().await;
+            true
+        } else {
+            child.wait().await.map(|s| s.success()).unwrap_or(true)
+        };
+        let stderr_out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stderr_task,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
 
         match result_line {
-            Some(line) => match parse_cli_result(&line, exit_success, &stage.role) {
+            Some(line) => match parse_cli_result(&line, exit_success, &stage.role, &stderr_out) {
                 Ok(outcome) => Ok(outcome),
                 Err(_) => Ok(failed_stage(&format!(
                     "claude produced no parseable result: {}",
@@ -414,6 +483,13 @@ fn failure_detail(stderr: &str, fallback: &str) -> String {
     src.chars().take(400).collect()
 }
 
+/// Last `n` non-empty lines of stderr, joined — appended to a failure message
+/// when claude itself gave no detail. Empty string when stderr is blank.
+fn stderr_tail(stderr: &str, n: usize) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 fn failed_stage(msg: &str) -> StageOutcome {
     StageOutcome {
         artifact: StageArtifact {
@@ -429,5 +505,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         tool_calls: vec![],
         error: Some(msg.to_string()),
         verdict: None,
+        session_id: None,
     }
 }

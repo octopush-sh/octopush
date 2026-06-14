@@ -1115,14 +1115,16 @@ pub async fn resolve_checkpoint(
     action: String,
     feedback: Option<String>,
     model_override: Option<String>,
+    max_turns_override: Option<i64>,
 ) -> AppResult<()> {
     let action = match action.as_str() {
         "approve" => CheckpointAction::Approve,
         "edit" => CheckpointAction::Edit,
         "abort" => CheckpointAction::Abort,
-        "reject" => CheckpointAction::Reject { feedback, model_override },
-        "resume" => CheckpointAction::Resume,
+        "reject" => CheckpointAction::Reject { feedback, model_override, max_turns_override },
+        "resume" => CheckpointAction::Resume { max_turns_override },
         "send_back" => CheckpointAction::SendBack { feedback },
+        "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
     // Drive in the background; the frontend reacts to run:// events.
