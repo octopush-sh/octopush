@@ -5415,4 +5415,12 @@ mod cli_result_tests {
         let err = out.error.unwrap();
         assert!(err.contains("overloaded_error"), "got: {err}");
     }
+
+    /// Task 4: session_id is extracted from the result event.
+    #[test]
+    fn parse_cli_result_extracts_session_id() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc-123","usage":{"input_tokens":1,"output_tokens":2}}"#;
+        let out = parse_cli_result(line, true, "fix", "").unwrap();
+        assert_eq!(out.session_id.as_deref(), Some("abc-123"));
+    }
 }
