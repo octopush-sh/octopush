@@ -302,6 +302,7 @@ impl AgentRunner for ApiRunner {
                         tool_calls: r.tool_calls,
                         error: Some(unfinished_stage_error(cancelled, max_iterations)),
                         verdict: None,
+                        session_id: None,
                     });
                 }
                 let kind = artifact_kind_for(&stage.role);
@@ -327,6 +328,7 @@ impl AgentRunner for ApiRunner {
                     tool_calls: r.tool_calls,
                     error: None,
                     verdict,
+                    session_id: None,
                 })
             }
             Err(e) => Ok(StageOutcome {
@@ -343,6 +345,7 @@ impl AgentRunner for ApiRunner {
                 tool_calls: vec![],
                 error: Some(e.to_string()),
                 verdict: None,
+                session_id: None,
             }),
         }
     }

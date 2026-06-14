@@ -237,6 +237,9 @@ pub struct StageOutcome {
     pub error: Option<String>,
     /// Parsed `VERDICT:` sentinel from a review stage's output (auto mode only).
     pub verdict: Option<ReviewVerdict>,
+    /// The CLI session ID from the `type:"result"` event, when the CLI substrate
+    /// was used. `None` for API-substrate stages.
+    pub session_id: Option<String>,
 }
 
 /// What the user chose at a checkpoint.

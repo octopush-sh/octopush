@@ -32,6 +32,9 @@ struct CliResult {
     total_cost_usd: f64,
     #[serde(default)]
     usage: CliUsage,
+    /// The CLI session ID from the result event — carries forward for resume.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -150,12 +153,14 @@ fn resolved_cli_path() -> String {
 }
 
 /// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
-/// A non-zero exit OR `is_error: true` produces a Failed outcome. Returns
-/// `Err` only when the line isn't parseable at all.
+/// A non-zero exit OR `is_error: true` produces a Failed outcome. `stderr_text`
+/// is appended to the failure message when the result itself gives no detail.
+/// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
     exit_success: bool,
     role: &str,
+    stderr_text: &str,
 ) -> AppResult<StageOutcome> {
     let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| {
         let preview: String = stdout.chars().take(300).collect();
@@ -163,8 +168,15 @@ pub fn parse_cli_result(
     })?;
 
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
-    let subtype_only = !parsed.is_error && exit_success;
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
+        let error = match (bad_subtype, parsed.result.is_empty()) {
+            (Some(st), true) => format!(
+                "claude stopped early ({st}) — review the work journal, then resume or re-run"
+            ),
+            (Some(st), false) => format!("claude stopped early ({st}): {}", parsed.result),
+            (None, true) => "claude exited with an error".to_string(),
+            (None, false) => parsed.result.clone(),
+        };
         return Ok(StageOutcome {
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -177,15 +189,9 @@ pub fn parse_cli_result(
             cost_usd: parsed.total_cost_usd,
             status: StageStatus::Failed,
             tool_calls: vec![],
-            // Prefix the subtype only when it was the sole failure signal (the
-            // success-shaped case); explicit errors keep their own message.
-            error: Some(match (subtype_only, bad_subtype, parsed.result.is_empty()) {
-                (true, Some(st), true) => format!("claude stopped early ({st}) — review the work journal, then re-run or abort"),
-                (true, Some(st), false) => format!("claude stopped early ({st}): {}", parsed.result),
-                (_, _, true) => "claude exited with an error".to_string(),
-                (_, _, false) => parsed.result.clone(),
-            }),
+            error: Some(error),
             verdict: None,
+            session_id: parsed.session_id.clone(),
         });
     }
 
@@ -205,6 +211,7 @@ pub fn parse_cli_result(
         tool_calls: vec![],
         error: None,
         verdict: parse_verdict(&parsed.result),
+        session_id: parsed.session_id.clone(),
     })
 }
 
@@ -384,7 +391,7 @@ impl AgentRunner for CliRunner {
         let stderr_out = stderr_task.await.unwrap_or_default();
 
         match result_line {
-            Some(line) => match parse_cli_result(&line, exit_success, &stage.role) {
+            Some(line) => match parse_cli_result(&line, exit_success, &stage.role, &stderr_out) {
                 Ok(outcome) => Ok(outcome),
                 Err(_) => Ok(failed_stage(&format!(
                     "claude produced no parseable result: {}",
@@ -429,5 +436,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         tool_calls: vec![],
         error: Some(msg.to_string()),
         verdict: None,
+        session_id: None,
     }
 }

@@ -2718,6 +2718,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -2750,6 +2751,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: if self.fail { Some("ran out of iterations".into()) } else { None },
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -2789,6 +2791,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3125,6 +3128,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3644,6 +3648,7 @@ mod orchestrator_tests {
                 status: StageStatus::Done, tool_calls: vec![],
                 error: None,
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: None,
             })
         }
     }
@@ -3750,6 +3755,7 @@ mod orchestrator_tests {
                 tool_calls: vec![],
                 error: None,
                 verdict: None,
+                session_id: None,
             })
         }
     }
@@ -3874,7 +3880,7 @@ mod cli_runner_tests {
 
     #[test]
     fn parses_success_into_done_outcome() {
-        let outcome = parse_cli_result(SUCCESS, true, "implement").unwrap();
+        let outcome = parse_cli_result(SUCCESS, true, "implement", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Done);
         assert_eq!(outcome.artifact.text, "Implemented the feature.");
         assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
@@ -3887,20 +3893,20 @@ mod cli_runner_tests {
 
     #[test]
     fn is_error_flag_yields_failed_outcome() {
-        let outcome = parse_cli_result(ERRORED, true, "implement").unwrap();
+        let outcome = parse_cli_result(ERRORED, true, "implement", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("Budget exceeded."));
     }
 
     #[test]
     fn nonzero_exit_yields_failed_even_if_json_ok() {
-        let outcome = parse_cli_result(SUCCESS, false, "plan").unwrap();
+        let outcome = parse_cli_result(SUCCESS, false, "plan", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
     }
 
     #[test]
     fn unparseable_output_is_an_error() {
-        assert!(parse_cli_result("not json", true, "plan").is_err());
+        assert!(parse_cli_result("not json", true, "plan", "").is_err());
     }
 
     #[test]
@@ -3909,7 +3915,7 @@ mod cli_runner_tests {
         // historically with is_error=false — a success-shaped failure.
         const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"","is_error":false,
             "total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let outcome = parse_cli_result(MAX_TURNS, true, "implement").unwrap();
+        let outcome = parse_cli_result(MAX_TURNS, true, "implement", "").unwrap();
         assert!(matches!(outcome.status, crate::orchestrator::types::StageStatus::Failed));
         assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
         assert_eq!(outcome.cost_usd, 1.25);
@@ -5381,5 +5387,22 @@ mod ancestry_tests {
         ];
         assert!(ancestors_of(&stages, 1).is_empty(), "a second root must not inherit the first root");
         assert_eq!(ancestors_of(&stages, 2), [0, 1].into_iter().collect());
+    }
+}
+
+/// Tests for parse_cli_result diagnostics (Tasks 2, 3, 4).
+#[cfg(test)]
+mod cli_result_tests {
+    use crate::orchestrator::cli_runner::parse_cli_result;
+    use crate::orchestrator::types::StageStatus;
+
+    /// Task 2: subtype is surfaced even when is_error is true.
+    #[test]
+    fn parse_cli_result_names_subtype_when_is_error() {
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let out = parse_cli_result(line, true, "verify", "").unwrap();
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.unwrap();
+        assert!(err.contains("error_max_turns"), "got: {err}");
     }
 }
