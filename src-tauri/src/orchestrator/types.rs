@@ -212,6 +212,10 @@ pub struct StageSpec {
     /// Free-form instructions appended to the archetype's system prompt — the
     /// pipeline author's per-stage shaping.
     pub instructions: Option<String>,
+    /// CLI session to `--resume` on this run (set only by a Resume action).
+    pub resume_session: Option<String>,
+    /// The stage id, so the runner can clear `resume_pending` once it starts.
+    pub stage_id: String,
 }
 
 /// A single tool invocation, captured for the run-event log.

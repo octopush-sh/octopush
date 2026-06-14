@@ -317,7 +317,14 @@ impl Orchestrator {
             max_iterations: stage.max_iterations,
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
+            resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            stage_id: stage.id.clone(),
         };
+
+        // Clear resume_pending once the run starts so a second re-run is always fresh.
+        if stage.resume_pending {
+            self.db.lock().set_stage_resume_pending(&stage.id, false)?;
+        }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
         let input = self.assemble_stage_input(&run.id, stage.position)?;

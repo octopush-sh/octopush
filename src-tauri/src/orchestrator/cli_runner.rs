@@ -243,6 +243,21 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<S
     ]
 }
 
+/// Argv for resuming an existing headless session: continue the same
+/// conversation (`--resume <id>`) with a fresh turn budget. The continuation
+/// nudge is supplied via stdin by the caller.
+pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        "--output-format".to_string(), "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--model".to_string(), model.to_string(),
+        "--resume".to_string(), session_id.to_string(),
+        "--permission-mode".to_string(), "bypassPermissions".to_string(),
+        "--max-turns".to_string(), max_turns.max(1).to_string(),
+    ]
+}
+
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
 /// text, cost, usage, and `is_error`). Parsed via [`parse_cli_result`].
 pub fn is_result_event(v: &Value) -> bool {
@@ -271,8 +286,17 @@ impl AgentRunner for CliRunner {
         // per-stage tool allowlist does not apply here; the author's free-form
         // instructions still shape the stage via the system prompt.
         let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
-        let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
-        let args = build_cli_args(&stage.agent_model, &system, stage.max_iterations);
+        let (args, user) = match stage.resume_session.as_deref() {
+            Some(sid) => (
+                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
+                "Continue the task from where you left off. You have a fresh turn budget; \
+                 finish the remaining work, then stop.".to_string(),
+            ),
+            None => (
+                build_cli_args(&stage.agent_model, &system, stage.max_iterations),
+                user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
+            ),
+        };
 
         let path_env = resolved_cli_path();
         let program: std::ffi::OsString = resolve_executable("claude", &path_env)

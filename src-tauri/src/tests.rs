@@ -3927,7 +3927,7 @@ mod cli_runner_tests {
 
 #[cfg(test)]
 mod cli_args_tests {
-    use crate::orchestrator::cli_runner::build_cli_args;
+    use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume};
 
     #[test]
     fn args_include_model_format_and_permission() {
@@ -3946,6 +3946,13 @@ mod cli_args_tests {
         // F4: the per-stage tool-turn budget drives --max-turns.
         let t = args.iter().position(|a| a == "--max-turns").unwrap();
         assert_eq!(args[t + 1], "40");
+    }
+
+    #[test]
+    fn build_cli_args_resume_uses_resume_flag() {
+        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50);
+        assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
     }
 }
 
