@@ -330,6 +330,16 @@ impl Orchestrator {
         );
         self.emit_run_update(&run.id);
 
+        // Snapshot the worktree NOW so a later Discard reverts only this stage's
+        // edits. Best-effort & forensic: a capture failure never blocks the run.
+        if let Ok(ws) = self.workspace_path(run) {
+            match crate::orchestrator::git_baseline::capture_baseline(&ws) {
+                Ok(Some(sha)) => { let _ = self.db.lock().set_stage_baseline(&stage.id, Some(&sha)); }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(stage_id = %stage.id, "baseline capture failed: {e}"),
+            }
+        }
+
         // Install a FRESH cancel flag for this run before the stage starts —
         // `stop_current_stage`/`abort_run` set it to interrupt in-flight work.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -2236,6 +2236,16 @@ impl Db {
         Ok(())
     }
 
+    /// Persist the pre-stage worktree commit SHA captured at stage start.
+    /// Used by Discard to revert only this stage's edits.
+    pub fn set_stage_baseline(&self, stage_id: &str, baseline: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET baseline_commit = ?2 WHERE id = ?1",
+            params![stage_id, baseline],
+        )?;
+        Ok(())
+    }
+
     /// Append one `run://log` entry (JSON) to a stage's persisted journal.
     pub fn append_stage_log(&self, run_id: &str, stage_id: &str, entry_json: &str) -> AppResult<()> {
         self.conn.execute(
