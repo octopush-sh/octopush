@@ -109,6 +109,20 @@ fn message_to_openai(msg: &LlmMessage) -> Vec<Value> {
             "role": "user",
             "content": t,
         })],
+        (_, LlmContent::Multimodal(blocks)) => {
+            // OpenAI vision: text parts + image_url parts with base64 data URLs.
+            let parts: Vec<Value> = blocks
+                .iter()
+                .map(|b| match b {
+                    crate::providers::LlmBlock::Text(t) => json!({ "type": "text", "text": t }),
+                    crate::providers::LlmBlock::Image { media_type, data } => json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                    }),
+                })
+                .collect();
+            vec![json!({ "role": "user", "content": parts })]
+        }
         (LlmRole::Assistant, LlmContent::Text(t)) => vec![json!({
             "role": "assistant",
             "content": t,

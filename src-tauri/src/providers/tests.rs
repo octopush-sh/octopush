@@ -2,7 +2,7 @@
 //! These are pure functions — no HTTP, no async, fast.
 
 use super::{
-    LlmContent, LlmMessage, LlmRequest, LlmRole, LlmStopReason,
+    LlmBlock, LlmContent, LlmMessage, LlmRequest, LlmRole, LlmStopReason,
     LlmTool, LlmToolResult, LlmToolUse,
 };
 use super::{anthropic, openai_compat};
@@ -41,6 +41,46 @@ fn anthropic_build_request_shape() {
     assert_eq!(body["tools"][0]["name"], "read_file");
     assert_eq!(body["tools"][0]["description"], "Read a file.");
     assert!(body["tools"][0]["input_schema"].is_object());
+}
+
+#[test]
+fn anthropic_multimodal_serializes_image_blocks() {
+    let mut req = sample_request();
+    req.messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Multimodal(vec![
+            LlmBlock::Text("what is this?".into()),
+            LlmBlock::Image { media_type: "image/png".into(), data: "QUJD".into() },
+        ]),
+    }];
+    let body = anthropic::build_request(&req);
+    let content = &body["messages"][0]["content"];
+    assert!(content.is_array());
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "QUJD");
+}
+
+#[test]
+fn openai_multimodal_serializes_image_url() {
+    let mut req = sample_request();
+    req.messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Multimodal(vec![
+            LlmBlock::Text("hi".into()),
+            LlmBlock::Image { media_type: "image/jpeg".into(), data: "ZZ".into() },
+        ]),
+    }];
+    let body = openai_compat::build_request(&req);
+    let parts = &body["messages"].as_array().unwrap();
+    // First user message (after the system message) carries the content parts.
+    let user = parts.iter().find(|m| m["role"] == "user").unwrap();
+    assert_eq!(user["content"][0]["type"], "text");
+    assert_eq!(user["content"][1]["type"], "image_url");
+    assert_eq!(user["content"][1]["image_url"]["url"], "data:image/jpeg;base64,ZZ");
 }
 
 #[test]

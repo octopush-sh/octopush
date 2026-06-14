@@ -20,8 +20,11 @@ import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
 import { SlashMenu } from "./SlashMenu";
+import { AttachmentTray } from "./AttachmentTray";
+import { fileToAttachment } from "../../lib/attachments";
 import { FadeSwap } from "../primitives/FadeSwap";
-import { X } from "lucide-react";
+import { X, Paperclip } from "lucide-react";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
   workspaceId: string;
@@ -47,6 +50,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const stop = useChatStore((s) => s.stop);
   const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
   const setActiveSkill = useChatStore((s) => s.setActiveSkill);
+  const attachments = useChatStore((s) => s.getAttachments(workspaceId));
+  const addAttachment = useChatStore((s) => s.addAttachment);
+  const removeAttachment = useChatStore((s) => s.removeAttachment);
   const overrideActive = useBudgetsStore((s) => s.overrideActive);
 
   const [input, setInputState] = useState("");
@@ -213,6 +219,50 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       ? estimatePerMessageCost(activeModelInfo, estimatedTokens)
       : null;
 
+  // ── Image attachments (paste / drag-drop / file picker) ─────────────
+  async function addFiles(files: FileList | File[]) {
+    for (const file of Array.from(files)) {
+      const att = await fileToAttachment(file);
+      if (att) addAttachment(workspaceId, att);
+    }
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const imgs = Array.from(e.clipboardData.files).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (imgs.length > 0) {
+      e.preventDefault();
+      void addFiles(imgs);
+    }
+  }
+
+  function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    if (e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    void addFiles(e.dataTransfer.files);
+  }
+
+  async function pickAttachments() {
+    try {
+      const selected = await openFileDialog({
+        multiple: true,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      for (const path of paths) {
+        try {
+          const att = await ipc.readAttachment(path);
+          addAttachment(workspaceId, att);
+        } catch {
+          // skip unreadable / oversized files
+        }
+      }
+    } catch {
+      // dialog cancelled / unavailable
+    }
+  }
+
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const val = e.target.value;
     setInput(val);
@@ -361,6 +411,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   return (
     <div className="px-6 pb-4 pt-3">
       <div
+        onDrop={handleDrop}
+        onDragOver={(e) => e.preventDefault()}
         className={clsx(
           "relative rounded-lg border bg-octo-onyx transition-colors duration-[180ms]",
           streaming
@@ -368,6 +420,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             : "border-octo-hairline focus-within:border-[var(--brass-dim)]",
         )}
       >
+        <AttachmentTray
+          attachments={attachments}
+          onRemove={(i) => removeAttachment(workspaceId, i)}
+        />
         {mention && (
           <MentionPopover
             items={mentionItems}
@@ -410,6 +466,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           value={input}
           onChange={handleInput}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           // Recompute the mention on every caret move (click, ArrowLeft/Right,
           // Home/End) — not just on typing — so the popover closes when the
           // caret leaves the trigger and mention.caret never goes stale.
@@ -434,6 +491,15 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         <div className="flex items-center gap-3 px-3 pb-2.5">
           <ModelPicker activeModel={model} onSelectModel={setModel} />
           <EffortSelector />
+          <button
+            type="button"
+            onClick={pickAttachments}
+            title="Attach an image"
+            aria-label="Attach an image"
+            className="flex items-center text-octo-mute transition-colors hover:text-octo-brass"
+          >
+            <Paperclip size={14} />
+          </button>
 
           {inlineCost !== null && (
             <div

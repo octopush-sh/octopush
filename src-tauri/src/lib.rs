@@ -180,6 +180,7 @@ pub fn run() {
             commands::rename_chat_thread,
             commands::delete_chat_thread,
             commands::list_skills,
+            commands::read_attachment,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,

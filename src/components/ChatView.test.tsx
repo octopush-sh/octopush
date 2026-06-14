@@ -46,6 +46,7 @@ vi.mock("../lib/ipc", () => ({
     renameChatThread: vi.fn().mockResolvedValue(undefined),
     deleteChatThread: vi.fn().mockResolvedValue(undefined),
     listSkills: vi.fn().mockResolvedValue([]),
+    readAttachment: vi.fn().mockResolvedValue({ mediaType: "image/png", data: "", name: "x.png" }),
   },
 }));
 
@@ -67,6 +68,7 @@ function resetStore() {
     activeThreadByWs: {},
     streamingThreadByWs: {},
     activeSkillByWs: {},
+    attachmentsByWs: {},
   });
   useBudgetsStore.setState({
     budgets: [],

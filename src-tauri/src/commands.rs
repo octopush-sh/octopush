@@ -903,6 +903,56 @@ pub async fn list_skills(workspace_path: String) -> AppResult<Vec<crate::skills:
     Ok(skills.iter().map(|s| s.meta()).collect())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentData {
+    pub media_type: String,
+    pub data: String,
+    pub name: String,
+}
+
+/// Read an image file into a base64 attachment (images only, ≤ 5 MB) for the
+/// chat composer. Returns the IANA media type, base64 data, and file name.
+#[tauri::command]
+pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
+    use base64::Engine as _;
+    let p = std::path::Path::new(&path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let media_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        other => {
+            return Err(crate::error::AppError::Other(format!(
+                "Unsupported attachment type: .{other} (images only)"
+            )))
+        }
+    };
+    let bytes = std::fs::read(p)
+        .map_err(|e| crate::error::AppError::Other(format!("Failed to read {path}: {e}")))?;
+    if bytes.len() > 5_000_000 {
+        return Err(crate::error::AppError::Other(
+            "Image too large (max 5 MB).".into(),
+        ));
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image")
+        .to_string();
+    Ok(AttachmentData {
+        media_type: media_type.to_string(),
+        data,
+        name,
+    })
+}
+
 // ─── Direct-mode orchestration commands ──────────────────────────
 
 #[tauri::command]

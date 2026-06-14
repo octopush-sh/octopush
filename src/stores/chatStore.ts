@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
-import type { ChatMessage, ChatStreamEvent, ChatThread } from "../lib/types";
+import type { ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
 import { useAttentionStore } from "./attentionStore";
@@ -120,6 +120,7 @@ const EMPTY_MESSAGES: ChatMessage[] = [];
 const EMPTY_TIMELINE: ConversationItem[] = [];
 const EMPTY_LIVE_TOOLS: LiveTool[] = [];
 const EMPTY_THREADS: ChatThread[] = [];
+const EMPTY_ATTACHMENTS: Attachment[] = [];
 
 /** Whether an event for `threadId` should apply to the workspace's currently
  *  shown thread. Lenient: when no active thread is recorded yet (e.g. tests) or
@@ -158,6 +159,9 @@ interface ChatState {
   /** Active skill name per workspace — appended to the system prompt + tool
    *  scoping for each turn until cleared. */
   activeSkillByWs: Record<string, string | null>;
+  /** Pending image attachments per workspace — sent with the next turn, then
+   *  cleared. */
+  attachmentsByWs: Record<string, Attachment[]>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -174,6 +178,7 @@ interface ChatState {
   getThreads: (workspaceId: string) => ChatThread[];
   getActiveThread: (workspaceId: string) => string | null;
   getActiveSkill: (workspaceId: string) => string | null;
+  getAttachments: (workspaceId: string) => Attachment[];
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -186,6 +191,9 @@ interface ChatState {
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
   setActiveSkill: (workspaceId: string, skill: string | null) => void;
+  addAttachment: (workspaceId: string, attachment: Attachment) => void;
+  removeAttachment: (workspaceId: string, index: number) => void;
+  clearAttachments: (workspaceId: string) => void;
   /** Stop the in-flight turn for this workspace (best-effort; backend halts
    *  before its next iteration/tool and emits the done event). */
   stop: (workspaceId: string) => void;
@@ -374,6 +382,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     activeThreadByWs: {},
     streamingThreadByWs: {},
     activeSkillByWs: {},
+    attachmentsByWs: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -385,6 +394,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     getThreads: (workspaceId) => get().threadsByWs[workspaceId] ?? EMPTY_THREADS,
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
     getActiveSkill: (workspaceId) => get().activeSkillByWs[workspaceId] ?? null,
+    getAttachments: (workspaceId) => get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -465,6 +475,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
 
+      // Snapshot + clear pending attachments — they ride along on this turn only.
+      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
+      if (attachments.length > 0) {
+        set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
+      }
+
       try {
         await ipc.sendChatMessage({
           workspaceId,
@@ -475,6 +491,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           system: systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
           skill: get().activeSkillByWs[workspaceId] ?? undefined,
+          attachments: attachments.length
+            ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
+            : undefined,
         });
       } catch (e) {
         set((s) => ({
@@ -490,6 +509,24 @@ export const useChatStore = create<ChatState>((set, get) => {
     setEffort: (effort) => set({ effort }),
     setActiveSkill: (workspaceId, skill) =>
       set((s) => ({ activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: skill } })),
+    addAttachment: (workspaceId, attachment) =>
+      set((s) => ({
+        attachmentsByWs: {
+          ...s.attachmentsByWs,
+          [workspaceId]: [...(s.attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS), attachment],
+        },
+      })),
+    removeAttachment: (workspaceId, index) =>
+      set((s) => ({
+        attachmentsByWs: {
+          ...s.attachmentsByWs,
+          [workspaceId]: (s.attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS).filter(
+            (_, i) => i !== index,
+          ),
+        },
+      })),
+    clearAttachments: (workspaceId) =>
+      set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } })),
 
     stop: (workspaceId) => {
       // Fire-and-forget; the backend emits `chat://stream` done which clears
