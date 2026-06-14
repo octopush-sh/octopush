@@ -180,8 +180,8 @@ step("Verifying bundled sidecars");
 
 const appDir = readdirSync(macosDir).find((f) => f.endsWith(".app"));
 if (!appDir) die(`No .app found in ${macosDir}`);
-const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
-const sidecars = conf?.bundle?.externalBin ?? [];
+const bundleConf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
+const sidecars = bundleConf?.bundle?.externalBin ?? [];
 const macosBinDir = join(macosDir, appDir, "Contents/MacOS");
 for (const entry of sidecars) {
   const name = entry.split("/").pop();
