@@ -177,6 +177,8 @@ pub fn parse_cli_result(
             (None, true) => "claude exited with an error".to_string(),
             (None, false) => parsed.result.clone(),
         };
+        let tail = stderr_tail(stderr_text, 10);
+        let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
         return Ok(StageOutcome {
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -419,6 +421,13 @@ impl AgentRunner for CliRunner {
 fn failure_detail(stderr: &str, fallback: &str) -> String {
     let src = if stderr.trim().is_empty() { fallback } else { stderr };
     src.chars().take(400).collect()
+}
+
+/// Last `n` non-empty lines of stderr, joined — appended to a failure message
+/// when claude itself gave no detail. Empty string when stderr is blank.
+fn stderr_tail(stderr: &str, n: usize) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 fn failed_stage(msg: &str) -> StageOutcome {

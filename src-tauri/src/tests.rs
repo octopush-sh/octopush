@@ -5405,4 +5405,14 @@ mod cli_result_tests {
         let err = out.error.unwrap();
         assert!(err.contains("error_max_turns"), "got: {err}");
     }
+
+    /// Task 3: stderr tail is folded into the failure message.
+    #[test]
+    fn parse_cli_result_appends_stderr_tail() {
+        let line = r#"{"type":"result","is_error":true,"result":"","usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let stderr = "line one\noverloaded_error: server is busy\n";
+        let out = parse_cli_result(line, false, "fix", stderr).unwrap();
+        let err = out.error.unwrap();
+        assert!(err.contains("overloaded_error"), "got: {err}");
+    }
 }
