@@ -25,7 +25,7 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -169,6 +169,34 @@ const signature = readFileSync(sigPath, "utf8").trim();
 ok(`DMG: ${dmgFile}`);
 ok(`Tarball: ${tarball}`);
 ok(`Signature: ${sigFile}`);
+
+// ── 3b. Verify sidecars made it into the bundle ──────────────────
+// A missing/empty externalBin sidecar means a feature ships dead (e.g.
+// octopush-mcp absent → "Connect to Claude Code" registers a nonexistent
+// binary). Tauri only errors when a sidecar is missing at copy time; a
+// stale build tree can still produce a bundle that silently lacks one.
+// Fail the release here, before anything is tagged or published.
+step("Verifying bundled sidecars");
+
+const appDir = readdirSync(macosDir).find((f) => f.endsWith(".app"));
+if (!appDir) die(`No .app found in ${macosDir}`);
+const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
+const sidecars = conf?.bundle?.externalBin ?? [];
+const macosBinDir = join(macosDir, appDir, "Contents/MacOS");
+for (const entry of sidecars) {
+  const name = entry.split("/").pop();
+  const binPath = join(macosBinDir, name);
+  if (!existsSync(binPath) || statSync(binPath).size === 0) {
+    die(
+      `Sidecar '${name}' is missing or empty in ${appDir}.\n` +
+        `  Expected a non-empty binary at ${binPath}.\n` +
+        `  This usually means the build tree is stale — rebuild from a clean ` +
+        `checkout of the merged branch (the externalBin list and the compiled ` +
+        `binaries must agree).`,
+    );
+  }
+  ok(`Sidecar bundled: ${name} (${statSync(binPath).size} bytes)`);
+}
 
 // ── 4. Build latest.json ─────────────────────────────────────────
 
