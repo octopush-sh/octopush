@@ -77,18 +77,6 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       ? estimatePerMessageCost(activeModelInfo, estimatedTokens)
       : null;
 
-  // ── Cmd-K focuses the composer ──────────────────────────────────────
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
-        e.preventDefault();
-        textareaRef.current?.focus();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const val = e.target.value;
     setInput(val);
@@ -213,7 +201,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
       {/* Quiet hint line beneath the box. */}
       <div className="mt-1.5 px-1 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-        ⌘K to focus · Enter to send · ⇧↵ for newline
+        Enter to send · ⇧↵ for newline · ↑ for history
       </div>
     </div>
   );

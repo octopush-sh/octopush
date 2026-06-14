@@ -21,6 +21,9 @@ export interface LiveTool {
   callId: string;
   toolName: string;
   toolInput: Record<string, unknown>;
+  /** Backend's RFC3339 start timestamp — the elapsed timer measures from here,
+   *  not from card mount, so a slow first paint doesn't under-report. */
+  startedAt: string;
   /** True once `chat://tool-end` arrived; the card briefly shows a verdict. */
   done: boolean;
   ok: boolean;
@@ -176,12 +179,16 @@ export const useChatStore = create<ChatState>((set, get) => {
           } catch {
             callId = undefined;
           }
-          // Drop the matching call (or, defensively, the oldest unresolved one
-          // if the record predates callId tagging).
-          const next = callId
-            ? live.filter((t) => t.callId !== callId)
-            : live.slice(1);
-          liveToolsByWs = { ...s.liveToolsByWs, [wsId]: next };
+          // Retire strictly by callId — the producer (tool-start) always tags
+          // it, so there's no positional guessing. An untagged row (legacy/
+          // replayed) simply leaves the live list untouched; the stream `done`
+          // sweep is the backstop.
+          if (callId) {
+            liveToolsByWs = {
+              ...s.liveToolsByWs,
+              [wsId]: live.filter((t) => t.callId !== callId),
+            };
+          }
         }
       }
 
@@ -244,6 +251,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         callId: p.callId,
         toolName: p.toolName,
         toolInput: p.toolInput ?? {},
+        startedAt: p.startedAt,
         done: false,
         ok: true,
         durationMs: null,

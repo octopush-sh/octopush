@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import { AlertTriangle, Settings, Copy, Check } from "lucide-react";
 import { useChatStore, buildTimeline, type ConversationItem } from "../../stores/chatStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
-import { copyToClipboard } from "../../lib/clipboard";
+import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { BrassRule } from "../BrassRule";
 import { ChatMessage } from "../ChatMessage";
 import { ToolCallCard } from "../ToolCallCard";
@@ -152,15 +152,11 @@ export function ChatCanvas({
 
 /** Wraps a message so a quiet Copy affordance reveals on hover (group). */
 function MessageRow({ children }: { children: React.ReactNode }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
   const ref = useRef<HTMLDivElement>(null);
 
   function handleCopy() {
-    const text = ref.current?.innerText ?? "";
-    if (!text.trim()) return;
-    void copyToClipboard(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    copy(ref.current?.innerText ?? "");
   }
 
   return (

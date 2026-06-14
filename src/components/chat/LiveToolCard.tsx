@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { LiveTool } from "../../stores/chatStore";
 import { toolLabel, summarizeTool } from "../ToolCallCard";
+import { formatDuration } from "../../lib/duration";
 import { prefersReducedMotion } from "../../lib/motion";
 
 interface Props {
@@ -20,19 +21,27 @@ export function LiveToolCard({ tool }: Props) {
   const label = toolLabel(tool.toolName);
   const summary = summarizeTool(tool.toolName, tool.toolInput);
 
-  // Elapsed timer ticks from mount. Once done, freeze on the reported duration.
-  const mountRef = useRef<number>(0);
-  const [elapsedMs, setElapsedMs] = useState(0);
+  // Elapsed measures from the backend's real start timestamp (not card mount),
+  // so a slow first paint doesn't under-report. While running we tick a `now`
+  // clock; reduced-motion skips the interval but the value is still computed
+  // from startedAt at every render (so it's never stuck at 0).
+  const startMs = useMemo(() => {
+    const t = Date.parse(tool.startedAt);
+    return Number.isNaN(t) ? null : t;
+  }, [tool.startedAt]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    if (tool.done) return;
-    if (prefersReducedMotion()) return;
-    const start = performance.now();
-    mountRef.current = start;
-    const id = setInterval(() => setElapsedMs(performance.now() - start), 200);
+    if (tool.done || prefersReducedMotion()) return;
+    const id = setInterval(() => setNowMs(Date.now()), 250);
     return () => clearInterval(id);
   }, [tool.done]);
 
-  const shownMs = tool.done && tool.durationMs != null ? tool.durationMs : elapsedMs;
+  const shownMs =
+    tool.done && tool.durationMs != null
+      ? tool.durationMs
+      : startMs != null
+        ? Math.max(0, nowMs - startMs)
+        : 0;
 
   return (
     <div
@@ -73,17 +82,8 @@ export function LiveToolCard({ tool }: Props) {
       </span>
       {/* Fixed-width meta slot — never reflows the row as the timer ticks. */}
       <span className="octo-tabular shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
-        {tool.done ? (tool.ok ? "done" : "failed") : "running"} · {formatElapsed(shownMs)}
+        {tool.done ? (tool.ok ? "done" : "failed") : "running"} · {formatDuration(shownMs)}
       </span>
     </div>
   );
-}
-
-/** Compact mm:ss.s / s.s elapsed format with a stable character width. */
-function formatElapsed(ms: number): string {
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.floor(s % 60);
-  return `${m}:${String(rem).padStart(2, "0")}`;
 }

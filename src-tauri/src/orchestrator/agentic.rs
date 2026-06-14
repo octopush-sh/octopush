@@ -222,7 +222,10 @@ pub async fn run_agentic_loop(
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
             emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
-            let result = execute_tool(workspace_path, &u.name, &u.input);
+            // The chat engine consumes execute_tool's structural `ok`; the
+            // orchestrator keeps its own text-based classifier for journal
+            // continuity, so it deliberately ignores the bool here.
+            let (result, _) = execute_tool(workspace_path, &u.name, &u.input);
             emitter.tool_result(!crate::orchestrator::live::looks_like_error(&result), &crate::orchestrator::live::summarize(&result));
             // The journal keeps the FULL result as evidence; only the copy fed
             // back to the model is capped, to bound input-token growth.

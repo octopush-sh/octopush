@@ -1,6 +1,6 @@
 import { useState, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
-import { copyToClipboard } from "../lib/clipboard";
+import { useCopyFeedback } from "../hooks/useCopyFeedback";
 import type { ToolExecution } from "../stores/chatStore";
 
 interface Props {
@@ -101,7 +101,7 @@ const headerStyle: CSSProperties = {
 
 export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
   const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
 
   const label = toolLabel(tool.toolName);
   const summary = summarizeTool(tool.toolName, tool.toolInput);
@@ -270,12 +270,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
             <span
               role="button"
               tabIndex={0}
-              onClick={() => {
-                // Inline "copied" label is the success feedback; no toast.
-                void copyToClipboard(tool.result);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              }}
+              onClick={() => copy(tool.result)}
               onKeyDown={() => {}}
               style={{
                 fontSize: 9,
