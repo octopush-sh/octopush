@@ -960,6 +960,31 @@ pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
     })
 }
 
+/// List the tools exposed by the worktree's configured + reachable MCP servers.
+/// Connects lazily; unreachable servers are skipped.
+#[tauri::command]
+pub async fn list_mcp_tools(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    Ok(state
+        .chat
+        .mcp
+        .list_tools(std::path::Path::new(&workspace_path)))
+}
+
+/// List the names of MCP servers configured for a worktree (project ∪ user),
+/// whether or not they're currently reachable.
+#[tauri::command]
+pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> {
+    let mut names: Vec<String> =
+        crate::mcp::load_server_configs(std::path::Path::new(&workspace_path))
+            .into_keys()
+            .collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Identify a supported image type from its leading bytes, or None.
 fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

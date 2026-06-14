@@ -222,6 +222,7 @@ import type {
   ChatThread,
   SkillMeta,
   Attachment,
+  McpToolInfo,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -425,6 +426,12 @@ export const ipc = {
 
   // ─── Attachments ─────────────────────────────────────────────────
   readAttachment: (path: string) => invoke<Attachment>("read_attachment", { path }),
+
+  // ─── MCP ─────────────────────────────────────────────────────────
+  listMcpTools: (workspacePath: string) =>
+    invoke<McpToolInfo[]>("list_mcp_tools", { workspacePath }),
+  listMcpServers: (workspacePath: string) =>
+    invoke<string[]>("list_mcp_servers", { workspacePath }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),

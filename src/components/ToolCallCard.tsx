@@ -19,8 +19,10 @@ export const TOOL_LABELS: Record<string, string> = {
   list_files: "LIST",
 };
 
-/** The card header label for a tool name (e.g. `write_file` → `WRITE`). */
+/** The card header label for a tool name (e.g. `write_file` → `WRITE`,
+ *  `mcp__github__create_issue` → `MCP`). */
 export function toolLabel(toolName: string): string {
+  if (toolName.startsWith("mcp__")) return "MCP";
   return TOOL_LABELS[toolName] ?? toolName.toUpperCase();
 }
 
@@ -30,6 +32,12 @@ export function summarizeTool(
   toolName: string,
   toolInput: Record<string, unknown>,
 ): string {
+  // MCP tools render as `server · tool` so the namespaced name is readable.
+  if (toolName.startsWith("mcp__")) {
+    const rest = toolName.slice(5);
+    const sep = rest.indexOf("__");
+    return sep >= 0 ? `${rest.slice(0, sep)} · ${rest.slice(sep + 2)}` : rest;
+  }
   switch (toolName) {
     case "run_command": {
       const cmd = String(toolInput?.command ?? "");

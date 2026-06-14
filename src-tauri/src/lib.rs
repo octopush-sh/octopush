@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod git_ops;
 pub mod git_url;
+pub mod mcp;
 pub mod provider_router;
 pub mod providers;
 pub mod pty_client;
@@ -181,6 +182,8 @@ pub fn run() {
             commands::delete_chat_thread,
             commands::list_skills,
             commands::read_attachment,
+            commands::list_mcp_tools,
+            commands::list_mcp_servers,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,

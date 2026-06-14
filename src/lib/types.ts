@@ -218,6 +218,14 @@ export interface Attachment {
   name: string;
 }
 
+/** A tool exposed by a connected MCP server. */
+export interface McpToolInfo {
+  server: string;
+  name: string;
+  namespaced: string;
+  description: string;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;

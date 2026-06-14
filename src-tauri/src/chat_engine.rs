@@ -368,6 +368,10 @@ pub struct ChatEngine {
     /// agentic loop stops before its next iteration. Mirrors the orchestrator's
     /// cancel registry.
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// MCP server registry — connects to configured stdio MCP servers, injects
+    /// their tools into the loop, and proxies tool calls. Shared so the
+    /// `list_mcp_*` commands can read the same connections.
+    pub mcp: Arc<crate::mcp::McpRegistry>,
 }
 
 impl ChatEngine {
@@ -377,6 +381,7 @@ impl ChatEngine {
             client: shared_http_client().clone(),
             db,
             cancels: Arc::new(Mutex::new(HashMap::new())),
+            mcp: Arc::new(crate::mcp::McpRegistry::new()),
         }
     }
 
@@ -617,6 +622,20 @@ impl ChatEngine {
                 }
             }
         }
+
+        // ── MCP tools ─────────────────────────────────────────────
+        // Append tools exposed by configured MCP servers (namespaced
+        // `mcp__server__tool`). Unreachable servers are skipped inside
+        // list_tools. A skill's allowed-tools filter above doesn't touch these
+        // (MCP tools are opt-in via the server config, not the skill).
+        for t in self.mcp.list_tools(&workspace_path) {
+            tools.push(LlmTool {
+                name: t.namespaced,
+                description: t.description,
+                input_schema: t.input_schema,
+            });
+        }
+
         let mut total_input: u64 = 0;
         let mut total_output: u64 = 0;
 
@@ -866,7 +885,16 @@ impl ChatEngine {
                     started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                 });
 
-                let (result, ok) = execute_tool(&workspace_path, &u.name, &u.input);
+                // Route MCP tools (`mcp__server__tool`) to their server; all
+                // other names are built-in workspace tools.
+                let (result, ok) = if crate::mcp::is_mcp_tool(&u.name) {
+                    match self.mcp.call(&workspace_path, &u.name, &u.input) {
+                        Ok(r) => (r, true),
+                        Err(e) => (format!("MCP error: {e}"), false),
+                    }
+                } else {
+                    execute_tool(&workspace_path, &u.name, &u.input)
+                };
 
                 // ── Live card: announce completion (timing + status) ──
                 let _ = app.emit("chat://tool-end", &ToolEndEvent {
