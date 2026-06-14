@@ -56,14 +56,42 @@ pub struct ChatStreamEvent {
     pub output_tokens: Option<u64>,
 }
 
-/// Emitted when Claude calls a tool — the frontend shows this inline.
+/// Emitted the moment a tool BEGINS executing — before the (potentially slow)
+/// `execute_tool` call returns. Lets the frontend show a live "running" card
+/// with an elapsed timer instead of a silent gap. Reconciled to the resolved
+/// `ToolCallCard` when the matching `chat://message-added` (role=tool) arrives,
+/// correlated by `call_id` (the provider's `tool_use.id`).
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolUseEvent {
+pub struct ToolStartEvent {
     pub workspace_id: String,
+    pub call_id: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
-    pub result: String,
+    pub started_at: String,
+}
+
+/// Emitted the moment a tool FINISHES executing. Carries timing + a best-effort
+/// success flag so the live card can show a duration and flip to a failed
+/// (rouge) state before the resolved card takes over.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolEndEvent {
+    pub workspace_id: String,
+    pub call_id: String,
+    pub ok: bool,
+    pub duration_ms: u64,
+}
+
+/// Best-effort failure detection from a tool's textual result. The tools return
+/// human-readable strings (no structured status), so we sniff the known error
+/// prefixes produced by `execute_tool`. Used only to tint the live card; the
+/// resolved card always shows the full result regardless.
+fn tool_result_looks_failed(result: &str) -> bool {
+    result.starts_with("Error ")
+        || result.starts_with("Error:")
+        || result.starts_with("Failed to execute")
+        || result.starts_with("Unknown tool:")
 }
 
 /// Emitted whenever a chat message is persisted to the DB.
@@ -627,7 +655,41 @@ impl ChatEngine {
             let mut tool_results: Vec<LlmToolResult> = Vec::new();
             for u in &response.tool_uses {
                 tracing::info!(tool = %u.name, "executing tool");
+
+                // Build the display-safe input ONCE, up front: strip large
+                // write_file bodies (already destined for disk) so neither the
+                // live-card event nor the persisted record carries multi-KB
+                // JSON. Reused for tool-start, persistence, and the message.
+                let input_for_display = if u.name == "write_file" {
+                    let mut display = u.input.clone();
+                    if let Some(content) = display.get("content").and_then(|c| c.as_str()) {
+                        let len = content.len();
+                        display["content"] = serde_json::json!(format!("({len} chars, written to disk)"));
+                    }
+                    display
+                } else {
+                    u.input.clone()
+                };
+
+                // ── Live card: announce the tool is starting ──────────
+                let call_started = std::time::Instant::now();
+                let _ = app.emit("chat://tool-start", &ToolStartEvent {
+                    workspace_id: request.workspace_id.clone(),
+                    call_id: u.id.clone(),
+                    tool_name: u.name.clone(),
+                    tool_input: input_for_display.clone(),
+                    started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                });
+
                 let result = execute_tool(&workspace_path, &u.name, &u.input);
+
+                // ── Live card: announce completion (timing + status) ──
+                let _ = app.emit("chat://tool-end", &ToolEndEvent {
+                    workspace_id: request.workspace_id.clone(),
+                    call_id: u.id.clone(),
+                    ok: !tool_result_looks_failed(&result),
+                    duration_ms: call_started.elapsed().as_millis() as u64,
+                });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
                 if u.name == "write_file" {
@@ -646,22 +708,12 @@ impl ChatEngine {
                     }
                 }
 
-                // For persistence and events, strip large file contents from
-                // the input (the file is already on disk). This prevents
-                // multi-KB JSON payloads that slow down events and DB.
-                let input_for_display = if u.name == "write_file" {
-                    let mut display = u.input.clone();
-                    if let Some(content) = display.get("content").and_then(|c| c.as_str()) {
-                        let len = content.len();
-                        display["content"] = serde_json::json!(format!("({len} chars, written to disk)"));
-                    }
-                    display
-                } else {
-                    u.input.clone()
-                };
-
                 // Persist tool execution as role="tool" and emit message-added.
+                // `callId` correlates this resolved card back to the live card
+                // created by the earlier tool-start event so the frontend can
+                // retire the spinner without a flash.
                 let tool_record = serde_json::json!({
+                    "callId": u.id,
                     "toolName": u.name,
                     "toolInput": input_for_display,
                     "result": result,
@@ -788,4 +840,24 @@ fn git_status_files(workspace_path: &std::path::Path) -> std::collections::HashS
         files.insert(path.trim().to_string());
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_failure_sniffing() {
+        // Known error prefixes from execute_tool → failed.
+        assert!(tool_result_looks_failed("Error reading foo.txt: No such file"));
+        assert!(tool_result_looks_failed("Error writing foo.txt: permission denied"));
+        assert!(tool_result_looks_failed("Error listing .: not a directory"));
+        assert!(tool_result_looks_failed("Failed to execute command: boom"));
+        assert!(tool_result_looks_failed("Unknown tool: frobnicate"));
+        // Ordinary output → not failed.
+        assert!(!tool_result_looks_failed("Wrote 42 bytes to index.html"));
+        assert!(!tool_result_looks_failed("a.ts\nb.ts\nc.ts"));
+        assert!(!tool_result_looks_failed("(exit code 0)"));
+        assert!(!tool_result_looks_failed(""));
+    }
 }

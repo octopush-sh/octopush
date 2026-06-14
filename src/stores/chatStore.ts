@@ -11,6 +11,35 @@ export interface ToolExecution {
   toolName: string;
   toolInput: Record<string, unknown>;
   result: string;
+  /** Provider tool_use id — correlates the resolved card to its live card. */
+  callId?: string;
+}
+
+/** A tool currently executing (between `chat://tool-start` and the resolved
+ *  `chat://message-added` role=tool). Rendered as a live "running" card. */
+export interface LiveTool {
+  callId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  /** True once `chat://tool-end` arrived; the card briefly shows a verdict. */
+  done: boolean;
+  ok: boolean;
+  durationMs: number | null;
+}
+
+interface ToolStartEvent {
+  workspaceId: string;
+  callId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  startedAt: string;
+}
+
+interface ToolEndEvent {
+  workspaceId: string;
+  callId: string;
+  ok: boolean;
+  durationMs: number;
 }
 
 /** A display item in the conversation — either a regular message, tool execution, or persisted error. */
@@ -18,6 +47,42 @@ export type ConversationItem =
   | { kind: "message"; message: ChatMessage }
   | { kind: "tool"; tool: ToolExecution; id: number }
   | { kind: "error"; message: ChatMessage };
+
+/** Strip the trailing `[tool_calls: …]` bookkeeping suffix the engine appends
+ *  to persisted `assistant_tool_use` rows, returning only the human-facing
+ *  lead text. Empty result ⇒ the row is pure bookkeeping and should be hidden. */
+function stripToolCallsSuffix(content: string): string {
+  const idx = content.indexOf("[tool_calls:");
+  return (idx === -1 ? content : content.slice(0, idx)).trim();
+}
+
+/** Project persisted messages into renderable timeline items. Shared by the
+ *  store's `getTimeline` selector and the canvas useMemo so both agree on how
+ *  tool rows, errors, and `assistant_tool_use` bookkeeping are handled. */
+export function buildTimeline(msgs: ChatMessage[]): ConversationItem[] {
+  const items: ConversationItem[] = [];
+  for (const msg of msgs) {
+    const role = msg.role as string;
+    if (role === "tool") {
+      try {
+        const tool: ToolExecution = JSON.parse(msg.content);
+        items.push({ kind: "tool", tool, id: msg.id });
+      } catch {
+        items.push({ kind: "message", message: msg });
+      }
+    } else if (role === "error") {
+      items.push({ kind: "error", message: msg });
+    } else if (role === "assistant_tool_use") {
+      // Reloaded from DB: show only the model's lead text, never the raw
+      // `[tool_calls: …]` JSON. Skip rows that are pure bookkeeping.
+      const text = stripToolCallsSuffix(msg.content);
+      if (text) items.push({ kind: "message", message: { ...msg, content: text } });
+    } else {
+      items.push({ kind: "message", message: msg });
+    }
+  }
+  return items;
+}
 
 export interface MessageAddedEvent {
   workspaceId: string;
@@ -36,6 +101,7 @@ export interface MessageAddedEvent {
 // invalidate every render → infinite re-render loop (caught in Phase 4 bug fix).
 const EMPTY_MESSAGES: ChatMessage[] = [];
 const EMPTY_TIMELINE: ConversationItem[] = [];
+const EMPTY_LIVE_TOOLS: LiveTool[] = [];
 
 interface ChatState {
   /** Messages keyed by workspaceId. Each workspace has its own conversation. */
@@ -46,6 +112,8 @@ interface ChatState {
   streamBufferByWs: Record<string, string>;
   /** Last error per workspace. */
   errorByWs: Record<string, string | null>;
+  /** Tools currently executing per workspace (live "running" cards). */
+  liveToolsByWs: Record<string, LiveTool[]>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -55,6 +123,7 @@ interface ChatState {
   getStreaming: (workspaceId: string) => boolean;
   getStreamBuffer: (workspaceId: string) => string;
   getError: (workspaceId: string) => string | null;
+  getLiveTools: (workspaceId: string) => LiveTool[];
   getTimeline: (workspaceId: string) => ConversationItem[];
 
   // Actions
@@ -93,11 +162,35 @@ export const useChatStore = create<ChatState>((set, get) => {
         costUsd: payload.costUsd,
         createdAt: payload.createdAt,
       };
+
+      // When a resolved tool row arrives, retire its live "running" card so the
+      // ToolCallCard from the timeline takes over with no flash. Correlate by
+      // the callId embedded in the persisted record.
+      let liveToolsByWs = s.liveToolsByWs;
+      if (payload.role === "tool") {
+        const live = s.liveToolsByWs[wsId];
+        if (live && live.length > 0) {
+          let callId: string | undefined;
+          try {
+            callId = (JSON.parse(payload.content) as ToolExecution).callId;
+          } catch {
+            callId = undefined;
+          }
+          // Drop the matching call (or, defensively, the oldest unresolved one
+          // if the record predates callId tagging).
+          const next = callId
+            ? live.filter((t) => t.callId !== callId)
+            : live.slice(1);
+          liveToolsByWs = { ...s.liveToolsByWs, [wsId]: next };
+        }
+      }
+
       return {
         messagesByWs: {
           ...s.messagesByWs,
           [wsId]: [...existing, newMessage],
         },
+        liveToolsByWs,
       };
     });
 
@@ -119,6 +212,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [wsId]: false },
         streamBufferByWs: { ...s.streamBufferByWs, [wsId]: "" },
+        // Clear any stragglers (e.g. a tool whose result errored before its
+        // resolved row landed) so no spinner outlives the turn.
+        liveToolsByWs: { ...s.liveToolsByWs, [wsId]: EMPTY_LIVE_TOOLS },
       }));
       // Only ring the chime / pulse the rail if the user isn't already
       // looking at this chat — otherwise they'll just be told what
@@ -136,38 +232,64 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
   });
 
+  // ── chat://tool-start ─────────────────────────────────────────
+  // A tool began executing — show a live "running" card immediately.
+  listen<ToolStartEvent>("chat://tool-start", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const live = s.liveToolsByWs[p.workspaceId] ?? EMPTY_LIVE_TOOLS;
+      if (live.some((t) => t.callId === p.callId)) return {};
+      const entry: LiveTool = {
+        callId: p.callId,
+        toolName: p.toolName,
+        toolInput: p.toolInput ?? {},
+        done: false,
+        ok: true,
+        durationMs: null,
+      };
+      return {
+        liveToolsByWs: { ...s.liveToolsByWs, [p.workspaceId]: [...live, entry] },
+      };
+    });
+  });
+
+  // ── chat://tool-end ───────────────────────────────────────────
+  // The tool finished — mark the live card done (timing + verdict). The
+  // resolved row (message-added) removes it moments later.
+  listen<ToolEndEvent>("chat://tool-end", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const live = s.liveToolsByWs[p.workspaceId];
+      if (!live || !live.some((t) => t.callId === p.callId)) return {};
+      const next = live.map((t) =>
+        t.callId === p.callId
+          ? { ...t, done: true, ok: p.ok, durationMs: p.durationMs }
+          : t,
+      );
+      return { liveToolsByWs: { ...s.liveToolsByWs, [p.workspaceId]: next } };
+    });
+  });
+
   return {
     messagesByWs: {},
     streamingByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
+    liveToolsByWs: {},
     model: "claude-sonnet-4-6",
 
     getMessages: (workspaceId) => get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES,
     getStreaming: (workspaceId) => get().streamingByWs[workspaceId] ?? false,
     getStreamBuffer: (workspaceId) => get().streamBufferByWs[workspaceId] ?? "",
     getError: (workspaceId) => get().errorByWs[workspaceId] ?? null,
+    getLiveTools: (workspaceId) => get().liveToolsByWs[workspaceId] ?? EMPTY_LIVE_TOOLS,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
       if (!msgs || msgs.length === 0) return EMPTY_TIMELINE;
-      const items: ConversationItem[] = [];
-      for (const msg of msgs) {
-        const role = msg.role as string;
-        if (role === "tool") {
-          try {
-            const tool: ToolExecution = JSON.parse(msg.content);
-            items.push({ kind: "tool", tool, id: msg.id });
-          } catch {
-            items.push({ kind: "message", message: msg });
-          }
-        } else if (role === "error") {
-          items.push({ kind: "error", message: msg });
-        } else {
-          items.push({ kind: "message", message: msg });
-        }
-      }
-      return items;
+      return buildTimeline(msgs);
     },
 
     loadHistory: async (workspaceId) => {
@@ -193,6 +315,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
+        liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
 
       try {
@@ -220,6 +343,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         messagesByWs: { ...s.messagesByWs, [workspaceId]: EMPTY_MESSAGES },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
+        liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       })),
 
     clearError: (workspaceId) =>

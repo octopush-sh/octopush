@@ -46,6 +46,7 @@ function resetStore() {
     streamingByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
+    liveToolsByWs: {},
   });
 }
 
@@ -211,6 +212,103 @@ describe("chatStore — single workspace tool-card persistence", () => {
     if (timeline[1].kind === "error") {
       expect(timeline[1].message.content).toBe("Network timeout");
     }
+  });
+});
+
+describe("chatStore — live tool cards (P2)", () => {
+  beforeEach(() => resetStore());
+
+  it("tool-start adds a live tool; tool-end marks it done with timing", () => {
+    emit("chat://tool-start", {
+      workspaceId: "ws-1",
+      callId: "call_a",
+      toolName: "run_command",
+      toolInput: { command: "npm test" },
+      startedAt: "2026-05-17T10:00:00Z",
+    });
+
+    let live = useChatStore.getState().getLiveTools("ws-1");
+    expect(live).toHaveLength(1);
+    expect(live[0].callId).toBe("call_a");
+    expect(live[0].done).toBe(false);
+
+    emit("chat://tool-end", {
+      workspaceId: "ws-1",
+      callId: "call_a",
+      ok: true,
+      durationMs: 1234,
+    });
+
+    live = useChatStore.getState().getLiveTools("ws-1");
+    expect(live[0].done).toBe(true);
+    expect(live[0].ok).toBe(true);
+    expect(live[0].durationMs).toBe(1234);
+  });
+
+  it("a resolved tool row (message-added) retires its live card by callId", () => {
+    emit("chat://tool-start", {
+      workspaceId: "ws-1", callId: "call_b", toolName: "read_file",
+      toolInput: { path: "a.ts" }, startedAt: "2026-05-17T10:00:00Z",
+    });
+    expect(useChatStore.getState().getLiveTools("ws-1")).toHaveLength(1);
+
+    emit("chat://message-added", makeMsg({
+      id: 7, role: "tool",
+      content: JSON.stringify({ callId: "call_b", toolName: "read_file", toolInput: { path: "a.ts" }, result: "ok" }),
+    }));
+
+    // Live card gone; resolved row present.
+    expect(useChatStore.getState().getLiveTools("ws-1")).toHaveLength(0);
+    expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(1);
+  });
+
+  it("live tools are scoped per workspace and cleared on done", () => {
+    emit("chat://tool-start", {
+      workspaceId: "ws-A", callId: "c1", toolName: "list_files",
+      toolInput: { path: "." }, startedAt: "2026-05-17T10:00:00Z",
+    });
+    expect(useChatStore.getState().getLiveTools("ws-A")).toHaveLength(1);
+    expect(useChatStore.getState().getLiveTools("ws-B")).toHaveLength(0);
+
+    emit("chat://stream", { workspaceId: "ws-A", delta: "", done: true, inputTokens: null, outputTokens: null });
+    expect(useChatStore.getState().getLiveTools("ws-A")).toHaveLength(0);
+  });
+
+  it("getLiveTools returns a stable empty reference for unknown workspaces", () => {
+    const a = useChatStore.getState().getLiveTools("never");
+    const b = useChatStore.getState().getLiveTools("never");
+    expect(a).toBe(b);
+  });
+});
+
+describe("chatStore — assistant_tool_use rendering", () => {
+  beforeEach(() => resetStore());
+
+  it("strips the [tool_calls: …] suffix and keeps the lead text", () => {
+    emit("chat://message-added", makeMsg({
+      id: 1, role: "assistant_tool_use",
+      content: "Let me check the files.\n\n[tool_calls: [{\"toolName\":\"list_files\"}]]",
+    }));
+
+    const timeline = useChatStore.getState().getTimeline("ws-1");
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].kind).toBe("message");
+    if (timeline[0].kind === "message") {
+      expect(timeline[0].message.content).toBe("Let me check the files.");
+    }
+  });
+
+  it("hides pure-bookkeeping assistant_tool_use rows (no lead text)", () => {
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "go" }));
+    emit("chat://message-added", makeMsg({
+      id: 2, role: "assistant_tool_use",
+      content: "[tool_calls: [{\"toolName\":\"read_file\"}]]",
+    }));
+
+    const timeline = useChatStore.getState().getTimeline("ws-1");
+    // Only the user message survives — the bookkeeping row is hidden.
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].kind).toBe("message");
   });
 });
 
