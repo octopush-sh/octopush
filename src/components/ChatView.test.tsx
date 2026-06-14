@@ -45,6 +45,7 @@ vi.mock("../lib/ipc", () => ({
     ),
     renameChatThread: vi.fn().mockResolvedValue(undefined),
     deleteChatThread: vi.fn().mockResolvedValue(undefined),
+    listSkills: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -65,6 +66,7 @@ function resetStore() {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
+    activeSkillByWs: {},
   });
   useBudgetsStore.setState({
     budgets: [],

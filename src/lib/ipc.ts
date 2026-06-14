@@ -220,6 +220,7 @@ import type {
   EditorChoice,
   ChatMessage,
   ChatThread,
+  SkillMeta,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -400,6 +401,7 @@ export const ipc = {
     userMessage: string;
     system?: string;
     maxTokens: number;
+    skill?: string;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** Stop the in-flight agentic turn for this thread. */
@@ -414,6 +416,10 @@ export const ipc = {
     invoke<void>("rename_chat_thread", { threadId, title }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
+
+  // ─── Skills ──────────────────────────────────────────────────────
+  listSkills: (workspacePath: string) =>
+    invoke<SkillMeta[]>("list_skills", { workspacePath }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),

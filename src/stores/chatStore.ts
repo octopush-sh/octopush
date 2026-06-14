@@ -155,6 +155,9 @@ interface ChatState {
    *  if it's not the one being shown — lets the streaming indicator be restored
    *  when switching back to a still-running thread. */
   streamingThreadByWs: Record<string, string | null>;
+  /** Active skill name per workspace — appended to the system prompt + tool
+   *  scoping for each turn until cleared. */
+  activeSkillByWs: Record<string, string | null>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -170,6 +173,7 @@ interface ChatState {
   getTimeline: (workspaceId: string) => ConversationItem[];
   getThreads: (workspaceId: string) => ChatThread[];
   getActiveThread: (workspaceId: string) => string | null;
+  getActiveSkill: (workspaceId: string) => string | null;
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -181,6 +185,7 @@ interface ChatState {
   ) => Promise<void>;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
+  setActiveSkill: (workspaceId: string, skill: string | null) => void;
   /** Stop the in-flight turn for this workspace (best-effort; backend halts
    *  before its next iteration/tool and emits the done event). */
   stop: (workspaceId: string) => void;
@@ -368,6 +373,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
+    activeSkillByWs: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -378,6 +384,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     getLiveTools: (workspaceId) => get().liveToolsByWs[workspaceId] ?? EMPTY_LIVE_TOOLS,
     getThreads: (workspaceId) => get().threadsByWs[workspaceId] ?? EMPTY_THREADS,
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
+    getActiveSkill: (workspaceId) => get().activeSkillByWs[workspaceId] ?? null,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -467,6 +474,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           userMessage: content,
           system: systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
+          skill: get().activeSkillByWs[workspaceId] ?? undefined,
         });
       } catch (e) {
         set((s) => ({
@@ -480,6 +488,8 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     setModel: (model) => set({ model }),
     setEffort: (effort) => set({ effort }),
+    setActiveSkill: (workspaceId, skill) =>
+      set((s) => ({ activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: skill } })),
 
     stop: (workspaceId) => {
       // Fire-and-forget; the backend emits `chat://stream` done which clears
@@ -526,6 +536,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
         messagesByWs: { ...s.messagesByWs, [workspaceId]: EMPTY_MESSAGES },
+        // A skill is a per-conversation choice — don't leak it across threads.
+        activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: null },
       }));
       const messages = await ipc.listChatMessages(threadId);
       set((s) => ({
@@ -547,6 +559,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
+        activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: null },
       }));
     },
 

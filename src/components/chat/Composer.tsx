@@ -9,7 +9,7 @@ import {
   formatTokens,
 } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
-import type { ModelInfo, ProviderConfig } from "../../lib/types";
+import type { ModelInfo, ProviderConfig, SkillMeta } from "../../lib/types";
 import {
   findActiveMention,
   rankFiles,
@@ -19,7 +19,9 @@ import {
 import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
+import { SlashMenu } from "./SlashMenu";
 import { FadeSwap } from "../primitives/FadeSwap";
+import { X } from "lucide-react";
 
 interface Props {
   workspaceId: string;
@@ -43,6 +45,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const setModel = useChatStore((s) => s.setModel);
   const send = useChatStore((s) => s.send);
   const stop = useChatStore((s) => s.stop);
+  const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
+  const setActiveSkill = useChatStore((s) => s.setActiveSkill);
   const overrideActive = useBudgetsStore((s) => s.overrideActive);
 
   const [input, setInputState] = useState("");
@@ -68,6 +72,51 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const [mention, setMention] = useState<{ query: string; start: number; caret: number } | null>(null);
   const [mentionItems, setMentionItems] = useState<string[]>([]);
   const [mentionIndex, setMentionIndex] = useState(0);
+
+  // ── /skill slash menu ───────────────────────────────────────────────
+  const [skills, setSkills] = useState<SkillMeta[]>([]);
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashItems, setSlashItems] = useState<SkillMeta[]>([]);
+  const [slashIndex, setSlashIndex] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .listSkills(workspacePath)
+      .then((s) => !cancelled && setSkills(s))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspacePath]);
+
+  function closeSlash() {
+    setSlashOpen(false);
+    setSlashItems([]);
+    setSlashIndex(0);
+  }
+
+  /** A `/` at the very start of the input opens the skill menu, filtered by the
+   *  text after it (until the first space). */
+  function refreshSlash(value: string) {
+    if (value.startsWith("/") && !value.includes(" ") && !value.includes("\n")) {
+      const q = value.slice(1).toLowerCase();
+      const items = q
+        ? skills.filter((s) => s.name.toLowerCase().includes(q))
+        : skills;
+      setSlashOpen(true);
+      setSlashItems(items);
+      setSlashIndex(0);
+    } else {
+      closeSlash();
+    }
+  }
+
+  function selectSkill(skill: SkillMeta) {
+    setActiveSkill(workspaceId, skill.name);
+    setInput("");
+    closeSlash();
+    pendingCaretRef.current = 0;
+  }
   // Caret to apply after a mention insertion re-renders the textarea.
   const pendingCaretRef = useRef<number | null>(null);
   // Tracks the onBlur dismiss timer so it can be cleared on unmount.
@@ -140,6 +189,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     historyIdxRef.current = -1;
     setInput("");
     closeMention();
+    closeSlash();
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
@@ -168,6 +218,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setInput(val);
     historyIdxRef.current = -1; // any manual edit exits history navigation
     refreshMention(val, e.target.selectionStart ?? val.length);
+    refreshSlash(val);
     const ta = e.target;
     ta.style.height = "auto";
     const lineHeight = 20;
@@ -221,6 +272,30 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }, [streaming, send, workspaceId, workspacePath]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // ── Slash (skill) menu takes precedence while open ──
+    if (slashOpen && slashItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => (i + 1) % slashItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => (i - 1 + slashItems.length) % slashItems.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        selectSkill(slashItems[slashIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSlash();
+        return;
+      }
+    }
+
     // ── Mention popover takes precedence over history/send while open ──
     if (mention && mentionItems.length > 0) {
       if (e.key === "ArrowDown") {
@@ -301,6 +376,35 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             onHover={setMentionIndex}
           />
         )}
+        {slashOpen && (
+          <SlashMenu
+            items={slashItems}
+            activeIndex={slashIndex}
+            onSelect={selectSkill}
+            onHover={setSlashIndex}
+          />
+        )}
+        {/* Active skill chip — the turn runs under this skill until cleared. */}
+        {activeSkill && (
+          <div className="flex items-center gap-1.5 px-4 pt-2.5">
+            <span
+              className="flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono text-[10px] text-octo-brass"
+              style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            >
+              <span className="font-serif" aria-hidden>§</span>
+              {activeSkill}
+              <button
+                type="button"
+                onClick={() => setActiveSkill(workspaceId, null)}
+                aria-label="Clear active skill"
+                title="Clear active skill"
+                className="flex items-center text-octo-mute transition-colors hover:text-octo-rouge"
+              >
+                <X size={11} />
+              </button>
+            </span>
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           value={input}
@@ -320,7 +424,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             blurTimerRef.current = setTimeout(closeMention, 120);
           }}
           disabled={streaming}
-          placeholder="Ask anything…  ⟶  @ to reference a file"
+          placeholder="Ask anything…  ⟶  @ file · / skill"
           rows={1}
           className="w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
           style={{ maxHeight: "calc(8 * 1.25rem + 1.5rem)" }}

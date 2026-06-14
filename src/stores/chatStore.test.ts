@@ -59,6 +59,7 @@ function resetStore() {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
+    activeSkillByWs: {},
   });
 }
 
@@ -335,6 +336,15 @@ describe("chatStore — stop + effort (P3)", () => {
     useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
     useChatStore.getState().stop("ws-1");
     expect(ipc.cancelChat).toHaveBeenCalledWith("t1");
+  });
+
+  it("send() passes the workspace's active skill (P6)", async () => {
+    useChatStore.getState().setActiveSkill("ws-1", "write-tests");
+    await useChatStore.getState().send("ws-1", "/tmp", "go");
+    expect(ipc.sendChatMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ skill: "write-tests" }),
+    );
+    expect(useChatStore.getState().getActiveSkill("ws-1")).toBe("write-tests");
   });
 
   it("send() uses the effort's max-tokens budget", async () => {

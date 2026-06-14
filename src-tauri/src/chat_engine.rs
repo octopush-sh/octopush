@@ -47,6 +47,10 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// Optional skill name — its SKILL.md body is appended to the system prompt
+    /// and, if it declares `allowed-tools`, the turn's tool set is restricted.
+    #[serde(default)]
+    pub skill: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -533,7 +537,7 @@ impl ChatEngine {
             }
         }
 
-        let system_prompt = request.system.unwrap_or_else(|| {
+        let mut system_prompt = request.system.unwrap_or_else(|| {
             format!(
                 "You are a helpful coding assistant working in the project at {}. \
                  You have tools to run commands, read/write files, and list directories. \
@@ -543,7 +547,36 @@ impl ChatEngine {
             )
         });
 
-        let tools = build_llm_tools();
+        let mut tools = build_llm_tools();
+
+        // ── Active skill ──────────────────────────────────────────
+        // A selected skill appends its SKILL.md body to the system prompt and,
+        // if it declares `allowed-tools`, restricts this turn's tool set.
+        if let Some(skill_name) = request.skill.as_deref() {
+            if let Some(skill) = crate::skills::load_skill(&workspace_path, skill_name) {
+                system_prompt.push_str(&format!(
+                    "\n\n# Active skill: {}\n{}",
+                    skill.name, skill.body
+                ));
+                if let Some(allowed) = &skill.allowed_tools {
+                    let filtered: Vec<LlmTool> = tools
+                        .iter()
+                        .filter(|t| allowed.iter().any(|a| a == &t.name))
+                        .cloned()
+                        .collect();
+                    // A typo'd / unknown tool name would otherwise empty the set
+                    // and silently disable the agent — keep all tools + warn.
+                    if filtered.is_empty() {
+                        tracing::warn!(
+                            skill = %skill.name,
+                            "skill allowed-tools matched no known tools; keeping the full tool set"
+                        );
+                    } else {
+                        tools = filtered;
+                    }
+                }
+            }
+        }
         let mut total_input: u64 = 0;
         let mut total_output: u64 = 0;
 

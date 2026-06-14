@@ -896,6 +896,13 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     state.db.lock().delete_chat_thread(&thread_id)
 }
 
+/// List the skills available to a worktree (project ∪ user SKILL.md files).
+#[tauri::command]
+pub async fn list_skills(workspace_path: String) -> AppResult<Vec<crate::skills::SkillMeta>> {
+    let skills = crate::skills::scan_skills(std::path::Path::new(&workspace_path));
+    Ok(skills.iter().map(|s| s.meta()).collect())
+}
+
 // ─── Direct-mode orchestration commands ──────────────────────────
 
 #[tauri::command]

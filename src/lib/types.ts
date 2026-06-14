@@ -204,6 +204,13 @@ export interface ChatThread {
   updatedAt: string;
 }
 
+export interface SkillMeta {
+  name: string;
+  description: string;
+  /** "project" or "user" — where the SKILL.md was found. */
+  source: string;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;

@@ -19,6 +19,7 @@ mod pty_manager;
 mod session;
 pub mod session_recap;
 pub mod settings;
+pub mod skills;
 mod state;
 pub mod template;
 pub mod theme;
@@ -178,6 +179,7 @@ pub fn run() {
             commands::create_chat_thread,
             commands::rename_chat_thread,
             commands::delete_chat_thread,
+            commands::list_skills,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,
