@@ -434,6 +434,17 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN custom_name TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN instructions TEXT")?;
 
+        // ── v12 Direct halt recovery: session resume + per-stage baseline ──
+        // session_id: the Claude Code CLI session id from the stage's last
+        //   attempt — enables `--resume` and is shown in the halt diagnostics.
+        // resume_pending: 1 ⇒ the next run of this stage should `--resume`
+        //   session_id (set by a Resume action, cleared when the run starts).
+        // baseline_commit: dangling commit SHA snapshotting the worktree at the
+        //   stage's start, so Discard reverts only this stage's changes.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN session_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_pending INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN baseline_commit TEXT")?;
+
         // ── v11 chat threads: multiple conversations per workspace ──
         // A `chat_threads` table + a nullable `thread_id` on chat_messages.
         // Then a one-time backfill: every workspace that still has un-threaded
@@ -1953,7 +1964,8 @@ impl Db {
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
-                    max_iterations, parents, tools, custom_name, instructions
+                    max_iterations, parents, tools, custom_name, instructions,
+                    session_id, resume_pending, baseline_commit
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -1984,6 +1996,9 @@ impl Db {
                 tools: parse_tools(r.get(23)?),
                 custom_name: r.get(24)?,
                 instructions: r.get(25)?,
+                session_id: r.get(26)?,
+                resume_pending: r.get::<_, i64>(27)? != 0,
+                baseline_commit: r.get(28)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2695,6 +2710,13 @@ pub struct RunStageRow {
     pub custom_name: Option<String>,
     /// Free-form prompt additions copied from the template.
     pub instructions: Option<String>,
+    /// Claude Code CLI session id from the stage's last attempt (CLI substrate
+    /// only); enables `--resume`. None for legacy rows and API stages.
+    pub session_id: Option<String>,
+    /// 1 ⇒ the next run of this stage should resume `session_id`.
+    pub resume_pending: bool,
+    /// Dangling commit SHA snapshotting the worktree at this stage's start.
+    pub baseline_commit: Option<String>,
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /
