@@ -75,8 +75,8 @@ describe("RunControlBar", () => {
     render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "compile error: missing semicolon" })}
       loopTargetRole={null} loopState={null} {...h} />);
     expect(screen.getByText(/stage halted/i)).toBeInTheDocument();
-    // API substrate with no sessionId → primary action is Re-run.
-    fireEvent.click(screen.getByRole("button", { name: /^Re-run$/i }));
+    // API substrate with no sessionId → primary action is Re-run · N turns (default 50).
+    fireEvent.click(screen.getByRole("button", { name: /^Re-run · 50 turns$/i }));
     expect(h.onReject).toHaveBeenCalledWith("", 50);
     // Open the why panel to access Accept partial work.
     fireEvent.click(screen.getByRole("button", { name: /why this halted/i }));

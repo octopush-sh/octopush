@@ -199,7 +199,7 @@ function DecisionBar({
                 </span>
                 <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
                   className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                  {canResume ? "Resume" : "Re-run"}
+                  {canResume ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
                 </button>
                 {canResume && (
                   <button type="button" onClick={() => setMode("reject")}
@@ -214,13 +214,14 @@ function DecisionBar({
               </div>
 
               <button type="button" onClick={() => setShowWhy((v) => !v)}
-                className="flex w-fit items-center gap-1.5 font-mono text-[11px] text-octo-mute transition-colors hover:text-octo-sage">
+                aria-expanded={showWhy} aria-controls="halt-why-panel"
+                className="flex w-fit items-center gap-1.5 font-mono text-[11px] text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage">
                 <ChevronRight size={12} className="transition-transform duration-[180ms]" style={{ transform: showWhy ? "rotate(90deg)" : "none" }} />
                 why this halted
               </button>
 
               <Reveal open={showWhy}>
-                <div className="mt-1 rounded-r-md border-l-2 border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-3">
+                <div id="halt-why-panel" className="mt-1 rounded-md border border-octo-hairline bg-octo-panel-2 px-3 py-3">
                   {cause.remedy && <p className="mb-2 text-xs text-octo-sage">{cause.remedy}</p>}
                   <pre className="mb-3 max-h-32 overflow-auto rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-2 font-mono text-[11px] text-octo-mute whitespace-pre-wrap">{blockedStage.error ?? "no detail"}</pre>
                   <div className="flex flex-wrap items-center gap-3">
@@ -247,14 +248,14 @@ function DecisionBar({
 
               {confirmDiscard && (
                 <ModalShell onClose={() => setConfirmDiscard(false)} closeOnBackdrop={false} ariaLabel="Confirm discard"
-                  panelClassName="w-[420px] rounded-lg border border-octo-hairline bg-octo-panel p-5">
-                  <p className="font-serif text-[16px] text-octo-ivory">Discard this stage's changes?</p>
-                  <p className="mt-2 text-sm text-octo-sage">This reverts the worktree to how it was when <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> started — the work of earlier stages is preserved. This cannot be undone.</p>
+                  panelClassName="w-[420px] rounded-lg border border-octo-hairline bg-octo-panel p-6">
+                  <p className="font-sans text-[15px] font-semibold text-octo-ivory">Discard this stage's changes?</p>
+                  <p className="mt-2 text-sm text-octo-sage">This discards the changes from <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>'s latest attempt and reverts the worktree to the last good state. Earlier stages' work is preserved. This cannot be undone.</p>
                   <div className="mt-4 flex justify-end gap-2">
                     <button type="button" onClick={() => setConfirmDiscard(false)}
-                      className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors hover:text-octo-ivory">Cancel</button>
+                      className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory">Cancel</button>
                     <button type="button" onClick={() => { setConfirmDiscard(false); onDiscard(); }}
-                      className="rounded-md border border-octo-rouge px-3 py-1.5 font-mono text-xs text-octo-rouge transition-colors hover:bg-[var(--rouge-ghost)]">Discard changes</button>
+                      className="rounded-md border border-octo-rouge px-3 py-1.5 font-mono text-xs text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Discard changes</button>
                   </div>
                 </ModalShell>
               )}
