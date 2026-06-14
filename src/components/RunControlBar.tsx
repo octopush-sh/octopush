@@ -139,7 +139,8 @@ function DecisionBar({
   const [feedback, setFeedback] = useState("");
   const [showWhy, setShowWhy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
-  const [turns, setTurns] = useState(() => Math.min(100, blockedStage.maxIterations * 2));
+  const defaultTurns = Math.min(100, Math.max(5, Math.round((blockedStage.maxIterations * 2) / 5) * 5));
+  const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
   const transient = failed && isTransientHalt(blockedStage.error);
@@ -153,14 +154,14 @@ function DecisionBar({
     setFeedback("");
     setShowWhy(false);
     setConfirmDiscard(false);
-    setTurns(Math.min(100, blockedStage.maxIterations * 2));
+    setTurns(defaultTurns);
   }, [blockedStage.id, blockedStage.maxIterations]);
 
   const atCap = loopState !== null && loopState.iteration >= loopState.max;
   const canSendBack = loopTargetRole !== null && !atCap;
 
   function submitFeedback() {
-    if (mode === "reject") onReject(feedback, turns);
+    if (mode === "reject") onReject(feedback, failed ? turns : undefined);
     else onSendBack(feedback);
     setMode("decide");
     setFeedback("");

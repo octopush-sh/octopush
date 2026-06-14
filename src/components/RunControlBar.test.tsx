@@ -53,8 +53,8 @@ describe("RunControlBar", () => {
     // The editor crossfades in (FadeSwap holds the old view ~120ms first).
     fireEvent.change(await screen.findByRole("textbox"), { target: { value: "fix the imports" } });
     fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
-    // onReject now receives (feedback, turns); turns defaults to maxIterations * 2 (25 * 2 = 50).
-    expect(h.onReject).toHaveBeenCalledWith("fix the imports", 50);
+    // Non-failed checkpoint reject must NOT pass a turn override (FIX 3).
+    expect(h.onReject).toHaveBeenCalledWith("fix the imports", undefined);
   });
 
   it("checkpoint with a loop target: offers Send back and shows loop state", async () => {
@@ -82,6 +82,20 @@ describe("RunControlBar", () => {
     fireEvent.click(screen.getByRole("button", { name: /why this halted/i }));
     fireEvent.click(await screen.findByRole("button", { name: /Accept partial work/i }));
     expect(h.onApprove).toHaveBeenCalled();
+  });
+
+  it("failed stage reject (via Re-run button in mode=reject): passes turns override", async () => {
+    const h = handlers();
+    // Use a CLI substrate with a sessionId so the secondary "Re-run" button is visible.
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({ status: "failed", error: "compile error: missing semicolon", maxIterations: 25, substrate: "cli", sessionId: "abc123" })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    // The secondary Re-run button opens the reject editor (only shown when canResume=true).
+    fireEvent.click(screen.getByRole("button", { name: /^Re-run$/i }));
+    fireEvent.change(await screen.findByRole("textbox"), { target: { value: "fix it" } });
+    fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
+    // Failed stage — turns override (defaultTurns = 50 for maxIterations=25) must be passed.
+    expect(h.onReject).toHaveBeenCalledWith("fix it", 50);
   });
 
   it("transient halt: offers Resume in amber, not accept/re-run", () => {

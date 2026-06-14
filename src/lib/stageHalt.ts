@@ -14,13 +14,13 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
     };
   }
   if (raw.includes("error_during_execution")) {
-    return { title: "Claude hit an execution error mid-run", remedy: "Resume to continue, or re-run." };
+    return { title: "Claude hit an execution error mid-run", remedy: "Resume or re-run to continue." };
   }
   if (/no output for/i.test(raw)) {
-    return { title: "Claude produced no output and timed out", remedy: "The CLI stalled. Resume or re-run." };
+    return { title: "Claude produced no output and timed out", remedy: "The CLI stalled — resume or re-run." };
   }
   if (/exceeded the .* cap/i.test(raw)) {
-    return { title: "Claude ran past the time cap", remedy: "Resume to continue where it left off." };
+    return { title: "Claude ran past the time cap", remedy: "Resume or re-run with more turns." };
   }
   return { title: raw.split("\n")[0] };
 }
