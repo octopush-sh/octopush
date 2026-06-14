@@ -269,6 +269,22 @@ impl Orchestrator {
         }
     }
 
+    /// Append a terminal entry to the stage's work journal so the journal
+    /// explains the halt instead of just stopping mid-action. Persisted AND
+    /// emitted live (best-effort — a journal write must never mask the failure).
+    fn record_halt(&self, run_id: &str, stage_id: &str, error: &str) {
+        let first = error.lines().next().unwrap_or("stage halted").trim();
+        let entry = serde_json::json!({ "kind": "notice", "text": format!("⏹ Stage halted — {first}") });
+        let json = entry.to_string();
+        if let Err(e) = self.db.lock().append_stage_log(run_id, stage_id, &json) {
+            tracing::warn!(stage_id = %stage_id, "halt journal write failed: {e}");
+        }
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run_id, "stageId": stage_id, "entry": entry }),
+        );
+    }
+
     /// Execute one stage and persist its outcome + cost/baseline.
     async fn run_stage_once(
         &self,
@@ -282,6 +298,7 @@ impl Orchestrator {
                     &stage.id,
                     &format!("unknown substrate '{}'", stage.substrate),
                 )?;
+                self.record_halt(&run.id, &stage.id, &format!("unknown substrate '{}'", stage.substrate));
                 return Ok((StageStatus::Failed, None));
             }
         };
@@ -344,7 +361,9 @@ impl Orchestrator {
         let outcome = match run_result {
             Ok(o) => o,
             Err(e) => {
-                self.db.lock().fail_run_stage(&stage.id, &e.to_string())?;
+                let err_str = e.to_string();
+                self.db.lock().fail_run_stage(&stage.id, &err_str)?;
+                self.record_halt(&run.id, &stage.id, &err_str);
                 return Ok((StageStatus::Failed, None));
             }
         };
@@ -391,6 +410,7 @@ impl Orchestrator {
                     self.recompute_run_cost(&run.id)?;
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
+                self.record_halt(&run.id, &stage.id, &err);
                 // A failed stage may still have touched the worktree — keep the
                 // evidence (best-effort; empty diffs are skipped internally).
                 self.capture_stage_diff_snapshot(run, &stage.id);
