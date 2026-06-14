@@ -211,6 +211,13 @@ export interface SkillMeta {
   source: string;
 }
 
+/** A base64 image attachment for the chat composer. */
+export interface Attachment {
+  mediaType: string;
+  data: string;
+  name: string;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;

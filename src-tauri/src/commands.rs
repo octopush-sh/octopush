@@ -903,6 +903,78 @@ pub async fn list_skills(workspace_path: String) -> AppResult<Vec<crate::skills:
     Ok(skills.iter().map(|s| s.meta()).collect())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentData {
+    pub media_type: String,
+    pub data: String,
+    pub name: String,
+}
+
+/// Read an image file into a base64 attachment (images only, ≤ 5 MB) for the
+/// chat composer. Returns the IANA media type, base64 data, and file name.
+#[tauri::command]
+pub async fn read_attachment(path: String) -> AppResult<AttachmentData> {
+    use base64::Engine as _;
+    let p = std::path::Path::new(&path);
+    let bytes = std::fs::read(p)
+        .map_err(|e| crate::error::AppError::Other(format!("Failed to read {path}: {e}")))?;
+    if bytes.len() > 5_000_000 {
+        return Err(crate::error::AppError::Other(
+            "Image too large (max 5 MB).".into(),
+        ));
+    }
+    // Detect the media type from the file's MAGIC BYTES (robust to a misleading
+    // extension, which the API would otherwise reject). Fall back to the
+    // extension only when the bytes don't match a known image signature.
+    let media_type = sniff_image_media_type(&bytes)
+        .or_else(|| {
+            match p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("png") => Some("image/png"),
+                Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+                Some("gif") => Some("image/gif"),
+                Some("webp") => Some("image/webp"),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            crate::error::AppError::Other(
+                "Unsupported attachment (images only: png, jpeg, gif, webp).".into(),
+            )
+        })?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image")
+        .to_string();
+    Ok(AttachmentData {
+        media_type: media_type.to_string(),
+        data,
+        name,
+    })
+}
+
+/// Identify a supported image type from its leading bytes, or None.
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 // ─── Direct-mode orchestration commands ──────────────────────────
 
 #[tauri::command]

@@ -132,6 +132,19 @@ fn message_to_anthropic(msg: &LlmMessage) -> Value {
     };
     let content = match &msg.content {
         LlmContent::Text(t) => Value::String(t.clone()),
+        LlmContent::Multimodal(blocks) => {
+            let arr: Vec<Value> = blocks
+                .iter()
+                .map(|b| match b {
+                    crate::providers::LlmBlock::Text(t) => json!({ "type": "text", "text": t }),
+                    crate::providers::LlmBlock::Image { media_type, data } => json!({
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": media_type, "data": data },
+                    }),
+                })
+                .collect();
+            Value::Array(arr)
+        }
         LlmContent::AssistantWithTools { text, tool_uses } => {
             let mut arr: Vec<Value> = Vec::new();
             if !text.is_empty() {

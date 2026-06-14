@@ -39,6 +39,9 @@ pub enum LlmRole {
 pub enum LlmContent {
     /// Plain text (most common — user prompts, simple assistant replies).
     Text(String),
+    /// A user turn carrying text plus one or more inline image blocks
+    /// (attachments). Text-only providers degrade to the text part.
+    Multimodal(Vec<LlmBlock>),
     /// Assistant turn that called one or more tools.
     /// Also carries any text the assistant emitted alongside the tool calls.
     AssistantWithTools {
@@ -47,6 +50,14 @@ pub enum LlmContent {
     },
     /// User-role turn carrying the results of previously-called tools.
     ToolResults(Vec<LlmToolResult>),
+}
+
+/// A single block within a multimodal message.
+#[derive(Serialize, Clone, Debug)]
+pub enum LlmBlock {
+    Text(String),
+    /// A base64-encoded image with its IANA media type (e.g. `image/png`).
+    Image { media_type: String, data: String },
 }
 
 #[derive(Serialize, Clone, Debug)]

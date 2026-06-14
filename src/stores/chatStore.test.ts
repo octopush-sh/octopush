@@ -60,6 +60,7 @@ function resetStore() {
     activeThreadByWs: {},
     streamingThreadByWs: {},
     activeSkillByWs: {},
+    attachmentsByWs: {},
   });
 }
 
@@ -345,6 +346,16 @@ describe("chatStore — stop + effort (P3)", () => {
       expect.objectContaining({ skill: "write-tests" }),
     );
     expect(useChatStore.getState().getActiveSkill("ws-1")).toBe("write-tests");
+  });
+
+  it("send() passes pending attachments then clears them (P7)", async () => {
+    useChatStore.getState().addAttachment("ws-1", { mediaType: "image/png", data: "QUJD", name: "a.png" });
+    expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(1);
+    await useChatStore.getState().send("ws-1", "/tmp", "look at this");
+    expect(ipc.sendChatMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ attachments: [{ mediaType: "image/png", data: "QUJD" }] }),
+    );
+    expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(0);
   });
 
   it("send() uses the effort's max-tokens budget", async () => {

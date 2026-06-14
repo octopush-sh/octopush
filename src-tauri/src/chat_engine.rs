@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 use crate::providers::{
     anthropic::AnthropicProvider,
     openai_compat::OpenAICompatibleProvider,
-    LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
+    LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
     LlmStopReason, LlmTool, LlmToolResult,
 };
 use crate::provider_router::ProviderRouter;
@@ -51,6 +51,18 @@ pub struct ChatRequest {
     /// and, if it declares `allowed-tools`, the turn's tool set is restricted.
     #[serde(default)]
     pub skill: Option<String>,
+    /// Inline image attachments for THIS turn (base64). Sent as multimodal
+    /// content blocks alongside the user text. Not persisted in history.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A base64 image attachment sent with a user turn.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -534,6 +546,34 @@ impl ChatEngine {
                     role: LlmRole::User,
                     content: LlmContent::Text(msg.content.clone()),
                 });
+            }
+        }
+
+        // Attach this turn's images: replace the current (last) user turn with a
+        // multimodal block carrying the text + image blocks. Attachments aren't
+        // persisted, so they only ride along on the turn that sent them.
+        if !request.attachments.is_empty() {
+            // The just-persisted user message is the last entry. Guard on its
+            // role; warn (rather than silently drop) if it's somehow not a user
+            // turn. The text block is omitted when empty (image-only sends),
+            // since providers reject empty text blocks.
+            match messages.last_mut() {
+                Some(last) if last.role == LlmRole::User => {
+                    let mut blocks: Vec<LlmBlock> = Vec::new();
+                    if !request.user_message.trim().is_empty() {
+                        blocks.push(LlmBlock::Text(request.user_message.clone()));
+                    }
+                    for att in &request.attachments {
+                        blocks.push(LlmBlock::Image {
+                            media_type: att.media_type.clone(),
+                            data: att.data.clone(),
+                        });
+                    }
+                    last.content = LlmContent::Multimodal(blocks);
+                }
+                _ => tracing::warn!(
+                    "attachments present but the last message isn't a user turn; images dropped"
+                ),
             }
         }
 
