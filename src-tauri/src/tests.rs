@@ -5484,4 +5484,22 @@ mod git_baseline_tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "A\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn baseline_deletes_a_unicode_named_stage_file() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("octo-baseline-uni-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| { Command::new("git").args(a).current_dir(&dir).output().unwrap(); };
+        git(&["init", "-q"]); git(&["config","user.email","t@t"]); git(&["config","user.name","t"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add","-A"]); git(&["commit","-qm","init"]);
+        let baseline = capture_baseline(&dir).unwrap().unwrap();
+        std::fs::write(dir.join("café_new.txt"), "stage file\n").unwrap(); // unicode name created during stage
+        restore_baseline(&dir, &baseline).unwrap();
+        assert!(!dir.join("café_new.txt").exists(), "unicode-named stage file should be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -62,10 +62,14 @@ pub fn capture_baseline(ws: &Path) -> AppResult<Option<String>> {
 /// baseline contains, remove every file it does not (i.e. created during the
 /// stage). Never touches the user's real index.
 pub fn restore_baseline(ws: &Path, baseline: &str) -> AppResult<()> {
-    let ls = git(ws, None, &["ls-tree", "-r", "--name-only", baseline])?;
+    let ls = git(ws, None, &["ls-tree", "-r", "--name-only", "-z", baseline])?;
     ok(&ls, "ls-tree baseline")?;
-    let in_baseline: HashSet<String> =
-        String::from_utf8_lossy(&ls.stdout).lines().map(str::to_string).collect();
+    let in_baseline: HashSet<String> = ls
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
 
     let idx = temp_index(ws);
     let _ = std::fs::remove_file(&idx);
@@ -73,14 +77,14 @@ pub fn restore_baseline(ws: &Path, baseline: &str) -> AppResult<()> {
     ok(&git(ws, Some(&idx), &["checkout-index", "-a", "-f"])?, "checkout-index")?;
     let _ = std::fs::remove_file(&idx);
 
-    let tracked = git(ws, None, &["ls-files"])?;
+    let tracked = git(ws, None, &["ls-files", "-z"])?;
     ok(&tracked, "ls-files")?;
-    let untracked = git(ws, None, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = git(ws, None, &["ls-files", "-z", "--others", "--exclude-standard"])?;
     ok(&untracked, "ls-files --others")?;
     let mut current: HashSet<String> = HashSet::new();
     for src in [&tracked.stdout, &untracked.stdout] {
-        for f in String::from_utf8_lossy(src).lines() {
-            current.insert(f.to_string());
+        for f in src.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            current.insert(String::from_utf8_lossy(f).into_owned());
         }
     }
 
