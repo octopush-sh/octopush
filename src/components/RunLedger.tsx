@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { Run, RunStage } from "../lib/ipc";
 import { savingsVsBaseline } from "../lib/runStatus";
-import { labelForRole } from "../lib/stageMeta";
+import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 
 interface Props {
   run: Run;
   stages: RunStage[];
-}
-
-/** Compact token count: 1240 → "1.2k", 980 → "980". */
-function fmtTokens(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
 /** The ledger strip — Direct's cost surface, savings-first (the differentiator

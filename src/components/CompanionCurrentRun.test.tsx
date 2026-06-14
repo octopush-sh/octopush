@@ -44,6 +44,6 @@ describe("CompanionCurrentRun", () => {
     expect(screen.getByText("current run")).toBeInTheDocument();
     expect(screen.getByText("Build it")).toBeInTheDocument(); // the running stage spotlighted
     expect(screen.getByText("$0.42")).toBeInTheDocument(); // run cost
-    expect(screen.getByText(/↑1,000 ↓200/)).toBeInTheDocument(); // run tokens
+    expect(screen.getByText(/↑1\.0k ↓200/)).toBeInTheDocument(); // run tokens (shared fmtTokens)
   });
 });

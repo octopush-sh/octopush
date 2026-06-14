@@ -86,7 +86,7 @@ describe("RunFlow", () => {
     render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
 
     expect(screen.getByText("$0.50")).toBeInTheDocument();
-    expect(screen.getByText("↑1200 ↓340")).toBeInTheDocument();
+    expect(screen.getByText("↑1.2k ↓340")).toBeInTheDocument();
   });
 
   it("renders the loop badge for a stage with a loop target", () => {

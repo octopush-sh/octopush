@@ -4,7 +4,7 @@ import type { LiveEntry, RunStage, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
-import { stageTitle } from "../lib/stageMeta";
+import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -252,7 +252,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
         <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
           {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
             <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
-              ↑{stage.inputTokens.toLocaleString()} ↓{stage.outputTokens.toLocaleString()}
+              ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
             </span>
           )}
           <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>

@@ -1,6 +1,6 @@
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
-import { ROMAN, stageTitle } from "../lib/stageMeta";
+import { ROMAN, stageTitle, fmtTokens } from "../lib/stageMeta";
 import { archetypeFor } from "./builder/graph";
 import { ARTIFACT_ICON } from "./builder/icons";
 import { useRunsStore } from "../stores/runsStore";
@@ -109,7 +109,7 @@ function StageCard({
   // ONE fixed-height live/meta line; content picked by status, geometry constant.
   const verdict = s.status === "done" ? lastNotice(entries) : "";
   const live: { node: React.ReactNode; cls: string } = running
-    ? { node: lastActivity(entries), cls: "text-octo-brass" }
+    ? { node: lastActivity(entries), cls: "text-octo-sage" }
     : verdict
       ? { node: verdict, cls: "text-octo-verdigris" }
       : { node: <MetaLine stage={s} />, cls: "text-octo-mute" };
@@ -123,20 +123,25 @@ function StageCard({
     looping &&
     ((awaiting && s.loopIterations < s.loopMaxIterations) || running);
 
-  const skin = selected
-    ? "border-octo-brass bg-[var(--brass-ghost)]"
-    : running
-      ? "border-octo-brass bg-[var(--brass-ghost)]"
-      : awaiting
-        ? "border-octo-brass bg-octo-panel-2 hover:border-octo-brass"
-        : transientHalt
-          ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
-          : s.status === "failed"
-            ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
+  // Status carries its own colour family so the run reads at a glance and brass
+  // stays surgical: running is VERDIGRIS (liveness), a checkpoint that needs you
+  // is BRASS, a stall is AMBER, a hard fail is ROUGE. Selection only styles a
+  // resting card (brass ghost) — an active card already announces itself, so
+  // running (verdigris) never collides with selected (brass).
+  const skin = transientHalt
+    ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
+    : s.status === "failed"
+      ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
+      : running
+        ? "border-octo-verdigris bg-octo-panel-2"
+        : awaiting
+          ? "border-octo-brass bg-octo-panel-2"
+          : selected
+            ? "border-octo-brass bg-[var(--brass-ghost)]"
             : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]";
 
   // Running + awaiting both earn the calm pulse: one says "work here now", the
-  // other "needs you". Selected reads via the brass border, no extra motion.
+  // other "needs you". A resting selected card reads via the brass ghost alone.
   const pulse = (running || awaiting) ? "octo-stage-pulse " : "";
 
   return (
@@ -146,9 +151,9 @@ function StageCard({
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
       className={`octo-rise-in flex w-[210px] shrink-0 flex-col gap-2 rounded-lg border px-3.5 py-3 text-left transition-colors ${pulse}${skin}`}
     >
-      {/* Header — archetype icon (brass while running) · title · Roman numeral. */}
+      {/* Header — archetype icon · title · Roman numeral. */}
       <div className="flex items-center gap-2">
-        <span className={running ? "text-octo-brass" : "text-octo-sage"}>
+        <span className="text-octo-sage">
           <Icon size={14} strokeWidth={1.75} />
         </span>
         <span className="min-w-0 flex-1 truncate font-serif text-[14px] text-octo-ivory" title={stageTitle(s)}>
@@ -163,7 +168,7 @@ function StageCard({
           {glyph}
         </span>
         <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
-        <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-brass">
+        <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-verdigris">
           {running ? elapsed : ""}
         </span>
       </span>
@@ -204,7 +209,9 @@ function StageCard({
             ⟲ {s.loopIterations}/{s.loopMaxIterations}
           </span>
           {s.loopTargetPosition !== null && (
-            <span className="ml-1">→ {ROMAN[s.loopTargetPosition] ?? s.loopTargetPosition + 1}</span>
+            // "back to" — the loop hands work to an EARLIER stage; a plain → read
+            // as forward flow, contradicting the ⟶ connectors on the same card.
+            <span className="ml-1">back to {ROMAN[s.loopTargetPosition] ?? s.loopTargetPosition + 1}</span>
           )}
         </span>
       )}
@@ -221,7 +228,7 @@ function MetaLine({ stage: s }: { stage: RunStage }) {
       <span className="octo-tabular text-octo-brass">${s.costUsd.toFixed(2)}</span>
       {hasTokens && (
         <span className="octo-tabular text-octo-mute" title="input / output tokens">
-          ↑{s.inputTokens} ↓{s.outputTokens}
+          ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}
         </span>
       )}
     </span>

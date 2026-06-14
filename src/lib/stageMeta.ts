@@ -4,6 +4,12 @@
 
 export const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 
+/** Compact token count — the single format across every Direct surface:
+ *  1240 → "1.2k", 980 → "980". */
+export function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 /** The archetype's display label. Keep in sync with ARCHETYPES in
  *  src/components/builder/graph.ts (the authoritative table). */
 export function labelForRole(role: string): string {
