@@ -628,12 +628,26 @@ impl ChatEngine {
         // `mcp__server__tool`). Unreachable servers are skipped inside
         // list_tools. A skill's allowed-tools filter above doesn't touch these
         // (MCP tools are opt-in via the server config, not the skill).
-        for t in self.mcp.list_tools(&workspace_path) {
-            tools.push(LlmTool {
-                name: t.namespaced,
-                description: t.description,
-                input_schema: t.input_schema,
-            });
+        // Run the (blocking) MCP discovery off the async runtime thread, bounded
+        // by a timeout so a hung server can't freeze the turn.
+        {
+            let mcp = Arc::clone(&self.mcp);
+            let wp = workspace_path.clone();
+            let discovered = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+            for t in discovered {
+                tools.push(LlmTool {
+                    name: t.namespaced,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                });
+            }
         }
 
         let mut total_input: u64 = 0;
@@ -886,11 +900,23 @@ impl ChatEngine {
                 });
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
-                // other names are built-in workspace tools.
+                // other names are built-in workspace tools. MCP calls run off
+                // the runtime thread with a timeout so a slow/hung server
+                // surfaces as a tool error instead of freezing the turn.
                 let (result, ok) = if crate::mcp::is_mcp_tool(&u.name) {
-                    match self.mcp.call(&workspace_path, &u.name, &u.input) {
-                        Ok(r) => (r, true),
-                        Err(e) => (format!("MCP error: {e}"), false),
+                    let mcp = Arc::clone(&self.mcp);
+                    let wp = workspace_path.clone();
+                    let name = u.name.clone();
+                    let input = u.input.clone();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        tokio::task::spawn_blocking(move || mcp.call(&wp, &name, &input)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(out))) => (out, true),
+                        Ok(Ok(Err(e))) => (format!("MCP error: {e}"), false),
+                        _ => ("MCP error: tool call timed out".to_string(), false),
                     }
                 } else {
                     execute_tool(&workspace_path, &u.name, &u.input)

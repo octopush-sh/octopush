@@ -124,6 +124,19 @@ impl Connection {
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
+            // A server→client REQUEST (has both id and method, e.g.
+            // sampling/createMessage, roots/list) — reply method-not-found so
+            // the server isn't left blocked waiting on us (which would deadlock
+            // our own read). Plain notifications (method, no id) are ignored.
+            if msg.get("method").is_some() {
+                if let Some(req_id) = msg.get("id") {
+                    let _ = self.write_message(&json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": { "code": -32601, "message": "method not supported" }
+                    }));
+                }
+            }
         }
     }
 
@@ -142,18 +155,33 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Kill AND reap — std's Child doesn't wait on drop, so without this the
+        // killed server lingers as a zombie process.
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 /// Holds live connections to MCP servers, keyed by server name.
 pub struct McpRegistry {
     conns: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+    /// Servers that failed to start this session — skipped on subsequent turns
+    /// so a broken config doesn't re-spawn a failing process every turn.
+    failed: Mutex<std::collections::HashSet<String>>,
 }
 
 impl McpRegistry {
     pub fn new() -> Self {
-        Self { conns: Mutex::new(HashMap::new()) }
+        Self {
+            conns: Mutex::new(HashMap::new()),
+            failed: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Drop a server's cached connection (e.g. after it errored) so the next
+    /// use re-spawns it.
+    fn evict(&self, name: &str) {
+        self.conns.lock().remove(name);
     }
 
     /// Spawn a server, run the MCP initialize handshake, and fetch its tools.
@@ -218,10 +246,21 @@ impl McpRegistry {
         if let Some(c) = self.conns.lock().get(name) {
             return Ok(Arc::clone(c));
         }
-        let conn = Self::connect(name, cfg)?;
-        let arc = Arc::new(Mutex::new(conn));
-        self.conns.lock().insert(name.to_string(), Arc::clone(&arc));
-        Ok(arc)
+        if self.failed.lock().contains(name) {
+            return Err(format!("MCP server '{name}' previously failed; skipping"));
+        }
+        match Self::connect(name, cfg) {
+            Ok(conn) => {
+                let arc = Arc::new(Mutex::new(conn));
+                self.conns.lock().insert(name.to_string(), Arc::clone(&arc));
+                Ok(arc)
+            }
+            Err(e) => {
+                // Remember the failure so we don't re-spawn it every turn.
+                self.failed.lock().insert(name.to_string());
+                Err(e)
+            }
+        }
     }
 
     /// All tools across configured + reachable servers for a worktree.
@@ -248,9 +287,19 @@ impl McpRegistry {
             .get(&server)
             .ok_or_else(|| format!("MCP server '{server}' not configured"))?;
         let conn = self.ensure(&server, cfg)?;
-        let result = conn
+        let result = match conn
             .lock()
-            .request("tools/call", json!({ "name": tool, "arguments": input }))?;
+            .request("tools/call", json!({ "name": tool, "arguments": input }))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // The connection is likely dead (broken pipe / closed) — evict
+                // it so the next call re-spawns a fresh server instead of
+                // reusing a corpse forever.
+                self.evict(&server);
+                return Err(e);
+            }
+        };
         let text = result
             .get("content")
             .and_then(|c| c.as_array())
