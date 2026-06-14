@@ -746,6 +746,11 @@ export const ipc = {
   stopStage: (runId: string) =>
     invoke<void>("stop_stage", { runId }),
 
+  /** Ask a running run to pause at its next stage boundary; the next stage is
+   *  parked awaiting the director, and approving it resumes the run. */
+  requestRunPause: (runId: string) =>
+    invoke<void>("request_run_pause", { runId }),
+
   /** The persisted live journal for a stage, oldest first. Entries are
    *  LiveEntry-shaped JSON plus `{kind:"reset"}` marker objects that split
    *  the log into per-attempt segments. */

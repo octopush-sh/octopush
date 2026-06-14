@@ -1,7 +1,7 @@
 import type { PipelineStage } from "../../lib/ipc";
 import { archetypeFor, TOOLS } from "../builder/graph";
 import { ARTIFACT_ICON } from "../builder/icons";
-import { ROMAN, stageTitle } from "../RunTrack";
+import { ROMAN, stageTitle } from "../../lib/stageMeta";
 import { ModelPicker } from "../ModelPicker";
 
 interface Props {

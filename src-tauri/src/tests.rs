@@ -2936,6 +2936,33 @@ mod orchestrator_tests {
         assert_eq!(stages[0].diff_snapshot, None);
     }
 
+    #[tokio::test]
+    async fn director_pause_parks_the_next_stage_and_approve_resumes() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // Pause requested before the drive: the next pending stage parks at the
+        // boundary (run paused, stage awaiting a decision) and nothing executes.
+        orch.request_pause(&run_id);
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "awaiting_checkpoint");
+        assert!(stages[0].started_at.is_none(), "the parked stage never ran");
+        assert_eq!(stages[1].status, "pending");
+
+        // Approving the parked-never-started stage releases it; the run finishes.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages.iter().all(|s| s.status == "done"), "all stages run after resume");
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";

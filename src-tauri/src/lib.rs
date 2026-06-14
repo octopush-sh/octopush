@@ -181,6 +181,7 @@ pub fn run() {
             commands::resolve_checkpoint,
             commands::abort_run,
             commands::stop_stage,
+            commands::request_run_pause,
             commands::estimate_run_cost,
             commands::get_stage_log,
             commands::list_stage_iterations,

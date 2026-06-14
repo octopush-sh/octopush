@@ -1000,6 +1000,18 @@ pub async fn stop_stage(
     orch.stop_current_stage(&run_id)
 }
 
+/// Ask a running run to pause at its next stage boundary. The next pending stage
+/// is parked awaiting the director; approving it resumes the run. Safe no-op if
+/// the run isn't currently driving.
+#[tauri::command]
+pub async fn request_run_pause(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+) -> AppResult<()> {
+    orch.request_pause(&run_id);
+    Ok(())
+}
+
 /// The persisted live journal for a stage, oldest first. Rows that fail to
 /// parse (shouldn't happen — we wrote them) are skipped rather than erroring.
 #[tauri::command]

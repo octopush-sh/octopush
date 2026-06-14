@@ -13,18 +13,19 @@ vi.mock("./PipelineSetup", () => ({
   ),
 }));
 vi.mock("./PipelineBuilder", () => ({ PipelineBuilder: () => <div>BUILDER</div> }));
-vi.mock("./RunTrack", () => ({
-  RunTrack: ({ onRunAgain }: any) => (
+vi.mock("./RunFlow", () => ({ RunFlow: () => <div>RUNVIEW</div> }));
+vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
+vi.mock("./RunLedger", () => ({ RunLedger: () => <div /> }));
+const TERMINAL = new Set(["completed", "aborted", "failed"]);
+vi.mock("./RunControlBar", () => ({
+  RunControlBar: ({ run, blockedStage, onRunAgain }: any) => (
     <div>
-      RUNVIEW
-      {onRunAgain && <button onClick={onRunAgain}>again</button>}
+      {blockedStage && <div>CHECKPOINT</div>}
+      {run.status === "running" && !blockedStage && <div>RUNNINGBAR</div>}
+      {TERMINAL.has(run.status) && <button onClick={onRunAgain}>again</button>}
     </div>
   ),
-  labelForRole: (r: string) => r,
 }));
-vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
-vi.mock("./CheckpointBar", () => ({ CheckpointBar: () => <div>CHECKPOINT</div> }));
-vi.mock("./RunLedger", () => ({ RunLedger: () => <div /> }));
 
 const { DirectCanvas } = await import("./DirectCanvas");
 const { useRunsStore } = await import("../stores/runsStore");
@@ -137,7 +138,7 @@ describe("DirectCanvas viewed-run routing", () => {
     expect(useRunsStore.getState().selectedRunIdByWs.w1).toBeNull();
   });
 
-  it("keeps the checkpoint strip mounted in a Reveal and folds it away on resume", () => {
+  it("shows the decision surface when paused at a checkpoint, and the running controls once resumed", () => {
     const blocked = {
       id: "s1", runId: "r1", position: 0, role: "code_review", agentModel: "haiku",
       substrate: "api", checkpoint: true, status: "awaiting_checkpoint",
@@ -149,17 +150,17 @@ describe("DirectCanvas viewed-run routing", () => {
     useRunsStore.getState().selectRun("w1", "r1");
     render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
 
-    // Paused: the strip is open.
-    const strip = screen.getByText("CHECKPOINT");
-    expect(strip.closest("[aria-hidden]")).toHaveAttribute("aria-hidden", "false");
+    // Paused at a checkpoint: the decision surface is shown.
+    expect(screen.getByText("CHECKPOINT")).toBeInTheDocument();
+    expect(screen.queryByText("RUNNINGBAR")).not.toBeInTheDocument();
 
-    // Resume: the strip folds away but its content stays mounted through the animation.
+    // Resumed: the control bar adapts to the running controls (no decision).
     act(() => {
       useRunsStore.setState({
         detailByRun: { r1: { run: { ...run, status: "running" }, stages: [{ ...blocked, status: "running" }] } },
       });
     });
-    expect(screen.getByText("CHECKPOINT")).toBeInTheDocument();
-    expect(screen.getByText("CHECKPOINT").closest("[aria-hidden]")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByText("CHECKPOINT")).not.toBeInTheDocument();
+    expect(screen.getByText("RUNNINGBAR")).toBeInTheDocument();
   });
 });

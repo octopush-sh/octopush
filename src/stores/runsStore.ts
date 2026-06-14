@@ -77,6 +77,8 @@ interface RunsState {
   abort: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
+  /** Ask the run to pause at its next stage boundary (parks the next stage). */
+  pauseRun: (runId: string) => Promise<void>;
   /** null clears a manual pin — the canvas falls back to the active stage. */
   selectStage: (runId: string, stageId: string | null) => void;
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
@@ -217,6 +219,10 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   stopStage: async (runId) => {
     await ipc.stopStage(runId);
+  },
+
+  pauseRun: async (runId) => {
+    await ipc.requestRunPause(runId);
   },
 
   selectStage: (runId, stageId) =>

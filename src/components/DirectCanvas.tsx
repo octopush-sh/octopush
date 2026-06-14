@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import type { RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { usePipelineStore } from "../stores/pipelineStore";
+import { labelForRole } from "../lib/stageMeta";
 import { PipelineSetup } from "./PipelineSetup";
 import { PipelineBuilder } from "./PipelineBuilder";
-import { RunTrack, labelForRole } from "./RunTrack";
+import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
-import { CheckpointBar } from "./CheckpointBar";
+import { RunControlBar } from "./RunControlBar";
 import { RunLedger } from "./RunLedger";
 import { FadeSwap } from "./primitives/FadeSwap";
-import { Reveal } from "./primitives/Reveal";
 
 interface Props {
   active: boolean;
@@ -31,6 +30,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const resolve = useRunsStore((s) => s.resolve);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
+  const pauseRun = useRunsStore((s) => s.pauseRun);
   const selectRun = useRunsStore((s) => s.selectRun);
   const setLauncherPrefill = useRunsStore((s) => s.setLauncherPrefill);
 
@@ -43,13 +43,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     if (active && viewedId && !detail?.run) void refreshDetail(viewedId);
   }, [active, viewedId, detail?.run, refreshDetail]);
 
-  // Hold the last blocked stage so the strip's content survives the fold-away animation.
-  const [lastBlocked, setLastBlocked] = useState<RunStage | null>(null);
-
   const run = detail?.run;
   const stages = detail?.stages ?? [];
   const blockedStage = stages.find((s) => s.status === "awaiting_checkpoint" || s.status === "failed") ?? null;
-  useEffect(() => { if (blockedStage) setLastBlocked(blockedStage); }, [blockedStage]);
 
   // D4 — focus follows the action. When the MANUALLY selected stage transitions
   // out of "running" (→ done / failed / awaiting_checkpoint), release the pin so
@@ -119,45 +115,53 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
       }
     }
 
-    const checkpointOpen = run.status === "paused" && blockedStage !== null;
-    const barStage = blockedStage ?? lastBlocked;
+    const doneCount = stages.filter((s) => s.status === "done").length;
+    const onRunAgain = () => {
+      // Seed the launcher with this run's brief, pipeline, and crew — the
+      // launcher consumes the prefill once on mount.
+      setLauncherPrefill({
+        task: run.task,
+        pipelineId: run.pipelineId,
+        overrides: stages.map((s) => [s.position, s.agentModel] as [number, string]),
+      });
+      selectRun(workspaceId, null);
+    };
 
     body = (
       <div className="flex min-h-0 flex-1 flex-col">
-        <RunTrack
-          run={run}
-          stages={stages}
-          selectedStageId={shownStageId}
-          onSelectStage={(id) => selectStage(run.id, id)}
-          onStopStage={() => void stopStage(run.id)}
-          onAbort={() => void abort(run.id)}
-          onRunAgain={() => {
-            // Seed the launcher with this run's brief, pipeline, and crew —
-            // PipelineSetup consumes the prefill once on mount.
-            setLauncherPrefill({
-              task: run.task,
-              pipelineId: run.pipelineId,
-              overrides: stages.map((s) => [s.position, s.agentModel] as [number, string]),
-            });
-            selectRun(workspaceId, null);
-          }}
-        />
+        {/* Run header — stage count + the brief, always legible. */}
+        <div className="flex items-center gap-4 border-b border-octo-hairline bg-octo-panel px-4 py-2.5">
+          <div className="shrink-0">
+            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">stage</div>
+            <div className="octo-tabular font-mono text-[13px] text-octo-ivory">
+              {Math.min(doneCount + 1, stages.length)} / {stages.length}
+            </div>
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">the brief</div>
+            <div className="truncate font-serif text-[13px] text-octo-ivory" title={run.task}>{run.task}</div>
+          </div>
+        </div>
+        {/* The living pipeline. */}
+        <div className="border-b border-octo-hairline bg-octo-panel px-4 py-3">
+          <RunFlow stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
+        </div>
         <StageFocus stage={shownStage} workspacePath={workspacePath} />
         <RunLedger run={run} stages={stages} />
-        <Reveal open={checkpointOpen}>
-          {barStage && (
-            <CheckpointBar
-              blockedStage={barStage}
-              onApprove={() => void resolve(run.id, "approve")}
-              onReject={(feedback) => void resolve(run.id, "reject", feedback || undefined)}
-              onResume={() => void resolve(run.id, "resume")}
-              onAbort={() => void abort(run.id)}
-              loopTargetRole={loopTargetRole}
-              loopState={loopState}
-              onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
-            />
-          )}
-        </Reveal>
+        <RunControlBar
+          run={run}
+          blockedStage={blockedStage}
+          loopTargetRole={loopTargetRole}
+          loopState={loopState}
+          onPause={() => void pauseRun(run.id)}
+          onStopStage={() => void stopStage(run.id)}
+          onAbort={() => void abort(run.id)}
+          onApprove={() => void resolve(run.id, "approve")}
+          onReject={(fb) => void resolve(run.id, "reject", fb || undefined)}
+          onResume={() => void resolve(run.id, "resume")}
+          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
+          onRunAgain={onRunAgain}
+        />
       </div>
     );
   }

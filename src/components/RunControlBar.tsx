@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import type { RunStage } from "../lib/ipc";
+import { Pause, CircleStop, Ban, RotateCcw } from "lucide-react";
+import type { Run, RunStage } from "../lib/ipc";
 import { isTransientHalt } from "../lib/runStatus";
-import { labelForRole } from "./RunTrack";
+import { labelForRole } from "../lib/stageMeta";
 import { FadeSwap } from "./primitives/FadeSwap";
 
 interface LoopState {
@@ -10,36 +11,130 @@ interface LoopState {
 }
 
 interface Props {
-  blockedStage: RunStage;
+  run: Run;
+  /** The stage awaiting a decision (awaiting_checkpoint or failed), or null. */
+  blockedStage: RunStage | null;
+  /** Human label for a loop target when a gated send-back applies, else null. */
+  loopTargetRole: string | null;
+  loopState: LoopState | null;
+  onPause: () => void;
+  onStopStage: () => void;
+  onAbort: () => void;
   onApprove: () => void;
   onReject: (feedback: string) => void;
-  onAbort: () => void;
-  /** Re-run a transient halt as-is (no feedback, spend kept) — see CheckpointAction::Resume. */
   onResume: () => void;
-  /** Human-readable label for the loop target stage, or null when no loop applies. */
-  loopTargetRole: string | null;
-  /** Current loop iteration state, or null when no loop applies. */
-  loopState: LoopState | null;
   onSendBack: (feedback: string) => void;
+  onRunAgain: () => void;
 }
 
-/** First non-empty line of a stage error, for the one-line decision strip. */
+const TERMINAL = new Set(["completed", "aborted", "failed"]);
+
 function firstLine(error: string | null): string {
   const line = (error ?? "").split("\n")[0].trim();
   return line || "stage halted";
 }
 
-export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, onResume, loopTargetRole, loopState, onSendBack }: Props) {
+/** A small icon control button with a tooltip — the run's quiet verbs. */
+function IconCtl({
+  label,
+  onClick,
+  children,
+  danger = false,
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      className={`flex h-8 w-8 items-center justify-center rounded-md border border-octo-hairline text-octo-sage transition-colors duration-[180ms] hover:border-[var(--brass-dim)] ${
+        danger ? "hover:text-octo-rouge" : "hover:text-octo-ivory"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * The single, state-adaptive command surface for a run. It subsumes the old
+ * RunTrack controls and the CheckpointBar: while running it offers pause / stop
+ * / abort; at a checkpoint it carries the full decision (approve · send-back ·
+ * reject · resume · abort) with a feedback editor; when terminal it offers a
+ * re-run. One bar, one place to steer.
+ */
+export function RunControlBar(props: Props) {
+  const { run, blockedStage } = props;
+
+  if (TERMINAL.has(run.status)) {
+    return <TerminalBar run={run} onRunAgain={props.onRunAgain} />;
+  }
+  if (blockedStage) {
+    return <DecisionBar {...props} blockedStage={blockedStage} />;
+  }
+  if (run.status === "running") {
+    return <RunningBar onPause={props.onPause} onStopStage={props.onStopStage} onAbort={props.onAbort} />;
+  }
+  return null;
+}
+
+function RunningBar({ onPause, onStopStage, onAbort }: { onPause: () => void; onStopStage: () => void; onAbort: () => void }) {
+  return (
+    <div className="octo-fade-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2.5">
+      <span className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+        <span className="octo-stage-pulse inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" aria-hidden="true" />
+        running
+      </span>
+      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-mute">
+        Pause parks the next stage for you · stop ends the current stage.
+      </span>
+      <IconCtl label="Pause at the next stage" onClick={onPause}><Pause size={14} strokeWidth={1.75} /></IconCtl>
+      <IconCtl label="Stop the current stage" onClick={onStopStage}><CircleStop size={14} strokeWidth={1.75} /></IconCtl>
+      <IconCtl label="Abort the run" onClick={onAbort} danger><Ban size={14} strokeWidth={1.75} /></IconCtl>
+    </div>
+  );
+}
+
+function TerminalBar({ run, onRunAgain }: { run: Run; onRunAgain: () => void }) {
+  const word = run.status === "completed" ? "completed" : run.status === "aborted" ? "aborted" : "failed";
+  const cls = run.status === "completed" ? "text-octo-verdigris" : run.status === "failed" ? "text-octo-rouge" : "text-octo-mute";
+  return (
+    <div className="octo-fade-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2.5">
+      <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${cls}`}>{word}</span>
+      <span className="min-w-0 flex-1" />
+      <button
+        type="button"
+        onClick={onRunAgain}
+        className="flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass-hi"
+      >
+        <RotateCcw size={13} strokeWidth={1.75} />
+        Run it again
+      </button>
+    </div>
+  );
+}
+
+function DecisionBar({
+  blockedStage,
+  loopTargetRole,
+  loopState,
+  onApprove,
+  onReject,
+  onResume,
+  onSendBack,
+  onAbort,
+}: Props & { blockedStage: RunStage }) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
   const [feedback, setFeedback] = useState("");
   const failed = blockedStage.status === "failed";
-  // A transient halt (rate limit, overload, 5xx, dropped connection) isn't a
-  // wrong result — the substrate was briefly unavailable. It gets its own calmer
-  // amber treatment and a Resume affordance, not the rouge accept/re-run choice.
   const transient = failed && isTransientHalt(blockedStage.error);
 
-  // The bar stays mounted inside the Reveal dock across pauses — a new
-  // checkpoint must never inherit the previous one's editor mode or text.
+  // Reset the editor whenever a new checkpoint arrives (the bar stays mounted).
   useEffect(() => {
     setMode("decide");
     setFeedback("");
@@ -95,15 +190,11 @@ export function CheckpointBar({ blockedStage, onApprove, onReject, onAbort, onRe
               )}
             </span>
             {transient ? (
-              // The work isn't wrong — the substrate hiccuped. Resume re-runs the
-              // stage as-is (worktree intact, spend kept). Amber, never brass.
               <button type="button" onClick={onResume}
                 className="rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]">
                 Resume the stage
               </button>
             ) : failed ? (
-              // Accept the partial work and let the pipeline's next review
-              // catch the gaps. Outlined — the bar keeps at most one solid brass.
               <button type="button" onClick={onApprove}
                 className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                 Accept &amp; continue
