@@ -10,6 +10,12 @@ use crate::error::{AppError, AppResult};
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide monotonic counter — makes each temp index unique per call so
+/// two concurrent capture/restore calls (e.g. double-click Discard) never
+/// collide on the same file.
+static IDX_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn git(ws: &Path, index: Option<&Path>, args: &[&str]) -> AppResult<std::process::Output> {
     let mut cmd = Command::new("git");
@@ -25,15 +31,9 @@ fn ok(out: &std::process::Output, what: &str) -> AppResult<()> {
     else { Err(AppError::Other(format!("{what}: {}", String::from_utf8_lossy(&out.stderr)))) }
 }
 
-fn temp_index(ws: &Path) -> std::path::PathBuf {
-    // Use a hash of the workspace path so concurrent calls from different
-    // worktrees (or tests) never share the same temp index file.
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ws.hash(&mut h);
-    std::process::id().hash(&mut h);
-    let key = <std::collections::hash_map::DefaultHasher as Hasher>::finish(&h);
-    std::env::temp_dir().join(format!("octopush-idx-{key:x}"))
+fn temp_index(_ws: &Path) -> std::path::PathBuf {
+    let seq = IDX_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("octopush-idx-{}-{}", std::process::id(), seq))
 }
 
 /// Snapshot the current worktree (tracked + newly-added, honoring .gitignore) as
@@ -88,7 +88,19 @@ pub fn restore_baseline(ws: &Path, baseline: &str) -> AppResult<()> {
         }
     }
 
+    // Build a case-folded mirror of the baseline set. On macOS (case-insensitive
+    // FS) a stage that does `git mv File.txt file.txt` produces a current set
+    // containing `file.txt` while the baseline contains `File.txt`. The
+    // case-sensitive HashSet difference would then DELETE the just-restored file.
+    // Skipping any deletion whose lowercased name appears in the baseline fixes
+    // the data-loss bug and is a safe no-op on case-sensitive Linux filesystems.
+    let in_baseline_lower: HashSet<String> =
+        in_baseline.iter().map(|s| s.to_lowercase()).collect();
+
     for f in current.difference(&in_baseline) {
+        if in_baseline_lower.contains(&f.to_lowercase()) {
+            continue;
+        }
         let p = ws.join(f);
         let _ = std::fs::remove_file(&p);
         let mut parent = p.parent();

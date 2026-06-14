@@ -412,6 +412,8 @@ impl Orchestrator {
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
+                // Read before outcome.error is (partially) moved below.
+                let outcome_no_new_session = outcome.session_id.is_none();
                 let err = outcome.error.unwrap_or_else(|| "stage failed".into());
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
@@ -429,6 +431,12 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A resume attempt that produced no new session likely hit a
+                // dead/expired session — clear it so the next recovery re-runs
+                // fresh instead of looping on `--resume <dead id>`.
+                if stage.resume_pending && outcome_no_new_session {
+                    let _ = self.db.lock().set_stage_session(&stage.id, None);
+                }
                 // A failed stage may still have touched the worktree — keep the
                 // evidence (best-effort; empty diffs are skipped internally).
                 self.capture_stage_diff_snapshot(run, &stage.id);
@@ -915,8 +923,10 @@ impl Orchestrator {
                         let run = self.db.lock().get_run(run_id)?
                             .ok_or_else(|| crate::error::AppError::Other("run not found".into()))?;
                         let ws = self.workspace_path(&run)?;
-                        crate::orchestrator::git_baseline::restore_baseline(&ws, &baseline)?;
-                        self.record_halt(run_id, &s.id, "changes discarded — worktree reverted to the stage baseline");
+                        match crate::orchestrator::git_baseline::restore_baseline(&ws, &baseline) {
+                            Ok(()) => self.record_halt(run_id, &s.id, "changes discarded — worktree reverted to the stage baseline"),
+                            Err(e) => self.record_halt(run_id, &s.id, &format!("discard failed — {e}")),
+                        }
                     }
                 }
             }

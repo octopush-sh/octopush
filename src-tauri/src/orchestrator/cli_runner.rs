@@ -420,20 +420,29 @@ impl AgentRunner for CliRunner {
                 ));
             }
         };
-        let (result_line, tail) = match read_end {
-            ReadEnd::Eof(r, t) => (r, t),
-            ReadEnd::Idle(_, _) => {
+        let (result_line, tail, salvaged) = match read_end {
+            ReadEnd::Eof(r, t) => (r, t, false),
+            ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
+            ReadEnd::Idle(None, _) => {
+                stderr_task.abort();
                 return Ok(failed_stage("claude timed out — no output for 5 minutes"));
             }
-            ReadEnd::AbsCap(_, _) => {
+            ReadEnd::AbsCap(None, _) => {
+                stderr_task.abort();
                 return Ok(failed_stage("claude exceeded the 60-minute cap"));
             }
         };
 
-        // We got a result event from claude (it ran to completion); trust its
-        // own `is_error` over a rare `wait()` hiccup, so default a wait error to
-        // success rather than failing a stage that actually succeeded.
-        let exit_success = child.wait().await.map(|s| s.success()).unwrap_or(true);
+        // When we salvaged a result from a slow-EOF idle/cap, the child may still
+        // be lingering — kill it instead of blocking on wait(), and trust the
+        // result event's own is_error (same rationale as the existing wait-hiccup
+        // comment). Otherwise (clean EOF) wait normally.
+        let exit_success = if salvaged {
+            let _ = child.kill().await;
+            true
+        } else {
+            child.wait().await.map(|s| s.success()).unwrap_or(true)
+        };
         let stderr_out = stderr_task.await.unwrap_or_default();
 
         match result_line {

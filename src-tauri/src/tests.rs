@@ -5511,4 +5511,65 @@ mod git_baseline_tests {
         assert!(!dir.join("café_new.txt").exists(), "unicode-named stage file should be deleted");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Regression test for the case-insensitive deletion guard (Fix 2).
+    ///
+    /// Simulates a stage that does `git mv File.txt file.txt` (case-only rename):
+    /// after restore the file must exist with the BASELINE content, not be deleted.
+    ///
+    /// On a case-sensitive FS (Linux CI) the rename produces two distinct entries
+    /// so the guard is still exercised without triggering actual deletion. On a
+    /// case-insensitive FS (macOS) this reproduces the data-loss bug the fix
+    /// addresses.
+    #[test]
+    fn baseline_case_only_rename_preserves_file() {
+        use crate::orchestrator::git_baseline::{capture_baseline, restore_baseline};
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "octo-baseline-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| {
+            Command::new("git").args(a).current_dir(&dir).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Baseline: file tracked as "File.txt"
+        std::fs::write(dir.join("File.txt"), "baseline content\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let baseline = capture_baseline(&dir).unwrap().expect("baseline");
+
+        // Simulate the stage doing a case-only rename (mv File.txt file.txt).
+        // On a case-insensitive FS the OS sees it as the same file; on a
+        // case-sensitive FS we emulate by removing the old name and writing the new.
+        git(&["mv", "File.txt", "file.txt"]);
+        // On a case-insensitive FS `git mv` changes only the index entry; on a
+        // case-sensitive FS both names exist temporarily. Either way, after
+        // restore the file must contain the baseline content.
+
+        restore_baseline(&dir, &baseline).unwrap();
+
+        // On a case-insensitive FS the file lives under whichever case the OS
+        // chose; on a case-sensitive FS it's restored as "File.txt". Check both.
+        let content = std::fs::read_to_string(dir.join("File.txt"))
+            .or_else(|_| std::fs::read_to_string(dir.join("file.txt")))
+            .expect("file should exist after restore (baseline must not be deleted)");
+        assert_eq!(
+            content, "baseline content\n",
+            "restored file must contain the baseline content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
