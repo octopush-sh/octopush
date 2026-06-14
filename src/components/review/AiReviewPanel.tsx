@@ -178,7 +178,7 @@ export function AiReviewPanel({
           title={collapsed ? "Expand AI review" : "Collapse AI review"}
           className="flex items-center gap-1.5 rounded font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass transition hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
-          <span>§ AI Review</span>
+          <span>AI Review</span>
           <ChevronDown
             size={12}
             aria-hidden

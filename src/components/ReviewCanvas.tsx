@@ -547,12 +547,20 @@ function WhyDrawer({ filePath, fileEdits, onClose }: WhyDrawerProps) {
     setMessage(null);
     setError(null);
     setLoading(true);
-    const edit = fileEdits.find(
-      (e) => e.filePath === filePath || filePath.endsWith(e.filePath),
-    );
+    // Match on either path being a tail of the other (a recorded edit may be
+    // absolute or repo-relative; the diff path is repo-relative), then fall
+    // back to a basename match so a real agent edit is still attributed.
+    const base = (p: string) => p.split("/").pop() ?? p;
+    const edit =
+      fileEdits.find(
+        (e) =>
+          e.filePath === filePath ||
+          filePath.endsWith("/" + e.filePath) ||
+          e.filePath.endsWith("/" + filePath),
+      ) ?? fileEdits.find((e) => base(e.filePath) === base(filePath));
     if (edit?.messageId == null) {
       setError(
-        "This change isn't linked to an agent turn — likely a manual edit (or made before agent-edit tracking landed).",
+        "This change isn't attributed to an agent turn — it was hand-written, or made outside an agent run.",
       );
       setLoading(false);
       return;
@@ -577,7 +585,7 @@ function WhyDrawer({ filePath, fileEdits, onClose }: WhyDrawerProps) {
     <div className="octo-fade-in shrink-0 border-t border-octo-hairline bg-octo-onyx/60 px-4 py-3">
       <div className="mb-2 flex items-center justify-between">
         <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-octo-brass">
-          § Agent origin
+          Agent origin
         </span>
         <button
           onClick={onClose}

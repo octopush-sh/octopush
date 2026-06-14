@@ -195,7 +195,7 @@ function ProvenanceTurn({ turn, onJump }: { turn: Turn; onJump?: (file: string, 
         aria-expanded={open}
         className="flex w-full items-center gap-1.5 py-1 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
-        <span aria-hidden className="font-mono text-[10px] text-octo-brass">§</span>
+        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-octo-brass" />
         <span className="font-mono text-[10px] text-octo-sage">
           {turn.latest ? formatRelTime(turn.latest) : "edit"}
         </span>

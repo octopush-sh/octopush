@@ -225,7 +225,7 @@ function TabButton({
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+      className={`flex items-center gap-1 whitespace-nowrap px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
         borderLeft ? "border-l border-octo-hairline " : ""
       }${active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
       style={active ? { background: "var(--brass-ghost)" } : undefined}

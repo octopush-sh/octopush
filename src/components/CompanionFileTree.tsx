@@ -592,11 +592,11 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     <section className="flex h-full min-h-0 flex-col">
       {/* Eyebrow — same height & padding as the canvas toolbar and the
           left rail's CHANGES eyebrow so the three top bars form one row. */}
-      <div className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4">
+      <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-octo-hairline px-3">
         {headerLeading ?? (
           <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Files</h3>
         )}
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             aria-label="Filter files"
@@ -830,17 +830,6 @@ function TreeRow({
             style={{ color: isChanged ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
           />
         )
-      )}
-
-      {/* § glyph for folders (quiet brand mark, not for root) */}
-      {isDir && !isRoot && (
-        <span
-          aria-hidden="true"
-          className="shrink-0 font-mono text-[10px]"
-          style={{ color: "var(--brass-dim)" }}
-        >
-          §
-        </span>
       )}
 
       {/* Label */}

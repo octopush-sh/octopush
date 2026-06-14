@@ -213,7 +213,7 @@ describe("ReviewCanvas Why? drawer", () => {
     );
     fireEvent.click(whyBtn);
     await waitFor(() => {
-      expect(screen.getByText(/isn't linked to an agent turn/)).toBeTruthy();
+      expect(screen.getByText(/isn't attributed to an agent turn/)).toBeTruthy();
     });
   });
 });

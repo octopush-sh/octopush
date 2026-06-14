@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 interface Props {
   /** Close handler (Escape, and backdrop click when closeOnBackdrop). */
@@ -104,7 +105,10 @@ export function ModalShell({
 
   const justify = align === "top" ? `items-start ${topOffset}` : "items-center";
 
-  return (
+  // Portal to <body> so the fixed backdrop is always measured against the
+  // viewport — not a transformed/animated ancestor (e.g. the Review canvas),
+  // which would otherwise confine the scrim and let content bleed through.
+  return createPortal(
     <div
       ref={dialogRef}
       role="dialog"
@@ -121,6 +125,7 @@ export function ModalShell({
       >
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
