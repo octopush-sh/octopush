@@ -3895,7 +3895,7 @@ mod cli_runner_tests {
     fn is_error_flag_yields_failed_outcome() {
         let outcome = parse_cli_result(ERRORED, true, "implement", "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("Budget exceeded."));
+        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
     }
 
     #[test]
