@@ -386,12 +386,11 @@ impl Orchestrator {
             }
         };
 
-        if outcome.session_id.is_some() {
-            self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
-        }
-
         match outcome.status {
             StageStatus::Done => {
+                // Always persist on Done: Some updates to the new session, None
+                // clears any stale one (a completed stage is never resumed).
+                self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
                 let verdict = outcome.verdict.clone();
                 let artifact_json = serde_json::to_string(&outcome.artifact)?;
                 self.db.lock().complete_run_stage(
@@ -412,6 +411,13 @@ impl Orchestrator {
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
+                // Persist session_id when Some: on a normal failure with a session
+                // we want to keep it so the user can Resume. When None (e.g. an
+                // idle/cancel stop that produced no session) we leave the existing
+                // id intact — it may still be valid for a future Resume.
+                if outcome.session_id.is_some() {
+                    self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
+                }
                 // Read before outcome.error is (partially) moved below.
                 let outcome_no_new_session = outcome.session_id.is_none();
                 let err = outcome.error.unwrap_or_else(|| "stage failed".into());

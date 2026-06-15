@@ -360,20 +360,29 @@ impl AgentRunner for CliRunner {
             let mut raw: Vec<u8> = Vec::new();
             let started = std::time::Instant::now();
             loop {
-                if started.elapsed().as_secs() >= ABS_CAP_SECS {
+                let elapsed = started.elapsed().as_secs();
+                if elapsed >= ABS_CAP_SECS {
                     return ReadEnd::AbsCap(result_line, tail);
                 }
                 raw.clear();
+                let wait = IDLE_TIMEOUT_SECS.min(ABS_CAP_SECS - elapsed);
                 let read = tokio::time::timeout(
-                    std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+                    std::time::Duration::from_secs(wait),
                     reader.read_until(b'\n', &mut raw),
                 )
                 .await;
                 match read {
-                    Err(_) => return ReadEnd::Idle(result_line, tail), // no line within IDLE
-                    Ok(Ok(0)) => break,                                 // EOF
+                    Err(_) => {
+                        // Timed out after `wait`. If we reached the absolute cap,
+                        // report that; otherwise it's a genuine idle stall.
+                        if started.elapsed().as_secs() >= ABS_CAP_SECS {
+                            return ReadEnd::AbsCap(result_line, tail);
+                        }
+                        return ReadEnd::Idle(result_line, tail);
+                    }
+                    Ok(Ok(0)) => break,  // EOF
                     Ok(Ok(_)) => {}
-                    Ok(Err(_)) => break,                                // read error
+                    Ok(Err(_)) => break, // read error
                 }
                 let line = String::from_utf8_lossy(&raw);
                 let trimmed = line.trim();
