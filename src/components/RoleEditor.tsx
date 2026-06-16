@@ -131,6 +131,7 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
     : defaultRole();
 
   const [label, setLabel] = useState(init.label);
+  const [description, setDescription] = useState(init.description);
   const [key, setKey] = useState(init.key);
   const [promptBody, setPromptBody] = useState(init.promptBody);
   const [artifactKind, setArtifactKind] = useState<ArtifactKind>(init.artifactKind);
@@ -200,7 +201,7 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
       const role: Role = {
         key: key.trim(),
         label: label.trim(),
-        description: "",
+        description: description.trim(),
         promptBody: promptBody.trim(),
         artifactKind,
         environment,
@@ -278,6 +279,18 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
               Action
             </button>
           </div>
+        </div>
+
+        {/* ── Description subtitle ───────────────────────────────────── */}
+        <div className="px-[18px] pt-[4px]">
+          <input
+            type="text"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="One-line description (shown in the palette)"
+            aria-label="Role description"
+            className="w-full border-b border-transparent bg-transparent pb-0.5 font-mono text-[11px] text-octo-sage outline-none transition-colors duration-[180ms] placeholder:text-octo-mute hover:border-[var(--brass-dim)] focus:border-[var(--brass-dim)]"
+          />
         </div>
 
         {/* ── Hero prompt ────────────────────────────────────────────── */}

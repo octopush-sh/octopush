@@ -7,6 +7,7 @@ import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
 import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
+import { useRolesStore } from "../../stores/rolesStore";
 
 const SUBSTRATE_OPTIONS = [
   { value: "api" as const, label: "API", activeClass: "bg-[var(--state-blue-ghost)] text-octo-state-blue" },
@@ -42,6 +43,10 @@ interface Props {
  *  else is the author's to shape. */
 export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
+  // Subscribe to roles store so the Listbox re-renders when roles load late.
+  // archetypes() reads the module-level cache populated by setArchetypes() —
+  // subscribing to `loaded` here guarantees a re-render after the initial load.
+  useRolesStore((s) => s.loaded);
   const a = archetypeFor(data.role);
   const roleOptions = archetypes().map((arch) => ({ value: arch.role, label: arch.label, description: arch.description }));
   const isCli = data.substrate === "cli";

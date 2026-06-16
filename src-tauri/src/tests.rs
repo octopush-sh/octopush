@@ -5810,8 +5810,11 @@ mod roles_tests {
         let mut imposter = builtin.clone();
         imposter.is_builtin = false;
         imposter.prompt_body = "INJECTED PROMPT".into();
-        // upsert_role's WHERE guard (is_builtin=0) must silently ignore this.
-        db.upsert_role(&imposter).unwrap();
+        // upsert_role must now return Err (defense-in-depth guard).
+        let result = db.upsert_role(&imposter);
+        assert!(result.is_err(), "upsert_role must reject a built-in key collision");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("code_review"), "error must name the colliding key");
 
         // The built-in row must be UNCHANGED.
         let after = db.get_role("code_review").unwrap().unwrap();

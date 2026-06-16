@@ -583,6 +583,22 @@ impl Db {
              WHERE roles.is_builtin=0",
             params![role.key, role.label, role.description, role.prompt_body, role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64, serde_json::to_string(&role.default_tools)?, role.default_substrate, role.default_checkpoint as i64, role.token_est_in, role.token_est_out, role.is_builtin as i64, now],
         )?;
+        // Defense-in-depth: if 0 rows were changed, check whether the key belongs
+        // to a built-in.  The save_role command guard fires first for normal callers,
+        // but direct callers of upsert_role must also get a hard error — not a
+        // silent no-op that looks like success.
+        if self.conn.changes() == 0 {
+            let is_builtin: bool = self.conn.query_row(
+                "SELECT is_builtin FROM roles WHERE key=?1",
+                params![role.key],
+                |r| r.get::<_, i64>(0),
+            ).map(|v| v != 0).unwrap_or(false);
+            if is_builtin {
+                return Err(crate::error::AppError::Other(
+                    format!("cannot overwrite built-in role '{}'", role.key),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2599,7 +2615,7 @@ fn default_max_iterations() -> i64 {
 const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 
 /// The workspace tools a stage's agent may be granted. Keep in sync with
-/// `tool_definitions()` in chat_engine.rs and `ARCHETYPES` in the builder.
+/// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.
 pub const KNOWN_TOOLS: &[&str] = &["read_file", "list_files", "write_file", "run_command"];
 
 
