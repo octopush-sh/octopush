@@ -60,6 +60,23 @@ vi.mock("../stores/pipelineStore", () => ({
   usePipelineStore: (sel: any) => sel({ save: saveMock, remove: removeMock }),
 }));
 
+// Seed minimal roles so the palette renders in tests (no Tauri IPC available).
+import { setArchetypes } from "./builder/graph";
+import type { Role } from "../lib/ipc";
+const SEED_ROLES_FOR_TEST: Role[] = [
+  { key: "plan", label: "Plan", description: "", promptBody: "", artifactKind: "plan", environment: "worktree", canLoop: false, defaultTools: ["read_file", "list_files"], defaultSubstrate: "api", defaultCheckpoint: false, tokenEstIn: 4000, tokenEstOut: 1000, isBuiltin: true },
+  { key: "implement", label: "Implement", description: "", promptBody: "", artifactKind: "diff", environment: "worktree", canLoop: false, defaultTools: ["read_file", "list_files", "write_file", "run_command"], defaultSubstrate: "api", defaultCheckpoint: false, tokenEstIn: 12000, tokenEstOut: 6000, isBuiltin: true },
+  { key: "code_review", label: "Code review", description: "", promptBody: "", artifactKind: "review", environment: "worktree", canLoop: true, defaultTools: ["read_file", "list_files"], defaultSubstrate: "api", defaultCheckpoint: false, tokenEstIn: 8000, tokenEstOut: 1000, isBuiltin: true },
+  { key: "test", label: "Tests", description: "", promptBody: "", artifactKind: "tests", environment: "worktree", canLoop: false, defaultTools: ["read_file", "list_files", "write_file", "run_command"], defaultSubstrate: "api", defaultCheckpoint: false, tokenEstIn: 6000, tokenEstOut: 2000, isBuiltin: true },
+];
+const mockRolesState = { roles: SEED_ROLES_FOR_TEST, loaded: true, load: vi.fn().mockResolvedValue(undefined) };
+vi.mock("../stores/rolesStore", () => ({
+  useRolesStore: Object.assign(
+    (sel?: any) => (typeof sel === "function" ? sel(mockRolesState) : mockRolesState),
+    { getState: () => mockRolesState },
+  ),
+}));
+
 const { PipelineBuilder } = await import("./PipelineBuilder");
 
 const stage = (over: Record<string, unknown>) => ({
@@ -87,7 +104,11 @@ const flaggedGated = {
 } as any;
 
 describe("PipelineBuilder (node canvas)", () => {
-  beforeEach(() => { saveMock.mockClear(); removeMock.mockClear(); });
+  beforeEach(() => {
+    saveMock.mockClear();
+    removeMock.mockClear();
+    setArchetypes(SEED_ROLES_FOR_TEST);
+  });
 
   it("a builtin opens with the fork label and a pre-filled copy name", () => {
     render(<PipelineBuilder pipeline={builtin} onClose={vi.fn()} />);

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -18,6 +18,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import type { PipelineWithStages } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
+import { useRolesStore } from "../stores/rolesStore";
 import { tokens } from "../lib/tokens";
 import { StageNode } from "./builder/StageNode";
 import { FlowEdge, LoopEdge } from "./builder/edges";
@@ -64,6 +65,11 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const isBuiltin = pipeline?.pipeline.isBuiltin ?? false;
   const save = usePipelineStore((s) => s.save);
   const remove = usePipelineStore((s) => s.remove);
+
+  // Load roles so the palette and graph derive from live data.
+  useEffect(() => {
+    void useRolesStore.getState().load();
+  }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
   const wrapperRef = useRef<HTMLDivElement>(null);
 

@@ -6,7 +6,7 @@ import { SegmentedControl } from "../controls/SegmentedControl";
 import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
-import { ARCHETYPES, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
+import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 
 const SUBSTRATE_OPTIONS = [
   { value: "api" as const, label: "API", activeClass: "bg-[var(--state-blue-ghost)] text-octo-state-blue" },
@@ -16,7 +16,6 @@ const MODE_OPTIONS = [
   { value: "gated" as const, label: "Gated" },
   { value: "auto" as const, label: "Auto" },
 ];
-const ROLE_OPTIONS = ARCHETYPES.map((a) => ({ value: a.role, label: a.label, description: a.description }));
 
 export interface LoopState {
   target: string | null;
@@ -44,6 +43,7 @@ interface Props {
 export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
   const a = archetypeFor(data.role);
+  const roleOptions = archetypes().map((arch) => ({ value: arch.role, label: arch.label, description: arch.description }));
   const isCli = data.substrate === "cli";
   const grantedSet = new Set(data.tools ?? TOOLS.map((t) => t.id));
 
@@ -110,7 +110,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
       {/* Archetype */}
       <label className="flex flex-col gap-1">
         <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute">Archetype</span>
-        <Listbox value={data.role} options={ROLE_OPTIONS} onChange={(r) => onPatch({ role: r })} ariaLabel="Stage archetype" className="w-full" />
+        <Listbox value={data.role} options={roleOptions} onChange={(r) => onPatch({ role: r })} ariaLabel="Stage archetype" className="w-full" />
       </label>
 
       {/* Model */}
