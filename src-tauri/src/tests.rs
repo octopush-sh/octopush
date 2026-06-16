@@ -5662,6 +5662,32 @@ mod git_baseline_tests {
 
 #[cfg(test)]
 mod roles_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> (Db, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn roles_table_seeds_and_reads() {
+        let (db, _tmp) = test_db();
+        let all = db.list_roles().unwrap();
+        assert_eq!(all.len(), 15);
+        let cr = db.get_role("code_review").unwrap().unwrap();
+        assert!(cr.can_loop);
+        assert_eq!(cr.is_builtin, true);
+        assert!(db.get_role("nope").unwrap().is_none());
+        // custom upsert + in-use + delete
+        let mut custom = cr.clone(); custom.key = "perf_audit".into(); custom.label = "Perf audit".into(); custom.is_builtin = false;
+        db.upsert_role(&custom).unwrap();
+        assert!(!db.role_in_use("perf_audit").unwrap());
+        db.delete_role("perf_audit").unwrap();
+        assert!(db.get_role("perf_audit").unwrap().is_none());
+    }
+
     #[test]
     fn builtin_roles_seed_matches_legacy_prompts() {
         use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};

@@ -445,6 +445,19 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_pending INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN baseline_commit TEXT")?;
 
+        // ── v13 roles as data ──────────────────────────────────────
+        self.conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS roles (
+                key TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT NOT NULL,
+                prompt_body TEXT NOT NULL, artifact_kind TEXT NOT NULL, environment TEXT NOT NULL,
+                can_loop INTEGER NOT NULL DEFAULT 0, default_tools TEXT NOT NULL,
+                default_substrate TEXT NOT NULL, default_checkpoint INTEGER NOT NULL DEFAULT 0,
+                token_est_in INTEGER NOT NULL, token_est_out INTEGER NOT NULL,
+                is_builtin INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+            );"#,
+        )?;
+        self.seed_builtin_roles()?;
+
         // ── v11 chat threads: multiple conversations per workspace ──
         // A `chat_threads` table + a nullable `thread_id` on chat_messages.
         // Then a one-time backfill: every workspace that still has un-threaded
@@ -514,6 +527,71 @@ impl Db {
                 rusqlite::params![tid, ws],
             )?;
         }
+        Ok(())
+    }
+
+    fn seed_builtin_roles(&self) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        for r in crate::orchestrator::roles::builtin_roles() {
+            // Upsert built-ins (so prompt/desc updates ship); never clobber a
+            // user's custom row (different key) — built-ins own their keys.
+            self.conn.execute(
+                "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)
+                 ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12,is_builtin=1
+                 WHERE roles.is_builtin=1",
+                params![r.key, r.label, r.description, r.prompt_body, r.artifact_kind.as_db(), r.environment.as_db(), r.can_loop as i64, serde_json::to_string(&r.default_tools)?, r.default_substrate, r.default_checkpoint as i64, r.token_est_in, r.token_est_out, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn row_to_role(r: &rusqlite::Row) -> rusqlite::Result<crate::orchestrator::roles::RoleDef> {
+        use crate::orchestrator::types::{ArtifactKind, RoleEnvironment};
+        let tools_json: String = r.get(7)?;
+        Ok(crate::orchestrator::roles::RoleDef {
+            key: r.get(0)?, label: r.get(1)?, description: r.get(2)?, prompt_body: r.get(3)?,
+            artifact_kind: ArtifactKind::from_db(&r.get::<_, String>(4)?).unwrap_or(ArtifactKind::Note),
+            environment: RoleEnvironment::from_db(&r.get::<_, String>(5)?).unwrap_or(RoleEnvironment::Worktree),
+            can_loop: r.get::<_, i64>(6)? != 0,
+            default_tools: serde_json::from_str(&tools_json).unwrap_or_default(),
+            default_substrate: r.get(8)?, default_checkpoint: r.get::<_, i64>(9)? != 0,
+            token_est_in: r.get(10)?, token_est_out: r.get(11)?, is_builtin: r.get::<_, i64>(12)? != 0,
+        })
+    }
+
+    const ROLE_COLS: &str = "key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin";
+
+    pub fn list_roles(&self) -> AppResult<Vec<crate::orchestrator::roles::RoleDef>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM roles ORDER BY is_builtin DESC, label", Self::ROLE_COLS))?;
+        let rows = stmt.query_map([], Self::row_to_role)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_role(&self, key: &str) -> AppResult<Option<crate::orchestrator::roles::RoleDef>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM roles WHERE key=?1", Self::ROLE_COLS))?;
+        let mut rows = stmt.query_map(params![key], Self::row_to_role)?;
+        Ok(match rows.next() { Some(r) => Some(r?), None => None })
+    }
+
+    pub fn upsert_role(&self, role: &crate::orchestrator::roles::RoleDef) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12",
+            params![role.key, role.label, role.description, role.prompt_body, role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64, serde_json::to_string(&role.default_tools)?, role.default_substrate, role.default_checkpoint as i64, role.token_est_in, role.token_est_out, role.is_builtin as i64, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn role_in_use(&self, key: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM pipeline_stages WHERE role=?1", params![key], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_role(&self, key: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM roles WHERE key=?1 AND is_builtin=0", params![key])?;
         Ok(())
     }
 
