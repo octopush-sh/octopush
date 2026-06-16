@@ -5751,4 +5751,19 @@ mod roles_tests {
         let s = compose_system_prompt("Body.", RoleEnvironment::Worktree, None, None);
         assert!(s.ends_with("Body."));
     }
+
+    #[test]
+    fn new_builtin_roles_have_expected_contracts() {
+        let (db, _tmp) = test_db();
+        use crate::orchestrator::types::RoleEnvironment;
+        for k in ["pull_request", "merge", "release"] {
+            let r = db.get_role(k).unwrap().unwrap();
+            assert_eq!(r.environment, RoleEnvironment::Action, "{k}");
+            assert_eq!(r.default_substrate, "cli", "{k}");
+            assert!(r.default_checkpoint, "{k}");
+            assert!(!r.can_loop, "{k}");
+        }
+        assert!(db.get_role("security_review").unwrap().unwrap().can_loop);
+        assert_eq!(db.get_role("architect").unwrap().unwrap().artifact_kind.as_db(), "plan");
+    }
 }
