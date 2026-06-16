@@ -303,6 +303,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               <NodePalette
                 onAdd={addNode}
                 onNewRole={() => setEditorState({})}
+                onEditRole={(role) => setEditorState({ initial: role })}
               />
             </Panel>
             {selectedNode && (

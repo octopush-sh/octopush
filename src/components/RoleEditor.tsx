@@ -7,7 +7,7 @@
  *
  * Built-in roles are treated as forks: new key + isBuiltin=false.
  */
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { ipc, type Role } from "../lib/ipc";
 import { ModalShell } from "./ModalShell";
 import { MenuSurface } from "./MenuSurface";
@@ -54,7 +54,6 @@ interface ChipMenuProps {
 
 function ChipMenu({ label, warn, menu }: ChipMenuProps) {
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null);
-  const btnRef = useRef<HTMLButtonElement>(null);
 
   const open = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -66,7 +65,6 @@ function ChipMenu({ label, warn, menu }: ChipMenuProps) {
   return (
     <>
       <button
-        ref={btnRef}
         type="button"
         onClick={open}
         className={[
@@ -324,9 +322,9 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
                     </>
                   )}
                 />{" "}
-                role that may{" "}
+                role that may use{" "}
                 <ChipMenu
-                  label="commit, push & release"
+                  label={toolsLabel}
                   warn
                   menu={(close) => (
                     <>
@@ -534,8 +532,29 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
                       ))}
                     </>
                   )}
-                />
-                .
+                />{" "}
+                and{" "}
+                <ChipMenu
+                  label={checkpoint ? "pauses for approval" : "does not pause"}
+                  menu={(close) => (
+                    <>
+                      <p className={MENU_HEADER}>Checkpoint</p>
+                      {([true, false] as const).map((v) => (
+                        <button
+                          key={String(v)}
+                          type="button"
+                          role="menuitem"
+                          className={MENU_ITEM}
+                          onClick={() => { setCheckpoint(v); close(); }}
+                        >
+                          {v === checkpoint && <span className="text-octo-brass">✓ </span>}
+                          {v ? "pause for approval" : "do not pause"}
+                        </button>
+                      ))}
+                    </>
+                  )}
+                />{" "}
+                first.
               </>
             )}
           </p>

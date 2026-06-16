@@ -1,5 +1,6 @@
-import { Lock, Plus } from "lucide-react";
+import { Lock, Pencil, Plus } from "lucide-react";
 import { useRolesStore } from "../../stores/rolesStore";
+import type { Role } from "../../lib/ipc";
 import { archetypes } from "./graph";
 import { ARTIFACT_ICON } from "./icons";
 
@@ -8,8 +9,10 @@ export const ARCHETYPE_DND_MIME = "application/octopush-archetype";
 interface Props {
   /** Click-to-add fallback (drag-and-drop is the primary gesture). */
   onAdd: (role: string) => void;
-  /** Opens the Role Editor to create a new role. Will be wired in Task 9. */
+  /** Opens the Role Editor to create a new role. */
   onNewRole?: () => void;
+  /** Opens the Role Editor pre-filled with an existing role (built-ins fork). */
+  onEditRole?: (role: Role) => void;
 }
 
 /** Group label ordering for the palette. */
@@ -28,7 +31,7 @@ function groupFor(role: string, environment: string, isBuiltin: boolean): GroupN
 /** The well of stage archetypes. Drag one onto the canvas, or click to drop it
  *  at the center. Built-in roles are marked with a lock; custom roles show a
  *  "custom" badge. Groups: Plan & design / Build / Review / Action / Your roles. */
-export function NodePalette({ onAdd, onNewRole }: Props) {
+export function NodePalette({ onAdd, onNewRole, onEditRole }: Props) {
   const { roles, loaded } = useRolesStore();
   const all = archetypes();
 
@@ -74,37 +77,51 @@ export function NodePalette({ onAdd, onNewRole }: Props) {
                   const isBuiltin = role?.isBuiltin ?? true;
                   const Icon = ARTIFACT_ICON[a.artifact];
                   return (
-                    <button
-                      key={a.role}
-                      type="button"
-                      title={a.description}
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.setData(ARCHETYPE_DND_MIME, a.role);
-                        e.dataTransfer.effectAllowed = "move";
-                      }}
-                      onClick={() => onAdd(a.role)}
-                      className="group flex cursor-grab items-center gap-2 rounded-sm px-2 py-1.5 text-left transition-colors duration-[150ms] hover:bg-[var(--brass-ghost)] active:cursor-grabbing"
-                    >
-                      <span className="text-octo-sage transition-colors duration-[150ms] group-hover:text-octo-brass">
-                        <Icon size={13} strokeWidth={1.75} />
-                      </span>
-                      <span className="min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory">{a.label}</span>
-                      {isBuiltin ? (
-                        <span className="shrink-0 text-octo-mute" title="Built-in role">
-                          <Lock size={9} strokeWidth={1.75} />
+                    <div key={a.role} className="group flex items-center">
+                      <button
+                        type="button"
+                        title={a.description}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData(ARCHETYPE_DND_MIME, a.role);
+                          e.dataTransfer.effectAllowed = "move";
+                        }}
+                        onClick={() => onAdd(a.role)}
+                        className="flex min-w-0 flex-1 cursor-grab items-center gap-2 rounded-sm px-2 py-1.5 text-left transition-colors duration-[150ms] hover:bg-[var(--brass-ghost)] active:cursor-grabbing"
+                      >
+                        <span className="text-octo-sage transition-colors duration-[150ms] group-hover:text-octo-brass">
+                          <Icon size={13} strokeWidth={1.75} />
                         </span>
-                      ) : (
-                        <span className="shrink-0 font-mono text-[8px] text-octo-brass" title="Custom role">
-                          custom
-                        </span>
+                        <span className="min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory">{a.label}</span>
+                        {isBuiltin ? (
+                          <span className="shrink-0 text-octo-mute" title="Built-in role">
+                            <Lock size={9} strokeWidth={1.75} />
+                          </span>
+                        ) : (
+                          <span className="shrink-0 font-mono text-[8px] text-octo-brass" title="Custom role">
+                            custom
+                          </span>
+                        )}
+                        {a.canLoop && (
+                          <span className="ml-0 shrink-0 font-mono text-[9px] text-octo-mute" title="Can loop work back">
+                            ⟜
+                          </span>
+                        )}
+                      </button>
+                      {onEditRole && role && (
+                        <button
+                          type="button"
+                          title={isBuiltin ? "Fork & edit" : "Edit role"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onEditRole(role);
+                          }}
+                          className="mr-1 shrink-0 rounded p-0.5 text-octo-mute opacity-0 transition-opacity duration-[150ms] group-hover:opacity-100 hover:text-octo-brass"
+                        >
+                          <Pencil size={12} strokeWidth={1.75} />
+                        </button>
                       )}
-                      {a.canLoop && (
-                        <span className="ml-0 shrink-0 font-mono text-[9px] text-octo-mute" title="Can loop work back">
-                          ⟜
-                        </span>
-                      )}
-                    </button>
+                    </div>
                   );
                 })}
               </div>
@@ -113,7 +130,7 @@ export function NodePalette({ onAdd, onNewRole }: Props) {
         </div>
       )}
 
-      {/* New role button — wired to onNewRole (Task 9 will implement the editor) */}
+      {/* New role button */}
       <div className="mt-1 border-t border-octo-hairline pt-1">
         <button
           type="button"
