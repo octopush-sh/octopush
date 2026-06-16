@@ -7,7 +7,7 @@
 //! human control point.
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::runner::{artifact_kind_for, compose_system_prompt, parse_verdict, user_input_for, AgentRunner, StageContext};
+use crate::orchestrator::runner::{compose_system_prompt, parse_verdict, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageInput, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
 use serde_json::Value;
@@ -163,7 +163,7 @@ fn resolved_cli_path() -> String {
 pub fn parse_cli_result(
     stdout: &str,
     exit_success: bool,
-    role: &str,
+    artifact_kind: ArtifactKind,
     stderr_text: &str,
 ) -> AppResult<StageOutcome> {
     let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| {
@@ -201,7 +201,7 @@ pub fn parse_cli_result(
         });
     }
 
-    let kind = artifact_kind_for(role);
+    let kind = artifact_kind;
     let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
     Ok(StageOutcome {
         artifact: StageArtifact {
@@ -285,7 +285,7 @@ impl AgentRunner for CliRunner {
         // The CLI substrate (Claude Code) owns its own tool surface, so the
         // per-stage tool allowlist does not apply here; the author's free-form
         // instructions still shape the stage via the system prompt.
-        let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
+        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref());
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
                 build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
@@ -462,7 +462,7 @@ impl AgentRunner for CliRunner {
         .unwrap_or_default();
 
         match result_line {
-            Some(line) => match parse_cli_result(&line, exit_success, &stage.role, &stderr_out) {
+            Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
                 Ok(outcome) => Ok(outcome),
                 Err(_) => Ok(failed_stage(&format!(
                     "claude produced no parseable result: {}",

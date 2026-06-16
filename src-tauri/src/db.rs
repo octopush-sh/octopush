@@ -445,6 +445,19 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_pending INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN baseline_commit TEXT")?;
 
+        // ── v13 roles as data ──────────────────────────────────────
+        self.conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS roles (
+                key TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT NOT NULL,
+                prompt_body TEXT NOT NULL, artifact_kind TEXT NOT NULL, environment TEXT NOT NULL,
+                can_loop INTEGER NOT NULL DEFAULT 0, default_tools TEXT NOT NULL,
+                default_substrate TEXT NOT NULL, default_checkpoint INTEGER NOT NULL DEFAULT 0,
+                token_est_in INTEGER NOT NULL, token_est_out INTEGER NOT NULL,
+                is_builtin INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+            );"#,
+        )?;
+        self.seed_builtin_roles()?;
+
         // ── v11 chat threads: multiple conversations per workspace ──
         // A `chat_threads` table + a nullable `thread_id` on chat_messages.
         // Then a one-time backfill: every workspace that still has un-threaded
@@ -514,6 +527,96 @@ impl Db {
                 rusqlite::params![tid, ws],
             )?;
         }
+        Ok(())
+    }
+
+    fn seed_builtin_roles(&self) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        for r in crate::orchestrator::roles::builtin_roles() {
+            // Upsert built-ins (so prompt/desc updates ship); never clobber a
+            // user's custom row (different key) — built-ins own their keys.
+            self.conn.execute(
+                "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)
+                 ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12,is_builtin=1
+                 WHERE roles.is_builtin=1",
+                params![r.key, r.label, r.description, r.prompt_body, r.artifact_kind.as_db(), r.environment.as_db(), r.can_loop as i64, serde_json::to_string(&r.default_tools)?, r.default_substrate, r.default_checkpoint as i64, r.token_est_in, r.token_est_out, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn row_to_role(r: &rusqlite::Row) -> rusqlite::Result<crate::orchestrator::roles::RoleDef> {
+        use crate::orchestrator::types::{ArtifactKind, RoleEnvironment};
+        let tools_json: String = r.get(7)?;
+        Ok(crate::orchestrator::roles::RoleDef {
+            key: r.get(0)?, label: r.get(1)?, description: r.get(2)?, prompt_body: r.get(3)?,
+            artifact_kind: ArtifactKind::from_db(&r.get::<_, String>(4)?).unwrap_or(ArtifactKind::Note),
+            environment: RoleEnvironment::from_db(&r.get::<_, String>(5)?).unwrap_or(RoleEnvironment::Worktree),
+            can_loop: r.get::<_, i64>(6)? != 0,
+            default_tools: serde_json::from_str(&tools_json).unwrap_or_default(),
+            default_substrate: r.get(8)?, default_checkpoint: r.get::<_, i64>(9)? != 0,
+            token_est_in: r.get(10)?, token_est_out: r.get(11)?, is_builtin: r.get::<_, i64>(12)? != 0,
+        })
+    }
+
+    const ROLE_COLS: &str = "key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin";
+
+    pub fn list_roles(&self) -> AppResult<Vec<crate::orchestrator::roles::RoleDef>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM roles ORDER BY is_builtin DESC, label", Self::ROLE_COLS))?;
+        let rows = stmt.query_map([], Self::row_to_role)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_role(&self, key: &str) -> AppResult<Option<crate::orchestrator::roles::RoleDef>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM roles WHERE key=?1", Self::ROLE_COLS))?;
+        let mut rows = stmt.query_map(params![key], Self::row_to_role)?;
+        Ok(match rows.next() { Some(r) => Some(r?), None => None })
+    }
+
+    pub fn upsert_role(&self, role: &crate::orchestrator::roles::RoleDef) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12
+             WHERE roles.is_builtin=0",
+            params![role.key, role.label, role.description, role.prompt_body, role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64, serde_json::to_string(&role.default_tools)?, role.default_substrate, role.default_checkpoint as i64, role.token_est_in, role.token_est_out, role.is_builtin as i64, now],
+        )?;
+        // Defense-in-depth: if 0 rows were changed, check whether the key belongs
+        // to a built-in.  The save_role command guard fires first for normal callers,
+        // but direct callers of upsert_role must also get a hard error — not a
+        // silent no-op that looks like success.
+        if self.conn.changes() == 0 {
+            let is_builtin: bool = self.conn.query_row(
+                "SELECT is_builtin FROM roles WHERE key=?1",
+                params![role.key],
+                |r| r.get::<_, i64>(0),
+            ).map(|v| v != 0).unwrap_or(false);
+            if is_builtin {
+                return Err(crate::error::AppError::Other(
+                    format!("cannot overwrite built-in role '{}'", role.key),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn role_in_use(&self, key: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM pipeline_stages WHERE role=?1
+                UNION ALL
+                SELECT id FROM run_stages WHERE role=?1
+             )",
+            params![key],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_role(&self, key: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM roles WHERE key=?1 AND is_builtin=0", params![key])?;
         Ok(())
     }
 
@@ -1798,7 +1901,7 @@ impl Db {
         if name.trim().is_empty() {
             return Err(AppError::Other("the pipeline needs a name".into()));
         }
-        validate_pipeline_stages(stages)?;
+        self.validate_pipeline_stages(stages)?;
 
         // Resolve the edit target: does it exist, and is it a builtin?
         let target: Option<(String, bool)> = match pipeline_id.as_deref() {
@@ -2512,15 +2615,9 @@ fn default_max_iterations() -> i64 {
 const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 
 /// The workspace tools a stage's agent may be granted. Keep in sync with
-/// `tool_definitions()` in chat_engine.rs and `ARCHETYPES` in the builder.
+/// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.
 pub const KNOWN_TOOLS: &[&str] = &["read_file", "list_files", "write_file", "run_command"];
 
-// Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
-const KNOWN_ROLES: &[&str] = &[
-    "plan", "plan_review", "implement", "code_review", "test",
-    "repro", "fix", "verify", "critique", "refine",
-];
-const REVIEW_ROLES: &[&str] = &["plan_review", "code_review", "critique", "verify"];
 
 /// Transitive flow-ancestors of stage `idx`, following `parents` (positions).
 /// Assumes parents reference earlier indices (validated before this is used).
@@ -2536,8 +2633,10 @@ fn draft_ancestors(stages: &[StageDraft], idx: usize) -> std::collections::HashS
     seen
 }
 
-/// Validate a pipeline's stage drafts (the §3.7 builder contract). Pure.
-pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResult<()> {
+/// Validate a pipeline's stage drafts (the §3.7 builder contract).
+/// Roles are looked up from the DB; an unknown role key is rejected.
+impl Db {
+pub fn validate_pipeline_stages(&self, stages: &[StageDraft]) -> crate::error::AppResult<()> {
     use crate::error::AppError;
     if stages.is_empty() {
         return Err(AppError::Other("a pipeline needs at least one stage".into()));
@@ -2547,7 +2646,7 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
     // draft has no parents, so "earlier position" is the right contract there).
     let authored = stages.iter().any(|s| !s.parents.is_empty());
     for (i, s) in stages.iter().enumerate() {
-        if !KNOWN_ROLES.contains(&s.role.as_str()) {
+        if self.get_role(&s.role)?.is_none() {
             return Err(AppError::Other(format!("unknown stage role '{}'", s.role)));
         }
         if !matches!(s.substrate.as_str(), "api" | "cli") {
@@ -2609,7 +2708,7 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
         }
         match s.loop_target_position {
             Some(target) => {
-                if !REVIEW_ROLES.contains(&s.role.as_str()) {
+                if !self.get_role(&s.role)?.map(|r| r.can_loop).unwrap_or(false) {
                     return Err(AppError::Other(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
                 }
                 if target < 0 || target >= i as i64 {
@@ -2639,6 +2738,7 @@ pub fn validate_pipeline_stages(stages: &[StageDraft]) -> crate::error::AppResul
     }
     Ok(())
 }
+} // impl Db (validate_pipeline_stages)
 
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]

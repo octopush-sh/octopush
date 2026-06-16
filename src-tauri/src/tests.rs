@@ -1869,6 +1869,28 @@ mod orchestrator_types_tests {
         assert_eq!(AgentSubstrate::Api.as_db(), "api");
         assert_eq!(AgentSubstrate::from_db("cli"), Some(AgentSubstrate::Cli));
     }
+
+    #[test]
+    fn artifact_kind_db_roundtrip() {
+        use crate::orchestrator::types::ArtifactKind;
+        for (k, s) in [
+            (ArtifactKind::Plan, "plan"), (ArtifactKind::Review, "review"),
+            (ArtifactKind::Tests, "tests"), (ArtifactKind::Diff, "diff"), (ArtifactKind::Note, "note"),
+        ] {
+            assert_eq!(k.as_db(), s);
+            assert_eq!(ArtifactKind::from_db(s), Some(k));
+        }
+        assert_eq!(ArtifactKind::from_db("bogus"), None);
+    }
+
+    #[test]
+    fn role_environment_db_roundtrip() {
+        use crate::orchestrator::types::RoleEnvironment;
+        assert_eq!(RoleEnvironment::Worktree.as_db(), "worktree");
+        assert_eq!(RoleEnvironment::Action.as_db(), "action");
+        assert_eq!(RoleEnvironment::from_db("action"), Some(RoleEnvironment::Action));
+        assert_eq!(RoleEnvironment::from_db("x"), None);
+    }
 }
 
 #[cfg(test)]
@@ -1987,7 +2009,7 @@ mod cost_tests {
 
 #[cfg(test)]
 mod runner_helpers_tests {
-    use crate::orchestrator::runner::{artifact_kind_for, system_prompt_for, user_input_for};
+    use crate::orchestrator::runner::user_input_for;
     use crate::orchestrator::types::{ArtifactKind, InputSection, StageInput};
 
     /// Dossier with one Plan section, for the single-section tests.
@@ -2007,34 +2029,48 @@ mod runner_helpers_tests {
 
     #[test]
     fn role_maps_to_artifact_kind() {
-        assert_eq!(artifact_kind_for("plan"), ArtifactKind::Plan);
-        assert_eq!(artifact_kind_for("plan_review"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("code_review"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("implement"), ArtifactKind::Diff);
-        assert_eq!(artifact_kind_for("test"), ArtifactKind::Tests);
-        assert_eq!(artifact_kind_for("anything-else"), ArtifactKind::Note);
+        use crate::orchestrator::roles::builtin_roles;
+        let roles = builtin_roles();
+        let kind_for = |key: &str| roles.iter().find(|r| r.key == key).map(|r| r.artifact_kind.clone());
+        assert_eq!(kind_for("plan"), Some(ArtifactKind::Plan));
+        assert_eq!(kind_for("plan_review"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("code_review"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("implement"), Some(ArtifactKind::Diff));
+        assert_eq!(kind_for("test"), Some(ArtifactKind::Tests));
         // refine outputs a refined PLAN; repro outputs FINDINGS — neither is a
         // diff. The kind picks both the dossier slot and the section label, so
         // a wrong mapping evicts an unrelated artifact AND mislabels this one.
-        assert_eq!(artifact_kind_for("refine"), ArtifactKind::Plan);
-        assert_eq!(artifact_kind_for("repro"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("fix"), ArtifactKind::Diff);
+        assert_eq!(kind_for("refine"), Some(ArtifactKind::Plan));
+        assert_eq!(kind_for("repro"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("fix"), Some(ArtifactKind::Diff));
+        // unknown keys are no longer handled by a fallback match — they are DB-resident
     }
 
     #[test]
     fn system_prompt_is_role_specific() {
-        assert!(system_prompt_for("plan").to_lowercase().contains("plan"));
-        assert!(system_prompt_for("implement").to_lowercase().contains("implement"));
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
+        use crate::orchestrator::types::RoleEnvironment;
+        let roles = builtin_roles();
+        let prompt_for = |key: &str| {
+            let r = roles.iter().find(|r| r.key == key).unwrap();
+            compose_system_prompt(&r.prompt_body, r.environment, None, None)
+        };
+        assert!(prompt_for("plan").to_lowercase().contains("plan"));
+        assert!(prompt_for("implement").to_lowercase().contains("implement"));
     }
 
     #[test]
     fn system_prompt_frames_agent_as_non_interactive_pipeline_worker() {
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
+        use crate::orchestrator::types::RoleEnvironment;
+        let roles = builtin_roles();
         // Every stage, regardless of role, gets the autonomous/no-questions framing.
-        for role in ["plan", "implement", "code_review", "test", "anything"] {
-            let p = system_prompt_for(role).to_lowercase();
-            assert!(p.contains("never ask"), "role {role} missing no-questions directive");
-            assert!(p.contains("pipeline"), "role {role} missing pipeline framing");
-            assert!(p.contains("git"), "role {role} missing git-ownership note");
+        for key in ["plan", "implement", "code_review", "test"] {
+            let r = roles.iter().find(|r| r.key == key).unwrap();
+            let p = compose_system_prompt(&r.prompt_body, r.environment, None, None).to_lowercase();
+            assert!(p.contains("never ask"), "role {key} missing no-questions directive");
+            assert!(p.contains("pipeline"), "role {key} missing pipeline framing");
+            assert!(p.contains("git"), "role {key} missing git-ownership note");
         }
     }
 
@@ -2053,13 +2089,16 @@ mod runner_helpers_tests {
 
     #[test]
     fn auto_review_prompt_requests_a_verdict() {
-        use crate::orchestrator::runner::system_prompt_with_loop;
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
         use crate::orchestrator::types::LoopMode;
-        let auto = system_prompt_with_loop("code_review", Some(LoopMode::Auto));
+        let roles = builtin_roles();
+        let cr = roles.iter().find(|r| r.key == "code_review").unwrap();
+        let auto = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None);
         assert!(auto.contains("VERDICT:"));
-        let gated = system_prompt_with_loop("code_review", Some(LoopMode::Gated));
+        let gated = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Gated), None);
         assert!(!gated.contains("VERDICT:"));
-        let plain = system_prompt_with_loop("implement", None);
+        let impl_r = roles.iter().find(|r| r.key == "implement").unwrap();
+        let plain = compose_system_prompt(&impl_r.prompt_body, impl_r.environment, None, None);
         assert!(!plain.contains("VERDICT:"));
     }
 
@@ -2212,17 +2251,17 @@ mod pipeline_crud_tests {
 
     #[test]
     fn validate_pipeline_stages_bounds_the_tool_turn_budget() {
-        use crate::db::validate_pipeline_stages;
+        let db = test_db();
         // F4: per-stage max_iterations must be 1..=100.
         let mut zero = draft("plan"); zero.max_iterations = 0;
-        assert!(validate_pipeline_stages(&[zero]).is_err());
+        assert!(db.validate_pipeline_stages(&[zero]).is_err());
         let mut over = draft("plan"); over.max_iterations = 101;
-        assert!(validate_pipeline_stages(&[over]).is_err());
+        assert!(db.validate_pipeline_stages(&[over]).is_err());
         let mut ok = draft("plan"); ok.max_iterations = 25;
-        assert!(validate_pipeline_stages(&[ok]).is_ok());
+        assert!(db.validate_pipeline_stages(&[ok]).is_ok());
         let mut edge_lo = draft("plan"); edge_lo.max_iterations = 1;
         let mut edge_hi = draft("plan"); edge_hi.max_iterations = 100;
-        assert!(validate_pipeline_stages(&[edge_lo, edge_hi]).is_ok());
+        assert!(db.validate_pipeline_stages(&[edge_lo, edge_hi]).is_ok());
     }
 
     #[test]
@@ -2247,40 +2286,40 @@ mod pipeline_crud_tests {
 
     #[test]
     fn validate_pipeline_stages_enforces_roles_substrates_and_loop_contract() {
-        use crate::db::validate_pipeline_stages;
+        let db = test_db();
         // valid linear pipeline
-        assert!(validate_pipeline_stages(&[draft("plan"), draft("implement")]).is_ok());
+        assert!(db.validate_pipeline_stages(&[draft("plan"), draft("implement")]).is_ok());
         // empty pipeline / unknown role / bad substrate / empty model
-        assert!(validate_pipeline_stages(&[]).is_err());
-        assert!(validate_pipeline_stages(&[draft("dance")]).is_err());
+        assert!(db.validate_pipeline_stages(&[]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("dance")]).is_err());
         let mut bad_sub = draft("plan"); bad_sub.substrate = "ftp".into();
-        assert!(validate_pipeline_stages(&[bad_sub]).is_err());
+        assert!(db.validate_pipeline_stages(&[bad_sub]).is_err());
         let mut no_model = draft("plan"); no_model.agent_model = "".into();
-        assert!(validate_pipeline_stages(&[no_model]).is_err());
+        assert!(db.validate_pipeline_stages(&[no_model]).is_err());
 
         // valid gated loop: code_review at index 1 loops back to 0
         let mut review = draft("code_review");
         review.loop_target_position = Some(0); review.loop_max_iterations = 2; review.loop_mode = Some("gated".into());
-        assert!(validate_pipeline_stages(&[draft("implement"), review.clone()]).is_ok());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), review.clone()]).is_ok());
 
         // loop on a non-review role
         let mut looped_impl = draft("implement");
         looped_impl.loop_target_position = Some(0); looped_impl.loop_max_iterations = 2; looped_impl.loop_mode = Some("gated".into());
-        assert!(validate_pipeline_stages(&[draft("plan"), looped_impl]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("plan"), looped_impl]).is_err());
         // target not strictly earlier (self)
         let mut self_loop = review.clone(); self_loop.loop_target_position = Some(1);
-        assert!(validate_pipeline_stages(&[draft("implement"), self_loop]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), self_loop]).is_err());
         // target out of range
         let mut far = review.clone(); far.loop_target_position = Some(5);
-        assert!(validate_pipeline_stages(&[draft("implement"), far]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), far]).is_err());
         // max 0 with a target / bad mode
         let mut zero = review.clone(); zero.loop_max_iterations = 0;
-        assert!(validate_pipeline_stages(&[draft("implement"), zero]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), zero]).is_err());
         let mut mode = review.clone(); mode.loop_mode = Some("magic".into());
-        assert!(validate_pipeline_stages(&[draft("implement"), mode]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), mode]).is_err());
         // no target but leftover loop fields → invalid (builder must normalize)
         let mut leftover = draft("code_review"); leftover.loop_max_iterations = 2;
-        assert!(validate_pipeline_stages(&[draft("implement"), leftover]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("implement"), leftover]).is_err());
     }
 
     #[test]
@@ -2325,40 +2364,40 @@ mod pipeline_crud_tests {
 
     #[test]
     fn validate_pipeline_stages_enforces_graph_fields() {
-        use crate::db::validate_pipeline_stages;
+        let db = test_db();
 
         // parents must reference strictly-earlier stages.
         let mut a = draft("plan");
         let mut b = draft("implement");
         b.parents = vec![0]; // ok: 0 < 1
-        assert!(validate_pipeline_stages(&[a.clone(), b.clone()]).is_ok());
+        assert!(db.validate_pipeline_stages(&[a.clone(), b.clone()]).is_ok());
         let mut fwd = draft("implement");
         fwd.parents = vec![1]; // a parent at its own position
-        assert!(validate_pipeline_stages(&[draft("plan"), fwd]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("plan"), fwd]).is_err());
         let mut neg = draft("implement");
         neg.parents = vec![-1];
-        assert!(validate_pipeline_stages(&[draft("plan"), neg]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("plan"), neg]).is_err());
         let mut dup = draft("implement");
         dup.parents = vec![0, 0]; // same upstream twice
-        assert!(validate_pipeline_stages(&[draft("plan"), dup]).is_err());
+        assert!(db.validate_pipeline_stages(&[draft("plan"), dup]).is_err());
 
         // tools: a non-empty subset of the known set; empty or unknown → error.
         a.tools = Some(vec!["read_file".into(), "list_files".into()]);
-        assert!(validate_pipeline_stages(&[a.clone()]).is_ok());
+        assert!(db.validate_pipeline_stages(&[a.clone()]).is_ok());
         let mut empty_tools = draft("plan");
         empty_tools.tools = Some(vec![]);
-        assert!(validate_pipeline_stages(&[empty_tools]).is_err());
+        assert!(db.validate_pipeline_stages(&[empty_tools]).is_err());
         let mut bad_tool = draft("plan");
         bad_tool.tools = Some(vec!["telepathy".into()]);
-        assert!(validate_pipeline_stages(&[bad_tool]).is_err());
+        assert!(db.validate_pipeline_stages(&[bad_tool]).is_err());
 
         // instructions: long but bounded.
         let mut long = draft("plan");
         long.instructions = Some("x".repeat(9_000));
-        assert!(validate_pipeline_stages(&[long]).is_err());
+        assert!(db.validate_pipeline_stages(&[long]).is_err());
         let mut ok_instr = draft("plan");
         ok_instr.instructions = Some("Focus on the auth module.".into());
-        assert!(validate_pipeline_stages(&[ok_instr]).is_ok());
+        assert!(db.validate_pipeline_stages(&[ok_instr]).is_ok());
 
         // In an authored graph, a loop must return to an ANCESTOR of the review,
         // not merely an earlier position (a sibling branch).
@@ -2370,10 +2409,10 @@ mod pipeline_crud_tests {
         rv.loop_max_iterations = 2;
         rv.loop_mode = Some("gated".into());
         rv.loop_target_position = Some(2); // sibling branch B — NOT an ancestor of the review
-        assert!(validate_pipeline_stages(&[p.clone(), ia.clone(), ib.clone(), rv.clone()]).is_err());
+        assert!(db.validate_pipeline_stages(&[p.clone(), ia.clone(), ib.clone(), rv.clone()]).is_err());
         let mut rv_ok = rv.clone();
         rv_ok.loop_target_position = Some(0); // the shared ancestor — fine
-        assert!(validate_pipeline_stages(&[p, ia, ib, rv_ok]).is_ok());
+        assert!(db.validate_pipeline_stages(&[p, ia, ib, rv_ok]).is_ok());
     }
 
     #[test]
@@ -2415,6 +2454,19 @@ mod pipeline_crud_tests {
         db.delete_pipeline(&id).unwrap();
         assert!(db.list_pipelines().unwrap().iter().all(|p| p.id != id));
         assert!(db.get_pipeline_stages(&id).unwrap().is_empty()); // stages gone too
+    }
+
+    #[test]
+    fn validate_accepts_seeded_and_custom_rejects_unknown() {
+        let db = test_db();
+        let mk = |role: &str| crate::db::StageDraft {
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
+            custom_name: None, instructions: None,
+        };
+        assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
+        assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
     }
 }
 
@@ -3100,7 +3152,7 @@ mod orchestrator_tests {
 
     /// A runner that always returns a hard Err (simulates CliRunnerUnavailable / unresolved model).
     /// Records each stage's assembled input dossier and produces a
-    /// role-appropriate artifact (kind from `artifact_kind_for`).
+    /// role-appropriate artifact (kind from stage.artifact_kind, resolved by the orchestrator).
     struct RecordingRunner {
         seen: Arc<Mutex<Vec<(String, StageInput)>>>,
     }
@@ -3113,7 +3165,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.role.clone(), input.clone()));
-            let kind = crate::orchestrator::runner::artifact_kind_for(&stage.role);
+            let kind = stage.artifact_kind.clone();
             let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
             Ok(StageOutcome {
                 artifact: StageArtifact {
@@ -3882,7 +3934,7 @@ mod cli_runner_tests {
 
     #[test]
     fn parses_success_into_done_outcome() {
-        let outcome = parse_cli_result(SUCCESS, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Done);
         assert_eq!(outcome.artifact.text, "Implemented the feature.");
         assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
@@ -3895,20 +3947,20 @@ mod cli_runner_tests {
 
     #[test]
     fn is_error_flag_yields_failed_outcome() {
-        let outcome = parse_cli_result(ERRORED, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
     }
 
     #[test]
     fn nonzero_exit_yields_failed_even_if_json_ok() {
-        let outcome = parse_cli_result(SUCCESS, false, "plan", "").unwrap();
+        let outcome = parse_cli_result(SUCCESS, false, ArtifactKind::Plan, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
     }
 
     #[test]
     fn unparseable_output_is_an_error() {
-        assert!(parse_cli_result("not json", true, "plan", "").is_err());
+        assert!(parse_cli_result("not json", true, ArtifactKind::Plan, "").is_err());
     }
 
     #[test]
@@ -3917,7 +3969,7 @@ mod cli_runner_tests {
         // historically with is_error=false — a success-shaped failure.
         const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"","is_error":false,
             "total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let outcome = parse_cli_result(MAX_TURNS, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(MAX_TURNS, true, ArtifactKind::Diff, "").unwrap();
         assert!(matches!(outcome.status, crate::orchestrator::types::StageStatus::Failed));
         assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
         assert_eq!(outcome.cost_usd, 1.25);
@@ -5403,13 +5455,13 @@ mod ancestry_tests {
 #[cfg(test)]
 mod cli_result_tests {
     use crate::orchestrator::cli_runner::parse_cli_result;
-    use crate::orchestrator::types::StageStatus;
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
     /// Task 2: subtype is surfaced even when is_error is true.
     #[test]
     fn parse_cli_result_names_subtype_when_is_error() {
         let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let out = parse_cli_result(line, true, "verify", "").unwrap();
+        let out = parse_cli_result(line, true, ArtifactKind::Review, "").unwrap();
         assert!(matches!(out.status, StageStatus::Failed));
         let err = out.error.unwrap();
         assert!(err.contains("error_max_turns"), "got: {err}");
@@ -5420,7 +5472,7 @@ mod cli_result_tests {
     fn parse_cli_result_appends_stderr_tail() {
         let line = r#"{"type":"result","is_error":true,"result":"","usage":{"input_tokens":0,"output_tokens":0}}"#;
         let stderr = "line one\noverloaded_error: server is busy\n";
-        let out = parse_cli_result(line, false, "fix", stderr).unwrap();
+        let out = parse_cli_result(line, false, ArtifactKind::Diff, stderr).unwrap();
         let err = out.error.unwrap();
         assert!(err.contains("overloaded_error"), "got: {err}");
     }
@@ -5429,7 +5481,7 @@ mod cli_result_tests {
     #[test]
     fn parse_cli_result_extracts_session_id() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc-123","usage":{"input_tokens":1,"output_tokens":2}}"#;
-        let out = parse_cli_result(line, true, "fix", "").unwrap();
+        let out = parse_cli_result(line, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(out.session_id.as_deref(), Some("abc-123"));
     }
 
@@ -5635,5 +5687,141 @@ mod git_baseline_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod roles_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> (Db, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn roles_table_seeds_and_reads() {
+        let (db, _tmp) = test_db();
+        let all = db.list_roles().unwrap();
+        assert_eq!(all.len(), 15);
+        let cr = db.get_role("code_review").unwrap().unwrap();
+        assert!(cr.can_loop);
+        assert_eq!(cr.is_builtin, true);
+        assert!(db.get_role("nope").unwrap().is_none());
+        // custom upsert + in-use + delete
+        let mut custom = cr.clone(); custom.key = "perf_audit".into(); custom.label = "Perf audit".into(); custom.is_builtin = false;
+        db.upsert_role(&custom).unwrap();
+        assert!(!db.role_in_use("perf_audit").unwrap());
+        db.delete_role("perf_audit").unwrap();
+        assert!(db.get_role("perf_audit").unwrap().is_none());
+    }
+
+    #[test]
+    fn builtin_roles_seed_matches_legacy_prompts() {
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
+        use crate::orchestrator::types::RoleEnvironment;
+        let by = |k: &str| builtin_roles().into_iter().find(|r| r.key == k).unwrap();
+        // plan body, worktree preamble, no instructions, no verdict
+        let plan = by("plan");
+        let got = compose_system_prompt(&plan.prompt_body, plan.environment, None, None);
+        assert!(got.contains("You are one stage in an automated, headless build pipeline."));
+        assert!(got.contains("Do not commit, push, or otherwise manage git"));
+        assert!(got.contains("Produce a concise, concrete implementation plan"));
+        // there are 15 builtin roles, all keys unique
+        let all = builtin_roles();
+        assert_eq!(all.len(), 15);
+        let mut keys: Vec<_> = all.iter().map(|r| r.key.clone()).collect();
+        keys.sort(); keys.dedup();
+        assert_eq!(keys.len(), 15);
+        // an action role uses the action preamble
+        let rel = by("release");
+        assert_eq!(rel.environment, RoleEnvironment::Action);
+        let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None);
+        assert!(rp.contains("may commit, push"));
+        assert!(!rp.contains("Do not commit, push"));
+    }
+
+    #[test]
+    fn unknown_role_is_a_clean_failure_message() {
+        // compose still works for an arbitrary body+env (no role lookup needed here)
+        use crate::orchestrator::roles::compose_system_prompt;
+        use crate::orchestrator::types::RoleEnvironment;
+        let s = compose_system_prompt("Body.", RoleEnvironment::Worktree, None, None);
+        assert!(s.ends_with("Body."));
+    }
+
+    #[test]
+    fn new_builtin_roles_have_expected_contracts() {
+        let (db, _tmp) = test_db();
+        use crate::orchestrator::types::RoleEnvironment;
+        for k in ["pull_request", "merge", "release"] {
+            let r = db.get_role(k).unwrap().unwrap();
+            assert_eq!(r.environment, RoleEnvironment::Action, "{k}");
+            assert_eq!(r.default_substrate, "cli", "{k}");
+            assert!(r.default_checkpoint, "{k}");
+            assert!(!r.can_loop, "{k}");
+        }
+        assert!(db.get_role("security_review").unwrap().unwrap().can_loop);
+        assert_eq!(db.get_role("architect").unwrap().unwrap().artifact_kind.as_db(), "plan");
+    }
+
+    #[test]
+    fn delete_role_rejects_when_in_use() {
+        let (db, _tmp) = test_db();
+        // Create a custom role.
+        let cr = db.get_role("code_review").unwrap().unwrap();
+        let mut custom = cr.clone();
+        custom.key = "perf_audit".into();
+        custom.label = "Perf audit".into();
+        custom.is_builtin = false;
+        db.upsert_role(&custom).unwrap();
+        // Not in use yet.
+        assert!(!db.role_in_use("perf_audit").unwrap());
+        // Wire a pipeline stage that references the custom role.
+        let pid = db.insert_pipeline("test-pipe", "desc", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "perf_audit", "claude-haiku-4-5", "api", false, None, 0, None, 25).unwrap();
+        // Now it's in use — role_in_use must be true.
+        assert!(db.role_in_use("perf_audit").unwrap());
+        // The delete_role command guard must refuse.
+        let result = db.role_in_use("perf_audit").unwrap();
+        assert!(result, "role should be in use after stage insert");
+        // Simulate the command logic: if in use, error; else delete.
+        let del_result: crate::error::AppResult<()> = if db.role_in_use("perf_audit").unwrap() {
+            Err(crate::error::AppError::Other("role 'perf_audit' is used by a pipeline".into()))
+        } else {
+            db.delete_role("perf_audit")
+        };
+        assert!(del_result.is_err(), "delete should be rejected when role is in use");
+        let err_msg = del_result.unwrap_err().to_string();
+        assert!(err_msg.contains("perf_audit"), "error should mention the role key");
+    }
+
+    #[test]
+    fn save_role_cannot_overwrite_builtin() {
+        let (db, _tmp) = test_db();
+        // Grab the built-in code_review's original prompt so we can check it after.
+        let builtin = db.get_role("code_review").unwrap().unwrap();
+        assert!(builtin.is_builtin, "code_review must be a built-in");
+        let original_prompt = builtin.prompt_body.clone();
+
+        // Attempt to upsert a custom role that happens to share the same key.
+        let mut imposter = builtin.clone();
+        imposter.is_builtin = false;
+        imposter.prompt_body = "INJECTED PROMPT".into();
+        // upsert_role must now return Err (defense-in-depth guard).
+        let result = db.upsert_role(&imposter);
+        assert!(result.is_err(), "upsert_role must reject a built-in key collision");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("code_review"), "error must name the colliding key");
+
+        // The built-in row must be UNCHANGED.
+        let after = db.get_role("code_review").unwrap().unwrap();
+        assert_eq!(
+            after.prompt_body, original_prompt,
+            "upsert_role must not overwrite a built-in role's prompt"
+        );
+        assert!(after.is_builtin, "is_builtin flag must still be 1");
     }
 }

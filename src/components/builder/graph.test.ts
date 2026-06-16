@@ -1,14 +1,53 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   graphToStageDrafts,
   draftToGraph,
   validateGraph,
   newStageData,
   loopEdge,
+  archetypeFromRole,
+  archetypeFor,
+  archetypes,
+  setArchetypes,
   type StageNode,
   type StageEdge,
 } from "./graph";
-import type { PipelineWithStages, PipelineStage } from "../../lib/ipc";
+import type { PipelineWithStages, PipelineStage, Role } from "../../lib/ipc";
+
+// ─── Seed roles that mirror the 10 original built-ins ────────────────────────
+
+function makeRole(overrides: Partial<Role> & Pick<Role, "key" | "label" | "artifactKind" | "canLoop">): Role {
+  return {
+    description: "",
+    promptBody: "",
+    environment: "worktree",
+    defaultTools: ["read_file", "list_files"],
+    defaultSubstrate: "api",
+    defaultCheckpoint: false,
+    tokenEstIn: 4000,
+    tokenEstOut: 1000,
+    isBuiltin: true,
+    ...overrides,
+  };
+}
+
+const SEED_ROLES: Role[] = [
+  makeRole({ key: "plan", label: "Plan", artifactKind: "plan", canLoop: false, defaultTools: ["read_file", "list_files"] }),
+  makeRole({ key: "plan_review", label: "Plan review", artifactKind: "review", canLoop: true, defaultTools: ["read_file", "list_files"] }),
+  makeRole({ key: "implement", label: "Implement", artifactKind: "diff", canLoop: false, defaultTools: ["read_file", "list_files", "write_file", "run_command"] }),
+  makeRole({ key: "code_review", label: "Code review", artifactKind: "review", canLoop: true, defaultTools: ["read_file", "list_files"] }),
+  makeRole({ key: "test", label: "Tests", artifactKind: "tests", canLoop: false, defaultTools: ["read_file", "list_files", "write_file", "run_command"] }),
+  makeRole({ key: "repro", label: "Reproduce", artifactKind: "review", canLoop: false, defaultTools: ["read_file", "list_files", "run_command"] }),
+  makeRole({ key: "fix", label: "Fix", artifactKind: "diff", canLoop: false, defaultTools: ["read_file", "list_files", "write_file", "run_command"] }),
+  makeRole({ key: "verify", label: "Verify", artifactKind: "review", canLoop: true, defaultTools: ["read_file", "list_files", "run_command"] }),
+  makeRole({ key: "critique", label: "Critique", artifactKind: "review", canLoop: true, defaultTools: ["read_file", "list_files"] }),
+  makeRole({ key: "refine", label: "Refine", artifactKind: "plan", canLoop: false, defaultTools: ["read_file", "list_files"] }),
+];
+
+// Seed LOADED before every test suite so archetypeFor/archetypes() work.
+beforeEach(() => {
+  setArchetypes(SEED_ROLES);
+});
 
 function node(id: string, role: string, x = 0, y = 0): StageNode {
   return { id, type: "stage", position: { x, y }, data: { ...newStageData(role) } };
@@ -16,6 +55,78 @@ function node(id: string, role: string, x = 0, y = 0): StageNode {
 function flow(source: string, target: string): StageEdge {
   return { id: `f-${source}-${target}`, source, target, type: "flow", data: { kind: "flow" } };
 }
+
+// ─── Task 8 new tests ────────────────────────────────────────────────────────
+
+describe("archetypeFromRole", () => {
+  it("maps Role fields to Archetype shape", () => {
+    const role = makeRole({ key: "plan", label: "Plan", artifactKind: "plan", canLoop: false, defaultTools: ["read_file"] });
+    const a = archetypeFromRole(role);
+    expect(a.role).toBe("plan");
+    expect(a.label).toBe("Plan");
+    expect(a.artifact).toBe("plan");
+    expect(a.canLoop).toBe(false);
+    expect(a.defaultTools).toEqual(["read_file"]);
+  });
+
+  it("maps canLoop=true correctly", () => {
+    const role = makeRole({ key: "code_review", label: "Code review", artifactKind: "review", canLoop: true });
+    const a = archetypeFromRole(role);
+    expect(a.canLoop).toBe(true);
+    expect(a.artifact).toBe("review");
+  });
+});
+
+describe("setArchetypes + archetypes", () => {
+  it("round-trips: setArchetypes then archetypes returns mapped list", () => {
+    const roles: Role[] = [
+      makeRole({ key: "my_role", label: "My Role", artifactKind: "note", canLoop: false }),
+    ];
+    setArchetypes(roles);
+    const all = archetypes();
+    expect(all).toHaveLength(1);
+    expect(all[0].role).toBe("my_role");
+    expect(all[0].label).toBe("My Role");
+    expect(all[0].artifact).toBe("note");
+  });
+
+  it("replaces previous LOADED on successive calls", () => {
+    setArchetypes(SEED_ROLES);
+    expect(archetypes()).toHaveLength(SEED_ROLES.length);
+    setArchetypes([makeRole({ key: "solo", label: "Solo", artifactKind: "plan", canLoop: false })]);
+    expect(archetypes()).toHaveLength(1);
+    // Restore for subsequent tests
+    setArchetypes(SEED_ROLES);
+  });
+});
+
+describe("archetypeFor", () => {
+  it("returns the matching archetype when found", () => {
+    const a = archetypeFor("code_review");
+    expect(a.role).toBe("code_review");
+    expect(a.canLoop).toBe(true);
+  });
+
+  it("returns a safe fallback (not undefined) for unknown keys", () => {
+    const a = archetypeFor("totally_unknown_role");
+    expect(a).toBeTruthy();
+    expect(a.role).toBe("totally_unknown_role");
+    expect(a.artifact).toBe("note");
+    expect(a.canLoop).toBe(false);
+  });
+
+  it("returns a safe fallback when LOADED is empty", () => {
+    setArchetypes([]); // simulate pre-load state
+    const a = archetypeFor("plan");
+    expect(a).toBeTruthy();
+    expect(a.role).toBe("plan");
+    expect(a.canLoop).toBe(false);
+    // Restore
+    setArchetypes(SEED_ROLES);
+  });
+});
+
+// ─── Existing tests (unchanged behaviour, now with seeded roles) ─────────────
 
 describe("graphToStageDrafts", () => {
   it("topologically orders a linear chain and records single parents", () => {

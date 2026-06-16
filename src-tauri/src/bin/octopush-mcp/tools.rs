@@ -199,7 +199,7 @@ fn STAGE_ARRAY_SCHEMA() -> Value {
         "items": {
             "type": "object",
             "properties": {
-                "role": { "type": "string", "description": "One of: plan, plan_review, implement, code_review, test, repro, fix, verify, critique, refine." },
+                "role": { "type": "string", "description": "One of: plan, plan_review, implement, code_review, test, repro, fix, verify, critique, refine, architect, security_review, pull_request, merge, release. Custom roles defined in the app are also valid — call list_roles for the current set." },
                 "agentModel": { "type": "string", "description": "Model id, e.g. claude-sonnet-4-6 or claude-haiku-4-5." },
                 "substrate": { "type": "string", "enum": ["api", "cli"], "description": "api = in-process LLM; cli = external agent CLI. Default api." },
                 "checkpoint": { "type": "boolean", "description": "Pause for human review before this stage. Default false." },
@@ -437,16 +437,22 @@ fn describe_pipeline_schema() -> Value {
                     Each stage is a role-specialized agent that transforms the workspace \
                     and hands its artifact to downstream stages.",
         "roles": {
-            "plan":        "Produce an implementation plan.",
-            "plan_review": "Review a plan (review role; can loop).",
-            "implement":   "Write the code for the task.",
-            "code_review": "Review code changes (review role; can loop).",
-            "test":        "Run/author tests and report.",
-            "repro":       "Reproduce a reported bug.",
-            "fix":         "Fix the bug.",
-            "verify":      "Verify the fix (review role; can loop).",
-            "critique":    "Critique a plan/artifact (review role; can loop).",
-            "refine":      "Refine an artifact after critique."
+            "plan":            "Produce an implementation plan.",
+            "plan_review":     "Review a plan (review role; can loop).",
+            "implement":       "Write the code for the task.",
+            "code_review":     "Review code changes (review role; can loop).",
+            "test":            "Run/author tests and report.",
+            "repro":           "Reproduce a reported bug.",
+            "fix":             "Fix the bug.",
+            "verify":          "Verify the fix (review role; can loop).",
+            "critique":        "Critique a plan/artifact (review role; can loop).",
+            "refine":          "Refine an artifact after critique.",
+            "architect":       "Produce a high-level architecture plan.",
+            "security_review": "Security review of code or architecture (review role; can loop).",
+            "pull_request":    "Open a pull request for the changes (action role).",
+            "merge":           "Merge the pull request (action role).",
+            "release":         "Cut a release (action role).",
+            "__note__":        "Custom roles defined in the app are also valid — call list_roles for the current set."
         },
         "reviewRoles": ["plan_review", "code_review", "critique", "verify"],
         "substrates": {

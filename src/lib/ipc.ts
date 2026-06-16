@@ -805,6 +805,13 @@ export const ipc = {
       stageOverrides: stageOverrides ?? null,
     }),
 
+  // ─── Roles ────────────────────────────────────────────────────
+  listRoles: () => invoke<Role[]>("list_roles"),
+
+  saveRole: (role: Role) => invoke<Role>("save_role", { role }),
+
+  deleteRole: (key: string) => invoke<void>("delete_role", { key }),
+
   // ─── AI primitive (G5) ────────────────────────────────────────
   aiComplete: (
     model: string,
@@ -837,6 +844,23 @@ export const ipc = {
   connectClaudeCode: () =>
     invoke<McpConnectResult>("connect_claude_code"),
 };
+
+/** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */
+export interface Role {
+  key: string;
+  label: string;
+  description: string;
+  promptBody: string;
+  artifactKind: "plan" | "review" | "tests" | "diff" | "note";
+  environment: "worktree" | "action";
+  canLoop: boolean;
+  defaultTools: string[];
+  defaultSubstrate: "api" | "cli";
+  defaultCheckpoint: boolean;
+  tokenEstIn: number;
+  tokenEstOut: number;
+  isBuiltin: boolean;
+}
 
 /** State of the bundled octopush-mcp server + its Claude Code registration. */
 export interface McpStatus {

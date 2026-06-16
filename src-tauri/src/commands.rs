@@ -1192,16 +1192,6 @@ pub async fn estimate_run_cost(
     pipeline_id: String,
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<serde_json::Value> {
-    // Heuristic per-role token estimate (refined later from history).
-    fn est_tokens(role: &str) -> (u64, u64) {
-        match role {
-            "implement" | "fix" => (12_000, 6_000),
-            "plan" | "refine" => (4_000, 1_500),
-            "code_review" | "plan_review" | "critique" | "verify" | "repro" => (8_000, 1_000),
-            "test" => (6_000, 2_000),
-            _ => (4_000, 1_000),
-        }
-    }
     let overrides = stage_overrides.unwrap_or_default();
     let db = state.db.lock();
     let stages = db.get_pipeline_stages(&pipeline_id)?;
@@ -1209,15 +1199,20 @@ pub async fn estimate_run_cost(
     let mut cost = 0.0;
     let mut baseline = 0.0;
     for s in &stages {
-        let (i, o) = est_tokens(&s.role);
+        // Token estimates come from the role's definition in the DB; fall back to
+        // (4000, 1000) when the role is absent (custom/deleted roles).
+        let (tok_in, tok_out) = db
+            .get_role(&s.role)?
+            .map(|r| (r.token_est_in as u64, r.token_est_out as u64))
+            .unwrap_or((4_000, 1_000));
         let model = overrides
             .iter()
             .find(|(pos, _)| *pos == s.position)
             .map(|(_, m)| m.as_str())
             .unwrap_or(s.agent_model.as_str());
-        cost += crate::orchestrator::cost::stage_cost(model, i, o, 0, 0);
+        cost += crate::orchestrator::cost::stage_cost(model, tok_in, tok_out, 0, 0);
         if let Some(ref_model) = &reference {
-            baseline += crate::orchestrator::cost::baseline_cost(ref_model, i, o);
+            baseline += crate::orchestrator::cost::baseline_cost(ref_model, tok_in, tok_out);
         }
     }
     if reference.is_none() || baseline < cost {
@@ -3996,6 +3991,44 @@ pub async fn connect_claude_code() -> AppResult<crate::mcp_setup::McpConnectResu
     tokio::task::spawn_blocking(crate::mcp_setup::connect)
         .await
         .map_err(|e| AppError::Other(format!("connect task failed: {e}")))
+}
+
+// ─── Role commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_roles(state: State<'_, AppState>) -> AppResult<Vec<crate::orchestrator::roles::RoleDef>> {
+    state.db.lock().list_roles()
+}
+
+#[tauri::command]
+pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::roles::RoleDef) -> AppResult<crate::orchestrator::roles::RoleDef> {
+    let mut role = role;
+    role.is_builtin = false; // user-saved roles are never built-in
+    if role.key.trim().is_empty() { return Err(crate::error::AppError::Other("role key required".into())); }
+    if role.prompt_body.trim().is_empty() { return Err(crate::error::AppError::Other("role prompt cannot be empty".into())); }
+    let db = state.db.lock();
+    if let Some(existing) = db.get_role(&role.key)? {
+        if existing.is_builtin {
+            return Err(crate::error::AppError::Other(format!(
+                "the name '{}' maps to a built-in role key ('{}'); choose a different name",
+                role.label, role.key
+            )));
+        }
+    }
+    db.upsert_role(&role)?;
+    Ok(role)
+}
+
+#[tauri::command]
+pub async fn delete_role(state: State<'_, AppState>, key: String) -> AppResult<()> {
+    let db = state.db.lock();
+    if let Some(existing) = db.get_role(&key)? {
+        if existing.is_builtin {
+            return Err(crate::error::AppError::Other(format!("cannot delete the built-in role '{key}'")));
+        }
+    }
+    if db.role_in_use(&key)? { return Err(crate::error::AppError::Other(format!("role '{key}' is used by a pipeline"))); }
+    db.delete_role(&key)
 }
 
 #[cfg(test)]

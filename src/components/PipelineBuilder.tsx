@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -16,8 +16,10 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import type { PipelineWithStages } from "../lib/ipc";
+import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
+import { useRolesStore } from "../stores/rolesStore";
+import { RoleEditor } from "./RoleEditor";
 import { tokens } from "../lib/tokens";
 import { StageNode } from "./builder/StageNode";
 import { FlowEdge, LoopEdge } from "./builder/edges";
@@ -64,6 +66,11 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const isBuiltin = pipeline?.pipeline.isBuiltin ?? false;
   const save = usePipelineStore((s) => s.save);
   const remove = usePipelineStore((s) => s.remove);
+
+  // Load roles so the palette and graph derive from live data.
+  useEffect(() => {
+    void useRolesStore.getState().load();
+  }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
   const wrapperRef = useRef<HTMLDivElement>(null);
 
@@ -81,6 +88,9 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   // Cascades click-to-add nodes so repeated palette clicks don't stack at one point.
   const addCascade = useRef(0);
+
+  // Role Editor state: null = closed; { initial?: Role } = open (new or fork).
+  const [editorState, setEditorState] = useState<{ initial?: Role } | null>(null);
 
   const validation = useMemo(() => validateGraph(nodes, edges), [nodes, edges]);
 
@@ -290,7 +300,11 @@ function BuilderInner({ pipeline, onClose }: Props) {
               nodeStrokeColor={() => tokens.brassDim}
             />
             <Panel position="top-left">
-              <NodePalette onAdd={addNode} />
+              <NodePalette
+                onAdd={addNode}
+                onNewRole={() => setEditorState({})}
+                onEditRole={(role) => setEditorState({ initial: role })}
+              />
             </Panel>
             {selectedNode && (
               <Panel position="top-right" className="!m-3 max-h-[calc(100%-1.5rem)]">
@@ -345,6 +359,19 @@ function BuilderInner({ pipeline, onClose }: Props) {
             <span className="text-octo-mute">{nodes.length === 1 ? "1 stage" : `${nodes.length} stages`} · ready</span>
           )}
         </div>
+
+        {/* Role editor — mounts as a ModalShell portal above the builder */}
+        {editorState !== null && (
+          <RoleEditor
+            initial={editorState.initial}
+            onSaved={() => {
+              // Refresh role store so palette reflects the new role immediately.
+              void useRolesStore.getState().load();
+              setEditorState(null);
+            }}
+            onClose={() => setEditorState(null)}
+          />
+        )}
 
         {pipeline && !isBuiltin &&
           (confirmingDelete ? (

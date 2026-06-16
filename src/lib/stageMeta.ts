@@ -2,6 +2,8 @@
 // run view). Kept framework-free so any component can import them without
 // pulling in a heavy component module.
 
+import { useRolesStore } from "../stores/rolesStore";
+
 export const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 
 /** Compact token count — the single format across every Direct surface:
@@ -10,22 +12,10 @@ export function fmtTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
-/** The archetype's display label. Keep in sync with ARCHETYPES in
- *  src/components/builder/graph.ts (the authoritative table). */
+/** The role's display label — read from the loaded roles store (falls back to
+ *  the key itself when roles have not yet loaded or the key is unknown). */
 export function labelForRole(role: string): string {
-  const map: Record<string, string> = {
-    plan: "Plan",
-    plan_review: "Plan review",
-    implement: "Implement",
-    code_review: "Code review",
-    test: "Tests",
-    repro: "Reproduce",
-    fix: "Fix",
-    verify: "Verify",
-    critique: "Critique",
-    refine: "Refine",
-  };
-  return map[role] ?? role;
+  return useRolesStore.getState().roles.find((r) => r.key === role)?.label ?? role;
 }
 
 /** A stage's display title: the author's custom name when set, else the

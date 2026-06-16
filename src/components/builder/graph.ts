@@ -15,7 +15,7 @@
 // instructions to the author.
 
 import type { Node, Edge } from "@xyflow/react";
-import type { AgentSubstrate, PipelineWithStages, PipelineStage, StageDraft } from "../../lib/ipc";
+import type { AgentSubstrate, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
 
 // ─── Tools ────────────────────────────────────────────────────────────────
 // Keep in sync with KNOWN_TOOLS in src-tauri/src/db.rs and tool_definitions().
@@ -37,12 +37,9 @@ export const TOOLS: ToolMeta[] = [
 ];
 
 const TOOL_IDS = TOOLS.map((t) => t.id);
-const RO = ["read_file", "list_files"];
-const RUN = ["read_file", "list_files", "run_command"];
-const FULL = ["read_file", "list_files", "write_file", "run_command"];
 
 // ─── Archetypes ─────────────────────────────────────────────────────────────
-// Keep roles in sync with KNOWN_ROLES/REVIEW_ROLES in src-tauri/src/db.rs.
+// Roles are loaded from the backend `roles` table via listRoles()/setArchetypes().
 
 export type ArtifactKind = "plan" | "review" | "diff" | "tests" | "note";
 
@@ -59,24 +56,47 @@ export interface Archetype {
   description: string;
 }
 
-export const ARCHETYPES: Archetype[] = [
-  { role: "plan", label: "Plan", artifact: "plan", canLoop: false, defaultTools: RO, description: "Outline the approach before any code" },
-  { role: "plan_review", label: "Plan review", artifact: "review", canLoop: true, defaultTools: RO, description: "Critique the plan — can loop back" },
-  { role: "implement", label: "Implement", artifact: "diff", canLoop: false, defaultTools: FULL, description: "Write the code in the worktree" },
-  { role: "code_review", label: "Code review", artifact: "review", canLoop: true, defaultTools: RO, description: "Review the diff — can loop back" },
-  { role: "test", label: "Tests", artifact: "tests", canLoop: false, defaultTools: FULL, description: "Write and run the tests" },
-  { role: "repro", label: "Reproduce", artifact: "review", canLoop: false, defaultTools: RUN, description: "Reproduce the reported problem" },
-  { role: "fix", label: "Fix", artifact: "diff", canLoop: false, defaultTools: FULL, description: "Apply the fix" },
-  { role: "verify", label: "Verify", artifact: "review", canLoop: true, defaultTools: RUN, description: "Confirm the fix holds — can loop back" },
-  { role: "critique", label: "Critique", artifact: "review", canLoop: true, defaultTools: RO, description: "Critique the artifact — can loop back" },
-  { role: "refine", label: "Refine", artifact: "plan", canLoop: false, defaultTools: RO, description: "Polish from the critique" },
-];
-
-const ARCHETYPE_BY_ROLE = new Map(ARCHETYPES.map((a) => [a.role, a]));
-
-export function archetypeFor(role: string): Archetype {
-  return ARCHETYPE_BY_ROLE.get(role) ?? ARCHETYPES[0];
+/** Convert a Role (from the DB / IPC) into an Archetype for builder use. */
+export function archetypeFromRole(r: Role): Archetype {
+  return {
+    role: r.key,
+    label: r.label,
+    artifact: r.artifactKind,
+    canLoop: r.canLoop,
+    defaultTools: r.defaultTools,
+    description: r.description,
+  };
 }
+
+/** Module-level cache, populated by rolesStore after loading from the backend. */
+let LOADED: Archetype[] = [];
+
+/** Called by rolesStore.load() once roles arrive from the backend. */
+export function setArchetypes(roles: Role[]): void {
+  LOADED = roles.map(archetypeFromRole);
+}
+
+/** All currently-loaded archetypes (empty until rolesStore.load() resolves). */
+export function archetypes(): Archetype[] {
+  return LOADED;
+}
+
+/** Look up an archetype by role key.
+ *  Returns a minimal safe default when LOADED is empty (pre-load) or the key
+ *  is unknown — never returns undefined so callers don't need to null-check. */
+export function archetypeFor(role: string): Archetype {
+  return (
+    LOADED.find((a) => a.role === role) ?? {
+      role,
+      label: role,
+      artifact: "note" as ArtifactKind,
+      canLoop: false,
+      defaultTools: [],
+      description: "",
+    }
+  );
+}
+
 
 export function isReviewArchetype(role: string): boolean {
   return archetypeFor(role).canLoop;
