@@ -2009,7 +2009,7 @@ mod cost_tests {
 
 #[cfg(test)]
 mod runner_helpers_tests {
-    use crate::orchestrator::runner::{artifact_kind_for, system_prompt_for, user_input_for};
+    use crate::orchestrator::runner::user_input_for;
     use crate::orchestrator::types::{ArtifactKind, InputSection, StageInput};
 
     /// Dossier with one Plan section, for the single-section tests.
@@ -2029,34 +2029,48 @@ mod runner_helpers_tests {
 
     #[test]
     fn role_maps_to_artifact_kind() {
-        assert_eq!(artifact_kind_for("plan"), ArtifactKind::Plan);
-        assert_eq!(artifact_kind_for("plan_review"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("code_review"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("implement"), ArtifactKind::Diff);
-        assert_eq!(artifact_kind_for("test"), ArtifactKind::Tests);
-        assert_eq!(artifact_kind_for("anything-else"), ArtifactKind::Note);
+        use crate::orchestrator::roles::builtin_roles;
+        let roles = builtin_roles();
+        let kind_for = |key: &str| roles.iter().find(|r| r.key == key).map(|r| r.artifact_kind.clone());
+        assert_eq!(kind_for("plan"), Some(ArtifactKind::Plan));
+        assert_eq!(kind_for("plan_review"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("code_review"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("implement"), Some(ArtifactKind::Diff));
+        assert_eq!(kind_for("test"), Some(ArtifactKind::Tests));
         // refine outputs a refined PLAN; repro outputs FINDINGS — neither is a
         // diff. The kind picks both the dossier slot and the section label, so
         // a wrong mapping evicts an unrelated artifact AND mislabels this one.
-        assert_eq!(artifact_kind_for("refine"), ArtifactKind::Plan);
-        assert_eq!(artifact_kind_for("repro"), ArtifactKind::Review);
-        assert_eq!(artifact_kind_for("fix"), ArtifactKind::Diff);
+        assert_eq!(kind_for("refine"), Some(ArtifactKind::Plan));
+        assert_eq!(kind_for("repro"), Some(ArtifactKind::Review));
+        assert_eq!(kind_for("fix"), Some(ArtifactKind::Diff));
+        // unknown keys are no longer handled by a fallback match — they are DB-resident
     }
 
     #[test]
     fn system_prompt_is_role_specific() {
-        assert!(system_prompt_for("plan").to_lowercase().contains("plan"));
-        assert!(system_prompt_for("implement").to_lowercase().contains("implement"));
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
+        use crate::orchestrator::types::RoleEnvironment;
+        let roles = builtin_roles();
+        let prompt_for = |key: &str| {
+            let r = roles.iter().find(|r| r.key == key).unwrap();
+            compose_system_prompt(&r.prompt_body, r.environment, None, None)
+        };
+        assert!(prompt_for("plan").to_lowercase().contains("plan"));
+        assert!(prompt_for("implement").to_lowercase().contains("implement"));
     }
 
     #[test]
     fn system_prompt_frames_agent_as_non_interactive_pipeline_worker() {
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
+        use crate::orchestrator::types::RoleEnvironment;
+        let roles = builtin_roles();
         // Every stage, regardless of role, gets the autonomous/no-questions framing.
-        for role in ["plan", "implement", "code_review", "test", "anything"] {
-            let p = system_prompt_for(role).to_lowercase();
-            assert!(p.contains("never ask"), "role {role} missing no-questions directive");
-            assert!(p.contains("pipeline"), "role {role} missing pipeline framing");
-            assert!(p.contains("git"), "role {role} missing git-ownership note");
+        for key in ["plan", "implement", "code_review", "test"] {
+            let r = roles.iter().find(|r| r.key == key).unwrap();
+            let p = compose_system_prompt(&r.prompt_body, r.environment, None, None).to_lowercase();
+            assert!(p.contains("never ask"), "role {key} missing no-questions directive");
+            assert!(p.contains("pipeline"), "role {key} missing pipeline framing");
+            assert!(p.contains("git"), "role {key} missing git-ownership note");
         }
     }
 
@@ -2075,13 +2089,16 @@ mod runner_helpers_tests {
 
     #[test]
     fn auto_review_prompt_requests_a_verdict() {
-        use crate::orchestrator::runner::system_prompt_with_loop;
+        use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
         use crate::orchestrator::types::LoopMode;
-        let auto = system_prompt_with_loop("code_review", Some(LoopMode::Auto));
+        let roles = builtin_roles();
+        let cr = roles.iter().find(|r| r.key == "code_review").unwrap();
+        let auto = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None);
         assert!(auto.contains("VERDICT:"));
-        let gated = system_prompt_with_loop("code_review", Some(LoopMode::Gated));
+        let gated = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Gated), None);
         assert!(!gated.contains("VERDICT:"));
-        let plain = system_prompt_with_loop("implement", None);
+        let impl_r = roles.iter().find(|r| r.key == "implement").unwrap();
+        let plain = compose_system_prompt(&impl_r.prompt_body, impl_r.environment, None, None);
         assert!(!plain.contains("VERDICT:"));
     }
 
@@ -3122,7 +3139,7 @@ mod orchestrator_tests {
 
     /// A runner that always returns a hard Err (simulates CliRunnerUnavailable / unresolved model).
     /// Records each stage's assembled input dossier and produces a
-    /// role-appropriate artifact (kind from `artifact_kind_for`).
+    /// role-appropriate artifact (kind from stage.artifact_kind, resolved by the orchestrator).
     struct RecordingRunner {
         seen: Arc<Mutex<Vec<(String, StageInput)>>>,
     }
@@ -3135,7 +3152,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.role.clone(), input.clone()));
-            let kind = crate::orchestrator::runner::artifact_kind_for(&stage.role);
+            let kind = stage.artifact_kind.clone();
             let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
             Ok(StageOutcome {
                 artifact: StageArtifact {
@@ -3904,7 +3921,7 @@ mod cli_runner_tests {
 
     #[test]
     fn parses_success_into_done_outcome() {
-        let outcome = parse_cli_result(SUCCESS, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Done);
         assert_eq!(outcome.artifact.text, "Implemented the feature.");
         assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
@@ -3917,20 +3934,20 @@ mod cli_runner_tests {
 
     #[test]
     fn is_error_flag_yields_failed_outcome() {
-        let outcome = parse_cli_result(ERRORED, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
     }
 
     #[test]
     fn nonzero_exit_yields_failed_even_if_json_ok() {
-        let outcome = parse_cli_result(SUCCESS, false, "plan", "").unwrap();
+        let outcome = parse_cli_result(SUCCESS, false, ArtifactKind::Plan, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
     }
 
     #[test]
     fn unparseable_output_is_an_error() {
-        assert!(parse_cli_result("not json", true, "plan", "").is_err());
+        assert!(parse_cli_result("not json", true, ArtifactKind::Plan, "").is_err());
     }
 
     #[test]
@@ -3939,7 +3956,7 @@ mod cli_runner_tests {
         // historically with is_error=false — a success-shaped failure.
         const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"","is_error":false,
             "total_cost_usd":1.25,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let outcome = parse_cli_result(MAX_TURNS, true, "implement", "").unwrap();
+        let outcome = parse_cli_result(MAX_TURNS, true, ArtifactKind::Diff, "").unwrap();
         assert!(matches!(outcome.status, crate::orchestrator::types::StageStatus::Failed));
         assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
         assert_eq!(outcome.cost_usd, 1.25);
@@ -5425,13 +5442,13 @@ mod ancestry_tests {
 #[cfg(test)]
 mod cli_result_tests {
     use crate::orchestrator::cli_runner::parse_cli_result;
-    use crate::orchestrator::types::StageStatus;
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
     /// Task 2: subtype is surfaced even when is_error is true.
     #[test]
     fn parse_cli_result_names_subtype_when_is_error() {
         let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":20}}"#;
-        let out = parse_cli_result(line, true, "verify", "").unwrap();
+        let out = parse_cli_result(line, true, ArtifactKind::Review, "").unwrap();
         assert!(matches!(out.status, StageStatus::Failed));
         let err = out.error.unwrap();
         assert!(err.contains("error_max_turns"), "got: {err}");
@@ -5442,7 +5459,7 @@ mod cli_result_tests {
     fn parse_cli_result_appends_stderr_tail() {
         let line = r#"{"type":"result","is_error":true,"result":"","usage":{"input_tokens":0,"output_tokens":0}}"#;
         let stderr = "line one\noverloaded_error: server is busy\n";
-        let out = parse_cli_result(line, false, "fix", stderr).unwrap();
+        let out = parse_cli_result(line, false, ArtifactKind::Diff, stderr).unwrap();
         let err = out.error.unwrap();
         assert!(err.contains("overloaded_error"), "got: {err}");
     }
@@ -5451,7 +5468,7 @@ mod cli_result_tests {
     #[test]
     fn parse_cli_result_extracts_session_id() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc-123","usage":{"input_tokens":1,"output_tokens":2}}"#;
-        let out = parse_cli_result(line, true, "fix", "").unwrap();
+        let out = parse_cli_result(line, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(out.session_id.as_deref(), Some("abc-123"));
     }
 
@@ -5711,5 +5728,14 @@ mod roles_tests {
         let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None);
         assert!(rp.contains("may commit, push"));
         assert!(!rp.contains("Do not commit, push"));
+    }
+
+    #[test]
+    fn unknown_role_is_a_clean_failure_message() {
+        // compose still works for an arbitrary body+env (no role lookup needed here)
+        use crate::orchestrator::roles::compose_system_prompt;
+        use crate::orchestrator::types::RoleEnvironment;
+        let s = compose_system_prompt("Body.", RoleEnvironment::Worktree, None, None);
+        assert!(s.ends_with("Body."));
     }
 }

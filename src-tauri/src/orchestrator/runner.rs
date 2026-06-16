@@ -10,6 +10,10 @@ use crate::orchestrator::types::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Re-export compose_system_prompt from roles so callers can use it without
+/// importing the roles module directly.
+pub use crate::orchestrator::roles::compose_system_prompt;
+
 /// Everything a runner needs to execute one stage, beyond the `StageSpec`.
 pub struct StageContext {
     pub workspace_path: PathBuf,
@@ -48,56 +52,6 @@ pub trait AgentRunner: Send + Sync {
     ) -> AppResult<StageOutcome>;
 }
 
-/// Map a stage role to the kind of artifact it produces.
-///
-/// The kind drives two things downstream: the section label later stages see
-/// ("The plan to follow" vs "Review findings"…) and which dossier slot the
-/// artifact occupies — so a role mapped to the wrong kind both mislabels its
-/// output AND evicts an unrelated artifact from the context. `refine` produces
-/// a refined PLAN (its prompt: "refine and finalize the plan"), and `repro`
-/// produces FINDINGS (a root-cause description) — neither is a code diff.
-pub fn artifact_kind_for(role: &str) -> ArtifactKind {
-    match role {
-        "plan" | "refine" => ArtifactKind::Plan,
-        "plan_review" | "code_review" | "critique" | "verify" | "repro" => ArtifactKind::Review,
-        "implement" | "fix" => ArtifactKind::Diff,
-        "test" => ArtifactKind::Tests,
-        _ => ArtifactKind::Note,
-    }
-}
-
-/// Prepended to every stage prompt: the agent is one step in an automated,
-/// headless pipeline — there is no human to answer it mid-stage, so it must act
-/// autonomously and never block on input. The worktree is the shared blackboard
-/// between stages, so the agent leaves its changes uncommitted (later stages
-/// read them from the working tree) and must not touch git itself.
-const PIPELINE_PREAMBLE: &str = "You are one stage in an automated, headless build pipeline. \
-    There is NO human watching this stage and no way to answer you — never ask questions, never \
-    present options or menus, and never wait for input, confirmation, or approval. Work \
-    autonomously to completion using your tools, then end with a brief summary of what you did \
-    and anything still outstanding. Do not commit, push, or otherwise manage git: leave any code \
-    changes uncommitted in the working tree — the next stage reads them from there, and that is \
-    expected and correct.";
-
-/// Role-specific system prompt, with the shared [`PIPELINE_PREAMBLE`] prepended.
-pub fn system_prompt_for(role: &str) -> String {
-    let role_body = match role {
-        "plan" => "You are a senior engineer. Produce a concise, concrete implementation plan \
-            for the task. Do not write code; describe the steps, files, and approach.",
-        "plan_review" | "critique" => "You are a critical reviewer. Review the proposed plan for \
-            gaps, risks, and better approaches. Be specific and concise.",
-        "implement" | "fix" => "You are a skilled engineer. Implement the plan by editing files in \
-            the workspace using your tools. Make the changes; do not just describe them.",
-        "code_review" | "verify" => "You are a code reviewer. Inspect the current changes in the \
-            workspace and report concrete issues. Do not modify files.",
-        "test" => "You are a test engineer. Write unit tests for the recent changes using your \
-            tools to create the test files. Run them if a test command is obvious.",
-        "repro" => "You are a debugger. Reproduce the reported issue and describe the root cause.",
-        "refine" => "You are an editor. Refine and finalize the plan based on the prior review.",
-        _ => "You are a helpful engineering assistant working in the project workspace.",
-    };
-    format!("{PIPELINE_PREAMBLE}\n\n{role_body}")
-}
 
 /// Cap (chars) on a single dossier section fed to a stage. Generous enough for
 /// a full plan or review (~4k tokens), tight enough that a runaway artifact
@@ -182,36 +136,6 @@ pub fn user_input_for(
     s
 }
 
-const VERDICT_INSTRUCTION: &str = "\n\nThis is an automated review. After your findings, end your \
-    response with EXACTLY ONE line, on its own line: `VERDICT: PASS` if the changes are acceptable, \
-    or `VERDICT: CHANGES_REQUESTED` if they must be revised. Emit nothing after that line.";
-
-/// `system_prompt_for(role)` plus the auto-mode verdict instruction when this is
-/// an auto-loop stage. Convenience wrapper for [`compose_system_prompt`] with no
-/// author instructions.
-pub fn system_prompt_with_loop(role: &str, loop_mode: Option<crate::orchestrator::types::LoopMode>) -> String {
-    compose_system_prompt(role, loop_mode, None)
-}
-
-/// The full system prompt for a stage: the archetype body, then the pipeline
-/// author's free-form `instructions` (their creative shaping), then — last, so
-/// "emit nothing after the verdict line" still holds — the auto-mode verdict
-/// instruction when applicable.
-pub fn compose_system_prompt(
-    role: &str,
-    loop_mode: Option<crate::orchestrator::types::LoopMode>,
-    instructions: Option<&str>,
-) -> String {
-    let mut s = system_prompt_for(role);
-    if let Some(instr) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
-        s.push_str("\n\nAdditional instructions for this stage, from the pipeline author:\n");
-        s.push_str(instr);
-    }
-    if matches!(loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)) {
-        s.push_str(VERDICT_INSTRUCTION);
-    }
-    s
-}
 
 /// Parse the LAST `VERDICT: PASS|CHANGES_REQUESTED` line from a review stage's
 /// output (case/space tolerant). `None` when absent or malformed — the caller
@@ -248,7 +172,7 @@ impl AgentRunner for ApiRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
-        let system = compose_system_prompt(&stage.role, stage.loop_mode.clone(), stage.instructions.as_deref());
+        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref());
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
@@ -305,7 +229,7 @@ impl AgentRunner for ApiRunner {
                         session_id: None,
                     });
                 }
-                let kind = artifact_kind_for(&stage.role);
+                let kind = stage.artifact_kind.clone();
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
                 let verdict = parse_verdict(&r.text);
                 if let Some(v) = &verdict {

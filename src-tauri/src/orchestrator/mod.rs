@@ -304,6 +304,14 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
+        let role_def = match self.db.lock().get_role(&stage.role)? {
+            Some(rd) => rd,
+            None => {
+                self.db.lock().fail_run_stage(&stage.id, &format!("unknown role '{}'", stage.role))?;
+                self.record_halt(&run.id, &stage.id, &format!("unknown role '{}'", stage.role));
+                return Ok((StageStatus::Failed, None));
+            }
+        };
         let spec = StageSpec {
             position: stage.position,
             role: stage.role.clone(),
@@ -320,6 +328,9 @@ impl Orchestrator {
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
             stage_id: stage.id.clone(),
+            role_prompt: role_def.prompt_body,
+            role_environment: role_def.environment,
+            artifact_kind: role_def.artifact_kind,
         };
 
         // Clear resume_pending once the run starts so a second re-run is always fresh.
@@ -831,7 +842,10 @@ impl Orchestrator {
                         // input and runs against the worktree as the halted agent
                         // left it — the following review stage catches any gaps
                         // and loops back (the pipeline-native recovery).
-                        let kind = crate::orchestrator::runner::artifact_kind_for(&s.role);
+                        let kind = self.db.lock().get_role(&s.role)
+                            .ok().flatten()
+                            .map(|rd| rd.artifact_kind)
+                            .unwrap_or(ArtifactKind::Note);
                         let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
                         let reason = s
                             .error

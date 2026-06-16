@@ -2593,7 +2593,7 @@ const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 /// `tool_definitions()` in chat_engine.rs and `ARCHETYPES` in the builder.
 pub const KNOWN_TOOLS: &[&str] = &["read_file", "list_files", "write_file", "run_command"];
 
-// Keep in sync with ALL_ROLES/REVIEW_ROLES in src/components/PipelineBuilder.tsx and the role match arms in orchestrator/runner.rs (artifact_kind_for / system_prompt_for).
+// TODO(roles-T5): Replace KNOWN_ROLES/REVIEW_ROLES with DB lookup after validate_pipeline_stages becomes a Db method.
 const KNOWN_ROLES: &[&str] = &[
     "plan", "plan_review", "implement", "code_review", "test",
     "repro", "fix", "verify", "critique", "refine",

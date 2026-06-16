@@ -235,6 +235,10 @@ pub struct StageSpec {
     pub resume_session: Option<String>,
     /// The stage id, so the runner can clear `resume_pending` once it starts.
     pub stage_id: String,
+    /// Resolved from the role's definition at spec-build time.
+    pub role_prompt: String,
+    pub role_environment: crate::orchestrator::types::RoleEnvironment,
+    pub artifact_kind: crate::orchestrator::types::ArtifactKind,
 }
 
 /// A single tool invocation, captured for the run-event log.
