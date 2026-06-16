@@ -13,6 +13,25 @@ pub enum ArtifactKind {
     Note,
 }
 
+impl ArtifactKind {
+    pub fn as_db(&self) -> &'static str {
+        match self { Self::Plan => "plan", Self::Review => "review", Self::Tests => "tests", Self::Diff => "diff", Self::Note => "note" }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s { "plan" => Some(Self::Plan), "review" => Some(Self::Review), "tests" => Some(Self::Tests), "diff" => Some(Self::Diff), "note" => Some(Self::Note), _ => None }
+    }
+}
+
+/// Whether a role leaves the worktree dirty for the next stage (the default) or
+/// is allowed to perform git/external side-effects (commit/push/release).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoleEnvironment { Worktree, Action }
+impl RoleEnvironment {
+    pub fn as_db(&self) -> &'static str { match self { Self::Worktree => "worktree", Self::Action => "action" } }
+    pub fn from_db(s: &str) -> Option<Self> { match s { "worktree" => Some(Self::Worktree), "action" => Some(Self::Action), _ => None } }
+}
+
 /// The structured output one stage hands to the next.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]

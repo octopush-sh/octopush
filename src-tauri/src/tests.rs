@@ -1869,6 +1869,28 @@ mod orchestrator_types_tests {
         assert_eq!(AgentSubstrate::Api.as_db(), "api");
         assert_eq!(AgentSubstrate::from_db("cli"), Some(AgentSubstrate::Cli));
     }
+
+    #[test]
+    fn artifact_kind_db_roundtrip() {
+        use crate::orchestrator::types::ArtifactKind;
+        for (k, s) in [
+            (ArtifactKind::Plan, "plan"), (ArtifactKind::Review, "review"),
+            (ArtifactKind::Tests, "tests"), (ArtifactKind::Diff, "diff"), (ArtifactKind::Note, "note"),
+        ] {
+            assert_eq!(k.as_db(), s);
+            assert_eq!(ArtifactKind::from_db(s), Some(k));
+        }
+        assert_eq!(ArtifactKind::from_db("bogus"), None);
+    }
+
+    #[test]
+    fn role_environment_db_roundtrip() {
+        use crate::orchestrator::types::RoleEnvironment;
+        assert_eq!(RoleEnvironment::Worktree.as_db(), "worktree");
+        assert_eq!(RoleEnvironment::Action.as_db(), "action");
+        assert_eq!(RoleEnvironment::from_db("action"), Some(RoleEnvironment::Action));
+        assert_eq!(RoleEnvironment::from_db("x"), None);
+    }
 }
 
 #[cfg(test)]
