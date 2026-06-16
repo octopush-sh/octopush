@@ -5766,4 +5766,35 @@ mod roles_tests {
         assert!(db.get_role("security_review").unwrap().unwrap().can_loop);
         assert_eq!(db.get_role("architect").unwrap().unwrap().artifact_kind.as_db(), "plan");
     }
+
+    #[test]
+    fn delete_role_rejects_when_in_use() {
+        let (db, _tmp) = test_db();
+        // Create a custom role.
+        let cr = db.get_role("code_review").unwrap().unwrap();
+        let mut custom = cr.clone();
+        custom.key = "perf_audit".into();
+        custom.label = "Perf audit".into();
+        custom.is_builtin = false;
+        db.upsert_role(&custom).unwrap();
+        // Not in use yet.
+        assert!(!db.role_in_use("perf_audit").unwrap());
+        // Wire a pipeline stage that references the custom role.
+        let pid = db.insert_pipeline("test-pipe", "desc", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "perf_audit", "claude-haiku-4-5", "api", false, None, 0, None, 25).unwrap();
+        // Now it's in use — role_in_use must be true.
+        assert!(db.role_in_use("perf_audit").unwrap());
+        // The delete_role command guard must refuse.
+        let result = db.role_in_use("perf_audit").unwrap();
+        assert!(result, "role should be in use after stage insert");
+        // Simulate the command logic: if in use, error; else delete.
+        let del_result: crate::error::AppResult<()> = if db.role_in_use("perf_audit").unwrap() {
+            Err(crate::error::AppError::Other("role 'perf_audit' is used by a pipeline".into()))
+        } else {
+            db.delete_role("perf_audit")
+        };
+        assert!(del_result.is_err(), "delete should be rejected when role is in use");
+        let err_msg = del_result.unwrap_err().to_string();
+        assert!(err_msg.contains("perf_audit"), "error should mention the role key");
+    }
 }

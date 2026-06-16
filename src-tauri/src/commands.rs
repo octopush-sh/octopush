@@ -3993,6 +3993,29 @@ pub async fn connect_claude_code() -> AppResult<crate::mcp_setup::McpConnectResu
         .map_err(|e| AppError::Other(format!("connect task failed: {e}")))
 }
 
+// ─── Role commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_roles(state: State<'_, AppState>) -> AppResult<Vec<crate::orchestrator::roles::RoleDef>> {
+    state.db.lock().list_roles()
+}
+
+#[tauri::command]
+pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::roles::RoleDef) -> AppResult<crate::orchestrator::roles::RoleDef> {
+    let mut role = role;
+    role.is_builtin = false; // user-saved roles are never built-in
+    if role.key.trim().is_empty() { return Err(crate::error::AppError::Other("role key required".into())); }
+    state.db.lock().upsert_role(&role)?;
+    Ok(role)
+}
+
+#[tauri::command]
+pub async fn delete_role(state: State<'_, AppState>, key: String) -> AppResult<()> {
+    let db = state.db.lock();
+    if db.role_in_use(&key)? { return Err(crate::error::AppError::Other(format!("role '{key}' is used by a pipeline"))); }
+    db.delete_role(&key)
+}
+
 #[cfg(test)]
 mod ai_complete_tests {
     use crate::providers::{LlmContent, LlmRole};

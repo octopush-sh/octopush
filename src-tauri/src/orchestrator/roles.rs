@@ -3,9 +3,11 @@
 //! with is_builtin=0. The runner composes a stage's system prompt from a role's
 //! prompt_body + the preamble its environment contract selects.
 
+use serde::{Deserialize, Serialize};
 use crate::orchestrator::types::{ArtifactKind, LoopMode, RoleEnvironment};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoleDef {
     pub key: String,
     pub label: String,

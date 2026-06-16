@@ -311,6 +311,10 @@ pub fn run() {
             // MCP server integration (Connect to Claude Code)
             commands::mcp_connection_status,
             commands::connect_claude_code,
+            // Role commands
+            commands::list_roles,
+            commands::save_role,
+            commands::delete_role,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.
