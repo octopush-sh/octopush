@@ -26,13 +26,30 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 7. **No new colors without spec update.** If a feature needs a hue not in the palette, propose updating the spec first — don't slip new accents in via a PR.
 8. **UI copy is English. Always. No exceptions.** Every visible string (labels, buttons, placeholders, helper text, empty states, error messages, aria-labels, tooltips, eyebrow text, modal titles) is English regardless of the developer's chat language. Mixing languages is a bug. The one exception is **user data** displayed verbatim from third-party APIs (e.g. Jira's `statusName` is whatever Jira returns in the user's account locale — we never translate it; if the user wants English statuses, they change their Jira profile language).
 
-### Five signature details — preserve these always
+### Signature details and decorative retirement (2026-06-16)
 
+> **Retired for new surfaces:** The brass *rule* divider (28px gradient), the `⟶` glyph used as **ornament** (prompt decoration, input nudges, button accents), and the `✦` flourish are **banned on all new UI**. Do not introduce them. Structural/functional glyphs are explicitly preserved (see below).
+
+**Structural glyphs — keep these:**
+- **`⟶` in brass — structural only** — Direct run-track stage connector. NOT as prompt glyph or ornament on new surfaces.
+- **`⟜` in brass** — Direct run-track checkpoint gate.
+- **`§` in brass** — every tool call card (`§ TOOL_NAME`) and Direct focus-pane role headers. Structural; do not retire.
+
+**Active branding details:**
 - **`&` in brass** — "Octopus & you" branding. The ampersand alone is brass.
-- **`⟶` in brass** — the prompt glyph everywhere (terminal, palette, input nudges).
-- **`§` in brass** — every tool call card is prefixed with `§ TOOL_NAME`.
-- **Roman numerals** — multi-step wizards use `I · II · III` in brass mono.
-- **Italic-serif placeholders** — input placeholders are phrases in Spectral italic.
+- **Roman numerals** — multi-step wizards use `I · II · III` in brass mono; Direct run-track stage numbers.
+- **Upright-serif phrases** — CTAs and placeholders use upright serif phrases (no italics anywhere; `em, i { font-style: normal }` enforced globally).
+
+### Minimalism principles (binding)
+
+These complement the design rules above and govern all new surfaces:
+
+- **Theme-agnostic via tokens. Never hardcode.** Colors, fonts, and spacing go through `--color-octo-*` CSS variables and Tailwind token classes. No hex literals, no raw font strings outside `styles.css`.
+- **No decorative flourishes on new surfaces.** Brass rule, `⟶` as ornament, and `✦` are retired (see above).
+- **Icons over text where possible, with `title` tooltips.** Use a `lucide-react` icon + `title` attribute instead of a text label wherever the icon is unambiguous. Never ship an icon without a tooltip.
+- **Smooth, token-driven transitions.** Every element that mounts/unmounts uses the motion primitives in `src/styles.css` (§6 of the cheatsheet). Do not hand-roll or mount abruptly.
+- **Intuitive and professional.** Controls behave exactly as a developer expects. No surprising gestures, no undiscoverable interactions, no status requiring decoding.
+- **Minimal visual noise.** Every element earns its place. No redundant labels, no nested borders, no decorative chrome that isn't functional.
 
 ---
 

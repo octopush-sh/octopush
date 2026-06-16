@@ -60,7 +60,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 - **Spacing scale (base 4):** `4 · 8 · 12 · 16 · 24 · 32 · 48`. Default gaps: 12 / 16 / 24. Premium breath: 24 / 32.
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
-- **Brass rule:** 28px gradient `linear-gradient(90deg, var(--brass), transparent)` — the signature divider for moments.
+- **Brass rule:** 28px gradient `linear-gradient(90deg, var(--brass), transparent)` — the signature divider for moments. **RETIRED for new surfaces (2026-06-16).** Existing uses in legacy surfaces remain; do not add this pattern to any new UI. Use `--hairline` borders or spacing for visual separation instead.
 
 ---
 
@@ -134,18 +134,21 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 ---
 
-## 5. Five signature details — preserve always
+## 5. Signature details — structural glyphs and active patterns
 
-| Detail        | Where to use                                                        |
-|---------------|---------------------------------------------------------------------|
-| `&` in brass  | "Octopus & you" branding moments (welcome, about)                   |
-| `⟶` in brass | Terminal prompt, command palette prompt, input nudges; also the Direct run-track stage connector. **Never as button/CTA decoration** — buttons carry the phrase alone (user rule, 2026-06-11: structural flow glyphs yes, ornamental arrows on actions no) |
-| `§` in brass  | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; also Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER` |
-| Roman numerals| Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; also Direct run-track stage numbers |
-| Italic phrases| CTAs and placeholders are **phrases in Spectral italic**, not labels|
-| `⟜` in brass | Direct run-track checkpoint gate — pauses the pipeline for human approval |
-| `⟳` in **amber** (`--color-octo-warning`) | Direct mode transient halt — a stage stalled on a recoverable substrate fault (rate limit, overload, dropped connection) and awaits **Resume**. Amber = caution, never brass: a transient stall is not a hard `✕` failure. Used consistently on the run-track card, the focus banner, and the checkpoint strip |
-| Substrate pills | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
+> **Decorative flourish retirement (2026-06-16):** The brass *rule* divider (§3), the `⟶` glyph used as **ornament** (prompt decoration, input nudges, button accents), and the `✦` flourish are **retired for all new surfaces**. Do not introduce them in new components. See §9 (Minimalism doctrine) for the replacement principles. What remains of `⟶` is its **structural/functional** role in Direct mode (see below) — that is not retired.
+
+| Detail        | Status | Where to use                                                        |
+|---------------|--------|---------------------------------------------------------------------|
+| `&` in brass  | Active | "Octopus & you" branding moments (welcome, about)                   |
+| `⟶` in brass — **structural only** | Active (structural); **RETIRED as ornament** | **KEEP:** Direct run-track stage connector; Direct checkpoint gate flow. **DO NOT add** as prompt glyph, input nudge, or button decoration on any new surface. |
+| `⟜` in brass | Active | Direct run-track checkpoint gate — pauses the pipeline for human approval |
+| `§` in brass  | Active | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER`. This prefix is structural; do not retire it. |
+| Roman numerals| Active | Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; Direct run-track stage numbers |
+| Italic phrases| Active — **upright only** | CTAs and placeholders use upright serif phrases (italics banned app-wide; see §9) |
+| `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass. |
+| Substrate pills | Active | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
+| `✦` flourish  | **RETIRED** | Never use. Not in any existing surface; do not introduce. |
 
 ---
 
@@ -214,17 +217,21 @@ Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPan
 
 ---
 
-## 9. Minimalism doctrine (2026-06-10)
+## 9. Minimalism doctrine (2026-06-10; extended 2026-06-16)
 
-Binding norm: **reduce visual noise; give a sense of control and cleanliness — without losing features.** Simplify presentation, never capability.
+Binding norm: **reduce visual noise; give a sense of control and cleanliness — without losing features.** Simplify presentation, never capability. Octopush must feel professional and intentional — not like a generic AI tool.
 
-- **Zero italics, buttons especially.** Upright serif phrases are allowed for *moments*; controls never slant.
+- **Theme-agnostic via design tokens. Never hardcode.** All colors, fonts, and spacing go through `--color-octo-*` CSS variables and Tailwind token classes. A component that hardcodes a hex value, a font string, or a pixel color is a bug. When a token is missing, add it to `src/styles.css` (and `src/lib/tokens.ts` when it exists) — never inline it.
+- **Zero italics, buttons especially.** Upright serif phrases are allowed for *moments*; controls never slant. `em, i { font-style: normal }` in `styles.css` enforces this globally.
+- **No decorative flourishes on new surfaces.** The brass *rule* divider, the `⟶` glyph used as ornament, and the `✦` character are retired (2026-06-16). Existing uses in legacy surfaces may remain; do not add to new components. Structural/functional glyphs (`⟶` as Direct run-track connector, `⟜` checkpoint gate, `§` tool-call prefix) are explicitly preserved — see §5.
 - **Every element earns its place.** A state shown by a colored dot does not also get a text label (the dot gets a `title`). A count visible in a list is not repeated in its header. A percentage encoded by a bar's width is not printed next to it.
 - **One canonical chrome per concept.** Section header = the eyebrow bar (`flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass`). Quiet action = the icon button (`flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`, 12px lucide icon, always with `title`). Don't invent a third.
-- **Icons over text where an icon + `title` tooltip says the same.** Truncated or elided text always carries `title`.
+- **Icons over text where an icon + `title` tooltip says the same.** Prefer a `lucide-react` icon with a `title` attribute over a text label for any action where the icon is unambiguous in context. Truncated or elided text always carries `title`. Never ship an icon without a tooltip.
+- **Smooth, token-driven enter/exit transitions.** Every element that appears or disappears uses the motion primitives in §6 (`.octo-modal-enter`, `.octo-menu-enter`, `.octo-fade-in`, `<Reveal>`, `<FadeSwap>`, `.octo-rise-in`). Do not hand-roll transitions; do not mount/unmount abruptly.
 - **Boxes don't nest.** No border-inside-border-inside-border; if a container is already bounded, its children don't bring their own frame.
 - **Nothing appears or disappears abruptly.** Mode/state swaps use `FadeSwap`; rows enter with `octo-rise-in`; collapses use grid-rows; async content prefers stale-while-revalidate over blank-and-reload. Reserve layout slots (border/glyph widths) so state changes never shift content.
 - **Progressive disclosure over removal.** Secondary panels may default collapsed (persist the user's choice); features stay one click away.
+- **Intuitive, not clever.** UI should be self-evident. Controls behave exactly as a professional developer expects. Avoid surprising interactions, undiscoverable gestures, or status that requires decoding.
 
 ---
 
