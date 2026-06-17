@@ -226,6 +226,13 @@ export interface McpToolInfo {
   description: string;
 }
 
+/** A configured MCP server (stdio): the command to spawn + its args/env. */
+export interface McpServerConfig {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;

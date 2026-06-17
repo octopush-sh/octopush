@@ -985,6 +985,34 @@ pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> 
     Ok(names)
 }
 
+/// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
+#[tauri::command]
+pub async fn get_mcp_config(
+) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+    Ok(crate::mcp::load_user_config())
+}
+
+/// Replace the user-level MCP server config.
+#[tauri::command]
+pub async fn save_mcp_config(
+    servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+) -> AppResult<()> {
+    crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)
+}
+
+/// Smoke-test a single server config: spawn it, run the handshake, and return
+/// its tools (or an error). The connection is dropped immediately after.
+#[tauri::command]
+pub async fn test_mcp_server(
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    tokio::task::spawn_blocking(move || crate::mcp::McpRegistry::test_connect(&name, &config))
+        .await
+        .map_err(|e| crate::error::AppError::Other(e.to_string()))?
+        .map_err(crate::error::AppError::Other)
+}
+
 /// Identify a supported image type from its leading bytes, or None.
 fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

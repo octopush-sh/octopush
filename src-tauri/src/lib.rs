@@ -184,6 +184,9 @@ pub fn run() {
             commands::read_attachment,
             commands::list_mcp_tools,
             commands::list_mcp_servers,
+            commands::get_mcp_config,
+            commands::save_mcp_config,
+            commands::test_mcp_server,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,
