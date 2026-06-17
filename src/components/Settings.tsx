@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, RefreshCw, CheckCircle, Loader2, Minus, Pencil, Plus, X } from "lucide-react";
+import { McpServersSection } from "./settings/McpServersSection";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useEditorPrefs, FONT_MIN, FONT_MAX, TAB_WIDTHS } from "../stores/editorPrefsStore";
@@ -2224,6 +2225,9 @@ function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
 
       {/* ── Coding Agents — Octopush MCP server ── */}
       <ClaudeCodeCard />
+
+      {/* ── MCP servers Octopush connects to (chat tools) ── */}
+      <McpServersSection />
     </>
   );
 }
