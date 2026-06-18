@@ -168,18 +168,23 @@ export function Companion({
       className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
-      <div className="relative flex items-center justify-center border-b border-octo-hairline px-3 py-2">
-        <ModeSwitcher
-          mode={mode}
-          onChange={onModeChange}
-          workspaceId={workspaceId ?? undefined}
-        />
+      {/* The collapse button is in-flow (reserves its space) so the centered
+          ModeSwitcher can never slide under it; its wrapper is min-w-0 and
+          scrolls if the companion is narrowed past the switcher's width. */}
+      <div className="flex items-center gap-1 border-b border-octo-hairline px-2 py-2">
+        <div className="flex min-w-0 flex-1 justify-center overflow-x-auto">
+          <ModeSwitcher
+            mode={mode}
+            onChange={onModeChange}
+            workspaceId={workspaceId ?? undefined}
+          />
+        </div>
         <button
           type="button"
           onClick={onToggleCollapsed}
           aria-label="Collapse companion"
           title="Collapse companion"
-          className="absolute right-2 flex h-7 w-7 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           <PanelRightClose size={16} />
         </button>
