@@ -257,35 +257,41 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         opacity: isCollapsed || projectExpanded ? 1 : 0,
       }}
     >
-      <div className={`flex min-h-0 flex-col gap-0.5 overflow-hidden ${isCollapsed ? "" : "p-1"}`}>
-        {visibleWs.map((ws) => (
-          <WorkspaceRow
-            key={ws?.id || `ws-${projectIndex}`}
-            workspace={ws}
-            active={ws?.id === activeWorkspaceId}
-            isCollapsed={isCollapsed}
-            ticketKey={
-              ws?.linkedIssueKey ??
-              detectIssueKeyForProject(ws?.branch ?? "", project.jiraProjectKey ?? null)
-            }
-            dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
-            ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
-            behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
-            hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
-            onSelect={() => ws?.id && onSelect(ws.id)}
-            onCustomize={() => ws?.id && onCustomize(ws.id)}
-            onContextMenu={
-              onContextMenu && ws?.id
-                ? (x, y) => onContextMenu(ws.id, x, y)
-                : undefined
-            }
-          />
-        ))}
-        {!isCollapsed && visibleWs.length === 0 && (
-          <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
-            No workspaces yet
-          </div>
-        )}
+      {/* Clip wrapper carries NO padding so the grid-rows 0fr collapse reaches a
+          true 0px — padding on the grid item itself survives the collapse and
+          left a visible "lip" of border below a collapsed project's header. The
+          row padding lives on the inner content div instead. */}
+      <div className="min-h-0 overflow-hidden">
+        <div className={`flex flex-col gap-0.5 ${isCollapsed ? "" : "p-1"}`}>
+          {visibleWs.map((ws) => (
+            <WorkspaceRow
+              key={ws?.id || `ws-${projectIndex}`}
+              workspace={ws}
+              active={ws?.id === activeWorkspaceId}
+              isCollapsed={isCollapsed}
+              ticketKey={
+                ws?.linkedIssueKey ??
+                detectIssueKeyForProject(ws?.branch ?? "", project.jiraProjectKey ?? null)
+              }
+              dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
+              ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
+              behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
+              hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+              onSelect={() => ws?.id && onSelect(ws.id)}
+              onCustomize={() => ws?.id && onCustomize(ws.id)}
+              onContextMenu={
+                onContextMenu && ws?.id
+                  ? (x, y) => onContextMenu(ws.id, x, y)
+                  : undefined
+              }
+            />
+          ))}
+          {!isCollapsed && visibleWs.length === 0 && (
+            <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
+              No workspaces yet
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
