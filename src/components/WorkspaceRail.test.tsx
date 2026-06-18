@@ -321,6 +321,55 @@ describe("WorkspaceRail", () => {
     expect(monogramButton).toHaveAttribute("title", "Alpha");
   });
 
+  it("renders status chips for ticket, ahead count, and open PR", () => {
+    const workspaces = [
+      makeWorkspace({ id: "a", name: "Alpha", linkedIssueKey: "GUIDE-42" }),
+    ];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z" /* not active, so dirty chip can show */
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        gitSummaryByWs={{ a: { dirty: true, ahead: 90, behind: 0 } as never }}
+        prByWs={{ a: { number: 7 } as never }}
+      />,
+    );
+    // Ticket key chip
+    expect(screen.getByText("GUIDE-42")).toBeInTheDocument();
+    // Ahead count chip
+    expect(screen.getByText("90")).toBeInTheDocument();
+    // Open PR chip carries an accessible title
+    expect(screen.getByTitle(/open pull request/i)).toBeInTheDocument();
+    // Dirty chip on a non-active workspace (row chip uses the exact phrase;
+    // the header aggregate differs — "N workspace(s) with uncommitted changes").
+    expect(screen.getByTitle("Uncommitted changes")).toBeInTheDocument();
+  });
+
+  it("rolls project status up into header chips", () => {
+    const workspaces = [
+      makeWorkspace({ id: "a", name: "Alpha" }),
+      makeWorkspace({ id: "b", name: "Beta" }),
+    ];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="a"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        gitSummaryByWs={{ a: { dirty: true } as never, b: { dirty: true } as never }}
+        prByWs={{ a: { number: 1 } as never }}
+      />,
+    );
+    // 2 workspaces dirty, 1 open PR → header aggregate chips with those titles.
+    expect(screen.getByTitle(/2 workspaces with uncommitted changes/i)).toBeInTheDocument();
+    expect(screen.getByTitle(/1 open pr/i)).toBeInTheDocument();
+  });
+
   it("should display active state with correct styling", () => {
     const workspaces = [
       makeWorkspace({ id: "a", name: "Alpha" }),
