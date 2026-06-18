@@ -148,6 +148,44 @@ describe("ModelsPane — model editing", () => {
     await renderModelsPane();
     expect(screen.queryByRole("button", { name: /save changes/i })).not.toBeInTheDocument();
   });
+
+  it("rejects a model whose id duplicates an existing one", async () => {
+    await renderModelsPane();
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
+    const dialog = modelDialog();
+    await act(async () => {
+      fireEvent.change(within(dialog).getByPlaceholderText(/model id/i), {
+        target: { value: "claude-sonnet-4-6" },
+      });
+    });
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^add model$/i })); });
+
+    expect(within(dialog).getByText(/already exists/i)).toBeInTheDocument();
+  });
+});
+
+describe("ModelsPane — provider display names", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSettingsMock.mockResolvedValue(MOCK_SETTINGS);
+  });
+
+  it("renders canonical capitalization for built-in providers (OpenAI, not Openai)", async () => {
+    const openai: ProviderConfig = {
+      name: "openai",
+      apiBase: "https://api.openai.com/v1",
+      apiKeyEnv: "OPENAI_API_KEY",
+      models: [],
+      enabled: true,
+      protocol: "openai-compatible",
+      local: false,
+    };
+    listProvidersMock.mockResolvedValue([openai]);
+    await renderModelsPane();
+    expect(screen.getAllByText("OpenAI").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Openai")).not.toBeInTheDocument();
+  });
 });
 
 describe("ModelsPane — custom provider management", () => {

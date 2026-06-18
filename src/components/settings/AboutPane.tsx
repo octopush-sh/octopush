@@ -90,7 +90,7 @@ export function AboutPane() {
               <div className="mt-3">
                 <div className="h-[3px] overflow-hidden rounded-sm" style={{ background: "var(--color-octo-hairline)" }}>
                   <div
-                    className="h-full transition-all"
+                    className="h-full transition-[width]"
                     style={{ width: `${progress}%`, background: "var(--color-octo-brass)" }}
                   />
                 </div>

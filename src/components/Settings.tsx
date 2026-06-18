@@ -48,8 +48,11 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
       className="absolute inset-0 z-40 flex flex-col bg-octo-bg"
       data-tauri-drag-region
       style={{
+        // --brass-faint is the accent at 4% alpha, re-derived per theme by
+        // themeStore — so the wash follows the active palette instead of
+        // staying Atelier-brass under a legacy theme.
         background:
-          "radial-gradient(ellipse at 20% 10%, rgba(212,165,116,0.04), transparent 50%), var(--color-octo-onyx)",
+          "radial-gradient(ellipse at 20% 10%, var(--brass-faint), transparent 50%), var(--color-octo-onyx)",
       }}
     >
       {/* Header */}
@@ -115,6 +118,7 @@ function TabButton({ label, active, onClick }: {
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className="mb-0.5 flex w-full items-baseline rounded-md px-3 py-1.5 text-left transition"
       style={
         active

@@ -59,7 +59,10 @@ export function ModelsPane() {
     });
   }, []);
 
-  const dirty = serialize(providers, keys, baseUrls) !== snapshot;
+  const dirty = useMemo(
+    () => serialize(providers, keys, baseUrls) !== snapshot,
+    [providers, keys, baseUrls, snapshot],
+  );
 
   // Resolve the selected provider, falling back to the first if the selection
   // was removed (so the detail pane is never blank while providers exist).
@@ -94,7 +97,12 @@ export function ModelsPane() {
       await ipc.saveSettings({ ...current, providerKeys: filteredKeys, providerBaseUrls: filteredBaseUrls });
       // Refresh models so the picker reflects edits.
       await ipc.listModels?.();
-      setSnapshot(serialize(providers, keys, baseUrls));
+      // Align the working copy + snapshot with exactly what was persisted —
+      // empty credential entries are dropped on disk, so adopt the filtered set
+      // here too, otherwise the in-memory snapshot wouldn't match a fresh load.
+      setKeys(filteredKeys);
+      setBaseUrls(filteredBaseUrls);
+      setSnapshot(serialize(providers, filteredKeys, filteredBaseUrls));
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
     } finally {
@@ -114,6 +122,17 @@ export function ModelsPane() {
   }
 
   async function handleRefreshPricing() {
+    // Pricing refresh replaces the in-memory catalog with the server's freshly
+    // priced one. Refuse while there are unsaved edits so we never silently
+    // clobber them.
+    if (dirty) {
+      pushToast({
+        level: "error",
+        title: "Unsaved changes",
+        body: "Save or discard your changes before refreshing pricing.",
+      });
+      return;
+    }
     setRefreshingPricing(true);
     setPricingMessage(null);
     try {
@@ -240,7 +259,7 @@ export function ModelsPane() {
       <div className="sticky bottom-0 mt-6 max-w-[860px]">
         <Reveal open={dirty}>
           <div
-            className="octo-rise-in flex items-center gap-3 rounded-lg px-4 py-2.5"
+            className="flex items-center gap-3 rounded-lg px-4 py-2.5"
             style={{ background: "var(--color-octo-panel-2)", border: "1px solid var(--brass-dim)" }}
           >
             <span className="font-serif text-[13px] text-octo-ivory">Unsaved changes</span>
@@ -280,8 +299,13 @@ export function ModelsPane() {
 
       {modelDialog && selected && (
         <ModelDialog
-          providerName={titleCase(selected.name)}
+          providerName={displayProviderName(selected.name)}
           initial={modelDialog.mode === "edit" ? modelDialog.model : undefined}
+          takenIds={
+            modelDialog.mode === "edit"
+              ? selected.models.filter((x) => x.id !== modelDialog.model.id).map((x) => x.id)
+              : selected.models.map((x) => x.id)
+          }
           onSubmit={submitModel}
           onClose={() => setModelDialog(null)}
         />
@@ -293,7 +317,18 @@ export function ModelsPane() {
           body="The provider and all its models will be removed from the catalog. This cannot be undone without resetting to defaults."
           destructiveLabel="Remove provider"
           onConfirm={() => {
-            setProviders((ps) => ps.filter((p) => p.name !== confirmRemoveProvider));
+            const removed = confirmRemoveProvider;
+            const next = providers.filter((p) => p.name !== removed);
+            setProviders(next);
+            // Remove is only reachable from the selected provider's detail, so
+            // advance the selection to keep selectedName truthful.
+            if (selectedName === removed || selected?.name === removed) {
+              setSelectedName(next[0]?.name ?? null);
+            }
+            // Prune orphaned credentials so they aren't re-persisted for a
+            // provider that no longer exists in the catalog.
+            setKeys((k) => Object.fromEntries(Object.entries(k).filter(([n]) => n !== removed)));
+            setBaseUrls((b) => Object.fromEntries(Object.entries(b).filter(([n]) => n !== removed)));
             setConfirmRemoveProvider(null);
           }}
           onCancel={() => setConfirmRemoveProvider(null)}
@@ -333,7 +368,7 @@ function ProviderListItem({ provider, active, onSelect }: {
     >
       <span aria-hidden className="h-2 w-2 shrink-0 rounded-full" style={{ background: providerDot(provider.name) }} />
       <span className={`flex-1 truncate font-serif text-[14px] ${active ? "text-octo-brass" : "text-octo-ivory"}`}>
-        {titleCase(provider.name)}
+        {displayProviderName(provider.name)}
       </span>
       <span className="octo-tabular shrink-0 font-mono text-[10px] text-octo-mute">
         {provider.local ? "local" : provider.models.length}
@@ -377,7 +412,7 @@ function ProviderDetail({
     <div className="octo-fade-in">
       <div className="flex items-baseline justify-between gap-3">
         <div className="flex items-baseline gap-2.5">
-          <h3 className="font-serif text-[17px] text-octo-ivory">{titleCase(provider.name)}</h3>
+          <h3 className="font-serif text-[17px] text-octo-ivory">{displayProviderName(provider.name)}</h3>
           <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
             {provider.local ? "local" : "cloud"}
           </span>
@@ -496,6 +531,19 @@ function ProviderDetail({
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
+
+// Built-in providers have canonical capitalizations that a naive title-case
+// would mangle (e.g. "openai" → "Openai" instead of "OpenAI").
+const PROVIDER_DISPLAY: Record<string, string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  deepseek: "DeepSeek",
+  ollama: "Ollama",
+};
+
+function displayProviderName(name: string): string {
+  return PROVIDER_DISPLAY[name] ?? titleCase(name);
+}
 
 function titleCase(name: string): string {
   return name ? name[0].toUpperCase() + name.slice(1) : name;

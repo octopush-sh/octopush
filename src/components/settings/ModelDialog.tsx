@@ -8,11 +8,14 @@ import { ModalShell } from "../ModalShell";
 export function ModelDialog({
   providerName,
   initial,
+  takenIds = [],
   onSubmit,
   onClose,
 }: {
   providerName: string;
   initial?: ModelInfo;
+  /** Ids already used by other models in this provider — rejected as duplicates. */
+  takenIds?: string[];
   onSubmit: (m: ModelInfo) => void;
   onClose: () => void;
 }) {
@@ -24,8 +27,13 @@ export function ModelDialog({
   const [err, setErr] = useState<string | null>(null);
 
   function submit() {
-    if (!id.trim()) {
+    const trimmed = id.trim();
+    if (!trimmed) {
       setErr("Model id is required");
+      return;
+    }
+    if (takenIds.includes(trimmed)) {
+      setErr("A model with that id already exists");
       return;
     }
     onSubmit({

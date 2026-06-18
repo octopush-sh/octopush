@@ -6,12 +6,14 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell,
 } from "recharts";
+import { Plus, X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { useTokenStore } from "../../stores/tokenStore";
 import { useBudgetsStore } from "../../stores/budgetsStore";
 import type { Budget, BudgetPeriod, BudgetScope, UsageBreakdown } from "../../lib/types";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
+import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
 import {
   PaneHeader, SectionLabel, Stat, Row, formatTokens, useChartColors, type ChartColors,
@@ -219,8 +221,9 @@ export function UsagePane() {
         <SectionLabel>Export ledger</SectionLabel>
         <div className="flex items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3">
           <div className="flex items-center gap-2">
-            <label className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">From</label>
+            <label htmlFor="usage-export-from" className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">From</label>
             <input
+              id="usage-export-from"
               type="date"
               value={exportStart}
               onChange={(e) => setExportStart(e.target.value)}
@@ -228,8 +231,9 @@ export function UsagePane() {
             />
           </div>
           <div className="flex items-center gap-2">
-            <label className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">To</label>
+            <label htmlFor="usage-export-to" className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">To</label>
             <input
+              id="usage-export-to"
               type="date"
               value={exportEnd}
               onChange={(e) => setExportEnd(e.target.value)}
@@ -318,10 +322,10 @@ function BudgetsSection({
         <button
           type="button"
           onClick={() => setShowAdd(true)}
-          className="rounded-md px-3 py-1 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage transition hover:text-octo-brass"
-          style={{ border: "1px solid var(--color-octo-hairline)" }}
+          className="flex items-center gap-1.5 rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition"
+          style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
         >
-          + Add budget
+          <Plus size={12} /> Add a budget
         </button>
       </div>
 
@@ -523,18 +527,12 @@ function BudgetRow({
           Spent: <span className="octo-tabular text-octo-ivory">${spentUsd.toFixed(2)}</span>
           <span className="octo-tabular ml-1 text-octo-mute">{pct.toFixed(0)}%</span>
         </span>
-        <button
-          type="button"
-          onClick={onClear}
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded font-mono text-[14px] leading-none text-octo-mute transition hover:bg-octo-rouge/15 hover:text-octo-rouge"
-          title="Remove budget"
-          aria-label="Remove budget"
-        >
-          ×
-        </button>
+        <IconButton label="Remove budget" danger onClick={onClear}>
+          <X size={12} />
+        </IconButton>
       </div>
       <div className="ml-16 h-[2px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }}>
-        <div className="h-full rounded-sm transition-all" style={{ width: `${pct}%`, background: barColor }} />
+        <div className="h-full rounded-sm transition-[width]" style={{ width: `${pct}%`, background: barColor }} />
       </div>
     </div>
   );
@@ -550,7 +548,7 @@ function BudgetGauge({ remaining, total }: { remaining: number; total: number })
         <span className="octo-tabular">{pct.toFixed(0)}% used</span>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full" style={{ background: "var(--color-octo-hairline)" }}>
-        <div className="h-full rounded-full transition-all" style={{ width: `${Math.min(pct, 100)}%`, background: tint }} />
+        <div className="h-full rounded-full transition-[width]" style={{ width: `${Math.min(pct, 100)}%`, background: tint }} />
       </div>
       <div className="octo-tabular mt-2 text-right font-mono text-[10px] text-octo-mute">
         {formatTokens(remaining)} remaining
