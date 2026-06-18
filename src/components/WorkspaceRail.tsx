@@ -519,19 +519,22 @@ function WorkspaceRow({
         {mono?.glyph || "?"}
       </button>
 
-      {/* Workspace name — ellipsis + title (the full name is the tooltip). */}
-      <div
+      {/* Workspace name — a real button (keyboard-operable) that truncates with
+          the full name as its tooltip. No aria-label: its accessible name is the
+          visible text, so the monogram stays the single name-labelled control. */}
+      <button
+        type="button"
         onClick={onSelect}
         title={
           showPulse
             ? `${workspace?.name || "Workspace"} — needs your attention${attentionFlag?.kind ? ` (${attentionFlag.kind})` : ""}`
             : `${workspace?.name || "Workspace"} (right-click to customize)`
         }
-        className="min-w-0 flex-1 cursor-pointer truncate text-left text-[13px] transition"
+        className="min-w-0 flex-1 cursor-pointer truncate bg-transparent text-left text-[13px] transition"
         style={{ color: active ? "var(--color-octo-ivory)" : "var(--color-octo-sage)" }}
       >
         {workspace?.name || "Workspace"}
-      </div>
+      </button>
 
       {/* Aligned status column (§4.3) — ticket · ahead/behind · PR · dirty. */}
       <div className="flex shrink-0 items-center justify-end gap-1">
@@ -578,6 +581,10 @@ function StatusChip({
   return (
     <span
       title={title}
+      // Icon-only chips carry no text, so give them an image role + label that
+      // screen readers announce; labelled chips are read via their text.
+      role={label ? undefined : "img"}
+      aria-label={label ? undefined : title}
       className={`octo-pop-in octo-tabular inline-flex items-center gap-[3px] rounded border px-1 py-[1px] font-mono text-[9.5px] leading-none ${toneClass}`}
     >
       {icon}
