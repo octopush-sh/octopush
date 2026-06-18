@@ -27,6 +27,14 @@ vi.mock("../lib/ipc", () => ({
     getDefaultProviders: vi.fn().mockResolvedValue([]),
     listModels: vi.fn().mockResolvedValue([]),
     refreshPricing: vi.fn().mockResolvedValue({ modelsUpdated: 0, modelsTotal: 0, fetchedAt: "" }),
+    // Coding Agents card (ClaudeCodeCard) probes the MCP connection on mount.
+    mcpConnectionStatus: vi.fn().mockResolvedValue({
+      registered: false,
+      claudeFound: false,
+      manualCommand: "claude mcp add octopush -s user -- /path/to/octopush-mcp",
+      binaryPath: null,
+    }),
+    connectClaudeCode: vi.fn().mockResolvedValue({ ok: true, registered: true, message: "", binaryPath: null }),
   },
 }));
 

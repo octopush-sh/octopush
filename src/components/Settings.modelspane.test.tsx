@@ -1,10 +1,11 @@
 /**
- * Behavioral tests for the Settings → Models & Providers pane.
- * Tests add/edit/remove models and providers, and verify that
- * ipc.saveProviders + ipc.saveSettings are called on save.
+ * Behavioral tests for the Settings → Models pane (master-detail redesign).
+ * The first provider is auto-selected; add/edit/remove of models and providers
+ * happen through dialogs. The backend contract is unchanged — saving still calls
+ * ipc.saveProviders + ipc.saveSettings with the edited catalog.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import type { ProviderConfig, AppSettings } from "../lib/types";
 
 // ─── Fixtures ─────────────────────────────────────────────────────
@@ -60,18 +61,38 @@ vi.mock("../lib/ipc", () => ({
 // ─── Helpers ──────────────────────────────────────────────────────
 
 async function renderModelsPane() {
-  // Lazy import so mock is applied first
   const { Settings } = await import("./Settings");
   let rendered: ReturnType<typeof render>;
   await act(async () => {
-    rendered = render(
-      <Settings open initialTab="models" onClose={vi.fn()} />
-    );
+    rendered = render(<Settings open initialTab="models" onClose={vi.fn()} />);
   });
   return rendered!;
 }
 
+/** The add/edit-model dialog. */
+function modelDialog() {
+  return screen.getByRole("dialog", { name: /model/i });
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
+
+describe("ModelsPane — selection & detail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listProvidersMock.mockResolvedValue([MOCK_PROVIDER]);
+    getSettingsMock.mockResolvedValue(MOCK_SETTINGS);
+    saveProvidersMock.mockResolvedValue(undefined);
+    saveSettingsMock.mockResolvedValue(undefined);
+    getDefaultProvidersMock.mockResolvedValue([MOCK_PROVIDER]);
+  });
+
+  it("auto-selects the first provider and shows its model in the detail pane", async () => {
+    await renderModelsPane();
+    // Provider name appears both in the list item and the detail header.
+    expect(screen.getAllByText("Anthropic").length).toBeGreaterThan(0);
+    expect(screen.getByText("claude-sonnet-4-6")).toBeInTheDocument();
+  });
+});
 
 describe("ModelsPane — model editing", () => {
   beforeEach(() => {
@@ -83,31 +104,21 @@ describe("ModelsPane — model editing", () => {
     getDefaultProvidersMock.mockResolvedValue([MOCK_PROVIDER]);
   });
 
-  it("renders the anthropic provider with its model", async () => {
-    await renderModelsPane();
-    expect(screen.getByText("Anthropic")).toBeInTheDocument();
-    expect(screen.getByText("claude-sonnet-4-6")).toBeInTheDocument();
-  });
-
-  it("adds a model to a provider and saves both settings and providers", async () => {
+  it("adds a model through the dialog and saves both settings and providers", async () => {
     await renderModelsPane();
 
-    // Click "Add a model" button
-    const addModelBtn = screen.getByRole("button", { name: /add a model/i });
-    await act(async () => { fireEvent.click(addModelBtn); });
+    // Open the add-model dialog.
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
 
-    // Fill in the model id
-    const idInput = screen.getByPlaceholderText(/model id/i);
+    const dialog = modelDialog();
+    const idInput = within(dialog).getByPlaceholderText(/model id/i);
     await act(async () => { fireEvent.change(idInput, { target: { value: "claude-x" } }); });
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^add model$/i })); });
 
-    // Submit
-    const submitBtn = screen.getByRole("button", { name: /add model/i });
-    await act(async () => { fireEvent.click(submitBtn); });
-
-    // After adding, the model should appear in the list
+    // The new model now appears in the detail list.
     expect(screen.getByText("claude-x")).toBeInTheDocument();
 
-    // Now click "Save changes"
+    // The unsaved-changes bar reveals a Save action.
     const saveBtn = screen.getByRole("button", { name: /save changes/i });
     await act(async () => { fireEvent.click(saveBtn); });
 
@@ -116,7 +127,6 @@ describe("ModelsPane — model editing", () => {
       expect(saveSettingsMock).toHaveBeenCalledTimes(1);
     });
 
-    // Verify the providers call includes claude-x
     const providersArg: ProviderConfig[] = saveProvidersMock.mock.calls[0][0];
     const anthropic = providersArg.find((p) => p.name === "anthropic");
     expect(anthropic).toBeDefined();
@@ -126,20 +136,55 @@ describe("ModelsPane — model editing", () => {
   it("blocks a model with an empty id", async () => {
     await renderModelsPane();
 
-    const addModelBtn = screen.getByRole("button", { name: /add a model/i });
-    await act(async () => { fireEvent.click(addModelBtn); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
 
-    // Submit without filling in an id (it's blank by default)
-    const submitBtn = screen.getByRole("button", { name: /add model/i });
-    await act(async () => { fireEvent.click(submitBtn); });
+    const dialog = modelDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^add model$/i })); });
 
-    // An error message should appear
-    expect(screen.getByText(/model id is required/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/model id is required/i)).toBeInTheDocument();
+  });
 
-    // The model count for anthropic should still be 1 (no new model added)
-    // Verify by checking the model list hasn't grown
-    const modelIds = screen.getAllByText("claude-sonnet-4-6");
-    expect(modelIds.length).toBeGreaterThan(0);
+  it("does not show an unsaved bar until something changes", async () => {
+    await renderModelsPane();
+    expect(screen.queryByRole("button", { name: /save changes/i })).not.toBeInTheDocument();
+  });
+
+  it("rejects a model whose id duplicates an existing one", async () => {
+    await renderModelsPane();
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
+    const dialog = modelDialog();
+    await act(async () => {
+      fireEvent.change(within(dialog).getByPlaceholderText(/model id/i), {
+        target: { value: "claude-sonnet-4-6" },
+      });
+    });
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^add model$/i })); });
+
+    expect(within(dialog).getByText(/already exists/i)).toBeInTheDocument();
+  });
+});
+
+describe("ModelsPane — provider display names", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSettingsMock.mockResolvedValue(MOCK_SETTINGS);
+  });
+
+  it("renders canonical capitalization for built-in providers (OpenAI, not Openai)", async () => {
+    const openai: ProviderConfig = {
+      name: "openai",
+      apiBase: "https://api.openai.com/v1",
+      apiKeyEnv: "OPENAI_API_KEY",
+      models: [],
+      enabled: true,
+      protocol: "openai-compatible",
+      local: false,
+    };
+    listProvidersMock.mockResolvedValue([openai]);
+    await renderModelsPane();
+    expect(screen.getAllByText("OpenAI").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Openai")).not.toBeInTheDocument();
   });
 });
 
@@ -153,44 +198,33 @@ describe("ModelsPane — custom provider management", () => {
     getDefaultProvidersMock.mockResolvedValue([MOCK_PROVIDER]);
   });
 
-  it("adds a custom provider and appends it to the list", async () => {
+  it("adds a custom local provider through the wizard and selects it", async () => {
     await renderModelsPane();
 
-    // Click "Add a provider"
-    const addProviderBtn = screen.getByRole("button", { name: /add a provider/i });
-    await act(async () => { fireEvent.click(addProviderBtn); });
+    // Open the add-provider wizard.
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a provider/i })); });
 
-    // Fill in provider name
-    const nameInput = screen.getByPlaceholderText(/e.g. my-gateway/i);
-    await act(async () => { fireEvent.change(nameInput, { target: { value: "sonatype" } }); });
+    const dialog = screen.getByRole("dialog", { name: /add a provider/i });
+    await act(async () => {
+      fireEvent.change(within(dialog).getByPlaceholderText(/my-gateway/i), { target: { value: "sonatype" } });
+    });
+    // Mark it local so the wizard finishes in one step (no endpoint needed).
+    await act(async () => { fireEvent.click(within(dialog).getByRole("switch", { name: /runs locally/i })); });
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /add a provider/i })); });
 
-    // Fill in base URL
-    const baseUrlInput = screen.getByPlaceholderText(/https:\/\/my-gateway/i);
-    await act(async () => { fireEvent.change(baseUrlInput, { target: { value: "https://sonatype.example.com" } }); });
-
-    // Use the form's Add a provider button (the second one inside the form)
-    const addBtns = screen.getAllByRole("button", { name: /add a provider/i });
-    // After clicking the top-level one, the form appears — the submit button is inside the form
-    // There should be one remaining for the submit inside the form
-    const submitFormBtn = addBtns[addBtns.length - 1];
-    await act(async () => { fireEvent.click(submitFormBtn); });
-
-    // The new provider should appear in the list
-    expect(screen.getByText("Sonatype")).toBeInTheDocument();
+    // New provider is selected — its name shows in the list and detail header.
+    expect(screen.getAllByText("Sonatype").length).toBeGreaterThan(0);
   });
 
   it("shows an error when adding a provider with empty name", async () => {
     await renderModelsPane();
 
-    const addProviderBtn = screen.getByRole("button", { name: /add a provider/i });
-    await act(async () => { fireEvent.click(addProviderBtn); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a provider/i })); });
+    const dialog = screen.getByRole("dialog", { name: /add a provider/i });
+    // Click Continue with no name.
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /continue/i })); });
 
-    // Submit without filling name
-    const addBtns = screen.getAllByRole("button", { name: /add a provider/i });
-    const submitFormBtn = addBtns[addBtns.length - 1];
-    await act(async () => { fireEvent.click(submitFormBtn); });
-
-    expect(screen.getByText(/name is required/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/name is required/i)).toBeInTheDocument();
   });
 
   it("removes a custom provider via confirm dialog", async () => {
@@ -203,48 +237,30 @@ describe("ModelsPane — custom provider management", () => {
       protocol: "anthropic",
       local: false,
     };
-    // Only show the custom provider (not built-in) so there's only one Remove button
     listProvidersMock.mockResolvedValue([customProvider]);
     await renderModelsPane();
 
-    // The custom provider is shown
-    expect(screen.getByText("My-gateway")).toBeInTheDocument();
-
-    // Click the "Remove" provider button (not a model remove)
+    // Auto-selected; "Remove" lives in the detail header.
     const removeBtn = screen.getByRole("button", { name: /^remove$/i });
     await act(async () => { fireEvent.click(removeBtn); });
 
-    // ConfirmDialog should appear
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-
-    // Click the destructive button in the dialog
     const confirmBtn = screen.getByRole("button", { name: /remove provider/i });
     await act(async () => { fireEvent.click(confirmBtn); });
 
-    // Provider should be gone from UI
     expect(screen.queryByText("My-gateway")).not.toBeInTheDocument();
   });
 
-  it("reset to defaults restores a builtin provider's models in local state", async () => {
-    // Start with anthropic with models removed
-    const modifiedAnthropic: ProviderConfig = {
-      ...MOCK_PROVIDER,
-      models: [],
-    };
+  it("reset to defaults restores a builtin provider's models", async () => {
+    const modifiedAnthropic: ProviderConfig = { ...MOCK_PROVIDER, models: [] };
     listProvidersMock.mockResolvedValue([modifiedAnthropic]);
-    // Defaults still have the model
     getDefaultProvidersMock.mockResolvedValue([MOCK_PROVIDER]);
 
     await renderModelsPane();
-
-    // Should have no model initially
     expect(screen.queryByText("claude-sonnet-4-6")).not.toBeInTheDocument();
 
-    // Click "Reset to defaults"
-    const resetBtn = screen.getByRole("button", { name: /reset to defaults/i });
-    await act(async () => { fireEvent.click(resetBtn); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /reset to defaults/i })); });
 
-    // The model should now appear
     await waitFor(() => {
       expect(screen.getByText("claude-sonnet-4-6")).toBeInTheDocument();
     });

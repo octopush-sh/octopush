@@ -3,6 +3,7 @@
 
 export type SettingsTab =
   | "general"
+  | "editor"
   | "models"
   | "appearance"
   | "usage"
@@ -13,6 +14,7 @@ export type SettingsTab =
 
 export const SETTINGS_TABS: SettingsTab[] = [
   "general",
+  "editor",
   "models",
   "appearance",
   "usage",
@@ -24,7 +26,8 @@ export const SETTINGS_TABS: SettingsTab[] = [
 
 export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   general: "General",
-  models: "Models & Providers",
+  editor: "Editor",
+  models: "Models",
   appearance: "Appearance",
   usage: "Usage",
   shortcuts: "Shortcuts",
@@ -32,3 +35,17 @@ export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   integrations: "Integrations",
   about: "About",
 };
+
+// Grouped navigation — the structural fix. Each group is a category eyebrow over
+// its items, replacing the old flat list. Order here is render order.
+export interface SettingsGroup {
+  label: string;
+  tabs: SettingsTab[];
+}
+
+export const SETTINGS_GROUPS: SettingsGroup[] = [
+  { label: "Setup", tabs: ["general", "editor"] },
+  { label: "Intelligence", tabs: ["models", "usage"] },
+  { label: "Connections", tabs: ["integrations"] },
+  { label: "App", tabs: ["appearance", "shortcuts", "privacy", "about"] },
+];
