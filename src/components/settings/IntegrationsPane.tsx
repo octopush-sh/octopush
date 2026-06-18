@@ -7,6 +7,7 @@ import type { McpStatus } from "../../lib/ipc";
 import type { ProjectInfo } from "../../lib/types";
 import { pushToast } from "../Toasts";
 import { PaneHeader, SectionLabel } from "./shared";
+import { McpServersSection } from "./McpServersSection";
 
 // Sentinel shown in the API-token field when a saved token is loaded; if the
 // user submits without editing the field we substitute the original token so
@@ -197,6 +198,9 @@ export function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void
 
       {/* ── Coding Agents — Octopush MCP server ── */}
       <ClaudeCodeCard />
+
+      {/* ── MCP servers Octopush connects to (chat tools) ── */}
+      <McpServersSection />
     </>
   );
 }

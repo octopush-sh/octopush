@@ -9,6 +9,9 @@ interface Props {
   /** Called when the user wants to open the written file in the in-app
    *  editor (Review → Editor view). When omitted, the button is hidden. */
   onOpenInEditor?: (relativePath: string) => void;
+  /** Called to re-run a `run_command` tool's command in the RUN-mode terminal.
+   *  When omitted, the button is hidden. (Cross-mode action, P9.) */
+  onRunInTerminal?: (command: string) => void;
 }
 
 // Tool name → uppercase mono label. Falls back to the raw tool name.
@@ -107,7 +110,7 @@ const headerStyle: CSSProperties = {
   boxSizing: "border-box" as const,
 };
 
-export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
+export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTerminal }: Props) {
   const [expanded, setExpanded] = useState(false);
   const { copied, copy } = useCopyFeedback();
 
@@ -115,6 +118,8 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
   const summary = summarizeTool(tool.toolName, tool.toolInput);
   const filePath = getFilePath(tool);
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
+  const command =
+    tool.toolName === "run_command" ? String(tool.toolInput?.command ?? "") : "";
 
   return (
     <div className="chat-selectable" style={cardStyle}>
@@ -179,6 +184,39 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor }: Props) {
             ▸
           </span>
         </div>
+
+        {command && onRunInTerminal && (
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onRunInTerminal(command);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onRunInTerminal(command);
+              }
+            }}
+            title="Send to terminal (copies the command and switches to Run)"
+            aria-label="Send to terminal"
+            style={{
+              fontFamily: "system-ui, sans-serif",
+              fontSize: 11,
+              color: BRASS,
+              background: BRASS_GHOST,
+              border: `1px solid ${BRASS_DIM}`,
+              borderRadius: 4,
+              padding: "3px 10px",
+              cursor: "pointer",
+              marginRight: 10,
+              flexShrink: 0,
+            }}
+          >
+            Send to terminal
+          </div>
+        )}
 
         {filePath && tool.toolName === "write_file" && onOpenInEditor && (
           <div

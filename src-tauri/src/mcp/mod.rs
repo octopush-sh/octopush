@@ -28,7 +28,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
@@ -59,6 +59,40 @@ pub fn parse_mcp_config(content: &str) -> HashMap<String, McpServerConfig> {
     serde_json::from_str::<File>(content)
         .map(|f| f.mcp_servers)
         .unwrap_or_default()
+}
+
+/// The user-level config path (`~/.claude/mcp.json`), if a home dir exists.
+fn user_config_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude/mcp.json"))
+}
+
+/// Load ONLY the user-level (`~/.claude/mcp.json`) servers — the set the
+/// Settings UI manages (project-level `.claude/mcp.json` is repo-committed and
+/// edited in the repo, not here).
+pub fn load_user_config() -> HashMap<String, McpServerConfig> {
+    user_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_mcp_config(&c))
+        .unwrap_or_default()
+}
+
+/// Persist the user-level server map to `~/.claude/mcp.json` (pretty JSON under
+/// the `mcpServers` key, matching the Claude-Code shape).
+pub fn save_user_config(servers: &HashMap<String, McpServerConfig>) -> Result<(), String> {
+    let path = user_config_path().ok_or("no home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Preserve any sibling top-level keys the user keeps in mcp.json — only the
+    // `mcpServers` object is ours to rewrite. (Comments aren't preserved; JSON.)
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["mcpServers"] = serde_json::to_value(servers).map_err(|e| e.to_string())?;
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| e.to_string())
 }
 
 /// Load configured servers for a worktree (project overrides user on name clash).
@@ -241,6 +275,16 @@ impl McpRegistry {
         Ok(conn)
     }
 
+    /// One-shot smoke test: spawn the server, run the handshake, and return its
+    /// tools — then drop the connection (the child is killed on drop). Used by
+    /// the Settings "Test connection" button and the integration test. Does NOT
+    /// touch the cache or the failed-set, so testing a broken config doesn't
+    /// poison a real session.
+    pub fn test_connect(name: &str, cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
+        let conn = Self::connect(name, cfg)?;
+        Ok(conn.tools.clone())
+    }
+
     /// Lazily connect (and cache) a server's connection.
     fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<Arc<Mutex<Connection>>, String> {
         if let Some(c) = self.conns.lock().get(name) {
@@ -339,6 +383,62 @@ mod tests {
     fn malformed_config_is_empty() {
         assert!(parse_mcp_config("not json").is_empty());
         assert!(parse_mcp_config("{}").is_empty());
+    }
+
+    // A minimal MCP server (bash) that speaks just enough JSON-RPC to exercise
+    // the real stdio client: initialize → tools/list → tools/call, echoing back
+    // each request's id. Used to verify the client end-to-end without network.
+    const FIXTURE: &str = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fixture","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echoes","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn client_connects_and_lists_tools_against_a_fixture_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fixture.sh");
+        std::fs::write(&script, FIXTURE).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = McpServerConfig {
+            command: "bash".into(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: HashMap::new(),
+        };
+        // Real spawn + initialize handshake + tools/list over stdio JSON-RPC.
+        let tools = McpRegistry::test_connect("fix", &cfg).expect("fixture should connect");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].namespaced, "mcp__fix__echo");
+
+        // Full path incl. tools/call via the cached registry against a worktree
+        // config pointing at the same fixture.
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"fix":{{"command":"bash","args":[{:?}]}}}}}}"#,
+                script.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let reg = McpRegistry::new();
+        let out = reg
+            .call(dir.path(), "mcp__fix__echo", &serde_json::json!({"x": 1}))
+            .expect("tools/call should succeed");
+        assert_eq!(out, "pong");
     }
 
     #[test]

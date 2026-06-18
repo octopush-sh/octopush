@@ -227,6 +227,7 @@ import type {
   SkillMeta,
   Attachment,
   McpToolInfo,
+  McpServerConfig,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -436,6 +437,11 @@ export const ipc = {
     invoke<McpToolInfo[]>("list_mcp_tools", { workspacePath }),
   listMcpServers: (workspacePath: string) =>
     invoke<string[]>("list_mcp_servers", { workspacePath }),
+  getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
+  saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
+    invoke<void>("save_mcp_config", { servers }),
+  testMcpServer: (name: string, config: McpServerConfig) =>
+    invoke<McpToolInfo[]>("test_mcp_server", { name, config }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),

@@ -13,6 +13,8 @@ interface Props {
   workspacePath: string;
   onOpenSettings?: () => void;
   onOpenInEditor?: (path: string) => void;
+  /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
+  onRunInTerminal?: (command: string) => void;
 }
 
 /**
@@ -28,6 +30,7 @@ export function ChatCanvas({
   workspacePath,
   onOpenSettings,
   onOpenInEditor,
+  onRunInTerminal,
 }: Props) {
   const messages = useChatStore((s) => s.getMessages(workspaceId));
   const streaming = useChatStore((s) => s.getStreaming(workspaceId));
@@ -83,6 +86,7 @@ export function ChatCanvas({
                   tool={item.tool}
                   workspacePath={workspacePath}
                   onOpenInEditor={onOpenInEditor}
+                  onRunInTerminal={onRunInTerminal}
                 />
               );
             }

@@ -9,6 +9,8 @@ interface Props {
    *  WRITE tool cards show an "Open in editor" button, and bare file paths
    *  rendered in chat messages become clickable links. */
   onOpenInEditor?: (path: string) => void;
+  /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
+  onRunInTerminal?: (command: string) => void;
 }
 
 /**
@@ -21,6 +23,7 @@ export function ChatView({
   workspacePath,
   onOpenSettings,
   onOpenInEditor,
+  onRunInTerminal,
 }: Props) {
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -29,6 +32,7 @@ export function ChatView({
         workspacePath={workspacePath}
         onOpenSettings={onOpenSettings}
         onOpenInEditor={onOpenInEditor}
+        onRunInTerminal={onRunInTerminal}
       />
       <div className="shrink-0 border-t border-octo-hairline bg-octo-panel">
         <Composer workspaceId={workspaceId} workspacePath={workspacePath} />

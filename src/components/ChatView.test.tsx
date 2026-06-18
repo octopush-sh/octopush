@@ -249,6 +249,26 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("styles.css")).toBeInTheDocument();
   });
 
+  it("run_command card exposes a Send-to-terminal action wired to onRunInTerminal", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [
+          {
+            id: 1, workspaceId: "ws-1", role: "tool",
+            content: JSON.stringify({ toolName: "run_command", toolInput: { command: "npm test" }, result: "" }),
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-05-17T10:00:00Z",
+          },
+        ],
+      },
+      streamingByWs: { "ws-1": false },
+    });
+    const onRunInTerminal = vi.fn();
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" onRunInTerminal={onRunInTerminal} />);
+    fireEvent.click(screen.getByText("Send to terminal"));
+    expect(onRunInTerminal).toHaveBeenCalledWith("npm test");
+  });
+
   it("renders multiple tool cards in order between user and assistant", () => {
     useChatStore.setState({
       messagesByWs: {

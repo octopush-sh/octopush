@@ -657,6 +657,20 @@ function App() {
     [activeWorkspaceId],
   );
 
+  // Cross-mode action (P9): take a chat tool's shell command to RUN mode.
+  // Switches to the terminal and copies the command to the clipboard so the
+  // user pastes + reviews + presses Enter — deliberately a hand-off, not an
+  // auto-run: it never injects into a not-yet-spawned PTY (which would silently
+  // drop the text) and never auto-executes a multi-line command.
+  const handleRunInTerminal = useCallback(
+    (command: string) => {
+      if (!activeWorkspaceId) return;
+      setMode("run");
+      void copyToClipboard(command, "Command copied — paste into the terminal to run");
+    },
+    [activeWorkspaceId, setMode],
+  );
+
   // ── Chat / terminal handlers wired to Companion ──
   // Conversation-thread handlers delegate to chatStore, which persists threads
   // in the DB (real multi-conversation per workspace) and keeps the active
@@ -1407,6 +1421,7 @@ function App() {
                     workspacePath={activeWorkspace.worktreePath || project.path}
                     onOpenSettings={() => setSettingsTab("general")}
                     onOpenInEditor={(p) => navigateToFile(p, "editor")}
+                    onRunInTerminal={handleRunInTerminal}
                   />
                 )}
               </ModeOverlay>

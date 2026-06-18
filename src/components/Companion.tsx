@@ -3,6 +3,7 @@ import { PanelRightClose, PanelRightOpen, SquareTerminal, MessagesSquare, GitCom
 import { MODES, MODE_LABELS, type WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
+import { SavingsLedger } from "./chat/SavingsLedger";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
@@ -212,6 +213,7 @@ export function Companion({
           <div className="flex flex-col">
             <CompanionHistory {...historyProps} />
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
+            {workspaceId && <SavingsLedger workspaceId={workspaceId} />}
           </div>
         )}
         {mode === "run" && workspaceId && (
