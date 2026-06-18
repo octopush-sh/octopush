@@ -30,6 +30,13 @@ const FOCUSABLE_SELECTOR =
  *  opened) modal when dialogs are stacked, instead of all of them at once. */
 const escStack: symbol[] = [];
 
+/** True while at least one ModalShell is mounted. Full-screen overlays that run
+ *  their own Escape handler (e.g. Settings) check this so Escape closes the
+ *  dialog on top first, instead of the overlay underneath it. */
+export function isModalOpen(): boolean {
+  return escStack.length > 0;
+}
+
 export function ModalShell({
   onClose,
   children,

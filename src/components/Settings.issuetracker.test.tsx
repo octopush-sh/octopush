@@ -198,7 +198,7 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     });
   });
 
-  it("renders a Project Mappings row per Octopush Project with the saved jiraProjectKey", async () => {
+  it("renders a Project links row per Octopush Project with the saved jiraProjectKey", async () => {
     listRecentProjectsMock.mockResolvedValue([
       { id: "p1", name: "Octopush", path: "/p1", jiraProjectKey: "CLPNSNS" },
       { id: "p2", name: "Sandbox",  path: "/p2", jiraProjectKey: null },
@@ -206,16 +206,16 @@ describe("Settings — Integrations / Issue Tracker section", () => {
 
     await renderIntegrationsPane();
 
-    expect(await screen.findByText(/project mappings/i)).toBeInTheDocument();
+    expect(await screen.findByText(/project links/i)).toBeInTheDocument();
     expect(screen.getByText("Octopush")).toBeInTheDocument();
     expect(screen.getByText("Sandbox")).toBeInTheDocument();
 
-    const inputs = screen.getAllByPlaceholderText(/jira project key/i) as HTMLInputElement[];
+    const inputs = screen.getAllByPlaceholderText(/project key/i) as HTMLInputElement[];
     expect(inputs[0].value).toBe("CLPNSNS");
     expect(inputs[1].value).toBe("");
   });
 
-  it("saving a Project Mappings row calls updateProjectJiraKey with the right args", async () => {
+  it("saving a Project links row calls updateProjectJiraKey with the right args", async () => {
     listRecentProjectsMock.mockResolvedValue([
       { id: "p1", name: "Octopush", path: "/p1", jiraProjectKey: "CLPNSNS" },
       { id: "p2", name: "Sandbox",  path: "/p2", jiraProjectKey: null },
@@ -223,14 +223,14 @@ describe("Settings — Integrations / Issue Tracker section", () => {
 
     await renderIntegrationsPane();
 
-    await screen.findByText(/project mappings/i);
+    await screen.findByText(/project links/i);
 
-    const inputs = screen.getAllByPlaceholderText(/jira project key/i) as HTMLInputElement[];
+    const inputs = screen.getAllByPlaceholderText(/project key/i) as HTMLInputElement[];
     await act(async () => {
       fireEvent.change(inputs[1], { target: { value: "SANDBOX" } });
     });
 
-    const saveButtons = screen.getAllByRole("button", { name: /save mapping/i });
+    const saveButtons = screen.getAllByRole("button", { name: /save link/i });
     await act(async () => {
       fireEvent.click(saveButtons[1]);
     });
@@ -238,5 +238,13 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     await waitFor(() => {
       expect(updateProjectJiraKeyMock).toHaveBeenCalledWith("p2", "SANDBOX");
     });
+  });
+
+  it("shows Linear and Azure DevOps as upcoming (disabled) trackers", async () => {
+    await renderIntegrationsPane();
+    expect(screen.getByRole("button", { name: /linear/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /azure devops/i })).toBeDisabled();
+    // Jira is the selectable, active tracker.
+    expect(screen.getByRole("button", { name: /^jira/i })).toHaveAttribute("aria-pressed", "true");
   });
 });
