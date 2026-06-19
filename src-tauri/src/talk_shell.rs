@@ -133,6 +133,13 @@ impl TalkShell {
         *self.client.lock() = client;
     }
 
+    /// Whether a daemon client is attached — i.e. the shared shell can be used.
+    /// Callers use this to decide between the shared shell and an isolated
+    /// fallback, rather than treating every `run` error as "no daemon".
+    pub fn available(&self) -> bool {
+        self.client.lock().is_some()
+    }
+
     /// Run a command in the thread's shell.
     ///
     /// `promote = true` ($-direct): if the command hasn't finished within
@@ -247,10 +254,14 @@ impl TalkShell {
             // preserved). Only if the re-sync fails do we recycle (env lost).
             Probe::NotYet { raw, .. } => {
                 let note = format!(
-                    "(command did not finish within {}s — interrupted)",
+                    "(command was still running after {}s and was interrupted — the output \
+                     above may be incomplete, and any process it backgrounded may still be \
+                     running)",
                     timeout.as_secs()
                 );
-                let partial = clean_output(&raw);
+                // Strip any partial/unterminated marker that landed at the timeout
+                // boundary so marker noise never reaches the model.
+                let partial = strip_octo_markers(&clean_output(&raw));
                 let body = if partial.is_empty() { note.clone() } else { format!("{partial}\n{note}") };
                 let _ = client.write(&id, b"\x03");
                 match resync_after_interrupt(&client, &id, &rx, &nonce) {
@@ -784,6 +795,21 @@ fn clean_inline(s: &str) -> String {
     s.replace('\u{1e}', "")
 }
 
+fn octo_marker_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        // RS bytes and any whole-or-partial marker word (START/END/READY), as can
+        // land at a timeout boundary before the closing delimiter arrives.
+        regex::Regex::new(r"\x1e+|OCTO_(?:START|END|READY)_[0-9a-f]*(?::-?\d*:?[^\n\x1e]*)?").unwrap()
+    })
+}
+
+/// Remove any leftover capture-marker noise (RS bytes / marker words) — used on
+/// best-effort partial output, where a marker may be unterminated.
+fn strip_octo_markers(s: &str) -> String {
+    octo_marker_re().replace_all(s, "").trim().to_string()
+}
+
 /// Cap output at `MAX_OUTPUT_BYTES` on a char boundary, with a truncation note.
 fn cap_output(s: String) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {
@@ -1096,7 +1122,7 @@ mod e2e {
         // resync keeps the shell, so env survives (no recycle).
         let r = cap(shell.run_capture("u", "/", "sleep 30", Duration::from_secs(1)).unwrap());
         assert!(!r.ok);
-        assert!(r.output.contains("did not finish"), "missing interrupt note: {:?}", r.output);
+        assert!(r.output.contains("was interrupted"), "missing interrupt note: {:?}", r.output);
         let r = cap(shell.run_capture("u", "/", "echo \"$OCTO_T4\"", quick).unwrap());
         assert_eq!(r.output, "shared", "env lost after a timeout interrupt");
 
