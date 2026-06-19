@@ -253,4 +253,18 @@ mod tests {
         assert!(s.contains(&format!("\"protocol_version\":{DAEMON_PROTOCOL_VERSION}")), "got: {s}");
         assert!(s.contains("\"version\":\"9.9.9\""), "got: {s}");
     }
+
+    #[test]
+    fn foreground_event_serializes_with_busy_flag() {
+        let line = Event::Foreground {
+            id: "term-1".into(),
+            busy: true,
+        }
+        .to_line();
+        let s = String::from_utf8(line).unwrap();
+        assert!(s.contains("\"event\":\"foreground\""), "got: {s}");
+        assert!(s.contains("\"id\":\"term-1\""), "got: {s}");
+        assert!(s.contains("\"busy\":true"), "got: {s}");
+        assert!(s.ends_with('\n'), "expected newline-terminated line");
+    }
 }

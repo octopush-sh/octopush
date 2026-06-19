@@ -474,6 +474,12 @@ impl Session {
     /// the rail reflects activity the moment it starts or stops. An
     /// indeterminate reading (no fg pgroup yet, or shell pid unknown) leaves
     /// the state unchanged rather than flickering to idle.
+    ///
+    /// The normal "command finished" clear comes from `fg` returning to the
+    /// shell pid on the next tick. The `!running` branch only keeps internal
+    /// state honest — by the time a session is dead its client has already
+    /// detached, so it emits nothing; the frontend clears `busy` off the
+    /// `pty://exit` event instead.
     pub fn check_foreground(&mut self, fg_pgroup: Option<i32>) -> Option<bool> {
         if !self.running {
             return self.set_fg_busy(false);
