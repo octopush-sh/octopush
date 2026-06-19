@@ -573,10 +573,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
       } finally {
-        set((s) => ({
-          streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
-          streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
-        }));
+        // Only clear if THIS run still owns the streaming slot — a normal LLM
+        // turn that started on the same workspace meanwhile must not be clobbered.
+        set((s) =>
+          s.streamingThreadByWs[workspaceId] === threadId
+            ? {
+                streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
+                streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
+              }
+            : {},
+        );
       }
     },
 

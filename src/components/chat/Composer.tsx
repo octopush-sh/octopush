@@ -300,6 +300,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     }
 
     // `$ <cmd>` / `/run <cmd>` — run directly in the thread's shell, no LLM.
+    // Any staged attachments are intentionally left in the tray (a shell
+    // command doesn't consume images): they stay visible and ride the user's
+    // next actual chat message instead of being dropped here.
     const shellCmd = parseShellCommand(trimmed);
     if (shellCmd) {
       void runShell(workspaceId, workspacePath, shellCmd);

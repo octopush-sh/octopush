@@ -662,9 +662,15 @@ impl ChatEngine {
                     let empty_obj = serde_json::json!({});
                     let input = parsed.get("toolInput").unwrap_or(&empty_obj);
                     let result = parsed.get("result").and_then(|r| r.as_str()).unwrap_or("");
-                    // Truncate long results for context efficiency.
+                    // Truncate long results for context efficiency, on a UTF-8
+                    // char boundary (shell output via `$`-direct is arbitrary
+                    // bytes, so a naive `&result[..500]` byte slice can panic).
                     let short_result = if result.len() > 500 {
-                        format!("{}...(truncated)", &result[..500])
+                        let mut end = 500;
+                        while end > 0 && !result.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...(truncated)", &result[..end])
                     } else {
                         result.to_string()
                     };
@@ -701,10 +707,25 @@ impl ChatEngine {
                     pending_tool_summary.clear();
                 }
                 content.push_str(&msg.content);
-                messages.push(LlmMessage {
-                    role: LlmRole::User,
-                    content: LlmContent::Text(content),
-                });
+                // Merge into a preceding user turn rather than pushing a second
+                // one. A `$`-direct command (user row `$ cmd` + tool row) before
+                // another user/`$` row would otherwise yield two consecutive
+                // User messages, which Anthropic rejects with a 400.
+                match messages.last_mut() {
+                    Some(last)
+                        if last.role == LlmRole::User
+                            && matches!(last.content, LlmContent::Text(_)) =>
+                    {
+                        if let LlmContent::Text(prev) = &mut last.content {
+                            prev.push_str("\n\n");
+                            prev.push_str(&content);
+                        }
+                    }
+                    _ => messages.push(LlmMessage {
+                        role: LlmRole::User,
+                        content: LlmContent::Text(content),
+                    }),
+                }
             }
         }
 

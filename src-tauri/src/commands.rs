@@ -905,6 +905,9 @@ pub async fn rename_chat_thread(
 
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    // Tear down the thread's TALK shell (kills the daemon PTY + releases the
+    // session entry) so deleting conversations doesn't leak bash processes.
+    state.chat.talk_shell.close(&thread_id);
     state.db.lock().delete_chat_thread(&thread_id)
 }
 
