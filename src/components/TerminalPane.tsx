@@ -12,6 +12,7 @@ import type {
   PtyReattachedEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { XTERM_FONT_FAMILY, XTERM_THEME } from "../lib/xtermTheme";
 
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
@@ -114,33 +115,10 @@ export function TerminalPane({
 
     const term = new Terminal({
       cursorBlink: true,
-      fontFamily:
-        '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace',
+      fontFamily: XTERM_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.3,
-      theme: {
-        background: "#0a0a0b",
-        foreground: "#e4e4e7",
-        cursor: "#a78bfa",
-        cursorAccent: "#0a0a0b",
-        selectionBackground: "#3f3f46",
-        black: "#18181b",
-        red: "#f87171",
-        green: "#34d399",
-        yellow: "#fbbf24",
-        blue: "#60a5fa",
-        magenta: "#a78bfa",
-        cyan: "#22d3ee",
-        white: "#d4d4d8",
-        brightBlack: "#3f3f46",
-        brightRed: "#fca5a5",
-        brightGreen: "#6ee7b7",
-        brightYellow: "#fcd34d",
-        brightBlue: "#93c5fd",
-        brightMagenta: "#c4b5fd",
-        brightCyan: "#67e8f9",
-        brightWhite: "#fafafa",
-      },
+      theme: XTERM_THEME,
       allowProposedApi: true,
       scrollback: 10000,
     });

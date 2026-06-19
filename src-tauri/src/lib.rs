@@ -176,6 +176,7 @@ pub fn run() {
             // Chat
             commands::send_chat_message,
             commands::run_shell_command,
+            commands::stop_shell_command,
             commands::list_chat_messages,
             commands::cancel_chat,
             commands::list_chat_threads,

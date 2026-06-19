@@ -422,10 +422,16 @@ export const ipc = {
     workspacePath: string;
     command: string;
   }) =>
-    invoke<{ output: string; exitCode: number; ok: boolean; cwd: string; timedOut: boolean }>(
-      "run_shell_command",
-      { request },
-    ),
+    invoke<{
+      output: string;
+      exitCode: number;
+      ok: boolean;
+      cwd: string;
+      live: boolean;
+    }>("run_shell_command", { request }),
+  /** SIGINT (Ctrl-C) a thread's live `$`-direct process. */
+  stopShellCommand: (threadId: string) =>
+    invoke<void>("stop_shell_command", { threadId }),
 
   // ─── Chat threads (conversations) ────────────────────────────────
   listChatThreads: (workspaceId: string) =>

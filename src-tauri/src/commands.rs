@@ -856,6 +856,14 @@ pub async fn run_shell_command(
     state.chat.run_shell_command(app, request).await
 }
 
+/// Send SIGINT (Ctrl-C) to a thread's live `$`-direct process. The streamer
+/// then sees the command exit and resolves its card.
+#[tauri::command]
+pub async fn stop_shell_command(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    state.chat.talk_shell.interrupt(&thread_id);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,

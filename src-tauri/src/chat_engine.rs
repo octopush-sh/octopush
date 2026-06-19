@@ -81,24 +81,16 @@ pub struct ShellRequest {
 /// its live "running" card). Distinct from provider tool_use ids.
 static SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Format a shell result's output for the tool card / model context, mirroring
-/// `execute_tool`'s conventions (annotate non-zero exits, surface timeouts,
-/// and show an explicit exit code when there's no output).
-fn format_shell_output(r: &crate::talk_shell::ShellResult) -> String {
-    let mut s = r.output.clone();
-    if r.timed_out {
+/// Format captured shell output for the tool card / model context, mirroring
+/// `execute_tool`'s conventions: annotate a non-zero exit, and show an explicit
+/// exit code when there's no output. Shared by the quick and live paths.
+fn format_command_output(output: &str, exit_code: i32) -> String {
+    let mut s = output.to_string();
+    if exit_code != 0 {
         if !s.is_empty() {
             s.push('\n');
         }
-        s.push_str(
-            "(command still running after 120s — it was interrupted; live long-running \
-             process support arrives in a later update)",
-        );
-    } else if r.exit_code != 0 {
-        if !s.is_empty() {
-            s.push('\n');
-        }
-        s.push_str(&format!("(exit code {})", r.exit_code));
+        s.push_str(&format!("(exit code {exit_code})"));
     } else if s.trim().is_empty() {
         s = "(exit code 0)".to_string();
     }
@@ -145,6 +137,38 @@ pub struct ToolEndEvent {
     pub duration_ms: u64,
 }
 
+
+/// Emitted when a `$`-direct command is promoted to a live process — the
+/// frontend opens a pinned mini-terminal keyed by `call_id`; output then
+/// arrives as `chat://shell-output` chunks.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellLiveStartEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub call_id: String,
+    pub command: String,
+}
+
+/// A chunk of raw output from a live process (markers stripped, ANSI kept for
+/// xterm).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellOutputEvent {
+    pub thread_id: String,
+    pub call_id: String,
+    pub chunk: String,
+}
+
+/// Emitted when a live process exits — closes the pinned panel and updates cwd.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellExitEvent {
+    pub thread_id: String,
+    pub call_id: String,
+    pub exit_code: i32,
+    pub cwd: String,
+}
 
 /// Emitted whenever a chat message is persisted to the DB.
 /// Carries the DB rowid + the full message row so the frontend can append
@@ -554,64 +578,178 @@ impl ChatEngine {
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
         let command = request.command.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        // Promote to a live process if the command hasn't finished within this
+        // window (dev servers / watchers stream instead of blocking the turn).
+        let outcome = tokio::task::spawn_blocking(move || {
             shell.run(
                 &thread_id,
                 &workspace_path,
                 &command,
-                std::time::Duration::from_secs(120),
+                std::time::Duration::from_millis(1500),
             )
         })
         .await
         .map_err(|e| AppError::Other(format!("shell task join error: {e}")))?;
-        let duration_ms = started.elapsed().as_millis() as u64;
 
-        // On a hard failure (daemon down / spawn failed) surface it as a tool
-        // card too, so the user sees why nothing ran — then propagate the error.
-        let result = match result {
-            Ok(r) => r,
+        let outcome = match outcome {
+            Ok(o) => o,
             Err(e) => {
-                let _ = app.emit("chat://tool-end", &ToolEndEvent {
-                    workspace_id: request.workspace_id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    call_id: call_id.clone(),
-                    ok: false,
-                    duration_ms,
-                });
-                let record = serde_json::json!({
-                    "callId": call_id,
-                    "toolName": "run_command",
-                    "toolInput": tool_input,
-                    "result": format!("Shell error: {e}"),
-                });
-                let _ = self.insert_and_emit_message(
-                    &app, &request.workspace_id, &request.thread_id,
-                    "tool", &record.to_string(), None, None, None, None,
+                // Hard failure (daemon down / spawn failed) — surface as a card.
+                self.resolve_shell_card(
+                    &app, &request, &call_id, &tool_input, false, started,
+                    &format!("Shell error: {e}"),
                 );
                 return Err(e);
             }
         };
 
+        use crate::talk_shell::{RunOutcome, ShellResult};
+        match outcome {
+            RunOutcome::Done(result) => {
+                self.resolve_shell_card(
+                    &app, &request, &call_id, &tool_input, result.ok, started,
+                    &format_command_output(&result.output, result.exit_code),
+                );
+                Ok(result)
+            }
+            RunOutcome::Busy => {
+                let note = "A live process is already running in this conversation — \
+                            stop it before running another command.";
+                self.resolve_shell_card(
+                    &app, &request, &call_id, &tool_input, false, started, note,
+                );
+                Ok(ShellResult {
+                    output: note.to_string(),
+                    exit_code: -1,
+                    ok: false,
+                    cwd: String::new(),
+                    live: false,
+                })
+            }
+            RunOutcome::Live(live) => {
+                // Open the pinned live panel; the first shell-output chunk fills it.
+                let _ = app.emit("chat://shell-live-start", &ShellLiveStartEvent {
+                    workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
+                    call_id: call_id.clone(),
+                    command: request.command.clone(),
+                });
+                self.spawn_live_streamer(
+                    app.clone(), request.clone(), call_id, tool_input, started, live,
+                );
+                Ok(ShellResult {
+                    output: String::new(),
+                    exit_code: 0,
+                    ok: true,
+                    cwd: String::new(),
+                    live: true,
+                })
+            }
+        }
+    }
+
+    /// Emit `tool-end` + persist the resolved `role="tool"` card for a `$`-direct
+    /// command (the quick / busy / error paths share this).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_shell_card(
+        &self,
+        app: &AppHandle,
+        request: &ShellRequest,
+        call_id: &str,
+        tool_input: &serde_json::Value,
+        ok: bool,
+        started: std::time::Instant,
+        result_str: &str,
+    ) {
         let _ = app.emit("chat://tool-end", &ToolEndEvent {
             workspace_id: request.workspace_id.clone(),
             thread_id: request.thread_id.clone(),
-            call_id: call_id.clone(),
-            ok: result.ok,
-            duration_ms,
+            call_id: call_id.to_string(),
+            ok,
+            duration_ms: started.elapsed().as_millis() as u64,
         });
-
         let record = serde_json::json!({
             "callId": call_id,
             "toolName": "run_command",
             "toolInput": tool_input,
-            "result": format_shell_output(&result),
+            "result": result_str,
         });
-        self.insert_and_emit_message(
-            &app, &request.workspace_id, &request.thread_id,
+        let _ = self.insert_and_emit_message(
+            app, &request.workspace_id, &request.thread_id,
             "tool", &record.to_string(), None, None, None, None,
-        )?;
+        );
+    }
 
-        Ok(result)
+    /// Drive a promoted live process on a background thread: stream raw output as
+    /// `chat://shell-output`, then on exit emit `tool-end` + `shell-exit` and
+    /// persist the resolved card with the full captured output.
+    fn spawn_live_streamer(
+        &self,
+        app: AppHandle,
+        request: ShellRequest,
+        call_id: String,
+        tool_input: serde_json::Value,
+        started: std::time::Instant,
+        live: crate::talk_shell::LiveRun,
+    ) {
+        let db = Arc::clone(&self.db);
+        std::thread::Builder::new()
+            .name(format!("talk-live-{call_id}"))
+            .spawn(move || {
+                let exit = {
+                    let app = app.clone();
+                    let tid = request.thread_id.clone();
+                    let cid = call_id.clone();
+                    live.stream(|chunk| {
+                        let _ = app.emit("chat://shell-output", &ShellOutputEvent {
+                            thread_id: tid.clone(),
+                            call_id: cid.clone(),
+                            chunk: chunk.to_string(),
+                        });
+                    })
+                };
+
+                let _ = app.emit("chat://tool-end", &ToolEndEvent {
+                    workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
+                    call_id: call_id.clone(),
+                    ok: exit.exit_code == 0,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                });
+                let _ = app.emit("chat://shell-exit", &ShellExitEvent {
+                    thread_id: request.thread_id.clone(),
+                    call_id: call_id.clone(),
+                    exit_code: exit.exit_code,
+                    cwd: exit.cwd.clone(),
+                });
+
+                let record = serde_json::json!({
+                    "callId": call_id,
+                    "toolName": "run_command",
+                    "toolInput": tool_input,
+                    "result": format_command_output(&exit.full_output, exit.exit_code),
+                });
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                let id = db.lock().insert_chat_message(
+                    &request.workspace_id, &request.thread_id, "tool",
+                    &record.to_string(), None, None, None, None,
+                );
+                if let Ok(id) = id {
+                    let _ = app.emit("chat://message-added", &MessageAddedEvent {
+                        workspace_id: request.workspace_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        id,
+                        role: "tool".to_string(),
+                        content: record.to_string(),
+                        model: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost_usd: None,
+                        created_at: now,
+                    });
+                }
+            })
+            .ok();
     }
 
     /// Run the agentic loop: send messages with tools, execute tool calls,
@@ -739,9 +877,16 @@ impl ChatEngine {
             // since providers reject empty text blocks.
             match messages.last_mut() {
                 Some(last) if last.role == LlmRole::User => {
+                    // Use the turn's already-built text, not request.user_message:
+                    // the former includes any merged `$`-direct command context
+                    // prepended above, which would otherwise be dropped here.
+                    let text = match &last.content {
+                        LlmContent::Text(t) => t.clone(),
+                        _ => request.user_message.clone(),
+                    };
                     let mut blocks: Vec<LlmBlock> = Vec::new();
-                    if !request.user_message.trim().is_empty() {
-                        blocks.push(LlmBlock::Text(request.user_message.clone()));
+                    if !text.trim().is_empty() {
+                        blocks.push(LlmBlock::Text(text));
                     }
                     for att in &request.attachments {
                         blocks.push(LlmBlock::Image {

@@ -79,6 +79,49 @@ function makeMsg(overrides: Partial<MessageAddedEvent>): MessageAddedEvent {
   };
 }
 
+describe("chatStore — live `$`-direct process lifecycle", () => {
+  beforeEach(() => resetStore());
+
+  it("opens a live process on shell-live-start and closes it on shell-exit", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
+
+    emit("chat://shell-live-start", {
+      workspaceId: "ws-1",
+      threadId: "t1",
+      callId: "shell-1",
+      command: "npm run dev",
+    });
+
+    const live = useChatStore.getState().getLiveProcess("ws-1");
+    expect(live).not.toBeNull();
+    expect(live?.command).toBe("npm run dev");
+    expect(live?.callId).toBe("shell-1");
+
+    emit("chat://shell-exit", {
+      threadId: "t1",
+      callId: "shell-1",
+      exitCode: 0,
+      cwd: "/repo/packages/api",
+    });
+
+    expect(useChatStore.getState().getLiveProcess("ws-1")).toBeNull();
+    // The exit cwd updates the badge source.
+    expect(useChatStore.getState().getShellCwd("ws-1")).toBe("/repo/packages/api");
+  });
+
+  it("scopes the live process to its thread", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t-other" } });
+    emit("chat://shell-live-start", {
+      workspaceId: "ws-1",
+      threadId: "t1",
+      callId: "shell-1",
+      command: "tail -f log",
+    });
+    // Active thread is t-other, so the t1 process isn't surfaced here.
+    expect(useChatStore.getState().getLiveProcess("ws-1")).toBeNull();
+  });
+});
+
 // ─── Tests ────────────────────────────────────────────────────────────
 describe("chatStore — single workspace tool-card persistence", () => {
   beforeEach(() => resetStore());

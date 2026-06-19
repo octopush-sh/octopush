@@ -1,5 +1,6 @@
 import { ChatCanvas } from "./chat/ChatCanvas";
 import { Composer } from "./chat/Composer";
+import { LiveProcessPanel } from "./chat/LiveProcessPanel";
 
 interface Props {
   workspaceId: string;
@@ -34,6 +35,7 @@ export function ChatView({
         onOpenInEditor={onOpenInEditor}
         onRunInTerminal={onRunInTerminal}
       />
+      <LiveProcessPanel workspaceId={workspaceId} />
       <div className="shrink-0 border-t border-octo-hairline bg-octo-panel">
         <Composer workspaceId={workspaceId} workspacePath={workspacePath} />
       </div>
