@@ -109,6 +109,11 @@ pub struct Session {
     /// produces a busy tick, so it never alerts on open. Reset on
     /// every attach.
     saw_fg_activity: bool,
+    /// Whether a non-shell child currently owns the PTY (a command is
+    /// running). Tracked independently of the attention latches so the
+    /// rail's "processing" bar reflects reality immediately; the daemon
+    /// emits `Event::Foreground` only when this flips.
+    fg_busy: bool,
 }
 
 /// Output-quiet window before considering the byte stream "calm"
@@ -157,6 +162,7 @@ impl Session {
             consecutive_idle_ticks: 0,
             attention_grace_until: None,
             saw_fg_activity: false,
+            fg_busy: false,
         }
     }
 
@@ -460,6 +466,53 @@ impl Session {
             let _ = tx.send(event.to_line());
         }
     }
+
+    /// Update the "a command is running" state from the current foreground
+    /// process group and return `Some(new_state)` when it FLIPS (else
+    /// `None`). Unlike `check_attention`, this is a plain ownership check
+    /// (`fg != shell`) with no latch, byte threshold, or grace window — so
+    /// the rail reflects activity the moment it starts or stops. An
+    /// indeterminate reading (no fg pgroup yet, or shell pid unknown) leaves
+    /// the state unchanged rather than flickering to idle.
+    ///
+    /// The normal "command finished" clear comes from `fg` returning to the
+    /// shell pid on the next tick. The `!running` branch only keeps internal
+    /// state honest — by the time a session is dead its client has already
+    /// detached, so it emits nothing; the frontend clears `busy` off the
+    /// `pty://exit` event instead.
+    pub fn check_foreground(&mut self, fg_pgroup: Option<i32>) -> Option<bool> {
+        if !self.running {
+            return self.set_fg_busy(false);
+        }
+        let (Some(fg), Some(shell)) = (fg_pgroup, self.shell_pid) else {
+            return None;
+        };
+        if fg <= 0 {
+            return None;
+        }
+        self.set_fg_busy(fg != shell)
+    }
+
+    /// Set `fg_busy`, returning `Some(value)` only on a change.
+    fn set_fg_busy(&mut self, busy: bool) -> Option<bool> {
+        if busy == self.fg_busy {
+            None
+        } else {
+            self.fg_busy = busy;
+            Some(busy)
+        }
+    }
+
+    /// Emit an `Event::Foreground` to the attached client, if any.
+    pub fn emit_foreground(&self, busy: bool) {
+        if let Some(ref tx) = self.attached {
+            let event = Event::Foreground {
+                id: self.id.clone(),
+                busy,
+            };
+            let _ = tx.send(event.to_line());
+        }
+    }
 }
 
 /// Sum of user + system CPU time for `pid` in nanoseconds, as
@@ -559,6 +612,38 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         Session::new("attn-test".into(), "label".into(), "/tmp".into(), 0)
+    }
+
+    /// `check_foreground` reports a busy transition only on a flip, with no
+    /// grace window or byte threshold (unlike attention).
+    #[test]
+    fn foreground_busy_flips_on_change_only() {
+        let mut sess = new_sess();
+        sess.shell_pid = Some(100);
+
+        // Shell at prompt → not busy; no change from the default false.
+        assert_eq!(sess.check_foreground(Some(100)), None);
+        // A child takes the foreground → busy=true (a flip).
+        assert_eq!(sess.check_foreground(Some(200)), Some(true));
+        // Still the child → no re-emit.
+        assert_eq!(sess.check_foreground(Some(200)), None);
+        // Shell regains control → busy=false (a flip).
+        assert_eq!(sess.check_foreground(Some(100)), Some(false));
+        // An indeterminate reading (no fg pgroup) leaves state unchanged.
+        assert_eq!(sess.check_foreground(None), None);
+        // No grace/threshold gating: busy fires immediately even mid-grace.
+        sess.attention_grace_until = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(sess.check_foreground(Some(200)), Some(true));
+    }
+
+    /// A dead session is never busy.
+    #[test]
+    fn foreground_clears_when_not_running() {
+        let mut sess = new_sess();
+        sess.shell_pid = Some(100);
+        assert_eq!(sess.check_foreground(Some(200)), Some(true));
+        sess.running = false;
+        assert_eq!(sess.check_foreground(Some(200)), Some(false));
     }
 
     /// Event A (command-finished): the foreground pgroup transitions from

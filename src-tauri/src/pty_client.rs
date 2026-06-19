@@ -35,6 +35,10 @@ pub enum TermEvent {
     /// "waiting for user input". Frontend uses this to drive the
     /// attention chime + monogram halo + mode-tab pulse.
     Attention,
+    /// Emitted on a foreground-process state change: `busy` is true when a
+    /// non-shell child owns the PTY (a command is running), false when the
+    /// shell is back at its prompt. Drives the rail's processing bar.
+    Foreground { busy: bool },
 }
 
 /// Minimal terminal descriptor returned by `list_terminals`.
@@ -492,6 +496,10 @@ fn run_reader(
                     TermEvent::Error { message }
                 }
                 Some("attention") => TermEvent::Attention,
+                Some("foreground") => {
+                    let busy = v["busy"].as_bool().unwrap_or(false);
+                    TermEvent::Foreground { busy }
+                }
                 _ => continue,
             };
 
@@ -683,6 +691,9 @@ mod tests {
                 }
                 Ok(TermEvent::Attention) => {
                     // Daemon-driven attention pings — not under test here.
+                }
+                Ok(TermEvent::Foreground { .. }) => {
+                    // Foreground busy transitions — not under test here.
                 }
                 Err(_) => {}
             }

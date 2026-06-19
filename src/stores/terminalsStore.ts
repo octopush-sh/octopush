@@ -11,6 +11,10 @@ export interface TerminalState {
   position: number;
   /** true once the frontend has spawned (or reattached) a PTY for this id */
   running: boolean;
+  /** true while a non-shell command is executing in this PTY (foreground
+   *  process != shell). Distinct from `running` (= shell session alive);
+   *  driven by the daemon's `pty://foreground` events. */
+  busy: boolean;
   /**
    * Transient flag: true when this terminal was reattached to a surviving
    * daemon session on startup (as opposed to a fresh spawn).  Cleared after
@@ -53,6 +57,9 @@ interface TerminalsStore {
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
   setActive: (workspaceId: string, id: string | null) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
+  /** Set whether a command is currently executing in a terminal (foreground
+   *  busy), from the daemon's `pty://foreground` events. */
+  setBusy: (workspaceId: string, id: string, busy: boolean) => void;
   /** Clear the transient `restored` badge for a given terminal. */
   clearRestored: (workspaceId: string, id: string) => void;
 }
@@ -123,6 +130,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           label: r.label,
           position: r.position,
           running,
+          busy: false,
           restored,
         };
       });
@@ -169,6 +177,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       label: record.label,
       position: record.position,
       running: false,
+      busy: false,
       restored: false,
     };
 
@@ -247,9 +256,22 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       return {
         terminalsByWs: {
           ...s.terminalsByWs,
+          // A dead session can't be busy — clear busy when the PTY stops.
           [workspaceId]: prev.map((t) =>
-            t.id === id ? { ...t, running } : t,
+            t.id === id ? { ...t, running, busy: running ? t.busy : false } : t,
           ),
+        },
+      };
+    }),
+
+  setBusy: (workspaceId, id, busy) =>
+    set((s) => {
+      const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+      if (!prev.some((t) => t.id === id && t.busy !== busy)) return s;
+      return {
+        terminalsByWs: {
+          ...s.terminalsByWs,
+          [workspaceId]: prev.map((t) => (t.id === id ? { ...t, busy } : t)),
         },
       };
     }),

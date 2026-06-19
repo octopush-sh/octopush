@@ -106,23 +106,27 @@ function App() {
   // shallow-compared, so a DIRECT run's frequent cost ticks (which mutate
   // runsByWs) don't re-render the shell unless the running set actually changes.
   //
-  // RUN/terminal is intentionally NOT included: the only terminal signal today
-  // (`TerminalState.running`) means "a shell session is alive", not "a command
-  // is executing", so it would mark the bar forever for any open terminal. A
-  // real foreground-busy signal exists in the PTY daemon (it powers attention
-  // detection) but isn't surfaced to the frontend yet — that's a follow-up.
+  // RUN/terminal uses `TerminalState.busy` — the daemon's foreground signal
+  // ("a non-shell command owns the PTY"), NOT `running` (= shell session alive,
+  // which would mark the bar forever for any open terminal).
   const chatRunningIds = useChatStore(
     useShallow((s) => Object.keys(s.streamingByWs).filter((id) => s.streamingByWs[id])),
   );
   const directRunningIds = useRunsStore(
     useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
   );
+  const terminalBusyIds = useTerminalsStore(
+    useShallow((s) =>
+      Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
+    ),
+  );
   const runningByWs = useMemo(() => {
     const out: Record<string, boolean> = {};
     for (const id of chatRunningIds) out[id] = true;
     for (const id of directRunningIds) out[id] = true;
+    for (const id of terminalBusyIds) out[id] = true;
     return out;
-  }, [chatRunningIds, directRunningIds]);
+  }, [chatRunningIds, directRunningIds, terminalBusyIds]);
 
   const [appView, setAppView] = useState<AppView>("project");
 

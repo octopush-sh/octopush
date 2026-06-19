@@ -455,7 +455,9 @@ impl LiveRun {
                     push(&tail, &mut full, &mut on_chunk);
                     break;
                 }
-                Ok(TermEvent::Attention) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(TermEvent::Attention)
+                | Ok(TermEvent::Foreground { .. })
+                | Err(RecvTimeoutError::Timeout) => {}
             }
         }
 
@@ -537,7 +539,7 @@ fn probe(rx: &Receiver<TermEvent>, timeout: Duration, nonce: &str) -> Probe {
                     output: extract_partial(&buf, nonce),
                 };
             }
-            Ok(TermEvent::Attention) => {}
+            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Probe::Dead {
@@ -687,7 +689,7 @@ fn init_and_wait_ready(
             Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
                 return Err(AppError::Other("talk shell exited during init".into()));
             }
-            Ok(TermEvent::Attention) => {}
+            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(AppError::Other("talk shell channel closed during init".into()));
@@ -723,7 +725,7 @@ fn resync_after_interrupt(
             Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
                 return Err(AppError::Other("shell exited during resync".into()));
             }
-            Ok(TermEvent::Attention) => {}
+            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(AppError::Other("shell channel closed during resync".into()));
