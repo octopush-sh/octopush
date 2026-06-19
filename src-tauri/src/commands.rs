@@ -864,6 +864,30 @@ pub async fn stop_shell_command(state: State<'_, AppState>, thread_id: String) -
     Ok(())
 }
 
+/// Forward keystrokes to a thread's live process (interactive stdin: REPLs,
+/// TUIs, prompts). Output streams back via `chat://shell-output`.
+#[tauri::command]
+pub async fn send_shell_input(
+    state: State<'_, AppState>,
+    thread_id: String,
+    data: String,
+) -> AppResult<()> {
+    state.chat.talk_shell.write_stdin(&thread_id, data.as_bytes());
+    Ok(())
+}
+
+/// Resize a thread's PTY so a full-screen TUI lays out to the live panel size.
+#[tauri::command]
+pub async fn resize_shell(
+    state: State<'_, AppState>,
+    thread_id: String,
+    rows: u16,
+    cols: u16,
+) -> AppResult<()> {
+    state.chat.talk_shell.resize(&thread_id, cols, rows);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,

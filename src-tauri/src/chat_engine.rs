@@ -779,11 +779,13 @@ impl ChatEngine {
                 let id = {
                     let db = db.lock();
                     match db.chat_thread_exists(&request.thread_id) {
-                        Ok(true) => db.insert_chat_message(
+                        // Only skip when the thread was definitively deleted — a
+                        // transient DB error must NOT drop the command's card.
+                        Ok(false) => return,
+                        _ => db.insert_chat_message(
                             &request.workspace_id, &request.thread_id, "tool",
                             &record.to_string(), None, None, None, None,
                         ),
-                        _ => return,
                     }
                 };
                 if let Ok(id) = id {
@@ -1310,8 +1312,11 @@ impl ChatEngine {
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
+                    // Generous cap so legitimate long builds/installs/test suites
+                    // (which the old execute_tool path ran un-timed) complete; only
+                    // a true hang is interrupted.
                     match tokio::task::spawn_blocking(move || {
-                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(120))
+                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(600))
                     })
                     .await
                     {
@@ -1324,7 +1329,9 @@ impl ChatEngine {
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since
-                        // it runs at the workspace root, not the shared cwd.
+                        // it runs at the workspace root, not the shared cwd. The
+                        // fallback is itself bounded (off-thread + timeout) so it
+                        // can't hang the turn.
                         other => {
                             let reason = match other {
                                 Ok(Ok(crate::talk_shell::CaptureOutcome::Busy)) =>
@@ -1332,7 +1339,18 @@ impl ChatEngine {
                                 Ok(Err(e)) => e.to_string(),
                                 _ => "the shared shell task failed".to_string(),
                             };
-                            let (out, ok) = execute_tool(&workspace_path, &u.name, &u.input);
+                            let wp = workspace_path.clone();
+                            let name = u.name.clone();
+                            let input = u.input.clone();
+                            let (out, ok) = match tokio::time::timeout(
+                                std::time::Duration::from_secs(600),
+                                tokio::task::spawn_blocking(move || execute_tool(&wp, &name, &input)),
+                            )
+                            .await
+                            {
+                                Ok(Ok((o, k))) => (o, k),
+                                _ => ("(isolated fallback timed out or failed)".to_string(), false),
+                            };
                             (
                                 format!(
                                     "(ran in an isolated shell at the workspace root — {reason})\n{out}"
