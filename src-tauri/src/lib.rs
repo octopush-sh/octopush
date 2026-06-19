@@ -22,6 +22,7 @@ pub mod session_recap;
 pub mod settings;
 pub mod skills;
 mod state;
+pub mod talk_shell;
 pub mod template;
 pub mod theme;
 pub mod token_engine;
@@ -174,6 +175,7 @@ pub fn run() {
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,
+            commands::run_shell_command,
             commands::list_chat_messages,
             commands::cancel_chat,
             commands::list_chat_threads,

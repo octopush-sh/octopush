@@ -27,7 +27,7 @@ impl AppState {
     pub fn init(daemon_client: Option<Arc<DaemonClient>>) -> AppResult<Self> {
         let db = Arc::new(Mutex::new(Db::open(&Db::default_path())?));
         let tokens = Arc::new(TokenEngine::new(Arc::clone(&db)));
-        let chat = ChatEngine::new(Arc::clone(&db));
+        let chat = ChatEngine::new(Arc::clone(&db), daemon_client.clone());
         let router = ProviderRouter::load()?;
 
         let pty = match daemon_client.as_ref() {

@@ -844,6 +844,18 @@ pub async fn send_chat_message(
     state.chat.send_agentic(app, request).await
 }
 
+/// Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
+/// command + output into the conversation and returns the resulting cwd/exit
+/// for the composer's cwd badge.
+#[tauri::command]
+pub async fn run_shell_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::chat_engine::ShellRequest,
+) -> AppResult<crate::talk_shell::ShellResult> {
+    state.chat.run_shell_command(app, request).await
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,
@@ -893,6 +905,9 @@ pub async fn rename_chat_thread(
 
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    // Tear down the thread's TALK shell (kills the daemon PTY + releases the
+    // session entry) so deleting conversations doesn't leak bash processes.
+    state.chat.talk_shell.close(&thread_id);
     state.db.lock().delete_chat_thread(&thread_id)
 }
 
