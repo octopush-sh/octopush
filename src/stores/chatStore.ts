@@ -50,6 +50,15 @@ interface ToolEndEvent {
 
 /** Generation effort presets — map to the output-token budget (and, later,
  *  thinking budget). Swift is cheap/snappy; Deep gives the model more room. */
+/** A promoted long-running `$`-direct process, rendered in a pinned terminal. */
+export interface LiveProcess {
+  callId: string;
+  command: string;
+  /** Output already seen during the promotion window — painted on panel mount. */
+  initial: string;
+  workspaceId: string;
+}
+
 export type Effort = "swift" | "standard" | "deep";
 
 export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
@@ -166,6 +175,9 @@ interface ChatState {
    *  after every `$`-direct command so the composer can show a cwd badge once
    *  the user has `cd`'d away from the workspace root. */
   shellCwdByThread: Record<string, string>;
+  /** A live (long-running) `$`-direct process per thread, shown as a pinned
+   *  mini-terminal. Present between chat://shell-live-start and shell-exit. */
+  liveProcessByThread: Record<string, LiveProcess>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -185,6 +197,8 @@ interface ChatState {
   getAttachments: (workspaceId: string) => Attachment[];
   /** The active thread's TALK shell cwd, or null if unknown / never run. */
   getShellCwd: (workspaceId: string) => string | null;
+  /** The active thread's live `$`-direct process, or null if none is running. */
+  getLiveProcess: (workspaceId: string) => LiveProcess | null;
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -201,6 +215,8 @@ interface ChatState {
     workspacePath: string,
     command: string,
   ) => Promise<void>;
+  /** SIGINT (Ctrl-C) the active thread's live `$`-direct process. */
+  stopShellProcess: (workspaceId: string) => void;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
   setActiveSkill: (workspaceId: string, skill: string | null) => void;
@@ -385,6 +401,52 @@ export const useChatStore = create<ChatState>((set, get) => {
     });
   });
 
+  // ── chat://shell-live-start ───────────────────────────────────
+  // A `$`-direct command was promoted to a live process — open a pinned
+  // mini-terminal for the thread. The `initial` output is painted on mount;
+  // subsequent chunks arrive as chat://shell-output (consumed by TerminalView).
+  listen<{
+    workspaceId: string;
+    threadId: string;
+    callId: string;
+    command: string;
+    initial: string;
+  }>("chat://shell-live-start", (ev) => {
+    const p = ev.payload;
+    if (!p.threadId) return;
+    set((s) => ({
+      liveProcessByThread: {
+        ...s.liveProcessByThread,
+        [p.threadId]: {
+          callId: p.callId,
+          command: p.command,
+          initial: p.initial,
+          workspaceId: p.workspaceId,
+        },
+      },
+    }));
+  });
+
+  // ── chat://shell-exit ─────────────────────────────────────────
+  // The live process exited — close the pinned terminal and update the cwd.
+  listen<{ threadId: string; callId: string; exitCode: number; cwd: string }>(
+    "chat://shell-exit",
+    (ev) => {
+      const p = ev.payload;
+      if (!p.threadId) return;
+      set((s) => {
+        const next = { ...s.liveProcessByThread };
+        delete next[p.threadId];
+        return {
+          liveProcessByThread: next,
+          shellCwdByThread: p.cwd
+            ? { ...s.shellCwdByThread, [p.threadId]: p.cwd }
+            : s.shellCwdByThread,
+        };
+      });
+    },
+  );
+
   return {
     messagesByWs: {},
     streamingByWs: {},
@@ -397,6 +459,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     activeSkillByWs: {},
     attachmentsByWs: {},
     shellCwdByThread: {},
+    liveProcessByThread: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -412,6 +475,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     getShellCwd: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
       return threadId ? get().shellCwdByThread[threadId] ?? null : null;
+    },
+    getLiveProcess: (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      return threadId ? get().liveProcessByThread[threadId] ?? null : null;
     },
 
     getTimeline: (workspaceId) => {
@@ -584,6 +651,11 @@ export const useChatStore = create<ChatState>((set, get) => {
             : {},
         );
       }
+    },
+
+    stopShellProcess: (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      if (threadId) void ipc.stopShellCommand(threadId).catch(() => {});
     },
 
     setModel: (model) => set({ model }),
