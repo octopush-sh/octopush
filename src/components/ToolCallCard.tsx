@@ -120,6 +120,10 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
   const command =
     tool.toolName === "run_command" ? String(tool.toolInput?.command ?? "") : "";
+  // Where a `$`-direct command ran, relative to the workspace root (only set
+  // when not the root) — surfaces the persistent shell's cwd per command.
+  const cwd =
+    tool.toolName === "run_command" ? String(tool.toolInput?.cwd ?? "") : "";
 
   return (
     <div className="chat-selectable" style={cardStyle}>
@@ -170,6 +174,24 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
           >
             {summary}
           </span>
+          {cwd && (
+            <span
+              title={`ran in ${cwd}`}
+              style={{
+                fontSize: 10,
+                color: MUTE,
+                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                flexShrink: 0,
+                marginLeft: 6,
+                maxWidth: 160,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {cwd}
+            </span>
+          )}
           <span
             style={{
               fontSize: 10,

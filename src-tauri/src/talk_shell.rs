@@ -143,7 +143,7 @@ impl TalkShell {
         let handle = match existing {
             Some(h) => h,
             None => {
-                let session = Self::spawn_session(&client, thread_id, workspace_path)?;
+                let session = Self::ensure_session(&client, thread_id, workspace_path)?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -190,7 +190,7 @@ impl TalkShell {
                 // Shell died — recycle in place at the saved cwd.
                 let _ = client.remove(&id);
                 let mut session = handle.lock();
-                if let Ok(fresh) = Self::spawn_session(&client, thread_id, &cwd) {
+                if let Ok(fresh) = Self::ensure_session(&client, thread_id, &cwd) {
                     *session = fresh;
                 }
                 Ok(RunOutcome::Done(ShellResult {
@@ -232,63 +232,67 @@ impl TalkShell {
         }
     }
 
-    fn spawn_session(
+    /// Get a session for `thread_id`: reattach to a surviving daemon PTY — so the
+    /// shell (cwd, env, exports) persists across an Octopush restart — or spawn a
+    /// fresh bash. Either way, (re-)define the marker emitters with a fresh nonce
+    /// and wait until the shell confirms ready (on reattach, replayed scrollback
+    /// is drained past). Returns the (restored) cwd.
+    fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
         cwd: &str,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
+        let reattaching = client
+            .list_terminals()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.id == id && t.running);
+
+        if !reattaching {
+            Self::spawn_bash(client, &id, cwd)?;
+        }
         let nonce = gen_nonce();
+        let rx = client.attach(&id, 0)?;
+
+        match init_and_wait_ready(client, &id, &rx, &nonce) {
+            Ok(ready_cwd) => Ok(Session {
+                id,
+                rx: Some(rx),
+                cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
+                nonce,
+            }),
+            // The reattached shell never became ready — likely mid-run (a live
+            // process from before the restart). Recycle it: kill + fresh spawn.
+            Err(_) if reattaching => {
+                drop(rx);
+                let _ = client.remove(&id);
+                Self::spawn_bash(client, &id, cwd)?;
+                let nonce = gen_nonce();
+                let rx = client.attach(&id, 0)?;
+                let ready_cwd = init_and_wait_ready(client, &id, &rx, &nonce)?;
+                Ok(Session {
+                    id,
+                    rx: Some(rx),
+                    cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
+                    nonce,
+                })
+            }
+            Err(e) => {
+                let _ = client.remove(&id);
+                Err(e)
+            }
+        }
+    }
+
+    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str) -> AppResult<()> {
         let mut env = HashMap::new();
+        // Forward the app's PATH so commands resolve as the app sees them.
         if let Ok(path) = std::env::var("PATH") {
             env.insert("PATH".to_string(), path);
         }
-        client.spawn(&id, cwd, &env, Some("/bin/bash"), 40, 120)?;
-        let rx = client.attach(&id, 0)?;
-
-        let mut init = String::new();
-        init.push_str("stty -echo 2>/dev/null; PS1=''; PS2=''; PROMPT_COMMAND=''\n");
-        init.push_str("__OCTORS=$(printf '\\036')\n");
-        init.push_str(&format!(
-            "__octo_start() {{ printf '%s%sOCTO_START_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str(&format!(
-            "__octo_end() {{ printf '%s%sOCTO_END_{nonce}:%d:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$1\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str(&format!(
-            "__octo_ready() {{ printf '%s%sOCTO_READY_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str("__octo_ready\n");
-        client.write(&id, init.as_bytes())?;
-
-        let ready = ready_marker(&nonce);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut buf = String::new();
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(TermEvent::Data { bytes, .. }) => {
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
-                    if buf.contains(&ready) {
-                        return Ok(Session {
-                            id,
-                            rx: Some(rx),
-                            cwd: cwd.to_string(),
-                            nonce,
-                        });
-                    }
-                }
-                Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
-                    return Err(AppError::Other("talk shell exited during init".into()));
-                }
-                Ok(TermEvent::Attention) => {}
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(AppError::Other("talk shell channel closed during init".into()));
-                }
-            }
-        }
-        let _ = client.remove(&id);
-        Err(AppError::Other("talk shell did not become ready".into()))
+        client.spawn(id, cwd, &env, Some("/bin/bash"), 40, 120)?;
+        Ok(())
     }
 }
 
@@ -524,8 +528,62 @@ fn start_marker(nonce: &str) -> String {
     format!("\u{1e}\u{1e}OCTO_START_{nonce}\u{1e}\u{1e}")
 }
 
-fn ready_marker(nonce: &str) -> String {
-    format!("\u{1e}\u{1e}OCTO_READY_{nonce}\u{1e}\u{1e}")
+/// The READY marker carries `$PWD` so a reattach recovers the shell's cwd.
+fn ready_re(nonce: &str) -> regex::Regex {
+    regex::Regex::new(&format!(
+        r"\x1e\x1eOCTO_READY_{}:([^\x1e]*)\x1e\x1e",
+        regex::escape(nonce)
+    ))
+    .expect("valid ready-marker regex")
+}
+
+/// (Re-)define the marker emitters with `nonce` on an attached shell, then drain
+/// the receiver until the READY marker — discarding any replayed scrollback /
+/// echo (the reattach path replays prior output). Returns the shell's cwd,
+/// parsed from the ready marker.
+fn init_and_wait_ready(
+    client: &Arc<DaemonClient>,
+    id: &str,
+    rx: &Receiver<TermEvent>,
+    nonce: &str,
+) -> AppResult<Option<String>> {
+    let mut init = String::new();
+    init.push_str("stty -echo 2>/dev/null; PS1=''; PS2=''; PROMPT_COMMAND=''\n");
+    init.push_str("__OCTORS=$(printf '\\036')\n");
+    init.push_str(&format!(
+        "__octo_start() {{ printf '%s%sOCTO_START_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str(&format!(
+        "__octo_end() {{ printf '%s%sOCTO_END_{nonce}:%d:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$1\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str(&format!(
+        "__octo_ready() {{ printf '%s%sOCTO_READY_{nonce}:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str("__octo_ready\n");
+    client.write(id, init.as_bytes())?;
+
+    let re = ready_re(nonce);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = String::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(TermEvent::Data { bytes, .. }) => {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                if let Some(caps) = re.captures(&buf) {
+                    return Ok(Some(caps[1].to_string()));
+                }
+            }
+            Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
+                return Err(AppError::Other("talk shell exited during init".into()));
+            }
+            Ok(TermEvent::Attention) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppError::Other("talk shell channel closed during init".into()));
+            }
+        }
+    }
+    Err(AppError::Other("talk shell did not become ready".into()))
 }
 
 fn end_re(nonce: &str) -> regex::Regex {
@@ -822,6 +880,46 @@ mod e2e {
         assert_eq!(r.output, "back");
 
         shell.close("t");
+        daemon.kill().ok();
+    }
+
+    #[test]
+    #[serial]
+    fn reattaches_to_surviving_shell_across_restart() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let base = home.join(".octopush");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("pty-server.sock");
+        let mut daemon = start_daemon(home);
+        assert!(wait_for_socket(&sock), "daemon socket did not appear");
+        let quick = Duration::from_secs(5);
+
+        // First app run: establish shell state (cd + an exported env var).
+        {
+            let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
+            let shell = TalkShell::new();
+            shell.set_client(Some(client));
+            done(shell.run("persist", "/", "cd /tmp && export OCTO_T3=kept", quick).unwrap());
+            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            assert!(r.output.ends_with("tmp"));
+            // `shell` (and its session receiver) drops here — simulating an
+            // Octopush restart. The daemon keeps the `talk-persist` PTY alive.
+        }
+
+        // Second app run: a brand-new TalkShell against the SAME daemon must
+        // reattach to the surviving shell, preserving cwd AND the exported var.
+        {
+            let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
+            let shell = TalkShell::new();
+            shell.set_client(Some(client));
+            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            assert!(r.output.ends_with("tmp"), "cwd not restored on reattach: {:?}", r.output);
+            let r = done(shell.run("persist", "/", "echo \"$OCTO_T3\"", quick).unwrap());
+            assert_eq!(r.output, "kept", "env var not restored on reattach");
+            shell.close("persist");
+        }
+
         daemon.kill().ok();
     }
 }
