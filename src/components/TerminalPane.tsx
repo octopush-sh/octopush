@@ -9,9 +9,11 @@ import type {
   PtyAttentionEvent,
   PtyDataEvent,
   PtyExitEvent,
+  PtyForegroundEvent,
   PtyReattachedEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { useTerminalsStore } from "../stores/terminalsStore";
 import { XTERM_FONT_FAMILY, XTERM_THEME } from "../lib/xtermTheme";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
@@ -328,6 +330,20 @@ export function TerminalPane({
       unlistenAttention = u;
     });
 
+    // Daemon-driven foreground state: a command started or stopped running in
+    // this PTY. Feeds the rail's processing bar — updated regardless of whether
+    // the pane is visible, so a background workspace's bar reflects its work.
+    let unlistenForeground: UnlistenFn | undefined;
+    listen<PtyForegroundEvent>("pty://foreground", (ev) => {
+      const ptyId = ptySessionIdRef.current;
+      if (!ptyId || ev.payload.sessionId !== ptyId) return;
+      useTerminalsStore
+        .getState()
+        .setBusy(workspaceIdRef.current, ptyId, ev.payload.busy);
+    }).then((u) => {
+      unlistenForeground = u;
+    });
+
     listen<PtyExitEvent>("pty://exit", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       term.writeln("\r\n\x1b[2;37m[session exited]\x1b[0m");
@@ -437,6 +453,7 @@ export function TerminalPane({
       unlistenExit?.();
       unlistenReattached?.();
       unlistenAttention?.();
+      unlistenForeground?.();
       copyEl.removeEventListener("contextmenu", onContextMenu);
       copyEl.removeEventListener("wheel", onWheel);
       term.dispose();

@@ -51,6 +51,16 @@ struct PtyAttentionEvent {
     session_id: String,
 }
 
+/// Event payload for `pty://foreground` — emitted when the PTY's foreground
+/// process flips between the shell (idle) and a running command. `busy` is
+/// true while a command is executing.
+#[derive(Serialize, Clone)]
+struct PtyForegroundEvent {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    busy: bool,
+}
+
 /// Event payload for `pty://reattached` — emitted once when a PTY is
 /// reattached to a surviving daemon session (i.e., after an Octopush restart).
 #[derive(Serialize, Clone)]
@@ -306,6 +316,15 @@ fn start_reader_thread(
                             "pty://attention",
                             PtyAttentionEvent {
                                 session_id: id.clone(),
+                            },
+                        );
+                    }
+                    Ok(TermEvent::Foreground { busy }) => {
+                        let _ = app.emit(
+                            "pty://foreground",
+                            PtyForegroundEvent {
+                                session_id: id.clone(),
+                                busy,
                             },
                         );
                     }

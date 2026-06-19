@@ -194,6 +194,14 @@ export interface PtyAttentionEvent {
   sessionId: string;
 }
 
+/** Payload of the `pty://foreground` Tauri event. Emitted when the PTY's
+ *  foreground process flips between the shell (idle) and a running command —
+ *  `busy` is true while a command executes. Drives the rail's processing bar. */
+export interface PtyForegroundEvent {
+  sessionId: string;
+  busy: boolean;
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────
 
 export interface ChatThread {
