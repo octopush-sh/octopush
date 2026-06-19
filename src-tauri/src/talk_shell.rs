@@ -64,6 +64,13 @@ pub enum RunOutcome {
     Busy,
 }
 
+/// Result of a capture-only run (the agent loop): completed, or the shell was
+/// busy with a live `$`-direct process.
+pub enum CaptureOutcome {
+    Done(ShellResult),
+    Busy,
+}
+
 /// Hand-off for a promoted long-running command. The caller drives
 /// [`LiveRun::stream`] to pump output to a sink until the command exits, then
 /// the session is restored for the next `$` command.
@@ -126,16 +133,27 @@ impl TalkShell {
         *self.client.lock() = client;
     }
 
-    /// Run a command in the thread's shell. Captures normally; if it hasn't
-    /// finished within `promote_after`, returns [`RunOutcome::Live`] so the
-    /// caller can stream the rest. `overall_timeout` bounds the quick path's
-    /// wait before promotion is forced.
+    /// Whether a daemon client is attached — i.e. the shared shell can be used.
+    /// Callers use this to decide between the shared shell and an isolated
+    /// fallback, rather than treating every `run` error as "no daemon".
+    pub fn available(&self) -> bool {
+        self.client.lock().is_some()
+    }
+
+    /// Run a command in the thread's shell.
+    ///
+    /// `promote = true` ($-direct): if the command hasn't finished within
+    /// `timeout`, return [`RunOutcome::Live`] so the caller can stream the rest.
+    /// `promote = false` (agent capture): never promote — on `timeout`, interrupt
+    /// the command (Ctrl-C) and return the partial output, preserving the shell's
+    /// env where possible (so the agent and the user share one cwd/env).
     pub fn run(
         &self,
         thread_id: &str,
         workspace_path: &str,
         command: &str,
-        promote_after: Duration,
+        timeout: Duration,
+        promote: bool,
     ) -> AppResult<RunOutcome> {
         let client = self
             .client
@@ -175,7 +193,7 @@ impl TalkShell {
             return Err(e);
         }
 
-        match probe(&rx, promote_after, &nonce) {
+        match probe(&rx, timeout, &nonce) {
             Probe::Done {
                 output,
                 exit_code,
@@ -218,7 +236,7 @@ impl TalkShell {
                     cwd_label: String::new(),
                 }))
             }
-            Probe::NotYet { raw, started } => Ok(RunOutcome::Live(LiveRun {
+            Probe::NotYet { raw, started } if promote => Ok(RunOutcome::Live(LiveRun {
                 rx,
                 // RAW (markers/ANSI intact): the stream filter both detects a
                 // marker split across the promotion boundary and emits it.
@@ -230,6 +248,74 @@ impl TalkShell {
                 handle,
                 client,
             })),
+            // Capture-only (agent): the command didn't finish in time. Interrupt
+            // it (Ctrl-C, which also flushes the queued end marker), then re-sync
+            // by emitting a fresh ready marker — this KEEPS the shell (env + cwd
+            // preserved). Only if the re-sync fails do we recycle (env lost).
+            Probe::NotYet { raw, .. } => {
+                let note = format!(
+                    "(command was still running after {}s and was interrupted — the output \
+                     above may be incomplete, and any process it backgrounded may still be \
+                     running)",
+                    timeout.as_secs()
+                );
+                // Strip any partial/unterminated marker that landed at the timeout
+                // boundary so marker noise never reaches the model.
+                let partial = strip_octo_markers(&clean_output(&raw));
+                let body = if partial.is_empty() { note.clone() } else { format!("{partial}\n{note}") };
+                let _ = client.write(&id, b"\x03");
+                match resync_after_interrupt(&client, &id, &rx, &nonce) {
+                    Ok(synced_cwd) => {
+                        let final_cwd = synced_cwd.filter(|c| !c.is_empty()).unwrap_or(cwd);
+                        let mut session = handle.lock();
+                        session.rx = Some(rx);
+                        session.cwd = final_cwd.clone();
+                        Ok(RunOutcome::Done(ShellResult {
+                            output: cap_output(body),
+                            exit_code: -1,
+                            ok: false,
+                            cwd: final_cwd,
+                            live: false,
+                            cwd_label: String::new(),
+                        }))
+                    }
+                    Err(_) => {
+                        let _ = client.remove(&id);
+                        match Self::ensure_session(&client, thread_id, &cwd) {
+                            Ok(fresh) => *handle.lock() = fresh,
+                            Err(e) => {
+                                self.sessions.lock().remove(thread_id);
+                                return Err(e);
+                            }
+                        }
+                        Ok(RunOutcome::Done(ShellResult {
+                            output: cap_output(body),
+                            exit_code: -1,
+                            ok: false,
+                            cwd,
+                            live: false,
+                            cwd_label: String::new(),
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Capture-only run for the agent loop (never promotes to a live process).
+    /// Shares the user's persistent shell, so the agent's `run_command` sees the
+    /// same cwd/env as `$`-direct commands.
+    pub fn run_capture(
+        &self,
+        thread_id: &str,
+        workspace_path: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> AppResult<CaptureOutcome> {
+        match self.run(thread_id, workspace_path, command, timeout, false)? {
+            RunOutcome::Done(r) => Ok(CaptureOutcome::Done(r)),
+            // Live never occurs in capture mode; treat defensively as Busy.
+            RunOutcome::Busy | RunOutcome::Live(_) => Ok(CaptureOutcome::Busy),
         }
     }
 
@@ -611,6 +697,42 @@ fn init_and_wait_ready(
     Err(AppError::Other("talk shell did not become ready".into()))
 }
 
+/// After interrupting a hung command (Ctrl-C), confirm the shell is back at an
+/// idle prompt by emitting a fresh ready marker (the emitter is still defined)
+/// and draining until it — discarding the interrupted command's trailing output.
+/// Returns the shell's cwd. Errors if the shell doesn't respond (caller recycles).
+fn resync_after_interrupt(
+    client: &Arc<DaemonClient>,
+    id: &str,
+    rx: &Receiver<TermEvent>,
+    nonce: &str,
+) -> AppResult<Option<String>> {
+    // Leading newline submits any partial line the interrupt left behind.
+    client.write(id, b"\n__octo_ready\n")?;
+    let re = ready_re(nonce);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut buf = String::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TermEvent::Data { bytes, .. }) => {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                if let Some(caps) = re.captures(&buf) {
+                    return Ok(Some(caps[1].to_string()));
+                }
+            }
+            Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
+                return Err(AppError::Other("shell exited during resync".into()));
+            }
+            Ok(TermEvent::Attention) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppError::Other("shell channel closed during resync".into()));
+            }
+        }
+    }
+    Err(AppError::Other("shell did not resync after interrupt".into()))
+}
+
 fn end_re(nonce: &str) -> regex::Regex {
     regex::Regex::new(&format!(
         r"\x1e\x1eOCTO_END_{}:(\d+):([^\x1e]*)\x1e\x1e",
@@ -671,6 +793,21 @@ fn clean_output(s: &str) -> String {
 /// bare control bytes our markers use, so stray RS bytes never reach xterm.
 fn clean_inline(s: &str) -> String {
     s.replace('\u{1e}', "")
+}
+
+fn octo_marker_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        // RS bytes and any whole-or-partial marker word (START/END/READY), as can
+        // land at a timeout boundary before the closing delimiter arrives.
+        regex::Regex::new(r"\x1e+|OCTO_(?:START|END|READY)_[0-9a-f]*(?::-?\d*:?[^\n\x1e]*)?").unwrap()
+    })
+}
+
+/// Remove any leftover capture-marker noise (RS bytes / marker words) — used on
+/// best-effort partial output, where a marker may be unterminated.
+fn strip_octo_markers(s: &str) -> String {
+    octo_marker_re().replace_all(s, "").trim().to_string()
 }
 
 /// Cap output at `MAX_OUTPUT_BYTES` on a char boundary, with a truncation note.
@@ -850,6 +987,13 @@ mod e2e {
         }
     }
 
+    fn cap(o: CaptureOutcome) -> ShellResult {
+        match o {
+            CaptureOutcome::Done(r) => r,
+            CaptureOutcome::Busy => panic!("expected Done, got Busy"),
+        }
+    }
+
     #[test]
     #[serial]
     fn quick_capture_persists_cwd_and_promotes_long_commands() {
@@ -867,25 +1011,25 @@ mod e2e {
         let quick = Duration::from_secs(5);
 
         // Quick command captured cleanly.
-        let r = done(shell.run("t", "/tmp", "echo hello world", quick).unwrap());
+        let r = done(shell.run("t", "/tmp", "echo hello world", quick, true).unwrap());
         assert_eq!(r.output, "hello world");
         assert!(r.ok);
 
         // cwd persists.
-        done(shell.run("t", "/tmp", "cd /tmp", quick).unwrap());
-        let r = done(shell.run("t", "/tmp", "pwd", quick).unwrap());
+        done(shell.run("t", "/tmp", "cd /tmp", quick, true).unwrap());
+        let r = done(shell.run("t", "/tmp", "pwd", quick, true).unwrap());
         assert!(r.output.ends_with("tmp"), "cwd not inherited: {:?}", r.output);
 
         // A long command promotes; stream it and assert the live output + exit.
         let r = shell
-            .run("t", "/tmp", "echo live-start; sleep 1; echo live-done", Duration::from_millis(300))
+            .run("t", "/tmp", "echo live-start; sleep 1; echo live-done", Duration::from_millis(300), true)
             .unwrap();
         let live = match r {
             RunOutcome::Live(l) => l,
             _ => panic!("expected promotion to Live"),
         };
         // While live, the shell is busy.
-        assert!(matches!(shell.run("t", "/tmp", "echo x", quick).unwrap(), RunOutcome::Busy));
+        assert!(matches!(shell.run("t", "/tmp", "echo x", quick, true).unwrap(), RunOutcome::Busy));
 
         // The stream emits ALL output — including what was seen during the
         // promotion window (fed through the filter, then emitted as the first
@@ -901,7 +1045,7 @@ mod e2e {
         assert!(exit.full_output.contains("live-start") && exit.full_output.contains("live-done"));
 
         // After the live process ends the shell is usable again.
-        let r = done(shell.run("t", "/tmp", "echo back", quick).unwrap());
+        let r = done(shell.run("t", "/tmp", "echo back", quick, true).unwrap());
         assert_eq!(r.output, "back");
 
         shell.close("t");
@@ -925,8 +1069,8 @@ mod e2e {
             let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
             let shell = TalkShell::new();
             shell.set_client(Some(client));
-            done(shell.run("persist", "/", "cd /tmp && export OCTO_T3=kept", quick).unwrap());
-            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            done(shell.run("persist", "/", "cd /tmp && export OCTO_T3=kept", quick, true).unwrap());
+            let r = done(shell.run("persist", "/", "pwd", quick, true).unwrap());
             assert!(r.output.ends_with("tmp"));
             // `shell` (and its session receiver) drops here — simulating an
             // Octopush restart. The daemon keeps the `talk-persist` PTY alive.
@@ -938,13 +1082,51 @@ mod e2e {
             let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
             let shell = TalkShell::new();
             shell.set_client(Some(client));
-            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            let r = done(shell.run("persist", "/", "pwd", quick, true).unwrap());
             assert!(r.output.ends_with("tmp"), "cwd not restored on reattach: {:?}", r.output);
-            let r = done(shell.run("persist", "/", "echo \"$OCTO_T3\"", quick).unwrap());
+            let r = done(shell.run("persist", "/", "echo \"$OCTO_T3\"", quick, true).unwrap());
             assert_eq!(r.output, "kept", "env var not restored on reattach");
             shell.close("persist");
         }
 
+        daemon.kill().ok();
+    }
+
+    #[test]
+    #[serial]
+    fn agent_capture_shares_cwd_and_env_with_direct_shell() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let base = home.join(".octopush");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("pty-server.sock");
+        let mut daemon = start_daemon(home);
+        assert!(wait_for_socket(&sock), "daemon socket did not appear");
+
+        let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
+        let shell = TalkShell::new();
+        shell.set_client(Some(client));
+        let quick = Duration::from_secs(5);
+
+        // The user sets cwd + an env var via `$`-direct (promote=true).
+        done(shell.run("u", "/", "cd /tmp && export OCTO_T4=shared", quick, true).unwrap());
+
+        // The AGENT (capture mode) runs in the SAME shell: it sees the cwd...
+        let r = cap(shell.run_capture("u", "/", "pwd", quick).unwrap());
+        assert!(r.output.ends_with("tmp"), "agent didn't share cwd: {:?}", r.output);
+        // ...and the exported env var.
+        let r = cap(shell.run_capture("u", "/", "echo \"$OCTO_T4\"", quick).unwrap());
+        assert_eq!(r.output, "shared", "agent didn't share env");
+
+        // A hanging agent command is interrupted at the timeout — and the SIGINT
+        // resync keeps the shell, so env survives (no recycle).
+        let r = cap(shell.run_capture("u", "/", "sleep 30", Duration::from_secs(1)).unwrap());
+        assert!(!r.ok);
+        assert!(r.output.contains("was interrupted"), "missing interrupt note: {:?}", r.output);
+        let r = cap(shell.run_capture("u", "/", "echo \"$OCTO_T4\"", quick).unwrap());
+        assert_eq!(r.output, "shared", "env lost after a timeout interrupt");
+
+        shell.close("u");
         daemon.kill().ok();
     }
 }

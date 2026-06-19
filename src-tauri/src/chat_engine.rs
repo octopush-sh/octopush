@@ -622,6 +622,7 @@ impl ChatEngine {
                 &workspace_path,
                 &command,
                 std::time::Duration::from_millis(1500),
+                true, // $-direct promotes long commands to a live process
             )
         })
         .await
@@ -957,8 +958,11 @@ impl ChatEngine {
             format!(
                 "You are a helpful coding assistant working in the project at {}. \
                  You have tools to run commands, read/write files, and list directories. \
-                 Use them to help the user with their tasks. Be concise and take action \
-                 rather than just explaining what to do.",
+                 run_command executes in a persistent shell SHARED with the user — a \
+                 `cd` or env export (yours or theirs) carries over to later commands, so \
+                 you can rely on the working directory you've set. Use the tools to help \
+                 the user with their tasks. Be concise and take action rather than just \
+                 explaining what to do.",
                 request.workspace_path
             )
         });
@@ -1270,6 +1274,10 @@ impl ChatEngine {
                     started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                 });
 
+                // Absolute cwd a run_command executed in (shared shell), captured
+                // so its card can show the cwd badge. Empty for other tools.
+                let mut run_command_cwd = String::new();
+
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
                 // the runtime thread with a timeout so a slow/hung server
@@ -1288,6 +1296,50 @@ impl ChatEngine {
                         Ok(Ok(Ok(out))) => (out, true),
                         Ok(Ok(Err(e))) => (format!("MCP error: {e}"), false),
                         _ => ("MCP error: tool call timed out".to_string(), false),
+                    }
+                } else if u.name == "run_command" && self.talk_shell.available() {
+                    // Unify with `$`-direct: the agent runs commands in the SAME
+                    // persistent shell, so it shares the user's cwd/env. Capture
+                    // to completion with a timeout (which `execute_tool` lacked).
+                    let command = u
+                        .input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let shell = Arc::clone(&self.talk_shell);
+                    let tid = request.thread_id.clone();
+                    let wp = request.workspace_path.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(120))
+                    })
+                    .await
+                    {
+                        Ok(Ok(crate::talk_shell::CaptureOutcome::Done(r))) => {
+                            // Record where it ran (absolute) so the card shows the
+                            // cwd badge, matching `$`-direct.
+                            run_command_cwd = r.cwd.clone();
+                            (format_command_output(&r.output, r.exit_code), r.ok)
+                        }
+                        // Shared shell unavailable (a live `$` process holds it, or
+                        // a transient error). Run THIS command in an isolated shell
+                        // so the agent isn't blocked — but say so explicitly, since
+                        // it runs at the workspace root, not the shared cwd.
+                        other => {
+                            let reason = match other {
+                                Ok(Ok(crate::talk_shell::CaptureOutcome::Busy)) =>
+                                    "a live process is using the shared shell".to_string(),
+                                Ok(Err(e)) => e.to_string(),
+                                _ => "the shared shell task failed".to_string(),
+                            };
+                            let (out, ok) = execute_tool(&workspace_path, &u.name, &u.input);
+                            (
+                                format!(
+                                    "(ran in an isolated shell at the workspace root — {reason})\n{out}"
+                                ),
+                                ok,
+                            )
+                        }
                     }
                 } else {
                     execute_tool(&workspace_path, &u.name, &u.input)
@@ -1323,10 +1375,18 @@ impl ChatEngine {
                 // `callId` correlates this resolved card back to the live card
                 // created by the earlier tool-start event so the frontend can
                 // retire the spinner without a flash.
+                // For run_command, annotate the card with where it ran (the
+                // shared shell's cwd) so the agent's commands show a cwd badge
+                // just like `$`-direct ones.
+                let display_input = if u.name == "run_command" {
+                    tool_input_with_cwd(&input_for_display, &run_command_cwd, &request.workspace_path)
+                } else {
+                    input_for_display
+                };
                 let tool_record = serde_json::json!({
                     "callId": u.id,
                     "toolName": u.name,
-                    "toolInput": input_for_display,
+                    "toolInput": display_input,
                     "result": result,
                 });
                 if let Err(e) = self.insert_and_emit_message(

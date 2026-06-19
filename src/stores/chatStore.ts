@@ -186,6 +186,9 @@ interface ChatState {
    *  after every `$`-direct command so the composer can show a cwd badge once
    *  the user has `cd`'d away from the workspace root. */
   shellCwdByThread: Record<string, string>;
+  /** Absolute cwd per thread — kept alongside the label so the badge tooltip can
+   *  show the full path (the label elides out-of-tree prefixes). */
+  shellCwdAbsByThread: Record<string, string>;
   /** A live (long-running) `$`-direct process per thread, shown as a pinned
    *  mini-terminal. Present between chat://shell-live-start and shell-exit. */
   liveProcessByThread: Record<string, LiveProcess>;
@@ -208,8 +211,10 @@ interface ChatState {
   getActiveThread: (workspaceId: string) => string | null;
   getActiveSkill: (workspaceId: string) => string | null;
   getAttachments: (workspaceId: string) => Attachment[];
-  /** The active thread's TALK shell cwd, or null if unknown / never run. */
+  /** The active thread's TALK shell cwd label (badge text), or null. */
   getShellCwd: (workspaceId: string) => string | null;
+  /** The active thread's absolute TALK shell cwd (for the badge tooltip). */
+  getShellCwdAbs: (workspaceId: string) => string | null;
   /** The active thread's live `$`-direct process, or null if none is running. */
   getLiveProcess: (workspaceId: string) => LiveProcess | null;
   /** Buffered output for a live process (by callId) — for the pinned terminal. */
@@ -498,6 +503,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         liveOutputByCallId: nextOut,
         // Backend-computed label is the badge's single source (empty = root).
         shellCwdByThread: { ...s.shellCwdByThread, [p.threadId]: p.cwdLabel ?? "" },
+        shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [p.threadId]: p.cwd ?? "" },
       };
     });
   });
@@ -514,6 +520,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     activeSkillByWs: {},
     attachmentsByWs: {},
     shellCwdByThread: {},
+    shellCwdAbsByThread: {},
     liveProcessByThread: {},
     liveOutputByCallId: {},
     model: "claude-sonnet-4-6",
@@ -531,6 +538,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     getShellCwd: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
       return threadId ? get().shellCwdByThread[threadId] ?? null : null;
+    },
+    getShellCwdAbs: (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      return threadId ? get().shellCwdAbsByThread[threadId] ?? null : null;
     },
     getLiveProcess: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
@@ -694,11 +705,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           command,
         });
         // Update the badge from the backend-computed label (the single source).
-        // Skip live promotions — their cwd is only known once the process exits
-        // (delivered via chat://shell-exit). Empty label = at the workspace root.
-        if (result && !result.live) {
+        // Only when a command actually RAN in the shell (result.cwd non-empty):
+        // skip live promotions (cwd known later, via shell-exit) and Busy/error
+        // results (cwd empty) so they don't wipe a valid badge.
+        if (result && !result.live && result.cwd) {
           set((s) => ({
             shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwdLabel ?? "" },
+            shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [threadId]: result.cwd },
           }));
         }
       } catch (e) {

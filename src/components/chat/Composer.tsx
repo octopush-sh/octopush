@@ -50,6 +50,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const send = useChatStore((s) => s.send);
   const runShell = useChatStore((s) => s.runShell);
   const shellCwd = useChatStore((s) => s.getShellCwd(workspaceId));
+  const shellCwdAbs = useChatStore((s) => s.getShellCwdAbs(workspaceId));
   const stop = useChatStore((s) => s.stop);
   const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
   const setActiveSkill = useChatStore((s) => s.setActiveSkill);
@@ -534,7 +535,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           {cwdLabel && (
             <span
               className="flex items-center gap-1 font-mono text-[10px] text-octo-sage"
-              title={`TALK shell working directory: ${shellCwd}`}
+              title={`TALK shell working directory: ${shellCwdAbs || shellCwd}`}
             >
               <TerminalSquare size={11} className="text-octo-brass" />
               {cwdLabel}
