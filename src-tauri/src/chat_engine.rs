@@ -622,6 +622,7 @@ impl ChatEngine {
                 &workspace_path,
                 &command,
                 std::time::Duration::from_millis(1500),
+                true, // $-direct promotes long commands to a live process
             )
         })
         .await
@@ -957,8 +958,11 @@ impl ChatEngine {
             format!(
                 "You are a helpful coding assistant working in the project at {}. \
                  You have tools to run commands, read/write files, and list directories. \
-                 Use them to help the user with their tasks. Be concise and take action \
-                 rather than just explaining what to do.",
+                 run_command executes in a persistent shell SHARED with the user — a \
+                 `cd` or env export (yours or theirs) carries over to later commands, so \
+                 you can rely on the working directory you've set. Use the tools to help \
+                 the user with their tasks. Be concise and take action rather than just \
+                 explaining what to do.",
                 request.workspace_path
             )
         });
@@ -1288,6 +1292,37 @@ impl ChatEngine {
                         Ok(Ok(Ok(out))) => (out, true),
                         Ok(Ok(Err(e))) => (format!("MCP error: {e}"), false),
                         _ => ("MCP error: tool call timed out".to_string(), false),
+                    }
+                } else if u.name == "run_command" {
+                    // Unify with `$`-direct: the agent runs commands in the SAME
+                    // persistent shell, so it shares the user's cwd/env. Capture
+                    // to completion with a timeout (which `execute_tool` lacked).
+                    // Falls back to the isolated executor if the daemon is absent.
+                    let command = u
+                        .input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let shell = Arc::clone(&self.talk_shell);
+                    let tid = request.thread_id.clone();
+                    let wp = request.workspace_path.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(120))
+                    })
+                    .await
+                    {
+                        Ok(Ok(crate::talk_shell::CaptureOutcome::Done(r))) => {
+                            (format_command_output(&r.output, r.exit_code), r.ok)
+                        }
+                        Ok(Ok(crate::talk_shell::CaptureOutcome::Busy)) => (
+                            "The shell is busy with a live process started via `$` — \
+                             it must finish or be stopped before running a command."
+                                .to_string(),
+                            false,
+                        ),
+                        // Daemon unavailable / task error → isolated fallback.
+                        _ => execute_tool(&workspace_path, &u.name, &u.input),
                     }
                 } else {
                     execute_tool(&workspace_path, &u.name, &u.input)
