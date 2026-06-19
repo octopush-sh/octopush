@@ -348,12 +348,26 @@ export const useChatStore = create<ChatState>((set, get) => {
           ? { ...s.streamingThreadByWs, [wsId]: null }
           : s.streamingThreadByWs;
         if (!active) return { streamingThreadByWs };
+        // Clear any stragglers (e.g. a tool whose result errored before its
+        // resolved row landed) so no spinner outlives the turn — BUT keep the
+        // live card of a `$`-direct process that's still running in this
+        // workspace (its callId is tracked in liveProcessByThread); the LLM
+        // turn finishing must not erase a concurrently streaming process.
+        const liveCallIds = new Set(
+          Object.values(s.liveProcessByThread)
+            .filter((p) => p.workspaceId === wsId)
+            .map((p) => p.callId),
+        );
+        const kept = (s.liveToolsByWs[wsId] ?? EMPTY_LIVE_TOOLS).filter((t) =>
+          liveCallIds.has(t.callId),
+        );
         return {
           streamingByWs: { ...s.streamingByWs, [wsId]: false },
           streamBufferByWs: { ...s.streamBufferByWs, [wsId]: "" },
-          // Clear any stragglers (e.g. a tool whose result errored before its
-          // resolved row landed) so no spinner outlives the turn.
-          liveToolsByWs: { ...s.liveToolsByWs, [wsId]: EMPTY_LIVE_TOOLS },
+          liveToolsByWs: {
+            ...s.liveToolsByWs,
+            [wsId]: kept.length ? kept : EMPTY_LIVE_TOOLS,
+          },
           streamingThreadByWs,
         };
       });
@@ -465,26 +479,28 @@ export const useChatStore = create<ChatState>((set, get) => {
 
   // ── chat://shell-exit ─────────────────────────────────────────
   // The live process exited — close the pinned terminal and update the cwd.
-  listen<{ threadId: string; callId: string; exitCode: number; cwd: string }>(
-    "chat://shell-exit",
-    (ev) => {
-      const p = ev.payload;
-      if (!p.threadId) return;
-      set((s) => {
-        const next = { ...s.liveProcessByThread };
-        delete next[p.threadId];
-        const nextOut = { ...s.liveOutputByCallId };
-        delete nextOut[p.callId];
-        return {
-          liveProcessByThread: next,
-          liveOutputByCallId: nextOut,
-          shellCwdByThread: p.cwd
-            ? { ...s.shellCwdByThread, [p.threadId]: p.cwd }
-            : s.shellCwdByThread,
-        };
-      });
-    },
-  );
+  listen<{
+    threadId: string;
+    callId: string;
+    exitCode: number;
+    cwd: string;
+    cwdLabel: string;
+  }>("chat://shell-exit", (ev) => {
+    const p = ev.payload;
+    if (!p.threadId) return;
+    set((s) => {
+      const next = { ...s.liveProcessByThread };
+      delete next[p.threadId];
+      const nextOut = { ...s.liveOutputByCallId };
+      delete nextOut[p.callId];
+      return {
+        liveProcessByThread: next,
+        liveOutputByCallId: nextOut,
+        // Backend-computed label is the badge's single source (empty = root).
+        shellCwdByThread: { ...s.shellCwdByThread, [p.threadId]: p.cwdLabel ?? "" },
+      };
+    });
+  });
 
   return {
     messagesByWs: {},
@@ -677,9 +693,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           workspacePath,
           command,
         });
-        if (result?.cwd) {
+        // Update the badge from the backend-computed label (the single source).
+        // Skip live promotions — their cwd is only known once the process exits
+        // (delivered via chat://shell-exit). Empty label = at the workspace root.
+        if (result && !result.live) {
           set((s) => ({
-            shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwd },
+            shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwdLabel ?? "" },
           }));
         }
       } catch (e) {

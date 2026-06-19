@@ -433,14 +433,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     (input.trim().length > 0 || attachments.length > 0) &&
     (!isBudgetError || overrideActive);
 
-  // The TALK shell's cwd, shown as a badge only once the user has `cd`'d away
-  // from the workspace root — so the persistent shell's state is never hidden.
-  const cwdLabel = (() => {
-    if (!shellCwd || shellCwd === workspacePath) return null;
-    if (shellCwd.startsWith(workspacePath + "/")) return shellCwd.slice(workspacePath.length + 1);
-    const parts = shellCwd.split("/").filter(Boolean);
-    return parts.length > 2 ? "…/" + parts.slice(-2).join("/") : shellCwd;
-  })();
+  // The TALK shell's cwd badge — shown once the user has `cd`'d away from the
+  // workspace root. The label is computed once in the backend (single source);
+  // here we just render it (empty string ⇒ at root ⇒ no badge).
+  const cwdLabel = shellCwd || null;
 
   return (
     <div className="px-6 pb-4 pt-3">

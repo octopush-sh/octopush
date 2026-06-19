@@ -102,11 +102,12 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
       callId: "shell-1",
       exitCode: 0,
       cwd: "/repo/packages/api",
+      cwdLabel: "packages/api",
     });
 
     expect(useChatStore.getState().getLiveProcess("ws-1")).toBeNull();
-    // The exit cwd updates the badge source.
-    expect(useChatStore.getState().getShellCwd("ws-1")).toBe("/repo/packages/api");
+    // The exit's backend-computed label updates the badge source.
+    expect(useChatStore.getState().getShellCwd("ws-1")).toBe("packages/api");
   });
 
   it("scopes the live process to its thread", () => {

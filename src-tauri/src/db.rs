@@ -1329,6 +1329,17 @@ impl Db {
         Ok(())
     }
 
+    /// Whether a chat thread still exists — used to avoid persisting a late
+    /// live-process result row for a conversation the user already deleted.
+    pub fn chat_thread_exists(&self, thread_id: &str) -> AppResult<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     // ─── Terminals ────────────────────────────────────────────────
 
     pub fn list_terminals(&self, workspace_id: &str) -> AppResult<Vec<TerminalRow>> {

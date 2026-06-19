@@ -427,6 +427,7 @@ export const ipc = {
       exitCode: number;
       ok: boolean;
       cwd: string;
+      cwdLabel: string;
       live: boolean;
     }>("run_shell_command", { request }),
   /** SIGINT (Ctrl-C) a thread's live `$`-direct process. */

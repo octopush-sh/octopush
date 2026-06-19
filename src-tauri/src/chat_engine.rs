@@ -97,6 +97,40 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
     s
 }
 
+/// A command's cwd relative to the workspace root, for display on its card.
+/// Empty at the root/unknown; the path relative to root when inside the tree;
+/// and a consistent `…/tail` (up to the last two segments) when outside it —
+/// never the bare absolute path, so a deep filesystem location isn't leaked.
+fn relativize_cwd(abs: &str, root: &str) -> String {
+    if abs.is_empty() || abs == root {
+        return String::new();
+    }
+    if let Some(rest) = abs.strip_prefix(&format!("{root}/")) {
+        return rest.to_string();
+    }
+    let parts: Vec<&str> = abs.split('/').filter(|s| !s.is_empty()).collect();
+    let tail = if parts.len() >= 2 {
+        parts[parts.len() - 2..].join("/")
+    } else {
+        parts.join("/")
+    };
+    format!("…/{tail}")
+}
+
+/// Clone a `run_command` tool-input, adding a `cwd` field (relative to `root`)
+/// when the command ran somewhere other than the workspace root.
+fn tool_input_with_cwd(input: &serde_json::Value, abs_cwd: &str, root: &str) -> serde_json::Value {
+    let rel = relativize_cwd(abs_cwd, root);
+    if rel.is_empty() {
+        return input.clone();
+    }
+    let mut v = input.clone();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("cwd".to_string(), serde_json::Value::String(rel));
+    }
+    v
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatStreamEvent {
@@ -168,6 +202,8 @@ pub struct ShellExitEvent {
     pub call_id: String,
     pub exit_code: i32,
     pub cwd: String,
+    /// Relativized cwd for the badge (single backend source; rendered verbatim).
+    pub cwd_label: String,
 }
 
 /// Emitted whenever a chat message is persisted to the DB.
@@ -597,7 +633,7 @@ impl ChatEngine {
                 // Hard failure (daemon down / spawn failed) — surface as a card.
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, false, started,
-                    &format!("Shell error: {e}"),
+                    &format!("Shell error: {e}"), "",
                 );
                 return Err(e);
             }
@@ -605,18 +641,21 @@ impl ChatEngine {
 
         use crate::talk_shell::{RunOutcome, ShellResult};
         match outcome {
-            RunOutcome::Done(result) => {
+            RunOutcome::Done(mut result) => {
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, result.ok, started,
-                    &format_command_output(&result.output, result.exit_code),
+                    &format_command_output(&result.output, result.exit_code), &result.cwd,
                 );
+                // Compute the badge label once here (the single source) so the
+                // frontend renders it verbatim instead of re-deriving the rule.
+                result.cwd_label = relativize_cwd(&result.cwd, &request.workspace_path);
                 Ok(result)
             }
             RunOutcome::Busy => {
                 let note = "A live process is already running in this conversation — \
                             stop it before running another command.";
                 self.resolve_shell_card(
-                    &app, &request, &call_id, &tool_input, false, started, note,
+                    &app, &request, &call_id, &tool_input, false, started, note, "",
                 );
                 Ok(ShellResult {
                     output: note.to_string(),
@@ -624,6 +663,7 @@ impl ChatEngine {
                     ok: false,
                     cwd: String::new(),
                     live: false,
+                    cwd_label: String::new(),
                 })
             }
             RunOutcome::Live(live) => {
@@ -643,6 +683,7 @@ impl ChatEngine {
                     ok: true,
                     cwd: String::new(),
                     live: true,
+                    cwd_label: String::new(),
                 })
             }
         }
@@ -660,6 +701,7 @@ impl ChatEngine {
         ok: bool,
         started: std::time::Instant,
         result_str: &str,
+        abs_cwd: &str,
     ) {
         let _ = app.emit("chat://tool-end", &ToolEndEvent {
             workspace_id: request.workspace_id.clone(),
@@ -671,7 +713,7 @@ impl ChatEngine {
         let record = serde_json::json!({
             "callId": call_id,
             "toolName": "run_command",
-            "toolInput": tool_input,
+            "toolInput": tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
             "result": result_str,
         });
         let _ = self.insert_and_emit_message(
@@ -721,19 +763,28 @@ impl ChatEngine {
                     call_id: call_id.clone(),
                     exit_code: exit.exit_code,
                     cwd: exit.cwd.clone(),
+                    cwd_label: relativize_cwd(&exit.cwd, &request.workspace_path),
                 });
 
                 let record = serde_json::json!({
                     "callId": call_id,
                     "toolName": "run_command",
-                    "toolInput": tool_input,
+                    "toolInput": tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
                     "result": format_command_output(&exit.full_output, exit.exit_code),
                 });
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-                let id = db.lock().insert_chat_message(
-                    &request.workspace_id, &request.thread_id, "tool",
-                    &record.to_string(), None, None, None, None,
-                );
+                // The conversation may have been deleted while the process ran;
+                // don't leave an orphaned row (no FK from messages → threads).
+                let id = {
+                    let db = db.lock();
+                    match db.chat_thread_exists(&request.thread_id) {
+                        Ok(true) => db.insert_chat_message(
+                            &request.workspace_id, &request.thread_id, "tool",
+                            &record.to_string(), None, None, None, None,
+                        ),
+                        _ => return,
+                    }
+                };
                 if let Ok(id) = id {
                     let _ = app.emit("chat://message-added", &MessageAddedEvent {
                         workspace_id: request.workspace_id.clone(),
@@ -1433,5 +1484,28 @@ mod tests {
         // Unknown tool → failure.
         let (_, ok) = execute_tool(wp, "frobnicate", &serde_json::json!({}));
         assert!(!ok);
+    }
+
+    #[test]
+    fn relativize_cwd_cases() {
+        // At the workspace root → no badge.
+        assert_eq!(relativize_cwd("/repo", "/repo"), "");
+        assert_eq!(relativize_cwd("", "/repo"), "");
+        // Under the root → relative path.
+        assert_eq!(relativize_cwd("/repo/packages/api", "/repo"), "packages/api");
+        // Outside the worktree → consistent `…/tail` (never a bare absolute path).
+        assert_eq!(relativize_cwd("/var/tmp/build", "/repo"), "…/tmp/build");
+        assert_eq!(relativize_cwd("/tmp", "/repo"), "…/tmp");
+    }
+
+    #[test]
+    fn tool_input_with_cwd_only_adds_when_not_root() {
+        let input = serde_json::json!({ "command": "ls" });
+        // Root → unchanged.
+        assert!(tool_input_with_cwd(&input, "/repo", "/repo").get("cwd").is_none());
+        // Subdir → cwd added.
+        let v = tool_input_with_cwd(&input, "/repo/src", "/repo");
+        assert_eq!(v.get("cwd").and_then(|c| c.as_str()), Some("src"));
+        assert_eq!(v.get("command").and_then(|c| c.as_str()), Some("ls"));
     }
 }

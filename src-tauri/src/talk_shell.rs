@@ -42,6 +42,11 @@ pub struct ShellResult {
     pub exit_code: i32,
     pub ok: bool,
     pub cwd: String,
+    /// The cwd relativized for display (computed by the chat engine; empty at the
+    /// workspace root). The single source of the cwd badge string — the frontend
+    /// renders it verbatim rather than re-deriving the rule.
+    #[serde(default)]
+    pub cwd_label: String,
     /// True when the command was promoted to a live process — output streams via
     /// `chat://shell-output` and the final card resolves on `chat://shell-exit`.
     #[serde(default)]
@@ -64,9 +69,11 @@ pub enum RunOutcome {
 /// the session is restored for the next `$` command.
 pub struct LiveRun {
     rx: Receiver<TermEvent>,
-    /// Raw output already seen during the promotion window (after the start
-    /// marker), to paint immediately.
+    /// Raw output already seen during the promotion window, to paint
+    /// immediately (post-start when `started`, else the whole pre-start buffer).
     pub initial: String,
+    /// Whether the start marker was already seen (filter pre-started).
+    started: bool,
     nonce: String,
     cwd: String,
     thread_id: String,
@@ -143,7 +150,7 @@ impl TalkShell {
         let handle = match existing {
             Some(h) => h,
             None => {
-                let session = Self::spawn_session(&client, thread_id, workspace_path)?;
+                let session = Self::ensure_session(&client, thread_id, workspace_path)?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -184,14 +191,23 @@ impl TalkShell {
                     ok: exit_code == 0,
                     cwd: final_cwd,
                     live: false,
+                    cwd_label: String::new(),
                 }))
             }
             Probe::Dead { output } => {
-                // Shell died — recycle in place at the saved cwd.
+                // Shell died — recycle in place at the saved cwd. If the respawn
+                // fails (daemon hiccup), evict the session so the NEXT `$`
+                // recreates it from scratch — never leave rx == None, which would
+                // wedge the thread as permanently Busy.
                 let _ = client.remove(&id);
-                let mut session = handle.lock();
-                if let Ok(fresh) = Self::spawn_session(&client, thread_id, &cwd) {
-                    *session = fresh;
+                match Self::ensure_session(&client, thread_id, &cwd) {
+                    Ok(fresh) => {
+                        *handle.lock() = fresh;
+                    }
+                    Err(e) => {
+                        self.sessions.lock().remove(thread_id);
+                        return Err(e);
+                    }
                 }
                 Ok(RunOutcome::Done(ShellResult {
                     output: cap_output(output),
@@ -199,13 +215,15 @@ impl TalkShell {
                     ok: false,
                     cwd,
                     live: false,
+                    cwd_label: String::new(),
                 }))
             }
-            Probe::NotYet { raw } => Ok(RunOutcome::Live(LiveRun {
+            Probe::NotYet { raw, started } => Ok(RunOutcome::Live(LiveRun {
                 rx,
                 // RAW (markers/ANSI intact): the stream filter both detects a
                 // marker split across the promotion boundary and emits it.
                 initial: raw,
+                started,
                 nonce,
                 cwd,
                 thread_id: thread_id.to_string(),
@@ -232,63 +250,63 @@ impl TalkShell {
         }
     }
 
-    fn spawn_session(
+    /// Get a session for `thread_id`: reattach to a surviving daemon PTY — so the
+    /// shell (cwd, env, exports) persists across an Octopush restart — or spawn a
+    /// fresh bash. Either way, (re-)define the marker emitters with a fresh nonce
+    /// and wait until the shell confirms ready (on reattach, replayed scrollback
+    /// is drained past). Returns the (restored) cwd.
+    fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
         cwd: &str,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
+        let reattaching = client
+            .list_terminals()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.id == id && t.running);
+
+        if !reattaching {
+            Self::spawn_bash(client, &id, cwd)?;
+        }
         let nonce = gen_nonce();
+        let rx = client.attach(&id, 0)?;
+
+        match init_and_wait_ready(client, &id, &rx, &nonce) {
+            Ok(ready_cwd) => Ok(Session {
+                id,
+                rx: Some(rx),
+                cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
+                nonce,
+            }),
+            // Reattached but never became ready — the surviving shell is busy,
+            // almost certainly still running a process started before the restart
+            // (e.g. a dev server). We must NOT kill it (that would silently
+            // destroy the user's running process + state). Surface a clear error;
+            // the user can let it finish, or delete the conversation to stop it.
+            Err(_) if reattaching => Err(AppError::Other(
+                "This conversation's shell is busy with a process still running \
+                 from before the restart. Wait for it to finish, or delete the \
+                 conversation to stop it."
+                    .into(),
+            )),
+            // Fresh spawn that never readied — a genuine failure; clean up.
+            Err(e) => {
+                let _ = client.remove(&id);
+                Err(e)
+            }
+        }
+    }
+
+    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str) -> AppResult<()> {
         let mut env = HashMap::new();
+        // Forward the app's PATH so commands resolve as the app sees them.
         if let Ok(path) = std::env::var("PATH") {
             env.insert("PATH".to_string(), path);
         }
-        client.spawn(&id, cwd, &env, Some("/bin/bash"), 40, 120)?;
-        let rx = client.attach(&id, 0)?;
-
-        let mut init = String::new();
-        init.push_str("stty -echo 2>/dev/null; PS1=''; PS2=''; PROMPT_COMMAND=''\n");
-        init.push_str("__OCTORS=$(printf '\\036')\n");
-        init.push_str(&format!(
-            "__octo_start() {{ printf '%s%sOCTO_START_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str(&format!(
-            "__octo_end() {{ printf '%s%sOCTO_END_{nonce}:%d:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$1\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str(&format!(
-            "__octo_ready() {{ printf '%s%sOCTO_READY_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
-        ));
-        init.push_str("__octo_ready\n");
-        client.write(&id, init.as_bytes())?;
-
-        let ready = ready_marker(&nonce);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut buf = String::new();
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(TermEvent::Data { bytes, .. }) => {
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
-                    if buf.contains(&ready) {
-                        return Ok(Session {
-                            id,
-                            rx: Some(rx),
-                            cwd: cwd.to_string(),
-                            nonce,
-                        });
-                    }
-                }
-                Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
-                    return Err(AppError::Other("talk shell exited during init".into()));
-                }
-                Ok(TermEvent::Attention) => {}
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(AppError::Other("talk shell channel closed during init".into()));
-                }
-            }
-        }
-        let _ = client.remove(&id);
-        Err(AppError::Other("talk shell did not become ready".into()))
+        client.spawn(id, cwd, &env, Some("/bin/bash"), 40, 120)?;
+        Ok(())
     }
 }
 
@@ -303,7 +321,7 @@ impl LiveRun {
         // filter (so an end marker that began arriving in the window is detected
         // — never leaving the panel stuck "running") and emit it as the FIRST
         // chunk, so the always-on store listener buffers it with no mount race.
-        filter.started = true;
+        filter.started = self.started;
         let mut full = String::new();
 
         let mut push = |emit: &str, full: &mut String, on_chunk: &mut F| {
@@ -389,9 +407,12 @@ enum Probe {
         exit_code: i32,
         cwd: String,
     },
-    /// Promotion window elapsed; `raw` is the post-start output seen so far.
+    /// Promotion window elapsed. `raw` is the output seen so far; `started` is
+    /// whether the start marker was already present (so the live StreamFilter
+    /// knows whether to still strip a late-arriving start marker).
     NotYet {
         raw: String,
+        started: bool,
     },
     Dead {
         output: String,
@@ -405,8 +426,13 @@ fn probe(rx: &Receiver<TermEvent>, timeout: Duration, nonce: &str) -> Probe {
     let mut buf = String::new();
     loop {
         if Instant::now() >= deadline {
-            return Probe::NotYet {
-                raw: after_start(&buf, nonce),
+            // If the start marker already arrived, hand off the post-start output
+            // (filter is pre-started). Otherwise hand off the whole buffer so the
+            // filter still strips the start marker when it arrives.
+            let sm = start_marker(nonce);
+            return match buf.find(&sm) {
+                Some(i) => Probe::NotYet { raw: buf[i + sm.len()..].to_string(), started: true },
+                None => Probe::NotYet { raw: buf, started: false },
             };
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -524,8 +550,65 @@ fn start_marker(nonce: &str) -> String {
     format!("\u{1e}\u{1e}OCTO_START_{nonce}\u{1e}\u{1e}")
 }
 
-fn ready_marker(nonce: &str) -> String {
-    format!("\u{1e}\u{1e}OCTO_READY_{nonce}\u{1e}\u{1e}")
+/// The READY marker carries `$PWD` so a reattach recovers the shell's cwd.
+fn ready_re(nonce: &str) -> regex::Regex {
+    regex::Regex::new(&format!(
+        r"\x1e\x1eOCTO_READY_{}:([^\x1e]*)\x1e\x1e",
+        regex::escape(nonce)
+    ))
+    .expect("valid ready-marker regex")
+}
+
+/// (Re-)define the marker emitters with `nonce` on an attached shell, then drain
+/// the receiver until the READY marker — discarding any replayed scrollback /
+/// echo (the reattach path replays prior output). Returns the shell's cwd,
+/// parsed from the ready marker.
+fn init_and_wait_ready(
+    client: &Arc<DaemonClient>,
+    id: &str,
+    rx: &Receiver<TermEvent>,
+    nonce: &str,
+) -> AppResult<Option<String>> {
+    let mut init = String::new();
+    // Leading newline submits any partial line left in the shell's input buffer
+    // (e.g. on reattach) so our init isn't appended to it and swallowed.
+    init.push('\n');
+    init.push_str("stty -echo 2>/dev/null; PS1=''; PS2=''; PROMPT_COMMAND=''\n");
+    init.push_str("__OCTORS=$(printf '\\036')\n");
+    init.push_str(&format!(
+        "__octo_start() {{ printf '%s%sOCTO_START_{nonce}%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str(&format!(
+        "__octo_end() {{ printf '%s%sOCTO_END_{nonce}:%d:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$1\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str(&format!(
+        "__octo_ready() {{ printf '%s%sOCTO_READY_{nonce}:%s%s%s\\n' \"$__OCTORS\" \"$__OCTORS\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+    ));
+    init.push_str("__octo_ready\n");
+    client.write(id, init.as_bytes())?;
+
+    let re = ready_re(nonce);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = String::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(TermEvent::Data { bytes, .. }) => {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                if let Some(caps) = re.captures(&buf) {
+                    return Ok(Some(caps[1].to_string()));
+                }
+            }
+            Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
+                return Err(AppError::Other("talk shell exited during init".into()));
+            }
+            Ok(TermEvent::Attention) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppError::Other("talk shell channel closed during init".into()));
+            }
+        }
+    }
+    Err(AppError::Other("talk shell did not become ready".into()))
 }
 
 fn end_re(nonce: &str) -> regex::Regex {
@@ -822,6 +905,46 @@ mod e2e {
         assert_eq!(r.output, "back");
 
         shell.close("t");
+        daemon.kill().ok();
+    }
+
+    #[test]
+    #[serial]
+    fn reattaches_to_surviving_shell_across_restart() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let base = home.join(".octopush");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("pty-server.sock");
+        let mut daemon = start_daemon(home);
+        assert!(wait_for_socket(&sock), "daemon socket did not appear");
+        let quick = Duration::from_secs(5);
+
+        // First app run: establish shell state (cd + an exported env var).
+        {
+            let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
+            let shell = TalkShell::new();
+            shell.set_client(Some(client));
+            done(shell.run("persist", "/", "cd /tmp && export OCTO_T3=kept", quick).unwrap());
+            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            assert!(r.output.ends_with("tmp"));
+            // `shell` (and its session receiver) drops here — simulating an
+            // Octopush restart. The daemon keeps the `talk-persist` PTY alive.
+        }
+
+        // Second app run: a brand-new TalkShell against the SAME daemon must
+        // reattach to the surviving shell, preserving cwd AND the exported var.
+        {
+            let client = DaemonClient::connect_to(sock.to_str().unwrap()).unwrap();
+            let shell = TalkShell::new();
+            shell.set_client(Some(client));
+            let r = done(shell.run("persist", "/", "pwd", quick).unwrap());
+            assert!(r.output.ends_with("tmp"), "cwd not restored on reattach: {:?}", r.output);
+            let r = done(shell.run("persist", "/", "echo \"$OCTO_T3\"", quick).unwrap());
+            assert_eq!(r.output, "kept", "env var not restored on reattach");
+            shell.close("persist");
+        }
+
         daemon.kill().ok();
     }
 }
