@@ -469,4 +469,26 @@ describe("WorkspaceRail", () => {
 
     useAttentionStore.setState({ flagsByWs: {} });
   });
+
+  it("keeps the attention pulse in the collapsed rail even while running (no bar there)", () => {
+    const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    useAttentionStore.setState({ flagsByWs: { a: { kind: "chat", at: Date.now() } } });
+
+    const { container } = render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={true}
+        onCustomize={vi.fn()}
+        runningByWs={{ a: true }}
+      />,
+    );
+    // Collapsed has no bar to show, so running must NOT swallow the pulse.
+    expect(container.querySelector("[data-running-bar]")).toBeNull();
+    expect(container.querySelector(".animate-attention-pulse")).not.toBeNull();
+
+    useAttentionStore.setState({ flagsByWs: {} });
+  });
 });

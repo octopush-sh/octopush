@@ -50,6 +50,7 @@ import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { useShallow } from "zustand/react/shallow";
+import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
@@ -104,28 +105,24 @@ function App() {
   // Each selector derives the SET of workspaces with live activity and is
   // shallow-compared, so a DIRECT run's frequent cost ticks (which mutate
   // runsByWs) don't re-render the shell unless the running set actually changes.
-  // A DIRECT run counts only while "running" — "paused" is a checkpoint waiting
-  // on the user (attention), not processing.
+  //
+  // RUN/terminal is intentionally NOT included: the only terminal signal today
+  // (`TerminalState.running`) means "a shell session is alive", not "a command
+  // is executing", so it would mark the bar forever for any open terminal. A
+  // real foreground-busy signal exists in the PTY daemon (it powers attention
+  // detection) but isn't surfaced to the frontend yet — that's a follow-up.
   const chatRunningIds = useChatStore(
     useShallow((s) => Object.keys(s.streamingByWs).filter((id) => s.streamingByWs[id])),
   );
   const directRunningIds = useRunsStore(
-    useShallow((s) =>
-      Object.keys(s.runsByWs).filter((id) => (s.runsByWs[id] ?? []).some((r) => r.status === "running")),
-    ),
-  );
-  const terminalRunningIds = useTerminalsStore(
-    useShallow((s) =>
-      Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.running)),
-    ),
+    useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
   );
   const runningByWs = useMemo(() => {
     const out: Record<string, boolean> = {};
     for (const id of chatRunningIds) out[id] = true;
     for (const id of directRunningIds) out[id] = true;
-    for (const id of terminalRunningIds) out[id] = true;
     return out;
-  }, [chatRunningIds, directRunningIds, terminalRunningIds]);
+  }, [chatRunningIds, directRunningIds]);
 
   const [appView, setAppView] = useState<AppView>("project");
 

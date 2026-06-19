@@ -179,9 +179,9 @@
 }
 
 /* Rail row "processing" bar — while a workspace is actively working (TALK
-   streaming, RUN executing, or a DIRECT run), its 3px identity edge turns into
-   marching segments that scroll upward, signalling live activity. This is
-   mutually exclusive with the attention pulse (which means paused/finished).
+   streaming or a DIRECT run), its 3px identity edge turns into marching segments
+   that scroll upward, signalling live activity. This is mutually exclusive with
+   the attention pulse (which means paused/finished).
    The colour comes from --rail-bar (brass on the active row, the workspace tint
    otherwise). Reduced motion falls back to a solid bar — never a frozen dash. */
 @keyframes rail-march {

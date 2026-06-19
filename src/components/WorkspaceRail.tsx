@@ -466,7 +466,9 @@ function WorkspaceRow({
   // "Needs attention" and "processing" are mutually exclusive: a running
   // workspace shows the marching bar, never the pulse. (A run that pauses or
   // finishes drops `running`, at which point the attention flag may take over.)
-  const showPulse = !!attentionFlag && !active && !running;
+  // The suppression only applies in the expanded rail, where the bar exists to
+  // replace the pulse — the collapsed rail has no bar, so it keeps pulsing.
+  const showPulse = !!attentionFlag && !active && (isCollapsed || !running);
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
@@ -540,7 +542,7 @@ function WorkspaceRow({
           aria-hidden
           data-running-bar
           className="rail-bar-running"
-          style={{ ["--rail-bar" as string]: barColor } as React.CSSProperties}
+          style={{ "--rail-bar": barColor } as React.CSSProperties}
         />
       )}
 
