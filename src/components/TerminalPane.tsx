@@ -14,6 +14,12 @@ import type {
 import { useAttentionStore } from "../stores/attentionStore";
 import { XTERM_FONT_FAMILY, XTERM_THEME } from "../lib/xtermTheme";
 
+// Terminal zoom bounds. The font size is session-local (not persisted): each
+// pane opens at ZOOM_DEFAULT and resets on remount.
+const ZOOM_MIN = 8;
+const ZOOM_MAX = 28;
+const ZOOM_DEFAULT = 13;
+
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
   terminalId: string;
@@ -74,6 +80,8 @@ export function TerminalPane({
   const containerRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // Current terminal font size (zoom level). Session-local, not persisted.
+  const fontSizeRef = useRef(ZOOM_DEFAULT);
   // Track last known size to avoid no-op resize IPC calls.
   const lastSizeRef = useRef<{ rows: number; cols: number }>({ rows: 0, cols: 0 });
   // The PTY session id — for TerminalPane this is always equal to `terminalId`
@@ -129,6 +137,19 @@ export function TerminalPane({
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    fontSizeRef.current = ZOOM_DEFAULT;
+
+    // ── Zoom ──────────────────────────────────────────────────────────
+    // xterm has no built-in zoom: changing `fontSize` then refitting is the
+    // whole mechanism. `syncSize` recomputes rows/cols and notifies the PTY,
+    // so the inner app reflows to the new geometry.
+    const applyFontSize = (next: number) => {
+      const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(next)));
+      if (clamped === term.options.fontSize) return;
+      fontSizeRef.current = clamped;
+      term.options.fontSize = clamped;
+      syncSize();
+    };
 
     // ── Clipboard bridge ──────────────────────────────────────────────
     // xterm paints its OWN selection (not a native DOM range), so the
@@ -138,6 +159,25 @@ export function TerminalPane({
     // Cmd-C / Ctrl-Shift-C and on right-click-with-a-selection.
     if (typeof term.attachCustomKeyEventHandler === "function") {
       term.attachCustomKeyEventHandler((e) => {
+        // Zoom: Cmd/Ctrl with +, -, or 0. `+` is Shift+= on most layouts, so
+        // we don't exclude Shift here. Handled keys are not forwarded to the PTY.
+        if (e.type === "keydown" && (e.metaKey || e.ctrlKey) && !e.altKey) {
+          if (e.key === "=" || e.key === "+") {
+            applyFontSize(fontSizeRef.current + 1);
+            e.preventDefault();
+            return false;
+          }
+          if (e.key === "-" || e.key === "_") {
+            applyFontSize(fontSizeRef.current - 1);
+            e.preventDefault();
+            return false;
+          }
+          if (e.key === "0") {
+            applyFontSize(ZOOM_DEFAULT);
+            e.preventDefault();
+            return false;
+          }
+        }
         if (
           e.type === "keydown" &&
           (e.key === "c" || e.key === "C") &&
@@ -162,6 +202,15 @@ export function TerminalPane({
       }
     };
     copyEl.addEventListener("contextmenu", onContextMenu);
+
+    // Ctrl + mouse wheel zoom. `passive: false` so we can preventDefault and
+    // stop the browser's own pinch-zoom from firing underneath.
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      applyFontSize(fontSizeRef.current + (e.deltaY < 0 ? 1 : -1));
+    };
+    copyEl.addEventListener("wheel", onWheel, { passive: false });
 
     // File-path link provider — scans each rendered terminal line for
     // path-shaped tokens (anything with at least one slash + a short
@@ -389,6 +438,7 @@ export function TerminalPane({
       unlistenReattached?.();
       unlistenAttention?.();
       copyEl.removeEventListener("contextmenu", onContextMenu);
+      copyEl.removeEventListener("wheel", onWheel);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
