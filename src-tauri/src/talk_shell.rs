@@ -42,9 +42,6 @@ pub struct ShellResult {
     pub exit_code: i32,
     pub ok: bool,
     pub cwd: String,
-    /// True when the command didn't finish within the timeout (long-running);
-    /// it was interrupted and the shell recycled in place.
-    pub timed_out: bool,
     /// True when the command was promoted to a live process — output streams via
     /// `chat://shell-output` and the final card resolves on `chat://shell-exit`.
     #[serde(default)]
@@ -186,7 +183,6 @@ impl TalkShell {
                     exit_code,
                     ok: exit_code == 0,
                     cwd: final_cwd,
-                    timed_out: false,
                     live: false,
                 }))
             }
@@ -202,13 +198,14 @@ impl TalkShell {
                     exit_code: -1,
                     ok: false,
                     cwd,
-                    timed_out: false,
                     live: false,
                 }))
             }
             Probe::NotYet { raw } => Ok(RunOutcome::Live(LiveRun {
                 rx,
-                initial: clean_inline(&raw),
+                // RAW (markers/ANSI intact): the stream filter both detects a
+                // marker split across the promotion boundary and emits it.
+                initial: raw,
                 nonce,
                 cwd,
                 thread_id: thread_id.to_string(),
@@ -301,11 +298,13 @@ impl LiveRun {
     /// `$` command and return the exit info. Blocking — run on a worker thread.
     pub fn stream<F: FnMut(&str)>(self, mut on_chunk: F) -> LiveExit {
         let mut filter = StreamFilter::new(&self.nonce);
-        // The promotion probe already consumed the start marker, and the output
-        // seen so far rides in `initial` (delivered via `shell-live-start`), so
-        // we DON'T re-emit it here — but it's part of the final captured output.
+        // The promotion probe already consumed the start marker; the output seen
+        // during that window rides in `initial` (RAW). We feed it through the
+        // filter (so an end marker that began arriving in the window is detected
+        // — never leaving the panel stuck "running") and emit it as the FIRST
+        // chunk, so the always-on store listener buffers it with no mount race.
         filter.started = true;
-        let mut full = self.initial.clone();
+        let mut full = String::new();
 
         let mut push = |emit: &str, full: &mut String, on_chunk: &mut F| {
             if !emit.is_empty() {
@@ -319,6 +318,14 @@ impl LiveRun {
             cwd: self.cwd.clone(),
             full_output: String::new(),
         };
+
+        let (init_emit, init_done) = filter.feed(&self.initial);
+        push(&init_emit, &mut full, &mut on_chunk);
+        if let Some((code, cwd)) = init_done {
+            exit.exit_code = code;
+            exit.cwd = cwd;
+            return self.finish(exit, full);
+        }
 
         loop {
             match self.rx.recv_timeout(Duration::from_millis(500)) {
@@ -779,7 +786,7 @@ mod e2e {
         // Quick command captured cleanly.
         let r = done(shell.run("t", "/tmp", "echo hello world", quick).unwrap());
         assert_eq!(r.output, "hello world");
-        assert!(r.ok && !r.timed_out);
+        assert!(r.ok);
 
         // cwd persists.
         done(shell.run("t", "/tmp", "cd /tmp", quick).unwrap());
@@ -797,17 +804,15 @@ mod e2e {
         // While live, the shell is busy.
         assert!(matches!(shell.run("t", "/tmp", "echo x", quick).unwrap(), RunOutcome::Busy));
 
-        // `initial` carries output already seen during the promotion window
-        // (delivered to the panel via shell-live-start); the stream carries the rest.
-        let initial = live.initial.clone();
+        // The stream emits ALL output — including what was seen during the
+        // promotion window (fed through the filter, then emitted as the first
+        // chunk so the store buffers it race-free).
         let chunks = Arc::new(StdMutex::new(String::new()));
         let c2 = Arc::clone(&chunks);
         let exit = live.stream(move |s| c2.lock().unwrap().push_str(s));
         let streamed = chunks.lock().unwrap().clone();
-        let all = format!("{initial}{streamed}");
-        assert!(all.contains("live-start"), "missing output: {all:?}");
-        assert!(all.contains("live-done"));
-        assert!(!all.contains("OCTO_"), "marker leaked: {all:?}");
+        assert!(streamed.contains("live-start"), "missing early output: {streamed:?}");
+        assert!(streamed.contains("live-done"), "missing later output: {streamed:?}");
         assert!(!streamed.contains("OCTO_"), "marker leaked into stream: {streamed:?}");
         assert_eq!(exit.exit_code, 0);
         assert!(exit.full_output.contains("live-start") && exit.full_output.contains("live-done"));

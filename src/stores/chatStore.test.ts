@@ -90,14 +90,12 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
       threadId: "t1",
       callId: "shell-1",
       command: "npm run dev",
-      initial: "VITE ready\n",
     });
 
     const live = useChatStore.getState().getLiveProcess("ws-1");
     expect(live).not.toBeNull();
     expect(live?.command).toBe("npm run dev");
     expect(live?.callId).toBe("shell-1");
-    expect(live?.initial).toContain("VITE ready");
 
     emit("chat://shell-exit", {
       threadId: "t1",
@@ -118,7 +116,6 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
       threadId: "t1",
       callId: "shell-1",
       command: "tail -f log",
-      initial: "",
     });
     // Active thread is t-other, so the t1 process isn't surfaced here.
     expect(useChatStore.getState().getLiveProcess("ws-1")).toBeNull();

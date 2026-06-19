@@ -54,10 +54,21 @@ interface ToolEndEvent {
 export interface LiveProcess {
   callId: string;
   command: string;
-  /** Output already seen during the promotion window — painted on panel mount. */
-  initial: string;
   workspaceId: string;
 }
+
+/** Buffered live-process output, kept so the pinned terminal can render even if
+ *  it mounts after the first chunks arrive (the listener is always-on, so no
+ *  output is lost to a mount race). `total` is the monotonic count of all bytes
+ *  ever appended — `text` is capped, so the panel writes `total - written` from
+ *  the tail. */
+export interface LiveOutput {
+  text: string;
+  total: number;
+}
+
+/** Cap on the in-memory live-output buffer (xterm holds its own scrollback). */
+const LIVE_OUTPUT_CAP = 262_144;
 
 export type Effort = "swift" | "standard" | "deep";
 
@@ -178,6 +189,8 @@ interface ChatState {
   /** A live (long-running) `$`-direct process per thread, shown as a pinned
    *  mini-terminal. Present between chat://shell-live-start and shell-exit. */
   liveProcessByThread: Record<string, LiveProcess>;
+  /** Buffered output for each live process, keyed by callId. */
+  liveOutputByCallId: Record<string, LiveOutput>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -199,6 +212,8 @@ interface ChatState {
   getShellCwd: (workspaceId: string) => string | null;
   /** The active thread's live `$`-direct process, or null if none is running. */
   getLiveProcess: (workspaceId: string) => LiveProcess | null;
+  /** Buffered output for a live process (by callId) — for the pinned terminal. */
+  getLiveOutput: (callId: string) => LiveOutput | null;
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -410,7 +425,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     threadId: string;
     callId: string;
     command: string;
-    initial: string;
   }>("chat://shell-live-start", (ev) => {
     const p = ev.payload;
     if (!p.threadId) return;
@@ -420,12 +434,34 @@ export const useChatStore = create<ChatState>((set, get) => {
         [p.threadId]: {
           callId: p.callId,
           command: p.command,
-          initial: p.initial,
           workspaceId: p.workspaceId,
         },
       },
     }));
   });
+
+  // ── chat://shell-output ───────────────────────────────────────
+  // Live-process output chunks. Buffered here (listener always active) so the
+  // pinned terminal never loses output to a mount race; capped, with a monotonic
+  // `total` so the panel can write only the tail it hasn't shown yet.
+  listen<{ threadId: string; callId: string; chunk: string }>(
+    "chat://shell-output",
+    (ev) => {
+      const { callId, chunk } = ev.payload;
+      if (!chunk) return;
+      set((s) => {
+        const prev = s.liveOutputByCallId[callId] ?? { text: "", total: 0 };
+        let text = prev.text + chunk;
+        if (text.length > LIVE_OUTPUT_CAP) text = text.slice(text.length - LIVE_OUTPUT_CAP);
+        return {
+          liveOutputByCallId: {
+            ...s.liveOutputByCallId,
+            [callId]: { text, total: prev.total + chunk.length },
+          },
+        };
+      });
+    },
+  );
 
   // ── chat://shell-exit ─────────────────────────────────────────
   // The live process exited — close the pinned terminal and update the cwd.
@@ -437,8 +473,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => {
         const next = { ...s.liveProcessByThread };
         delete next[p.threadId];
+        const nextOut = { ...s.liveOutputByCallId };
+        delete nextOut[p.callId];
         return {
           liveProcessByThread: next,
+          liveOutputByCallId: nextOut,
           shellCwdByThread: p.cwd
             ? { ...s.shellCwdByThread, [p.threadId]: p.cwd }
             : s.shellCwdByThread,
@@ -460,6 +499,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     attachmentsByWs: {},
     shellCwdByThread: {},
     liveProcessByThread: {},
+    liveOutputByCallId: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -480,6 +520,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const threadId = get().activeThreadByWs[workspaceId];
       return threadId ? get().liveProcessByThread[threadId] ?? null : null;
     },
+    getLiveOutput: (callId) => get().liveOutputByCallId[callId] ?? null,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -618,6 +659,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Reuse the streaming flag so input disables and the live tool card shows
       // while the command runs; the tool-start/end + message-added events do the
       // rest. Cleared in `finally` since `$`-direct emits no stream-done event.
+      // Note: if the command is promoted to a live process the IPC resolves
+      // (live:true) and this clears — re-enabling the composer ON PURPOSE so the
+      // user can keep working; the pinned LiveProcessPanel + the still-running
+      // `§ RUN` card are the "process running" indicators while it streams.
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },

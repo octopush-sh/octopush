@@ -38,11 +38,7 @@ export function LiveProcessPanel({ workspaceId }: Props) {
           <Square size={10} fill="currentColor" /> Stop
         </button>
       </div>
-      <TerminalView
-        callId={live.callId}
-        initial={live.initial}
-        className="h-[200px] px-2 pb-2"
-      />
+      <TerminalView callId={live.callId} className="h-[200px] px-2 pb-2" />
     </div>
   );
 }

@@ -1,40 +1,35 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useChatStore } from "../../stores/chatStore";
 import { XTERM_FONT_FAMILY, XTERM_THEME } from "../../lib/xtermTheme";
 
-interface ShellOutputEvent {
-  threadId: string;
-  callId: string;
-  chunk: string;
-}
-
 interface Props {
-  /** Correlates this view to its live process; only matching output is written. */
+  /** Correlates this view to its live process's buffered output. */
   callId: string;
-  /** Output already seen during the promotion window, painted on mount. */
-  initial?: string;
   className?: string;
 }
 
 /**
- * A read-mostly xterm.js surface for a TALK live process. Renders the `initial`
- * snapshot, then appends `chat://shell-output` chunks for its `callId` (raw,
- * with ANSI — xterm draws the colors). Stdin/interactivity is intentionally out
- * of scope here (kill is driven from the panel header); full TTY arrives later.
+ * A read-mostly xterm.js surface for a TALK live process. Renders the buffered
+ * output for its `callId` from the store (raw, with ANSI — xterm draws the
+ * colors) and writes only the tail it hasn't shown yet as new chunks arrive.
+ *
+ * The buffer is filled by an always-on store listener, so output is never lost
+ * to this panel's mount timing. Stdin/interactivity is out of scope here (kill
+ * is driven from the panel header); full TTY arrives later.
  */
-export function TerminalView({ callId, initial, className }: Props) {
+export function TerminalView({ callId, className }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  // Keep the latest callId reachable from the once-registered listener without
-  // re-subscribing (and re-mounting xterm) on every render.
-  const callIdRef = useRef(callId);
-  callIdRef.current = callId;
+  const termRef = useRef<Terminal | null>(null);
+  // How many total bytes we've already written to xterm (monotonic, matches the
+  // store's `total`), so each render writes only the unseen tail.
+  const writtenRef = useRef(0);
+  const output = useChatStore((s) => s.getLiveOutput(callId));
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-
     const term = new Terminal({
       fontFamily: XTERM_FONT_FAMILY,
       fontSize: 12,
@@ -48,6 +43,9 @@ export function TerminalView({ callId, initial, className }: Props) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    termRef.current = term;
+    writtenRef.current = 0;
+
     const safeFit = () => {
       if (el.clientWidth > 0 && el.clientHeight > 0) {
         try {
@@ -58,29 +56,27 @@ export function TerminalView({ callId, initial, className }: Props) {
       }
     };
     safeFit();
-    if (initial) term.write(initial);
-
     const ro = new ResizeObserver(safeFit);
     ro.observe(el);
 
-    let unlisten: UnlistenFn | undefined;
-    let disposed = false;
-    void listen<ShellOutputEvent>("chat://shell-output", (ev) => {
-      if (ev.payload.callId === callIdRef.current) term.write(ev.payload.chunk);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
-
     return () => {
-      disposed = true;
-      unlisten?.();
       ro.disconnect();
       term.dispose();
+      termRef.current = null;
     };
-    // Mount once per callId; `initial` is captured at mount intentionally.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callId]);
+
+  // Write the unseen tail whenever the buffer grows.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || !output) return;
+    const pending = output.total - writtenRef.current;
+    if (pending <= 0) return;
+    // `text` is capped to its tail; never slice past its start.
+    const tail = output.text.slice(Math.max(0, output.text.length - pending));
+    term.write(tail);
+    writtenRef.current = output.total;
+  }, [output]);
 
   return <div ref={containerRef} className={className} />;
 }

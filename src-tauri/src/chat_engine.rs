@@ -81,38 +81,16 @@ pub struct ShellRequest {
 /// its live "running" card). Distinct from provider tool_use ids.
 static SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Format a shell result's output for the tool card / model context, mirroring
-/// `execute_tool`'s conventions (annotate non-zero exits, surface timeouts,
-/// and show an explicit exit code when there's no output).
-fn format_shell_output(r: &crate::talk_shell::ShellResult) -> String {
-    let mut s = r.output.clone();
-    if r.timed_out {
+/// Format captured shell output for the tool card / model context, mirroring
+/// `execute_tool`'s conventions: annotate a non-zero exit, and show an explicit
+/// exit code when there's no output. Shared by the quick and live paths.
+fn format_command_output(output: &str, exit_code: i32) -> String {
+    let mut s = output.to_string();
+    if exit_code != 0 {
         if !s.is_empty() {
             s.push('\n');
         }
-        s.push_str(
-            "(command still running after 120s — it was interrupted; live long-running \
-             process support arrives in a later update)",
-        );
-    } else if r.exit_code != 0 {
-        if !s.is_empty() {
-            s.push('\n');
-        }
-        s.push_str(&format!("(exit code {})", r.exit_code));
-    } else if s.trim().is_empty() {
-        s = "(exit code 0)".to_string();
-    }
-    s
-}
-
-/// Format a finished live process's captured output for the resolved card.
-fn format_live_output(exit: &crate::talk_shell::LiveExit) -> String {
-    let mut s = exit.full_output.clone();
-    if exit.exit_code != 0 {
-        if !s.is_empty() {
-            s.push('\n');
-        }
-        s.push_str(&format!("(exit code {})", exit.exit_code));
+        s.push_str(&format!("(exit code {exit_code})"));
     } else if s.trim().is_empty() {
         s = "(exit code 0)".to_string();
     }
@@ -170,9 +148,6 @@ pub struct ShellLiveStartEvent {
     pub thread_id: String,
     pub call_id: String,
     pub command: String,
-    /// Output already seen during the promotion window — painted immediately so
-    /// no early output is lost to the panel's mount race.
-    pub initial: String,
 }
 
 /// A chunk of raw output from a live process (markers stripped, ANSI kept for
@@ -633,7 +608,7 @@ impl ChatEngine {
             RunOutcome::Done(result) => {
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, result.ok, started,
-                    &format_shell_output(&result),
+                    &format_command_output(&result.output, result.exit_code),
                 );
                 Ok(result)
             }
@@ -648,7 +623,6 @@ impl ChatEngine {
                     exit_code: -1,
                     ok: false,
                     cwd: String::new(),
-                    timed_out: false,
                     live: false,
                 })
             }
@@ -659,7 +633,6 @@ impl ChatEngine {
                     thread_id: request.thread_id.clone(),
                     call_id: call_id.clone(),
                     command: request.command.clone(),
-                    initial: live.initial.clone(),
                 });
                 self.spawn_live_streamer(
                     app.clone(), request.clone(), call_id, tool_input, started, live,
@@ -669,7 +642,6 @@ impl ChatEngine {
                     exit_code: 0,
                     ok: true,
                     cwd: String::new(),
-                    timed_out: false,
                     live: true,
                 })
             }
@@ -755,7 +727,7 @@ impl ChatEngine {
                     "callId": call_id,
                     "toolName": "run_command",
                     "toolInput": tool_input,
-                    "result": format_live_output(&exit),
+                    "result": format_command_output(&exit.full_output, exit.exit_code),
                 });
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 let id = db.lock().insert_chat_message(
@@ -905,9 +877,16 @@ impl ChatEngine {
             // since providers reject empty text blocks.
             match messages.last_mut() {
                 Some(last) if last.role == LlmRole::User => {
+                    // Use the turn's already-built text, not request.user_message:
+                    // the former includes any merged `$`-direct command context
+                    // prepended above, which would otherwise be dropped here.
+                    let text = match &last.content {
+                        LlmContent::Text(t) => t.clone(),
+                        _ => request.user_message.clone(),
+                    };
                     let mut blocks: Vec<LlmBlock> = Vec::new();
-                    if !request.user_message.trim().is_empty() {
-                        blocks.push(LlmBlock::Text(request.user_message.clone()));
+                    if !text.trim().is_empty() {
+                        blocks.push(LlmBlock::Text(text));
                     }
                     for att in &request.attachments {
                         blocks.push(LlmBlock::Image {
