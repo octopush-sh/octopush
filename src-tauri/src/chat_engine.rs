@@ -21,7 +21,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use chrono;
@@ -63,6 +63,46 @@ pub struct ChatRequest {
 pub struct Attachment {
     pub media_type: String,
     pub data: String,
+}
+
+/// Request to run a `$`-direct command in a thread's TALK shell — bypasses the
+/// LLM entirely (zero tokens), but the command + output are persisted into the
+/// conversation so the agent sees them as context on its next turn.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub workspace_path: String,
+    pub command: String,
+}
+
+/// Monotonic counter for `$`-direct call ids (correlates the resolved card to
+/// its live "running" card). Distinct from provider tool_use ids.
+static SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Format a shell result's output for the tool card / model context, mirroring
+/// `execute_tool`'s conventions (annotate non-zero exits, surface timeouts,
+/// and show an explicit exit code when there's no output).
+fn format_shell_output(r: &crate::talk_shell::ShellResult) -> String {
+    let mut s = r.output.clone();
+    if r.timed_out {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(
+            "(command still running after 120s — it was interrupted; live long-running \
+             process support arrives in a later update)",
+        );
+    } else if r.exit_code != 0 {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&format!("(exit code {})", r.exit_code));
+    } else if s.trim().is_empty() {
+        s = "(exit code 0)".to_string();
+    }
+    s
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -372,16 +412,22 @@ pub struct ChatEngine {
     /// their tools into the loop, and proxies tool calls. Shared so the
     /// `list_mcp_*` commands can read the same connections.
     pub mcp: Arc<crate::mcp::McpRegistry>,
+    /// Per-thread persistent bash PTYs backing `$`-direct execution. Shared so
+    /// `run_shell_command` can reach the same sessions across turns.
+    pub talk_shell: Arc<crate::talk_shell::TalkShell>,
 }
 
 impl ChatEngine {
-    pub fn new(db: Arc<Mutex<Db>>) -> Self {
+    pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
+        let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
+        talk_shell.set_client(daemon);
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
             db,
             cancels: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(crate::mcp::McpRegistry::new()),
+            talk_shell,
         }
     }
 
@@ -469,6 +515,105 @@ impl ChatEngine {
         Ok(id)
     }
 
+    /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
+    ///
+    /// Persists the command as a user turn (`$ cmd`) and the output as a
+    /// `role="tool"` row so it renders as a `§ RUN` card and becomes context
+    /// for the agent's next turn. Emits the same `tool-start`/`tool-end` events
+    /// as the agentic loop so the existing live-card spinner is reused.
+    pub async fn run_shell_command(
+        &self,
+        app: AppHandle,
+        request: ShellRequest,
+    ) -> AppResult<crate::talk_shell::ShellResult> {
+        // Show the command as the user's turn straight away.
+        self.insert_and_emit_message(
+            &app,
+            &request.workspace_id,
+            &request.thread_id,
+            "user",
+            &format!("$ {}", request.command),
+            None, None, None, None,
+        )?;
+
+        let seq = SHELL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let call_id = format!("shell-{seq}");
+        let tool_input = serde_json::json!({ "command": request.command });
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let _ = app.emit("chat://tool-start", &ToolStartEvent {
+            workspace_id: request.workspace_id.clone(),
+            thread_id: request.thread_id.clone(),
+            call_id: call_id.clone(),
+            tool_name: "run_command".to_string(),
+            tool_input: tool_input.clone(),
+            started_at: now,
+        });
+
+        let started = std::time::Instant::now();
+        let shell = Arc::clone(&self.talk_shell);
+        let thread_id = request.thread_id.clone();
+        let workspace_path = request.workspace_path.clone();
+        let command = request.command.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            shell.run(
+                &thread_id,
+                &workspace_path,
+                &command,
+                std::time::Duration::from_secs(120),
+            )
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("shell task join error: {e}")))?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        // On a hard failure (daemon down / spawn failed) surface it as a tool
+        // card too, so the user sees why nothing ran — then propagate the error.
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = app.emit("chat://tool-end", &ToolEndEvent {
+                    workspace_id: request.workspace_id.clone(),
+                    thread_id: request.thread_id.clone(),
+                    call_id: call_id.clone(),
+                    ok: false,
+                    duration_ms,
+                });
+                let record = serde_json::json!({
+                    "callId": call_id,
+                    "toolName": "run_command",
+                    "toolInput": tool_input,
+                    "result": format!("Shell error: {e}"),
+                });
+                let _ = self.insert_and_emit_message(
+                    &app, &request.workspace_id, &request.thread_id,
+                    "tool", &record.to_string(), None, None, None, None,
+                );
+                return Err(e);
+            }
+        };
+
+        let _ = app.emit("chat://tool-end", &ToolEndEvent {
+            workspace_id: request.workspace_id.clone(),
+            thread_id: request.thread_id.clone(),
+            call_id: call_id.clone(),
+            ok: result.ok,
+            duration_ms,
+        });
+
+        let record = serde_json::json!({
+            "callId": call_id,
+            "toolName": "run_command",
+            "toolInput": tool_input,
+            "result": format_shell_output(&result),
+        });
+        self.insert_and_emit_message(
+            &app, &request.workspace_id, &request.thread_id,
+            "tool", &record.to_string(), None, None, None, None,
+        )?;
+
+        Ok(result)
+    }
+
     /// Run the agentic loop: send messages with tools, execute tool calls,
     /// feed results back, repeat until the provider gives a final text answer.
     /// Dispatches to the right LlmProvider impl via `resolve_provider()`.
@@ -545,11 +690,20 @@ impl ChatEngine {
                     content: LlmContent::Text(content),
                 });
             } else if msg.role == "user" {
-                // Flush any orphaned tool summaries.
-                pending_tool_summary.clear();
+                // Prepend any orphaned tool summaries to the user turn. This is
+                // the path a `$`-direct command takes: its output (role="tool")
+                // isn't followed by an assistant message, so without this the
+                // command's output would be dropped from the model's context.
+                let mut content = String::new();
+                if !pending_tool_summary.is_empty() {
+                    content.push_str(&pending_tool_summary.join("\n"));
+                    content.push_str("\n\n");
+                    pending_tool_summary.clear();
+                }
+                content.push_str(&msg.content);
                 messages.push(LlmMessage {
                     role: LlmRole::User,
-                    content: LlmContent::Text(msg.content.clone()),
+                    content: LlmContent::Text(content),
                 });
             }
         }

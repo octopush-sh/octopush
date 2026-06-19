@@ -162,6 +162,10 @@ interface ChatState {
   /** Pending image attachments per workspace — sent with the next turn, then
    *  cleared. */
   attachmentsByWs: Record<string, Attachment[]>;
+  /** Working directory of each thread's TALK shell (keyed by threadId), updated
+   *  after every `$`-direct command so the composer can show a cwd badge once
+   *  the user has `cd`'d away from the workspace root. */
+  shellCwdByThread: Record<string, string>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -179,6 +183,8 @@ interface ChatState {
   getActiveThread: (workspaceId: string) => string | null;
   getActiveSkill: (workspaceId: string) => string | null;
   getAttachments: (workspaceId: string) => Attachment[];
+  /** The active thread's TALK shell cwd, or null if unknown / never run. */
+  getShellCwd: (workspaceId: string) => string | null;
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -187,6 +193,13 @@ interface ChatState {
     workspacePath: string,
     content: string,
     systemPrompt?: string,
+  ) => Promise<void>;
+  /** Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
+   *  The command + output are persisted into the conversation as context. */
+  runShell: (
+    workspaceId: string,
+    workspacePath: string,
+    command: string,
   ) => Promise<void>;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
@@ -383,6 +396,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     streamingThreadByWs: {},
     activeSkillByWs: {},
     attachmentsByWs: {},
+    shellCwdByThread: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -395,6 +409,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
     getActiveSkill: (workspaceId) => get().activeSkillByWs[workspaceId] ?? null,
     getAttachments: (workspaceId) => get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS,
+    getShellCwd: (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      return threadId ? get().shellCwdByThread[threadId] ?? null : null;
+    },
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -505,6 +523,59 @@ export const useChatStore = create<ChatState>((set, get) => {
           attachmentsByWs: attachments.length
             ? { ...s.attachmentsByWs, [workspaceId]: attachments }
             : s.attachmentsByWs,
+        }));
+      }
+    },
+
+    runShell: async (workspaceId, workspacePath, command) => {
+      const threadId = await get().ensureThread(workspaceId);
+      if (!threadId) {
+        set((s) => ({
+          errorByWs: { ...s.errorByWs, [workspaceId]: "Could not start a conversation." },
+        }));
+        return;
+      }
+
+      // Name an untouched thread after its first command, mirroring `send`.
+      const existingMsgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+      const thread = (get().threadsByWs[workspaceId] ?? EMPTY_THREADS).find((t) => t.id === threadId);
+      if (
+        existingMsgs.length === 0 &&
+        thread &&
+        (thread.title === "New conversation" || thread.title === "Conversation")
+      ) {
+        const title = deriveChatTitle([{ role: "user", content: `$ ${command}` } as ChatMessage]);
+        void get().renameThread(workspaceId, threadId, title).catch(() => {});
+      }
+
+      // Reuse the streaming flag so input disables and the live tool card shows
+      // while the command runs; the tool-start/end + message-added events do the
+      // rest. Cleared in `finally` since `$`-direct emits no stream-done event.
+      set((s) => ({
+        streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
+        errorByWs: { ...s.errorByWs, [workspaceId]: null },
+        liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
+      }));
+
+      try {
+        const result = await ipc.runShellCommand({
+          workspaceId,
+          threadId,
+          workspacePath,
+          command,
+        });
+        if (result?.cwd) {
+          set((s) => ({
+            shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwd },
+          }));
+        }
+      } catch (e) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+      } finally {
+        set((s) => ({
+          streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
+          streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
         }));
       }
     },

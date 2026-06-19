@@ -414,6 +414,18 @@ export const ipc = {
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** Stop the in-flight agentic turn for this thread. */
   cancelChat: (threadId: string) => invoke<void>("cancel_chat", { threadId }),
+  /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
+   *  command + output into the conversation; returns cwd/exit for the badge. */
+  runShellCommand: (request: {
+    workspaceId: string;
+    threadId: string;
+    workspacePath: string;
+    command: string;
+  }) =>
+    invoke<{ output: string; exitCode: number; ok: boolean; cwd: string; timedOut: boolean }>(
+      "run_shell_command",
+      { request },
+    ),
 
   // ─── Chat threads (conversations) ────────────────────────────────
   listChatThreads: (workspaceId: string) =>

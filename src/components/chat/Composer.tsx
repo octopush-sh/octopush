@@ -22,8 +22,9 @@ import { MentionPopover } from "./MentionPopover";
 import { SlashMenu } from "./SlashMenu";
 import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
+import { parseShellCommand } from "../../lib/shellCommand";
 import { FadeSwap } from "../primitives/FadeSwap";
-import { X, Paperclip } from "lucide-react";
+import { X, Paperclip, TerminalSquare } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -47,6 +48,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const model = useChatStore((s) => s.model);
   const setModel = useChatStore((s) => s.setModel);
   const send = useChatStore((s) => s.send);
+  const runShell = useChatStore((s) => s.runShell);
+  const shellCwd = useChatStore((s) => s.getShellCwd(workspaceId));
   const stop = useChatStore((s) => s.stop);
   const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
   const setActiveSkill = useChatStore((s) => s.setActiveSkill);
@@ -288,18 +291,31 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setInput("");
     historyIdxRef.current = -1;
     closeMention();
+    closeSlash();
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     // Prepend to history, de-duplicating only consecutive duplicates. History
-    // keeps the user's literal text (with @mentions), not the expansion.
+    // keeps the user's literal text (with @mentions / `$`), not the expansion.
     if (historyRef.current[0] !== trimmed) {
       historyRef.current = [trimmed, ...historyRef.current];
     }
+
+    // `$ <cmd>` / `/run <cmd>` — run directly in the thread's shell, no LLM.
+    const shellCmd = parseShellCommand(trimmed);
+    if (shellCmd) {
+      void runShell(workspaceId, workspacePath, shellCmd);
+      return;
+    }
+
+    // `\$…` escape hatch: a leading backslash sends the literal `$…` text to
+    // the agent instead of running it.
+    const outgoing = trimmed.startsWith("\\$") ? trimmed.slice(1) : trimmed;
+
     // Expand any @file mentions into fenced context blocks appended to the
     // message, so the model receives the referenced files' contents. The chat
     // shows exactly what was sent (transparent). Files are read with a byte cap.
-    const mentions = extractMentions(trimmed, filesSetRef.current);
+    const mentions = extractMentions(outgoing, filesSetRef.current);
     if (mentions.length === 0) {
-      send(workspaceId, workspacePath, trimmed);
+      send(workspaceId, workspacePath, outgoing);
       return;
     }
     expandingRef.current = true;
@@ -319,13 +335,13 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             }
           }),
         );
-        send(workspaceId, workspacePath, trimmed + blocks.join(""));
+        send(workspaceId, workspacePath, outgoing + blocks.join(""));
       } finally {
         expandingRef.current = false;
         setExpanding(false);
       }
     })();
-  }, [streaming, send, workspaceId, workspacePath]);
+  }, [streaming, send, runShell, workspaceId, workspacePath]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // ── Slash (skill) menu takes precedence while open ──
@@ -414,6 +430,15 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     (input.trim().length > 0 || attachments.length > 0) &&
     (!isBudgetError || overrideActive);
 
+  // The TALK shell's cwd, shown as a badge only once the user has `cd`'d away
+  // from the workspace root — so the persistent shell's state is never hidden.
+  const cwdLabel = (() => {
+    if (!shellCwd || shellCwd === workspacePath) return null;
+    if (shellCwd.startsWith(workspacePath + "/")) return shellCwd.slice(workspacePath.length + 1);
+    const parts = shellCwd.split("/").filter(Boolean);
+    return parts.length > 2 ? "…/" + parts.slice(-2).join("/") : shellCwd;
+  })();
+
   return (
     <div className="px-6 pb-4 pt-3">
       <div
@@ -487,7 +512,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             blurTimerRef.current = setTimeout(closeMention, 120);
           }}
           disabled={streaming}
-          placeholder="Ask anything…  ⟶  @ file · / skill"
+          placeholder="Ask anything…   @ file · / skill · $ run a command"
           rows={1}
           className="w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
           style={{ maxHeight: "calc(8 * 1.25rem + 1.5rem)" }}
@@ -506,6 +531,16 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           >
             <Paperclip size={14} />
           </button>
+
+          {cwdLabel && (
+            <span
+              className="flex items-center gap-1 font-mono text-[10px] text-octo-sage"
+              title={`TALK shell working directory: ${shellCwd}`}
+            >
+              <TerminalSquare size={11} className="text-octo-brass" />
+              {cwdLabel}
+            </span>
+          )}
 
           {inlineCost !== null && (
             <div

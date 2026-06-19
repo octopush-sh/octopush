@@ -844,6 +844,18 @@ pub async fn send_chat_message(
     state.chat.send_agentic(app, request).await
 }
 
+/// Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
+/// command + output into the conversation and returns the resulting cwd/exit
+/// for the composer's cwd badge.
+#[tauri::command]
+pub async fn run_shell_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::chat_engine::ShellRequest,
+) -> AppResult<crate::talk_shell::ShellResult> {
+    state.chat.run_shell_command(app, request).await
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,
