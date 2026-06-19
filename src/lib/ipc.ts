@@ -433,6 +433,12 @@ export const ipc = {
   /** SIGINT (Ctrl-C) a thread's live `$`-direct process. */
   stopShellCommand: (threadId: string) =>
     invoke<void>("stop_shell_command", { threadId }),
+  /** Forward keystrokes to a thread's live process (interactive stdin). */
+  sendShellInput: (threadId: string, data: string) =>
+    invoke<void>("send_shell_input", { threadId, data }),
+  /** Resize a thread's PTY so a full-screen TUI fits the live panel. */
+  resizeShell: (threadId: string, rows: number, cols: number) =>
+    invoke<void>("resize_shell", { threadId, rows, cols }),
 
   // ─── Chat threads (conversations) ────────────────────────────────
   listChatThreads: (workspaceId: string) =>

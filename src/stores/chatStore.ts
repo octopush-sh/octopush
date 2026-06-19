@@ -55,6 +55,8 @@ export interface LiveProcess {
   callId: string;
   command: string;
   workspaceId: string;
+  /** The thread whose shell runs this process — targets interactive stdin/resize. */
+  threadId: string;
 }
 
 /** Buffered live-process output, kept so the pinned terminal can render even if
@@ -454,6 +456,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           callId: p.callId,
           command: p.command,
           workspaceId: p.workspaceId,
+          threadId: p.threadId,
         },
       },
     }));
