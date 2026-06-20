@@ -936,6 +936,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     respondApproval: (workspaceId, callId, decision) => {
+      // Snapshot the card so we can restore it if the IPC fails — otherwise the
+      // card vanishes (looks resolved) while the backend turn stays parked until
+      // its 300s timeout, with no way to retry the decision.
+      const card = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).find(
+        (a) => a.callId === callId,
+      );
       // Optimistically retire the card; the backend also emits approval-resolved.
       set((s) => {
         const cur = s.pendingApprovalsByWs[workspaceId];
@@ -947,7 +953,18 @@ export const useChatStore = create<ChatState>((set, get) => {
           },
         };
       });
-      void ipc.respondApproval(callId, decision).catch(() => {});
+      void ipc.respondApproval(callId, decision).catch((e) => {
+        // Restore the card + surface the error so the decision can be retried.
+        set((s) => ({
+          errorByWs: { ...s.errorByWs, [workspaceId]: `Could not send approval: ${String(e)}` },
+          pendingApprovalsByWs: card
+            ? {
+                ...s.pendingApprovalsByWs,
+                [workspaceId]: [...(s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS), card],
+              }
+            : s.pendingApprovalsByWs,
+        }));
+      });
     },
 
     loadShellHistory: async (workspaceId) => {

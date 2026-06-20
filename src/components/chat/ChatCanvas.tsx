@@ -70,6 +70,24 @@ export function ChatCanvas({
     loadHistory(workspaceId);
   }, [workspaceId, loadHistory]);
 
+  // Regenerate / Edit truncate the thread from the targeted message onward, so
+  // they're offered ONLY on the latest exchange — the last assistant turn and
+  // the last user turn. This prevents silently deleting a long conversation's
+  // tail by clicking an action on an old message. (Mid-history edit with an
+  // explicit confirmation is a deliberate future enhancement.)
+  const lastAssistantId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return messages[i].id;
+    }
+    return -1;
+  }, [messages]);
+  const lastUserId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") return messages[i].id;
+    }
+    return -1;
+  }, [messages]);
+
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -153,12 +171,12 @@ export function ChatCanvas({
                 message={item.message}
                 onOpenInEditor={onOpenInEditor}
                 onRegenerate={
-                  item.message.role === "assistant"
+                  item.message.role === "assistant" && item.message.id === lastAssistantId
                     ? (id) => regenerate(workspaceId, workspacePath, id)
                     : undefined
                 }
                 onEdit={
-                  item.message.role === "user"
+                  item.message.role === "user" && item.message.id === lastUserId
                     ? (id, content) => editAndResend(workspaceId, workspacePath, id, content)
                     : undefined
                 }
