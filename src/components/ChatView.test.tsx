@@ -174,6 +174,15 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByLabelText("Regenerate")).toBeInTheDocument();
   });
 
+  it("composer exposes a help popover documenting the @/ / /$ input modes", () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const help = screen.getByLabelText("Shortcuts & input modes");
+    expect(help).toBeInTheDocument();
+    fireEvent.click(help);
+    expect(screen.getByText(/Reference a file/i)).toBeInTheDocument();
+    expect(screen.getByText(/Run a command in the shared shell/i)).toBeInTheDocument();
+  });
+
   it("renders tools through the full event flow (user → tool → assistant → done)", async () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     // Let mount-time loadHistory resolve before emitting; its async set

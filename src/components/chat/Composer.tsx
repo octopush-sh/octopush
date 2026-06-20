@@ -25,7 +25,7 @@ import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
 import { parseShellCommand } from "../../lib/shellCommand";
 import { FadeSwap } from "../primitives/FadeSwap";
-import { X, Paperclip, TerminalSquare } from "lucide-react";
+import { X, Paperclip, TerminalSquare, HelpCircle } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -116,6 +116,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       const items = q
         ? skills.filter((s) => s.name.toLowerCase().includes(q))
         : skills;
+      closeMention();
+      closeCmdHist();
       setSlashOpen(true);
       setSlashItems(items);
       setSlashIndex(0);
@@ -162,6 +164,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       closeCmdHist();
       return;
     }
+    closeMention();
+    closeSlash();
     setCmdHistOpen(true);
     setCmdHistItems(items);
     setCmdHistIndex(0);
@@ -185,6 +189,11 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   // send during that async window (streaming only flips once send() runs).
   const expandingRef = useRef(false);
   const [expanding, setExpanding] = useState(false);
+  // Mirrors historyIdxRef >= 0 for the UI — shows a "History" hint while the
+  // user is navigating ↑/↓ through past prompts.
+  const [historyActive, setHistoryActive] = useState(false);
+  // Toggles the `?` keyboard/mode reference popover beneath the composer.
+  const [helpOpen, setHelpOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -215,6 +224,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       return;
     }
     const items = rankFiles(files, m.query);
+    closeSlash();
+    closeCmdHist();
     setMention({ ...m, caret });
     setMentionItems(items);
     setMentionIndex(0);
@@ -317,13 +328,22 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     }
   }
 
+  // True between compositionstart/end (IME for CJK etc.). While composing, the
+  // popover refreshes are skipped so they don't react to half-composed input.
+  const composingRef = useRef(false);
+
+  function runPopoverRefresh(value: string, caret: number) {
+    refreshMention(value, caret);
+    refreshSlash(value);
+    refreshCmdHist(value);
+  }
+
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const val = e.target.value;
     setInput(val);
     historyIdxRef.current = -1; // any manual edit exits history navigation
-    refreshMention(val, e.target.selectionStart ?? val.length);
-    refreshSlash(val);
-    refreshCmdHist(val);
+    if (historyActive) setHistoryActive(false);
+    if (!composingRef.current) runPopoverRefresh(val, e.target.selectionStart ?? val.length);
     const ta = e.target;
     ta.style.height = "auto";
     const lineHeight = 20;
@@ -339,6 +359,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     if ((!trimmed && !hasAttachments) || streaming || expandingRef.current) return;
     setInput("");
     historyIdxRef.current = -1;
+    setHistoryActive(false);
     closeMention();
     closeSlash();
     closeCmdHist();
@@ -384,7 +405,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
               }
               return `\n\n§ ${rel} _(not included: ${res.kind})_`;
             } catch {
-              return "";
+              // Surface the failure in the message instead of silently dropping
+              // it, so both the user and the model see the file was unreadable.
+              return `\n\n§ ${rel} _(not included: unreadable)_`;
             }
           }),
         );
@@ -477,6 +500,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         e.preventDefault();
         const next = Math.min(hist.length - 1, idx + 1);
         historyIdxRef.current = next;
+        setHistoryActive(next >= 0);
         if (next >= 0) setInput(hist[next] ?? "");
         return;
       }
@@ -485,6 +509,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       e.preventDefault();
       const next = idx - 1;
       historyIdxRef.current = next;
+      setHistoryActive(next >= 0);
       setInput(next < 0 ? "" : hist[next] ?? "");
       return;
     }
@@ -492,6 +517,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       e.preventDefault();
       setInput("");
       historyIdxRef.current = -1;
+      setHistoryActive(false);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -579,6 +605,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           onChange={handleInput}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
+          onCompositionStart={() => {
+            composingRef.current = true;
+          }}
+          onCompositionEnd={(e) => {
+            composingRef.current = false;
+            const ta = e.currentTarget;
+            runPopoverRefresh(ta.value, ta.selectionStart ?? ta.value.length);
+          }}
           // Recompute the mention on every caret move (click, ArrowLeft/Right,
           // Home/End) — not just on typing — so the popover closes when the
           // caret leaves the trigger and mention.caret never goes stale.
@@ -667,10 +701,68 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       </div>
 
       {/* Quiet hint line beneath the box. */}
-      <div className="mt-1.5 px-1 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-        Enter to send · ⇧↵ for newline · ↑ for history
+      <div className="relative mt-1.5 flex items-center gap-2 px-1">
+        <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+          {historyActive
+            ? "History · ↑↓ to navigate · Esc to exit"
+            : "Enter to send · ⇧↵ for newline · ↑ for history"}
+        </span>
+        <button
+          type="button"
+          onClick={() => setHelpOpen((v) => !v)}
+          aria-label="Shortcuts & input modes"
+          title="Shortcuts & input modes"
+          className="ml-auto flex items-center text-octo-mute transition-colors hover:text-octo-brass"
+        >
+          <HelpCircle size={12} />
+        </button>
+        {helpOpen && <ComposerHelp onClose={() => setHelpOpen(false)} />}
       </div>
     </div>
+  );
+}
+
+/** A small reference popover for the composer's input modes + key shortcuts —
+ *  makes the `@`/`/`/`$` modes discoverable without cluttering the chrome. */
+function ComposerHelp({ onClose }: { onClose: () => void }) {
+  const rows: { key: string; desc: string }[] = [
+    { key: "@ file", desc: "Reference a file — its contents ride along with the message" },
+    { key: "/ skill", desc: "Run a skill for this conversation" },
+    { key: "$ cmd", desc: "Run a command in the shared shell (also /run cmd)" },
+    { key: "\\$ …", desc: "Send a literal $… to the agent instead of running it" },
+    { key: "Enter", desc: "Send · ⇧↵ newline · ↑ ↓ history" },
+  ];
+  return (
+    <>
+      {/* Click-away scrim (invisible) so any outside click dismisses the popover. */}
+      <button
+        type="button"
+        aria-hidden
+        tabIndex={-1}
+        onClick={onClose}
+        className="fixed inset-0 z-10 cursor-default"
+      />
+      <div
+        role="dialog"
+        aria-label="Composer help"
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onClose();
+        }}
+        className="octo-pop-in absolute bottom-full right-0 z-20 mb-1.5 w-[min(22rem,90vw)] rounded-md border border-octo-hairline bg-octo-panel p-2.5 shadow-lg"
+      >
+        <div className="px-1 pb-1.5 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
+          Input modes & shortcuts
+        </div>
+        <ul className="flex flex-col gap-1">
+          {rows.map((r) => (
+            <li key={r.key} className="flex items-baseline gap-2 px-1">
+              <span className="shrink-0 font-mono text-[11px] text-octo-brass">{r.key}</span>
+              <span className="text-[11px] leading-tight text-octo-sage">{r.desc}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </>
   );
 }
 
