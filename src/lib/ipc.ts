@@ -458,6 +458,8 @@ export const ipc = {
     invoke<ChatThread>("create_chat_thread", { workspaceId, title }),
   renameChatThread: (threadId: string, title: string) =>
     invoke<void>("rename_chat_thread", { threadId, title }),
+  setThreadPinned: (threadId: string, pinned: boolean) =>
+    invoke<void>("set_thread_pinned", { threadId, pinned }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
 

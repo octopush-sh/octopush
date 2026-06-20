@@ -187,6 +187,7 @@ pub fn run() {
             commands::list_chat_threads,
             commands::create_chat_thread,
             commands::rename_chat_thread,
+            commands::set_thread_pinned,
             commands::delete_chat_thread,
             commands::list_skills,
             commands::read_attachment,

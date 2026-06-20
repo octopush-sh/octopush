@@ -742,6 +742,14 @@ function App() {
     [activeWorkspaceId],
   );
 
+  const handlePinChat = useCallback(
+    (id: string, pinned: boolean) => {
+      if (!activeWorkspaceId) return;
+      void useChatStore.getState().pinThread(activeWorkspaceId, id, pinned).catch(console.error);
+    },
+    [activeWorkspaceId],
+  );
+
   const handleExportChat = useCallback(
     (id: string) => {
       void (async () => {
@@ -1017,9 +1025,15 @@ function App() {
             id: t.id,
             title: deriveChatTitle(msgs) || t.title,
             meta: deriveChatMeta(msgs, tickerNow),
+            pinned: t.pinned,
           };
         }
-        return { id: t.id, title: t.title, meta: formatRelTime(t.updatedAt, tickerNow) };
+        return {
+          id: t.id,
+          title: t.title,
+          meta: formatRelTime(t.updatedAt, tickerNow),
+          pinned: t.pinned,
+        };
       });
       return {
         chats,
@@ -1029,6 +1043,7 @@ function App() {
         onDeleteChat: handleDeleteChat,
         onRenameChat: handleRenameChat,
         onExportChat: handleExportChat,
+        onPinChat: handlePinChat,
         streamingChatId: streamingThreadId,
       };
     },
@@ -1040,6 +1055,7 @@ function App() {
       handleDeleteChat,
       handleRenameChat,
       handleExportChat,
+      handlePinChat,
       streamingThreadId,
       activeWsPrimaryMessages,
       tickerNow,

@@ -340,6 +340,8 @@ interface ChatState {
   selectThread: (workspaceId: string, threadId: string) => Promise<void>;
   newThread: (workspaceId: string) => Promise<void>;
   renameThread: (workspaceId: string, threadId: string, title: string) => Promise<void>;
+  /** Pin/unpin a conversation (pinned sort to the top). */
+  pinThread: (workspaceId: string, threadId: string, pinned: boolean) => Promise<void>;
   deleteThread: (workspaceId: string, threadId: string) => Promise<void>;
 }
 
@@ -1134,6 +1136,22 @@ export const useChatStore = create<ChatState>((set, get) => {
           ),
         },
       }));
+    },
+
+    pinThread: async (workspaceId, threadId, pinned) => {
+      await ipc.setThreadPinned(threadId, pinned);
+      // Update the flag + re-sort pinned-first (then most-recent), matching the
+      // backend's list ordering so the row jumps to its new position immediately.
+      set((s) => {
+        const list = (s.threadsByWs[workspaceId] ?? EMPTY_THREADS).map((t) =>
+          t.id === threadId ? { ...t, pinned } : t,
+        );
+        const sorted = [...list].sort((a, b) => {
+          if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+          return (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "");
+        });
+        return { threadsByWs: { ...s.threadsByWs, [workspaceId]: sorted } };
+      });
     },
 
     deleteThread: async (workspaceId, threadId) => {

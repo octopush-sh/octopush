@@ -210,6 +210,7 @@ export interface ChatThread {
   title: string;
   createdAt: string;
   updatedAt: string;
+  pinned?: boolean;
 }
 
 export interface SkillMeta {

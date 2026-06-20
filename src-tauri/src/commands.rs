@@ -973,6 +973,16 @@ pub async fn rename_chat_thread(
     state.db.lock().rename_chat_thread(&thread_id, &title)
 }
 
+/// Pin/unpin a conversation — pinned threads sort to the top of the chat list.
+#[tauri::command]
+pub async fn set_thread_pinned(
+    state: State<'_, AppState>,
+    thread_id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    state.db.lock().set_thread_pinned(&thread_id, pinned)
+}
+
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the

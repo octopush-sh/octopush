@@ -39,6 +39,7 @@ interface HistoryProps {
   onDeleteChat?: (id: string) => void;
   onRenameChat?: (id: string, title: string) => void;
   onExportChat?: (id: string) => void;
+  onPinChat?: (id: string, pinned: boolean) => void;
   streamingChatId?: string | null;
 }
 

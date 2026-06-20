@@ -451,6 +451,29 @@ mod workspace_tests {
     }
 
     #[test]
+    fn pinned_threads_sort_to_the_top() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let a = db.create_chat_thread("ws", "A").unwrap();
+        let _b = db.create_chat_thread("ws", "B").unwrap();
+        let c = db.create_chat_thread("ws", "C").unwrap();
+        // Nothing pinned initially.
+        assert!(db.list_chat_threads("ws").unwrap().iter().all(|t| !t.pinned));
+
+        // Pin the oldest → it jumps to the top.
+        db.set_thread_pinned(&a.id, true).unwrap();
+        let list = db.list_chat_threads("ws").unwrap();
+        assert_eq!(list[0].id, a.id);
+        assert!(list[0].pinned);
+        assert_eq!(list[1].id, c.id); // remaining stay newest-first
+
+        // Unpin → back to pure recency (newest C first).
+        db.set_thread_pinned(&a.id, false).unwrap();
+        assert_eq!(db.list_chat_threads("ws").unwrap()[0].id, c.id);
+    }
+
+    #[test]
     fn truncate_chat_after_removes_message_and_everything_following() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();

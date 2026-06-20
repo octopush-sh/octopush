@@ -1,10 +1,11 @@
 import { useMemo, useRef, useState } from "react";
-import { Plus, X, Pencil, Check, Search, Download } from "lucide-react";
+import { Plus, X, Pencil, Check, Search, Download, Pin, PinOff } from "lucide-react";
 
 export interface CompanionHistoryChat {
   id: string;
   title: string;
   meta: string;
+  pinned?: boolean;
 }
 
 interface Props {
@@ -16,6 +17,8 @@ interface Props {
   onRenameChat?: (id: string, title: string) => void;
   /** Export a conversation (e.g. copy as Markdown). */
   onExportChat?: (id: string) => void;
+  /** Pin/unpin a conversation to the top of the list. */
+  onPinChat?: (id: string, pinned: boolean) => void;
   /** The thread (if any) with an in-flight turn — shows a live pulse dot. */
   streamingChatId?: string | null;
 }
@@ -28,6 +31,7 @@ export function CompanionHistory({
   onDeleteChat,
   onRenameChat,
   onExportChat,
+  onPinChat,
   streamingChatId,
 }: Props) {
   // Roving keyboard nav: ↑/↓ move focus between row buttons (M11).
@@ -159,6 +163,9 @@ export function CompanionHistory({
                         style={{ background: "var(--color-octo-brass)" }}
                       />
                     )}
+                    {!live && c.pinned && (
+                      <Pin size={10} className="shrink-0 text-octo-brass" aria-label="Pinned" />
+                    )}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-serif text-[12px] leading-tight text-octo-ivory">
                         {c.title}
@@ -200,6 +207,22 @@ export function CompanionHistory({
                   </span>
                 ) : !editing ? (
                   <span className="flex shrink-0 items-center opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+                    {onPinChat && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onPinChat(c.id, !c.pinned);
+                        }}
+                        title={c.pinned ? "Unpin conversation" : "Pin conversation"}
+                        aria-label={c.pinned ? "Unpin conversation" : "Pin conversation"}
+                        className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                          c.pinned ? "text-octo-brass" : "text-octo-mute"
+                        }`}
+                      >
+                        {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
+                      </button>
+                    )}
                     {onRenameChat && (
                       <button
                         type="button"

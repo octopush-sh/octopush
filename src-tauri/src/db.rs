@@ -490,6 +490,12 @@ impl Db {
             "#,
         )?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN thread_id TEXT")?;
+        // Pinned conversations sort to the top of the chat list. (Must run AFTER
+        // chat_threads is created above.)
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE chat_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -1303,14 +1309,25 @@ impl Db {
             title: title.to_string(),
             created_at: now.clone(),
             updated_at: now,
+            pinned: false,
         })
+    }
+
+    /// Pin/unpin a conversation — pinned threads sort to the top of the list.
+    pub fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_threads SET pinned = ?2 WHERE id = ?1",
+            params![thread_id, pinned as i64],
+        )?;
+        Ok(())
     }
 
     /// List a workspace's threads, most-recently-active first.
     pub fn list_chat_threads(&self, workspace_id: &str) -> AppResult<Vec<ChatThreadRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, title, created_at, updated_at
-             FROM chat_threads WHERE workspace_id = ?1 ORDER BY updated_at DESC",
+            "SELECT id, workspace_id, title, created_at, updated_at, pinned
+             FROM chat_threads WHERE workspace_id = ?1
+             ORDER BY pinned DESC, updated_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], |r| {
             Ok(ChatThreadRow {
@@ -1319,6 +1336,7 @@ impl Db {
                 title: r.get(2)?,
                 created_at: r.get(3)?,
                 updated_at: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2613,6 +2631,8 @@ pub struct ChatThreadRow {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
