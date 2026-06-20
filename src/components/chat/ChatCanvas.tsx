@@ -1,5 +1,5 @@
-import { useEffect, useRef, useMemo } from "react";
-import { AlertTriangle, Settings, Copy, Check } from "lucide-react";
+import { useEffect, useRef, useMemo, useState, useCallback } from "react";
+import { AlertTriangle, Settings, Copy, Check, ArrowDown } from "lucide-react";
 import { useChatStore, buildTimeline, type ConversationItem } from "../../stores/chatStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
@@ -47,6 +47,9 @@ export function ChatCanvas({
   const isBudgetError = error === BUDGET_CAP_MSG;
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  // True while the user is pinned near the bottom. Autoscroll only follows then,
+  // so reading back through history is never interrupted by a yank to the end.
+  const [atBottom, setAtBottom] = useState(true);
 
   // Compute the timeline locally with useMemo. Do NOT read it from a store
   // selector that builds a new array each call — that makes Zustand think the
@@ -62,19 +65,47 @@ export function ChatCanvas({
     loadHistory(workspaceId);
   }, [workspaceId, loadHistory]);
 
-  // Smooth autoscroll while streaming (stability doctrine S6).
-  useEffect(() => {
-    if (streaming) {
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setAtBottom(distance < 80);
+  }, []);
+
+  const scrollToBottom = useCallback((smooth: boolean) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const reduce =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (typeof el.scrollTo === "function") {
+      el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduce ? "smooth" : "auto" });
+    } else {
+      el.scrollTop = el.scrollHeight; // jsdom / older engines
     }
-  }, [streaming, streamBuffer]);
+  }, []);
+
+  // Follow streaming output, but only while the user is at the bottom — instant
+  // (not smooth) so the view stays glued to fast token output without lag.
+  useEffect(() => {
+    if (streaming && atBottom) scrollToBottom(false);
+  }, [streaming, streamBuffer, atBottom, scrollToBottom]);
+
+  // Glide to the bottom when a new turn lands, if the user is following along.
+  useEffect(() => {
+    if (atBottom) scrollToBottom(true);
+    // Only re-run when the conversation grows, not when atBottom toggles.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline.length]);
 
   const isEmpty = messages.length === 0 && !streaming && !error;
+  const showJump = !atBottom && !isEmpty;
 
   return (
+    <div className="relative flex min-h-0 flex-1 flex-col">
     <div
       ref={scrollRef}
+      onScroll={handleScroll}
       className="flex min-h-0 flex-1 flex-col overflow-y-auto px-8 py-6"
     >
       {isEmpty ? (
@@ -125,16 +156,30 @@ export function ChatCanvas({
           ))}
 
           {streaming && streamBuffer && (
-            <ChatMessage
-              message={{
-                role: "assistant",
-                content: streamBuffer + "▊",
-                model,
-                inputTokens: null,
-                outputTokens: null,
-              }}
-              onOpenInEditor={onOpenInEditor}
-            />
+            <div className="octo-fade-in">
+              <ChatMessage
+                message={{
+                  role: "assistant",
+                  content: streamBuffer + "▊",
+                  model,
+                  inputTokens: null,
+                  outputTokens: null,
+                }}
+                onOpenInEditor={onOpenInEditor}
+              />
+              {/* Explicit "this message is still being written" marker so a live
+                  turn is never mistaken for a finished one when the stream pauses. */}
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <span
+                  aria-hidden
+                  className="inline-block h-1 w-1 animate-pulse rounded-full"
+                  style={{ background: "var(--color-octo-brass)" }}
+                />
+                <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                  Generating
+                </span>
+              </div>
+            </div>
           )}
 
           {/* Only the bare "Thinking…" pulse when nothing else is live. */}
@@ -161,6 +206,19 @@ export function ChatCanvas({
             />
           ) : null}
         </div>
+      )}
+    </div>
+      {showJump && (
+        <button
+          type="button"
+          onClick={() => scrollToBottom(true)}
+          aria-label="Jump to latest"
+          title="Jump to latest"
+          className="octo-pop-in absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass"
+        >
+          <ArrowDown size={12} />
+          Latest
+        </button>
       )}
     </div>
   );
@@ -201,7 +259,7 @@ function EmptyState() {
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Talk
       </div>
-      <div className="font-serif text-[24px] leading-tight tracking-[-0.005em] text-octo-ivory">
+      <div className="font-serif text-[22px] leading-tight tracking-[-0.005em] text-octo-ivory">
         Begin a conversation.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">

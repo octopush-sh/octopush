@@ -140,6 +140,19 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("index.html")).toBeInTheDocument();
   });
 
+  it("marks a streaming partial with a 'Generating' indicator (distinct from a finished turn)", () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [] },
+      streamingByWs: { "ws-1": true },
+      streamBufferByWs: { "ws-1": "Working on it" },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    expect(screen.getByText(/Working on it/)).toBeInTheDocument();
+    expect(screen.getByText("Generating")).toBeInTheDocument();
+  });
+
   it("renders tools through the full event flow (user → tool → assistant → done)", async () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     // Let mount-time loadHistory resolve before emitting; its async set
