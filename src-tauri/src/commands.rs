@@ -888,6 +888,19 @@ pub async fn resize_shell(
     Ok(())
 }
 
+/// Most-recently-used `$`-direct commands for a workspace (recall palette / ↑).
+#[tauri::command]
+pub async fn list_shell_history(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    limit: Option<i64>,
+) -> AppResult<Vec<String>> {
+    state
+        .db
+        .lock()
+        .list_shell_history(&workspace_id, limit.unwrap_or(50))
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,

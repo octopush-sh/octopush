@@ -586,6 +586,12 @@ impl ChatEngine {
         app: AppHandle,
         request: ShellRequest,
     ) -> AppResult<crate::talk_shell::ShellResult> {
+        // Record the command for recall (best-effort; recency + use-count).
+        let _ = self
+            .db
+            .lock()
+            .record_shell_history(&request.workspace_id, &request.command);
+
         // Show the command as the user's turn straight away.
         self.insert_and_emit_message(
             &app,

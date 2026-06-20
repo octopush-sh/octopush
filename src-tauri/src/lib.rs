@@ -179,6 +179,7 @@ pub fn run() {
             commands::stop_shell_command,
             commands::send_shell_input,
             commands::resize_shell,
+            commands::list_shell_history,
             commands::list_chat_messages,
             commands::cancel_chat,
             commands::list_chat_threads,

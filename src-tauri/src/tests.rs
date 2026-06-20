@@ -451,6 +451,30 @@ mod workspace_tests {
     }
 
     #[test]
+    fn shell_history_recall_dedups_and_orders_by_recency() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        db.insert_workspace("ws2", "p", "ws2", "", "main", None, "", None).unwrap();
+
+        db.record_shell_history("ws", "npm test").unwrap();
+        db.record_shell_history("ws", "git status").unwrap();
+        db.record_shell_history("ws", "npm test").unwrap(); // repeat → bumps recency
+        db.record_shell_history("ws", "  ").unwrap(); // blank ignored
+        db.record_shell_history("ws2", "cargo build").unwrap(); // other workspace
+
+        let hist = db.list_shell_history("ws", 50).unwrap();
+        // Deduped (npm test once) and most-recent-first (npm test re-run last).
+        assert_eq!(hist, vec!["npm test".to_string(), "git status".to_string()]);
+
+        // Scoped per workspace.
+        assert_eq!(db.list_shell_history("ws2", 50).unwrap(), vec!["cargo build".to_string()]);
+
+        // Limit honored.
+        assert_eq!(db.list_shell_history("ws", 1).unwrap(), vec!["npm test".to_string()]);
+    }
+
+    #[test]
     fn insert_and_list_error_message() {
         let db = test_db();
         db.insert_project("proj-err", "Test Project", "/tmp/proj-err")
