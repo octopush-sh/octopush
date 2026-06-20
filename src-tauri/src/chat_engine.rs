@@ -194,6 +194,17 @@ pub struct ShellOutputEvent {
     pub chunk: String,
 }
 
+/// Emitted when the shared shell's cwd changes via the AGENT's run_command
+/// (the `$`-direct path updates the badge from its returned result instead).
+/// Keeps the composer's cwd badge accurate after the assistant `cd`s.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellCwdEvent {
+    pub thread_id: String,
+    pub cwd: String,
+    pub cwd_label: String,
+}
+
 /// Emitted when a live process exits — closes the pinned panel and updates cwd.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -641,6 +652,14 @@ impl ChatEngine {
         };
 
         use crate::talk_shell::{RunOutcome, ShellResult};
+        // Record for recall only when the command actually RAN (Done or promoted
+        // to Live) — not Busy / hard errors, which would pollute the palette.
+        let record_history = |this: &Self| {
+            let _ = this
+                .db
+                .lock()
+                .record_shell_history(&request.workspace_id, &request.command);
+        };
         match outcome {
             RunOutcome::Done(mut result) => {
                 self.resolve_shell_card(
@@ -650,6 +669,7 @@ impl ChatEngine {
                 // Compute the badge label once here (the single source) so the
                 // frontend renders it verbatim instead of re-deriving the rule.
                 result.cwd_label = relativize_cwd(&result.cwd, &request.workspace_path);
+                record_history(self);
                 Ok(result)
             }
             RunOutcome::Busy => {
@@ -675,6 +695,7 @@ impl ChatEngine {
                     call_id: call_id.clone(),
                     command: request.command.clone(),
                 });
+                record_history(self);
                 self.spawn_live_streamer(
                     app.clone(), request.clone(), call_id, tool_input, started, live,
                 );
@@ -961,9 +982,12 @@ impl ChatEngine {
                 "You are a helpful coding assistant working in the project at {}. \
                  You have tools to run commands, read/write files, and list directories. \
                  run_command executes in a persistent shell SHARED with the user — a \
-                 `cd` or env export (yours or theirs) carries over to later commands, so \
-                 you can rely on the working directory you've set. Use the tools to help \
-                 the user with their tasks. Be concise and take action rather than just \
+                 `cd` or env export (yours or theirs) carries over to later commands. It \
+                 is NON-interactive: don't run REPLs or commands that wait for stdin \
+                 (pass input via flags or a heredoc instead). read_file/write_file/\
+                 list_files paths are ALWAYS relative to the project root, regardless of \
+                 the shell's current directory — pass a path relative to the root. Use the \
+                 tools to help the user; be concise and take action rather than just \
                  explaining what to do.",
                 request.workspace_path
             )
@@ -1324,6 +1348,15 @@ impl ChatEngine {
                             // Record where it ran (absolute) so the card shows the
                             // cwd badge, matching `$`-direct.
                             run_command_cwd = r.cwd.clone();
+                            // Keep the composer's cwd badge accurate if the agent
+                            // `cd`'d the shared shell.
+                            if !r.cwd.is_empty() {
+                                let _ = app.emit("chat://shell-cwd", &ShellCwdEvent {
+                                    thread_id: request.thread_id.clone(),
+                                    cwd: r.cwd.clone(),
+                                    cwd_label: relativize_cwd(&r.cwd, &request.workspace_path),
+                                });
+                            }
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
                         // Shared shell unavailable (a live `$` process holds it, or

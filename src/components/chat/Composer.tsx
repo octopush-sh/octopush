@@ -20,6 +20,7 @@ import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
 import { SlashMenu } from "./SlashMenu";
+import { CommandHistoryPopover } from "./CommandHistoryPopover";
 import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
 import { parseShellCommand } from "../../lib/shellCommand";
@@ -51,6 +52,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const runShell = useChatStore((s) => s.runShell);
   const shellCwd = useChatStore((s) => s.getShellCwd(workspaceId));
   const shellCwdAbs = useChatStore((s) => s.getShellCwdAbs(workspaceId));
+  const shellHistory = useChatStore((s) => s.getShellHistory(workspaceId));
+  const loadShellHistory = useChatStore((s) => s.loadShellHistory);
   const stop = useChatStore((s) => s.stop);
   const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
   const setActiveSkill = useChatStore((s) => s.setActiveSkill);
@@ -126,6 +129,50 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setInput("");
     closeSlash();
     pendingCaretRef.current = 0;
+  }
+
+  // ── `$` command-recall palette ───────────────────────────────────────
+  const [cmdHistOpen, setCmdHistOpen] = useState(false);
+  const [cmdHistItems, setCmdHistItems] = useState<string[]>([]);
+  const [cmdHistIndex, setCmdHistIndex] = useState(0);
+  useEffect(() => {
+    void loadShellHistory(workspaceId);
+  }, [workspaceId, loadShellHistory]);
+
+  function closeCmdHist() {
+    setCmdHistOpen(false);
+    setCmdHistItems([]);
+    setCmdHistIndex(0);
+  }
+
+  /** In command mode (`$ …`), surface recent commands filtered by the partial
+   *  command typed so far. Empty `$`/`$ ` shows the full recent list. */
+  function refreshCmdHist(value: string) {
+    const m = /^\$\s*(.*)$/s.exec(value);
+    if (!m || m[1].includes("\n")) {
+      closeCmdHist();
+      return;
+    }
+    const q = m[1].trim().toLowerCase();
+    const items = (q ? shellHistory.filter((c) => c.toLowerCase().includes(q)) : shellHistory)
+      // Don't offer the exact thing already typed.
+      .filter((c) => c.toLowerCase() !== q)
+      .slice(0, 8);
+    if (items.length === 0) {
+      closeCmdHist();
+      return;
+    }
+    setCmdHistOpen(true);
+    setCmdHistItems(items);
+    setCmdHistIndex(0);
+  }
+
+  function selectCommand(command: string) {
+    const next = `$ ${command}`;
+    setInput(next);
+    closeCmdHist();
+    pendingCaretRef.current = next.length;
+    textareaRef.current?.focus();
   }
   // Caret to apply after a mention insertion re-renders the textarea.
   const pendingCaretRef = useRef<number | null>(null);
@@ -276,6 +323,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     historyIdxRef.current = -1; // any manual edit exits history navigation
     refreshMention(val, e.target.selectionStart ?? val.length);
     refreshSlash(val);
+    refreshCmdHist(val);
     const ta = e.target;
     ta.style.height = "auto";
     const lineHeight = 20;
@@ -293,6 +341,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     historyIdxRef.current = -1;
     closeMention();
     closeSlash();
+    closeCmdHist();
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     // Prepend to history, de-duplicating only consecutive duplicates. History
     // keeps the user's literal text (with @mentions / `$`), not the expansion.
@@ -348,6 +397,30 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }, [streaming, send, runShell, workspaceId, workspacePath]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // ── `$` command-recall palette takes precedence while open ──
+    if (cmdHistOpen && cmdHistItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setCmdHistIndex((i) => (i + 1) % cmdHistItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setCmdHistIndex((i) => (i - 1 + cmdHistItems.length) % cmdHistItems.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        selectCommand(cmdHistItems[cmdHistIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeCmdHist();
+        return;
+      }
+    }
+
     // ── Slash (skill) menu takes precedence while open ──
     if (slashOpen && slashItems.length > 0) {
       if (e.key === "ArrowDown") {
@@ -471,6 +544,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             onHover={setSlashIndex}
           />
         )}
+        {cmdHistOpen && (
+          <CommandHistoryPopover
+            items={cmdHistItems}
+            activeIndex={cmdHistIndex}
+            onSelect={selectCommand}
+            onHover={setCmdHistIndex}
+          />
+        )}
         {/* Active skill chip — the turn runs under this skill until cleared. */}
         {activeSkill && (
           <div className="flex items-center gap-1.5 px-4 pt-2.5">
@@ -509,7 +590,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             // blur), then dismiss on a genuine focus loss. Tracked so it can be
             // cleared on unmount.
             if (blurTimerRef.current) clearTimeout(blurTimerRef.current);
-            blurTimerRef.current = setTimeout(closeMention, 120);
+            blurTimerRef.current = setTimeout(() => {
+              closeMention();
+              closeCmdHist();
+            }, 120);
           }}
           disabled={streaming}
           placeholder="Ask anything…   @ file · / skill · $ run a command"

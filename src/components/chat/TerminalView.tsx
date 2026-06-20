@@ -52,7 +52,10 @@ export function TerminalView({ callId, threadId, className }: Props) {
     writtenRef.current = 0;
 
     // Forward keystrokes to the live process's stdin (REPLs / TUIs / prompts).
+    // Guard against the brief window after the process exits but before the panel
+    // unmounts: don't inject stray keys into the now-idle shell prompt.
     const onData = term.onData((data) => {
+      if (!useChatStore.getState().liveProcessByThread[threadIdRef.current]) return;
       void ipc.sendShellInput(threadIdRef.current, data).catch(() => {});
     });
 

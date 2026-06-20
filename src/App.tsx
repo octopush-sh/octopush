@@ -120,13 +120,20 @@ function App() {
       Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
     ),
   );
+  // Workspaces with a live `$`-direct process (promoted long command) — these
+  // clear streamingByWs the moment they promote, so the rail would otherwise
+  // show idle while a dev server / build streams in the pinned terminal.
+  const shellLiveIds = useChatStore(
+    useShallow((s) => [...new Set(Object.values(s.liveProcessByThread).map((p) => p.workspaceId))]),
+  );
   const runningByWs = useMemo(() => {
     const out: Record<string, boolean> = {};
     for (const id of chatRunningIds) out[id] = true;
     for (const id of directRunningIds) out[id] = true;
     for (const id of terminalBusyIds) out[id] = true;
+    for (const id of shellLiveIds) out[id] = true;
     return out;
-  }, [chatRunningIds, directRunningIds, terminalBusyIds]);
+  }, [chatRunningIds, directRunningIds, terminalBusyIds, shellLiveIds]);
 
   const [appView, setAppView] = useState<AppView>("project");
 

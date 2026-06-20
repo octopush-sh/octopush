@@ -439,6 +439,9 @@ export const ipc = {
   /** Resize a thread's PTY so a full-screen TUI fits the live panel. */
   resizeShell: (threadId: string, rows: number, cols: number) =>
     invoke<void>("resize_shell", { threadId, rows, cols }),
+  /** Most-recently-used `$`-direct commands for a workspace (recall palette). */
+  listShellHistory: (workspaceId: string, limit?: number) =>
+    invoke<string[]>("list_shell_history", { workspaceId, limit }),
 
   // ─── Chat threads (conversations) ────────────────────────────────
   listChatThreads: (workspaceId: string) =>

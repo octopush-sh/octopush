@@ -24,7 +24,7 @@ use crate::pty_client::{DaemonClient, TermEvent};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -229,11 +229,14 @@ impl TalkShell {
                     timeout.as_secs()
                 );
                 let partial = strip_octo_markers(&clean_output(&raw), &nonce);
-                let body = if partial.is_empty() { note.clone() } else { format!("{partial}\n{note}") };
                 let _ = client.write(&id, b"\x03");
                 match probe(&rx, Duration::from_secs(3), &nonce) {
-                    Probe::Done { cwd: new_cwd, .. } => {
+                    // The interrupt landed and the shell returned to its prompt —
+                    // env/cwd preserved. Include any output the command emitted
+                    // during the post-interrupt window (cleanup / SIGINT handler).
+                    Probe::Done { output: tail, cwd: new_cwd, .. } => {
                         let final_cwd = if new_cwd.is_empty() { cwd } else { new_cwd };
+                        let body = join_nonempty(&[&partial, &tail, &note]);
                         let mut session = handle.lock();
                         session.rx = Some(rx);
                         session.cwd = final_cwd.clone();
@@ -246,7 +249,10 @@ impl TalkShell {
                             live: false,
                         }))
                     }
+                    // The command ignored SIGINT and never returned to a prompt —
+                    // recycle as a last resort (this DOES lose the shell's env/cwd).
                     _ => {
+                        let body = join_nonempty(&[&partial, &note]);
                         let _ = client.remove(&id);
                         match Self::ensure_session(&client, thread_id, &cwd) {
                             Ok(fresh) => *handle.lock() = fresh,
@@ -453,15 +459,16 @@ enum Probe {
     Dead { output: String },
 }
 
-/// Discard any bytes currently buffered on the receiver (the idle prompt) so the
-/// next prompt marker is unambiguously the next command's completion.
+/// Discard the idle prompt (and any in-flight bytes) so the next prompt marker
+/// is unambiguously the NEXT command's completion. Drains until the channel is
+/// quiet for a short window rather than snapshotting it with try_recv — the idle
+/// prompt arrives asynchronously and a bare try_recv loop races it, which would
+/// make `probe` match the stale idle marker as this command's completion.
 fn drain_pending(rx: &Receiver<TermEvent>) {
-    loop {
-        match rx.try_recv() {
-            Ok(_) => {}
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-        }
-    }
+    // First clear whatever is already buffered.
+    while rx.try_recv().is_ok() {}
+    // Then wait briefly for a late idle prompt; stop once the channel goes quiet.
+    while rx.recv_timeout(Duration::from_millis(40)).is_ok() {}
 }
 
 /// Drain until the prompt marker (command done) or `timeout`, accumulating raw
@@ -576,18 +583,26 @@ fn init_and_wait_ready(
     nonce: &str,
 ) -> AppResult<Option<String>> {
     // Leading newline flushes any partial line a reattached shell left behind.
-    // `$__OCTORS` (a runtime-built RS byte) keeps the raw marker out of the
-    // (echoable) PS1 source; PROMPT_COMMAND captures the last exit code, and PS1
-    // prints the marker each time bash returns to its prompt.
+    //
+    // Completion marker design:
+    // - `$__OCTORS` is a runtime-built RS byte, so the raw marker bytes never
+    //   appear in (echoable) shell source.
+    // - PS1 is `$(__octo_ps)` — a command substitution evaluated at prompt time.
+    //   So `echo "$PS1"` / `set` / `declare` reproduce only the literal
+    //   `$(__octo_ps)`, NOT the marker (a command printing the env can't forge a
+    //   false completion).
+    // - PROMPT_COMMAND re-asserts PS1 each prompt, so a command that overwrites
+    //   PS1 (venv/conda activate, a sourced script) can't break detection.
     let mut init = String::new();
     init.push('\n');
     init.push_str("stty -echo 2>/dev/null; PS2=''\n");
     init.push_str("__OCTORS=$(printf '\\036')\n");
-    // Re-assert PS1 from PROMPT_COMMAND each prompt, so a command that overwrites
-    // PS1 (a venv/conda activate, a sourced script) can't break marker detection.
     init.push_str(&format!(
-        "PROMPT_COMMAND='__octo_oc=$?; PS1=\"${{__OCTORS}}${{__OCTORS}}OCTO_DONE_{nonce}:${{__octo_oc}}:${{PWD}}${{__OCTORS}}${{__OCTORS}}\"'\n"
+        "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$__octo_oc\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
     ));
+    init.push_str("__octo_setps() { PS1='$(__octo_ps)'; }\n");
+    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; __octo_setps'\n");
+    init.push_str("__octo_setps\n");
     client.write(id, init.as_bytes())?;
 
     let re = done_re(nonce);
@@ -634,6 +649,16 @@ fn clean_output(s: &str) -> String {
 /// RS bytes our marker uses, so a stray RS never reaches xterm.
 fn clean_inline(s: &str) -> String {
     s.replace('\u{1e}', "")
+}
+
+/// Join the non-empty parts with newlines (for assembling partial + tail + note).
+fn join_nonempty(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Remove leftover prompt-marker noise (RS bytes / a partial marker for THIS

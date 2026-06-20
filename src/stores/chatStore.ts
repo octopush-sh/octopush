@@ -143,6 +143,7 @@ const EMPTY_TIMELINE: ConversationItem[] = [];
 const EMPTY_LIVE_TOOLS: LiveTool[] = [];
 const EMPTY_THREADS: ChatThread[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];
+const EMPTY_HISTORY: string[] = [];
 
 /** Whether an event for `threadId` should apply to the workspace's currently
  *  shown thread. Lenient: when no active thread is recorded yet (e.g. tests) or
@@ -196,6 +197,9 @@ interface ChatState {
   liveProcessByThread: Record<string, LiveProcess>;
   /** Buffered output for each live process, keyed by callId. */
   liveOutputByCallId: Record<string, LiveOutput>;
+  /** Recent `$`-direct commands per workspace (newest first) — the recall
+   *  palette + `$ `↑ history. Persisted backend-side; cached here. */
+  shellHistoryByWs: Record<string, string[]>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -221,6 +225,8 @@ interface ChatState {
   getLiveProcess: (workspaceId: string) => LiveProcess | null;
   /** Buffered output for a live process (by callId) — for the pinned terminal. */
   getLiveOutput: (callId: string) => LiveOutput | null;
+  /** Recent `$`-direct commands for a workspace (newest first). */
+  getShellHistory: (workspaceId: string) => string[];
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -239,6 +245,8 @@ interface ChatState {
   ) => Promise<void>;
   /** SIGINT (Ctrl-C) the active thread's live `$`-direct process. */
   stopShellProcess: (workspaceId: string) => void;
+  /** Load the workspace's recent `$`-command history into the cache. */
+  loadShellHistory: (workspaceId: string) => Promise<void>;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
   setActiveSkill: (workspaceId: string, skill: string | null) => void;
@@ -485,6 +493,21 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
   );
 
+  // ── chat://shell-cwd ──────────────────────────────────────────
+  // The agent's run_command moved the shared shell's cwd — update the badge so
+  // it stays accurate (the `$`-direct path updates from its result instead).
+  listen<{ threadId: string; cwd: string; cwdLabel: string }>(
+    "chat://shell-cwd",
+    (ev) => {
+      const p = ev.payload;
+      if (!p.threadId) return;
+      set((s) => ({
+        shellCwdByThread: { ...s.shellCwdByThread, [p.threadId]: p.cwdLabel ?? "" },
+        shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [p.threadId]: p.cwd ?? "" },
+      }));
+    },
+  );
+
   // ── chat://shell-exit ─────────────────────────────────────────
   // The live process exited — close the pinned terminal and update the cwd.
   listen<{
@@ -526,6 +549,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     shellCwdAbsByThread: {},
     liveProcessByThread: {},
     liveOutputByCallId: {},
+    shellHistoryByWs: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -551,6 +575,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       return threadId ? get().liveProcessByThread[threadId] ?? null : null;
     },
     getLiveOutput: (callId) => get().liveOutputByCallId[callId] ?? null,
+    getShellHistory: (workspaceId) => get().shellHistoryByWs[workspaceId] ?? EMPTY_HISTORY,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -717,6 +742,8 @@ export const useChatStore = create<ChatState>((set, get) => {
             shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [threadId]: result.cwd },
           }));
         }
+        // Refresh the recall history so the just-run command surfaces.
+        void get().loadShellHistory(workspaceId);
       } catch (e) {
         set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
       } finally {
@@ -736,6 +763,15 @@ export const useChatStore = create<ChatState>((set, get) => {
     stopShellProcess: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (threadId) void ipc.stopShellCommand(threadId).catch(() => {});
+    },
+
+    loadShellHistory: async (workspaceId) => {
+      try {
+        const items = await ipc.listShellHistory(workspaceId, 50);
+        set((s) => ({ shellHistoryByWs: { ...s.shellHistoryByWs, [workspaceId]: items } }));
+      } catch {
+        /* history is a convenience — ignore load failures */
+      }
     },
 
     setModel: (model) => set({ model }),

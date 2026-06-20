@@ -260,6 +260,17 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_run_events_run
                 ON run_events(run_id, id);
+
+            CREATE TABLE IF NOT EXISTS shell_history (
+                workspace_id  TEXT NOT NULL,
+                command       TEXT NOT NULL,
+                used_at       TEXT NOT NULL,
+                uses          INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (workspace_id, command),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_shell_history_ws
+                ON shell_history(workspace_id, used_at DESC);
             "#,
         )?;
         // Phase 2 — workspace customization columns (glyph + tint).
@@ -1327,6 +1338,36 @@ impl Db {
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
         Ok(())
+    }
+
+    /// Record a `$`-direct command in the workspace's recall history (upsert:
+    /// bumps recency + use-count for a repeated command). Best-effort.
+    pub fn record_shell_history(&self, workspace_id: &str, command: &str) -> AppResult<()> {
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        self.conn.execute(
+            "INSERT INTO shell_history (workspace_id, command, used_at, uses)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(workspace_id, command)
+             DO UPDATE SET used_at = excluded.used_at, uses = uses + 1",
+            params![workspace_id, cmd, now],
+        )?;
+        Ok(())
+    }
+
+    /// Most-recently-used `$`-direct commands for a workspace (newest first).
+    pub fn list_shell_history(&self, workspace_id: &str, limit: i64) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT command FROM shell_history WHERE workspace_id = ?1
+             ORDER BY used_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![workspace_id, limit], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Whether a chat thread still exists — used to avoid persisting a late
