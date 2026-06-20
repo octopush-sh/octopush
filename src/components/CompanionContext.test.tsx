@@ -68,6 +68,11 @@ describe("CompanionContext spending block", () => {
     expect(screen.getByText("linear")).toBeTruthy();
   });
 
+  it("renders a 1M context window as 1M, not 1000k", () => {
+    render(<CompanionContext {...baseProps} tokensUsed={250_000} tokensLimit={1_000_000} />);
+    expect(screen.getByText("250k / 1M")).toBeTruthy();
+  });
+
   it("omits Capabilities when there is no skill and no MCP server", () => {
     render(<CompanionContext {...baseProps} />);
     expect(screen.queryByText("Capabilities")).toBeNull();
