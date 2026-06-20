@@ -68,6 +68,10 @@ const SAGE = "#95897a";
 const MUTE = "#6d6354";
 const ONYX = "#0c0a08";
 const HAIRLINE = "#2a2419";
+// Same load-bearing-inline rationale as the colors above: the mono stack must be
+// inline here (react-markdown cascade leak), but it lives in ONE const so the
+// new output controls don't scatter another copy of the literal.
+const MONO = "'JetBrains Mono', 'SF Mono', monospace";
 
 // Tool card has a FULL hairline-brass border (not just left), a slightly
 // more opaque brass-tinted background, and a subtle inset highlight so it
@@ -377,7 +381,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
                 borderRadius: 4,
                 background: ONYX,
                 padding: "10px 12px",
-                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                fontFamily: MONO,
                 fontSize: 11,
                 lineHeight: 1.55,
                 color: IVORY,
@@ -415,7 +419,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
                 border: "none",
                 color: BRASS,
                 cursor: "pointer",
-                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                fontFamily: MONO,
                 fontSize: 9,
                 letterSpacing: "0.2em",
                 textTransform: "uppercase",

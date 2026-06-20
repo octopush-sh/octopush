@@ -125,9 +125,19 @@ fn dangerous_command(command: &str) -> Option<&'static str> {
             return Some("recursive force delete (rm)");
         }
     }
-    // git push --force / -f (rewrites remote history). --force-with-lease too.
-    if has_tok("push") && (has("--force") || short('f')) {
-        return Some("force-push rewrites remote history");
+    // git push --force / -f / --force-with-lease (rewrites remote history). The
+    // force flag must appear AFTER the `push` token, so an unrelated `-f` earlier
+    // in the line (`grep -f x && git push`, `tar -xf a && git push`) doesn't trip
+    // a spurious approval on a benign push.
+    if let Some(pi) = tokens.iter().position(|t| *t == "push") {
+        let forced = tokens[pi + 1..].iter().any(|t| {
+            *t == "--force"
+                || *t == "--force-with-lease"
+                || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+        });
+        if forced {
+            return Some("force-push rewrites remote history");
+        }
     }
     // Regex rules — avoid the `> /dev/null` and `| shuf` false positives by
     // matching a shell/disk target as a whole word.
@@ -1870,6 +1880,11 @@ mod tests {
         assert!(dangerous_command("make 2>&1 > /dev/null").is_none()); // [6]
         assert!(dangerous_command("cat names | shuf | head").is_none()); // [6]
         assert!(dangerous_command("git push origin feature").is_none()); // non-force
+        // A `-f` belonging to ANOTHER command must not flag a benign push.
+        assert!(dangerous_command("grep -f patterns.txt && git push").is_none());
+        assert!(dangerous_command("tar -xf a.tar && git push origin main").is_none());
+        // But a real force-push after `push` is still caught.
+        assert!(dangerous_command("git push origin main -f").is_some());
     }
 
     #[test]

@@ -4,6 +4,7 @@ import { useChatStore, buildTimeline, type ConversationItem } from "../../stores
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { BrassRule } from "../BrassRule";
+import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
@@ -75,11 +76,9 @@ export function ChatCanvas({
   const scrollToBottom = useCallback((smooth: boolean) => {
     const el = scrollRef.current;
     if (!el) return;
-    const reduce =
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const animate = smooth && !prefersReducedMotion();
     if (typeof el.scrollTo === "function") {
-      el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduce ? "smooth" : "auto" });
+      el.scrollTo({ top: el.scrollHeight, behavior: animate ? "smooth" : "auto" });
     } else {
       el.scrollTop = el.scrollHeight; // jsdom / older engines
     }
