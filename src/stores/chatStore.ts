@@ -696,10 +696,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
     getLiveOutput: (callId) => get().liveOutputByCallId[callId] ?? null,
     getShellHistory: (workspaceId) => get().shellHistoryByWs[workspaceId] ?? EMPTY_HISTORY,
-    // Return the stored slice directly (stable ref → no spurious re-renders on
-    // unrelated store mutations). Approvals are surfaced workspace-wide rather
-    // than hidden behind a thread switch — a pending destructive command is a
-    // safety prompt the user must see even after navigating away.
+    // Returns the workspace's pending approvals as a STABLE slice ref (no new
+    // array per call → no spurious re-renders). The consumer (ChatCanvas) scopes
+    // these to the on-screen thread at render time — approving a command you
+    // can't see would be unsafe. (Surfacing a "thread N needs approval" signal in
+    // the chat list for a backgrounded thread is a separate, future affordance.)
     getPendingApprovals: (workspaceId) =>
       get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS,
 
@@ -824,6 +825,12 @@ export const useChatStore = create<ChatState>((set, get) => {
             ? { ...s.attachmentsByWs, [workspaceId]: attachments }
             : s.attachmentsByWs,
         }));
+        // Resync the visible conversation with the DB. Critical after a
+        // regenerate/editAndResend whose truncate committed but whose dispatch
+        // then failed — without this the UI keeps the optimistically-removed rows
+        // out of view while diverging from what's persisted. (For a plain send
+        // failure this is a harmless reload of the same rows.)
+        void get().loadHistory(workspaceId);
       }
     },
 

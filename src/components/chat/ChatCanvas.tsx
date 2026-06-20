@@ -138,7 +138,7 @@ export function ChatCanvas({
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="flex min-h-0 flex-1 flex-col overflow-y-auto px-8 py-6"
+      className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 py-6"
     >
       {isEmpty ? (
         <EmptyState />

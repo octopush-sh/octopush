@@ -17,6 +17,7 @@ export function CommandHistoryPopover({ items, activeIndex, onSelect, onHover }:
     <div
       className="octo-pop-in absolute bottom-full left-0 z-20 mb-1.5 max-h-64 w-[min(36rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg"
       role="listbox"
+      id="cmdhist-popover"
       aria-label="Recent commands"
     >
       <div className="px-3 py-1 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
@@ -27,6 +28,7 @@ export function CommandHistoryPopover({ items, activeIndex, onSelect, onHover }:
         return (
           <button
             key={command}
+            id={`cmdhist-opt-${i}`}
             type="button"
             role="option"
             aria-selected={active}
