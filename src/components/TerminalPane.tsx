@@ -22,6 +22,11 @@ const ZOOM_MIN = 8;
 const ZOOM_MAX = 28;
 const ZOOM_DEFAULT = 13;
 
+// How long a foreground "idle" lingers before the rail bar stops marching, so a
+// brief mid-task quiet gap doesn't flicker it off. A re-busy within the window
+// cancels the pending idle.
+const BUSY_OFF_LINGER_MS = 1500;
+
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
   terminalId: string;
@@ -89,6 +94,8 @@ export function TerminalPane({
   // The PTY session id — for TerminalPane this is always equal to `terminalId`
   // because we use the DB terminal record id as the PTY id end-to-end.
   const ptySessionIdRef = useRef<string | null>(null);
+  // Pending "stop marching" timer for the rail processing bar (linger debounce).
+  const busyOffTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
   const onExitRef = useRef(onExit);
@@ -333,13 +340,28 @@ export function TerminalPane({
     // Daemon-driven foreground state: a command started or stopped running in
     // this PTY. Feeds the rail's processing bar — updated regardless of whether
     // the pane is visible, so a background workspace's bar reflects its work.
+    //
+    // Busy=true applies immediately; busy=false lingers briefly so a short
+    // quiet gap mid-task (e.g. an agent waiting on its API between output
+    // bursts) doesn't flicker the bar off and back on — a re-busy within the
+    // window cancels the pending idle.
     let unlistenForeground: UnlistenFn | undefined;
     listen<PtyForegroundEvent>("pty://foreground", (ev) => {
       const ptyId = ptySessionIdRef.current;
       if (!ptyId || ev.payload.sessionId !== ptyId) return;
-      useTerminalsStore
-        .getState()
-        .setBusy(workspaceIdRef.current, ptyId, ev.payload.busy);
+      if (busyOffTimerRef.current) {
+        clearTimeout(busyOffTimerRef.current);
+        busyOffTimerRef.current = undefined;
+      }
+      const wsId = workspaceIdRef.current;
+      if (ev.payload.busy) {
+        useTerminalsStore.getState().setBusy(wsId, ptyId, true);
+      } else {
+        busyOffTimerRef.current = setTimeout(() => {
+          busyOffTimerRef.current = undefined;
+          useTerminalsStore.getState().setBusy(wsId, ptyId, false);
+        }, BUSY_OFF_LINGER_MS);
+      }
     }).then((u) => {
       unlistenForeground = u;
     });
@@ -454,6 +476,7 @@ export function TerminalPane({
       unlistenReattached?.();
       unlistenAttention?.();
       unlistenForeground?.();
+      if (busyOffTimerRef.current) clearTimeout(busyOffTimerRef.current);
       copyEl.removeEventListener("contextmenu", onContextMenu);
       copyEl.removeEventListener("wheel", onWheel);
       term.dispose();
