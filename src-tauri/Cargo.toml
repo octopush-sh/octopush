@@ -1,6 +1,6 @@
 [package]
 name = "octopush"
-version = "0.2.7"
+version = "0.2.8"
 description = "The IDE for Agentic Developers"
 authors = ["Octopush contributors"]
 edition = "2021"
