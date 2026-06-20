@@ -41,6 +41,7 @@ export function ChatCanvas({
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
+  const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
   const respondApproval = useChatStore((s) => s.respondApproval);
   const regenerate = useChatStore((s) => s.regenerate);
   const editAndResend = useChatStore((s) => s.editAndResend);
@@ -99,6 +100,17 @@ export function ChatCanvas({
     // Only re-run when the conversation grows, not when atBottom toggles.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeline.length]);
+
+  // Only surface approval cards for the conversation on screen — approving a
+  // destructive command you can't see (another thread) would be unsafe. The
+  // store keeps them workspace-wide (stable ref); we scope at render.
+  const approvalsForThread = useMemo(
+    () =>
+      activeThreadId
+        ? pendingApprovals.filter((a) => a.threadId === activeThreadId)
+        : pendingApprovals,
+    [pendingApprovals, activeThreadId],
+  );
 
   const isEmpty = messages.length === 0 && !streaming && !error;
   const showJump = !atBottom && !isEmpty;
@@ -162,7 +174,7 @@ export function ChatCanvas({
           ))}
 
           {/* Inline approval cards — the turn is paused on these. */}
-          {pendingApprovals.map((a) => (
+          {approvalsForThread.map((a) => (
             <ApprovalCard
               key={`approval-${a.callId}`}
               approval={a}

@@ -804,22 +804,32 @@ export const useChatStore = create<ChatState>((set, get) => {
     regenerate: async (workspaceId, workspacePath, assistantMessageId, systemPrompt) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (!threadId) return;
-      // Drop the assistant turn (and any trailing tool rows) locally + server-side,
-      // leaving the prompting user message as the tail of the history.
-      set((s) => ({
-        messagesByWs: {
-          ...s.messagesByWs,
-          [workspaceId]: (s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES).filter(
-            (m) => m.id < assistantMessageId,
-          ),
-        },
-      }));
+      const msgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+      const aIdx = msgs.findIndex((m) => m.id === assistantMessageId);
+      if (aIdx < 0) return;
+      // Truncate from the START of this assistant turn — the row right after the
+      // user message that prompted it — so the turn's TOOL rows go too. Cutting
+      // only at the assistant text id would leave orphaned tool rows that the
+      // backend re-injects, corrupting the regenerated turn's context.
+      let pu = aIdx - 1;
+      while (pu >= 0 && msgs[pu].role !== "user") pu--;
+      const truncateFromId = msgs[pu + 1]?.id ?? assistantMessageId;
+      // Await the DB delete BEFORE mutating local state, so a failed truncate
+      // never leaves the store inconsistent with what's persisted.
       try {
-        await ipc.truncateChatAfter(threadId, assistantMessageId);
+        await ipc.truncateChatAfter(threadId, truncateFromId);
       } catch (e) {
         set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
         return;
       }
+      set((s) => ({
+        messagesByWs: {
+          ...s.messagesByWs,
+          [workspaceId]: (s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES).filter(
+            (m) => m.id < truncateFromId,
+          ),
+        },
+      }));
       await get().runTurn(workspaceId, workspacePath, threadId, {
         userMessage: "",
         systemPrompt,
@@ -830,8 +840,15 @@ export const useChatStore = create<ChatState>((set, get) => {
     editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (!threadId || !newContent.trim()) return;
-      // Truncate from the edited message (it + everything after), then dispatch
-      // the new text as a fresh user turn.
+      // Truncate from the edited message (it + everything after) FIRST; only drop
+      // the rows locally once the DB delete succeeds (no optimistic-removal drift
+      // if the IPC fails). Then dispatch the new text as a fresh user turn.
+      try {
+        await ipc.truncateChatAfter(threadId, userMessageId);
+      } catch (e) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        return;
+      }
       set((s) => ({
         messagesByWs: {
           ...s.messagesByWs,
@@ -840,12 +857,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           ),
         },
       }));
-      try {
-        await ipc.truncateChatAfter(threadId, userMessageId);
-      } catch (e) {
-        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
-        return;
-      }
       await get().send(workspaceId, workspacePath, newContent, systemPrompt);
     },
 
@@ -977,12 +988,18 @@ export const useChatStore = create<ChatState>((set, get) => {
       // workspace's active thread (the one being shown).
       const threadId = get().activeThreadByWs[workspaceId];
       if (threadId) void ipc.cancelChat(threadId).catch(() => {});
-      // Retire any pending approval card immediately — the backend also resolves
-      // it as Deny on cancel, but clear here so Stop feels instant and a stale
-      // card can't be clicked to run a command on the cancelled turn.
-      if (get().pendingApprovalsByWs[workspaceId]?.length) {
+      // Retire the cancelled thread's pending approval card immediately — the
+      // backend also resolves it as Deny on cancel. Only this thread's cards are
+      // cleared (cancel() denies only this thread), so another thread's pending
+      // approval isn't wiped from the UI while its backend turn stays parked.
+      if (threadId && get().pendingApprovalsByWs[workspaceId]?.some((a) => a.threadId === threadId)) {
         set((s) => ({
-          pendingApprovalsByWs: { ...s.pendingApprovalsByWs, [workspaceId]: EMPTY_APPROVALS },
+          pendingApprovalsByWs: {
+            ...s.pendingApprovalsByWs,
+            [workspaceId]: (s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).filter(
+              (a) => a.threadId !== threadId,
+            ),
+          },
         }));
       }
     },

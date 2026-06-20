@@ -109,38 +109,41 @@ fn dangerous_command(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     let c = normalized.to_lowercase();
-    let tokens: Vec<&str> = c.split(' ').collect();
-    let has_tok = |t: &str| tokens.iter().any(|x| *x == t);
     let has = |n: &str| c.contains(n);
-    // All chars from short-flag groups (`-rf` → r,f) so combined flags in any
-    // order are caught. Long flags (`--force`) are matched separately.
-    let short_flag_chars: String = tokens
-        .iter()
-        .filter(|t| t.starts_with('-') && !t.starts_with("--"))
-        .flat_map(|t| t.chars())
-        .collect();
-    let short = |ch: char| short_flag_chars.contains(ch);
+    // Tokens for command-name detection ALSO split on shell separators, so a
+    // chained command with no surrounding spaces (`x;rm -rf`, `cmd|rm -rf`) still
+    // exposes `rm`/`push`/`clean` as its own token. (`c` keeps the separators so
+    // the fork-bomb literal below still matches.)
+    let token_src = c.replace([';', '|', '&', '(', ')'], " ");
+    let tokens: Vec<&str> = token_src.split_whitespace().collect();
+    // Does any short-flag token AFTER index `from` carry char `ch` (so `-rf`,
+    // `-fr`, `-f` all count), or is the long flag present?
+    let flag_after = |from: usize, ch: char, long: &str| {
+        tokens[from + 1..].iter().any(|t| {
+            *t == long || (t.starts_with('-') && !t.starts_with("--") && t.contains(ch))
+        })
+    };
 
-    // rm with BOTH recursive and force, in any flag spelling/order.
-    if has_tok("rm") || c.contains("; rm ") || c.contains("&& rm ") {
-        let recursive = short('r') || has("--recursive");
-        let force = short('f') || has("--force");
-        if recursive && force {
+    // rm with BOTH recursive and force (flags must follow the `rm` token, so an
+    // unrelated `grep -f … && rm file` isn't mis-flagged).
+    if let Some(ri) = tokens.iter().position(|t| *t == "rm") {
+        if flag_after(ri, 'r', "--recursive") && flag_after(ri, 'f', "--force") {
             return Some("recursive force delete (rm)");
         }
     }
-    // git push --force / -f / --force-with-lease (rewrites remote history). The
-    // force flag must appear AFTER the `push` token, so an unrelated `-f` earlier
-    // in the line (`grep -f x && git push`, `tar -xf a && git push`) doesn't trip
-    // a spurious approval on a benign push.
+    // git push --force / -f / --force-with-lease (rewrites remote history).
     if let Some(pi) = tokens.iter().position(|t| *t == "push") {
-        let forced = tokens[pi + 1..].iter().any(|t| {
-            *t == "--force"
-                || *t == "--force-with-lease"
-                || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
-        });
-        if forced {
+        if flag_after(pi, 'f', "--force")
+            || tokens[pi + 1..].iter().any(|t| *t == "--force-with-lease")
+        {
             return Some("force-push rewrites remote history");
+        }
+    }
+    // git clean with -f (any spelling: `-fd`, `-f -d`, `-ffd`) deletes untracked
+    // files; `-n` (dry run) has no `f` so it isn't flagged.
+    if let Some(ci) = tokens.iter().position(|t| *t == "clean") {
+        if flag_after(ci, 'f', "--force") {
+            return Some("deletes untracked files (git clean)");
         }
     }
     // Regex rules — avoid the `> /dev/null` and `| shuf` false positives by
@@ -150,15 +153,13 @@ fn dangerous_command(command: &str) -> Option<&'static str> {
             return Some(reason);
         }
     }
-    // Plain high-confidence substrings.
+    // Plain high-confidence substrings (matched on `c`, separators intact).
     const RULES: &[(&str, &str)] = &[
         ("sudo ", "runs with elevated privileges (sudo)"),
         ("mkfs", "formats a filesystem (mkfs)"),
         ("dd if=", "raw disk write (dd)"),
         (":(){:|:&};:", "fork bomb"),
         ("git reset --hard", "discards uncommitted changes (git reset --hard)"),
-        ("git clean -fd", "deletes untracked files (git clean)"),
-        ("git clean -df", "deletes untracked files (git clean)"),
         ("chmod -r", "recursive permission change (chmod -R)"),
         ("chown -r", "recursive ownership change (chown -R)"),
     ];
@@ -1893,6 +1894,16 @@ mod tests {
         assert!(dangerous_command("tar -xf a.tar && git push origin main").is_none());
         // But a real force-push after `push` is still caught.
         assert!(dangerous_command("git push origin main -f").is_some());
+        // Chained without a space around the separator still gates (review #4).
+        assert!(dangerous_command("echo hi;rm -rf build").is_some());
+        assert!(dangerous_command("true|rm -rf .").is_some());
+        // git clean with separate flags is caught (review #3); dry-run is not.
+        assert!(dangerous_command("git clean -f -d").is_some());
+        assert!(dangerous_command("git clean -ffd").is_some());
+        assert!(dangerous_command("git clean -n").is_none());
+        // An unrelated `-f`/`-r` before a benign rm/clean must NOT flag it.
+        assert!(dangerous_command("grep -f pats.txt && rm file.txt").is_none());
+        assert!(dangerous_command("grep -rf pats.txt && git clean -n").is_none());
     }
 
     #[test]

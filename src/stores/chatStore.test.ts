@@ -144,16 +144,20 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
     expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(1);
   });
 
-  it("stop() retires pending approvals immediately", () => {
+  it("stop() retires the active thread's pending approval, not other threads'", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
     emit("chat://approval-request", {
-      workspaceId: "ws-1",
-      threadId: "t1",
-      callId: "call-1",
-      command: "rm -rf x",
-      reason: "rm -rf",
+      workspaceId: "ws-1", threadId: "t1", callId: "call-1",
+      command: "rm -rf x", reason: "rm -rf",
+    });
+    // A pending approval on a DIFFERENT thread must survive Stop on the active one.
+    emit("chat://approval-request", {
+      workspaceId: "ws-1", threadId: "t2", callId: "call-2",
+      command: "git push --force", reason: "force-push",
     });
     useChatStore.getState().stop("ws-1");
-    expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(0);
+    const remaining = useChatStore.getState().getPendingApprovals("ws-1");
+    expect(remaining.map((a) => a.callId)).toEqual(["call-2"]);
   });
 
   it("scopes the live process to its thread", () => {
@@ -620,6 +624,41 @@ describe("chatStore — message actions (regenerate / edit-and-resend)", () => {
     expect(ipc.sendChatMessage).toHaveBeenCalledWith(
       expect.objectContaining({ regenerate: true, userMessage: "" }),
     );
+  });
+
+  it("regenerate truncates from the turn's first tool row, not the assistant text", async () => {
+    // A turn with tool calls: user(1) → tool(2) → assistant(3). Regenerating the
+    // assistant must drop the tool row too, or stale tool context leaks back in.
+    useChatStore.setState({
+      activeThreadByWs: { "ws-1": "t1" },
+      messagesByWs: {
+        "ws-1": [
+          { id: 1, workspaceId: "ws-1", role: "user", content: "go",
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:00Z" },
+          { id: 2, workspaceId: "ws-1", role: "tool", content: "{}",
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:01Z" },
+          { id: 3, workspaceId: "ws-1", role: "assistant", content: "done",
+            model: "claude-sonnet-4-6", inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:02Z" },
+        ],
+      },
+    });
+
+    await useChatStore.getState().regenerate("ws-1", "/tmp", 3);
+
+    // Truncates from the tool row (first row of the turn), keeping only the user.
+    expect(ipc.truncateChatAfter).toHaveBeenCalledWith("t1", 2);
+    expect(useChatStore.getState().getMessages("ws-1").map((m) => m.id)).toEqual([1]);
+  });
+
+  it("does not mutate the local store if the truncate IPC fails", async () => {
+    (ipc.truncateChatAfter as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("locked"));
+    await useChatStore.getState().regenerate("ws-1", "/tmp", 2);
+    // Messages are untouched (no optimistic removal) and the turn isn't dispatched.
+    expect(useChatStore.getState().getMessages("ws-1").map((m) => m.id)).toEqual([1, 2]);
+    expect(ipc.sendChatMessage).not.toHaveBeenCalled();
   });
 
   it("editAndResend truncates from the user message and resends the new text", async () => {
