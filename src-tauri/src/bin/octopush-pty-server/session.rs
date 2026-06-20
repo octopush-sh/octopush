@@ -121,6 +121,12 @@ pub struct Session {
 /// do most of the discriminating now.
 pub const OUTPUT_QUIET_MS: u64 = 2_000;
 
+/// A foreground child must have produced output within this window to count as
+/// "actively working" for the rail's processing bar. 2s comfortably spans
+/// Claude Code's ~1s spinner redraw and inter-token gaps, so the bar stays lit
+/// through a task and falls quiet ~2s after the agent parks at its prompt.
+pub const FG_BUSY_QUIET_MS: u64 = 2_000;
+
 /// Minimum bytes since the last attention emit. Filters out a
 /// freshly-spawned shell whose only output is the prompt itself.
 pub const MIN_BYTES_FOR_ATTENTION: u64 = 200;
@@ -467,19 +473,26 @@ impl Session {
         }
     }
 
-    /// Update the "a command is running" state from the current foreground
-    /// process group and return `Some(new_state)` when it FLIPS (else
-    /// `None`). Unlike `check_attention`, this is a plain ownership check
-    /// (`fg != shell`) with no latch, byte threshold, or grace window — so
-    /// the rail reflects activity the moment it starts or stops. An
-    /// indeterminate reading (no fg pgroup yet, or shell pid unknown) leaves
-    /// the state unchanged rather than flickering to idle.
+    /// Update the "actively working" state and return `Some(new_state)` when it
+    /// FLIPS (else `None`). The rail's processing bar should mean *a command is
+    /// doing something now*, so busy requires both:
+    ///   1. a non-shell child owns the PTY (`fg != shell`), and
+    ///   2. that child has produced output within [`FG_BUSY_QUIET_MS`].
     ///
-    /// The normal "command finished" clear comes from `fg` returning to the
-    /// shell pid on the next tick. The `!running` branch only keeps internal
-    /// state honest — by the time a session is dead its client has already
-    /// detached, so it emits nothing; the frontend clears `busy` off the
-    /// `pty://exit` event instead.
+    /// Condition 2 is what makes a long-running TUI like Claude Code behave:
+    /// while it works it streams a spinner + tokens + tool output (so output is
+    /// recent → busy), and when it parks at its prompt waiting for input the
+    /// stream falls quiet (→ idle), even though it's still the foreground
+    /// process the whole session. Process-group ownership alone would mark the
+    /// bar busy for the entire time such a TUI is open.
+    ///
+    /// No latch or grace window — unlike `check_attention`, this reads only
+    /// `fg`, `shell_pid`, and `last_data_at`, so it never perturbs attention. An
+    /// indeterminate fg reading leaves the state unchanged (no flicker).
+    ///
+    /// The `!running` branch only keeps internal state honest — by the time a
+    /// session is dead its client has already detached, so it emits nothing; the
+    /// frontend clears `busy` off the `pty://exit` event instead.
     pub fn check_foreground(&mut self, fg_pgroup: Option<i32>) -> Option<bool> {
         if !self.running {
             return self.set_fg_busy(false);
@@ -490,7 +503,9 @@ impl Session {
         if fg <= 0 {
             return None;
         }
-        self.set_fg_busy(fg != shell)
+        let child_fg = fg != shell;
+        let active = self.last_data_at.elapsed() < Duration::from_millis(FG_BUSY_QUIET_MS);
+        self.set_fg_busy(child_fg && active)
     }
 
     /// Set `fg_busy`, returning `Some(value)` only on a change.
@@ -614,24 +629,41 @@ mod tests {
         Session::new("attn-test".into(), "label".into(), "/tmp".into(), 0)
     }
 
-    /// `check_foreground` reports a busy transition only on a flip, with no
-    /// grace window or byte threshold (unlike attention).
+    /// Busy requires a non-shell child AND recent output; it flips only on a
+    /// change, and a foreground TUI that goes quiet (parks at its prompt) drops
+    /// to idle even though it still owns the PTY.
     #[test]
-    fn foreground_busy_flips_on_change_only() {
+    fn foreground_busy_requires_child_and_recent_output() {
         let mut sess = new_sess();
         sess.shell_pid = Some(100);
+        sess.last_data_at = Instant::now(); // fresh output
 
         // Shell at prompt → not busy; no change from the default false.
         assert_eq!(sess.check_foreground(Some(100)), None);
-        // A child takes the foreground → busy=true (a flip).
+        // A child with recent output → busy=true (a flip).
         assert_eq!(sess.check_foreground(Some(200)), Some(true));
-        // Still the child → no re-emit.
+        // Still the same active child → no re-emit.
         assert_eq!(sess.check_foreground(Some(200)), None);
-        // Shell regains control → busy=false (a flip).
+        // The child stays foreground but the stream goes quiet (parked at its
+        // prompt) → idle, even though it still owns the PTY.
+        sess.last_data_at = Instant::now() - Duration::from_millis(FG_BUSY_QUIET_MS + 500);
+        assert_eq!(sess.check_foreground(Some(200)), Some(false));
+        // Output resumes (next task) → busy again.
+        sess.last_data_at = Instant::now();
+        assert_eq!(sess.check_foreground(Some(200)), Some(true));
+        // Shell regains control → busy=false.
         assert_eq!(sess.check_foreground(Some(100)), Some(false));
         // An indeterminate reading (no fg pgroup) leaves state unchanged.
         assert_eq!(sess.check_foreground(None), None);
-        // No grace/threshold gating: busy fires immediately even mid-grace.
+    }
+
+    /// Independent of attention: busy tracks output even inside the attention
+    /// grace window (it never reads or writes attention state).
+    #[test]
+    fn foreground_busy_ignores_attention_grace() {
+        let mut sess = new_sess();
+        sess.shell_pid = Some(100);
+        sess.last_data_at = Instant::now();
         sess.attention_grace_until = Some(Instant::now() + Duration::from_secs(60));
         assert_eq!(sess.check_foreground(Some(200)), Some(true));
     }
@@ -641,6 +673,7 @@ mod tests {
     fn foreground_clears_when_not_running() {
         let mut sess = new_sess();
         sess.shell_pid = Some(100);
+        sess.last_data_at = Instant::now();
         assert_eq!(sess.check_foreground(Some(200)), Some(true));
         sess.running = false;
         assert_eq!(sess.check_foreground(Some(200)), Some(false));
