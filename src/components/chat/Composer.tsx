@@ -540,6 +540,19 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   // here we just render it (empty string ⇒ at root ⇒ no badge).
   const cwdLabel = shellCwd || null;
 
+  // Which composer popover (if any) owns the keyboard right now, and the id of
+  // its active option — wires the textarea's aria-activedescendant so screen
+  // readers announce the highlighted @file / skill / recent-command row.
+  const activePopover = mention ? "mention" : slashOpen ? "slash" : cmdHistOpen ? "cmdhist" : null;
+  const activeDescendant =
+    activePopover === "mention" && mentionItems.length
+      ? `mention-opt-${mentionIndex}`
+      : activePopover === "slash" && slashItems.length
+        ? `slash-opt-${slashIndex}`
+        : activePopover === "cmdhist" && cmdHistItems.length
+          ? `cmdhist-opt-${cmdHistIndex}`
+          : undefined;
+
   return (
     <div className="px-6 pb-4 pt-3">
       <div
@@ -604,6 +617,11 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         <textarea
           ref={textareaRef}
           value={input}
+          role="combobox"
+          aria-expanded={activePopover !== null}
+          aria-controls={activePopover ? `${activePopover}-popover` : undefined}
+          aria-activedescendant={activeDescendant}
+          aria-autocomplete="list"
           onChange={handleInput}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}

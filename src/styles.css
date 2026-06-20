@@ -390,6 +390,31 @@ button:not(:disabled),
   border-radius: 4px;
 }
 
+/* Tokenized scrollbar for app scroll regions (e.g. the TALK canvas) — replaces
+   the OS default so it reads in the Atelier palette. Thin, quiet track; a brass
+   thumb on hover. Apply via `octo-scroll`. */
+.octo-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-octo-hairline) transparent;
+}
+.octo-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.octo-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.octo-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-octo-hairline);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.octo-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--brass-dim);
+  background-clip: padding-box;
+}
+
 /* Make terminal text selectable */
 .xterm .xterm-screen {
   user-select: text;

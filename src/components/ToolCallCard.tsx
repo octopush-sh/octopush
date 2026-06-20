@@ -73,6 +73,17 @@ const HAIRLINE = "#2a2419";
 // new output controls don't scatter another copy of the literal.
 const MONO = "'JetBrains Mono', 'SF Mono', monospace";
 
+/** Keyboard activation for role="button" elements — Enter/Space fire the action,
+ *  matching native button behavior (a11y: these were no-op onKeyDown before). */
+function keyActivate(fn: () => void) {
+  return (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fn();
+    }
+  };
+}
+
 // Tool card has a FULL hairline-brass border (not just left), a slightly
 // more opaque brass-tinted background, and a subtle inset highlight so it
 // reads as a distinct surface against the onyx canvas. The previous
@@ -298,7 +309,9 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               e.stopPropagation();
               if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
             }}
-            onKeyDown={() => {}}
+            onKeyDown={keyActivate(() => {
+              if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
+            })}
             title="Reveal in Finder"
             style={{
               fontSize: 12,
@@ -324,7 +337,9 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
             onClick={() => {
               if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
             }}
-            onKeyDown={() => {}}
+            onKeyDown={keyActivate(() => {
+              if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
+            })}
             style={{
               fontFamily: "'Spectral', serif",
               
@@ -356,7 +371,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               role="button"
               tabIndex={0}
               onClick={() => copy(tool.result)}
-              onKeyDown={() => {}}
+              onKeyDown={keyActivate(() => copy(tool.result))}
               style={{
                 fontSize: 9,
                 fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
