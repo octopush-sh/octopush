@@ -38,6 +38,7 @@ interface HistoryProps {
   onNewChat: () => void;
   onDeleteChat?: (id: string) => void;
   onRenameChat?: (id: string, title: string) => void;
+  onExportChat?: (id: string) => void;
   streamingChatId?: string | null;
 }
 

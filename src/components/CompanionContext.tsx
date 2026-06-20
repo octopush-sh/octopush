@@ -267,6 +267,12 @@ function Row({
 }
 
 function formatThousands(n: number): string {
+  // Millions branch matters: the target model has a 1M context window, which
+  // must read "1M", not "1000k".
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
   if (n >= 1000) return `${Math.round(n / 1000)}k`;
   return String(n);
 }

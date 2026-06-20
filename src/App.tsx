@@ -61,6 +61,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
+import { conversationToMarkdown } from "./lib/exportConversation";
 import type { GitStatus, Pr, TintName, Issue, ProjectInfo } from "./lib/types";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
@@ -741,6 +742,25 @@ function App() {
     [activeWorkspaceId],
   );
 
+  const handleExportChat = useCallback(
+    (id: string) => {
+      void (async () => {
+        try {
+          const msgs = await ipc.listChatMessages(id);
+          const thread = useChatStore
+            .getState()
+            .getThreads(activeWorkspaceId ?? "")
+            .find((t) => t.id === id);
+          const md = conversationToMarkdown(thread?.title ?? "Conversation", msgs);
+          await copyToClipboard(md, "Conversation copied as Markdown");
+        } catch (e) {
+          console.error(e);
+        }
+      })();
+    },
+    [activeWorkspaceId],
+  );
+
   // ── Keyboard shortcuts (spec §3.6) ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1008,6 +1028,7 @@ function App() {
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
         onRenameChat: handleRenameChat,
+        onExportChat: handleExportChat,
         streamingChatId: streamingThreadId,
       };
     },
@@ -1018,6 +1039,7 @@ function App() {
       handleNewChat,
       handleDeleteChat,
       handleRenameChat,
+      handleExportChat,
       streamingThreadId,
       activeWsPrimaryMessages,
       tickerNow,

@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Plus, X, Pencil, Check, Search } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { Plus, X, Pencil, Check, Search, Download } from "lucide-react";
 
 export interface CompanionHistoryChat {
   id: string;
@@ -14,6 +14,8 @@ interface Props {
   onNewChat: () => void;
   onDeleteChat?: (id: string) => void;
   onRenameChat?: (id: string, title: string) => void;
+  /** Export a conversation (e.g. copy as Markdown). */
+  onExportChat?: (id: string) => void;
   /** The thread (if any) with an in-flight turn — shows a live pulse dot. */
   streamingChatId?: string | null;
 }
@@ -25,8 +27,22 @@ export function CompanionHistory({
   onNewChat,
   onDeleteChat,
   onRenameChat,
+  onExportChat,
   streamingChatId,
 }: Props) {
+  // Roving keyboard nav: ↑/↓ move focus between row buttons (M11).
+  const listRef = useRef<HTMLUListElement>(null);
+  function onRowKeyDown(e: React.KeyboardEvent) {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const rows = Array.from(
+      listRef.current?.querySelectorAll<HTMLButtonElement>("[data-row-select]") ?? [],
+    );
+    const i = rows.indexOf(document.activeElement as HTMLButtonElement);
+    if (i < 0) return;
+    e.preventDefault();
+    const next = e.key === "ArrowDown" ? i + 1 : i - 1;
+    rows[Math.max(0, Math.min(rows.length - 1, next))]?.focus();
+  }
   const [query, setQuery] = useState("");
   // Row-local transient states (one at a time): editing a title / confirming a
   // delete. Keyed by chat id so a re-render keeps the right row in its state.
@@ -82,7 +98,7 @@ export function CompanionHistory({
         </div>
       )}
 
-      <ul className="space-y-1 px-2 py-2">
+      <ul ref={listRef} onKeyDown={onRowKeyDown} className="space-y-1 px-2 py-2">
         {chats.length === 0 && (
           <li className="px-2 py-3 text-center">
             <div className="text-[11px] leading-relaxed text-octo-mute">No conversations yet.</div>
@@ -131,6 +147,7 @@ export function CompanionHistory({
                 ) : (
                   <button
                     type="button"
+                    data-row-select
                     onClick={() => onSelectChat(c.id)}
                     className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
@@ -192,6 +209,20 @@ export function CompanionHistory({
                         className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                       >
                         <Pencil size={12} />
+                      </button>
+                    )}
+                    {onExportChat && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onExportChat(c.id);
+                        }}
+                        title="Copy conversation as Markdown"
+                        aria-label="Export conversation"
+                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                      >
+                        <Download size={12} />
                       </button>
                     )}
                     {onDeleteChat && (

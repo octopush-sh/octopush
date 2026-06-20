@@ -68,6 +68,13 @@ describe("CompanionHistory — rendering & actions", () => {
     expect(props.onSelectChat).not.toHaveBeenCalled();
   });
 
+  it("exports a conversation via the export action", async () => {
+    const user = userEvent.setup();
+    const props = renderHistory({ onExportChat: vi.fn() });
+    await user.click(screen.getAllByRole("button", { name: "Export conversation" })[0]);
+    expect(props.onExportChat).toHaveBeenCalledWith("c1");
+  });
+
   it("renames a conversation via the rename action", async () => {
     const user = userEvent.setup();
     const props = renderHistory({ onRenameChat: vi.fn() });
