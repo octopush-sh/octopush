@@ -168,14 +168,14 @@ function makeMarkdownComponents(
   },
   table({ children }) {
     return (
-      <div className="my-3 overflow-x-auto rounded-md border border-octo-hairline">
+      <div className="my-3 max-h-[420px] overflow-auto rounded-md border border-octo-hairline">
         <table className="w-full text-[12px]">{children}</table>
       </div>
     );
   },
   th({ children }) {
     return (
-      <th className="border-b border-octo-hairline bg-octo-panel px-3 py-2 text-left font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
+      <th className="sticky top-0 z-[1] border-b border-octo-hairline bg-octo-panel px-3 py-2 text-left font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
         {children}
       </th>
     );

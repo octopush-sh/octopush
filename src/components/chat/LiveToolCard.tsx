@@ -80,8 +80,15 @@ export function LiveToolCard({ tool }: Props) {
       <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">
         {summary}
       </span>
-      {/* Fixed-width meta slot — never reflows the row as the timer ticks. */}
-      <span className="octo-tabular shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
+      {/* Fixed-width meta slot — never reflows the row as the timer ticks. A
+          failure reads in rouge (the full error lands in the resolved card that
+          replaces this one a beat later). */}
+      <span
+        className="octo-tabular shrink-0 font-mono text-[9px] uppercase tracking-[0.15em]"
+        style={{
+          color: tool.done && !tool.ok ? "var(--color-octo-rouge)" : "var(--color-octo-mute)",
+        }}
+      >
         {tool.done ? (tool.ok ? "done" : "failed") : "running"} · {formatDuration(shownMs)}
       </span>
     </div>

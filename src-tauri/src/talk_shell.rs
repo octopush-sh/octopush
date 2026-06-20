@@ -468,7 +468,16 @@ fn drain_pending(rx: &Receiver<TermEvent>) {
     // First clear whatever is already buffered.
     while rx.try_recv().is_ok() {}
     // Then wait briefly for a late idle prompt; stop once the channel goes quiet.
-    while rx.recv_timeout(Duration::from_millis(40)).is_ok() {}
+    // A hard deadline bounds the total wait so steady background output (a
+    // watcher/dev-server the shell launched earlier) can't starve this loop and
+    // block the command write indefinitely.
+    let deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(_) => continue, // late idle bytes — keep draining (bounded by deadline)
+            Err(_) => break,   // channel quiet → done
+        }
+    }
 }
 
 /// Drain until the prompt marker (command done) or `timeout`, accumulating raw
@@ -493,12 +502,14 @@ fn probe(rx: &Receiver<TermEvent>, timeout: Duration, nonce: &str) -> Probe {
                 }
             }
             Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
-                return Probe::Dead { output: clean_output(&buf) };
+                // Strip markers too: the shell may have died mid-prompt, leaving a
+                // partial OCTO_DONE marker that clean_output alone wouldn't remove.
+                return Probe::Dead { output: strip_octo_markers(&clean_output(&buf), nonce) };
             }
             Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                return Probe::Dead { output: clean_output(&buf) };
+                return Probe::Dead { output: strip_octo_markers(&clean_output(&buf), nonce) };
             }
         }
     }

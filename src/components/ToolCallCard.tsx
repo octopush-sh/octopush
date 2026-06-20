@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from "react";
+import { useState, useRef, useLayoutEffect, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
 import type { ToolExecution } from "../stores/chatStore";
@@ -68,6 +68,10 @@ const SAGE = "#95897a";
 const MUTE = "#6d6354";
 const ONYX = "#0c0a08";
 const HAIRLINE = "#2a2419";
+// Same load-bearing-inline rationale as the colors above: the mono stack must be
+// inline here (react-markdown cascade leak), but it lives in ONE const so the
+// new output controls don't scatter another copy of the literal.
+const MONO = "'JetBrains Mono', 'SF Mono', monospace";
 
 // Tool card has a FULL hairline-brass border (not just left), a slightly
 // more opaque brass-tinted background, and a subtle inset highlight so it
@@ -112,6 +116,11 @@ const headerStyle: CSSProperties = {
 
 export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTerminal }: Props) {
   const [expanded, setExpanded] = useState(false);
+  // Result output is capped (COLLAPSED_OUTPUT_PX) until the user opts to see it
+  // all — so a long `npm install` log doesn't silently clip with no signal.
+  const [outputExpanded, setOutputExpanded] = useState(false);
+  const [outputOverflows, setOutputOverflows] = useState(false);
+  const outputRef = useRef<HTMLPreElement>(null);
   const { copied, copy } = useCopyFeedback();
 
   const label = toolLabel(tool.toolName);
@@ -124,6 +133,14 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
   // when not the root) — surfaces the persistent shell's cwd per command.
   const cwd =
     tool.toolName === "run_command" ? String(tool.toolInput?.cwd ?? "") : "";
+
+  // Measure whether the (capped) output actually overflows, so the "Show full
+  // output" affordance and bottom fade only appear when there's more to see.
+  useLayoutEffect(() => {
+    const el = outputRef.current;
+    if (!el || outputExpanded) return;
+    setOutputOverflows(el.scrollHeight > el.clientHeight + 4);
+  }, [expanded, outputExpanded, tool.result]);
 
   return (
     <div className="chat-selectable" style={cardStyle}>
@@ -353,26 +370,65 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               {copied ? "✓ COPIED" : "COPY"}
             </span>
           </div>
-          <pre
-            style={{
-              maxHeight: 256,
-              overflow: "auto",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              borderRadius: 4,
-              background: ONYX,
-              padding: "10px 12px",
-              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
-              fontSize: 11,
-              lineHeight: 1.55,
-              color: IVORY,
-              margin: 0,
-              boxSizing: "border-box" as const,
-              border: `1px solid ${HAIRLINE}`,
-            }}
-          >
-            {tool.result}
-          </pre>
+          <div style={{ position: "relative" }}>
+            <pre
+              ref={outputRef}
+              style={{
+                maxHeight: outputExpanded ? undefined : 256,
+                overflow: outputExpanded ? "visible" : "auto",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                borderRadius: 4,
+                background: ONYX,
+                padding: "10px 12px",
+                fontFamily: MONO,
+                fontSize: 11,
+                lineHeight: 1.55,
+                color: IVORY,
+                margin: 0,
+                boxSizing: "border-box" as const,
+                border: `1px solid ${HAIRLINE}`,
+              }}
+            >
+              {tool.result}
+            </pre>
+            {/* Fade hint that there's more output below the cap. */}
+            {!outputExpanded && outputOverflows && (
+              <div
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  left: 1,
+                  right: 1,
+                  bottom: 1,
+                  height: 36,
+                  pointerEvents: "none",
+                  borderRadius: "0 0 4px 4px",
+                  background: `linear-gradient(to bottom, rgba(12, 10, 8, 0), ${ONYX})`,
+                }}
+              />
+            )}
+          </div>
+          {(outputOverflows || outputExpanded) && (
+            <button
+              type="button"
+              onClick={() => setOutputExpanded((v) => !v)}
+              style={{
+                marginTop: 6,
+                background: "transparent",
+                border: "none",
+                color: BRASS,
+                cursor: "pointer",
+                fontFamily: MONO,
+                fontSize: 9,
+                letterSpacing: "0.2em",
+                textTransform: "uppercase",
+                padding: "2px 0",
+              }}
+            >
+              {outputExpanded ? "Show less" : "Show full output"}
+            </button>
+          )}
         </div>
       )}
     </div>
