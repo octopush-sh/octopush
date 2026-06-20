@@ -109,45 +109,48 @@ fn dangerous_command(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     let c = normalized.to_lowercase();
-    let has = |n: &str| c.contains(n);
-    // Tokens for command-name detection ALSO split on shell separators, so a
-    // chained command with no surrounding spaces (`x;rm -rf`, `cmd|rm -rf`) still
-    // exposes `rm`/`push`/`clean` as its own token. (`c` keeps the separators so
-    // the fork-bomb literal below still matches.)
-    let token_src = c.replace([';', '|', '&', '(', ')'], " ");
-    let tokens: Vec<&str> = token_src.split_whitespace().collect();
-    // Does any short-flag token AFTER index `from` carry char `ch` (so `-rf`,
-    // `-fr`, `-f` all count), or is the long flag present?
-    let flag_after = |from: usize, ch: char, long: &str| {
-        tokens[from + 1..].iter().any(|t| {
-            *t == long || (t.starts_with('-') && !t.starts_with("--") && t.contains(ch))
-        })
-    };
 
-    // rm with BOTH recursive and force (flags must follow the `rm` token, so an
-    // unrelated `grep -f … && rm file` isn't mis-flagged).
-    if let Some(ri) = tokens.iter().position(|t| *t == "rm") {
-        if flag_after(ri, 'r', "--recursive") && flag_after(ri, 'f', "--force") {
-            return Some("recursive force delete (rm)");
+    // Per-COMMAND checks run on each shell segment independently, so a flag from
+    // one chained command can't be attributed to another (`rm -r a && rm -f b`
+    // is two non-destructive deletes, not one force-delete).
+    for seg in c.split([';', '|', '&', '\n']) {
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        // Any short-flag token after `from` carrying `ch` (`-rf`/`-fr`/`-f`), or
+        // the long flag, within THIS segment only.
+        let flag_after = |from: usize, ch: char, long: &str| {
+            tokens[from + 1..].iter().any(|t| {
+                *t == long || (t.starts_with('-') && !t.starts_with("--") && t.contains(ch))
+            })
+        };
+        let has_tok = |t: &str| tokens.iter().any(|x| *x == t);
+
+        if let Some(ri) = tokens.iter().position(|t| *t == "rm") {
+            if flag_after(ri, 'r', "--recursive") && flag_after(ri, 'f', "--force") {
+                return Some("recursive force delete (rm)");
+            }
+        }
+        if let Some(pi) = tokens.iter().position(|t| *t == "push") {
+            if flag_after(pi, 'f', "--force")
+                || tokens[pi + 1..].iter().any(|t| *t == "--force-with-lease")
+            {
+                return Some("force-push rewrites remote history");
+            }
+        }
+        if let Some(ci) = tokens.iter().position(|t| *t == "clean") {
+            // `git clean -f` deletes untracked files; `-n` (dry run) has no `f`.
+            if flag_after(ci, 'f', "--force") {
+                return Some("deletes untracked files (git clean)");
+            }
+        }
+        if has_tok("find") && has_tok("-delete") {
+            return Some("find -delete removes matched files");
         }
     }
-    // git push --force / -f / --force-with-lease (rewrites remote history).
-    if let Some(pi) = tokens.iter().position(|t| *t == "push") {
-        if flag_after(pi, 'f', "--force")
-            || tokens[pi + 1..].iter().any(|t| *t == "--force-with-lease")
-        {
-            return Some("force-push rewrites remote history");
-        }
-    }
-    // git clean with -f (any spelling: `-fd`, `-f -d`, `-ffd`) deletes untracked
-    // files; `-n` (dry run) has no `f` so it isn't flagged.
-    if let Some(ci) = tokens.iter().position(|t| *t == "clean") {
-        if flag_after(ci, 'f', "--force") {
-            return Some("deletes untracked files (git clean)");
-        }
-    }
+
     // Regex rules — avoid the `> /dev/null` and `| shuf` false positives by
-    // matching a shell/disk target as a whole word.
+    // matching a shell/disk target as a whole word. A destructive `dd` writes to
+    // a device (`of=/dev/sd…`), which the device-write regex catches — so the old
+    // bare `dd if=` substring (which mis-fired on `git add if=…`) is gone.
     for (re, reason) in danger_regexes() {
         if re.is_match(&c) {
             return Some(reason);
@@ -157,13 +160,12 @@ fn dangerous_command(command: &str) -> Option<&'static str> {
     const RULES: &[(&str, &str)] = &[
         ("sudo ", "runs with elevated privileges (sudo)"),
         ("mkfs", "formats a filesystem (mkfs)"),
-        ("dd if=", "raw disk write (dd)"),
         (":(){:|:&};:", "fork bomb"),
         ("git reset --hard", "discards uncommitted changes (git reset --hard)"),
         ("chmod -r", "recursive permission change (chmod -R)"),
         ("chown -r", "recursive ownership change (chown -R)"),
     ];
-    RULES.iter().find(|(n, _)| has(n)).map(|(_, r)| *r)
+    RULES.iter().find(|(n, _)| c.contains(*n)).map(|(_, r)| *r)
 }
 
 /// Regexes for danger rules that need word boundaries (so `> /dev/null` and
@@ -1904,6 +1906,17 @@ mod tests {
         // An unrelated `-f`/`-r` before a benign rm/clean must NOT flag it.
         assert!(dangerous_command("grep -f pats.txt && rm file.txt").is_none());
         assert!(dangerous_command("grep -rf pats.txt && git clean -n").is_none());
+        // Flags must not cross command boundaries (review #4): two separate
+        // non-destructive rm's are not a force-delete.
+        assert!(dangerous_command("rm -r tmpdir && rm -f lock").is_none());
+        assert!(dangerous_command("git clean -n && rm -i x").is_none());
+        // `add if=` no longer mistaken for `dd if=` (review #9).
+        assert!(dangerous_command("git add if-config.ts").is_none());
+        assert!(dangerous_command("echo add if=foo").is_none());
+        // dd to a real device is still caught (via the device-write regex).
+        assert!(dangerous_command("dd if=/dev/zero of=/dev/sda").is_some());
+        // New denylist entry: find -delete.
+        assert!(dangerous_command("find . -name '*.tmp' -delete").is_some());
     }
 
     #[test]

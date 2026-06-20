@@ -154,6 +154,18 @@ const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_HISTORY: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 
+/** True when a turn must be blocked for budget — workspace or global cap is
+ *  exceeded and no per-turn override is available to consume. Mirrors the gate
+ *  inside `send`; shared by regenerate / editAndResend so they can refuse BEFORE
+ *  truncating (a blocked action must not delete the rows it can't re-run). */
+function overBudgetBlocked(workspaceId: string): boolean {
+  const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
+  if (isOverBudget("workspace", workspaceId) || isOverBudget("global", "")) {
+    return !consumeOverride();
+  }
+  return false;
+}
+
 /** Whether an event for `threadId` should apply to the workspace's currently
  *  shown thread. Lenient: when no active thread is recorded yet (e.g. tests) or
  *  the event omits a threadId, it applies — preserving pre-thread behavior so
@@ -807,12 +819,22 @@ export const useChatStore = create<ChatState>((set, get) => {
       const msgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
       const aIdx = msgs.findIndex((m) => m.id === assistantMessageId);
       if (aIdx < 0) return;
-      // Truncate from the START of this assistant turn — the row right after the
-      // user message that prompted it — so the turn's TOOL rows go too. Cutting
-      // only at the assistant text id would leave orphaned tool rows that the
-      // backend re-injects, corrupting the regenerated turn's context.
+      // Find the user message that prompted this assistant turn. Without one we
+      // can't regenerate (re-running with an empty history 400s), and truncating
+      // would wipe the whole thread — so bail instead.
       let pu = aIdx - 1;
       while (pu >= 0 && msgs[pu].role !== "user") pu--;
+      if (pu < 0) return;
+      // Budget gate BEFORE truncating, so a blocked regenerate never deletes the
+      // turn it can't re-run.
+      if (overBudgetBlocked(workspaceId)) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG } }));
+        return;
+      }
+      // Truncate from the START of this assistant turn — the row right after the
+      // prompting user message — so the turn's TOOL rows go too. Cutting only at
+      // the assistant text id would leave orphaned tool rows that the backend
+      // re-injects, corrupting the regenerated turn's context.
       const truncateFromId = msgs[pu + 1]?.id ?? assistantMessageId;
       // Await the DB delete BEFORE mutating local state, so a failed truncate
       // never leaves the store inconsistent with what's persisted.
@@ -840,9 +862,17 @@ export const useChatStore = create<ChatState>((set, get) => {
     editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (!threadId || !newContent.trim()) return;
+      // Budget gate BEFORE truncating — otherwise the budget hard-stop inside the
+      // dispatch would fire AFTER the rows were already deleted, losing the
+      // conversation tail with no turn sent.
+      if (overBudgetBlocked(workspaceId)) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG } }));
+        return;
+      }
       // Truncate from the edited message (it + everything after) FIRST; only drop
       // the rows locally once the DB delete succeeds (no optimistic-removal drift
-      // if the IPC fails). Then dispatch the new text as a fresh user turn.
+      // if the IPC fails). Then dispatch the new text as a fresh user turn via
+      // runTurn (the budget was already gated above, so don't re-gate in send).
       try {
         await ipc.truncateChatAfter(threadId, userMessageId);
       } catch (e) {
@@ -857,7 +887,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           ),
         },
       }));
-      await get().send(workspaceId, workspacePath, newContent, systemPrompt);
+      await get().runTurn(workspaceId, workspacePath, threadId, {
+        userMessage: newContent,
+        systemPrompt,
+      });
     },
 
     runShell: async (workspaceId, workspacePath, command) => {

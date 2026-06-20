@@ -733,6 +733,14 @@ function App() {
     [activeWorkspaceId],
   );
 
+  const handleRenameChat = useCallback(
+    (id: string, title: string) => {
+      if (!activeWorkspaceId) return;
+      void useChatStore.getState().renameThread(activeWorkspaceId, id, title).catch(console.error);
+    },
+    [activeWorkspaceId],
+  );
+
   // ── Keyboard shortcuts (spec §3.6) ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -848,6 +856,10 @@ function App() {
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
+  // The thread currently running a turn (for the live pulse in the chat list).
+  const streamingThreadId = useChatStore((s) =>
+    activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
+  );
 
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
@@ -960,6 +972,8 @@ function App() {
         onSelectChat: handleSelectChat,
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
+        onRenameChat: handleRenameChat,
+        streamingChatId: streamingThreadId,
       };
     },
     [
@@ -968,6 +982,8 @@ function App() {
       handleSelectChat,
       handleNewChat,
       handleDeleteChat,
+      handleRenameChat,
+      streamingThreadId,
       activeWsPrimaryMessages,
       tickerNow,
     ],

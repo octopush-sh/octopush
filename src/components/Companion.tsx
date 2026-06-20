@@ -32,6 +32,9 @@ interface HistoryProps {
   activeChatId: string | null;
   onSelectChat: (id: string) => void;
   onNewChat: () => void;
+  onDeleteChat?: (id: string) => void;
+  onRenameChat?: (id: string, title: string) => void;
+  streamingChatId?: string | null;
 }
 
 interface Props {
