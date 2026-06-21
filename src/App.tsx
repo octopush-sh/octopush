@@ -32,6 +32,7 @@ import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
 import { ModeOverlay } from "./components/ModeOverlay";
 import { useReviewPrefs } from "./stores/reviewPrefsStore";
+import { useWorkspacePrefs } from "./stores/workspacePrefsStore";
 import { CanvasSplit } from "./components/CanvasSplit";
 import { useEditorStore } from "./stores/editorStore";
 import { useAttentionStore } from "./stores/attentionStore";
@@ -553,8 +554,13 @@ function App() {
   // user toggled workspaces. 3s is the sweet spot — fast enough to feel live,
   // not so often that we hammer git on huge repos.
   // ── Mode helpers ──
+  // The fallback for a workspace with no explicit mode this session is the
+  // user-configured default (Settings → General → Workspace defaults), not a
+  // hardcoded "talk". Applies to freshly created workspaces and any workspace
+  // after an app restart, since mode isn't persisted per-workspace.
+  const defaultMode = useWorkspacePrefs((s) => s.defaultMode);
   const activeMode: WorkspaceMode =
-    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
+    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || defaultMode;
 
   // Review whitespace pref — when it flips, the review diff is re-fetched
   // (the effect below depends on it) so the canvas honours the toggle.
