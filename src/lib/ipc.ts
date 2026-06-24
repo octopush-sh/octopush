@@ -261,6 +261,20 @@ import type {
   WorkspaceGitSummary,
 } from "./types";
 
+// ─── Entitlement (premium scaffolding — P0) ───────────────────────
+export type Plan = "free" | "pro" | "team" | "enterprise";
+export interface Entitlement {
+  plan: Plan;
+  features: string[];
+  /** Monthly Direct-run cap; null = unlimited (the P0 state). */
+  directRunsPerMonth: number | null;
+}
+export interface DirectRunUsage {
+  used: number;
+  limit: number | null;
+  remaining: number | null;
+}
+
 export const ipc = {
   // ─── Sessions ─────────────────────────────────────────────────
   createSession: (args: CreateSessionArgs) =>
@@ -848,6 +862,10 @@ export const ipc = {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
+
+  // ─── Entitlement (premium scaffolding) ────────────────────────
+  getEntitlement: () => invoke<Entitlement>("get_entitlement"),
+  directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
 
   // ─── Roles ────────────────────────────────────────────────────
   listRoles: () => invoke<Role[]>("list_roles"),

@@ -5,6 +5,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { savingsVsBaseline } from "../lib/runStatus";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
+import { DirectRunsMeter } from "./DirectRunsMeter";
 
 interface Props {
   defaultTask: string;
@@ -208,6 +209,8 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                   />
                 </div>
               </div>
+
+              <DirectRunsMeter />
 
               <div className="ml-auto flex flex-col items-end gap-1.5">
                 <button

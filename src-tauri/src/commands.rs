@@ -1212,6 +1212,20 @@ pub async fn start_run(
             "another run in this workspace is already executing".into(),
         ));
     }
+    // Entitlement gate (P0: inert). The Free entitlement grants `direct.unlimited`
+    // with no monthly cap, so this never blocks today — but the gate is wired so
+    // P2 only needs to return a restricted Free entitlement to switch it on.
+    {
+        let ent = crate::entitlement::Entitlement::current();
+        let used = state.db.lock().count_started_runs_this_month()?;
+        if let Err(denied) = ent.check_direct_run_quota(used) {
+            return Err(AppError::UpgradeRequired {
+                feature: denied.feature.to_string(),
+                used: denied.used,
+                limit: denied.limit,
+            });
+        }
+    }
     // Persist the optional spend cap before the drive starts. Only a finite
     // positive budget is meaningful; anything else stays NULL (no budget).
     if let Some(b) = budget_usd {
@@ -1240,6 +1254,28 @@ pub async fn list_runs(
     workspace_id: String,
 ) -> AppResult<Vec<crate::db::RunRow>> {
     state.db.lock().list_runs(&workspace_id)
+}
+
+/// The current entitlement (P0: hard-coded Free that grants everything). The
+/// frontend mirrors this for UX; the meaningful gates live in the Rust core.
+#[tauri::command]
+pub async fn get_entitlement() -> AppResult<crate::entitlement::Entitlement> {
+    Ok(crate::entitlement::Entitlement::current())
+}
+
+/// Monthly Direct-run usage for the launcher meter (`{used, limit, remaining}`).
+/// `limit == null` while the plan is uncapped (the P0 state).
+#[tauri::command]
+pub async fn direct_run_usage(
+    state: State<'_, AppState>,
+) -> AppResult<crate::entitlement::DirectRunUsage> {
+    let ent = crate::entitlement::Entitlement::current();
+    let used = state.db.lock().count_started_runs_this_month()?;
+    Ok(crate::entitlement::DirectRunUsage {
+        used,
+        limit: ent.direct_runs_per_month,
+        remaining: ent.direct_runs_remaining(used),
+    })
 }
 
 #[tauri::command]

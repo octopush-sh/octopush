@@ -2144,6 +2144,20 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Count Direct runs that were *started* (i.e. left `draft`) since the start
+    /// of the current month — the unit the free-tier Direct-runs meter shows and
+    /// the quota gate counts. Mirrors the month-window convention in
+    /// `period_spend` (ISO `created_at` vs `datetime('now','start of month')`).
+    pub fn count_started_runs_this_month(&self) -> AppResult<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs
+             WHERE status != 'draft' AND created_at >= datetime('now', 'start of month')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
     pub fn list_run_stages(&self, run_id: &str) -> AppResult<Vec<RunStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,

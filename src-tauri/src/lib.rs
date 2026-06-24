@@ -8,6 +8,7 @@ pub mod context_guard;
 // this crate) can drive the data layer directly. The MCP server is a thin,
 // read-and-author surface over the same SQLite store the desktop app uses.
 pub mod db;
+pub mod entitlement;
 pub mod error;
 pub mod git_ops;
 pub mod git_url;
@@ -327,6 +328,9 @@ pub fn run() {
             commands::list_roles,
             commands::save_role,
             commands::delete_role,
+            // Entitlement (premium scaffolding — P0)
+            commands::get_entitlement,
+            commands::direct_run_usage,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.
