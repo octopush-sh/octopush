@@ -26,7 +26,7 @@ import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlert
 import { EmptyProjectState } from "./components/EmptyProjectState";
 import { ChatView } from "./components/ChatView";
 import { ReviewSidebar } from "./components/ReviewSidebar";
-import { EditorPane } from "./components/EditorPane";
+import { EditorWithPreview } from "./components/editor/EditorWithPreview";
 import { EditorTabs } from "./components/EditorTabs";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
@@ -1664,7 +1664,7 @@ function App() {
                       >
                         {/* Editor mode content */}
                         <EditorTabs workspaceId={activeWorkspaceId!} />
-                        <EditorPane
+                        <EditorWithPreview
                           workspaceId={activeWorkspaceId!}
                           workspacePath={activeWorkspace.worktreePath || project.path}
                           diffText={gitDiff}
