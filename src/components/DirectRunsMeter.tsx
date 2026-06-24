@@ -1,11 +1,5 @@
 import { useEntitlement } from "../hooks/useEntitlement";
 
-/** A quiet "Direct runs · this month" meter for the launcher ledger.
- *
- *  P0: informational only — `limit` is null (uncapped), so it shows just the
- *  count. Once a Free monthly cap is enforced (P2) it renders "N of M" and the
- *  count tints toward rouge as it fills. Consistent with how Octopush already
- *  surfaces spend honestly. */
 /** Tint for the run count: sage while comfortable, amber past 80% of a cap,
  *  rouge once the cap is reached. Uncapped (P0) stays sage. */
 function countTone(used: number, limit: number | null): string {
@@ -16,6 +10,12 @@ function countTone(used: number, limit: number | null): string {
   return "text-octo-sage";
 }
 
+/** A quiet "Direct runs · this month" meter for the launcher ledger.
+ *
+ *  P0: informational only — `limit` is null (uncapped), so it shows just the
+ *  count. Once a Free monthly cap is enforced (P2) it renders "N of M" and the
+ *  count tints toward rouge as it fills. Consistent with how Octopush already
+ *  surfaces spend honestly. */
 export function DirectRunsMeter() {
   const { usage } = useEntitlement();
   if (!usage) return null;
