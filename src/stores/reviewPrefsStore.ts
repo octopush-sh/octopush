@@ -8,9 +8,15 @@ interface ReviewPrefsState {
   ignoreWhitespace: boolean;
   /** Per-workspace "show gitignored files in the tree" pref, keyed by rootPath. */
   showIgnoredFiles: Record<string, boolean>;
+  /** Markdown preview: open the rendered pane beside the editor for .md tabs. */
+  mdPreview: boolean;
+  /** Source-column width percent for the editor‖preview split (25..75). */
+  mdPreviewSplit: number;
   setReadingMode: (m: ReadingMode) => void;
   setIgnoreWhitespace: (v: boolean) => void;
   toggleShowIgnored: (rootPath: string) => void;
+  toggleMdPreview: () => void;
+  setMdPreviewSplit: (pct: number) => void;
 }
 
 export const useReviewPrefs = create<ReviewPrefsState>()(
@@ -19,6 +25,8 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
       readingMode: "inline",
       ignoreWhitespace: false,
       showIgnoredFiles: {},
+      mdPreview: true,
+      mdPreviewSplit: 50,
       setReadingMode: (readingMode) => set({ readingMode }),
       setIgnoreWhitespace: (ignoreWhitespace) => set({ ignoreWhitespace }),
       toggleShowIgnored: (rootPath) =>
@@ -31,6 +39,9 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
           }
           return { showIgnoredFiles: next };
         }),
+      toggleMdPreview: () => set((s) => ({ mdPreview: !s.mdPreview })),
+      setMdPreviewSplit: (pct) =>
+        set({ mdPreviewSplit: Math.max(25, Math.min(75, pct)) }),
     }),
     { name: "octo-review-prefs" },
   ),
