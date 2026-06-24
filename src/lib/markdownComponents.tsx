@@ -30,7 +30,7 @@ export function markdownComponents(): Components {
     strong: ({ children }) => <strong className="font-semibold text-octo-ivory">{children}</strong>,
     em: ({ children }) => <em className="font-medium text-octo-ivory">{children}</em>,
     a: ({ href, children }) => (
-      <a href={href} target="_blank" rel="noopener"
+      <a href={href} target="_blank" rel="noopener noreferrer"
          className="text-octo-brass underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass">
         {children}
       </a>

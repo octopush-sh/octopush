@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { EditorPane } from "../EditorPane";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { isMarkdownFile } from "../../lib/isMarkdownFile";
@@ -36,6 +36,8 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
   // Real state (not a ref) so the transition prop reactively flips to "none"
   // for the duration of a drag and back to the grow easing on release.
   const [dragging, setDragging] = useState(false);
+  // Detach handler for an in-flight drag, so an unmount mid-drag can clean up.
+  const stopDragRef = useRef<(() => void) | null>(null);
 
   const onDividerMouseDown = () => {
     setDragging(true);
@@ -44,14 +46,26 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
       if (!rect || rect.width === 0) return;
       setSplit(((e.clientX - rect.left) / rect.width) * 100);
     };
-    const onUp = () => {
-      setDragging(false);
+    const detach = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      stopDragRef.current = null;
     };
+    function onUp() {
+      setDragging(false);
+      detach();
+    }
+    stopDragRef.current = detach;
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
   };
+
+  // If the component unmounts mid-drag (workspace/mode switch, or the active
+  // tab flips to non-markdown so the divider unmounts), detach the document
+  // listeners so they don't fire after unmount. detach() only removes
+  // listeners — it does not call setDragging — so there is no state update on
+  // an unmounted component.
+  useEffect(() => () => { stopDragRef.current?.(); }, []);
 
   const transition = dragging ? "none" : GROW;
 
