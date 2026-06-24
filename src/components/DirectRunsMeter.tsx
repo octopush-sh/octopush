@@ -6,14 +6,21 @@ import { useEntitlement } from "../hooks/useEntitlement";
  *  count. Once a Free monthly cap is enforced (P2) it renders "N of M" and the
  *  count tints toward rouge as it fills. Consistent with how Octopush already
  *  surfaces spend honestly. */
+/** Tint for the run count: sage while comfortable, amber past 80% of a cap,
+ *  rouge once the cap is reached. Uncapped (P0) stays sage. */
+function countTone(used: number, limit: number | null): string {
+  if (limit == null || limit <= 0) return "text-octo-sage";
+  const ratio = used / limit;
+  if (ratio >= 1) return "text-octo-rouge";
+  if (ratio >= 0.8) return "text-octo-warning";
+  return "text-octo-sage";
+}
+
 export function DirectRunsMeter() {
   const { usage } = useEntitlement();
   if (!usage) return null;
 
   const { used, limit } = usage;
-  const ratio = limit && limit > 0 ? used / limit : 0;
-  const countTone =
-    limit == null ? "text-octo-sage" : ratio >= 1 ? "text-octo-rouge" : ratio >= 0.8 ? "text-octo-warning" : "text-octo-sage";
 
   return (
     <div className="min-w-0">
@@ -21,7 +28,7 @@ export function DirectRunsMeter() {
         direct runs · this month
       </div>
       <div className="octo-tabular font-mono text-xs text-octo-mute">
-        <span className={countTone}>{used}</span>
+        <span className={countTone(used, limit)}>{used}</span>
         {limit != null ? (
           <span className="text-octo-mute"> of {limit}</span>
         ) : (

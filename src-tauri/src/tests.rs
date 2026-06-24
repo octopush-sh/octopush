@@ -166,6 +166,30 @@ mod workspace_tests {
     }
 
     #[test]
+    fn count_started_runs_excludes_drafts_and_counts_started() {
+        // Guards the free-tier Direct-runs meter/quota: only runs that have
+        // *left* `draft` (i.e. were started) this month are counted.
+        let db = test_db();
+        setup_workspace(&db, "p", "ws");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        // A freshly created run is a draft → not counted.
+        let run_id = db
+            .create_run("ws", &pipeline_id, "task", None, None, &[])
+            .unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 0);
+
+        // Once it leaves draft (started), it counts...
+        db.set_run_status(&run_id, "running", false).unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 1);
+
+        // ...and a terminal state still counts (it also left draft).
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 1);
+    }
+
+    #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();
         setup_workspace(&db, "proj-1", "ws-1");
