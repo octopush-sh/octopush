@@ -1,5 +1,5 @@
-import { useRef } from "react";
-import { EditorPane } from "./EditorPane";
+import { useRef, useState } from "react";
+import { EditorPane } from "../EditorPane";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { isMarkdownFile } from "../../lib/isMarkdownFile";
 import { useEditorStore } from "../../stores/editorStore";
@@ -20,7 +20,8 @@ const GROW = REDUCED ? "none" : "width 280ms cubic-bezier(0.2,0.8,0.3,1)";
 /** REVIEW editor surface: EditorPane (always mounted) with an optional,
  *  collapsible MarkdownPreview to its right. The preview never unmounts the
  *  editor — it only collapses to zero width — so CodeMirror state survives a
- *  toggle. Divider is draggable (ratio persisted) and double-click-resets. */
+ *  toggle. Divider is draggable (ratio persisted, clamped by the store) and
+ *  double-click-resets. */
 export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Props) {
   const activePath = useEditorStore((s) => s.getActivePath(workspaceId));
   const files = useEditorStore((s) => s.getFiles(workspaceId));
@@ -32,17 +33,19 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
   const showPreview = mdPreview && isMarkdownFile(activeFile);
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef(false);
+  // Real state (not a ref) so the transition prop reactively flips to "none"
+  // for the duration of a drag and back to the grow easing on release.
+  const [dragging, setDragging] = useState(false);
 
   const onDividerMouseDown = () => {
-    draggingRef.current = true;
+    setDragging(true);
     const onMove = (e: MouseEvent) => {
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect || rect.width === 0) return;
       setSplit(((e.clientX - rect.left) / rect.width) * 100);
     };
     const onUp = () => {
-      draggingRef.current = false;
+      setDragging(false);
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
     };
@@ -50,7 +53,7 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
     document.addEventListener("mouseup", onUp);
   };
 
-  const transition = draggingRef.current ? "none" : GROW;
+  const transition = dragging ? "none" : GROW;
 
   return (
     <div ref={containerRef} data-testid="editor-with-preview" className="flex h-full min-h-0 w-full overflow-hidden">
@@ -71,7 +74,8 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
         />
       )}
 
-      {/* Preview — mounted, width-collapsed when hidden (never remounts editor). */}
+      {/* Preview — collapses to zero width when hidden; never remounts the editor.
+          Only rendered for markdown tabs so we don't run the renderer for code. */}
       <div
         className="min-h-0 overflow-hidden"
         style={{
@@ -80,7 +84,7 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
           transition,
         }}
       >
-        {activeFile && <MarkdownPreview source={activeFile.content} />}
+        {showPreview && activeFile && <MarkdownPreview source={activeFile.content} />}
       </div>
     </div>
   );

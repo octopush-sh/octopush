@@ -6,7 +6,7 @@ import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import type { OpenFile } from "../../stores/editorStore";
 
 // Stub the heavy panes — this test is about gating + divider, not CodeMirror.
-vi.mock("./EditorPane", () => ({ EditorPane: () => <div data-testid="editor-pane" /> }));
+vi.mock("../EditorPane", () => ({ EditorPane: () => <div data-testid="editor-pane" /> }));
 vi.mock("./MarkdownPreview", () => ({
   MarkdownPreview: ({ source }: { source: string }) => <div data-testid="md-preview">{source}</div>,
 }));
@@ -43,17 +43,19 @@ describe("EditorWithPreview", () => {
     expect(screen.getByRole("separator")).toBeInTheDocument();
   });
 
-  it("hides the preview for a non-markdown file", () => {
+  it("hides the preview for a non-markdown file but keeps the editor mounted", () => {
     seedFile({ path: "/r/App.tsx", lang: "javascript", kind: "text" });
     renderIt();
     expect(screen.queryByRole("separator")).toBeNull();
+    expect(screen.getByTestId("editor-pane")).toBeInTheDocument();
   });
 
-  it("hides the preview when mdPreview is off", () => {
+  it("hides the preview when mdPreview is off but keeps the editor mounted", () => {
     seedFile({ path: "/r/README.md", lang: "markdown", kind: "text" });
     useReviewPrefs.setState({ mdPreview: false });
     renderIt();
     expect(screen.queryByRole("separator")).toBeNull();
+    expect(screen.getByTestId("editor-pane")).toBeInTheDocument();
   });
 
   it("drag updates the split ratio, clamped to 25..75", () => {
