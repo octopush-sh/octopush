@@ -813,6 +813,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 - **Privacy** — Read-only statement: local-only data in `~/Library/Application Support/octopush/octopush.db`, API keys in `~/.octopush/settings.json`, outbound traffic only to configured providers, "No analytics, no telemetry." _Support:_ `PrivacyPane.tsx`.
 - **About** — Installed version + Check for updates; renders the updater flow; footer links (GitHub repo, last-checked, Ed25519-signature note). _Support:_ `AboutPane.tsx`; `updaterStore`.
 - **Integrations** — Hosts Issue tracking (§9), MCP Servers (§9), and the Claude Code "Connect" card (§9). _Support:_ `IntegrationsPane.tsx`.
+- **Account (premium — P1)** — Sign in / out and reach Clerk's hosted account portal. Signed-out shows a "Sign in" CTA; signed-in shows the identity + "Manage account ↗" (opens the Clerk portal in the browser) + "Sign out". _Support:_ `settings/AccountPane.tsx`, `useAuth` hook, `authStore`; commands `auth_begin_sign_in`/`auth_status`/`auth_sign_out`/`auth_account_portal_url`. _Entry:_ Settings → Account (App group). _Mechanism:_ the OAuth 2.0 Authorization Code + **PKCE (S256)** **public-client** flow runs in the Rust core (`src-tauri/src/auth.rs`) — opens the system browser to Clerk, captures the redirect on a `127.0.0.1:8976` loopback, exchanges the code (**no client secret**), fetches `/oauth/userinfo`, and stores the session in the macOS **Keychain** (`keyring`). Clerk app/instance config (client_id + domain) is built-in for now.
 - **Shared pane primitives** — `PaneHeader`, `SectionLabel`, `ToggleRow`, `Stat`, `Row`, `useChartColors` (live CSS-var theme colors for Recharts). _Support:_ `settings/shared.tsx`.
 
 ### Theming
@@ -888,6 +889,7 @@ All Tauri commands are registered in `src-tauri/src/lib.rs` (`invoke_handler`) a
 - **MCP setup** — `mcp_connection_status`, `connect_claude_code`
 - **Roles** — `list_roles`, `save_role`, `delete_role`
 - **Entitlement (premium scaffolding)** — `get_entitlement`, `direct_run_usage`
+- **Accounts (P1)** — `auth_begin_sign_in`, `auth_sign_out`, `auth_status`, `auth_account_portal_url`
 
 ---
 

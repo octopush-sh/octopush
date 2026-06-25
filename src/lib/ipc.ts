@@ -275,6 +275,13 @@ export interface DirectRunUsage {
   remaining: number | null;
 }
 
+// ─── Accounts (P1) ────────────────────────────────────────────────
+export interface AuthStatus {
+  signedIn: boolean;
+  email: string | null;
+  name: string | null;
+}
+
 export const ipc = {
   // ─── Sessions ─────────────────────────────────────────────────
   createSession: (args: CreateSessionArgs) =>
@@ -866,6 +873,12 @@ export const ipc = {
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
   directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
+
+  // ─── Accounts (P1) ────────────────────────────────────────────
+  authStatus: () => invoke<AuthStatus>("auth_status"),
+  authBeginSignIn: () => invoke<AuthStatus>("auth_begin_sign_in"),
+  authSignOut: () => invoke<void>("auth_sign_out"),
+  authAccountPortalUrl: () => invoke<string>("auth_account_portal_url"),
 
   // ─── Roles ────────────────────────────────────────────────────
   listRoles: () => invoke<Role[]>("list_roles"),

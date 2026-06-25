@@ -1278,6 +1278,34 @@ pub async fn direct_run_usage(
     })
 }
 
+// ─── Accounts (P1) ─────────────────────────────────────────────
+/// Run the interactive Clerk sign-in: opens the system browser, captures the
+/// loopback redirect, exchanges the code (PKCE, no secret), and stores the
+/// session in the OS keychain. Returns the resulting auth status.
+#[tauri::command]
+pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
+    crate::auth::begin_sign_in().await
+}
+
+/// Clear the stored session (sign out locally).
+#[tauri::command]
+pub async fn auth_sign_out() -> AppResult<()> {
+    crate::auth::sign_out()
+}
+
+/// Current sign-in status (signed in + identity, or signed out).
+#[tauri::command]
+pub async fn auth_status() -> AppResult<crate::auth::AuthStatus> {
+    Ok(crate::auth::status())
+}
+
+/// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend
+/// opens it in the browser via `open_file_in_system`.
+#[tauri::command]
+pub async fn auth_account_portal_url() -> AppResult<String> {
+    Ok(crate::auth::account_portal_url())
+}
+
 #[tauri::command]
 pub async fn resolve_checkpoint(
     orch: State<'_, Arc<Orchestrator>>,

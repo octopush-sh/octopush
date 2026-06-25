@@ -15,6 +15,7 @@ import { ShortcutsPane } from "./settings/ShortcutsPane";
 import { PrivacyPane } from "./settings/PrivacyPane";
 import { IntegrationsPane } from "./settings/IntegrationsPane";
 import { AboutPane } from "./settings/AboutPane";
+import { AccountPane } from "./settings/AccountPane";
 import { isModalOpen } from "./ModalShell";
 
 interface Props {
@@ -122,6 +123,7 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
           {tab === "shortcuts" && <ShortcutsPane />}
           {tab === "privacy" && <PrivacyPane />}
           {tab === "integrations" && <IntegrationsPane onConfigSaved={onIssueTrackerConfigSaved} />}
+          {tab === "account" && <AccountPane />}
           {tab === "about" && <AboutPane />}
         </main>
       </div>

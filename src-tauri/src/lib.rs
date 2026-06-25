@@ -1,6 +1,7 @@
 //! Octopush — native core.
 
 pub mod agent_adapter;
+pub mod auth;
 pub mod chat_engine;
 mod commands;
 pub mod context_guard;
@@ -331,6 +332,11 @@ pub fn run() {
             // Entitlement (premium scaffolding — P0)
             commands::get_entitlement,
             commands::direct_run_usage,
+            // Accounts (P1)
+            commands::auth_begin_sign_in,
+            commands::auth_sign_out,
+            commands::auth_status,
+            commands::auth_account_portal_url,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.
