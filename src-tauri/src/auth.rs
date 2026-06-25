@@ -23,11 +23,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Loopback port the OAuth redirect lands on. Must match a Redirect URL
 /// registered on the Clerk OAuth application.
 const LOOPBACK_PORT: u16 = 8976;
+
+/// Set by `cancel_sign_in` to abort an in-flight sign-in; the loopback poll
+/// checks it each tick. A single flag is enough — only one sign-in runs at a
+/// time (the loopback port is exclusive). Invariant: it is cleared at the
+/// *start* of every `begin_sign_in` and never read outside an active sign-in,
+/// so a leftover `true` from a prior cancel cannot pre-cancel the next one.
+static SIGN_IN_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Serializes token refresh so concurrent `status()` calls don't double-refresh
+/// — with refresh-token rotation, a second, now-stale refresh could spuriously
+/// revoke the whole session.
+static REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 /// How long we wait for the user to finish signing in before giving up.
 const SIGN_IN_TIMEOUT_SECS: u64 = 300;
 /// Keychain service/account under which the session blob is stored.
@@ -90,6 +107,10 @@ struct StoredSession {
     access_token: String,
     refresh_token: Option<String>,
     obtained_at: String,
+    /// RFC3339 expiry of `access_token` (from the token response's `expires_in`).
+    /// `None` for legacy sessions saved before this field existed.
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 // ─── PKCE + state (pure, unit-tested) ──────────────────────────────────────
@@ -249,6 +270,9 @@ fn wait_for_callback(
         .set_nonblocking(true)
         .map_err(|e| format!("could not arm the sign-in listener: {e}"))?;
     loop {
+        if SIGN_IN_CANCEL.load(Ordering::SeqCst) {
+            return Err("Sign-in cancelled.".into());
+        }
         if Instant::now() >= deadline {
             return Err("sign-in timed out — the browser never returned.".into());
         }
@@ -288,6 +312,8 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +428,7 @@ fn clear_session() -> AppResult<()> {
 /// exchanges the code, fetches identity, and persists the session.
 pub async fn begin_sign_in() -> AppResult<AuthStatus> {
     let cfg = ClerkConfig::current();
+    SIGN_IN_CANCEL.store(false, Ordering::SeqCst);
     let verifier = gen_verifier();
     let challenge = challenge_s256(&verifier);
     let state = random_state();
@@ -428,6 +455,8 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
         .map_err(|e| AppError::Other(format!("sign-in listener crashed: {e}")))?
         .map_err(AppError::Other)?;
 
+    // Past this point the sign-in is no longer cancellable — we hold a valid
+    // code and complete the exchange rather than abandon it.
     let tokens = exchange_code(&http, &cfg, &code, &verifier).await?;
     let user = fetch_userinfo(&http, &cfg, &tokens.access_token).await?;
 
@@ -438,6 +467,7 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         obtained_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: expires_at_from(tokens.expires_in),
     })?;
 
     Ok(AuthStatus { signed_in: true, email: user.email, name: user.name })
@@ -447,11 +477,129 @@ pub fn sign_out() -> AppResult<()> {
     clear_session()
 }
 
-pub fn status() -> AuthStatus {
-    match load_session() {
-        Some(s) => AuthStatus { signed_in: true, email: s.email, name: s.name },
-        None => AuthStatus::default(),
+/// Current sign-in status. If the access token has expired, attempt a silent
+/// refresh: on success update the stored session; if the refresh token is
+/// rejected the session is dead (clear it, report signed-out); on a
+/// transient/offline failure keep the session and stay signed in optimistically.
+pub async fn status() -> AuthStatus {
+    let session = match load_session() {
+        Some(s) => s,
+        None => return AuthStatus::default(),
+    };
+    if !is_expired(session.expires_at.as_deref()) {
+        return AuthStatus { signed_in: true, email: session.email, name: session.name };
     }
+    // Single-flight the refresh: only one network refresh runs at a time, and we
+    // re-load after acquiring the lock — another caller may have refreshed while
+    // we waited (avoids a refresh-token-rotation race that could sign us out).
+    let _guard = refresh_lock().lock().await;
+    let session = match load_session() {
+        Some(s) => s,
+        None => return AuthStatus::default(),
+    };
+    if !is_expired(session.expires_at.as_deref()) {
+        return AuthStatus { signed_in: true, email: session.email, name: session.name };
+    }
+    match refresh_session(&session).await {
+        RefreshOutcome::Refreshed(updated) => {
+            let _ = store_session(&updated);
+            AuthStatus { signed_in: true, email: updated.email, name: updated.name }
+        }
+        // The refresh token is gone/rejected → the session is truly dead.
+        RefreshOutcome::TokenRevoked => {
+            let _ = clear_session();
+            AuthStatus::default()
+        }
+        // Offline / server hiccup → keep the session and stay signed in
+        // optimistically (offline grace; it refreshes on a later call online).
+        RefreshOutcome::TransientError => {
+            AuthStatus { signed_in: true, email: session.email, name: session.name }
+        }
+    }
+}
+
+/// True when the stored access token has passed (or is within 30s of) its
+/// expiry. Unknown/legacy expiry is treated as not-expired (don't force a
+/// refresh on sessions saved before the field existed).
+fn is_expired(expires_at: Option<&str>) -> bool {
+    match expires_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(exp) => chrono::Utc::now() + chrono::Duration::seconds(30) >= exp,
+        None => false,
+    }
+}
+
+fn expires_at_from(expires_in: Option<i64>) -> Option<String> {
+    expires_in.map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339())
+}
+
+/// Outcome of a refresh attempt — distinguishes a definitively dead session
+/// (refresh token rejected → sign out) from a transient/offline failure (keep
+/// the session; never sign a user out just because they were offline).
+enum RefreshOutcome {
+    Refreshed(StoredSession),
+    TokenRevoked,
+    TransientError,
+}
+
+/// A non-success refresh status: only an explicit token rejection (400
+/// invalid_grant / 401) is definitive; everything else (403 proxy/WAF
+/// interstitials, 429 rate-limit, 5xx) is transient, so we keep the session.
+fn refresh_failure_is_revoked(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
+    )
+}
+
+/// Exchange the refresh token for a fresh access token (public-client grant, no
+/// secret). Keeps a rotated refresh token if Clerk returns one.
+async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
+    let Some(refresh_token) = session.refresh_token.as_deref() else {
+        return RefreshOutcome::TokenRevoked; // nothing to refresh with → dead
+    };
+    let cfg = ClerkConfig::current();
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return RefreshOutcome::TransientError,
+    };
+    let resp = match client
+        .post(cfg.token_url())
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", &cfg.client_id),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return RefreshOutcome::TransientError, // offline / DNS / TLS
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return if refresh_failure_is_revoked(status) {
+            RefreshOutcome::TokenRevoked
+        } else {
+            RefreshOutcome::TransientError
+        };
+    }
+    match resp.json::<TokenResponse>().await {
+        Ok(tokens) => RefreshOutcome::Refreshed(StoredSession {
+            sub: session.sub.clone(),
+            email: session.email.clone(),
+            name: session.name.clone(),
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token.or_else(|| session.refresh_token.clone()),
+            obtained_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: expires_at_from(tokens.expires_in),
+        }),
+        Err(_) => RefreshOutcome::TransientError,
+    }
+}
+
+/// Abort an in-flight sign-in; the loopback poll returns within ~100ms.
+pub fn cancel_sign_in() {
+    SIGN_IN_CANCEL.store(true, Ordering::SeqCst);
 }
 
 pub fn account_portal_url() -> String {
@@ -467,6 +615,39 @@ mod tests {
         // RFC 7636 Appendix B.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         assert_eq!(challenge_s256(verifier), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn is_expired_handles_past_future_and_unknown() {
+        // Unknown/legacy expiry → treated as still valid (no forced refresh).
+        assert!(!is_expired(None));
+        assert!(!is_expired(Some("not-a-date")));
+        // Far future → not expired.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(!is_expired(Some(&future)));
+        // Past → expired.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert!(is_expired(Some(&past)));
+        // Within the 30s skew window → expired (refresh proactively).
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+        assert!(is_expired(Some(&soon)));
+    }
+
+    #[test]
+    fn only_400_401_revoke_the_session() {
+        use reqwest::StatusCode;
+        assert!(refresh_failure_is_revoked(StatusCode::BAD_REQUEST));
+        assert!(refresh_failure_is_revoked(StatusCode::UNAUTHORIZED));
+        // 403 (proxy/WAF interstitial), 429, and 5xx must NOT sign the user out.
+        assert!(!refresh_failure_is_revoked(StatusCode::FORBIDDEN));
+        assert!(!refresh_failure_is_revoked(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!refresh_failure_is_revoked(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn expires_at_from_handles_none() {
+        assert!(expires_at_from(None).is_none());
+        assert!(expires_at_from(Some(3600)).is_some());
     }
 
     #[test]

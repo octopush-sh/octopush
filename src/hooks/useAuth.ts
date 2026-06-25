@@ -10,11 +10,12 @@ export function useAuth() {
   const error = useAuthStore((s) => s.error);
   const load = useAuthStore((s) => s.load);
   const signIn = useAuthStore((s) => s.signIn);
+  const cancelSignIn = useAuthStore((s) => s.cancelSignIn);
   const signOut = useAuthStore((s) => s.signOut);
 
   useEffect(() => {
     if (!loaded) void load();
   }, [loaded, load]);
 
-  return { status, loaded, signingIn, error, signIn, signOut };
+  return { status, loaded, signingIn, error, signIn, cancelSignIn, signOut };
 }

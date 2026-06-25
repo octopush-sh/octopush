@@ -335,6 +335,7 @@ pub fn run() {
             // Accounts (P1)
             commands::auth_begin_sign_in,
             commands::auth_sign_out,
+            commands::auth_cancel_sign_in,
             commands::auth_status,
             commands::auth_account_portal_url,
         ])

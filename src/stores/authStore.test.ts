@@ -1,10 +1,9 @@
 /**
- * Unit tests for authStore (accounts — P1).
+ * Unit tests for authStore (accounts — P1 + finalize).
  *
- * 1. load() reflects the backend status (signed in / out) and degrades on error
- * 2. signIn() stores the returned status and toggles signingIn
- * 3. signIn() surfaces an error without crashing
- * 4. signOut() returns to the signed-out state
+ * Covers load() (signed in/out + error degrade), signIn() (status, in-flight
+ * toggle, error surfacing), cancelSignIn() (clears state; a cancel is not
+ * surfaced as an error), and signOut().
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { AuthStatus } from "../lib/ipc";
@@ -12,11 +11,13 @@ import type { AuthStatus } from "../lib/ipc";
 const authStatusMock = vi.fn<() => Promise<AuthStatus>>();
 const authBeginSignInMock = vi.fn<() => Promise<AuthStatus>>();
 const authSignOutMock = vi.fn<() => Promise<void>>();
+const authCancelSignInMock = vi.fn<() => Promise<void>>();
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
     authStatus: authStatusMock,
     authBeginSignIn: authBeginSignInMock,
+    authCancelSignIn: authCancelSignInMock,
     authSignOut: authSignOutMock,
   },
 }));
@@ -30,6 +31,7 @@ beforeEach(() => {
   authStatusMock.mockReset();
   authBeginSignInMock.mockReset();
   authSignOutMock.mockReset().mockResolvedValue(undefined);
+  authCancelSignInMock.mockReset().mockResolvedValue(undefined);
 });
 
 describe("authStore", () => {
@@ -83,5 +85,31 @@ describe("authStore", () => {
     await useAuthStore.getState().signOut();
     expect(useAuthStore.getState().status.signedIn).toBe(false);
     expect(authSignOutMock).toHaveBeenCalled();
+  });
+
+  it("cancelSignIn() calls the backend and clears signingIn", async () => {
+    useAuthStore.setState({ signingIn: true });
+    await useAuthStore.getState().cancelSignIn();
+    expect(authCancelSignInMock).toHaveBeenCalled();
+    expect(useAuthStore.getState().signingIn).toBe(false);
+  });
+
+  it("a user-cancelled sign-in is not surfaced as an error", async () => {
+    let reject!: (e: Error) => void;
+    authBeginSignInMock.mockReturnValue(new Promise<AuthStatus>((_, r) => { reject = r; }));
+    const p = useAuthStore.getState().signIn();
+    await useAuthStore.getState().cancelSignIn(); // marks cancelling + clears signingIn
+    reject(new Error("Sign-in cancelled."));
+    await p;
+    const s = useAuthStore.getState();
+    expect(s.signingIn).toBe(false);
+    expect(s.error).toBeNull();
+  });
+
+  it("cancelSignIn() clears signingIn even if the backend call fails", async () => {
+    authCancelSignInMock.mockRejectedValue(new Error("ipc down"));
+    useAuthStore.setState({ signingIn: true });
+    await useAuthStore.getState().cancelSignIn();
+    expect(useAuthStore.getState().signingIn).toBe(false);
   });
 });

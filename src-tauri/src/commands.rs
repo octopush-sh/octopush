@@ -1293,10 +1293,18 @@ pub async fn auth_sign_out() -> AppResult<()> {
     crate::auth::sign_out()
 }
 
-/// Current sign-in status (signed in + identity, or signed out).
+/// Abort an in-flight interactive sign-in (the loopback returns ~immediately).
+#[tauri::command]
+pub async fn auth_cancel_sign_in() -> AppResult<()> {
+    crate::auth::cancel_sign_in();
+    Ok(())
+}
+
+/// Current sign-in status (signed in + identity, or signed out). Refreshes the
+/// token silently if it has expired.
 #[tauri::command]
 pub async fn auth_status() -> AppResult<crate::auth::AuthStatus> {
-    Ok(crate::auth::status())
+    Ok(crate::auth::status().await)
 }
 
 /// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend

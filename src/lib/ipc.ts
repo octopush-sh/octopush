@@ -877,6 +877,7 @@ export const ipc = {
   // ─── Accounts (P1) ────────────────────────────────────────────
   authStatus: () => invoke<AuthStatus>("auth_status"),
   authBeginSignIn: () => invoke<AuthStatus>("auth_begin_sign_in"),
+  authCancelSignIn: () => invoke<void>("auth_cancel_sign_in"),
   authSignOut: () => invoke<void>("auth_sign_out"),
   authAccountPortalUrl: () => invoke<string>("auth_account_portal_url"),
 

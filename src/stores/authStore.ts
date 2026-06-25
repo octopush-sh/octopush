@@ -11,16 +11,22 @@ interface AuthState {
   status: AuthStatus;
   loaded: boolean;
   signingIn: boolean;
+  /** Set while a user-initiated cancel is in flight, so signIn()'s resulting
+   *  rejection is treated as a cancel (not a red error) without sniffing the
+   *  backend error string. */
+  cancelling: boolean;
   error: string | null;
   load: () => Promise<void>;
   signIn: () => Promise<void>;
+  cancelSignIn: () => Promise<void>;
   signOut: () => Promise<void>;
 }
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   status: SIGNED_OUT,
   loaded: false,
   signingIn: false,
+  cancelling: false,
   error: null,
 
   load: async () => {
@@ -33,13 +39,26 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   signIn: async () => {
-    set({ signingIn: true, error: null });
+    set({ signingIn: true, error: null, cancelling: false });
     try {
       const status = await ipc.authBeginSignIn();
       set({ status, signingIn: false });
     } catch (e) {
-      set({ signingIn: false, error: e instanceof Error ? e.message : String(e) });
+      // If the user cancelled, the backend rejection isn't an error to surface.
+      const cancelled = get().cancelling;
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ signingIn: false, cancelling: false, error: cancelled ? null : msg });
     }
+  },
+
+  cancelSignIn: async () => {
+    set({ cancelling: true });
+    try {
+      await ipc.authCancelSignIn();
+    } catch {
+      /* best-effort — the in-flight sign-in will resolve shortly anyway */
+    }
+    set({ signingIn: false });
   },
 
   signOut: async () => {
