@@ -69,8 +69,9 @@ impl ClerkConfig {
             instance: "smooth-ringtail-82.clerk.accounts.dev".into(),
             client_id: "M3OMbpMlh1vzUnO4".into(),
             redirect_uri: format!("http://127.0.0.1:{LOOPBACK_PORT}/callback"),
-            // `offline_access` yields a refresh token for silent re-auth.
-            scopes: "openid email profile offline_access".into(),
+            // `offline_access` → refresh token; `public_metadata` → the user's
+            // plan claim (set by the billing webhook) rides on the OAuth session.
+            scopes: "openid email profile offline_access public_metadata".into(),
         }
     }
     pub fn authorize_url(&self) -> String {
@@ -111,6 +112,10 @@ struct StoredSession {
     /// `None` for legacy sessions saved before this field existed.
     #[serde(default)]
     expires_at: Option<String>,
+    /// The user's plan from Clerk `public_metadata.plan` (e.g. "pro"); `None`
+    /// = Free. Read from userinfo at sign-in / refresh_identity.
+    #[serde(default)]
+    plan: Option<String>,
 }
 
 // ─── PKCE + state (pure, unit-tested) ──────────────────────────────────────
@@ -323,6 +328,10 @@ struct UserInfo {
     email: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// Clerk public metadata (present when the `public_metadata` scope is
+    /// granted). Carries `{ "plan": "pro" }` once the billing webhook sets it.
+    #[serde(default)]
+    public_metadata: Option<serde_json::Value>,
 }
 
 /// Reduce a non-2xx token response to just the standard OAuth `error` /
@@ -460,6 +469,7 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
     let tokens = exchange_code(&http, &cfg, &code, &verifier).await?;
     let user = fetch_userinfo(&http, &cfg, &tokens.access_token).await?;
 
+    let plan = plan_from_userinfo(&user);
     store_session(&StoredSession {
         sub: user.sub,
         email: user.email.clone(),
@@ -468,6 +478,7 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
         refresh_token: tokens.refresh_token,
         obtained_at: chrono::Utc::now().to_rfc3339(),
         expires_at: expires_at_from(tokens.expires_in),
+        plan,
     })?;
 
     Ok(AuthStatus { signed_in: true, email: user.email, name: user.name })
@@ -592,6 +603,7 @@ async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
             refresh_token: tokens.refresh_token.or_else(|| session.refresh_token.clone()),
             obtained_at: chrono::Utc::now().to_rfc3339(),
             expires_at: expires_at_from(tokens.expires_in),
+            plan: session.plan.clone(),
         }),
         Err(_) => RefreshOutcome::TransientError,
     }
@@ -606,6 +618,75 @@ pub fn account_portal_url() -> String {
     ClerkConfig::current().account_portal_url()
 }
 
+/// Extract the plan claim from Clerk `public_metadata.plan` in a userinfo
+/// response (e.g. "pro"). `None` → treat as Free.
+fn plan_from_userinfo(user: &UserInfo) -> Option<String> {
+    user.public_metadata
+        .as_ref()?
+        .get("plan")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The signed-in user's plan (from the stored session), or `None` when signed
+/// out / no plan claim. Consulted by `entitlement::current`.
+pub fn current_plan() -> Option<String> {
+    load_session().and_then(|s| s.plan)
+}
+
+/// The signed-in user's (clerk_user_id, email), or `None` when signed out.
+/// Used by billing to stamp the checkout link.
+pub fn current_identity() -> Option<(String, Option<String>)> {
+    load_session().map(|s| (s.sub, s.email))
+}
+
+/// Re-fetch identity (incl. the `plan` in public_metadata) for the stored
+/// session, refreshing the access token first if needed. Picks up a plan change
+/// after the user subscribes. Best-effort: on a transient failure it returns the
+/// existing status unchanged (never signs the user out over a network hiccup).
+pub async fn refresh_identity() -> AppResult<AuthStatus> {
+    // Single-flight with status()'s refresh so concurrent calls can't both rotate
+    // the refresh token (re-load after acquiring, like status()).
+    let _guard = refresh_lock().lock().await;
+    let mut session = match load_session() {
+        Some(s) => s,
+        None => return Ok(AuthStatus::default()),
+    };
+    let here = |s: &StoredSession| AuthStatus {
+        signed_in: true,
+        email: s.email.clone(),
+        name: s.name.clone(),
+    };
+    if is_expired(session.expires_at.as_deref()) {
+        match refresh_session(&session).await {
+            RefreshOutcome::Refreshed(updated) => {
+                let _ = store_session(&updated);
+                session = updated;
+            }
+            RefreshOutcome::TokenRevoked => {
+                let _ = clear_session();
+                return Ok(AuthStatus::default());
+            }
+            RefreshOutcome::TransientError => return Ok(here(&session)),
+        }
+    }
+    let cfg = ClerkConfig::current();
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return Ok(here(&session)),
+    };
+    match fetch_userinfo(&client, &cfg, &session.access_token).await {
+        Ok(user) => {
+            session.email = user.email.clone();
+            session.name = user.name.clone();
+            session.plan = plan_from_userinfo(&user);
+            let _ = store_session(&session);
+            Ok(here(&session))
+        }
+        Err(_) => Ok(here(&session)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +696,26 @@ mod tests {
         // RFC 7636 Appendix B.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         assert_eq!(challenge_s256(verifier), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn plan_is_read_from_public_metadata() {
+        let pro: UserInfo = serde_json::from_value(serde_json::json!({
+            "sub": "user_1", "email": "a@b.co", "public_metadata": { "plan": "pro" }
+        }))
+        .unwrap();
+        assert_eq!(plan_from_userinfo(&pro).as_deref(), Some("pro"));
+
+        // No metadata at all → None (Free).
+        let bare: UserInfo = serde_json::from_value(serde_json::json!({ "sub": "u2" })).unwrap();
+        assert_eq!(plan_from_userinfo(&bare), None);
+
+        // Metadata present but no plan key → None.
+        let empty: UserInfo = serde_json::from_value(serde_json::json!({
+            "sub": "u3", "public_metadata": {}
+        }))
+        .unwrap();
+        assert_eq!(plan_from_userinfo(&empty), None);
     }
 
     #[test]

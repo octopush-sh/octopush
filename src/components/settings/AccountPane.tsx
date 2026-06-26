@@ -1,13 +1,28 @@
-// Settings → Account (P1). Sign in / out and reach Clerk's hosted account
-// portal. The OAuth/PKCE flow runs in the Rust core (opens the system browser,
-// stores the session in the OS keychain); this pane only reflects + triggers it.
+// Settings → Account (P1 + P2). Sign in / out, reach Clerk's hosted account
+// portal, and upgrade to Pro. The OAuth/PKCE flow + the plan (from Clerk
+// public_metadata) live in the Rust core; "Upgrade" opens a Dodo checkout link
+// in the browser. This pane only reflects + triggers — no secrets here.
+import { useEffect } from "react";
 import { useAuth } from "../../hooks/useAuth";
+import { useEntitlement } from "../../hooks/useEntitlement";
 import { ipc } from "../../lib/ipc";
 import { pushToast } from "../Toasts";
 import { PaneHeader, SectionLabel } from "./shared";
 
 export function AccountPane() {
-  const { status, signingIn, error, signIn, cancelSignIn, signOut } = useAuth();
+  const { status, signingIn, error, signIn, cancelSignIn, signOut, refresh } = useAuth();
+  const { plan, reload } = useEntitlement();
+  const isPro = plan === "pro";
+
+  // On opening the pane while signed in, re-fetch identity (to pick up a plan
+  // change after a just-completed checkout) and reload the entitlement.
+  useEffect(() => {
+    if (!status.signedIn) return;
+    void (async () => {
+      await refresh();
+      await reload();
+    })();
+  }, [status.signedIn, refresh, reload]);
 
   const openPortal = async () => {
     try {
@@ -16,6 +31,16 @@ export function AccountPane() {
     } catch (e) {
       console.error("Failed to open the account portal:", e);
       pushToast({ level: "error", title: "Couldn't open the account portal" });
+    }
+  };
+
+  const upgrade = async () => {
+    try {
+      const url = await ipc.billingCheckoutUrl();
+      await ipc.openFileInSystem(url);
+    } catch (e) {
+      console.error("Failed to open checkout:", e);
+      pushToast({ level: "error", title: "Couldn't open checkout" });
     }
   };
 
@@ -32,13 +57,37 @@ export function AccountPane() {
           <div className="space-y-4">
             <SectionLabel>Signed in</SectionLabel>
             <div className="rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-4">
-              <div className="font-serif text-[16px] text-octo-ivory">
-                {status.name || status.email || "Signed in"}
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate font-serif text-[16px] text-octo-ivory">
+                    {status.name || status.email || "Signed in"}
+                  </div>
+                  {status.email && status.name && (
+                    <div className="mt-0.5 truncate font-mono text-xs text-octo-mute">
+                      {status.email}
+                    </div>
+                  )}
+                </div>
+                <span
+                  className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-[11px] uppercase tracking-wide ${
+                    isPro
+                      ? "border-[var(--brass-dim)] text-octo-brass"
+                      : "border-octo-hairline text-octo-mute"
+                  }`}
+                >
+                  {isPro ? "Pro" : "Free"}
+                </span>
               </div>
-              {status.email && status.name && (
-                <div className="mt-0.5 font-mono text-xs text-octo-mute">{status.email}</div>
-              )}
               <div className="mt-4 flex flex-wrap gap-2">
+                {!isPro && (
+                  <button
+                    type="button"
+                    onClick={() => void upgrade()}
+                    className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi"
+                  >
+                    Upgrade to Pro
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => void openPortal()}
@@ -55,6 +104,13 @@ export function AccountPane() {
                 </button>
               </div>
             </div>
+            {!isPro && (
+              <p className="text-[13px] leading-relaxed text-octo-mute">
+                Pro unlocks the full multi-agent orchestration harness — unlimited Direct
+                runs, parallel and background runs, and full run history. Checkout opens in
+                your browser.
+              </p>
+            )}
           </div>
         ) : (
           <div className="space-y-4">

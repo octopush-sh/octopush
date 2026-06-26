@@ -59,12 +59,36 @@ pub struct QuotaDenied {
 }
 
 impl Entitlement {
-    /// The current entitlement. **P0:** a hard-coded Free that grants everything
-    /// (zero behavior change). The gate points already consult this, so P2 only
-    /// needs to return [`Entitlement::free_restricted`] for unpaid users plus a
-    /// real signed entitlement for subscribers.
+    /// The current entitlement, derived from the signed-in user's plan
+    /// (`public_metadata.plan` via Clerk). **P2 (this change):** a "pro" plan
+    /// gets [`Entitlement::pro`]; everyone else still gets the *uncapped* Free
+    /// entitlement — turning the Free cap on is the deliberate next step
+    /// ([`Entitlement::free_restricted`]).
     pub fn current() -> Self {
-        Self::free_unrestricted()
+        Self::for_plan(crate::auth::current_plan().as_deref())
+    }
+
+    /// Map a plan claim to an entitlement. Pure (the keyring read lives in
+    /// [`Entitlement::current`]) so it's unit-testable without a session.
+    pub fn for_plan(plan: Option<&str>) -> Self {
+        match plan {
+            Some("pro") => Self::pro(),
+            // Free and any unknown plan — uncapped until the Free cap flips on.
+            _ => Self::free_unrestricted(),
+        }
+    }
+
+    /// Pro: every premium feature, no caps.
+    pub fn pro() -> Self {
+        Entitlement {
+            plan: Plan::Pro,
+            features: vec![
+                feature::DIRECT_UNLIMITED.into(),
+                feature::RUNS_PARALLEL.into(),
+                feature::HISTORY_SYNC.into(),
+            ],
+            direct_runs_per_month: None,
+        }
     }
 
     /// P0 Free: every feature granted, no caps. Keeps behavior identical to
@@ -139,14 +163,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn p0_free_grants_everything_and_is_uncapped() {
-        let e = Entitlement::current();
+    fn free_plan_grants_everything_and_is_uncapped() {
+        // No plan claim (signed out / Free) → uncapped Free, behavior unchanged.
+        let e = Entitlement::for_plan(None);
         assert_eq!(e.plan, Plan::Free);
         assert!(e.has_feature(feature::DIRECT_UNLIMITED));
         assert!(e.has_feature(feature::RUNS_PARALLEL));
         assert!(e.has_feature(feature::HISTORY_SYNC));
         assert_eq!(e.direct_runs_per_month, None);
         assert_eq!(e.direct_runs_remaining(9999), None);
+        // An unknown plan string also falls back to Free.
+        assert_eq!(Entitlement::for_plan(Some("mystery")).plan, Plan::Free);
+    }
+
+    #[test]
+    fn pro_plan_is_uncapped_with_all_features() {
+        let e = Entitlement::for_plan(Some("pro"));
+        assert_eq!(e.plan, Plan::Pro);
+        assert!(e.has_feature(feature::DIRECT_UNLIMITED));
+        assert!(e.has_feature(feature::RUNS_PARALLEL));
+        assert!(e.has_feature(feature::HISTORY_SYNC));
+        assert_eq!(e.direct_runs_per_month, None);
+        assert!(e.check_direct_run_quota(10_000).is_ok());
     }
 
     #[test]

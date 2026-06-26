@@ -878,8 +878,10 @@ export const ipc = {
   authStatus: () => invoke<AuthStatus>("auth_status"),
   authBeginSignIn: () => invoke<AuthStatus>("auth_begin_sign_in"),
   authCancelSignIn: () => invoke<void>("auth_cancel_sign_in"),
+  authRefresh: () => invoke<AuthStatus>("auth_refresh"),
   authSignOut: () => invoke<void>("auth_sign_out"),
   authAccountPortalUrl: () => invoke<string>("auth_account_portal_url"),
+  billingCheckoutUrl: () => invoke<string>("billing_checkout_url"),
 
   // ─── Roles ────────────────────────────────────────────────────
   listRoles: () => invoke<Role[]>("list_roles"),

@@ -2,6 +2,7 @@
 
 pub mod agent_adapter;
 pub mod auth;
+pub mod billing;
 pub mod chat_engine;
 mod commands;
 pub mod context_guard;
@@ -337,7 +338,9 @@ pub fn run() {
             commands::auth_sign_out,
             commands::auth_cancel_sign_in,
             commands::auth_status,
+            commands::auth_refresh,
             commands::auth_account_portal_url,
+            commands::billing_checkout_url,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.

@@ -1307,11 +1307,25 @@ pub async fn auth_status() -> AppResult<crate::auth::AuthStatus> {
     Ok(crate::auth::status().await)
 }
 
+/// Re-fetch identity from Clerk (incl. the plan in public_metadata), refreshing
+/// the token if needed. Used to pick up a plan change after the user subscribes.
+#[tauri::command]
+pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
+    crate::auth::refresh_identity().await
+}
+
 /// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend
 /// opens it in the browser via `open_file_in_system`.
 #[tauri::command]
 pub async fn auth_account_portal_url() -> AppResult<String> {
     Ok(crate::auth::account_portal_url())
+}
+
+/// Dodo checkout link for the signed-in user to subscribe to Pro. Opened in the
+/// browser; carries the user's email + Clerk id so the webhook maps it back.
+#[tauri::command]
+pub async fn billing_checkout_url() -> AppResult<String> {
+    crate::billing::checkout_url_for_current_user()
 }
 
 #[tauri::command]

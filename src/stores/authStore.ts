@@ -20,6 +20,8 @@ interface AuthState {
   signIn: () => Promise<void>;
   cancelSignIn: () => Promise<void>;
   signOut: () => Promise<void>;
+  /** Re-fetch identity from Clerk (picks up a plan change after subscribing). */
+  refresh: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -66,6 +68,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       await ipc.authSignOut();
     } finally {
       set({ status: SIGNED_OUT, error: null });
+    }
+  },
+
+  refresh: async () => {
+    try {
+      const status = await ipc.authRefresh();
+      set({ status });
+    } catch {
+      /* best-effort — keep the cached status on a transient failure */
     }
   },
 }));
