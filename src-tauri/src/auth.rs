@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Loopback port the OAuth redirect lands on. Must match a Redirect URL
@@ -400,21 +400,28 @@ async fn fetch_userinfo(
         .map_err(|e| AppError::Other(format!("could not parse userinfo: {e}")))
 }
 
-// ─── Keychain persistence ──────────────────────────────────────────────────
+// ─── Keychain persistence (cached in memory) ───────────────────────────────
+//
+// The OS keychain prompts for access on an unsigned / ad-hoc-signed build
+// ("cannot verify the authenticity of Octopush"). So we read it AT MOST ONCE
+// per launch and serve every later read from an in-memory cache; writes/clears
+// update both. Without this, P2a's plan read on every Settings open (via the
+// entitlement) fires a keychain prompt each time.
+
+enum SessionCache {
+    Unloaded,
+    Loaded(Option<StoredSession>),
+}
+static SESSION_CACHE: Mutex<SessionCache> = Mutex::new(SessionCache::Unloaded);
 
 fn keyring_entry() -> AppResult<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| AppError::Other(format!("keychain unavailable: {e}")))
 }
 
-fn store_session(session: &StoredSession) -> AppResult<()> {
-    let blob = serde_json::to_string(session)?;
-    keyring_entry()?
-        .set_password(&blob)
-        .map_err(|e| AppError::Other(format!("could not save the session to the keychain: {e}")))
-}
-
-fn load_session() -> Option<StoredSession> {
+/// Read straight from the keychain (the only place that actually touches it for
+/// reads). Triggers the OS prompt on an unverified build — call sparingly.
+fn read_keychain() -> Option<StoredSession> {
     let entry = keyring_entry().ok()?;
     match entry.get_password() {
         Ok(blob) => serde_json::from_str(&blob).ok(),
@@ -422,13 +429,37 @@ fn load_session() -> Option<StoredSession> {
     }
 }
 
+fn store_session(session: &StoredSession) -> AppResult<()> {
+    let blob = serde_json::to_string(session)?;
+    keyring_entry()?
+        .set_password(&blob)
+        .map_err(|e| AppError::Other(format!("could not save the session to the keychain: {e}")))?;
+    *SESSION_CACHE.lock().unwrap() = SessionCache::Loaded(Some(session.clone()));
+    Ok(())
+}
+
+fn load_session() -> Option<StoredSession> {
+    let mut cache = SESSION_CACHE.lock().unwrap();
+    if let SessionCache::Loaded(session) = &*cache {
+        return session.clone();
+    }
+    let loaded = read_keychain();
+    *cache = SessionCache::Loaded(loaded.clone());
+    loaded
+}
+
 fn clear_session() -> AppResult<()> {
     let entry = keyring_entry()?;
-    match entry.delete_credential() {
+    let result = match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(AppError::Other(format!("could not clear the session: {e}"))),
-    }
+    };
+    // Clear the in-memory cache regardless of the delete outcome: the user asked
+    // to sign out, so honor it locally for this session even if the keychain
+    // delete failed (the keychain would win on the next launch).
+    *SESSION_CACHE.lock().unwrap() = SessionCache::Loaded(None);
+    result
 }
 
 // ─── Public API (driven by Tauri commands) ─────────────────────────────────
@@ -677,10 +708,15 @@ pub async fn refresh_identity() -> AppResult<AuthStatus> {
     };
     match fetch_userinfo(&client, &cfg, &session.access_token).await {
         Ok(user) => {
-            session.email = user.email.clone();
-            session.name = user.name.clone();
-            session.plan = plan_from_userinfo(&user);
-            let _ = store_session(&session);
+            // Only write the keychain when something actually changed — avoids a
+            // keychain prompt on every Account-pane open when nothing moved.
+            let new_plan = plan_from_userinfo(&user);
+            if session.email != user.email || session.name != user.name || session.plan != new_plan {
+                session.email = user.email.clone();
+                session.name = user.name.clone();
+                session.plan = new_plan;
+                let _ = store_session(&session);
+            }
             Ok(here(&session))
         }
         Err(_) => Ok(here(&session)),
