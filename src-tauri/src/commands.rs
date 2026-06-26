@@ -1212,9 +1212,8 @@ pub async fn start_run(
             "another run in this workspace is already executing".into(),
         ));
     }
-    // Entitlement gate (P0: inert). The Free entitlement grants `direct.unlimited`
-    // with no monthly cap, so this never blocks today — but the gate is wired so
-    // P2 only needs to return a restricted Free entitlement to switch it on.
+    // Entitlement gate (live). Pro is uncapped; Free / signed-out is capped at
+    // FREE_DIRECT_RUNS_PER_MONTH — over the cap this returns UpgradeRequired.
     {
         let ent = crate::entitlement::Entitlement::current();
         let used = state.db.lock().count_started_runs_this_month()?;
@@ -1256,7 +1255,7 @@ pub async fn list_runs(
     state.db.lock().list_runs(&workspace_id)
 }
 
-/// The current entitlement (P0: hard-coded Free that grants everything). The
+/// The current entitlement (derived from the signed-in user's Clerk plan). The
 /// frontend mirrors this for UX; the meaningful gates live in the Rust core.
 #[tauri::command]
 pub async fn get_entitlement() -> AppResult<crate::entitlement::Entitlement> {
@@ -1264,7 +1263,7 @@ pub async fn get_entitlement() -> AppResult<crate::entitlement::Entitlement> {
 }
 
 /// Monthly Direct-run usage for the launcher meter (`{used, limit, remaining}`).
-/// `limit == null` while the plan is uncapped (the P0 state).
+/// `limit == null` when the plan is uncapped (Pro).
 #[tauri::command]
 pub async fn direct_run_usage(
     state: State<'_, AppState>,
