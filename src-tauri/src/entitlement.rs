@@ -1,22 +1,18 @@
 //! Entitlement — the single source of truth for "what is this install allowed
 //! to do".
 //!
-//! **P0 (this change):** everyone is on the **Free** plan, and Free currently
-//! grants *everything* with no caps — so behavior is unchanged. What ships now
-//! is the *shape* (the [`Entitlement`] model + the gate helpers) and the gate
-//! *points* (e.g. [`Entitlement::check_direct_run_quota`], consulted in
-//! `commands::start_run`). Turning enforcement on later is therefore a **data
-//! change** (return a restricted entitlement), not a refactor.
+//! **Enforcement is live (P2c):** [`Entitlement::current`] derives the plan from
+//! the signed-in user's Clerk `public_metadata.plan` (set by the billing webhook
+//! after a Dodo subscription). **Pro** is uncapped; **Free / signed-out** gets
+//! the restricted tier — the monthly Direct-run cap, enforced by
+//! [`Entitlement::check_direct_run_quota`] in `commands::start_run`.
 //!
-//! **Later phases:** [`Entitlement::current`] will return a short-lived,
-//! Ed25519-signed entitlement derived from the signed-in user's subscription
-//! (verified in-process, cached with an offline grace window). See
-//! `docs/premium/accounts-and-subscriptions-implementation-plan.md`.
+//! See `docs/premium/accounts-and-subscriptions-implementation-plan.md`.
 
 use serde::Serialize;
 
-/// Feature keys gated by tier. Free holds all of them today (P0); P2/P4 drop the
-/// premium keys from the Free entitlement once accounts + billing exist.
+/// Feature keys gated by tier. Pro holds all of them; the restricted Free tier
+/// holds none.
 pub mod feature {
     /// Run Direct pipelines without the monthly free cap.
     pub const DIRECT_UNLIMITED: &str = "direct.unlimited";
@@ -26,8 +22,8 @@ pub mod feature {
     pub const HISTORY_SYNC: &str = "history.sync";
 }
 
-/// The proposed Free monthly Direct-run cap. Defined now (so the meter, the
-/// restricted entitlement, and tests share one number); **activated in P2**.
+/// The Free monthly Direct-run cap (live). Shared by the meter, the restricted
+/// entitlement, and the gate.
 pub const FREE_DIRECT_RUNS_PER_MONTH: u32 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -60,10 +56,9 @@ pub struct QuotaDenied {
 
 impl Entitlement {
     /// The current entitlement, derived from the signed-in user's plan
-    /// (`public_metadata.plan` via Clerk). **P2 (this change):** a "pro" plan
-    /// gets [`Entitlement::pro`]; everyone else still gets the *uncapped* Free
-    /// entitlement — turning the Free cap on is the deliberate next step
-    /// ([`Entitlement::free_restricted`]).
+    /// (`public_metadata.plan` via Clerk). A "pro" plan gets [`Entitlement::pro`]
+    /// (uncapped); **everyone else (Free / signed-out / unknown) gets
+    /// [`Entitlement::free_restricted`]** — the monthly Direct-run cap is live.
     pub fn current() -> Self {
         Self::for_plan(crate::auth::current_plan().as_deref())
     }
@@ -71,10 +66,13 @@ impl Entitlement {
     /// Map a plan claim to an entitlement. Pure (the keyring read lives in
     /// [`Entitlement::current`]) so it's unit-testable without a session.
     pub fn for_plan(plan: Option<&str>) -> Self {
-        match plan {
-            Some("pro") => Self::pro(),
-            // Free and any unknown plan — uncapped until the Free cap flips on.
-            _ => Self::free_unrestricted(),
+        // Trim + case-insensitive so a paying Pro user is never capped by stray
+        // casing/whitespace in the plan claim.
+        match plan.map(str::trim) {
+            Some(p) if p.eq_ignore_ascii_case("pro") => Self::pro(),
+            // Free, signed-out, and any unknown plan → the restricted Free tier
+            // (premium features off, monthly Direct-run cap on).
+            _ => Self::free_restricted(),
         }
     }
 
@@ -105,9 +103,8 @@ impl Entitlement {
         }
     }
 
-    /// The restricted Free tier P2 will switch to once billing exists: no
-    /// premium features, and the monthly Direct-run cap turned on. Defined now
-    /// so the gate logic that enforces it is unit-tested before it ships.
+    /// The restricted Free tier (live for every non-Pro user): no premium
+    /// features, and the monthly Direct-run cap turned on.
     pub fn free_restricted() -> Self {
         Entitlement {
             plan: Plan::Free,
@@ -129,8 +126,8 @@ impl Entitlement {
     /// The gate consulted before a Direct run starts. `Ok(())` when allowed;
     /// `Err(QuotaDenied)` when the monthly cap is reached on a capped plan.
     ///
-    /// With the P0 Free entitlement (has `DIRECT_UNLIMITED`, cap `None`) this is
-    /// **always `Ok`** — no run is blocked today.
+    /// Pro (has `DIRECT_UNLIMITED`, cap `None`) is always `Ok`; Free is denied
+    /// once `used` reaches the cap.
     pub fn check_direct_run_quota(&self, used: u32) -> Result<(), QuotaDenied> {
         if self.has_feature(feature::DIRECT_UNLIMITED) {
             return Ok(());
@@ -149,7 +146,7 @@ impl Entitlement {
 }
 
 /// Monthly Direct-run usage shown by the launcher meter. `limit == None` means
-/// the current plan is uncapped (the P0 state).
+/// the current plan is uncapped (Pro).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectRunUsage {
@@ -163,17 +160,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_plan_grants_everything_and_is_uncapped() {
-        // No plan claim (signed out / Free) → uncapped Free, behavior unchanged.
+    fn free_plan_is_capped_with_no_premium_features() {
+        // No plan claim (signed out / Free) → the restricted Free tier.
         let e = Entitlement::for_plan(None);
         assert_eq!(e.plan, Plan::Free);
-        assert!(e.has_feature(feature::DIRECT_UNLIMITED));
-        assert!(e.has_feature(feature::RUNS_PARALLEL));
-        assert!(e.has_feature(feature::HISTORY_SYNC));
-        assert_eq!(e.direct_runs_per_month, None);
-        assert_eq!(e.direct_runs_remaining(9999), None);
-        // An unknown plan string also falls back to Free.
-        assert_eq!(Entitlement::for_plan(Some("mystery")).plan, Plan::Free);
+        assert!(!e.has_feature(feature::DIRECT_UNLIMITED));
+        assert!(!e.has_feature(feature::RUNS_PARALLEL));
+        assert!(!e.has_feature(feature::HISTORY_SYNC));
+        assert_eq!(e.direct_runs_per_month, Some(FREE_DIRECT_RUNS_PER_MONTH));
+        // The monthly cap is enforced.
+        assert!(e.check_direct_run_quota(FREE_DIRECT_RUNS_PER_MONTH).is_err());
+        // An unknown plan string also maps to the restricted Free tier.
+        let unknown = Entitlement::for_plan(Some("mystery"));
+        assert_eq!(unknown.plan, Plan::Free);
+        assert_eq!(unknown.direct_runs_per_month, Some(FREE_DIRECT_RUNS_PER_MONTH));
+    }
+
+    #[test]
+    fn pro_match_tolerates_casing_and_whitespace() {
+        // A paying Pro user must never be capped by a stray-cased plan claim.
+        assert_eq!(Entitlement::for_plan(Some(" PRO ")).plan, Plan::Pro);
+        assert_eq!(Entitlement::for_plan(Some("Pro")).plan, Plan::Pro);
     }
 
     #[test]
