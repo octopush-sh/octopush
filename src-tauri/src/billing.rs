@@ -16,7 +16,7 @@ const DODO_PRODUCT_ID: &str = "pdt_0Nhqpssz0QnxuP6LwaScq";
 const CHECKOUT_BASE: &str = "https://test.checkout.dodopayments.com";
 /// Where Dodo returns the buyer after checkout (a Vercel page for now; a desktop
 /// deep-link can replace this once a custom scheme is registered).
-const RETURN_URL: &str = "https://octopush-vert.vercel.app/?upgraded=1";
+const RETURN_URL: &str = "https://octopush.sh/?upgraded=1";
 
 /// Build the Dodo static checkout link for the subscription, prefilling the
 /// user's email (when known) and carrying their Clerk id as metadata

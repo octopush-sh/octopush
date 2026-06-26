@@ -41,6 +41,7 @@ import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
+import { UpgradeSheet } from "./components/UpgradeSheet";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
@@ -2251,6 +2252,7 @@ function App() {
 
       <ToastContainer />
       <UpdateNotifier />
+      <UpgradeSheet />
     </div>
   );
 }

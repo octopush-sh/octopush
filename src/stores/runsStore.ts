@@ -8,6 +8,8 @@ import {
   type RunDetail,
   type CheckpointActionName,
 } from "../lib/ipc";
+import { useUpgradeStore } from "./upgradeStore";
+import { isUpgradeRequired } from "../lib/upgradeError";
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
@@ -196,8 +198,14 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       try {
         await ipc.startRun(runId, budgetUsd ?? null);
       } catch (e) {
-        // start was refused (e.g. another run is in progress) — drop the orphaned draft.
+        // start was refused — drop the orphaned draft.
         await ipc.abortRun(runId).catch(() => {});
+        // Over the Free monthly Direct-run cap → show the upgrade sheet, not an error.
+        const upgrade = isUpgradeRequired(e);
+        if (upgrade) {
+          useUpgradeStore.getState().show(upgrade);
+          return;
+        }
         throw e;
       }
       set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
