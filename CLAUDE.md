@@ -44,7 +44,7 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 - **`§` in brass** — every tool call card (`§ TOOL_NAME`) and Direct focus-pane role headers. Structural; do not retire.
 
 **Active branding details:**
-- **`&` in brass** — "Octopus & you" branding. The ampersand alone is brass.
+- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
 - **Roman numerals** — multi-step wizards use `I · II · III` in brass mono; Direct run-track stage numbers.
 - **Upright-serif phrases** — CTAs and placeholders use upright serif phrases (no italics anywhere; `em, i { font-style: normal }` enforced globally).
 

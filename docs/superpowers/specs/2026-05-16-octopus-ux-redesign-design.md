@@ -209,7 +209,7 @@ Storage: extend the `Workspace` type with optional `glyph?: string` and `tint?: 
 ### 4.1 Welcome (no project open)
 
 - Full-bleed onyx with a soft radial brass glow at top.
-- Centered card: 56px circular mark with italic-serif "O" in brass; below it "Octopus & you" in 28px italic serif with the ampersand alone in brass; subtitle "eight arms · one mind" in mono uppercase / 0.35em tracking.
+- Centered card: 56px circular mark with serif "O" in brass; below it the "Octopush" wordmark in 28px serif (the "Octopus & you" tagline is retired — too consumer-y for a dev tool); subtitle "eight arms · one mind" in mono uppercase / 0.35em tracking.
 - A 28px gradient brass rule under the subtitle.
 - A single primary CTA: *"Begin a new study"* (italic-serif inside a brass-ghost button).
 - Below: "or — Drop a folder, or **open one from disk**".
@@ -316,7 +316,7 @@ Two-pane layout (separate from the Atelier shell — this is a focused creation 
 
 Five details that should be unmistakably *Octopus*:
 
-1. **The brass ampersand.** "Octopus & you" — the ampersand alone in brass. Small, ceremonial, repeatable across about/welcome surfaces.
+1. **The brass ampersand.** The ampersand is the one brass typographic accent (e.g. "Onyx & Brass") — small, used sparingly. (The "Octopus & you" tagline is **retired** — too consumer-y for a developer tool.)
 2. **The brass `⟶`.** Replaces the shell `$` and chat prompt glyphs everywhere — terminal, command palette, input bar nudges. Tiny but consistent.
 3. **`§` tool cards.** Every tool call appears prefixed with a brass `§` and a mono label (`§ READ`, `§ WRITE`, `§ RUN`). A marginalia note, not a button.
 4. **Roman numerals in wizards.** All multi-step flows numbered `I · II · III` in brass mono. Feels like a manuscript, not a form.

@@ -35,7 +35,7 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 
 ### Five signature details — preserve these always
 
-- **`&` in brass** — "Octopus & you" branding. The ampersand alone is brass.
+- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
 - **`⟶` in brass** — the prompt glyph everywhere (terminal, palette, input nudges).
 - **`§` in brass** — every tool call card is prefixed with `§ TOOL_NAME`.
 - **Roman numerals** — multi-step wizards use `I · II · III` in brass mono.

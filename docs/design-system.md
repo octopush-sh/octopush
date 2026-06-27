@@ -140,7 +140,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 | Detail        | Status | Where to use                                                        |
 |---------------|--------|---------------------------------------------------------------------|
-| `&` in brass  | Active | "Octopus & you" branding moments (welcome, about)                   |
+| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass"), used sparingly  |
 | `⟶` in brass — **structural only** | Active (structural); **RETIRED as ornament** | **KEEP:** Direct run-track stage connector; Direct checkpoint gate flow. **DO NOT add** as prompt glyph, input nudge, or button decoration on any new surface. |
 | `⟜` in brass | Active | Direct run-track checkpoint gate — pauses the pipeline for human approval |
 | `§` in brass  | Active | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER`. This prefix is structural; do not retire it. |

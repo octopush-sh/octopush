@@ -241,17 +241,21 @@ fn handle_callback_conn(mut stream: TcpStream, expected_state: &str) -> Option<R
     }
     let (code, state, error) = parse_callback_query(target);
     let decision = decide_callback(code, state, error, expected_state);
-    let (status, title, body) = match &decision {
-        Ok(_) => ("200 OK", "Signed in", "You can close this tab and return to Octopush.".to_string()),
-        Err(msg) => ("400 Bad Request", "Sign-in failed", msg.clone()),
+    let (status, html) = match &decision {
+        Ok(_) => (
+            "200 OK",
+            callback_html(
+                "Signed in",
+                "You're all set — close this tab and head back to Octopush.",
+                "You can close this window",
+                false,
+            ),
+        ),
+        Err(msg) => (
+            "400 Bad Request",
+            callback_html("Sign-in didn't complete", msg, "Return to Octopush and try again", true),
+        ),
     };
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
-         <style>body{{font-family:-apple-system,system-ui,sans-serif;background:#0c0a08;color:#f4ecdb;\
-         display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}\
-         .c{{text-align:center}}h1{{color:#d4a574;font-weight:500}}</style></head>\
-         <body><div class=\"c\"><h1>{title}</h1><p>{body}</p></div></body></html>"
-    );
     let _ = stream.write_all(
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
@@ -260,6 +264,77 @@ fn handle_callback_conn(mut stream: TcpStream, expected_state: &str) -> Option<R
         .as_bytes(),
     );
     Some(decision)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The branded page the browser shows after the OAuth redirect (Atelier in Onyx
+/// & Brass). The dynamic `body` — which may carry the provider's `error` query
+/// param — is HTML-escaped to prevent reflected injection on the loopback page.
+fn callback_html(title: &str, body: &str, hint: &str, is_error: bool) -> String {
+    const TEMPLATE: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ · Octopush</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --onyx:#0c0a08;--panel:#14110d;--hairline:#2a2419;
+    --brass:#d4a574;--ivory:#f4ecdb;--sage:#95897a;--mute:#6d6354;--rouge:#d18b8b;
+    --serif:"Spectral",Georgia,"Times New Roman",serif;--mono:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--onyx);color:var(--ivory);font-family:var(--serif);
+    display:flex;align-items:center;justify-content:center;min-height:100vh;
+    padding:24px;position:relative;overflow:hidden;-webkit-font-smoothing:antialiased}
+  .glow{position:fixed;border-radius:50%;filter:blur(120px);pointer-events:none}
+  .glow-1{width:520px;height:520px;background:radial-gradient(circle,rgba(212,165,116,.16),transparent 70%);top:-180px;left:50%;transform:translateX(-50%)}
+  .glow-2{width:380px;height:380px;background:radial-gradient(circle,rgba(212,165,116,.07),transparent 70%);bottom:-160px;right:-90px}
+  .card{position:relative;z-index:1;text-align:center;max-width:440px;animation:rise .5s cubic-bezier(.2,.8,.3,1) both}
+  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  .mark{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;
+    border-radius:16px;background:var(--panel);border:1px solid var(--hairline);
+    font-family:var(--serif);font-weight:600;font-size:38px;line-height:1;color:var(--brass);
+    margin-bottom:26px;box-shadow:0 0 0 1px rgba(212,165,116,.06),0 24px 60px -24px rgba(0,0,0,.8)}
+  .mark.err{color:var(--rouge)}
+  h1{font-family:var(--serif);font-weight:500;font-size:26px;margin:0 0 12px;letter-spacing:-.01em;color:var(--ivory)}
+  p{font-family:var(--serif);font-size:15.5px;line-height:1.65;color:var(--sage);margin:0 auto;max-width:34ch}
+  .hint{margin-top:30px;font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;color:var(--mute);text-transform:uppercase}
+  .brand{position:fixed;bottom:30px;left:0;right:0;text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--mute);z-index:1}
+  .brand b{color:var(--brass);font-weight:500}
+  @media (prefers-reduced-motion:reduce){.card{animation:none}}
+</style>
+</head>
+<body>
+  <div class="glow glow-1"></div>
+  <div class="glow glow-2"></div>
+  <main class="card">
+    <div class="mark __MARKCLS__">§</div>
+    <h1>__TITLE__</h1>
+    <p>__BODY__</p>
+    <div class="hint">__HINT__</div>
+  </main>
+  <div class="brand">Octopush</div>
+</body>
+</html>"##;
+    // Substitute the attacker-influenceable __BODY__ LAST, so a body that happens
+    // to contain another placeholder literal (e.g. "__HINT__") is never re-replaced.
+    TEMPLATE
+        .replace("__TITLE__", &html_escape(title))
+        .replace("__HINT__", &html_escape(hint))
+        .replace("__MARKCLS__", if is_error { "err" } else { "" })
+        .replace("__BODY__", &html_escape(body))
 }
 
 /// Poll the loopback listener (non-blocking, so the thread is never parked
@@ -823,6 +898,34 @@ mod tests {
 
         let (_, _, error) = parse_callback_query("/callback?error=access_denied");
         assert_eq!(error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn html_escape_covers_the_dangerous_chars() {
+        assert_eq!(html_escape("<a href=\"x\">& '"), "&lt;a href=&quot;x&quot;&gt;&amp; &#39;");
+    }
+
+    #[test]
+    fn callback_html_escapes_the_body_and_brands_the_page() {
+        // A provider error param carrying HTML must not break out into markup.
+        let page = callback_html(
+            "Sign-in didn't complete",
+            "Clerk reported: <script>alert(1)</script>",
+            "Return to Octopush",
+            true,
+        );
+        assert!(!page.contains("<script>alert(1)</script>"));
+        assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        // Branded chrome + the error mark.
+        assert!(page.contains(">Octopush</div>"));
+        assert!(page.contains("class=\"mark err\""));
+        // Success uses the plain mark (no error class).
+        let ok = callback_html("Signed in", "All set.", "You can close this window", false);
+        assert!(ok.contains("class=\"mark \""));
+        // A body containing a placeholder literal must not trigger a second-order replace.
+        let tricky = callback_html("Signed in", "weird __HINT__ value", "HINTTEXT", false);
+        assert!(tricky.contains("weird __HINT__ value"));
+        assert!(!tricky.contains("weird HINTTEXT value"));
     }
 
     #[test]

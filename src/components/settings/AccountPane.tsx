@@ -48,7 +48,7 @@ export function AccountPane() {
     <>
       <PaneHeader
         eyebrow="Account"
-        title="Octopus & you."
+        title="Your account."
         subtitle="Octopush is free and local-first. An account unlocks premium — the multi-agent orchestration harness — and, later, sync across machines. Your provider keys and local data never leave this device."
       />
 
