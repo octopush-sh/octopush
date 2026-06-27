@@ -1313,6 +1313,14 @@ pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
     crate::auth::refresh_identity().await
 }
 
+/// Force a token refresh and return the current plan. Called right after the user
+/// returns from checkout so a freshly-minted access token reflects the new plan —
+/// lets Pro appear without a manual sign-out / sign-in.
+#[tauri::command]
+pub async fn auth_sync_plan() -> AppResult<Option<String>> {
+    crate::auth::sync_plan().await
+}
+
 /// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend
 /// opens it in the browser via `open_file_in_system`.
 #[tauri::command]

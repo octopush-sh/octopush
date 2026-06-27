@@ -879,6 +879,7 @@ export const ipc = {
   authBeginSignIn: () => invoke<AuthStatus>("auth_begin_sign_in"),
   authCancelSignIn: () => invoke<void>("auth_cancel_sign_in"),
   authRefresh: () => invoke<AuthStatus>("auth_refresh"),
+  authSyncPlan: () => invoke<string | null>("auth_sync_plan"),
   authSignOut: () => invoke<void>("auth_sign_out"),
   authAccountPortalUrl: () => invoke<string>("auth_account_portal_url"),
   billingCheckoutUrl: () => invoke<string>("billing_checkout_url"),

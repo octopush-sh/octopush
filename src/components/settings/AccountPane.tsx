@@ -6,6 +6,7 @@ import { useEffect } from "react";
 import { useAuth } from "../../hooks/useAuth";
 import { useEntitlement } from "../../hooks/useEntitlement";
 import { ipc } from "../../lib/ipc";
+import { awaitProAfterCheckout } from "../../lib/awaitPro";
 import { pushToast } from "../Toasts";
 import { PaneHeader, SectionLabel } from "./shared";
 
@@ -38,6 +39,7 @@ export function AccountPane() {
     try {
       const url = await ipc.billingCheckoutUrl();
       await ipc.openFileInSystem(url);
+      awaitProAfterCheckout();
     } catch (e) {
       console.error("Failed to open checkout:", e);
       pushToast({ level: "error", title: "Couldn't open checkout" });

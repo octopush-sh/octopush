@@ -752,6 +752,20 @@ pub fn current_identity() -> Option<(String, Option<String>)> {
 /// after the user subscribes. Best-effort: on a transient failure it returns the
 /// existing status unchanged (never signs the user out over a network hiccup).
 pub async fn refresh_identity() -> AppResult<AuthStatus> {
+    refresh_identity_inner(false).await
+}
+
+/// Force a token refresh (mint a fresh access token via the refresh token, even
+/// when the current one hasn't expired), then re-read identity, and return the
+/// current plan. A freshly-minted token carries the latest `public_metadata`, so
+/// a brand-new subscriber sees Pro right after checkout without signing out and
+/// back in (the plan rides on the OAuth session).
+pub async fn sync_plan() -> AppResult<Option<String>> {
+    refresh_identity_inner(true).await?;
+    Ok(current_plan())
+}
+
+async fn refresh_identity_inner(force_token_refresh: bool) -> AppResult<AuthStatus> {
     // Single-flight with status()'s refresh so concurrent calls can't both rotate
     // the refresh token (re-load after acquiring, like status()).
     let _guard = refresh_lock().lock().await;
@@ -764,7 +778,7 @@ pub async fn refresh_identity() -> AppResult<AuthStatus> {
         email: s.email.clone(),
         name: s.name.clone(),
     };
-    if is_expired(session.expires_at.as_deref()) {
+    if force_token_refresh || is_expired(session.expires_at.as_deref()) {
         match refresh_session(&session).await {
             RefreshOutcome::Refreshed(updated) => {
                 let _ = store_session(&updated);

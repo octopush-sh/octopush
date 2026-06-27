@@ -339,6 +339,7 @@ pub fn run() {
             commands::auth_cancel_sign_in,
             commands::auth_status,
             commands::auth_refresh,
+            commands::auth_sync_plan,
             commands::auth_account_portal_url,
             commands::billing_checkout_url,
         ])

@@ -1,5 +1,6 @@
 import { useUpgradeStore } from "../stores/upgradeStore";
 import { ipc } from "../lib/ipc";
+import { awaitProAfterCheckout } from "../lib/awaitPro";
 import { pushToast } from "./Toasts";
 import { ModalShell } from "./ModalShell";
 
@@ -15,6 +16,7 @@ export function UpgradeSheet() {
       const url = await ipc.billingCheckoutUrl();
       await ipc.openFileInSystem(url);
       hide();
+      awaitProAfterCheckout();
     } catch (e) {
       console.error("Failed to open checkout:", e);
       pushToast({ level: "error", title: "Couldn't open checkout" });
