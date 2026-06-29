@@ -49,6 +49,13 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // With WAL, synchronous=NORMAL stays crash-safe (no corruption — only a
+        // power/OS crash can drop the last commit) while committing with far fewer
+        // fsyncs. That shortens how long each write holds the single DB mutex —
+        // which matters under N concurrent Direct runs (Pro parallel runs). The
+        // busy_timeout lets a contended lock wait briefly instead of erroring.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Db { conn };
         db.migrate()?;
