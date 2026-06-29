@@ -36,7 +36,8 @@ export function RunsTray({ onJumpToRun }: { onJumpToRun: (workspaceId: string) =
       .flat()
       .find((w) => w.id === id);
 
-  const label = `${activeRuns.length} run${activeRuns.length > 1 ? "s" : ""} in progress`;
+  const totalCost = activeRuns.reduce((sum, r) => sum + r.costUsd, 0);
+  const label = `${activeRuns.length} run${activeRuns.length > 1 ? "s" : ""} in progress · $${totalCost.toFixed(2)} combined`;
 
   const open = () => {
     const r = btnRef.current?.getBoundingClientRect();
@@ -65,8 +66,14 @@ export function RunsTray({ onJumpToRun }: { onJumpToRun: (workspaceId: string) =
           onDismiss={() => setAnchor(null)}
           widthClass="w-[320px]"
         >
-          <div className="px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
-            Runs in progress
+          <div className="flex items-center justify-between gap-2 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+            <span>Runs in progress</span>
+            <span
+              className="text-octo-brass octo-tabular"
+              title="Combined live cost across all active runs"
+            >
+              ${totalCost.toFixed(2)}
+            </span>
           </div>
           {activeRuns.map((run) => {
             const meta = runStatusMeta(run.status);

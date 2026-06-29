@@ -249,6 +249,18 @@ mod workspace_tests {
     }
 
     #[test]
+    fn db_opens_in_wal_with_normal_sync() {
+        // WAL + synchronous=NORMAL keep writes fast (short mutex hold) without
+        // corruption risk — matters under N concurrent runs.
+        let db = test_db();
+        let conn = db.conn_ref();
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL");
+    }
+
+    #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();
         setup_workspace(&db, "proj-1", "ws-1");
