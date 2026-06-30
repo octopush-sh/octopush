@@ -393,75 +393,74 @@ pub fn create_branch(path: &Path, branch_name: &str, from: &str) -> AppResult<()
     Ok(())
 }
 
-pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> AppResult<()> {
-    // Clean up the working-tree directory itself in case a previous run
-    // bailed mid-way and left a partial checkout.
-    if worktree_path.exists() {
-        let _ = std::fs::remove_dir_all(worktree_path);
+/// Is `path` currently a *valid, registered* worktree of `repo`? Used to make
+/// sure we never delete a real checkout (and its uncommitted work) while
+/// cleaning up leftover directories.
+fn is_live_worktree_at(repo: &Repository, path: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(path);
+    // The main worktree (project root) is never listed by `worktrees()`, but is
+    // very much live — protect it explicitly so we never `rm -rf` the repo.
+    if repo.workdir().is_some_and(|wd| canon(wd) == target) {
+        return true;
     }
+    let Ok(names) = repo.worktrees() else { return false };
+    names.iter().flatten().any(|name| {
+        repo.find_worktree(name)
+            .ok()
+            .is_some_and(|wt| wt.validate().is_ok() && canon(wt.path()) == target)
+    })
+}
+
+pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> AppResult<()> {
+    // Serialize worktree creation process-wide. Two concurrent creates (e.g. a
+    // double-clicked "create", or the app and octopush-mcp at once) would
+    // otherwise race on the same `.git/worktrees/<branch>` slot and checkout
+    // path. Held only across the git work; never nested under the DB lock.
+    static CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialize = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let repo = open_repo(repo_path)?;
 
-    // ── Self-heal stale worktree state ───────────────────────────
-    // A previous failed attempt can leave the repo in one of three
-    // states, all of which would make `repo.worktree(branch, …)` fail:
-    //   1. Registered-but-invalid worktree (`validate().is_err()` —
-    //      working tree dir was deleted out from under libgit2).
-    //   2. Orphan directory at `.git/worktrees/<name>/` that libgit2
-    //      never finished initialising.
-    //   3. A "registered and valid" worktree whose name collides with
-    //      ours — the user is retrying the same task name after a
-    //      previous failure, and the previous attempt got far enough
-    //      to register the worktree even though the user never saw it
-    //      succeed.
+    // Clean up the target directory if a previous run bailed mid-way and left a
+    // partial checkout there — but NEVER delete a live, valid worktree (that
+    // would destroy a real checkout and its uncommitted work). A leftover from a
+    // failed attempt isn't a registered valid worktree, so it's still cleared.
+    if worktree_path.exists() && !is_live_worktree_at(&repo, worktree_path) {
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+
+    // ── Recycle a stale registry slot for THIS branch ────────────
+    // libgit2 names the worktree slot after `branch`, so a previous workspace
+    // for this branch can leave `.git/worktrees/<branch>` behind. If that slot
+    // is invalid (its working tree was deleted out from under git) — or locked,
+    // where libgit2's own `prune` bails out *before* deleting the slot — it then
+    // collides with the slot we're about to create ("failed to make directory
+    // '…/.git/worktrees/<name>': directory exists"), which is the reported bug.
     //
-    // For (3), we force-prune the colliding worktree only when our
-    // top-level `worktree_path.exists()` removal has already wiped its
-    // working tree from disk. That signals "we already decided to
-    // recycle this slot." If the user has an unrelated hand-made
-    // worktree with the same name, its directory wouldn't have been
-    // at `worktree_path`, so it survives.
-    if let Ok(names) = repo.worktrees() {
-        for opt_name in names.iter() {
-            let Some(name) = opt_name else { continue };
-            let Ok(wt) = repo.find_worktree(name) else { continue };
-            let invalid = wt.validate().is_err();
-            let same_name = name == branch;
-            if invalid || same_name {
+    // We recycle that slot, but ONLY when it isn't a valid, live worktree: we
+    // must never deregister another workspace whose checkout is merely
+    // unmounted/locked, nor clobber a valid checkout that happens to occupy a
+    // same-named slot. A live worktree on a *different* path is left alone, and
+    // `repo.worktree()` below surfaces a clear "already checked out" error for
+    // the genuine "branch in use" case.
+    let slot = repo.path().join("worktrees").join(branch);
+    if slot.exists() {
+        let stale = match repo.find_worktree(branch) {
+            Ok(wt) => wt.validate().is_err(),
+            Err(_) => true, // a dir libgit2 can't even open as a worktree
+        };
+        if stale {
+            if let Ok(wt) = repo.find_worktree(branch) {
                 let mut prune_opts = git2::WorktreePruneOptions::new();
-                // Allow pruning even if libgit2 thinks the worktree is
-                // currently valid — we just decided to recycle it.
                 prune_opts.valid(true);
+                prune_opts.locked(true);
                 prune_opts.working_tree(true);
                 let _ = wt.prune(Some(&mut prune_opts));
             }
-        }
-    }
-    // Sweep any orphan directories under .git/worktrees/ that the
-    // registry no longer references (typical when libgit2 created the
-    // dir before failing the rest of the init).
-    if let Some(git_dir) = repo.path().to_str() {
-        let worktrees_meta = std::path::Path::new(git_dir).join("worktrees");
-        if worktrees_meta.exists() {
-            let registered: std::collections::HashSet<String> = repo
-                .worktrees()
-                .ok()
-                .map(|names| {
-                    names
-                        .iter()
-                        .filter_map(|n| n.map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Ok(entries) = std::fs::read_dir(&worktrees_meta) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if registered.contains(&name) {
-                        continue;
-                    }
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
-            }
+            // Whatever prune left behind (a locked slot, or a half-written dir)
+            // gets force-removed so libgit2 can claim the name.
+            let _ = std::fs::remove_dir_all(&slot);
         }
     }
 
@@ -478,8 +477,16 @@ pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> 
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
 
-    repo.worktree(branch, worktree_path, Some(&opts))
-        .map_err(|e| AppError::Other(format!("create worktree: {e}")))?;
+    repo.worktree(branch, worktree_path, Some(&opts)).map_err(|e| {
+        let msg = e.to_string();
+        // Reuse the same friendly phrasing the branch-switch path uses for the
+        // "this branch lives in another worktree" collision.
+        if msg.contains("already checked out") || msg.contains("already used by worktree") {
+            AppError::Other(friendly_switch_error(branch, &msg))
+        } else {
+            AppError::Other(format!("create worktree: {msg}"))
+        }
+    })?;
 
     Ok(())
 }
@@ -1505,5 +1512,177 @@ mod tests {
             ContinueKind::Error,
         );
         assert_eq!(classify_continue(false, "fatal: No rebase in progress?"), ContinueKind::Error);
+    }
+
+    // ── create_worktree: reuse an existing branch ─────────────────
+    // Regression harness for the "branch exists — workspace will reuse it"
+    // flow. Each scenario sets up a different pre-existing state and asserts
+    // create_worktree still lands a usable worktree (or adopts the live one).
+
+    #[test]
+    fn reuse_branch_with_no_worktree_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        // Branch pre-exists, no worktree anywhere.
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &wt_path).unwrap();
+        assert!(wt_path.join("a.txt").exists(), "worktree checked out");
+    }
+
+    #[test]
+    fn reuse_branch_with_incomplete_metadata_dir_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        // Simulate a previous attempt that crashed after libgit2 created
+        // the metadata dir but before it finished initialising it.
+        let repo = open_repo(dir.path()).unwrap();
+        let meta = repo.path().join("worktrees").join("reuse-me");
+        std::fs::create_dir_all(&meta).unwrap();
+        drop(repo);
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &wt_path).unwrap();
+        assert!(wt_path.join("a.txt").exists(), "worktree checked out");
+    }
+
+    #[test]
+    fn reuse_branch_worktree_dir_deleted_out_from_under() {
+        // A previous workspace's working-tree directory was `rm -rf`'d (or
+        // lived on an unmounted drive), leaving a registered-but-invalid
+        // worktree whose `.git/worktrees/<name>` metadata survives.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let old_path = old_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &old_path).unwrap();
+        // Nuke just the working tree; metadata under .git/worktrees stays.
+        std::fs::remove_dir_all(&old_path).unwrap();
+        let repo = open_repo(dir.path()).unwrap();
+        assert!(
+            repo.path().join("worktrees").join("reuse-me").exists(),
+            "metadata survives the rm -rf"
+        );
+        drop(repo);
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &wt_path).unwrap();
+        assert!(wt_path.join("a.txt").exists(), "worktree checked out");
+    }
+
+    #[test]
+    fn reuse_branch_with_locked_stale_worktree_recovers() {
+        // The exact reported failure: a stale slot that libgit2's prune
+        // refuses to remove because it's locked, leaving a `.git/worktrees`
+        // dir that collides with "directory exists". Before the fix this
+        // panicked; now the self-heal force-removes the stale slot.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let old_path = old_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &old_path).unwrap();
+        // Lock it (a `locked` file is exactly what `git worktree lock` writes)
+        // and remove the working tree so the slot is stale AND unprunable.
+        let repo = open_repo(dir.path()).unwrap();
+        let meta = repo.path().join("worktrees").join("reuse-me");
+        std::fs::write(meta.join("locked"), "in use\n").unwrap();
+        std::fs::remove_dir_all(&old_path).unwrap();
+        drop(repo);
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &wt_path).unwrap();
+        assert!(wt_path.join("a.txt").exists(), "worktree checked out");
+    }
+
+    #[test]
+    fn reuse_branch_live_worktree_errors_without_clobbering() {
+        // The branch is checked out in a live, valid worktree elsewhere. Git
+        // can't check a branch out twice, so we must NOT recycle that slot or
+        // clobber its files — we surface a clear error and leave it intact.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_path = other_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &other_path).unwrap();
+        // A local edit proves the live worktree is never touched.
+        std::fs::write(other_path.join("local.txt"), "mine\n").unwrap();
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        let err = create_worktree(dir.path(), "reuse-me", &wt_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("another workspace"),
+            "friendly 'in use' error: {err}"
+        );
+        assert!(other_path.join("local.txt").exists(), "live worktree untouched");
+        assert!(
+            dir.path().join(".git/worktrees/reuse-me").exists(),
+            "the live worktree's slot survives"
+        );
+    }
+
+    #[test]
+    fn create_worktree_never_deletes_a_live_checkout_at_target() {
+        // A live, valid worktree already sits at the exact target path (e.g. a
+        // second Octopush project for the same repo, or a stale DB). Recreating
+        // it must NOT remove_dir_all its files — surface an error instead.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "reuse-me", &base).unwrap();
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reuse-me");
+        create_worktree(dir.path(), "reuse-me", &wt_path).unwrap();
+        std::fs::write(wt_path.join("wip.txt"), "uncommitted\n").unwrap();
+
+        // Same branch, same path, still live → must error, never delete wip.txt.
+        let err = create_worktree(dir.path(), "reuse-me", &wt_path).unwrap_err();
+        assert!(err.to_string().contains("another workspace"), "friendly: {err}");
+        assert!(wt_path.join("wip.txt").exists(), "live checkout's WIP preserved");
+    }
+
+    #[test]
+    fn reuse_branch_checked_out_at_repo_root_errors() {
+        // The default branch lives in the main worktree (the project root).
+        // Creating a second checkout of it must fail cleanly, not corrupt root.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join(&base);
+        let err = create_worktree(dir.path(), &base, &wt_path).unwrap_err();
+        assert!(
+            err.to_string().contains("another workspace"),
+            "friendly 'in use' error: {err}"
+        );
+        assert!(dir.path().join("a.txt").exists(), "project root untouched");
     }
 }

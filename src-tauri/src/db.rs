@@ -1187,6 +1187,45 @@ impl Db {
         Ok(row)
     }
 
+    /// Find a workspace by `(project_id, branch)` regardless of status. There
+    /// is at most one meaningful workspace per branch (git can't check a branch
+    /// out twice); when both an active and an archived row somehow exist we
+    /// prefer the active one. Used to keep workspace creation idempotent —
+    /// including over *archived* rows, which `list_workspaces` hides.
+    pub fn find_workspace_by_branch(
+        &self,
+        project_id: &str,
+        branch: &str,
+    ) -> AppResult<Option<WorkspaceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+             FROM workspaces WHERE project_id = ?1 AND branch = ?2
+             ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![project_id, branch], |r| {
+                Ok(WorkspaceRow {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    name: r.get(2)?,
+                    task: r.get(3)?,
+                    branch: r.get(4)?,
+                    worktree_path: r.get(5)?,
+                    setup_script: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                    last_active: r.get(9)?,
+                    glyph: r.get(10)?,
+                    tint: r.get(11)?,
+                    test_command: r.get(12)?,
+                    linked_issue_key: r.get(13)?,
+                    from_branch: r.get(14)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn update_workspace_link(
         &self,
         workspace_id: &str,
