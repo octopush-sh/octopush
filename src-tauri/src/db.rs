@@ -1238,6 +1238,17 @@ impl Db {
         Ok(())
     }
 
+    /// Update a workspace's on-disk worktree path. Used when a worktree is
+    /// (re)created at a different location than the row originally recorded —
+    /// e.g. the original path was occupied, so `create_worktree` stepped aside.
+    pub fn set_workspace_worktree_path(&self, id: &str, worktree_path: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2",
+            params![worktree_path, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())

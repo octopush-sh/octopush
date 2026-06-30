@@ -696,15 +696,18 @@ pub async fn delete_workspace(
         .unwrap_or(false);
 
     if !is_main_workspace {
-        // Remove worktree directory
+        // Prune the worktree's registry slot (by path — slot names aren't tied to
+        // the branch), remove its working-tree directory, then delete the branch.
         if let Some(wt) = &worktree_path {
+            let _ = crate::git_ops::delete_worktree(
+                std::path::Path::new(&project_path),
+                std::path::Path::new(wt),
+            );
             let wt_path = std::path::Path::new(wt);
             if wt_path.exists() {
                 let _ = std::fs::remove_dir_all(wt_path);
             }
         }
-        // Prune worktree ref and delete branch
-        let _ = crate::git_ops::delete_worktree(std::path::Path::new(&project_path), &branch);
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
     // Remove from DB
@@ -722,6 +725,9 @@ pub async fn archive_workspace(
     branch: String,
     worktree_path: Option<String>,
 ) -> AppResult<()> {
+    // Archive keeps the branch and prunes the slot by path, so `branch` is no
+    // longer needed here; retained in the signature for IPC/API symmetry.
+    let _ = &branch;
     let project_path = expand_tilde(&project_path);
     let project_path_abs = std::fs::canonicalize(&project_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
@@ -739,16 +745,20 @@ pub async fn archive_workspace(
         .unwrap_or(false);
 
     if !is_main_workspace {
-        // Remove worktree directory
+        // Prune the worktree's registry slot (by path — slot names aren't tied
+        // to the branch) BUT KEEP the branch — that's the point of archive vs
+        // delete. Prune first (while the slot still resolves), then remove the
+        // working-tree directory.
         if let Some(wt) = &worktree_path {
+            let _ = crate::git_ops::delete_worktree(
+                std::path::Path::new(&project_path),
+                std::path::Path::new(wt),
+            );
             let wt_path = std::path::Path::new(wt);
             if wt_path.exists() {
                 let _ = std::fs::remove_dir_all(wt_path);
             }
         }
-        // Prune worktree ref — but KEEP the branch (this is the whole point of
-        // archive vs delete).
-        let _ = crate::git_ops::delete_worktree(std::path::Path::new(&project_path), &branch);
     }
     // Mark archived in DB (row survives, hidden from the rail)
     state.db.lock().archive_workspace(&workspace_id)?;
@@ -780,17 +790,23 @@ pub async fn restore_workspace(
     if let Some(wt) = worktree_path {
         let wt = expand_tilde(&wt);
         // The "main" workspace points at the project root itself. Never recreate
-        // a worktree there — create_worktree self-heals by remove_dir_all'ing an
-        // existing target path, which would wipe the repo root. (Mirrors the
+        // a worktree there — that would wipe the repo root. (Mirrors the
         // is_main_workspace guard in archive_workspace/delete_workspace.)
         let wt_abs = std::fs::canonicalize(&wt)
             .unwrap_or_else(|_| std::path::PathBuf::from(&wt));
         if wt_abs != project_path_abs {
-            crate::git_ops::create_worktree(
+            // create_worktree returns where it actually landed (it steps aside if
+            // the original path/slot is occupied); persist that so the row points
+            // at the real worktree.
+            let actual = crate::git_ops::create_worktree(
                 std::path::Path::new(&project_path),
                 &branch,
                 std::path::Path::new(&wt),
             )?;
+            let actual_str = actual.to_string_lossy().to_string();
+            if actual_str != wt {
+                state.db.lock().set_workspace_worktree_path(&workspace_id, &actual_str)?;
+            }
         }
     }
     state.db.lock().restore_workspace(&workspace_id)

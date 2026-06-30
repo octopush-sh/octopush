@@ -3,7 +3,7 @@
 use crate::error::{AppError, AppResult};
 use git2::{Repository, StatusOptions, WorktreeAddOptions};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -393,94 +393,183 @@ pub fn create_branch(path: &Path, branch_name: &str, from: &str) -> AppResult<()
     Ok(())
 }
 
-/// Is `path` currently a *valid, registered* worktree of `repo`? Used to make
-/// sure we never delete a real checkout (and its uncommitted work) while
-/// cleaning up leftover directories.
+/// Upper bound on how far we'll suffix a worktree path/slot name before giving
+/// up — a safety backstop so collision loops can never spin forever.
+const MAX_SUFFIX: usize = 10_000;
+
+/// Resolve `p` to a comparable absolute form. If `p` itself can't be
+/// canonicalized because its leaf doesn't exist (e.g. a worktree whose directory
+/// was already removed), canonicalize the PARENT and re-append the leaf so that
+/// symlinked prefixes (macOS `/var` → `/private/var`) still compare equal.
+fn canonical(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(leaf)) if !parent.as_os_str().is_empty() => std::fs::canonicalize(parent)
+            .map(|pc| pc.join(leaf))
+            .unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Is `path` currently a *valid, registered* worktree of `repo` (or the repo's
+/// own main worktree)? Used so we never delete a real checkout — or the project
+/// root — while clearing leftover directories.
 fn is_live_worktree_at(repo: &Repository, path: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let target = canon(path);
-    // The main worktree (project root) is never listed by `worktrees()`, but is
-    // very much live — protect it explicitly so we never `rm -rf` the repo.
-    if repo.workdir().is_some_and(|wd| canon(wd) == target) {
-        return true;
+    let target = canonical(path);
+    if repo.workdir().is_some_and(|wd| canonical(wd) == target) {
+        return true; // the main worktree (never listed by worktrees())
     }
     let Ok(names) = repo.worktrees() else { return false };
     names.iter().flatten().any(|name| {
         repo.find_worktree(name)
             .ok()
-            .is_some_and(|wt| wt.validate().is_ok() && canon(wt.path()) == target)
+            .is_some_and(|wt| wt.validate().is_ok() && canonical(wt.path()) == target)
     })
 }
 
-pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> AppResult<()> {
-    // Serialize worktree creation process-wide. Two concurrent creates (e.g. a
-    // double-clicked "create", or the app and octopush-mcp at once) would
-    // otherwise race on the same `.git/worktrees/<branch>` slot and checkout
-    // path. Held only across the git work; never nested under the DB lock.
+/// If `branch` is checked out in a live worktree (incl. the main one), return
+/// that worktree's path. Git allows a branch in only one worktree, so this is
+/// how we detect "already in use" before trying — and failing — to make a second
+/// checkout. Reuse of an *existing workspace* is handled one layer up (by branch
+/// in the DB); this is purely the git-level guard.
+fn live_worktree_on_branch(repo: &Repository, branch: &str) -> Option<PathBuf> {
+    let on_branch = |dir: &Path| -> bool {
+        let Ok(sub) = Repository::open(dir) else { return false };
+        let Ok(head) = sub.head() else { return false };
+        head.is_branch() && head.shorthand() == Some(branch)
+    };
+    if let Some(wd) = repo.workdir() {
+        if repo.head().ok().is_some_and(|h| h.is_branch() && h.shorthand() == Some(branch)) {
+            return Some(canonical(wd));
+        }
+    }
+    let names = repo.worktrees().ok()?;
+    for name in names.iter().flatten() {
+        if let Ok(wt) = repo.find_worktree(name) {
+            if wt.validate().is_ok() && on_branch(wt.path()) {
+                return Some(canonical(wt.path()));
+            }
+        }
+    }
+    None
+}
+
+/// `<dir>/<stem>-<n>` — used to pick a non-colliding sibling path/name.
+fn suffixed(base: &Path, n: usize) -> PathBuf {
+    let stem = base.file_name().and_then(|s| s.to_str()).unwrap_or("workspace");
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}-{n}"))
+}
+
+/// Create a worktree that checks out `branch`, and return the path it actually
+/// landed at (usually `worktree_path`).
+///
+/// The hard rule git enforces — a branch may be checked out in only ONE worktree
+/// — and the fact that libgit2 names the `.git/worktrees/<name>` slot after the
+/// name we pass, are the two things this function navigates carefully:
+///
+///  * If `branch` is already checked out somewhere, we don't make a second
+///    checkout — we return a friendly error (reuse is handled by the caller via
+///    the workspace DB).
+///  * Otherwise we pick a **free slot name** and a **free working-tree path**,
+///    decoupled from the branch, so a leftover/locked/foreign slot of the same
+///    name can NEVER block creation (the reported "directory exists" bug) and we
+///    never clobber or deregister someone else's worktree to make room. Genuinely
+///    stale leftovers (no live worktree behind them) are reclaimed in place.
+pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> AppResult<PathBuf> {
+    // Serialize worktree creation process-wide so two concurrent creates can't
+    // race the same slot/path. Held only across the git work; never under the DB
+    // lock.
     static CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serialize = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let repo = open_repo(repo_path)?;
 
-    // Clean up the target directory if a previous run bailed mid-way and left a
-    // partial checkout there — but NEVER delete a live, valid worktree (that
-    // would destroy a real checkout and its uncommitted work). A leftover from a
-    // failed attempt isn't a registered valid worktree, so it's still cleared.
-    if worktree_path.exists() && !is_live_worktree_at(&repo, worktree_path) {
-        let _ = std::fs::remove_dir_all(worktree_path);
+    // Git constraint: the branch can live in only one worktree. If it's already
+    // checked out, refuse clearly instead of producing a cryptic libgit2 error.
+    if let Some(existing) = live_worktree_on_branch(&repo, branch) {
+        return Err(AppError::Other(friendly_switch_error(
+            branch,
+            &format!("'{branch}' is already checked out at {}", existing.display()),
+        )));
     }
 
-    // ── Recycle a stale registry slot for THIS branch ────────────
-    // libgit2 names the worktree slot after `branch`, so a previous workspace
-    // for this branch can leave `.git/worktrees/<branch>` behind. If that slot
-    // is invalid (its working tree was deleted out from under git) — or locked,
-    // where libgit2's own `prune` bails out *before* deleting the slot — it then
-    // collides with the slot we're about to create ("failed to make directory
-    // '…/.git/worktrees/<name>': directory exists"), which is the reported bug.
-    //
-    // We recycle that slot, but ONLY when it isn't a valid, live worktree: we
-    // must never deregister another workspace whose checkout is merely
-    // unmounted/locked, nor clobber a valid checkout that happens to occupy a
-    // same-named slot. A live worktree on a *different* path is left alone, and
-    // `repo.worktree()` below surfaces a clear "already checked out" error for
-    // the genuine "branch in use" case.
-    let slot = repo.path().join("worktrees").join(branch);
-    if slot.exists() {
-        let stale = match repo.find_worktree(branch) {
+    // Pick a free working-tree PATH. We only ever DELETE at the requested
+    // standard path, and only a stale leftover there (a partial checkout from a
+    // failed run) — never a live worktree. If the standard path is occupied by a
+    // live worktree (or a dir we can't clear), we STEP ASIDE to a fresh suffixed
+    // path that does not yet exist — never deleting anything at a stepped-aside
+    // path, so unrelated files there are safe.
+    let mut target = worktree_path.to_path_buf();
+    if target.exists() && !is_live_worktree_at(&repo, &target) {
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    let mut n = 2;
+    while target.exists() {
+        target = suffixed(worktree_path, n);
+        n += 1;
+        if n > MAX_SUFFIX {
+            return Err(AppError::Other(
+                "could not find a free worktree path".into(),
+            ));
+        }
+    }
+
+    // Pick a free SLOT name. Reclaim a stale slot of the natural name (the common
+    // self-heal: a previous worktree for this branch whose checkout is gone, or a
+    // locked slot libgit2's own prune won't clear); otherwise suffix past a slot
+    // that still backs a live worktree (which we must not touch). Callers always
+    // open the main repo, so `repo.path()` is the common dir where slots live.
+    let worktrees_dir = repo.path().join("worktrees");
+    let mut name = branch.to_string();
+    let mut n = 2;
+    loop {
+        let slot = worktrees_dir.join(&name);
+        if !slot.exists() {
+            break; // free name
+        }
+        let stale = match repo.find_worktree(&name) {
             Ok(wt) => wt.validate().is_err(),
             Err(_) => true, // a dir libgit2 can't even open as a worktree
         };
         if stale {
-            if let Ok(wt) = repo.find_worktree(branch) {
+            if let Ok(wt) = repo.find_worktree(&name) {
                 let mut prune_opts = git2::WorktreePruneOptions::new();
                 prune_opts.valid(true);
                 prune_opts.locked(true);
                 prune_opts.working_tree(true);
                 let _ = wt.prune(Some(&mut prune_opts));
             }
-            // Whatever prune left behind (a locked slot, or a half-written dir)
-            // gets force-removed so libgit2 can claim the name.
-            let _ = std::fs::remove_dir_all(&slot);
+            // If we actually cleared it, claim the natural name; otherwise step
+            // aside (this also guarantees the loop terminates).
+            if std::fs::remove_dir_all(&slot).is_ok() || !slot.exists() {
+                break;
+            }
+        }
+        name = format!("{branch}-{n}");
+        n += 1;
+        if n > MAX_SUFFIX {
+            return Err(AppError::Other(
+                "could not find a free worktree slot name".into(),
+            ));
         }
     }
 
-    std::fs::create_dir_all(
-        worktree_path.parent().unwrap_or(worktree_path),
-    )?;
+    std::fs::create_dir_all(target.parent().unwrap_or(&target))?;
 
-    // Use WorktreeAddOptions with the existing branch reference so
-    // git2 doesn't try to create a new refs/heads/<name> (which would
-    // conflict with the branch we already created in create_branch).
-    let branch_ref = repo.find_reference(&format!("refs/heads/{branch}"))
+    // Attach the EXISTING branch ref so git2 doesn't try to create a new
+    // refs/heads/<name> from the (possibly suffixed) worktree name.
+    let branch_ref = repo
+        .find_reference(&format!("refs/heads/{branch}"))
         .map_err(|e| AppError::Other(format!("branch '{branch}' not found: {e}")))?;
 
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
 
-    repo.worktree(branch, worktree_path, Some(&opts)).map_err(|e| {
+    repo.worktree(&name, &target, Some(&opts)).map_err(|e| {
         let msg = e.to_string();
-        // Reuse the same friendly phrasing the branch-switch path uses for the
-        // "this branch lives in another worktree" collision.
         if msg.contains("already checked out") || msg.contains("already used by worktree") {
             AppError::Other(friendly_switch_error(branch, &msg))
         } else {
@@ -488,16 +577,27 @@ pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> 
         }
     })?;
 
-    Ok(())
+    Ok(target)
 }
 
-pub fn delete_worktree(repo_path: &Path, worktree_name: &str) -> AppResult<()> {
+/// Prune the registry slot for the worktree living at `worktree_path`. We match
+/// by PATH, not by name, because slot names are no longer guaranteed to equal
+/// the branch (see `create_worktree`) — a previous name-based lookup would miss
+/// a suffixed slot and leak it.
+pub fn delete_worktree(repo_path: &Path, worktree_path: &Path) -> AppResult<()> {
     let repo = open_repo(repo_path)?;
-    if let Ok(wt) = repo.find_worktree(worktree_name) {
-        let mut opts = git2::WorktreePruneOptions::new();
-        opts.valid(true);
-        opts.working_tree(true);
-        let _ = wt.prune(Some(&mut opts));
+    let target = canonical(worktree_path);
+    let Ok(names) = repo.worktrees() else { return Ok(()) };
+    for name in names.iter().flatten() {
+        if let Ok(wt) = repo.find_worktree(name) {
+            if canonical(wt.path()) == target {
+                let mut opts = git2::WorktreePruneOptions::new();
+                opts.valid(true);
+                opts.locked(true);
+                opts.working_tree(true);
+                let _ = wt.prune(Some(&mut opts));
+            }
+        }
     }
     Ok(())
 }
@@ -1665,6 +1765,105 @@ mod tests {
         let err = create_worktree(dir.path(), "reuse-me", &wt_path).unwrap_err();
         assert!(err.to_string().contains("another workspace"), "friendly: {err}");
         assert!(wt_path.join("wip.txt").exists(), "live checkout's WIP preserved");
+    }
+
+    #[test]
+    fn reuse_branch_when_slot_name_held_by_other_branch_succeeds() {
+        // THE reported "directory exists" bug: a worktree whose SLOT is named
+        // after our branch is checked out on a DIFFERENT branch (e.g. a workspace
+        // created as guide-x then switched). Branch guide-x is no longer checked
+        // out anywhere, but `.git/worktrees/guide-x` exists and validates — the
+        // old self-heal left it and `repo.worktree` collided on mkdir. Now we use
+        // a non-colliding slot name and succeed without touching the other one.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "guide-x", &base).unwrap();
+        create_branch(dir.path(), "other", &base).unwrap();
+
+        let p1_dir = tempfile::tempdir().unwrap();
+        let p1 = p1_dir.path().join("guide-x");
+        create_worktree(dir.path(), "guide-x", &p1).unwrap();
+        std::fs::write(p1.join("keep.txt"), "x\n").unwrap();
+        Repository::open(&p1).unwrap().set_head("refs/heads/other").unwrap();
+        assert!(dir.path().join(".git/worktrees/guide-x").exists());
+
+        // Create a NEW workspace for guide-x at a fresh path → must succeed.
+        let p2_dir = tempfile::tempdir().unwrap();
+        let p2 = p2_dir.path().join("guide-x");
+        let landed = create_worktree(dir.path(), "guide-x", &p2).unwrap();
+        assert_eq!(landed, p2, "used the requested path (only the slot collided)");
+        assert!(p2.join("a.txt").exists(), "new worktree checked out on guide-x");
+        // The colliding worktree (and its files) is untouched.
+        assert!(p1.join("keep.txt").exists(), "other worktree untouched");
+        assert!(dir.path().join(".git/worktrees/guide-x").exists(), "its slot survives");
+    }
+
+    #[test]
+    fn create_steps_aside_when_target_path_and_slot_both_occupied() {
+        // Same as above but the live worktree sits at the EXACT path we want.
+        // We must step aside to a fresh path + slot, never clobbering it.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "guide-x", &base).unwrap();
+        create_branch(dir.path(), "other", &base).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let occupied = parent.path().join("guide-x");
+        create_worktree(dir.path(), "guide-x", &occupied).unwrap();
+        std::fs::write(occupied.join("keep.txt"), "x\n").unwrap();
+        Repository::open(&occupied).unwrap().set_head("refs/heads/other").unwrap();
+
+        // Ask for the SAME path; create_worktree must land elsewhere.
+        let landed = create_worktree(dir.path(), "guide-x", &occupied).unwrap();
+        assert_ne!(landed, occupied, "stepped aside from the occupied path");
+        assert!(landed.join("a.txt").exists(), "new worktree checked out");
+        assert!(occupied.join("keep.txt").exists(), "occupant untouched");
+    }
+
+    #[test]
+    fn delete_worktree_prunes_by_path_even_with_nonbranch_slot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let base = default_branch(dir.path()).unwrap().unwrap();
+        create_branch(dir.path(), "guide-x", &base).unwrap();
+        create_branch(dir.path(), "other", &base).unwrap();
+
+        // Force a non-branch slot name by occupying the natural one first.
+        let p1_dir = tempfile::tempdir().unwrap();
+        let p1 = p1_dir.path().join("guide-x");
+        create_worktree(dir.path(), "guide-x", &p1).unwrap();
+        Repository::open(&p1).unwrap().set_head("refs/heads/other").unwrap();
+
+        let p2_dir = tempfile::tempdir().unwrap();
+        let p2 = p2_dir.path().join("guide-x");
+        let landed = create_worktree(dir.path(), "guide-x", &p2).unwrap();
+        // Its slot is NOT "guide-x" (that name was taken).
+        let listed: Vec<String> = open_repo(dir.path())
+            .unwrap()
+            .worktrees()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(String::from)
+            .collect();
+        assert!(listed.iter().any(|n| n != "guide-x"), "a suffixed slot exists: {listed:?}");
+
+        // delete_worktree by PATH prunes the right slot.
+        delete_worktree(dir.path(), &landed).unwrap();
+        let after: Vec<String> = open_repo(dir.path())
+            .unwrap()
+            .worktrees()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(String::from)
+            .collect();
+        assert_eq!(after, vec!["guide-x".to_string()], "only the original slot remains");
     }
 
     #[test]

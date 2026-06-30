@@ -129,13 +129,15 @@ fn provision_worktree(
     // create_branch is idempotent — it reuses an existing branch of this name.
     crate::git_ops::create_branch(project_path, branch, &base)?;
 
-    let worktree_path = project_path
+    let desired = project_path
         .parent()
         .unwrap_or(project_path)
         .join(format!(".octopus-worktrees/{branch}"));
-    crate::git_ops::create_worktree(project_path, branch, &worktree_path)?;
+    // create_worktree returns where the worktree ACTUALLY landed — it may differ
+    // from `desired` if that path/slot was occupied by another live worktree.
+    let actual = crate::git_ops::create_worktree(project_path, branch, &desired)?;
 
-    Ok((base, worktree_path))
+    Ok((base, actual))
 }
 
 /// Hand back the existing workspace for this branch, making sure it's usable.
@@ -149,12 +151,20 @@ fn reuse_or_restore(
     project_path: &Path,
     ws: WorkspaceRow,
 ) -> AppResult<WorkspaceRow> {
+    let mut ws = ws;
     if let Some(wt) = ws.worktree_path.as_deref() {
         let wt_path = Path::new(wt);
         // A present worktree has a `.git` entry (a file, for linked worktrees).
         let missing = !wt_path.join(".git").exists();
         if missing && !same_path(wt_path, project_path) {
-            crate::git_ops::create_worktree(project_path, &ws.branch, wt_path)?;
+            // Rebuild it. create_worktree may land it at a different path if the
+            // original is now occupied; persist wherever it actually landed.
+            let actual = crate::git_ops::create_worktree(project_path, &ws.branch, wt_path)?;
+            if canonical_or(&actual) != canonical_or(wt_path) {
+                let actual_str = actual.to_string_lossy().to_string();
+                db.lock().set_workspace_worktree_path(&ws.id, &actual_str)?;
+                ws.worktree_path = Some(actual_str);
+            }
         }
     }
 
@@ -169,13 +179,16 @@ fn reuse_or_restore(
     Ok(ws)
 }
 
+fn canonical_or(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Path equality with the same raw-string fallback the archive/restore commands
 /// use: a `canonicalize` failure (broken symlink, restricted parent) must not
 /// be read as "different path" — that's how an archived main workspace could be
 /// mistaken for a normal one and its project root clobbered.
 fn same_path(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(a) == canon(b)
+    canonical_or(a) == canonical_or(b)
 }
 
 #[cfg(test)]
@@ -249,8 +262,8 @@ mod tests {
         // Archive it (drop the worktree dir + mark the row archived), as the
         // archive command does.
         let wt = ws.worktree_path.clone().unwrap();
+        crate::git_ops::delete_worktree(&repo, std::path::Path::new(&wt)).unwrap();
         std::fs::remove_dir_all(&wt).ok();
-        crate::git_ops::delete_worktree(&repo, "arch-branch").unwrap();
         db.lock().archive_workspace(&ws.id).unwrap();
         assert!(db.lock().list_workspaces("p1").unwrap().is_empty(), "hidden once archived");
 
