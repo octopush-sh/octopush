@@ -546,27 +546,19 @@ pub async fn create_workspace(
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
 
-    // Ensure the repo has at least one commit (empty repos can't branch).
-    crate::git_ops::ensure_initial_commit(project_path)?;
-
-    // Explicit base branch wins; blank falls back to the repo's default.
-    let base = crate::git_ops::resolve_base(
+    // Single shared code path with octopush-mcp. We pass the Mutex (not a held
+    // guard) so workspace::create locks only for its brief DB reads/writes and
+    // never across the worktree checkout.
+    crate::workspace::create(
+        &state.db,
+        &project_id,
+        project_path,
+        &name,
+        &task,
+        &branch,
         &from_branch,
-        crate::git_ops::default_branch(project_path)?,
-    )?;
-
-    crate::git_ops::create_branch(project_path, &branch, &base)?;
-    let wt_path = project_path.parent().unwrap_or(project_path)
-        .join(format!(".octopus-worktrees/{}", &branch));
-    crate::git_ops::create_worktree(project_path, &branch, &wt_path)?;
-    let id = uuid::Uuid::new_v4().to_string();
-    state.db.lock().insert_workspace(
-        &id, &project_id, &name, &task, &branch,
-        Some(&wt_path.to_string_lossy()), &setup_script,
-        Some(&base), // the RESOLVED base, not the raw (possibly blank) request
-    )?;
-    let workspaces = state.db.lock().list_workspaces(&project_id)?;
-    Ok(workspaces.into_iter().find(|w| w.id == id).unwrap())
+        &setup_script,
+    )
 }
 
 /// Local + remote-tracking branches for the workspace creator's base picker.

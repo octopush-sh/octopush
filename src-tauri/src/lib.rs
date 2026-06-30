@@ -26,6 +26,7 @@ pub mod settings;
 pub mod skills;
 mod state;
 pub mod talk_shell;
+pub mod workspace;
 pub mod template;
 pub mod theme;
 pub mod token_engine;

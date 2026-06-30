@@ -1,12 +1,15 @@
 //! The Octopush MCP tool surface: definitions (name + JSON Schema) and the
 //! dispatch into `octopush_lib::db`.
 //!
-//! v1 scope is **read + author**, never execute: list/inspect pipelines,
+//! Scope is **read + author**, never execute: list/inspect pipelines,
 //! projects, workspaces, and runs; create/update/delete pipeline templates;
-//! stage runs in `draft`; link a workspace to an issue. Nothing here spends
-//! tokens or touches a git working tree — run execution stays in the app.
+//! stage runs in `draft`; link a workspace to an issue; create a workspace.
+//! Nothing here spends tokens or launches a run — execution stays in the app.
+//! The one place we touch git is `create_workspace`, which materialises a
+//! worktree on disk (the same thing the app's workspace creator does).
 
 use octopush_lib::db::{Db, StageDraft};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 use crate::protocol::{tool_error_result, tool_text_result};
@@ -110,6 +113,35 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": { "workspaceId": { "type": "string" } },
                 "required": ["workspaceId"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
+            "create_workspace",
+            "Create a new workspace (a git worktree) in a project, or reuse the \
+             existing one for the branch. The branch is created if it doesn't \
+             exist and REUSED if it does — so you can start work on a branch a \
+             teammate or another Octopush session already pushed. Idempotent: \
+             one workspace per (project, branch); if a workspace for the branch \
+             already exists it's returned (and un-archived if it was archived) \
+             rather than duplicated. If the branch is currently checked out in \
+             another worktree that Octopush doesn't track, creation fails with a \
+             clear error (git can't check a branch out twice). Unlike the other \
+             tools this one DOES touch git — it materialises a worktree on disk. \
+             The new workspace shows up in Octopush's left rail (refresh the \
+             project, or it appears when the window regains focus). Returns the \
+             workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string", "description": "Project to create the workspace in (see list_projects)." },
+                    "task": { "type": "string", "description": "What this workspace is for. Becomes the default branch slug and name." },
+                    "branch": { "type": ["string", "null"], "description": "Optional explicit branch name; slugified to match the app. Defaults to a slug of `task`. An existing branch is reused." },
+                    "name": { "type": ["string", "null"], "description": "Optional display name for the rail. Defaults to the branch." },
+                    "fromBranch": { "type": ["string", "null"], "description": "Optional base to branch from (local like 'dev' or remote-tracking like 'origin/dev'). Defaults to the repo's default branch. Ignored when the branch already exists." },
+                    "setupScript": { "type": ["string", "null"], "description": "Optional shell script to seed the workspace's setup. Default empty." }
+                },
+                "required": ["projectId", "task"],
                 "additionalProperties": false
             }),
         ),
@@ -221,22 +253,30 @@ fn STAGE_ARRAY_SCHEMA() -> Value {
 /// Dispatch a `tools/call`. Returns the MCP result object (success or in-band
 /// tool error). A `None` return is impossible — unknown tools are reported as
 /// tool errors so the model can recover.
-pub fn call_tool(db: &Db, name: &str, args: &Value) -> Value {
-    let outcome = match name {
-        "describe_pipeline_schema" => Ok(describe_pipeline_schema()),
-        "list_pipelines" => list_pipelines(db),
-        "get_pipeline" => get_pipeline(db, args),
-        "create_pipeline" => save_pipeline(db, args, None),
-        "update_pipeline" => save_pipeline(db, args, Some(())),
-        "delete_pipeline" => delete_pipeline(db, args),
-        "list_projects" => list_projects(db),
-        "list_workspaces" => list_workspaces(db, args),
-        "get_workspace" => get_workspace(db, args),
-        "link_workspace_issue" => link_workspace_issue(db, args),
-        "create_run" => create_run(db, args),
-        "list_runs" => list_runs(db, args),
-        "get_run" => get_run(db, args),
-        other => Err(format!("unknown tool '{other}'")),
+pub fn call_tool(db: &Mutex<Db>, name: &str, args: &Value) -> Value {
+    // `create_workspace` manages its own locking (it must not hold the lock
+    // across the git worktree checkout); every other tool is a quick DB
+    // read/author, so we take the lock once for the call.
+    let outcome = if name == "create_workspace" {
+        create_workspace(db, args)
+    } else {
+        let db = db.lock();
+        match name {
+            "describe_pipeline_schema" => Ok(describe_pipeline_schema()),
+            "list_pipelines" => list_pipelines(&db),
+            "get_pipeline" => get_pipeline(&db, args),
+            "create_pipeline" => save_pipeline(&db, args, None),
+            "update_pipeline" => save_pipeline(&db, args, Some(())),
+            "delete_pipeline" => delete_pipeline(&db, args),
+            "list_projects" => list_projects(&db),
+            "list_workspaces" => list_workspaces(&db, args),
+            "get_workspace" => get_workspace(&db, args),
+            "link_workspace_issue" => link_workspace_issue(&db, args),
+            "create_run" => create_run(&db, args),
+            "list_runs" => list_runs(&db, args),
+            "get_run" => get_run(&db, args),
+            other => Err(format!("unknown tool '{other}'")),
+        }
     };
     match outcome {
         Ok(payload) => tool_text_result(&payload),
@@ -367,6 +407,51 @@ fn get_workspace(db: &Db, args: &Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no workspace with id '{id}'"))?;
     Ok(json!({ "workspace": ws }))
+}
+
+fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
+    let project_id = req_str(args, "projectId")?;
+    let task = req_str(args, "task")?;
+
+    // Resolve the project's on-disk path (brief lock). The DB stores absolute
+    // paths, so we hand it straight to the shared creator (no tilde expansion).
+    let project_path = db
+        .lock()
+        .get_project_by_id(&project_id)
+        .map_err(|e| e.to_string())?
+        .map(|(_, _, path)| path)
+        .ok_or_else(|| format!("no project with id '{project_id}'"))?;
+
+    // Branch defaults to a slug of the task; an explicit branch is slugified
+    // too so it matches what the app's creator would have produced.
+    let branch = match opt_str(args, "branch").filter(|s| !s.trim().is_empty()) {
+        Some(b) => octopush_lib::workspace::slugify(&b),
+        None => octopush_lib::workspace::slugify(&task),
+    };
+    let branch = if branch.is_empty() { "new-workspace".to_string() } else { branch };
+    let name = opt_str(args, "name")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| branch.clone());
+    let from_branch = opt_str(args, "fromBranch").unwrap_or_default();
+    let setup_script = opt_str(args, "setupScript").unwrap_or_default();
+
+    let ws = octopush_lib::workspace::create(
+        db,
+        &project_id,
+        std::path::Path::new(&project_path),
+        &name,
+        &task,
+        &branch,
+        &from_branch,
+        &setup_script,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "workspace": ws,
+        "note": "Workspace ready. It appears in Octopush's left rail when you \
+                 refresh the project or the window regains focus."
+    }))
 }
 
 fn link_workspace_issue(db: &Db, args: &Value) -> Result<Value, String> {

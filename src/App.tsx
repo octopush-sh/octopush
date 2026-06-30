@@ -516,13 +516,17 @@ function App() {
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
-  // Refresh the rail's git signal when the window regains focus — calm,
-  // event-driven (no polling). Summaries are cheap (local libgit2).
+  // Refresh the rail when the window regains focus — calm, event-driven (no
+  // polling). As well as the (cheap, local libgit2) git signal and PRs, we
+  // re-list workspaces so any created out-of-band — e.g. by the octopush-mcp
+  // `create_workspace` tool while you were in another app — shows up the
+  // moment you return to Octopush.
   useEffect(() => {
     const onFocus = () => {
       const byId = new Map<string, string>();
       if (project) byId.set(project.id, project.path);
       recentProjects.forEach((p) => byId.set(p.id, p.path));
+      void loadAllWorkspaces([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
@@ -530,7 +534,7 @@ function App() {
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, recentProjects, loadGitSummaries, loadProjectPrs]);
+  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
