@@ -71,6 +71,41 @@ describe("WorkspaceCreator", () => {
     expect(input.value).toBe("Add dark mode");
   });
 
+  it("always shows a Close control that cancels the creator (both steps)", async () => {
+    const onCancel = vi.fn();
+    render(
+      <WorkspaceCreator
+        projectId="proj-1"
+        projectPath="/home/user/proj"
+        onCreated={vi.fn()}
+        onCancel={onCancel}
+        initialTask="Add dark mode"
+      />
+    );
+    // Step 1: Close is present and exits.
+    fireEvent.click(screen.getByText("Continue"));
+    // Step 2: Close is still present (it's persistent, not step-scoped).
+    const close = await screen.findByLabelText("Close");
+    fireEvent.click(close);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("Escape closes the creator and prevents the default (so the OS doesn't exit fullscreen)", () => {
+    const onCancel = vi.fn();
+    render(
+      <WorkspaceCreator
+        projectId="proj-1"
+        projectPath="/home/user/proj"
+        onCreated={vi.fn()}
+        onCancel={onCancel}
+      />
+    );
+    const ev = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(ev);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
   it("calls ipc.updateWorkspaceLink with the new workspace id and key after create when linkIssueKeyOnCreate is set", async () => {
     const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
     vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
@@ -588,11 +623,13 @@ describe("WorkspaceCreator", () => {
       renderCreator();
       const noArrows = (el: HTMLElement) =>
         expect(el.textContent).not.toMatch(/[←→⟶↵«»‹›]/);
-      screen.getAllByRole("button", { name: /back/i }).forEach(noArrows);
+      // Step 1 has no Back button (the persistent Close is the exit); step 2's
+      // Back is step navigation. queryAll tolerates the empty step-1 case.
+      screen.queryAllByRole("button", { name: /back/i }).forEach(noArrows);
 
       fireEvent.click(screen.getByText("Continue"));
       await screen.findByText("Begin");
-      screen.getAllByRole("button", { name: /back/i }).forEach(noArrows);
+      screen.queryAllByRole("button", { name: /back/i }).forEach(noArrows);
     });
   });
 });

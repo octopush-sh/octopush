@@ -109,7 +109,11 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
-      if (e.defaultPrevented) return;
+      if (e.defaultPrevented) return; // an inner layer (e.g. the base-branch menu) claimed it
+      // We own Escape here. Prevent the default so it doesn't reach the OS — in
+      // native fullscreen an unhandled Escape exits fullscreen and visibly
+      // shrinks the window instead of just closing this view.
+      e.preventDefault();
       if (!creating) onCancel();
     }
     window.addEventListener("keydown", onKeyDown);
@@ -155,23 +159,26 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   return (
     <div
       data-tauri-drag-region
-      className="flex h-full w-full bg-octo-bg"
+      className="relative flex h-full w-full bg-octo-bg"
       style={{
         background:
           "radial-gradient(ellipse at 30% 25%, var(--brass-faint), transparent 50%), var(--color-octo-onyx)",
       }}
     >
+      {/* Always-present exit. A full-screen overlay needs one unmistakable way
+          out on every step; Escape does the same (see the key handler above). */}
+      <button
+        type="button"
+        onClick={onCancel}
+        title="Close · Esc"
+        aria-label="Close"
+        className="absolute right-4 top-4 z-10 inline-flex h-7 w-7 items-center justify-center rounded-md text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        <X size={15} />
+      </button>
+
       {/* Left index pane */}
       <aside className="w-[220px] shrink-0 border-r border-octo-hairline bg-octo-panel px-6 py-10">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="mb-10 inline-flex items-center gap-1 rounded-sm font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-        >
-          <ChevronLeft size={12} />
-          Back
-        </button>
-
         <div className="font-serif text-[18px] text-octo-ivory">
           A new workspace
         </div>
@@ -279,13 +286,6 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 Continue
-              </button>
-              <button
-                type="button"
-                onClick={onCancel}
-                className="rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-              >
-                Cancel
               </button>
               <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
                 <kbd className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] tracking-normal text-octo-mute">Enter</kbd>
