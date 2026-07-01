@@ -707,11 +707,13 @@ pub async fn delete_workspace(
     worktree_path: Option<String>,
 ) -> AppResult<()> {
     let project_path = expand_tilde(&project_path);
+    let is_main = worktree_path
+        .as_deref()
+        .is_some_and(|wt| is_project_root(&project_path, wt));
 
-    // Only destroy on disk what Octopush created. An adopted checkout (a worktree
-    // the user/another tool made) and the main workspace (the project root) are
-    // left intact — we just drop the DB row, never `rm -rf` the directory or
-    // delete a branch we didn't create.
+    // Remove the worktree directory only when Octopush created it (`managed`) and
+    // it isn't the project root. An adopted checkout (made by the user/another
+    // tool) and the main workspace are left on disk — we just drop the DB row.
     if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
         if let Some(wt) = &worktree_path {
             // Prune the worktree's registry slot (by path — slot names aren't
@@ -725,8 +727,22 @@ pub async fn delete_workspace(
                 let _ = std::fs::remove_dir_all(wt_path);
             }
         }
+    }
+
+    // Delete the branch only when Octopush itself created it — a reused or adopted
+    // branch (someone else's work) is never destroyed. Gated separately from the
+    // worktree: a workspace can create a worktree over a *pre-existing* branch, and
+    // deleting that branch would throw away commits Octopush didn't make. Default
+    // to NOT deleting on a read error (data-loss is worse than a leftover branch).
+    let created_branch = state
+        .db
+        .lock()
+        .is_branch_created_by_octopush(&workspace_id)
+        .unwrap_or(false);
+    if created_branch && !is_main {
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
+
     // Remove from DB
     state.db.lock().delete_workspace(&workspace_id)?;
     Ok(())
@@ -785,35 +801,20 @@ pub async fn restore_workspace(
     worktree_path: Option<String>,
 ) -> AppResult<()> {
     let project_path = expand_tilde(&project_path);
-    // Recreate the worktree from the kept branch (create_worktree attaches to
-    // the existing refs/heads/<branch>; it does NOT create a new branch), then
-    // flip status back to active.
-    let managed = state.db.lock().is_workspace_managed(&workspace_id).unwrap_or(true);
-    if let Some(wt) = worktree_path {
-        let wt = expand_tilde(&wt);
-        let wt_path = std::path::Path::new(&wt);
-        // Rebuild the worktree only for a MANAGED, non-main workspace whose
-        // directory is actually GONE (archiving a managed workspace removes it).
-        // We never rebuild a present dir — a present-but-broken worktree may hold
-        // uncommitted work, so preserving it beats rm -rf. An ADOPTED workspace
-        // keeps its (external) checkout untouched; the main workspace is the root.
-        let is_main = is_project_root(&project_path, &wt);
-        let missing = !wt_path.join(".git").exists();
-        if managed && !is_main && missing {
-            // create_worktree returns where it actually landed (it steps aside if
-            // the original path/slot is occupied); persist that so the row points
-            // at the real worktree.
-            let actual = crate::git_ops::create_worktree(
-                std::path::Path::new(&project_path),
-                &branch,
-                wt_path,
-            )?;
-            let actual_str = actual.to_string_lossy().to_string();
-            if actual_str != wt {
-                state.db.lock().set_workspace_worktree_path(&workspace_id, &actual_str)?;
-            }
-        }
-    }
+    // `branch`/`worktree_path` are kept in the signature for IPC symmetry, but the
+    // heal re-derives everything from the authoritative DB row.
+    let _ = (&branch, &worktree_path);
+
+    // Make the worktree usable via the shared healer, which handles all three
+    // cases without ever destroying work: adopt the branch's live checkout if it
+    // moved, rebuild a managed worktree if the directory is entirely gone, or
+    // leave a present directory untouched. Then flip status back to active.
+    let mut ws = state
+        .db
+        .lock()
+        .get_workspace(&workspace_id)?
+        .ok_or_else(|| AppError::Other("workspace not found".into()))?;
+    crate::workspace::heal_worktree(&state.db, std::path::Path::new(&project_path), &mut ws)?;
     state.db.lock().restore_workspace(&workspace_id)
 }
 

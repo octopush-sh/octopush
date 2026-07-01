@@ -133,8 +133,9 @@ pub fn create(
         if let Some(existing) = d.find_workspace_by_branch(project_id, branch)? {
             return Ok((existing, CreateOutcome::Existed));
         }
-        // Adopted, not created: born managed=false (atomically) so delete/archive
-        // never rm -rf this external checkout or delete its branch.
+        // Adopted, not created: born managed=false AND created_branch=false
+        // (atomically) so delete/archive never rm -rf this external checkout, and
+        // delete never removes a branch we didn't create.
         d.insert_workspace_managed(
             &id,
             project_id,
@@ -143,8 +144,9 @@ pub fn create(
             branch,
             Some(&path.to_string_lossy()),
             setup_script,
-            None, // we didn't branch from anything — the branch already existed
-            false,
+            None,  // we didn't branch from anything — the branch already existed
+            false, // managed: not ours
+            false, // created_branch: we adopted an existing branch
         )?;
         let ws = d
             .get_workspace(&id)?
@@ -153,17 +155,20 @@ pub fn create(
     }
 
     // 3. Not checked out anywhere → materialise a fresh worktree (no DB lock held
-    //    across the git checkout).
-    let (base, worktree_path) = provision_worktree(project_path, branch, from_branch)?;
-
+    //    across the git checkout). The id is generated first so the worktree gets a
+    //    directory unique to THIS workspace (`<slug>-<id8>`) — two workspaces can
+    //    never collide on one directory, whatever their branch names look like.
     let id = uuid::Uuid::new_v4().to_string();
+    let (base, worktree_path, created_branch) =
+        provision_worktree(project_path, branch, from_branch, &id)?;
+
     let d = db.lock();
     // Re-check under the lock to close the check-then-create race within this
     // process (a concurrent caller may have created it while we provisioned).
     if let Some(existing) = d.find_workspace_by_branch(project_id, branch)? {
         return Ok((existing, CreateOutcome::Existed));
     }
-    d.insert_workspace(
+    d.insert_workspace_managed(
         &id,
         project_id,
         name,
@@ -171,7 +176,9 @@ pub fn create(
         branch,
         Some(&worktree_path.to_string_lossy()),
         setup_script,
-        Some(&base), // the RESOLVED base, not the raw (possibly blank) request
+        Some(&base),    // the RESOLVED base, not the raw (possibly blank) request
+        true,           // managed: Octopush made this worktree
+        created_branch, // did we create the branch, or reuse an existing one?
     )?;
     let ws = d
         .get_workspace(&id)?
@@ -200,14 +207,16 @@ fn workspace_at_path(
 }
 
 /// Run the git side of creation: ensure the repo can branch, resolve the base,
-/// create-or-reuse the branch, and create the worktree. Returns the resolved
-/// base and the worktree path. Touches git only — no DB — so the caller can
-/// run it without holding the DB lock.
+/// create-or-reuse the branch, and create the worktree at a directory unique to
+/// this workspace. Returns the resolved base, the worktree path, and whether the
+/// branch was newly created (vs an existing one reused). Touches git only — no DB
+/// — so the caller can run it without holding the DB lock.
 fn provision_worktree(
     project_path: &Path,
     branch: &str,
     from_branch: &str,
-) -> AppResult<(String, PathBuf)> {
+    workspace_id: &str,
+) -> AppResult<(String, PathBuf, bool)> {
     // Ensure the repo has at least one commit (empty repos can't branch).
     crate::git_ops::ensure_initial_commit(project_path)?;
 
@@ -217,31 +226,50 @@ fn provision_worktree(
         crate::git_ops::default_branch(project_path)?,
     )?;
 
-    // create_branch is idempotent — it reuses an existing branch of this name.
-    crate::git_ops::create_branch(project_path, branch, &base)?;
+    // create_branch is idempotent — it reuses an existing branch of this name and
+    // reports whether it actually created a new one (so delete only ever removes
+    // branches Octopush itself created).
+    let created_branch = crate::git_ops::create_branch(project_path, branch, &base)?;
 
-    // Flatten the directory basename the same way the slot name is flattened:
-    // a slashed branch like `feat/foo` must NOT nest as `.octopus-worktrees/feat/foo`
-    // (that both breaks and lets a later `feat` workspace rm -rf the nested one).
-    let dir_name = crate::git_ops::slot_name_for(branch);
+    // Directory unique to this workspace: `<branch-slug>-<id8>`. The slug flattens
+    // slashes (a `feat/foo` branch must NOT nest as `.octopus-worktrees/feat/foo`),
+    // and the id suffix guarantees two workspaces never share one directory — so a
+    // later workspace can never rm -rf an earlier one's tree.
+    let dir_name = worktree_dir_name(branch, workspace_id);
     let desired = project_path
         .parent()
         .unwrap_or(project_path)
         .join(".octopus-worktrees")
         .join(&dir_name);
-    // create_worktree returns where the worktree ACTUALLY landed — it may differ
-    // from `desired` if that path/slot was occupied by another live worktree.
+    // create_worktree returns where the worktree ACTUALLY landed.
     let actual = crate::git_ops::create_worktree(project_path, branch, &desired)?;
 
-    Ok((base, actual))
+    Ok((base, actual, created_branch))
 }
 
-/// Hand back the existing workspace for this branch, making sure it's usable.
-/// Its worktree is rebuilt if missing — archiving removes it, and an active
-/// workspace's worktree can also vanish out-of-band (rm -rf, an unmounted
-/// drive) — and an archived row is flipped back to active. A healthy worktree
-/// is never touched (it may hold uncommitted work), and the "main" workspace
-/// (whose worktree is the project root) is never rebuilt.
+/// The directory basename for a workspace's worktree: `<branch-slug>-<id8>`.
+/// Unique per workspace by construction (the id suffix), and filesystem-safe /
+/// flat (the slug). Mirrored on the frontend by `worktreeDirName` for the path
+/// preview.
+fn worktree_dir_name(branch: &str, workspace_id: &str) -> String {
+    let id8: String = workspace_id.chars().take(8).collect();
+    format!("{}-{}", crate::git_ops::slot_name_for(branch), id8)
+}
+
+/// Hand back the existing workspace for this branch, made usable — and, crucially,
+/// without ever destroying work. Three cases, in order:
+///
+/// 1. **The branch is checked out somewhere else than we recorded** (a teammate
+///    or a Direct run moved it): point the row at that live checkout and mark it
+///    not-ours (`managed=false`) so a later delete never rm -rf's a tree we don't
+///    own. We can't `create_worktree` a branch that's already checked out anyway.
+/// 2. **The branch isn't checked out and the recorded directory is entirely gone**
+///    (archived-away, or an out-of-band `rm -rf`): rebuild a fresh managed
+///    worktree at this workspace's unique directory and mark it ours.
+/// 3. **The directory is present**: leave it completely alone — it may hold
+///    uncommitted work, so preserving even a broken tree beats deleting it.
+///
+/// An archived row is flipped back to active in every case.
 fn reuse_or_restore(
     db: &Mutex<Db>,
     project_path: &Path,
@@ -249,28 +277,8 @@ fn reuse_or_restore(
 ) -> AppResult<(WorkspaceRow, CreateOutcome)> {
     let mut ws = ws;
     let was_archived = ws.status == "archived";
-    let managed = db.lock().is_workspace_managed(&ws.id).unwrap_or(true);
-    if let Some(wt) = ws.worktree_path.as_deref() {
-        let wt_path = Path::new(wt);
-        // Rebuild ONLY a MANAGED, non-main worktree whose directory is actually
-        // GONE (no `.git` entry). We deliberately never rebuild a present dir —
-        // a present-but-broken worktree may still hold uncommitted work, so
-        // preserving it (even unusable) beats rm -rf'ing it. An ADOPTED
-        // workspace's checkout is the user's own (never recreate), and the main
-        // workspace is the project root.
-        let is_main = same_path(wt_path, project_path);
-        let missing = !wt_path.join(".git").exists();
-        if managed && !is_main && missing {
-            // create_worktree may land it at a different path if the original is
-            // now occupied; persist wherever it actually landed.
-            let actual = crate::git_ops::create_worktree(project_path, &ws.branch, wt_path)?;
-            if canonical_or(&actual) != canonical_or(wt_path) {
-                let actual_str = actual.to_string_lossy().to_string();
-                db.lock().set_workspace_worktree_path(&ws.id, &actual_str)?;
-                ws.worktree_path = Some(actual_str);
-            }
-        }
-    }
+
+    heal_worktree(db, project_path, &mut ws)?;
 
     if was_archived {
         let d = db.lock();
@@ -282,6 +290,65 @@ fn reuse_or_restore(
     }
 
     Ok((ws, CreateOutcome::Existed))
+}
+
+/// Ensure `ws` points at a usable worktree, mutating the row (and DB) in place.
+/// Shared by `reuse_or_restore` (create-time) and the `restore_workspace` command
+/// so both heal a branch the same way. See `reuse_or_restore` for the three cases.
+/// NEVER removes a present directory.
+pub fn heal_worktree(
+    db: &Mutex<Db>,
+    project_path: &Path,
+    ws: &mut WorkspaceRow,
+) -> AppResult<()> {
+    // Case 1: the branch is live in some worktree. A branch can be checked out in
+    // only one place, so that place IS the workspace — adopt it.
+    let checked_out_at = {
+        let repo = crate::git_ops::open_repo(project_path)?;
+        crate::git_ops::live_worktree_on_branch(&repo, &ws.branch)
+    };
+    if let Some(path) = checked_out_at {
+        let here = path.to_string_lossy().to_string();
+        let already = ws
+            .worktree_path
+            .as_deref()
+            .is_some_and(|w| same_path(Path::new(w), &path));
+        if !already {
+            // The branch moved to a checkout we didn't record — adopt that
+            // location and disown it (never rm on delete).
+            let d = db.lock();
+            d.set_workspace_worktree_path(&ws.id, &here)?;
+            d.set_workspace_managed(&ws.id, false)?;
+            ws.worktree_path = Some(here);
+        }
+        return Ok(());
+    }
+
+    // Case 2/3: not checked out anywhere. Rebuild only if the directory is entirely
+    // gone; never touch a present one.
+    let wt = ws.worktree_path.clone();
+    let is_main = wt
+        .as_deref()
+        .is_some_and(|w| same_path(Path::new(w), project_path));
+    let gone = wt.as_deref().map(|w| !Path::new(w).exists()).unwrap_or(true);
+    if !is_main && gone {
+        // Rebuild at this workspace's unique directory. The branch already exists,
+        // so create_branch reuses it (created_branch is irrelevant here — we don't
+        // change branch ownership on a heal). A rebuilt tree is ours → managed.
+        let dir_name = worktree_dir_name(&ws.branch, &ws.id);
+        let desired = project_path
+            .parent()
+            .unwrap_or(project_path)
+            .join(".octopus-worktrees")
+            .join(&dir_name);
+        let actual = crate::git_ops::create_worktree(project_path, &ws.branch, &desired)?;
+        let actual_str = actual.to_string_lossy().to_string();
+        let d = db.lock();
+        d.set_workspace_worktree_path(&ws.id, &actual_str)?;
+        d.set_workspace_managed(&ws.id, true)?;
+        ws.worktree_path = Some(actual_str);
+    }
+    Ok(())
 }
 
 fn canonical_or(p: &Path) -> PathBuf {
@@ -410,6 +477,10 @@ mod tests {
             !db.lock().is_workspace_managed(&ws.id).unwrap(),
             "adopted checkout is NOT managed — delete/archive must never rm it"
         );
+        assert!(
+            !db.lock().is_branch_created_by_octopush(&ws.id).unwrap(),
+            "adopted branch is NOT ours — delete must never `git branch -D` it"
+        );
         assert_eq!(
             canonical_or(Path::new(ws.worktree_path.as_deref().unwrap())),
             canonical_or(&landed),
@@ -459,5 +530,126 @@ mod tests {
             .insert_project("p1", "Proj", &repo.to_string_lossy())
             .unwrap();
         assert!(create(&db, "p1", &repo, "x", "x", "  ", "", "").is_err());
+    }
+
+    #[test]
+    fn workspaces_with_colliding_slugs_get_distinct_dirs() {
+        // `feat/x` and `feat-x` flatten to the same slug (`feat-x`). Before the
+        // per-workspace id suffix they'd have shared one directory — and creating
+        // the second could rm -rf the first. The unique dir must keep them apart.
+        let root = test_repo();
+        let repo = root.path().join("proj");
+        let db = test_db();
+        db.lock()
+            .insert_project("p1", "Proj", &repo.to_string_lossy())
+            .unwrap();
+
+        let (a, _) = create(&db, "p1", &repo, "a", "a", "feat/x", "", "").unwrap();
+        let (b, _) = create(&db, "p1", &repo, "b", "b", "feat-x", "", "").unwrap();
+
+        let pa = a.worktree_path.clone().unwrap();
+        let pb = b.worktree_path.clone().unwrap();
+        assert_ne!(pa, pb, "colliding slugs must land in distinct directories");
+        assert!(Path::new(&pa).join(".git").exists(), "first worktree is live");
+        assert!(Path::new(&pb).join(".git").exists(), "second worktree is live");
+        assert_eq!(db.lock().list_workspaces("p1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn branch_ownership_tracks_who_created_it() {
+        let root = test_repo();
+        let repo = root.path().join("proj");
+        let db = test_db();
+        db.lock()
+            .insert_project("p1", "Proj", &repo.to_string_lossy())
+            .unwrap();
+
+        // A brand-new branch → Octopush created it → delete may remove it.
+        let (fresh, _) = create(&db, "p1", &repo, "a", "a", "brand-new", "", "").unwrap();
+        assert!(
+            db.lock().is_branch_created_by_octopush(&fresh.id).unwrap(),
+            "a branch Octopush created is ours to delete"
+        );
+
+        // A pre-existing branch reused by a fresh worktree → NOT ours → delete must
+        // never destroy the commits already on it.
+        let base = crate::git_ops::default_branch(&repo).unwrap().unwrap();
+        crate::git_ops::create_branch(&repo, "pre-existing", &base).unwrap();
+        let (reused, outcome) =
+            create(&db, "p1", &repo, "b", "b", "pre-existing", "", "").unwrap();
+        assert_eq!(outcome, CreateOutcome::Created, "fresh worktree over an old branch");
+        assert!(
+            !db.lock().is_branch_created_by_octopush(&reused.id).unwrap(),
+            "a reused branch is someone else's work — never delete it"
+        );
+    }
+
+    #[test]
+    fn restore_adopts_a_branch_checked_out_elsewhere_without_clobbering() {
+        // An archived workspace's branch gets checked out somewhere else (a
+        // teammate, another session, a Direct run) before it's restored. Restoring
+        // must adopt that live checkout — never try to build a second one (git
+        // forbids it) and never touch the user's files.
+        let root = test_repo();
+        let repo = root.path().join("proj");
+        let db = test_db();
+        db.lock()
+            .insert_project("p1", "Proj", &repo.to_string_lossy())
+            .unwrap();
+
+        let (ws, _) = create(&db, "p1", &repo, "s", "s", "shared", "", "").unwrap();
+        let orig = ws.worktree_path.clone().unwrap();
+        // Archive: remove the managed worktree, keep the branch.
+        crate::git_ops::delete_worktree(&repo, Path::new(&orig)).unwrap();
+        std::fs::remove_dir_all(&orig).ok();
+        db.lock().archive_workspace(&ws.id).unwrap();
+
+        // Someone checks the branch out at an external path.
+        let ext_dir = tempdir().unwrap();
+        let ext = ext_dir.path().join("shared-elsewhere");
+        let landed = crate::git_ops::create_worktree(&repo, "shared", &ext).unwrap();
+        std::fs::write(landed.join("theirs.txt"), "keep\n").unwrap();
+
+        // Restoring adopts the live checkout instead of clobbering it.
+        let (restored, outcome) =
+            create(&db, "p1", &repo, "s", "s", "shared", "", "").unwrap();
+        assert_eq!(restored.id, ws.id);
+        assert_eq!(outcome, CreateOutcome::Restored);
+        assert_eq!(
+            canonical_or(Path::new(restored.worktree_path.as_deref().unwrap())),
+            canonical_or(&landed),
+            "row points at the live external checkout"
+        );
+        assert!(
+            !db.lock().is_workspace_managed(&restored.id).unwrap(),
+            "an adopted checkout is not ours — delete must never rm it"
+        );
+        assert!(landed.join("theirs.txt").exists(), "external checkout untouched");
+    }
+
+    #[test]
+    fn heal_leaves_a_present_worktree_and_its_uncommitted_work_alone() {
+        // A present directory is never rebuilt or removed — it may hold uncommitted
+        // work. Re-running create for a healthy workspace must preserve it verbatim.
+        let root = test_repo();
+        let repo = root.path().join("proj");
+        let db = test_db();
+        db.lock()
+            .insert_project("p1", "Proj", &repo.to_string_lossy())
+            .unwrap();
+
+        let (ws, _) = create(&db, "p1", &repo, "w", "w", "wip", "", "").unwrap();
+        let wt = ws.worktree_path.clone().unwrap();
+        std::fs::write(Path::new(&wt).join("uncommitted.txt"), "precious\n").unwrap();
+
+        let (again, outcome) = create(&db, "p1", &repo, "w", "w", "wip", "", "").unwrap();
+        assert_eq!(again.id, ws.id);
+        assert_eq!(outcome, CreateOutcome::Existed);
+        assert_eq!(again.worktree_path.as_deref(), Some(wt.as_str()), "same dir");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&wt).join("uncommitted.txt")).unwrap(),
+            "precious\n",
+            "uncommitted work preserved"
+        );
     }
 }

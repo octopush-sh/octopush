@@ -49,7 +49,10 @@ function worktreeDirName(branch: string): string {
 
 function worktreeDisplayPath(projectPath: string, branch: string): string {
   const parent = projectPath.replace(/\/[^/]+\/?$/, "");
-  return `${parent}/.octopus-worktrees/${worktreeDirName(branch)}`;
+  // The backend appends a short per-workspace id (`-<id>`) so two workspaces can
+  // never share a directory, whatever their branch names look like. It's assigned
+  // at creation time, so preview it as a placeholder suffix rather than a lie.
+  return `${parent}/.octopus-worktrees/${worktreeDirName(branch)}-<id>`;
 }
 
 function slugify(text: string): string {
