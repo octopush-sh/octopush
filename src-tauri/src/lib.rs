@@ -25,6 +25,7 @@ pub mod session_recap;
 pub mod settings;
 pub mod skills;
 mod state;
+pub mod sync;
 pub mod talk_shell;
 pub mod workspace;
 pub mod template;
@@ -335,6 +336,10 @@ pub fn run() {
             // Entitlement (premium scaffolding — P0)
             commands::get_entitlement,
             commands::direct_run_usage,
+            // Cross-machine run history (Pro-real Part B / B1)
+            commands::history_list,
+            commands::history_sync_pull,
+            commands::history_sync_push_all,
             // Accounts (P1)
             commands::auth_begin_sign_in,
             commands::auth_sign_out,

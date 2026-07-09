@@ -747,6 +747,33 @@ pub fn current_identity() -> Option<(String, Option<String>)> {
     load_session().map(|s| (s.sub, s.email))
 }
 
+/// A valid Clerk access token for the current session, refreshing it first if it
+/// has expired. `None` when signed out or the refresh token is rejected. Used to
+/// authenticate calls to the Octopush sync API (which resolves the user via Clerk
+/// `/oauth/userinfo`). Single-flights with the other refresh paths (re-loads
+/// after acquiring the lock) so it can't double-rotate the refresh token; on a
+/// transient/offline refresh failure it optimistically returns the existing token
+/// (the caller's request is best-effort and will simply 401 if it truly expired).
+pub async fn current_access_token() -> Option<String> {
+    let _guard = refresh_lock().lock().await;
+    let session = load_session()?;
+    if !is_expired(session.expires_at.as_deref()) {
+        return Some(session.access_token);
+    }
+    match refresh_session(&session).await {
+        RefreshOutcome::Refreshed(updated) => {
+            let token = updated.access_token.clone();
+            let _ = store_session(&updated);
+            Some(token)
+        }
+        RefreshOutcome::TokenRevoked => {
+            let _ = clear_session();
+            None
+        }
+        RefreshOutcome::TransientError => Some(session.access_token),
+    }
+}
+
 /// Re-fetch identity (incl. the `plan` in public_metadata) for the stored
 /// session, refreshing the access token first if needed. Picks up a plan change
 /// after the user subscribes. Best-effort: on a transient failure it returns the

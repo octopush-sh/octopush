@@ -282,6 +282,32 @@ export interface AuthStatus {
   name: string | null;
 }
 
+// ─── Cross-machine run history (Pro-real Part B / B1) ──────────────
+// NOTE: this mirrors the Rust `SyncRun` blob, which is intentionally
+// `snake_case` (it's a portable wire+storage format shared with the sync
+// server, which keys on `run_id`/`machine_id`) — unlike the camelCase IPC
+// types elsewhere. It is rendered as INERT TEXT only (never as HTML).
+export interface SyncedRunStage {
+  role: string;
+  model: string | null;
+  status: string;
+  cost_usd: number;
+}
+export interface SyncedRun {
+  run_id: string;
+  machine_id: string;
+  machine_name: string | null;
+  workspace_name: string | null;
+  task: string;
+  status: string;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  created_at: string;
+  finished_at: string | null;
+  stages: SyncedRunStage[];
+}
+
 export const ipc = {
   // ─── Sessions ─────────────────────────────────────────────────
   createSession: (args: CreateSessionArgs) =>
@@ -875,6 +901,16 @@ export const ipc = {
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
   directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
+
+  // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
+  /** The local read-only history mirror (instant, no network). */
+  historyList: () => invoke<SyncedRun[]>("history_list"),
+  /** Pull the user's run history from the cloud, replace the mirror, return it.
+   *  Pro-gated (throws `UpgradeRequired` for Free). */
+  historySyncPull: () => invoke<SyncedRun[]>("history_sync_pull"),
+  /** One-shot backfill of this machine's terminal runs to the cloud (Pro-only,
+   *  no-op otherwise). Returns the count attempted. */
+  historySyncPushAll: () => invoke<number>("history_sync_push_all"),
 
   // ─── Accounts (P1) ────────────────────────────────────────────
   authStatus: () => invoke<AuthStatus>("auth_status"),

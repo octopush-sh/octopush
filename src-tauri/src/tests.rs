@@ -260,6 +260,100 @@ mod workspace_tests {
         assert_eq!(sync, 1, "synchronous=NORMAL");
     }
 
+    // ── Cross-machine run history (Pro-real Part B / B1) ─────────────────
+
+    #[test]
+    fn machine_id_is_stable_across_calls() {
+        // A stable per-install id: generated once, persisted, then returned as-is.
+        let db = test_db();
+        let a = db.get_or_create_machine_id().unwrap();
+        let b = db.get_or_create_machine_id().unwrap();
+        assert!(!a.is_empty());
+        assert_eq!(a, b, "machine id must not change once created");
+    }
+
+    #[test]
+    fn app_meta_kv_roundtrips_and_upserts() {
+        let db = test_db();
+        assert_eq!(db.meta_get("k").unwrap(), None);
+        db.meta_set("k", "v1").unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("v1"));
+        db.meta_set("k", "v2").unwrap(); // upsert same key
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn list_terminal_runs_returns_only_completed_and_aborted() {
+        // Feeds the one-shot launch backfill push: only terminal runs replicate.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let done = db.create_run("ws1", &pipeline_id, "done", None, None, &[]).unwrap();
+        let killed = db.create_run("ws1", &pipeline_id, "killed", None, None, &[]).unwrap();
+        let live = db.create_run("ws1", &pipeline_id, "live", None, None, &[]).unwrap();
+        db.set_run_status(&done, "completed", true).unwrap();
+        db.set_run_status(&killed, "aborted", true).unwrap();
+        db.set_run_status(&live, "running", false).unwrap();
+        let ids: Vec<String> =
+            db.list_terminal_runs(100).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&done) && ids.contains(&killed));
+        assert!(!ids.contains(&live), "a running run is not terminal");
+    }
+
+    #[test]
+    fn synced_runs_mirror_replaces_and_lists_newest_first() {
+        let db = test_db();
+        let mk = |id: &str, created: &str| crate::sync::SyncRun {
+            run_id: id.into(),
+            machine_id: "m1".into(),
+            machine_name: Some("Test Mac".into()),
+            workspace_name: Some("ws".into()),
+            task: "t".into(),
+            status: "completed".into(),
+            cost_usd: 1.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: created.into(),
+            finished_at: None,
+            stages: vec![],
+        };
+        db.replace_synced_runs(&[
+            mk("r1", "2026-01-01T00:00:00Z"),
+            mk("r2", "2026-02-01T00:00:00Z"),
+        ])
+        .unwrap();
+        let got = db.list_synced_runs().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].run_id, "r2", "newest (later created_at) first");
+        // A fresh pull fully REPLACES the mirror (cloud is source of truth).
+        db.replace_synced_runs(&[mk("r3", "2026-03-01T00:00:00Z")]).unwrap();
+        let got = db.list_synced_runs().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].run_id, "r3");
+    }
+
+    #[test]
+    fn build_run_payload_maps_run_and_sums_stage_tokens() {
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let run_id = db.create_run("ws1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        let run = db.get_run(&run_id).unwrap().unwrap();
+        let payload = crate::sync::build_run_payload(&db, &run);
+        assert_eq!(payload.run_id, run_id);
+        assert_eq!(payload.task, "ship it");
+        assert_eq!(payload.status, "completed");
+        assert_eq!(payload.workspace_name.as_deref(), Some("ws"));
+        assert!(!payload.machine_id.is_empty());
+        let stages = db.list_run_stages(&run_id).unwrap();
+        assert_eq!(payload.stages.len(), stages.len());
+        let sum_in: i64 = stages.iter().map(|s| s.input_tokens).sum();
+        assert_eq!(payload.input_tokens, sum_in, "input tokens summed over stages");
+    }
+
     #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();
