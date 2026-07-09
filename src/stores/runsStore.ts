@@ -314,27 +314,32 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     if (startingRuns.has(runId)) return; // guard against double-click double-start
     startingRuns.add(runId);
     try {
-      await ipc.startRun(runId, null);
-    } catch (e) {
-      // Over the Free cap / concurrency gate → upgrade sheet; the draft
-      // survives (it's staged user data, not our own orphaned scaffolding).
-      const upgrade = isUpgradeRequired(e);
-      if (upgrade) {
-        useUpgradeStore.getState().show(upgrade);
+      try {
+        await ipc.startRun(runId, null);
+      } catch (e) {
+        // Over the Free cap / concurrency gate → upgrade sheet; the draft
+        // survives (it's staged user data, not our own orphaned scaffolding).
+        const upgrade = isUpgradeRequired(e);
+        if (upgrade) {
+          useUpgradeStore.getState().show(upgrade);
+          return;
+        }
+        // Any other refusal must be VISIBLE — the caller fire-and-forgets, and
+        // a silently dead "Begin this run" button is indistinguishable from a bug.
+        pushToast({
+          level: "error",
+          title: "Couldn't start the run",
+          body: String(e).split("\n")[0],
+        });
         return;
       }
-      // Any other refusal must be VISIBLE — the caller fire-and-forgets, and
-      // a silently dead "Begin this run" button is indistinguishable from a bug.
-      pushToast({
-        level: "error",
-        title: "Couldn't start the run",
-        body: String(e).split("\n")[0],
-      });
-      return;
+      // Refresh INSIDE the guard: releasing early lets a fast second click
+      // re-enter while the just-started run still reads as draft (at the Free
+      // cap that second attempt pops a spurious upgrade sheet).
+      await get().refreshDetail(runId).catch(() => {});
     } finally {
       startingRuns.delete(runId);
     }
-    await get().refreshDetail(runId);
   },
 
   resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {

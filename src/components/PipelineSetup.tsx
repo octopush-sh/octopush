@@ -47,7 +47,13 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
     const exists = selectedId && pipelines.some((p) => p.pipeline.id === selectedId);
-    if (!exists && pipelines.length > 0) setSelectedId(pipelines[0].pipeline.id);
+    if (!exists && pipelines.length > 0) {
+      setSelectedId(pipelines[0].pipeline.id);
+      // The selection is being REPLACED (first load, or the selected pipeline
+      // was deleted externally) — position-keyed overrides must not carry
+      // onto a different pipeline's stages.
+      setOverrides({});
+    }
   }, [pipelines, selectedId]);
   // "Run it again" (R3): consume the one-shot launcher prefill once the pipeline
   // list is in, so the existence check is meaningful. The task always applies;
