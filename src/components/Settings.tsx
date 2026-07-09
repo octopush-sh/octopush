@@ -16,7 +16,7 @@ import { PrivacyPane } from "./settings/PrivacyPane";
 import { IntegrationsPane } from "./settings/IntegrationsPane";
 import { AboutPane } from "./settings/AboutPane";
 import { AccountPane } from "./settings/AccountPane";
-import { isModalOpen } from "./ModalShell";
+import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 
 interface Props {
   open: boolean;
@@ -33,63 +33,17 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
     if (open) setTab(initialTab);
   }, [open, initialTab]);
 
-  // Esc closes Settings. Registered in the capture phase and consuming the event
-  // so it never reaches the webview/OS — otherwise, in a maximized (macOS
-  // full-screen) window, Escape would exit full-screen instead of closing
-  // Settings. Defers to any ModalShell dialog stacked on top, which runs its own
-  // Escape handler (e.g. the add-model dialog).
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      if (isModalOpen()) return; // a dialog on top handles its own Escape
-      // Always consume the event so a maximized (macOS full-screen) window
-      // never exits full-screen on Escape.
-      e.preventDefault();
-      // If focus is in a field, let that field's own Escape run (e.g. cancel an
-      // inline edit) and leave Settings open — don't hijack it.
-      const target = e.target;
-      if (
-        target instanceof Element &&
-        target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")
-      ) {
-        return;
-      }
-      e.stopPropagation();
-      onClose();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   return (
-    <div
-      className="absolute inset-0 z-40 flex flex-col bg-octo-bg"
-      data-tauri-drag-region
-      style={{
-        // --brass-faint is the accent at 4% alpha, re-derived per theme by
-        // themeStore — so the wash follows the active palette instead of
-        // staying Atelier-brass under a legacy theme.
-        background:
-          "radial-gradient(ellipse at 20% 10%, var(--brass-faint), transparent 50%), var(--color-octo-onyx)",
-      }}
-    >
+    <OverlayRoom onClose={onClose} ariaLabel="Settings">
       {/* Header */}
       <header className="flex items-baseline gap-4 border-b border-octo-hairline px-8 py-6">
         <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
           Preferences
         </span>
         <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Octopus</h1>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close settings"
-          className="ml-auto rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-brass"
-        >
-          ESC · CLOSE
-        </button>
+        <RoomClose onClose={onClose} label="Close settings" />
       </header>
 
       {/* Body: grouped nav + pane */}
@@ -127,7 +81,7 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
           {tab === "about" && <AboutPane />}
         </main>
       </div>
-    </div>
+    </OverlayRoom>
   );
 }
 

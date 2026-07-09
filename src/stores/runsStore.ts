@@ -45,6 +45,14 @@ interface RunsState {
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
+  /** Runs observed reaching a terminal state THIS SESSION (runId → epoch ms).
+   *  They linger on Mission Control's "Settled" band until dismissed — nothing
+   *  that finishes while you're away silently vanishes. Session-local. */
+  settledAt: Record<string, number>;
+  /** When each run's status last changed, as observed by this session (runId →
+   *  epoch ms). Drives Mission Control's time-in-state timer; best-effort — a
+   *  run hydrated at launch has no entry and falls back to createdAt. */
+  statusSince: Record<string, number>;
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
@@ -90,6 +98,10 @@ interface RunsState {
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
   /** Returns the pending prefill and clears it — consumed exactly once. */
   consumeLauncherPrefill: () => LauncherPrefill | null;
+  /** Drop one settled run from the Mission Control board (session-local). */
+  dismissSettled: (runId: string) => void;
+  /** Clear the whole settled band. */
+  clearSettled: () => void;
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
@@ -112,6 +124,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   selectedRunIdByWs: {},
   liveByStage: {},
   launcherPrefill: null,
+  settledAt: {},
+  statusSince: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
@@ -267,6 +281,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     return prefill;
   },
 
+  dismissSettled: (runId) =>
+    set((s) => {
+      if (!(runId in s.settledAt)) return {};
+      const next = { ...s.settledAt };
+      delete next[runId];
+      return { settledAt: next };
+    }),
+
+  clearSettled: () => set({ settledAt: {} }),
+
   applyStageUpdate: (runId, run) => {
     set((s) => {
       const prevDetail = s.detailByRun[runId];
@@ -274,10 +298,24 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         ? { ...prevDetail, run }
         : { run, stages: [] };
       const wsList = s.runsByWs[run.workspaceId] ?? EMPTY_RUNS;
-      return {
+      const next: Partial<RunsState> = {
         detailByRun: { ...s.detailByRun, [runId]: detail },
         runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
       };
+      // Track status transitions for Mission Control: stamp when the status
+      // changed (time-in-state), and when an ACTIVE run reaches a terminal
+      // state, park it on the Settled band (session-local; lingers until
+      // dismissed). A run that was never seen active (e.g. a draft aborted
+      // by the failed-start cleanup) never lands on the board.
+      const prevStatus = wsList.find((r) => r.id === runId)?.status;
+      if (prevStatus !== run.status) {
+        next.statusSince = { ...s.statusSince, [runId]: Date.now() };
+        const wasActive = prevStatus === "running" || prevStatus === "paused";
+        if (wasActive && TERMINAL.has(run.status)) {
+          next.settledAt = { ...s.settledAt, [runId]: Date.now() };
+        }
+      }
+      return next;
     });
     void get().refreshDetail(runId);
   },

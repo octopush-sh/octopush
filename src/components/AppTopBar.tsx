@@ -20,11 +20,11 @@ import { useEntitlement } from "../hooks/useEntitlement";
 interface Props {
   onOpenSettings: () => void;
   onToggleScratchpad: () => void;
-  /** Switch to a run's workspace + its Direct surface (from the runs tray). */
-  onJumpToRun: (workspaceId: string) => void;
+  /** Open the Mission Control room (the fleet cockpit). */
+  onOpenMissionControl: () => void;
 }
 
-export function AppTopBar({ onOpenSettings, onToggleScratchpad, onJumpToRun }: Props) {
+export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionControl }: Props) {
   const openHistory = useHistoryStore((s) => s.openSheet);
   const showUpgrade = useUpgradeStore((s) => s.show);
   const { hasFeature } = useEntitlement();
@@ -42,7 +42,7 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onJumpToRun }: P
       data-tauri-drag-region
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
-      <RunsTray onJumpToRun={onJumpToRun} />
+      <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">
         <button
           type="button"
