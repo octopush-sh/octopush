@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
+const { pushToastMock } = vi.hoisted(() => ({ pushToastMock: vi.fn() }));
+vi.mock("../components/Toasts", () => ({ pushToast: pushToastMock }));
+
 vi.mock("../lib/ipc", async () => {
   const actual = await vi.importActual<any>("../lib/ipc");
   return {
@@ -260,8 +263,6 @@ describe("runsStore", () => {
     (ipc.startRun as any).mockRejectedValue(
       JSON.stringify({ kind: "UpgradeRequired", feature: "direct.unlimited", used: 25, limit: 25 }),
     );
-    (ipc.abortRun as any) = (ipc.abortRun as any) ?? vi.fn();
-    (ipc.abortRun as any).mockClear?.();
 
     await useRunsStore.getState().start("r1");
 
@@ -269,9 +270,66 @@ describe("runsStore", () => {
     expect(ipc.abortRun).not.toHaveBeenCalled();
   });
 
-  it("start rethrows a non-upgrade failure", async () => {
+  it("start surfaces a non-upgrade failure as a toast (the CTA must never look dead)", async () => {
     (ipc.startRun as any).mockRejectedValue(new Error("engine on fire"));
-    await expect(useRunsStore.getState().start("r1")).rejects.toThrow("engine on fire");
+    await expect(useRunsStore.getState().start("r1")).resolves.toBeUndefined();
+    expect(pushToastMock).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "error", title: "Couldn't start the run" }),
+    );
+  });
+
+  it("start guards against a double-click double-start", async () => {
+    let release!: () => void;
+    (ipc.startRun as any).mockImplementation(
+      () => new Promise<void>((res) => { release = res; }),
+    );
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [] });
+    const first = useRunsStore.getState().start("r1");
+    const second = useRunsStore.getState().start("r1"); // while the first is in flight
+    release();
+    await Promise.all([first, second]);
+    expect(ipc.startRun).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Background (focus) refresh: sticky active, never clobber the canvas ──
+
+  it("background loadRuns keeps the current active run in place", async () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, // r1 running
+      activeRunIdByWs: { w1: "r1" },
+    });
+    // An MCP-staged draft appears, newer than the running run.
+    const draft: Run = { ...RUN, id: "rDraft", status: "draft" };
+    (ipc.listRuns as any).mockResolvedValue([draft, RUN]);
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [] });
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("r1");
+    // …but the draft IS in the list (Companion RUNS shows it).
+    expect(useRunsStore.getState().getRuns("w1").some((r) => r.id === "rDraft")).toBe(true);
+  });
+
+  it("background loadRuns never lets a staged draft steal the launcher", async () => {
+    // User is composing on the launcher (no active run); MCP stages a draft.
+    useRunsStore.setState({ runsByWs: { w1: [] }, activeRunIdByWs: { w1: null } });
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, id: "rDraft", status: "draft" }]);
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBeNull();
+  });
+
+  it("background loadRuns adopts an executing run when the active one is gone", async () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] }, activeRunIdByWs: { w1: "r1" } });
+    const other: Run = { ...RUN, id: "r2", status: "paused" };
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "completed" }, other]);
+    (ipc.getRun as any).mockResolvedValue({ run: other, stages: [] });
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("r2");
+  });
+
+  it("foreground loadRuns still presents a staged draft (first load / ws switch)", async () => {
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, id: "rDraft", status: "draft" }]);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, id: "rDraft", status: "draft" }, stages: [] });
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("rDraft");
   });
 
   // ── Mission Control board tracking (settled band + time-in-state) ──

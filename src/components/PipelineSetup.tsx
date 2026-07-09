@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ipc, type PipelineWithStages } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
@@ -76,6 +76,24 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
   }, [selectedId, overrides]);
 
   const selected: PipelineWithStages | undefined = pipelines.find((p) => p.pipeline.id === selectedId);
+
+  // Model overrides are keyed by stage POSITION. If the selected pipeline is
+  // restructured under us — e.g. octopush-mcp's `update_pipeline` while the
+  // window was unfocused, surfaced by the focus refresh — a kept override
+  // would silently retarget onto whatever stage now sits at that position.
+  // Reset overrides when the SAME selection's stage structure changes; a
+  // selection change keeps its own existing semantics (incl. prefill).
+  const stageSig = selected
+    ? selected.stages.map((s) => `${s.position}:${s.role}`).join("|")
+    : null;
+  const prevSig = useRef<{ id: string | null; sig: string | null }>({ id: null, sig: null });
+  useEffect(() => {
+    const prev = prevSig.current;
+    if (prev.id === selectedId && prev.sig !== null && stageSig !== null && prev.sig !== stageSig) {
+      setOverrides({});
+    }
+    prevSig.current = { id: selectedId, sig: stageSig };
+  }, [selectedId, stageSig]);
   const { saved, pct: savedPct } = estimate
     ? savingsVsBaseline(estimate.estimateUsd, estimate.baselineUsd)
     : { saved: 0, pct: 0 };

@@ -552,13 +552,17 @@ function App() {
         void loadProjectPrs(id, path);
       });
       // Pipelines (the ensemble picker) + the active workspace's runs list —
-      // read via getState so this handler doesn't re-subscribe per render.
+      // both read via getState at fire time, so the listener neither
+      // re-registers per workspace switch nor closes over stale state. The
+      // background flag keeps the refetch passive: the runs list refreshes,
+      // but the viewed canvas is never reassigned under the user.
       void usePipelineStore.getState().load();
-      if (activeWorkspaceId) void useRunsStore.getState().loadRuns(activeWorkspaceId);
+      const wsId = useWorkspaceStore.getState().activeId;
+      if (wsId) void useRunsStore.getState().loadRuns(wsId, { background: true });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, recentProjects, activeWorkspaceId, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
+  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {

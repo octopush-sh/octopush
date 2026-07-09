@@ -10,10 +10,12 @@ import {
 } from "../lib/ipc";
 import { useUpgradeStore } from "./upgradeStore";
 import { isUpgradeRequired } from "../lib/upgradeError";
+import { pushToast } from "../components/Toasts";
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
 const beginningWs = new Set<string>();
+const startingRuns = new Set<string>();
 const MAX_LOG_LINES = 200;
 
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
@@ -68,7 +70,11 @@ interface RunsState {
    *  fills an EMPTY buffer — a live stream is never clobbered. */
   hydrateLog: (stageId: string, entries: LiveEntry[]) => void;
 
-  loadRuns: (workspaceId: string) => Promise<void>;
+  /** `background: true` = a passive refetch (e.g. window focus): the runs
+   *  list refreshes, but the workspace's ACTIVE run — and therefore the
+   *  default-viewed canvas — is never reassigned under the user. A newly
+   *  staged draft surfaces in the RUNS list; it never steals the view. */
+  loadRuns: (workspaceId: string, opts?: { background?: boolean }) => Promise<void>;
   /** Hydrate the `running`/`paused` runs across ALL workspaces (incl. ones not
    *  opened this session) — drives the global "Runs in progress" tray. */
   loadActiveRuns: () => Promise<void>;
@@ -197,20 +203,35 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return { liveByStage: next };
     }),
 
-  loadRuns: async (workspaceId) => {
+  loadRuns: async (workspaceId, opts) => {
     const runs = await ipc.listRuns(workspaceId);
-    const active = runs.find((r) => !TERMINAL.has(r.status)) ?? null;
+    let nextActive: string | null = null;
     set((s) => {
       const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
       for (const run of runs) trackTransition(s, acc, run);
+      if (opts?.background) {
+        // Sticky active: keep the user's canvas exactly where it is. Only
+        // recompute when the current active run vanished or turned terminal —
+        // and even then adopt only an EXECUTING run (an externally staged
+        // draft must not clobber the launcher, incl. a half-typed brief).
+        const cur = s.activeRunIdByWs[workspaceId] ?? null;
+        const curValid = cur !== null && runs.some((r) => r.id === cur && !TERMINAL.has(r.status));
+        nextActive = curValid
+          ? cur
+          : runs.find((r) => r.status === "running" || r.status === "paused")?.id ?? null;
+      } else {
+        // First load / workspace switch: present the freshest non-terminal
+        // run (incl. a staged draft — the DraftBar makes it launchable).
+        nextActive = runs.find((r) => !TERMINAL.has(r.status))?.id ?? null;
+      }
       return {
         runsByWs: { ...s.runsByWs, [workspaceId]: runs },
         loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
-        activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
+        activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: nextActive },
         ...acc,
       };
     });
-    if (active) await get().refreshDetail(active.id);
+    if (nextActive) await get().refreshDetail(nextActive);
   },
 
   loadActiveRuns: async () => {
@@ -290,6 +311,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   },
 
   start: async (runId) => {
+    if (startingRuns.has(runId)) return; // guard against double-click double-start
+    startingRuns.add(runId);
     try {
       await ipc.startRun(runId, null);
     } catch (e) {
@@ -300,7 +323,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         useUpgradeStore.getState().show(upgrade);
         return;
       }
-      throw e;
+      // Any other refusal must be VISIBLE — the caller fire-and-forgets, and
+      // a silently dead "Begin this run" button is indistinguishable from a bug.
+      pushToast({
+        level: "error",
+        title: "Couldn't start the run",
+        body: String(e).split("\n")[0],
+      });
+      return;
+    } finally {
+      startingRuns.delete(runId);
     }
     await get().refreshDetail(runId);
   },
