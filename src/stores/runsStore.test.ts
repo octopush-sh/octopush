@@ -242,6 +242,38 @@ describe("runsStore", () => {
     expect("w1" in (useRunsStore.getState() as any).selectedRunIdByWs).toBe(false);
   });
 
+  // ── Staged (draft) runs — e.g. authored by octopush-mcp ──
+
+  it("start launches a staged draft and refreshes its detail", async () => {
+    (ipc.startRun as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [] });
+    await useRunsStore.getState().start("r1");
+    expect(ipc.startRun).toHaveBeenCalledWith("r1", null);
+    expect(ipc.getRun).toHaveBeenCalledWith("r1");
+  });
+
+  it("start over the quota gate shows the upgrade sheet and LEAVES the draft intact", async () => {
+    // Unlike begin() (which aborts its own just-created orphan), a staged
+    // draft is prior user data — a refused start must never destroy it.
+    const { useUpgradeStore } = await import("./upgradeStore");
+    useUpgradeStore.setState({ info: null });
+    (ipc.startRun as any).mockRejectedValue(
+      JSON.stringify({ kind: "UpgradeRequired", feature: "direct.unlimited", used: 25, limit: 25 }),
+    );
+    (ipc.abortRun as any) = (ipc.abortRun as any) ?? vi.fn();
+    (ipc.abortRun as any).mockClear?.();
+
+    await useRunsStore.getState().start("r1");
+
+    expect(useUpgradeStore.getState().info?.feature).toBe("direct.unlimited");
+    expect(ipc.abortRun).not.toHaveBeenCalled();
+  });
+
+  it("start rethrows a non-upgrade failure", async () => {
+    (ipc.startRun as any).mockRejectedValue(new Error("engine on fire"));
+    await expect(useRunsStore.getState().start("r1")).rejects.toThrow("engine on fire");
+  });
+
   // ── Mission Control board tracking (settled band + time-in-state) ──
 
   it("applyStageUpdate stamps statusSince on a status change and settles an active→terminal run", () => {

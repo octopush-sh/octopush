@@ -81,6 +81,11 @@ interface RunsState {
     linkedIssueKey?: string,
     budgetUsd?: number | null,
   ) => Promise<void>;
+  /** Start a STAGED (draft) run — e.g. one authored by octopush-mcp for the
+   *  user to launch from DIRECT. Unlike `begin`, there is nothing to create,
+   *  and the draft is prior user data: a refused start (over quota / the
+   *  concurrency gate) shows the upgrade sheet and LEAVES the draft intact. */
+  start: (runId: string) => Promise<void>;
   resolve: (
     runId: string,
     action: CheckpointActionName,
@@ -282,6 +287,22 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     } finally {
       beginningWs.delete(workspaceId);
     }
+  },
+
+  start: async (runId) => {
+    try {
+      await ipc.startRun(runId, null);
+    } catch (e) {
+      // Over the Free cap / concurrency gate → upgrade sheet; the draft
+      // survives (it's staged user data, not our own orphaned scaffolding).
+      const upgrade = isUpgradeRequired(e);
+      if (upgrade) {
+        useUpgradeStore.getState().show(upgrade);
+        return;
+      }
+      throw e;
+    }
+    await get().refreshDetail(runId);
   },
 
   resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
