@@ -23,35 +23,54 @@ export function UpgradeSheet() {
     }
   };
 
-  const isParallel = info.feature === "runs.parallel";
+  const copy =
+    info.feature === "runs.parallel"
+      ? {
+          eyebrow: "Direct · concurrency",
+          title: "Run your crew in parallel with Pro.",
+          body: (
+            <>
+              Free runs one Direct pipeline at a time. Upgrade to Pro to run{" "}
+              <span className="text-octo-ivory">multiple workspaces concurrently</span> — and keep
+              them going in the background.
+            </>
+          ),
+        }
+      : info.feature === "history.sync"
+        ? {
+            eyebrow: "Direct · history across machines",
+            title: "Your runs, on every machine.",
+            body: (
+              <>
+                Free keeps run history on the machine it ran on. Upgrade to Pro to{" "}
+                <span className="text-octo-ivory">sync your Direct-run history across all your
+                devices</span> — every run, its cost, and which machine it ran on.
+              </>
+            ),
+          }
+        : {
+            eyebrow: "Direct · monthly limit",
+            title: "You've hit your monthly Direct-run limit.",
+            body: (
+              <>
+                The Free plan includes {info.limit} Direct pipeline runs per month — you've used{" "}
+                {info.used}. Upgrade to Pro for{" "}
+                <span className="text-octo-ivory">unlimited Direct runs</span>, parallel and
+                background runs, and full run history.
+              </>
+            ),
+          };
 
   return (
     <ModalShell onClose={hide} ariaLabel="Upgrade to Pro" panelClassName="w-full max-w-[440px]">
       <div className="rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl">
         <span className="font-mono text-[11px] uppercase tracking-wide text-octo-brass">
-          {isParallel ? "Direct · concurrency" : "Direct · monthly limit"}
+          {copy.eyebrow}
         </span>
         <h2 className="mt-2 font-serif text-[18px] leading-tight text-octo-ivory">
-          {isParallel
-            ? "Run your crew in parallel with Pro."
-            : "You've hit your monthly Direct-run limit."}
+          {copy.title}
         </h2>
-        <p className="mt-3 text-[13px] leading-relaxed text-octo-sage">
-          {isParallel ? (
-            <>
-              Free runs one Direct pipeline at a time. Upgrade to Pro to run{" "}
-              <span className="text-octo-ivory">multiple workspaces concurrently</span> — and keep them
-              going in the background.
-            </>
-          ) : (
-            <>
-              The Free plan includes {info.limit} Direct pipeline runs per month — you've used{" "}
-              {info.used}. Upgrade to Pro for{" "}
-              <span className="text-octo-ivory">unlimited Direct runs</span>, parallel and background
-              runs, and full run history.
-            </>
-          )}
-        </p>
+        <p className="mt-3 text-[13px] leading-relaxed text-octo-sage">{copy.body}</p>
         <div className="mt-6 flex items-center justify-end gap-3">
           <button
             type="button"

@@ -1314,6 +1314,87 @@ pub async fn direct_run_usage(
     })
 }
 
+// ─── Cross-machine run history (Pro-real Part B / B1) ──────────────
+
+/// Pro-gate for the sync commands — mirrors the `start_run` concurrency gate so a
+/// non-entitled call surfaces the upgrade sheet.
+fn require_history_sync() -> AppResult<()> {
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        Ok(())
+    } else {
+        Err(AppError::UpgradeRequired {
+            feature: "history.sync".into(),
+            used: 0,
+            limit: 0,
+        })
+    }
+}
+
+/// The local read-only history mirror (instant, no network). The History view
+/// paints this first, then refreshes via `history_sync_pull`. **Entitlement-gated
+/// on read** (not just on pull): the mirror can hold runs pulled by a *previous*
+/// signed-in Pro user, so a signed-out / Free user (e.g. the next person on a
+/// shared machine) must not be able to read it — return empty for them. (The
+/// mirror is also cleared on sign-out; this is the belt to that suspenders.)
+#[tauri::command]
+pub async fn history_list(state: State<'_, AppState>) -> AppResult<Vec<crate::sync::SyncRun>> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        return Ok(Vec::new());
+    }
+    state.db.lock().list_synced_runs()
+}
+
+/// Pull the signed-in Pro user's run history from the cloud, replace the local
+/// mirror, and return it. Pro-gated (`history.sync`). Best-effort refresh: on a
+/// network/transient error it falls back to the current local mirror rather than
+/// failing (so opening History offline still shows the last-known data).
+#[tauri::command]
+pub async fn history_sync_pull(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::sync::SyncRun>> {
+    require_history_sync()?;
+    let client = crate::chat_engine::shared_http_client();
+    match crate::sync::pull_runs(client).await {
+        Ok(runs) => {
+            state.db.lock().replace_synced_runs(&runs)?;
+            Ok(runs)
+        }
+        Err(_) => state.db.lock().list_synced_runs(),
+    }
+}
+
+/// One-shot backfill: push this machine's terminal runs (newest first, capped at
+/// [`crate::sync::MAX_PUSH`]) so a Pro user's existing history is populated
+/// immediately — not only from the next run onward. No-op for non-Pro; the server
+/// upserts by run id so re-running it is idempotent. Returns the count attempted.
+#[tauri::command]
+pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        return Ok(0);
+    }
+    let runs = {
+        let db = state.db.lock();
+        let machine_id = match db.get_or_create_machine_id() {
+            Ok(id) if !id.is_empty() => id,
+            _ => return Ok(0), // can't mint an id → skip (empty would mis-attribute)
+        };
+        let terminal = db.list_terminal_runs(crate::sync::MAX_PUSH as u32)?;
+        terminal
+            .iter()
+            .map(|r| crate::sync::build_run_payload(&db, r, &machine_id))
+            .collect::<Vec<_>>()
+    };
+    let count = runs.len();
+    crate::sync::push_runs(crate::chat_engine::shared_http_client(), runs).await;
+    Ok(count)
+}
+
 // ─── Accounts (P1) ─────────────────────────────────────────────
 /// Run the interactive Clerk sign-in: opens the system browser, captures the
 /// loopback redirect, exchanges the code (PKCE, no secret), and stores the
@@ -1323,10 +1404,15 @@ pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
     crate::auth::begin_sign_in().await
 }
 
-/// Clear the stored session (sign out locally).
+/// Clear the stored session (sign out locally). Also drops the local run-history
+/// mirror — it may hold history pulled by this user from their OTHER machines, so
+/// it must not linger for whoever uses this machine next (privacy on shared
+/// machines). Best-effort: a mirror-clear failure never blocks the sign-out.
 #[tauri::command]
-pub async fn auth_sign_out() -> AppResult<()> {
-    crate::auth::sign_out()
+pub async fn auth_sign_out(state: State<'_, AppState>) -> AppResult<()> {
+    crate::auth::sign_out()?;
+    let _ = state.db.lock().clear_synced_runs();
+    Ok(())
 }
 
 /// Abort an in-flight interactive sign-in (the loopback returns ~immediately).

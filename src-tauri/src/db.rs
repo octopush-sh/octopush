@@ -522,6 +522,30 @@ impl Db {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
+
+        // Cross-machine run-history sync (Pro-real Part B / B1):
+        //   • app_meta   — a tiny key/value store for app-global scalars (e.g. the
+        //                  stable per-install `machine_id`); no such table existed.
+        //   • synced_runs — a READ-ONLY local mirror of the user's run history
+        //                  pulled from the cloud. Kept SEPARATE from `runs` on
+        //                  purpose: pulled runs come from other machines and have
+        //                  no local workspace (the `runs` table FKs to workspaces).
+        //                  `data` is the JSON blob (SyncRun) rendered by the view.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS synced_runs (
+                run_id     TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_synced_runs_created ON synced_runs(created_at DESC);
+            "#,
+        )?;
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -2328,6 +2352,93 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n.max(0) as u32)
+    }
+
+    /// Terminal runs (`completed`/`aborted`) across all workspaces, newest first,
+    /// capped at `limit`. Drives the one-shot history backfill push on launch.
+    pub fn list_terminal_runs(&self, limit: u32) -> AppResult<Vec<RunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+             FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_run)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ── app_meta: tiny key/value store for app-global scalars ────────────────
+
+    /// Read a scalar from `app_meta`; `None` if the key was never set.
+    pub fn meta_get(&self, key: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM app_meta WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Upsert a scalar into `app_meta`.
+    pub fn meta_set(&self, key: &str, value: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// A stable, opaque per-install id (generated once, then persisted). Used to
+    /// attribute a synced run to the machine it ran on ("from …").
+    pub fn get_or_create_machine_id(&self) -> AppResult<String> {
+        if let Some(id) = self.meta_get("machine_id")? {
+            if !id.is_empty() {
+                return Ok(id);
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.meta_set("machine_id", &id)?;
+        Ok(id)
+    }
+
+    // ── synced_runs: read-only local mirror of cloud run history ─────────────
+
+    /// Replace the entire local history mirror with a freshly pulled set (the
+    /// cloud is the source of truth for cross-machine history). Atomic.
+    pub fn replace_synced_runs(&self, runs: &[crate::sync::SyncRun]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM synced_runs", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO synced_runs (run_id, data, created_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for r in runs {
+                let data = serde_json::to_string(r)?;
+                stmt.execute(params![r.run_id, data, r.created_at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the entire local history mirror. Called on sign-out so a shared
+    /// machine doesn't retain the previous user's cross-machine run history.
+    pub fn clear_synced_runs(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM synced_runs", [])?;
+        Ok(())
+    }
+
+    /// The local history mirror, newest first. Skips any blob this build can't
+    /// parse (forward/back compat) rather than failing the whole read.
+    pub fn list_synced_runs(&self) -> AppResult<Vec<crate::sync::SyncRun>> {
+        let mut stmt =
+            self.conn.prepare("SELECT data FROM synced_runs ORDER BY created_at DESC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(run) = serde_json::from_str::<crate::sync::SyncRun>(&row?) {
+                out.push(run);
+            }
+        }
+        Ok(out)
     }
 
     pub fn list_run_stages(&self, run_id: &str) -> AppResult<Vec<RunStageRow>> {

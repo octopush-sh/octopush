@@ -143,6 +143,37 @@ impl Orchestrator {
         }
     }
 
+    /// Fire-and-forget: replicate a just-terminal run's metadata to the cloud so
+    /// it appears in the user's cross-machine History (Pro-real Part B / B1b).
+    /// No-op unless the user is Pro with `history.sync`. **Never blocks the run** —
+    /// builds the payload under a short DB lock, then spawns the network push, so
+    /// an abort still feels instant. The server upserts by run id, so a re-fire on
+    /// an already-terminal run (e.g. abort of an aborted run) is a harmless no-op.
+    fn sync_run_history(&self, run_id: &str) {
+        if !crate::entitlement::Entitlement::current()
+            .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+        {
+            return;
+        }
+        let payload = {
+            let db = self.db.lock();
+            // Resolve the machine id first — skip the whole push if we can't mint
+            // one (empty would mis-attribute the row, which the server keys on).
+            let machine_id = match db.get_or_create_machine_id() {
+                Ok(id) if !id.is_empty() => id,
+                _ => return,
+            };
+            match db.get_run(run_id) {
+                Ok(Some(run)) => crate::sync::build_run_payload(&db, &run, &machine_id),
+                _ => return,
+            }
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            crate::sync::push_runs(&client, vec![payload]).await;
+        });
+    }
+
     fn emit_cost(&self, run_id: &str, cost: f64, baseline: f64) {
         self.events.emit(
             "run://cost",
@@ -712,6 +743,7 @@ impl Orchestrator {
             let Some(stage) = next else {
                 self.db.lock().set_run_status(run_id, "completed", true)?;
                 self.emit_run_update(run_id);
+                self.sync_run_history(run_id);
                 return Ok(RunStatus::Completed);
             };
             // Only "pending" stages run; anything else (awaiting_checkpoint / failed)
@@ -830,6 +862,7 @@ impl Orchestrator {
             CheckpointAction::Abort => {
                 self.db.lock().set_run_status(run_id, "aborted", true)?;
                 self.emit_run_update(run_id);
+                self.sync_run_history(run_id);
                 return Ok(RunStatus::Aborted);
             }
             CheckpointAction::Approve | CheckpointAction::Edit => {
@@ -1024,6 +1057,7 @@ impl Orchestrator {
         // loop only checks the status BETWEEN stages.
         self.stop_current_stage(run_id)?;
         self.emit_run_update(run_id);
+        self.sync_run_history(run_id);
         Ok(())
     }
 

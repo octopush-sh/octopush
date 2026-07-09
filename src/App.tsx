@@ -42,6 +42,9 @@ import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
+import { HistorySheet } from "./components/HistorySheet";
+import { useHistoryStore } from "./stores/historyStore";
+import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
@@ -124,6 +127,17 @@ function App() {
   useEffect(() => {
     void loadActiveRuns();
   }, [loadActiveRuns]);
+
+  // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
+  // `history.sync`, backfill this machine's runs + pull the full history so the
+  // History sheet opens populated. Runs when the entitlement flips to granted
+  // (on load, or right after an upgrade). Best-effort/silent for everyone else.
+  const historySyncEntitled = useEntitlementStore((s) =>
+    s.entitlement.features.includes("history.sync"),
+  );
+  useEffect(() => {
+    if (historySyncEntitled) void useHistoryStore.getState().syncOnLaunch();
+  }, [historySyncEntitled]);
   const terminalBusyIds = useTerminalsStore(
     useShallow((s) =>
       Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
@@ -2274,6 +2288,7 @@ function App() {
       <ToastContainer />
       <UpdateNotifier />
       <UpgradeSheet />
+      <HistorySheet />
     </div>
   );
 }
