@@ -546,6 +546,35 @@ impl Db {
             "#,
         )?;
 
+        // Crew-quality retrofit (ONE-SHOT, gated via app_meta — so it must run
+        // after the CREATE above): code_review/security_review gained
+        // `run_command` in their default tool preset, but the builder SNAPSHOTS
+        // a role's tools into each pipeline_stages row at authoring time (and
+        // create_run copies that into run_stages) — so existing pipelines would
+        // run the NEW prompt ("run the build or tests…") against the OLD
+        // read-only allowlist, unable to comply. Upgrade exactly the rows still
+        // carrying the old default snapshot, ONCE: re-running on every launch
+        // would silently re-escalate a reviewer a user had deliberately set
+        // back to read-only (the old snapshot is byte-identical to that choice).
+        if self.meta_get("retrofit_reviewer_run_command")?.is_none() {
+            const OLD_RO: &str = r#"["read_file","list_files"]"#;
+            const NEW_RUN: &str = r#"["read_file","list_files","run_command"]"#;
+            self.conn.execute(
+                "UPDATE pipeline_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2",
+                params![NEW_RUN, OLD_RO],
+            )?;
+            // Also stages of runs that haven't executed yet (drafts) — started
+            // and terminal runs keep their historical allowlist.
+            self.conn.execute(
+                "UPDATE run_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2
+                   AND status = 'pending'",
+                params![NEW_RUN, OLD_RO],
+            )?;
+            self.meta_set("retrofit_reviewer_run_command", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())

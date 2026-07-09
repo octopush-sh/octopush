@@ -283,16 +283,49 @@ impl Orchestrator {
             .ok_or_else(|| AppError::Other("workspace has no worktree_path".into()))
     }
 
+    /// The COMPLETE uncommitted picture of a run's worktree: staged (HEAD→index)
+    /// plus unstaged/untracked (index→workdir) diffs concatenated. Staged
+    /// changes matter — a CLI-substrate agent habitually `git add`s part of its
+    /// edits despite the preamble, and an index-only diff would silently hide
+    /// them from the reviewer certifying "the actual code changes". Best-effort:
+    /// every capture failure is LOGGED; `None` when the workspace/unstaged side
+    /// fails, and a staged-side failure degrades to unstaged-only (warned).
+    /// Emptiness is the CALLER's concern.
+    fn full_worktree_diff(&self, run: &crate::db::RunRow) -> Option<String> {
+        let path = match self.workspace_path(run) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "worktree diff: no workspace path: {e}");
+                return None;
+            }
+        };
+        let staged = crate::git_ops::get_staged_diff_text(&path).unwrap_or_else(|e| {
+            tracing::warn!(run_id = %run.id, "worktree diff: staged capture failed: {e}");
+            String::new()
+        });
+        let unstaged = match crate::git_ops::get_diff_text(&path, false) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "worktree diff: unstaged capture failed: {e}");
+                return None;
+            }
+        };
+        Some(match (staged.trim().is_empty(), unstaged.trim().is_empty()) {
+            (true, _) => unstaged,
+            (false, true) => staged,
+            (false, false) => format!("{staged}\n{unstaged}"),
+        })
+    }
+
     /// Best-effort: persist the worktree diff onto a just-finished stage, so the
     /// focus pane can show the worktree as THIS stage left it instead of the
     /// live (still-mutating) one. The snapshot is forensic, never load-bearing —
     /// any capture failure is logged and swallowed, and an empty diff is skipped.
     fn capture_stage_diff_snapshot(&self, run: &crate::db::RunRow, stage_id: &str) {
         let result: AppResult<()> = (|| {
-            let path = self.workspace_path(run)?;
-            let diff = crate::git_ops::get_diff_text(&path, false)?;
+            let Some(diff) = self.full_worktree_diff(run) else { return Ok(()) };
             let capped = cap_diff(&diff);
-            if !capped.is_empty() {
+            if !capped.trim().is_empty() {
                 self.db.lock().set_stage_diff_snapshot(stage_id, &capped)?;
             }
             Ok(())
@@ -372,12 +405,15 @@ impl Orchestrator {
         };
 
         // Clear resume_pending once the run starts so a second re-run is always fresh.
+        let resuming = stage.resume_pending;
         if stage.resume_pending {
             self.db.lock().set_stage_resume_pending(&stage.id, false)?;
         }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
-        let input = self.assemble_stage_input(&run.id, stage.position)?;
+        // A resuming CLI stage discards the input for its resumed session, so
+        // don't spend a worktree-diff capture on it.
+        let input = self.assemble_stage_input(run, stage.position, !resuming)?;
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
         // Reset any prior live log for this stage (re-runs reuse the same id).
@@ -510,7 +546,13 @@ impl Orchestrator {
     /// of only whatever ran immediately before it. Token cost stays bounded:
     /// one section per kind at most, each capped at render time, and superseded
     /// or looped-over attempts (artifact = NULL after a reset) never ride along.
-    fn assemble_stage_input(&self, run_id: &str, position: i64) -> AppResult<StageInput> {
+    fn assemble_stage_input(
+        &self,
+        run: &crate::db::RunRow,
+        position: i64,
+        capture_diff: bool,
+    ) -> AppResult<StageInput> {
+        let run_id = &run.id;
         let stages = self.db.lock().list_run_stages(run_id)?;
 
         // Which earlier stages feed THIS one? With an authored graph, a stage's
@@ -592,7 +634,25 @@ impl Orchestrator {
             .collect::<Vec<_>>()
             .join(" → ");
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree })
+        // When earlier stages left real code in the worktree, capture the LIVE
+        // diff (staged + unstaged — see full_worktree_diff) so the receiving
+        // stage (reviewer, tester, verifier) sees the actual changes — not just
+        // the producer's prose summary of them. Best-effort: a capture failure
+        // or empty diff degrades to the "inspect with your tools" hint at
+        // render time (user_input_for owns emptiness), never blocks the run.
+        // Skipped for a CLI-resume stage, whose runner discards the input in
+        // favor of the resumed session. Deliberate semantics: the worktree is
+        // the run's shared blackboard, so in a multi-branch authored graph the
+        // diff can include a sibling branch's edits — the same visibility the
+        // reviewer always had by inspecting the workspace; the rendered prompt
+        // says so (user_input_for).
+        let worktree_diff = if refs_worktree && capture_diff {
+            self.full_worktree_diff(run)
+        } else {
+            None
+        };
+
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff })
     }
 
     /// Sum stage costs; recompute the baseline by re-pricing each stage's tokens
