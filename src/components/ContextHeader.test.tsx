@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { ContextHeader } from "./ContextHeader";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -14,11 +15,15 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
+const copyMock = vi.fn().mockResolvedValue(true);
+vi.mock("../lib/clipboard", () => ({ copyToClipboard: (...args: unknown[]) => copyMock(...args) }));
+
 const baseProps = {};
 
 beforeEach(() => {
   useIssuesStore.setState({ issues: null, loading: false, error: null });
   useParentIssuesStore.setState({ parents: {}, loading: {} });
+  copyMock.mockClear();
 });
 
 function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
@@ -521,6 +526,32 @@ describe("ContextHeader", () => {
       pr: { number: 4, url: "u", title: "t", isDraft: false, state: "closed" },
     });
     expect(screen.getByText("PR · #4")).toHaveClass("text-octo-rouge");
+  });
+
+  it("copy button copies the PR URL without opening it", async () => {
+    const workspace = makeWorkspace({ branch: "feat/x" });
+    const onOpenPr = vi.fn();
+    renderHeader({
+      workspace,
+      pr: { number: 5, url: "https://github.com/acme/repo/pull/5", title: "t", isDraft: false, state: "open" },
+      onOpenPr,
+    });
+    await userEvent.click(screen.getByRole("button", { name: /copy pr url/i }));
+    expect(copyMock).toHaveBeenCalledWith("https://github.com/acme/repo/pull/5", "PR URL copied");
+    expect(onOpenPr).not.toHaveBeenCalled();
+  });
+
+  it("clicking the PR chip text still opens the PR URL", async () => {
+    const workspace = makeWorkspace({ branch: "feat/x" });
+    const onOpenPr = vi.fn();
+    renderHeader({
+      workspace,
+      pr: { number: 6, url: "https://github.com/acme/repo/pull/6", title: "t", isDraft: false, state: "open" },
+      onOpenPr,
+    });
+    await userEvent.click(screen.getByText("PR · #6"));
+    expect(onOpenPr).toHaveBeenCalledWith("https://github.com/acme/repo/pull/6");
+    expect(copyMock).not.toHaveBeenCalled();
   });
 
   it("status text uses the correct token per statusCategory", async () => {
