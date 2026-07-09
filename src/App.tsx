@@ -49,6 +49,8 @@ import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useBudgetsStore } from "./stores/budgetsStore";
+import { usePipelineStore } from "./stores/pipelineStore";
+import { useRunsStore } from "./stores/runsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
@@ -472,6 +474,15 @@ function App() {
 
   // Refresh the rail's git signal when the window regains focus — calm,
   // event-driven (no polling). Summaries are cheap (local libgit2).
+  //
+  // The same tick also re-fetches pipelines, workspaces, and the active
+  // workspace's runs. octopush-mcp is a separate process that writes to the
+  // same SQLite database but cannot emit Tauri events into this window, so
+  // anything authored externally (a pipeline, a workspace, a draft run) only
+  // becomes visible here via this refresh. Each store's load/replace call is
+  // idempotent (it refetches and swaps state), so firing them unconditionally
+  // on every focus is safe — Promise.allSettled keeps one store's failure
+  // from blocking the others.
   useEffect(() => {
     const onFocus = () => {
       const byId = new Map<string, string>();
@@ -481,10 +492,17 @@ function App() {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
       });
+      const projectIds = Array.from(byId.keys());
+      const wsId = useWorkspaceStore.getState().activeId;
+      void Promise.allSettled([
+        usePipelineStore.getState().load(),
+        loadAllWorkspaces(projectIds),
+        wsId ? useRunsStore.getState().loadRuns(wsId) : Promise.resolve(),
+      ]);
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, recentProjects, loadGitSummaries, loadProjectPrs]);
+  }, [project, recentProjects, loadGitSummaries, loadProjectPrs, loadAllWorkspaces]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {

@@ -22,6 +22,12 @@ interface WorkspaceState {
   prByWs: Record<string, Pr | null>;
 
   load: (projectId: string) => Promise<void>;
+  /** Fetches + replaces workspacesByProjectId for the given ids; also syncs
+   *  the flat `workspaces` array (and reconciles `activeId`) when the
+   *  currently-open project is among them, so `activeWorkspace` resolves
+   *  correctly. Called on project-set changes, on archived-workspace
+   *  restore, and (unconditionally, since it's idempotent) on window focus —
+   *  the last picks up workspaces authored externally via octopush-mcp. */
   loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
   create: (projectId: string, projectPath: string, name: string, task: string,
            branch: string, fromBranch: string, setupScript: string) => Promise<Workspace>;
@@ -125,7 +131,25 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         results.forEach(({ projectId, workspaces }) => {
           newByProject[projectId] = workspaces;
         });
-        return { workspacesByProjectId: newByProject, loading: false };
+        // `activeWorkspace` in App.tsx resolves against the flat `workspaces`
+        // array, not this map. If the currently-open project is among the
+        // refreshed ids, keep that array in sync too — otherwise a workspace
+        // that just appeared in the rail (via the map) resolves to null when
+        // clicked, blanking the canvas.
+        const currentProjectId = useProjectStore.getState().current?.id;
+        const current = currentProjectId
+          ? results.find((r) => r.projectId === currentProjectId)
+          : undefined;
+        if (!current) {
+          return { workspacesByProjectId: newByProject, loading: false };
+        }
+        const activeStillExists = current.workspaces.some((w) => w.id === s.activeId);
+        return {
+          workspacesByProjectId: newByProject,
+          loading: false,
+          workspaces: current.workspaces,
+          activeId: activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null),
+        };
       });
     } catch (err) {
       console.error("loadAllWorkspaces failed:", err);
