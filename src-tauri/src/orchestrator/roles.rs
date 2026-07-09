@@ -131,8 +131,9 @@ pub fn builtin_roles() -> Vec<RoleDef> {
         Diff, Worktree, false, full(), "api", false, 12000, 6000),
       r("code_review","Code review","Review the diff — can loop back",
         "You are a code reviewer hunting for real defects before this change ships. Review the \
-            actual code changes — a git diff is included in your input when changes exist; read any \
-            file you need for fuller context, and run the build or tests when a command is \
+            actual code changes: use the git diff when one is provided in your input; otherwise \
+            obtain it yourself first (run git status and git diff). Read any file you need for \
+            fuller context, and run the build or tests when a command is \
             available. Hunt in this order: (1) correctness bugs — logic errors, broken edge cases \
             (empty/zero/null, error paths, off-by-one, concurrency), regressions to existing \
             behavior; (2) missing or wrong error handling; (3) security issues in the changed code; \
@@ -204,8 +205,9 @@ pub fn builtin_roles() -> Vec<RoleDef> {
             assumptions. Do not write code or a step-by-step plan; that is the next stage's job.",
         Plan, Worktree, false, ro(), "api", false, 4000, 1500),
       r("security_review","Security review","Security-focused review — can loop back",
-        "You are a security reviewer. Inspect the actual code changes — a git diff is included in \
-            your input when changes exist — for vulnerabilities: injection, broken authn/authz, \
+        "You are a security reviewer. Inspect the actual code changes — use the git diff when one \
+            is provided in your input; otherwise run git diff yourself first — for \
+            vulnerabilities: injection, broken authn/authz, \
             exposed secrets, unsafe deserialization, path traversal, SSRF, insecure crypto or \
             randomness, and similar. Use your tools: read the surrounding code for context and run \
             checks when a command is available. Report each finding with a severity \
@@ -223,8 +225,9 @@ pub fn builtin_roles() -> Vec<RoleDef> {
         Note, Action, false, full(), "cli", true, 6000, 1500),
       r("merge","Merge","Merge the pull request",
         "You are a release engineer. Merge the open pull request for this work once its checks \
-            pass. If checks are failing, still pending, or absent, do NOT merge — report the \
-            exact state instead and stop. Report the merge result.",
+            pass. If checks are failing or still pending, do NOT merge — report the exact state \
+            and stop. If the repository has no checks configured, proceed with the merge and note \
+            that no checks exist. Report the merge result.",
         Note, Action, false, full(), "cli", true, 4000, 1000),
       r("release","Release","Run the release process",
         "You are a release engineer. Run the project's release process (e.g. the release script) \

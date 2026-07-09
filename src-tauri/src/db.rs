@@ -492,6 +492,32 @@ impl Db {
         )?;
         self.seed_builtin_roles()?;
 
+        // Crew-quality retrofit: code_review/security_review gained
+        // `run_command` in their default tool preset, but the builder SNAPSHOTS
+        // a role's tools into each pipeline_stages row at authoring time (and
+        // create_run copies that into run_stages) — so existing pipelines would
+        // run the NEW prompt ("run the build or tests…") against the OLD
+        // read-only allowlist, unable to comply. Upgrade exactly the rows still
+        // carrying the old default snapshot; a user's customized allowlist
+        // (anything else) is never touched. Idempotent by construction.
+        {
+            const OLD_RO: &str = r#"["read_file","list_files"]"#;
+            const NEW_RUN: &str = r#"["read_file","list_files","run_command"]"#;
+            self.conn.execute(
+                "UPDATE pipeline_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2",
+                params![NEW_RUN, OLD_RO],
+            )?;
+            // Also stages of runs that haven't executed yet (drafts) — started
+            // and terminal runs keep their historical allowlist.
+            self.conn.execute(
+                "UPDATE run_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2
+                   AND status = 'pending'",
+                params![NEW_RUN, OLD_RO],
+            )?;
+        }
+
         // ── v11 chat threads: multiple conversations per workspace ──
         // A `chat_threads` table + a nullable `thread_id` on chat_messages.
         // Then a one-time backfill: every workspace that still has un-threaded

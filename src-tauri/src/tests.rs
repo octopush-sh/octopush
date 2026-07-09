@@ -2447,17 +2447,29 @@ mod runner_helpers_tests {
     fn dossier_includes_the_live_diff_so_reviewers_see_the_actual_code() {
         // The #1 crew-quality fix: a reviewer must certify the CODE, not the
         // implementer's prose summary of it. When the live worktree diff was
-        // captured it is rendered as a fenced diff section; the old tools hint
-        // remains the fallback (capture failure / empty diff).
+        // captured it is rendered between BEGIN/END markers; the old tools
+        // hint remains the fallback (capture failure / empty diff).
         let mut input = plan_input("plan text");
         input.refs_worktree = true;
         input.worktree_diff = Some("--- a/src/x.rs\n+++ b/src/x.rs\n+fn added() {}".into());
         let s = user_input_for("code_review", "T", &input, None);
-        assert!(s.contains("The actual code changes in the workspace (git diff):"), "{s}");
+        assert!(s.contains("===== BEGIN GIT DIFF ====="), "{s}");
+        assert!(s.contains("===== END GIT DIFF ====="));
         assert!(s.contains("+fn added() {}"));
         assert!(!s.contains("present in the workspace"), "diff replaces the vague hint");
+        assert!(!s.contains("too large to include"), "small diff carries no truncation note");
 
-        // A huge diff is capped like any dossier section (head + tail survive).
+        // Markers, not a ``` fence: a diff of a markdown file contains fence
+        // lines, which would terminate a fenced block early.
+        input.worktree_diff = Some("+```diff\n+nested fence\n+```".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        let begin = s.find("===== BEGIN GIT DIFF =====").unwrap();
+        let end = s.find("===== END GIT DIFF =====").unwrap();
+        let inside = &s[begin..end];
+        assert!(inside.contains("+```diff"), "fence lines survive inside the markers");
+
+        // A huge diff is capped like any dossier section (head + tail survive)
+        // and the prompt SAYS it was truncated (no silent coverage gap).
         let mut big = String::from("DIFF-HEAD\n");
         big.push_str(&"+x\n".repeat(20_000));
         big.push_str("DIFF-TAIL");
@@ -2465,11 +2477,50 @@ mod runner_helpers_tests {
         let s = user_input_for("code_review", "T", &input, None);
         assert!(s.contains("DIFF-HEAD") && s.contains("DIFF-TAIL"));
         assert!(s.contains("section truncated for length"));
+        assert!(s.contains("too large to include in full"), "truncation is inventoried");
 
-        // Whitespace-only diff falls back to the hint.
+        // Whitespace-only diff falls back to the hint (the render is the
+        // single owner of the emptiness decision).
         input.worktree_diff = Some("   \n".into());
         let s = user_input_for("code_review", "T", &input, None);
         assert!(s.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn migrate_upgrades_stale_reviewer_tool_snapshots() {
+        // The builder snapshots a role's default tools into pipeline_stages at
+        // authoring time — so the ro()→run_() upgrade for reviewers must be
+        // retrofitted onto existing rows still carrying the old default, or
+        // the new prompt ("run the build or tests…") runs against a read-only
+        // allowlist. A user-customized allowlist is never touched. Drives the
+        // REAL migration by re-opening the same database file (app update).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let pid = db.insert_pipeline("p", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        let pid2 = db.insert_pipeline("p2", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid2, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        // Simulate a pre-upgrade snapshot (pid) + a user customization (pid2).
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\",\"list_files\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid],
+        ).unwrap();
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid2],
+        ).unwrap();
+        drop(db);
+
+        // Re-open → migrate() re-runs → the retrofit applies (idempotently).
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let tools_of = |pid: &str| -> String {
+            db.conn_ref().query_row(
+                "SELECT tools FROM pipeline_stages WHERE pipeline_id=?1",
+                rusqlite::params![pid], |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(tools_of(&pid), r#"["read_file","list_files","run_command"]"#);
+        assert_eq!(tools_of(&pid2), r#"["read_file"]"#, "custom allowlists stay untouched");
     }
 
     #[test]

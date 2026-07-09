@@ -124,11 +124,26 @@ pub fn user_input_for(
         ));
     }
     // A reviewer/tester must judge the ACTUAL code: include the live worktree
-    // diff when it was captured; otherwise fall back to the tools hint.
+    // diff when it was captured; otherwise fall back to the tools hint. This
+    // is the single owner of the emptiness decision (the producer only maps
+    // capture failures to None). BEGIN/END markers instead of a ``` fence —
+    // a diff of a markdown file legitimately contains fence lines, which
+    // would terminate a fenced block early and spill the rest into the prompt.
     if let Some(diff) = input.worktree_diff.as_deref().filter(|d| !d.trim().is_empty()) {
-        s.push_str("The actual code changes in the workspace (git diff):\n```diff\n");
+        let truncated = diff.len() > SECTION_CAP_CHARS;
+        s.push_str(
+            "The actual code changes in the workspace (git diff, staged + unstaged), between the markers:\n===== BEGIN GIT DIFF =====\n",
+        );
         s.push_str(&cap_section(diff));
-        s.push_str("\n```\n\nRead any changed file with your tools when you need more context than the diff shows.\n\n");
+        s.push_str("\n===== END GIT DIFF =====\n");
+        if truncated {
+            s.push_str(
+                "Note: the diff was too large to include in full (middle omitted) — run `git diff --stat` for the complete file list before judging coverage.\n",
+            );
+        }
+        s.push_str(
+            "The workspace is shared by the whole run, so the diff may include work from other stages or branches; weigh what is relevant to your task. Read any changed file with your tools when you need more context than the diff shows.\n\n",
+        );
     } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
     }
