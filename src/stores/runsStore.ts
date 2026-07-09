@@ -45,6 +45,14 @@ interface RunsState {
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
+  /** Runs observed reaching a terminal state THIS SESSION (runId → epoch ms).
+   *  They linger on Mission Control's "Settled" band until dismissed — nothing
+   *  that finishes while you're away silently vanishes. Session-local. */
+  settledAt: Record<string, number>;
+  /** When each run's status last changed, as observed by this session (runId →
+   *  epoch ms). Drives Mission Control's time-in-state timer; best-effort — a
+   *  run hydrated at launch has no entry and falls back to createdAt. */
+  statusSince: Record<string, number>;
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
@@ -90,6 +98,10 @@ interface RunsState {
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
   /** Returns the pending prefill and clears it — consumed exactly once. */
   consumeLauncherPrefill: () => LauncherPrefill | null;
+  /** Drop one settled run from the Mission Control board (session-local). */
+  dismissSettled: (runId: string) => void;
+  /** Clear the whole settled band. */
+  clearSettled: () => void;
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
@@ -103,6 +115,28 @@ function replaceRunInList(list: Run[], run: Run): Run[] {
   return next;
 }
 
+/** Mission Control board tracking, applied by EVERY path that writes a run row
+ *  into `runsByWs` (stage events, refreshDetail, loadRuns) — a terminal status
+ *  can arrive through any of them first, and a transition observed by one must
+ *  not be invisible to the others. Returns the `statusSince`/`settledAt` deltas
+ *  for an observed status change: stamps time-in-state, and parks an
+ *  active→terminal run on the Settled band. First sight of a row (no previous
+ *  status) stamps nothing — time-in-state falls back to `createdAt`, and a run
+ *  never seen active doesn't belong on the board. */
+function trackTransition(
+  s: Pick<RunsState, "runsByWs" | "statusSince" | "settledAt">,
+  acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> },
+  run: Run,
+): void {
+  const prev = (s.runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id)?.status;
+  if (prev === undefined || prev === run.status) return;
+  acc.statusSince = { ...(acc.statusSince ?? s.statusSince), [run.id]: Date.now() };
+  const wasActive = prev === "running" || prev === "paused";
+  if (wasActive && TERMINAL.has(run.status)) {
+    acc.settledAt = { ...(acc.settledAt ?? s.settledAt), [run.id]: Date.now() };
+  }
+}
+
 export const useRunsStore = create<RunsState>((set, get) => ({
   runsByWs: {},
   loadedByWs: {},
@@ -112,6 +146,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   selectedRunIdByWs: {},
   liveByStage: {},
   launcherPrefill: null,
+  settledAt: {},
+  statusSince: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
@@ -159,11 +195,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   loadRuns: async (workspaceId) => {
     const runs = await ipc.listRuns(workspaceId);
     const active = runs.find((r) => !TERMINAL.has(r.status)) ?? null;
-    set((s) => ({
-      runsByWs: { ...s.runsByWs, [workspaceId]: runs },
-      loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
-      activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
-    }));
+    set((s) => {
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      for (const run of runs) trackTransition(s, acc, run);
+      return {
+        runsByWs: { ...s.runsByWs, [workspaceId]: runs },
+        loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
+        activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
+        ...acc,
+      };
+    });
     if (active) await get().refreshDetail(active.id);
   },
 
@@ -178,11 +219,13 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     set((s) => {
       const runsByWs = { ...s.runsByWs };
       const activeRunIdByWs = { ...s.activeRunIdByWs };
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
       for (const run of active) {
+        trackTransition(s, acc, run);
         runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
         activeRunIdByWs[run.workspaceId] = run.id;
       }
-      return { runsByWs, activeRunIdByWs };
+      return { runsByWs, activeRunIdByWs, ...acc };
     });
   },
 
@@ -197,6 +240,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       set((s) => {
         const next: any = { detailByRun: { ...s.detailByRun, [runId]: detail } };
         if (detail.run) {
+          const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+          trackTransition(s, acc, detail.run);
+          Object.assign(next, acc);
           const wsId = detail.run.workspaceId;
           const wsList = s.runsByWs[wsId] ?? EMPTY_RUNS;
           next.runsByWs = { ...s.runsByWs, [wsId]: replaceRunInList(wsList, detail.run) };
@@ -267,6 +313,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     return prefill;
   },
 
+  dismissSettled: (runId) =>
+    set((s) => {
+      if (!(runId in s.settledAt)) return {};
+      const next = { ...s.settledAt };
+      delete next[runId];
+      return { settledAt: next };
+    }),
+
+  clearSettled: () => set({ settledAt: {} }),
+
   applyStageUpdate: (runId, run) => {
     set((s) => {
       const prevDetail = s.detailByRun[runId];
@@ -274,10 +330,14 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         ? { ...prevDetail, run }
         : { run, stages: [] };
       const wsList = s.runsByWs[run.workspaceId] ?? EMPTY_RUNS;
-      return {
+      const next: Partial<RunsState> = {
         detailByRun: { ...s.detailByRun, [runId]: detail },
         runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
       };
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      trackTransition(s, acc, run);
+      Object.assign(next, acc);
+      return next;
     });
     void get().refreshDetail(runId);
   },

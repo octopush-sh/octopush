@@ -39,7 +39,7 @@ describe("runsStore", () => {
   beforeEach(() => {
     useRunsStore.setState({
       runsByWs: {}, loadedByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
-      selectedRunIdByWs: {}, liveByStage: {},
+      selectedRunIdByWs: {}, liveByStage: {}, settledAt: {}, statusSince: {},
     });
     vi.clearAllMocks();
   });
@@ -240,5 +240,68 @@ describe("runsStore", () => {
     expect(ipc.abortRun).toHaveBeenCalledWith("rDraft");
     // no explicit selection of the dead draft
     expect("w1" in (useRunsStore.getState() as any).selectedRunIdByWs).toBe(false);
+  });
+
+  // ── Mission Control board tracking (settled band + time-in-state) ──
+
+  it("applyStageUpdate stamps statusSince on a status change and settles an active→terminal run", () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // RUN is running
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "paused" });
+    const s1 = useRunsStore.getState();
+    expect(s1.statusSince["r1"]).toBeTypeOf("number");
+    expect(s1.settledAt["r1"]).toBeUndefined(); // paused is not terminal
+
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "completed" });
+    const s2 = useRunsStore.getState();
+    expect(s2.settledAt["r1"]).toBeTypeOf("number"); // active → terminal lands on the board
+  });
+
+  it("applyStageUpdate does not settle a run that was never seen active", () => {
+    // e.g. a draft aborted by the failed-start cleanup, or a first-ever event
+    // that already arrives terminal for a row we never held as active.
+    useRunsStore.setState({ runsByWs: { w1: [{ ...RUN, status: "draft" as const }] } });
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "aborted" });
+    expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
+  });
+
+  it("applyStageUpdate with an unchanged status stamps nothing", () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } });
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, costUsd: 0.2 });
+    expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
+
+  it("dismissSettled and clearSettled clear the board (session-local)", () => {
+    useRunsStore.setState({ settledAt: { r1: 1, r2: 2 } });
+    useRunsStore.getState().dismissSettled("r1");
+    expect(useRunsStore.getState().settledAt).toEqual({ r2: 2 });
+    useRunsStore.getState().clearSettled();
+    expect(useRunsStore.getState().settledAt).toEqual({});
+  });
+
+  it("refreshDetail also settles an active→terminal transition (no race with events)", async () => {
+    // A run completes while a refreshDetail is in flight: getRun returns the
+    // already-terminal row. The transition tracker must fire on THIS write
+    // path too, or the later run:// event sees no change and the run silently
+    // vanishes from the board.
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "completed" }, stages: [] });
+    await useRunsStore.getState().refreshDetail("r1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns settles an active→terminal transition seen via the list", async () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "aborted" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns first sight of terminal history rows stamps nothing", async () => {
+    // Bulk-loading a workspace's run history must not reset time-in-state or
+    // put old completed runs on the board.
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "completed" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
+    expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
   });
 });

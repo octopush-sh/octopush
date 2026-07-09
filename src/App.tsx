@@ -43,6 +43,7 @@ import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
+import { MissionControl } from "./components/MissionControl";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -285,6 +286,7 @@ function App() {
 
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
+  const [missionControlOpen, setMissionControlOpen] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
@@ -835,6 +837,13 @@ function App() {
         return;
       }
 
+      // ⌘⇧M → Mission Control (the fleet cockpit)
+      if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
+        e.preventDefault();
+        setMissionControlOpen((v) => !v);
+        return;
+      }
+
       // ⌘N → new workspace
       if (mod && !e.shiftKey && e.key === "n") {
         e.preventDefault();
@@ -1276,15 +1285,25 @@ function App() {
     [workspacesByProjectId, project, selectWorkspace, recentProjects, rememberActiveForProject, openProject],
   );
 
-  // Jump from the global runs tray to a run's workspace + its Direct surface.
-  // (Mode is App-local state, so the tray can't navigate on its own.)
+  // Jump from Mission Control to a run's workspace + its Direct surface.
+  // (Mode is App-local state, so the room can't navigate on its own.)
   const handleJumpToRun = useCallback(
     (workspaceId: string) => {
+      setMissionControlOpen(false);
       handleSelectWorkspace(workspaceId);
       setModePerWorkspace((p) => ({ ...p, [workspaceId]: "direct" }));
     },
     [handleSelectWorkspace],
   );
+
+  // "Send out a crew" — close the room and land on the current workspace's
+  // Direct surface (its launcher when no run is executing).
+  const handleDispatchCrew = useCallback(() => {
+    setMissionControlOpen(false);
+    if (activeWorkspaceId) {
+      setModePerWorkspace((p) => ({ ...p, [activeWorkspaceId]: "direct" }));
+    }
+  }, [activeWorkspaceId]);
 
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
@@ -1528,7 +1547,7 @@ function App() {
       <AppTopBar
         onOpenSettings={() => setSettingsTab("general")}
         onToggleScratchpad={toggleScratchpad}
-        onJumpToRun={handleJumpToRun}
+        onOpenMissionControl={() => setMissionControlOpen(true)}
       />
       <div className="flex min-h-0 flex-1">
       <WorkspaceRail
@@ -2289,6 +2308,17 @@ function App() {
       <UpdateNotifier />
       <UpgradeSheet />
       <HistorySheet />
+      {/* Mounted only while open — the room subscribes to the whole runs
+          board, so an always-mounted instance would churn on every stage
+          event for nothing. OverlayRoom's fade-in covers the entrance. */}
+      {missionControlOpen && (
+        <MissionControl
+          open
+          onClose={() => setMissionControlOpen(false)}
+          onJumpToRun={handleJumpToRun}
+          onDispatch={handleDispatchCrew}
+        />
+      )}
     </div>
   );
 }
