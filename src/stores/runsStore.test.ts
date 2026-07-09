@@ -277,4 +277,31 @@ describe("runsStore", () => {
     useRunsStore.getState().clearSettled();
     expect(useRunsStore.getState().settledAt).toEqual({});
   });
+
+  it("refreshDetail also settles an active→terminal transition (no race with events)", async () => {
+    // A run completes while a refreshDetail is in flight: getRun returns the
+    // already-terminal row. The transition tracker must fire on THIS write
+    // path too, or the later run:// event sees no change and the run silently
+    // vanishes from the board.
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "completed" }, stages: [] });
+    await useRunsStore.getState().refreshDetail("r1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns settles an active→terminal transition seen via the list", async () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "aborted" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns first sight of terminal history rows stamps nothing", async () => {
+    // Bulk-loading a workspace's run history must not reset time-in-state or
+    // put old completed runs on the board.
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "completed" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
+    expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
 });

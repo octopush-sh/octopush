@@ -115,6 +115,28 @@ function replaceRunInList(list: Run[], run: Run): Run[] {
   return next;
 }
 
+/** Mission Control board tracking, applied by EVERY path that writes a run row
+ *  into `runsByWs` (stage events, refreshDetail, loadRuns) — a terminal status
+ *  can arrive through any of them first, and a transition observed by one must
+ *  not be invisible to the others. Returns the `statusSince`/`settledAt` deltas
+ *  for an observed status change: stamps time-in-state, and parks an
+ *  active→terminal run on the Settled band. First sight of a row (no previous
+ *  status) stamps nothing — time-in-state falls back to `createdAt`, and a run
+ *  never seen active doesn't belong on the board. */
+function trackTransition(
+  s: Pick<RunsState, "runsByWs" | "statusSince" | "settledAt">,
+  acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> },
+  run: Run,
+): void {
+  const prev = (s.runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id)?.status;
+  if (prev === undefined || prev === run.status) return;
+  acc.statusSince = { ...(acc.statusSince ?? s.statusSince), [run.id]: Date.now() };
+  const wasActive = prev === "running" || prev === "paused";
+  if (wasActive && TERMINAL.has(run.status)) {
+    acc.settledAt = { ...(acc.settledAt ?? s.settledAt), [run.id]: Date.now() };
+  }
+}
+
 export const useRunsStore = create<RunsState>((set, get) => ({
   runsByWs: {},
   loadedByWs: {},
@@ -173,11 +195,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   loadRuns: async (workspaceId) => {
     const runs = await ipc.listRuns(workspaceId);
     const active = runs.find((r) => !TERMINAL.has(r.status)) ?? null;
-    set((s) => ({
-      runsByWs: { ...s.runsByWs, [workspaceId]: runs },
-      loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
-      activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
-    }));
+    set((s) => {
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      for (const run of runs) trackTransition(s, acc, run);
+      return {
+        runsByWs: { ...s.runsByWs, [workspaceId]: runs },
+        loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
+        activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
+        ...acc,
+      };
+    });
     if (active) await get().refreshDetail(active.id);
   },
 
@@ -192,11 +219,13 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     set((s) => {
       const runsByWs = { ...s.runsByWs };
       const activeRunIdByWs = { ...s.activeRunIdByWs };
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
       for (const run of active) {
+        trackTransition(s, acc, run);
         runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
         activeRunIdByWs[run.workspaceId] = run.id;
       }
-      return { runsByWs, activeRunIdByWs };
+      return { runsByWs, activeRunIdByWs, ...acc };
     });
   },
 
@@ -211,6 +240,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       set((s) => {
         const next: any = { detailByRun: { ...s.detailByRun, [runId]: detail } };
         if (detail.run) {
+          const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+          trackTransition(s, acc, detail.run);
+          Object.assign(next, acc);
           const wsId = detail.run.workspaceId;
           const wsList = s.runsByWs[wsId] ?? EMPTY_RUNS;
           next.runsByWs = { ...s.runsByWs, [wsId]: replaceRunInList(wsList, detail.run) };
@@ -302,19 +334,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         detailByRun: { ...s.detailByRun, [runId]: detail },
         runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
       };
-      // Track status transitions for Mission Control: stamp when the status
-      // changed (time-in-state), and when an ACTIVE run reaches a terminal
-      // state, park it on the Settled band (session-local; lingers until
-      // dismissed). A run that was never seen active (e.g. a draft aborted
-      // by the failed-start cleanup) never lands on the board.
-      const prevStatus = wsList.find((r) => r.id === runId)?.status;
-      if (prevStatus !== run.status) {
-        next.statusSince = { ...s.statusSince, [runId]: Date.now() };
-        const wasActive = prevStatus === "running" || prevStatus === "paused";
-        if (wasActive && TERMINAL.has(run.status)) {
-          next.settledAt = { ...s.settledAt, [runId]: Date.now() };
-        }
-      }
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      trackTransition(s, acc, run);
+      Object.assign(next, acc);
       return next;
     });
     void get().refreshDetail(runId);

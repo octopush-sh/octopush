@@ -125,12 +125,26 @@ describe("MissionControl", () => {
     expect(screen.getByText("The floor is quiet.")).toBeTruthy();
   });
 
-  it("clicking a card jumps to the run's workspace", () => {
+  it("clicking a card jumps to the run's workspace (when it's loaded)", () => {
     const onJumpToRun = vi.fn();
     useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-a", name: "Alpha" }] },
+    } as any);
     renderRoom({ onJumpToRun });
     fireEvent.click(screen.getByRole("button", { name: /task a/ }));
     expect(onJumpToRun).toHaveBeenCalledWith("ws-a");
+  });
+
+  it("a run in an UNLOADED workspace renders inert — no jump, but abort still works", () => {
+    const onJumpToRun = vi.fn();
+    useRunsStore.setState({ runsByWs: { "ws-gone": [mkRun("g", "running")] } });
+    renderRoom({ onJumpToRun });
+    // No clickable card (the old tray's guard: can't navigate to an unloaded ws)…
+    expect(screen.queryByRole("button", { name: /task g/ })).toBeNull();
+    expect(screen.getByTitle("Open this run's project to view it")).toBeTruthy();
+    // …but the run can still be aborted.
+    expect(screen.getByRole("button", { name: "Abort run" })).toBeTruthy();
   });
 
   it("abort is two-step: first click arms, second aborts — without jumping", () => {

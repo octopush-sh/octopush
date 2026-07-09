@@ -15,7 +15,6 @@ import { useWorkspaceStore } from "../stores/workspaceStore";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
 import { ROMAN, stageTitle } from "../lib/stageMeta";
-import { useElapsed } from "../hooks/useElapsed";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 
 interface Props {
@@ -38,14 +37,17 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
   const settledAt = useRunsStore((s) => s.settledAt);
   const statusSince = useRunsStore((s) => s.statusSince);
   const refreshDetail = useRunsStore((s) => s.refreshDetail);
-  const detailByRun = useRunsStore((s) => s.detailByRun);
 
   // The board: active runs everywhere + this session's settled (undismissed).
   const board = useMemo(() => {
     const all = Object.values(runsByWs).flat();
     const active = all.filter((r) => r.status === "running" || r.status === "paused");
     const settled = all.filter((r) => r.id in settledAt);
-    const since = (r: Run) => statusSince[r.id] ?? Date.parse(r.createdAt) ?? 0;
+    const since = (r: Run) => {
+      if (statusSince[r.id] !== undefined) return statusSince[r.id];
+      const t = Date.parse(r.createdAt);
+      return Number.isNaN(t) ? 0 : t;
+    };
     const fifo = (a: Run, b: Run) => since(a) - since(b);
     return {
       needsYou: active.filter((r) => r.status === "paused").sort(fifo),
@@ -60,10 +62,13 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
   );
 
   // Hydrate stage detail for any board run that hasn't streamed one yet (e.g.
-  // background runs restored at launch) so the micro-track can render.
+  // background runs restored at launch) so the micro-track can render. Reads
+  // detailByRun imperatively — subscribing to the whole map here would churn
+  // this component on every stage event even while the room is closed.
   const boardIds = boardRuns.map((r) => r.id).join(",");
   useEffect(() => {
     if (!open) return;
+    const detailByRun = useRunsStore.getState().detailByRun;
     for (const run of boardRuns) {
       if (!detailByRun[run.id]) void refreshDetail(run.id);
     }
@@ -73,10 +78,13 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
 
   if (!open) return null;
 
-  // Fleet ledger over the visible board — savings-first (the differentiator
-  // leads, per the Direct ledger convention).
-  const spent = boardRuns.reduce((sum, r) => sum + r.costUsd, 0);
-  const baseline = boardRuns.reduce((sum, r) => sum + r.baselineUsd, 0);
+  // Fleet ledger over the ACTIVE crews — the A3 "combined live cost" semantics:
+  // a live burn-rate figure, never inflated by this session's settled runs
+  // (each settled card carries its own cost). Savings-first, per the Direct
+  // ledger convention.
+  const activeRuns = [...board.needsYou, ...board.inFlight];
+  const spent = activeRuns.reduce((sum, r) => sum + r.costUsd, 0);
+  const baseline = activeRuns.reduce((sum, r) => sum + r.baselineUsd, 0);
   const saved = Math.max(0, baseline - spent);
   const savedPct = baseline > 0 ? Math.round((saved / baseline) * 100) : 0;
 
@@ -104,28 +112,32 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
               </span>
             ))}
         </span>
-        <span
-          className="ml-auto hidden shrink-0 items-baseline gap-2 font-mono text-[11px] sm:flex"
-          title="Fleet ledger — across every crew on the board"
-        >
-          {baseline > 0 && (
-            <>
-              <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
-              <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
-            </>
+        <span className="ml-auto flex shrink-0 items-baseline gap-3">
+          {activeRuns.length > 0 && (
+            <span
+              className="hidden items-baseline gap-2 font-mono text-[11px] sm:flex"
+              title="Combined live cost across all active runs"
+            >
+              {baseline > 0 && (
+                <>
+                  <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
+                  <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
+                </>
+              )}
+              <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
+            </span>
           )}
-          <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
+          <button
+            type="button"
+            onClick={onDispatch}
+            aria-label="Send out a crew"
+            title="Send out a crew"
+            className="flex shrink-0 items-center justify-center self-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            <Plus size={12} />
+          </button>
+          <RoomClose onClose={onClose} label="Close Mission Control" />
         </span>
-        <button
-          type="button"
-          onClick={onDispatch}
-          aria-label="Send out a crew"
-          title="Send out a crew"
-          className="flex shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-        >
-          <Plus size={12} />
-        </button>
-        <RoomClose onClose={onClose} label="Close Mission Control" />
       </header>
 
       {boardRuns.length === 0 ? (
@@ -192,14 +204,19 @@ function CrewCard({
   const stages = useRunsStore((s) => s.detailByRun[run.id]?.stages ?? EMPTY_STAGES);
   const statusSinceMs = useRunsStore((s) => s.statusSince[run.id]);
   const wsName = useWorkspaceName(run.workspaceId);
+  // A run whose workspace isn't loaded (project closed/removed) still shows —
+  // and can be aborted — but jump-to is disabled: we can't navigate to an
+  // unloaded workspace. (Same guard the old tray popover carried.)
+  const canJump = wsName !== null;
 
   // Time-in-state — session-observed transition time, falling back to the
-  // run's start for launch-hydrated rows. Fixed-width tabular slot (S2).
+  // run's start for launch-hydrated rows. Fixed-width tabular slot (S2);
+  // rolls to hours so long-lived background runs never overflow it.
   const sinceIso = useMemo(() => {
     const ms = statusSinceMs ?? Date.parse(run.createdAt);
     return Number.isNaN(ms) ? null : new Date(ms).toISOString();
   }, [statusSinceMs, run.createdAt]);
-  const inState = useElapsed(band === "settled" ? null : sinceIso);
+  const inState = useTimeInState(band === "settled" ? null : sinceIso);
 
   const meta = runStatusMeta(run.status);
 
@@ -228,31 +245,38 @@ function CrewCard({
 
   // The whole card jumps to the crew's workspace. A div-with-role (not a
   // <button>) so inner action buttons stay valid HTML and child `title`
-  // tooltips (truncated task, per-stage track) keep working.
+  // tooltips (truncated task, per-stage track) keep working. Cards for
+  // unloaded workspaces render inert (no role/click) with an explaining title.
   const jump = () => onJumpToRun(run.workspaceId);
+  const jumpProps = canJump
+    ? {
+        role: "button" as const,
+        tabIndex: 0,
+        onClick: jump,
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.target !== e.currentTarget) return; // inner buttons keep their keys
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            jump();
+          }
+        },
+        "aria-label": `Open ${wsName} — ${run.task}`,
+        title: undefined,
+      }
+    : { title: "Open this run's project to view it" };
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      onClick={jump}
-      onKeyDown={(e) => {
-        if (e.target !== e.currentTarget) return; // inner buttons keep their keys
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          jump();
-        }
-      }}
-      aria-label={`Open ${wsName ?? "workspace"} — ${run.task}`}
+      {...jumpProps}
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
-      className={`octo-rise-in group relative flex cursor-pointer flex-col gap-1.5 rounded-lg border bg-octo-panel px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${skin}`}
+      className={`octo-rise-in group relative flex flex-col gap-1.5 rounded-lg border bg-octo-panel px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${canJump ? "cursor-pointer" : ""} ${skin}`}
     >
       {/* Row 1 — status glyph · word · time-in-state. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
         <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`}>{glyph.label}</span>
         <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
         <span
-          className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-mute"
+          className="octo-tabular ml-auto w-[7ch] shrink-0 text-right text-octo-mute"
           title="Time in this state"
         >
           {inState}
@@ -451,6 +475,31 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
 function recentlySettled(runId: string): boolean {
   const at = useRunsStore.getState().settledAt[runId];
   return at !== undefined && Date.now() - at < 8000;
+}
+
+/** Time-in-state for a crew card — `mm:ss`, rolling to `Hh MMm` past an hour
+ *  so long-lived background runs never overflow the fixed 7ch slot (S1/S2). */
+function useTimeInState(sinceIso: string | null): string {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!sinceIso) return;
+    setNow(Date.now()); // reset so the first paint is correct
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [sinceIso]);
+
+  if (!sinceIso) return "";
+  const start = new Date(sinceIso).getTime();
+  if (Number.isNaN(start)) return "";
+  const secs = Math.max(0, Math.floor((now - start) / 1000));
+  if (secs < 3600) {
+    const mm = Math.floor(secs / 60).toString().padStart(2, "0");
+    const ss = (secs % 60).toString().padStart(2, "0");
+    return `${mm}:${ss}`;
+  }
+  const h = Math.floor(secs / 3600);
+  const mm = Math.floor((secs % 3600) / 60).toString().padStart(2, "0");
+  return `${h}h ${mm}m`;
 }
 
 /** The workspace's display name, from whichever project list holds it. */

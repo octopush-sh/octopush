@@ -2308,12 +2308,17 @@ function App() {
       <UpdateNotifier />
       <UpgradeSheet />
       <HistorySheet />
-      <MissionControl
-        open={missionControlOpen}
-        onClose={() => setMissionControlOpen(false)}
-        onJumpToRun={handleJumpToRun}
-        onDispatch={handleDispatchCrew}
-      />
+      {/* Mounted only while open — the room subscribes to the whole runs
+          board, so an always-mounted instance would churn on every stage
+          event for nothing. OverlayRoom's fade-in covers the entrance. */}
+      {missionControlOpen && (
+        <MissionControl
+          open
+          onClose={() => setMissionControlOpen(false)}
+          onJumpToRun={handleJumpToRun}
+          onDispatch={handleDispatchCrew}
+        />
+      )}
     </div>
   );
 }

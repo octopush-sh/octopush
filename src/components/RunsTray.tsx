@@ -9,21 +9,27 @@ import { useRunsStore } from "../stores/runsStore";
  *  the board is truly empty. Clicking opens the Mission Control room (which
  *  replaced the old popover — one canonical surface for the fleet). */
 export function RunsTray({ onOpen }: { onOpen: () => void }) {
-  const activeCount = useRunsStore(
-    useShallow(
-      (s) =>
-        Object.values(s.runsByWs)
-          .flat()
-          .filter((r) => r.status === "running" || r.status === "paused").length,
-    ),
+  // One shallow-compared tuple: active count + combined live cost + settled
+  // count. The combined figure keeps the A3 "live spend across active runs"
+  // number one hover away, without opening the room.
+  const [activeCount, totalCost, settledCount] = useRunsStore(
+    useShallow((s): [number, number, number] => {
+      const active = Object.values(s.runsByWs)
+        .flat()
+        .filter((r) => r.status === "running" || r.status === "paused");
+      return [
+        active.length,
+        active.reduce((sum, r) => sum + r.costUsd, 0),
+        Object.keys(s.settledAt).length,
+      ];
+    }),
   );
-  const settledCount = useRunsStore(useShallow((s) => Object.keys(s.settledAt).length));
 
   if (activeCount === 0 && settledCount === 0) return null;
 
   const active = activeCount > 0;
   const label = active
-    ? `${activeCount} run${activeCount > 1 ? "s" : ""} in progress — open Mission Control`
+    ? `${activeCount} run${activeCount > 1 ? "s" : ""} in progress · $${totalCost.toFixed(2)} combined — open Mission Control`
     : `${settledCount} run${settledCount > 1 ? "s" : ""} settled — open Mission Control`;
 
   return (

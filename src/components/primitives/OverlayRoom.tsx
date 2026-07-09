@@ -14,14 +14,24 @@ interface Props {
   children: React.ReactNode;
 }
 
+/** Mounted-room stack so Escape only dismisses the topmost (most recently
+ *  opened) room when rooms are stacked (e.g. Mission Control over Settings),
+ *  instead of both at once — `stopPropagation` cannot stop other listeners on
+ *  the same target (window), so ordering has to be explicit. Mirrors
+ *  ModalShell's escStack. */
+const roomStack: symbol[] = [];
+
 export function OverlayRoom({ onClose, ariaLabel, children }: Props) {
   // Esc closes the room. Registered in the capture phase and consuming the
   // event so it never reaches the webview/OS — otherwise, in a maximized
   // (macOS full-screen) window, Escape would exit full-screen instead.
   useEffect(() => {
+    const id = Symbol("overlay-room");
+    roomStack.push(id);
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (isModalOpen()) return; // a dialog on top handles its own Escape
+      if (roomStack[roomStack.length - 1] !== id) return; // not the top room
       e.preventDefault();
       // If focus is in a field, let that field's own Escape run (e.g. cancel
       // an inline edit) and leave the room open — don't hijack it.
@@ -32,17 +42,24 @@ export function OverlayRoom({ onClose, ariaLabel, children }: Props) {
       ) {
         return;
       }
-      e.stopPropagation();
+      // Also stop any OTHER window listeners (a room below) from acting on
+      // this same press — one Escape peels exactly one room.
+      e.stopImmediatePropagation();
       onClose();
     };
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      const idx = roomStack.indexOf(id);
+      if (idx !== -1) roomStack.splice(idx, 1);
+    };
   }, [onClose]);
 
   return (
     <div
       className="absolute inset-0 z-40 flex flex-col bg-octo-bg octo-fade-in"
       data-tauri-drag-region
+      role="region"
       aria-label={ariaLabel}
       style={{
         // --brass-faint is the accent at 4% alpha, re-derived per theme by
@@ -56,14 +73,24 @@ export function OverlayRoom({ onClose, ariaLabel, children }: Props) {
   );
 }
 
-/** The canonical room-dismiss affordance — top-right `ESC · CLOSE`. */
-export function RoomClose({ onClose, label }: { onClose: () => void; label: string }) {
+/** The canonical room-dismiss affordance — top-right `ESC · CLOSE`. Callers
+ *  own its placement (pass `ml-auto` when it's the only right-aligned item;
+ *  omit it inside an already right-aligned cluster). */
+export function RoomClose({
+  onClose,
+  label,
+  className = "",
+}: {
+  onClose: () => void;
+  label: string;
+  className?: string;
+}) {
   return (
     <button
       type="button"
       onClick={onClose}
       aria-label={label}
-      className="ml-auto rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-brass"
+      className={`rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute hover:text-octo-brass ${className}`}
     >
       ESC · CLOSE
     </button>

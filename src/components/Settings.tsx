@@ -43,7 +43,7 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
           Preferences
         </span>
         <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Octopus</h1>
-        <RoomClose onClose={onClose} label="Close settings" />
+        <RoomClose onClose={onClose} label="Close settings" className="ml-auto" />
       </header>
 
       {/* Body: grouped nav + pane */}
