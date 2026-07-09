@@ -93,6 +93,77 @@ export function ToggleRow({
   );
 }
 
+// ─── Segmented row ────────────────────────────────────────────────────
+
+/** A labelled setting whose value is one of a small, fixed set of choices.
+ *  The control mirrors the ModeSwitcher aesthetic (mono/uppercase segments,
+ *  a brass-ghost pill marking the active one) so the two read as the same
+ *  language. Stacked layout keeps wider option sets from cramping the label. */
+export function SegmentedRow<T extends string>({
+  label,
+  description,
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  testId,
+}: {
+  label: string;
+  description?: string;
+  value: T;
+  options: ReadonlyArray<{ value: T; label: string }>;
+  onChange: (v: T) => void;
+  ariaLabel?: string;
+  testId?: string;
+}) {
+  return (
+    <div
+      className="rounded-lg px-4 py-3"
+      style={{
+        border: "1px solid var(--color-octo-hairline)",
+        background: "var(--color-octo-panel)",
+      }}
+    >
+      <div className="font-serif text-[14px] leading-tight text-octo-ivory">{label}</div>
+      {description && (
+        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
+      )}
+      <div
+        role="radiogroup"
+        aria-label={ariaLabel ?? label}
+        data-testid={testId}
+        className="mt-3 inline-flex items-center gap-0.5"
+      >
+        {options.map((opt) => {
+          const active = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              onClick={() => onChange(opt.value)}
+              className={
+                "relative rounded-md border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] " +
+                (active
+                  ? "text-octo-brass"
+                  : "border-transparent text-octo-mute hover:text-octo-sage")
+              }
+              style={
+                active
+                  ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
+                  : undefined
+              }
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─── Small data helpers ───────────────────────────────────────────────
 
 export function Stat({ label, value }: { label: string; value: string }) {

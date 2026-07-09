@@ -1,6 +1,6 @@
 {
   "name": "octopush",
-  "version": "0.1.93",
+  "version": "0.2.31",
   "description": "The IDE for Agentic Developers — eight arms, zero wasted tokens.",
   "private": true,
   "type": "module",
@@ -54,6 +54,7 @@
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
+    "remark-gfm": "^4.0.1",
     "zustand": "^5.0.2"
   },
   "devDependencies": {

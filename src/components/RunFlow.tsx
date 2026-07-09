@@ -1,6 +1,7 @@
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
 import { ROMAN, stageTitle, fmtTokens } from "../lib/stageMeta";
+import { lastActivity, lastNotice } from "../lib/liveLine";
 import { archetypeFor } from "./builder/graph";
 import { ARTIFACT_ICON } from "./builder/icons";
 import { useRunsStore } from "../stores/runsStore";
@@ -13,24 +14,6 @@ interface Props {
 }
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
-
-/** One-line "current activity" from the most recent meaningful live entry. */
-function lastActivity(entries: LiveEntry[]): string {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.kind === "tool") return `§ ${e.tool}${e.hint ? " " + e.hint : ""}`;
-    if (e.kind === "text") return e.text.split("\n")[0].slice(0, 60);
-  }
-  return "";
-}
-
-/** The latest verdict notice (for a finished review), or "". */
-function lastNotice(entries: LiveEntry[]): string {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].kind === "notice") return (entries[i] as { text: string }).text;
-  }
-  return "";
-}
 
 /** The running pipeline drawn as a LIVING node flow — the execution-aware
  *  sibling of the launcher's StageFlow. It speaks the same node language

@@ -163,6 +163,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // Creating for any other project must not steal focus or corrupt that
     // list — it just lands in the per-project map for the rail (C3).
     const isActiveProject = useProjectStore.getState().current?.id === projectId;
+    // Creation is idempotent on (project, branch): the backend may return a
+    // workspace that already exists (e.g. reusing an existing branch). Upsert by
+    // id so the rail never grows a duplicate row / duplicate React key.
+    const upsert = (list: Workspace[]) => {
+      const i = list.findIndex((w) => w.id === ws.id);
+      if (i === -1) return [...list, ws];
+      const next = list.slice();
+      next[i] = ws;
+      return next;
+    };
     set((s) => {
       const updated = { ...s.lastActiveByProject, [projectId]: ws.id };
       try {
@@ -172,13 +182,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       return {
         // New workspaces sit at the end of their project's list (matching the
-        // backend's created_at ASC ordering).
-        workspaces: isActiveProject ? [...s.workspaces, ws] : s.workspaces,
+        // backend's created_at ASC ordering); reused ones replace in place.
+        workspaces: isActiveProject ? upsert(s.workspaces) : s.workspaces,
         activeId: isActiveProject ? ws.id : s.activeId,
         lastActiveByProject: updated,
         workspacesByProjectId: {
           ...s.workspacesByProjectId,
-          [projectId]: [...(s.workspacesByProjectId[projectId] || []), ws],
+          [projectId]: upsert(s.workspacesByProjectId[projectId] || []),
         },
       };
     });

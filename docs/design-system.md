@@ -140,7 +140,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 | Detail        | Status | Where to use                                                        |
 |---------------|--------|---------------------------------------------------------------------|
-| `&` in brass  | Active | "Octopus & you" branding moments (welcome, about)                   |
+| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass"), used sparingly  |
 | `⟶` in brass — **structural only** | Active (structural); **RETIRED as ornament** | **KEEP:** Direct run-track stage connector; Direct checkpoint gate flow. **DO NOT add** as prompt glyph, input nudge, or button decoration on any new surface. |
 | `⟜` in brass | Active | Direct run-track checkpoint gate — pauses the pipeline for human approval |
 | `§` in brass  | Active | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER`. This prefix is structural; do not retire it. |
@@ -306,6 +306,30 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 - Format: `saved $0.089 · 86% under all-premium  ·  spent $0.014` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
 - A 2px progress inset beneath (brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
 - **Completion moment:** when a run completes, a one-shot brass sweep (`.octo-sweep`) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
+
+### Full-screen rooms (Settings · Mission Control)
+
+A **room** is a transient, full-screen overlay for an **app-scoped** concern —
+something that belongs to the whole app, not to one workspace, and therefore
+cannot live in Canvas or Companion. It is NOT a dialog (no ModalShell): it
+frames a destination, not an interruption. Rules:
+
+- Use **`<OverlayRoom>`** (`src/components/primitives/OverlayRoom.tsx`) — it owns
+  the container (`absolute inset-0 z-40`, onyx + `--brass-faint` radial wash,
+  `octo-fade-in`) and the capture-phase Escape handling (defers to ModalShell
+  dialogs stacked on top at z-50; never hijacks Escape from a focused field).
+  `<RoomClose>` is the canonical `ESC · CLOSE` affordance.
+- Header: the Settings recipe — mono eyebrow + serif title (or app-scoped live
+  meta) + right-aligned quiet actions + RoomClose.
+- A room is **entered from existing chrome** (top bar, shortcut) and never
+  persistent — it adds zero standing pixels. One room per concept (§9).
+- Current residents: **Settings** (`⌘,`) and **Mission Control** (`⌘⇧M`) — the
+  fleet cockpit: every active Direct run across all workspaces as live crew
+  cards in triage bands (Needs you / In flight / Settled), each with the
+  micro-track (`I ⟶ II ⟜ III` — sanctioned Direct glyphs; Mission Control is a
+  Direct-family surface), a fixed-slot live ticker (S1/S5), and the savings-first
+  fleet ledger. Its cards follow the Direct status-color convention (needs-you =
+  brass border + calm pulse, exactly like an awaiting stage card).
 
 ### Status bar (bottom)
 

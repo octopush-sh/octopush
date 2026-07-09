@@ -27,9 +27,32 @@ type Step = 1 | 2;
  *  siblings of the project root, inside a shared `.octopus-worktrees/`
  *  directory. Showing this honestly here means the path the user sees
  *  in the wizard matches what they'd see in Finder. */
+/** Flatten a branch to the single-component directory name the backend uses for
+ *  the worktree (mirrors `git_ops::slot_name_for`): keep ASCII word chars, `.`;
+ *  turn everything else (slashes, spaces, …) into `-`; collapse; trim. So
+ *  `feat/Foo` lives at `.octopus-worktrees/feat-Foo`, not a nested `feat/Foo`. */
+function worktreeDirName(branch: string): string {
+  let out = "";
+  let prevDash = false;
+  for (const ch of branch) {
+    if (/[A-Za-z0-9_.]/.test(ch)) {
+      out += ch;
+      prevDash = false;
+    } else if (!prevDash) {
+      out += "-";
+      prevDash = true;
+    }
+  }
+  out = out.replace(/^-+|-+$/g, "").replace(/^\.+/, "");
+  return out || "workspace";
+}
+
 function worktreeDisplayPath(projectPath: string, branch: string): string {
   const parent = projectPath.replace(/\/[^/]+\/?$/, "");
-  return `${parent}/.octopus-worktrees/${branch}`;
+  // The backend appends a short per-workspace id (`-<id>`) so two workspaces can
+  // never share a directory, whatever their branch names look like. It's assigned
+  // at creation time, so preview it as a placeholder suffix rather than a lie.
+  return `${parent}/.octopus-worktrees/${worktreeDirName(branch)}-<id>`;
 }
 
 function slugify(text: string): string {
@@ -109,7 +132,11 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
-      if (e.defaultPrevented) return;
+      if (e.defaultPrevented) return; // an inner layer (e.g. the base-branch menu) claimed it
+      // We own Escape here. Prevent the default so it doesn't reach the OS — in
+      // native fullscreen an unhandled Escape exits fullscreen and visibly
+      // shrinks the window instead of just closing this view.
+      e.preventDefault();
       if (!creating) onCancel();
     }
     window.addEventListener("keydown", onKeyDown);
@@ -155,23 +182,26 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   return (
     <div
       data-tauri-drag-region
-      className="flex h-full w-full bg-octo-bg"
+      className="relative flex h-full w-full bg-octo-bg"
       style={{
         background:
           "radial-gradient(ellipse at 30% 25%, var(--brass-faint), transparent 50%), var(--color-octo-onyx)",
       }}
     >
+      {/* Always-present exit. A full-screen overlay needs one unmistakable way
+          out on every step; Escape does the same (see the key handler above). */}
+      <button
+        type="button"
+        onClick={onCancel}
+        title="Close · Esc"
+        aria-label="Close"
+        className="absolute right-4 top-4 z-10 inline-flex h-7 w-7 items-center justify-center rounded-md text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        <X size={15} />
+      </button>
+
       {/* Left index pane */}
       <aside className="w-[220px] shrink-0 border-r border-octo-hairline bg-octo-panel px-6 py-10">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="mb-10 inline-flex items-center gap-1 rounded-sm font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-        >
-          <ChevronLeft size={12} />
-          Back
-        </button>
-
         <div className="font-serif text-[18px] text-octo-ivory">
           A new workspace
         </div>
@@ -227,10 +257,13 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                   onChange={(e) => setBranchOverride(e.target.value)}
                   onBlur={() => {
                     if (branchOverride === null) return;
-                    const cleaned = slugify(branchOverride);
-                    setBranchOverride(cleaned || null);
+                    // An explicit branch is used verbatim (just trimmed) — mixed
+                    // case and slashes like JIRA-123 or feat/Foo are valid git
+                    // branches. Only the auto-suggested name (from the task) is
+                    // slugified. Matches octopush-mcp's verbatim behaviour.
+                    setBranchOverride(branchOverride.trim() || null);
                   }}
-                  title="Branch name — edit to override the suggested slug"
+                  title="Branch name — edit to set an exact name (e.g. feat/Foo)"
                   aria-label="Branch name"
                   className="rounded-none border-b border-transparent bg-transparent font-mono text-[10px] normal-case tracking-[0.2em] text-octo-brass outline-none transition-colors duration-[220ms] focus:border-octo-brass"
                   style={{
@@ -280,13 +313,6 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
               >
                 Continue
               </button>
-              <button
-                type="button"
-                onClick={onCancel}
-                className="rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-              >
-                Cancel
-              </button>
               <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
                 <kbd className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] tracking-normal text-octo-mute">Enter</kbd>
                 <span className="ml-1">to continue</span>
@@ -317,7 +343,13 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
               </Field>
 
               <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
-                Runs inside the new worktree at <span className="text-octo-sage">{worktreeDisplayPath(projectPath, branch)}</span>.
+                {branchCollides ? (
+                  // The branch already exists — creation reuses (or adopts) its
+                  // existing checkout, so we can't promise a fresh path here.
+                  <>Reuses the existing <span className="text-octo-sage">{branch}</span> branch — the setup script runs in its worktree.</>
+                ) : (
+                  <>Runs inside the new worktree at <span className="text-octo-sage">{worktreeDisplayPath(projectPath, branch)}</span>.</>
+                )}
               </div>
             </div>
 

@@ -140,6 +140,77 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("index.html")).toBeInTheDocument();
   });
 
+  it("marks a streaming partial with a 'Generating' indicator (distinct from a finished turn)", () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [] },
+      streamingByWs: { "ws-1": true },
+      streamBufferByWs: { "ws-1": "Working on it" },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    expect(screen.getByText(/Working on it/)).toBeInTheDocument();
+    expect(screen.getByText("Generating")).toBeInTheDocument();
+  });
+
+  it("exposes Edit on user turns and Regenerate on assistant turns", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [
+          { id: 1, workspaceId: "ws-1", role: "user", content: "do a thing",
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:00Z" },
+          { id: 2, workspaceId: "ws-1", role: "assistant", content: "did it",
+            model: "claude-sonnet-4-6", inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:01Z" },
+        ],
+      },
+      streamingByWs: { "ws-1": false },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    expect(screen.getByLabelText("Edit & resend")).toBeInTheDocument();
+    expect(screen.getByLabelText("Regenerate")).toBeInTheDocument();
+  });
+
+  it("composer exposes a help popover documenting the @/ / /$ input modes", () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const help = screen.getByLabelText("Shortcuts & input modes");
+    expect(help).toBeInTheDocument();
+    fireEvent.click(help);
+    expect(screen.getByText(/Reference a file/i)).toBeInTheDocument();
+    expect(screen.getByText(/Run a command in the shared shell/i)).toBeInTheDocument();
+  });
+
+  it("offers Regenerate/Edit only on the latest exchange, not on older turns", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [
+          { id: 1, workspaceId: "ws-1", role: "user", content: "old question",
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:00Z" },
+          { id: 2, workspaceId: "ws-1", role: "assistant", content: "old answer",
+            model: "claude-sonnet-4-6", inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:01Z" },
+          { id: 3, workspaceId: "ws-1", role: "user", content: "new question",
+            model: null, inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:02Z" },
+          { id: 4, workspaceId: "ws-1", role: "assistant", content: "new answer",
+            model: "claude-sonnet-4-6", inputTokens: null, outputTokens: null, costUsd: null,
+            createdAt: "2026-06-20T10:00:03Z" },
+        ],
+      },
+      streamingByWs: { "ws-1": false },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    // Exactly one of each action — on the latest user/assistant turns only.
+    expect(screen.getAllByLabelText("Edit & resend")).toHaveLength(1);
+    expect(screen.getAllByLabelText("Regenerate")).toHaveLength(1);
+  });
+
   it("renders tools through the full event flow (user → tool → assistant → done)", async () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     // Let mount-time loadHistory resolve before emitting; its async set

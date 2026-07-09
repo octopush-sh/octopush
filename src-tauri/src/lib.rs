@@ -1,6 +1,8 @@
 //! Octopush — native core.
 
 pub mod agent_adapter;
+pub mod auth;
+pub mod billing;
 pub mod chat_engine;
 mod commands;
 pub mod context_guard;
@@ -8,6 +10,7 @@ pub mod context_guard;
 // this crate) can drive the data layer directly. The MCP server is a thin,
 // read-and-author surface over the same SQLite store the desktop app uses.
 pub mod db;
+pub mod entitlement;
 pub mod error;
 pub mod git_ops;
 pub mod git_url;
@@ -22,7 +25,9 @@ pub mod session_recap;
 pub mod settings;
 pub mod skills;
 mod state;
+pub mod sync;
 pub mod talk_shell;
+pub mod workspace;
 pub mod template;
 pub mod theme;
 pub mod token_engine;
@@ -175,13 +180,19 @@ pub fn run() {
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,
+            commands::truncate_chat_after,
             commands::run_shell_command,
             commands::stop_shell_command,
+            commands::respond_approval,
+            commands::send_shell_input,
+            commands::resize_shell,
+            commands::list_shell_history,
             commands::list_chat_messages,
             commands::cancel_chat,
             commands::list_chat_threads,
             commands::create_chat_thread,
             commands::rename_chat_thread,
+            commands::set_thread_pinned,
             commands::delete_chat_thread,
             commands::list_skills,
             commands::read_attachment,
@@ -199,6 +210,7 @@ pub fn run() {
             commands::start_run,
             commands::get_run,
             commands::list_runs,
+            commands::list_active_runs,
             commands::resolve_checkpoint,
             commands::abort_run,
             commands::stop_stage,
@@ -321,6 +333,22 @@ pub fn run() {
             commands::list_roles,
             commands::save_role,
             commands::delete_role,
+            // Entitlement (premium scaffolding — P0)
+            commands::get_entitlement,
+            commands::direct_run_usage,
+            // Cross-machine run history (Pro-real Part B / B1)
+            commands::history_list,
+            commands::history_sync_pull,
+            commands::history_sync_push_all,
+            // Accounts (P1)
+            commands::auth_begin_sign_in,
+            commands::auth_sign_out,
+            commands::auth_cancel_sign_in,
+            commands::auth_status,
+            commands::auth_refresh,
+            commands::auth_sync_plan,
+            commands::auth_account_portal_url,
+            commands::billing_checkout_url,
         ])
         .setup(|app| {
             // Restore sessions that were active when the app last closed.

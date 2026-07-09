@@ -25,6 +25,10 @@ interface ContextProps {
   toolCalls: number;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
+  activeSkill?: string | null;
+  mcpServers?: string[];
+  onReviewClick?: () => void;
+  onSettingsClick?: () => void;
 }
 
 interface HistoryProps {
@@ -32,6 +36,11 @@ interface HistoryProps {
   activeChatId: string | null;
   onSelectChat: (id: string) => void;
   onNewChat: () => void;
+  onDeleteChat?: (id: string) => void;
+  onRenameChat?: (id: string, title: string) => void;
+  onExportChat?: (id: string) => void;
+  onPinChat?: (id: string, pinned: boolean) => void;
+  streamingChatId?: string | null;
 }
 
 interface Props {

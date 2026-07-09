@@ -16,6 +16,8 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ReviewCanvas } from "./ReviewCanvas";
 import { ipc } from "../lib/ipc";
 import { useReviewPrefs } from "../stores/reviewPrefsStore";
+import { useEditorStore } from "../stores/editorStore";
+import type { OpenFile } from "../stores/editorStore";
 
 // ─── Mock ipc ─────────────────────────────────────────────────────
 
@@ -249,5 +251,52 @@ describe("ReviewCanvas misc", () => {
       gitStatus: { branch: null, changedFiles: [], ahead: 0, behind: 0, hasUpstream: false, conflicted: 0, aheadBehindKnown: true, operation: null },
     });
     expect(screen.getByText(/Nothing to review/)).toBeTruthy();
+  });
+});
+
+// ─── Markdown preview toggle ────────────────────────────────────────
+
+describe("ReviewCanvas — markdown preview toggle", () => {
+  const WS = "wsR";
+  function seed(file: Pick<OpenFile, "path" | "lang" | "kind">) {
+    const f = { content: "# D", savedContent: "# D", mtime: 0, size: 1, version: 0, diskStale: false, ...file } as OpenFile;
+    useEditorStore.setState({ filesByWs: { [WS]: [f] }, activeByWs: { [WS]: f.path } });
+  }
+  beforeEach(() => {
+    useEditorStore.setState({ filesByWs: {}, activeByWs: {} });
+    useReviewPrefs.setState({ mdPreview: true });
+  });
+
+  function renderCanvas(viewMode: "diff" | "editor") {
+    return render(
+      <ReviewCanvas workspaceId={WS} workspacePath="/r" gitStatus={null} gitDiff="" viewMode={viewMode} onViewModeChange={() => {}}>
+        <div />
+      </ReviewCanvas>,
+    );
+  }
+
+  it("shows the Eye toggle in editor mode for a markdown file", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    expect(screen.getByRole("button", { name: /toggle rendered preview/i })).toBeInTheDocument();
+  });
+
+  it("hides the toggle in diff mode", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("diff");
+    expect(screen.queryByRole("button", { name: /toggle rendered preview/i })).toBeNull();
+  });
+
+  it("hides the toggle for a non-markdown file", () => {
+    seed({ path: "/r/App.tsx", lang: "javascript", kind: "text" });
+    renderCanvas("editor");
+    expect(screen.queryByRole("button", { name: /toggle rendered preview/i })).toBeNull();
+  });
+
+  it("clicking the toggle flips the mdPreview pref", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    fireEvent.click(screen.getByRole("button", { name: /toggle rendered preview/i }));
+    expect(useReviewPrefs.getState().mdPreview).toBe(false);
   });
 });
