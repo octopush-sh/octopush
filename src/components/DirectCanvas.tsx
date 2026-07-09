@@ -155,7 +155,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           </button>
         </div>
         {/* The living pipeline. */}
-        <div className="border-b border-octo-hairline bg-octo-panel px-4 py-3">
+        <div className="border-b border-octo-hairline bg-octo-panel px-4 py-2">
           <RunFlow stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
         </div>
         <StageFocus stage={shownStage} workspacePath={workspacePath} />
