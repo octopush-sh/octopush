@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
+import { Maximize2 } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { labelForRole } from "../lib/stageMeta";
@@ -8,6 +9,7 @@ import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
 import { RunControlBar } from "./RunControlBar";
 import { RunLedger } from "./RunLedger";
+import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
 
 interface Props {
@@ -37,6 +39,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   // Builder: undefined = closed; null = compose new; a pipelineId = edit that one.
   const [builder, setBuilder] = useState<undefined | null | string>(undefined);
   const pipelines = usePipelineStore((s) => s.pipelines);
+  const [briefOpen, setBriefOpen] = useState(false);
 
   useEffect(() => { if (active) void loadRuns(workspaceId); }, [active, workspaceId, loadRuns]);
   useEffect(() => {
@@ -137,10 +140,19 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
               {Math.min(doneCount + 1, stages.length)} / {stages.length}
             </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">the brief</div>
-            <div className="truncate font-serif text-[13px] text-octo-ivory" title={run.task}>{run.task}</div>
-          </div>
+          <button
+            type="button"
+            onClick={() => setBriefOpen(true)}
+            aria-label="View the full brief"
+            title="View the full brief"
+            className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+          >
+            <div className="min-w-0 flex-1">
+              <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">the brief</div>
+              <div className="truncate font-serif text-[13px] text-octo-ivory">{run.task}</div>
+            </div>
+            <Maximize2 size={12} className="shrink-0 text-octo-mute transition-colors duration-[180ms] group-hover:text-octo-brass" />
+          </button>
         </div>
         {/* The living pipeline. */}
         <div className="border-b border-octo-hairline bg-octo-panel px-4 py-3">
@@ -163,6 +175,14 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
           onRunAgain={onRunAgain}
         />
+        {briefOpen && (
+          <BriefModal
+            task={run.task}
+            pipelineName={pipelines.find((p) => p.pipeline.id === run.pipelineId)?.pipeline.name ?? "Unknown ensemble"}
+            stageCount={stages.length}
+            onClose={() => setBriefOpen(false)}
+          />
+        )}
       </div>
     );
   }

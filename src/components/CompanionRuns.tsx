@@ -53,7 +53,6 @@ export function CompanionRuns({ workspaceId }: Props) {
           <button
             key={r.id}
             type="button"
-            title={r.task || undefined}
             onClick={() => selectRun(workspaceId, r.id)}
             className={`octo-rise-in flex w-full flex-col gap-0.5 border-l-2 px-3.5 py-2 text-left transition-colors duration-[180ms] ${
               r.id === viewedId ? "border-octo-brass bg-[var(--brass-ghost)]" : "border-transparent hover:bg-octo-panel-2"
