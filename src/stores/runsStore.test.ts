@@ -105,6 +105,24 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().getDetail("r1")?.stages).toHaveLength(1);
   });
 
+  it("loadRuns is safe to call repeatedly and picks up a run staged externally (e.g. via octopush-mcp)", async () => {
+    (ipc.listRuns as any).mockResolvedValue([RUN]);
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().getRuns("w1")).toHaveLength(1);
+
+    // A focus-driven refresh must not disturb any live log buffer already
+    // streaming for this workspace's stages.
+    useRunsStore.getState().appendEntry("st1", { kind: "text", text: "live" });
+
+    const DRAFT: Run = { ...RUN, id: "r2", status: "draft" };
+    (ipc.listRuns as any).mockResolvedValue([RUN, DRAFT]);
+    await useRunsStore.getState().loadRuns("w1");
+
+    expect(useRunsStore.getState().getRuns("w1").map((r) => r.id)).toEqual(["r1", "r2"]);
+    expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([{ kind: "text", text: "live" }]);
+  });
+
   it("applyStageUpdate replaces the run row in detail and runs list", () => {
     useRunsStore.setState({
       runsByWs: { w1: [RUN] },
