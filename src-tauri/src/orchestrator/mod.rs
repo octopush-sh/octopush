@@ -288,11 +288,28 @@ impl Orchestrator {
     /// changes matter — a CLI-substrate agent habitually `git add`s part of its
     /// edits despite the preamble, and an index-only diff would silently hide
     /// them from the reviewer certifying "the actual code changes". Best-effort:
-    /// `None` on any capture failure. Emptiness is the CALLER's concern.
+    /// every capture failure is LOGGED; `None` when the workspace/unstaged side
+    /// fails, and a staged-side failure degrades to unstaged-only (warned).
+    /// Emptiness is the CALLER's concern.
     fn full_worktree_diff(&self, run: &crate::db::RunRow) -> Option<String> {
-        let path = self.workspace_path(run).ok()?;
-        let staged = crate::git_ops::get_staged_diff_text(&path).unwrap_or_default();
-        let unstaged = crate::git_ops::get_diff_text(&path, false).ok()?;
+        let path = match self.workspace_path(run) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "worktree diff: no workspace path: {e}");
+                return None;
+            }
+        };
+        let staged = crate::git_ops::get_staged_diff_text(&path).unwrap_or_else(|e| {
+            tracing::warn!(run_id = %run.id, "worktree diff: staged capture failed: {e}");
+            String::new()
+        });
+        let unstaged = match crate::git_ops::get_diff_text(&path, false) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "worktree diff: unstaged capture failed: {e}");
+                return None;
+            }
+        };
         Some(match (staged.trim().is_empty(), unstaged.trim().is_empty()) {
             (true, _) => unstaged,
             (false, true) => staged,

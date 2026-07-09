@@ -2492,15 +2492,18 @@ mod runner_helpers_tests {
         // authoring time — so the ro()→run_() upgrade for reviewers must be
         // retrofitted onto existing rows still carrying the old default, or
         // the new prompt ("run the build or tests…") runs against a read-only
-        // allowlist. A user-customized allowlist is never touched. Drives the
-        // REAL migration by re-opening the same database file (app update).
+        // allowlist. A user-customized allowlist is never touched, and the
+        // retrofit is ONE-SHOT: re-running every launch would re-escalate a
+        // reviewer a user deliberately set back to read-only. Drives the REAL
+        // migration by re-opening the same database file (app update).
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::Db::open(tmp.path()).unwrap();
         let pid = db.insert_pipeline("p", "d", false).unwrap();
         db.insert_pipeline_stage(&pid, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
         let pid2 = db.insert_pipeline("p2", "d", false).unwrap();
         db.insert_pipeline_stage(&pid2, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
-        // Simulate a pre-upgrade snapshot (pid) + a user customization (pid2).
+        // Simulate a pre-upgrade install: stale snapshot (pid), a user
+        // customization (pid2), and NO retrofit marker yet.
         db.conn_ref().execute(
             "UPDATE pipeline_stages SET tools='[\"read_file\",\"list_files\"]' WHERE pipeline_id=?1",
             rusqlite::params![pid],
@@ -2509,18 +2512,35 @@ mod runner_helpers_tests {
             "UPDATE pipeline_stages SET tools='[\"read_file\"]' WHERE pipeline_id=?1",
             rusqlite::params![pid2],
         ).unwrap();
+        db.conn_ref().execute(
+            "DELETE FROM app_meta WHERE key='retrofit_reviewer_run_command'", [],
+        ).unwrap();
         drop(db);
 
-        // Re-open → migrate() re-runs → the retrofit applies (idempotently).
+        // Re-open (the app update's first launch) → the retrofit applies once.
         let db = crate::db::Db::open(tmp.path()).unwrap();
-        let tools_of = |pid: &str| -> String {
+        let tools_of = |db: &crate::db::Db, pid: &str| -> String {
             db.conn_ref().query_row(
                 "SELECT tools FROM pipeline_stages WHERE pipeline_id=?1",
                 rusqlite::params![pid], |r| r.get(0),
             ).unwrap()
         };
-        assert_eq!(tools_of(&pid), r#"["read_file","list_files","run_command"]"#);
-        assert_eq!(tools_of(&pid2), r#"["read_file"]"#, "custom allowlists stay untouched");
+        assert_eq!(tools_of(&db, &pid), r#"["read_file","list_files","run_command"]"#);
+        assert_eq!(tools_of(&db, &pid2), r#"["read_file"]"#, "custom allowlists stay untouched");
+
+        // The user now DELIBERATELY sets the reviewer back to read-only — a
+        // later launch must respect that choice (one-shot, never re-escalate).
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\",\"list_files\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid],
+        ).unwrap();
+        drop(db);
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        assert_eq!(
+            tools_of(&db, &pid),
+            r#"["read_file","list_files"]"#,
+            "the retrofit must not re-apply after its one-shot marker is set"
+        );
     }
 
     #[test]
