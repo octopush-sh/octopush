@@ -2294,6 +2294,7 @@ mod runner_helpers_tests {
                 refs_worktree: false,
             }],
             refs_worktree: false,
+            worktree_diff: None,
         }
     }
 
@@ -2418,6 +2419,7 @@ mod runner_helpers_tests {
                 },
             ],
             refs_worktree: false,
+            worktree_diff: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -2439,6 +2441,35 @@ mod runner_helpers_tests {
         input.refs_worktree = true;
         let some = user_input_for("code_review", "T", &input, None);
         assert!(some.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn dossier_includes_the_live_diff_so_reviewers_see_the_actual_code() {
+        // The #1 crew-quality fix: a reviewer must certify the CODE, not the
+        // implementer's prose summary of it. When the live worktree diff was
+        // captured it is rendered as a fenced diff section; the old tools hint
+        // remains the fallback (capture failure / empty diff).
+        let mut input = plan_input("plan text");
+        input.refs_worktree = true;
+        input.worktree_diff = Some("--- a/src/x.rs\n+++ b/src/x.rs\n+fn added() {}".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("The actual code changes in the workspace (git diff):"), "{s}");
+        assert!(s.contains("+fn added() {}"));
+        assert!(!s.contains("present in the workspace"), "diff replaces the vague hint");
+
+        // A huge diff is capped like any dossier section (head + tail survive).
+        let mut big = String::from("DIFF-HEAD\n");
+        big.push_str(&"+x\n".repeat(20_000));
+        big.push_str("DIFF-TAIL");
+        input.worktree_diff = Some(big);
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("DIFF-HEAD") && s.contains("DIFF-TAIL"));
+        assert!(s.contains("section truncated for length"));
+
+        // Whitespace-only diff falls back to the hint.
+        input.worktree_diff = Some("   \n".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("The current code changes are present in the workspace"));
     }
 
     #[test]
@@ -2466,6 +2497,7 @@ mod runner_helpers_tests {
                 refs_worktree: false,
             }],
             refs_worktree: false,
+            worktree_diff: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -5989,7 +6021,7 @@ mod roles_tests {
     }
 
     #[test]
-    fn builtin_roles_seed_matches_legacy_prompts() {
+    fn builtin_roles_compose_with_the_right_preambles() {
         use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
         use crate::orchestrator::types::RoleEnvironment;
         let by = |k: &str| builtin_roles().into_iter().find(|r| r.key == k).unwrap();
@@ -5998,7 +6030,7 @@ mod roles_tests {
         let got = compose_system_prompt(&plan.prompt_body, plan.environment, None, None);
         assert!(got.contains("You are one stage in an automated, headless build pipeline."));
         assert!(got.contains("Do not commit, push, or otherwise manage git"));
-        assert!(got.contains("Produce a concise, concrete implementation plan"));
+        assert!(got.contains("produce a concrete implementation plan"));
         // there are 15 builtin roles, all keys unique
         let all = builtin_roles();
         assert_eq!(all.len(), 15);
@@ -6011,6 +6043,61 @@ mod roles_tests {
         let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None);
         assert!(rp.contains("may commit, push"));
         assert!(!rp.contains("Do not commit, push"));
+    }
+
+    #[test]
+    fn builtin_role_prompts_are_purpose_specific_not_clones() {
+        // The crew-quality invariant: fix/verify/critique were historically
+        // byte-identical clones of implement/code_review/plan_review, so
+        // `verify` never re-ran the repro and `fix` never targeted the root
+        // cause. Every builtin body must be unique, and the trio must speak
+        // to its actual purpose.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        let mut bodies: Vec<_> = all.iter().map(|r| r.prompt_body.clone()).collect();
+        bodies.sort();
+        let before = bodies.len();
+        bodies.dedup();
+        assert_eq!(bodies.len(), before, "duplicate builtin prompt bodies");
+        let by = |k: &str| all.iter().find(|r| r.key == k).unwrap();
+        assert!(by("fix").prompt_body.contains("ROOT CAUSE"));
+        assert!(by("verify").prompt_body.contains("by execution"));
+        assert!(by("verify").prompt_body.contains("Re-run the repro"));
+        assert!(!by("critique").prompt_body.contains("the proposed plan"),
+            "critique must not hard-code 'the plan' — it reviews any artifact");
+    }
+
+    #[test]
+    fn reviewer_prompts_carry_a_severity_rubric_and_anti_rubber_stamp_bar() {
+        // Automated review fails in two prompt-shaped ways: rubber-stamping
+        // and cosmetic-nitpick loops. Every looping reviewer must carry a
+        // severity rubric and the "nits alone don't send work back" bar.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        let by = |k: &str| all.iter().find(|r| r.key == k).unwrap();
+        for k in ["plan_review", "code_review", "critique"] {
+            assert!(by(k).prompt_body.contains("BLOCKING"), "{k} lacks a severity rubric");
+        }
+        assert!(by("code_review").prompt_body.contains("NITs alone are never grounds"));
+        assert!(by("security_review").prompt_body.contains("Critical"));
+        // The test role must be required to actually RUN the suite.
+        assert!(by("test").prompt_body.contains("running is not optional"));
+    }
+
+    #[test]
+    fn reviewers_can_run_commands_to_verify_findings() {
+        // code_review/security_review were read-only (`ro()`), so they could
+        // not run `git diff`, grep, or the test suite — structurally unable
+        // to verify what they certify. They now carry run_command.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        for k in ["code_review", "security_review", "verify", "repro", "test"] {
+            let r = all.iter().find(|r| r.key == k).unwrap();
+            assert!(
+                r.default_tools.iter().any(|t| t == "run_command"),
+                "{k} must be able to run commands"
+            );
+        }
     }
 
     #[test]

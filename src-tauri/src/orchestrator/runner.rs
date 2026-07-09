@@ -123,7 +123,13 @@ pub fn user_input_for(
             cap_section(&sec.text),
         ));
     }
-    if input.refs_worktree {
+    // A reviewer/tester must judge the ACTUAL code: include the live worktree
+    // diff when it was captured; otherwise fall back to the tools hint.
+    if let Some(diff) = input.worktree_diff.as_deref().filter(|d| !d.trim().is_empty()) {
+        s.push_str("The actual code changes in the workspace (git diff):\n```diff\n");
+        s.push_str(&cap_section(diff));
+        s.push_str("\n```\n\nRead any changed file with your tools when you need more context than the diff shows.\n\n");
+    } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
     }
     if let Some(fb) = feedback {

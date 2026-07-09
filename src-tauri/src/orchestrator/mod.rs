@@ -377,7 +377,7 @@ impl Orchestrator {
         }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
-        let input = self.assemble_stage_input(&run.id, stage.position)?;
+        let input = self.assemble_stage_input(run, stage.position)?;
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
         // Reset any prior live log for this stage (re-runs reuse the same id).
@@ -510,7 +510,8 @@ impl Orchestrator {
     /// of only whatever ran immediately before it. Token cost stays bounded:
     /// one section per kind at most, each capped at render time, and superseded
     /// or looped-over attempts (artifact = NULL after a reset) never ride along.
-    fn assemble_stage_input(&self, run_id: &str, position: i64) -> AppResult<StageInput> {
+    fn assemble_stage_input(&self, run: &crate::db::RunRow, position: i64) -> AppResult<StageInput> {
+        let run_id = &run.id;
         let stages = self.db.lock().list_run_stages(run_id)?;
 
         // Which earlier stages feed THIS one? With an authored graph, a stage's
@@ -592,7 +593,21 @@ impl Orchestrator {
             .collect::<Vec<_>>()
             .join(" → ");
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree })
+        // When earlier stages left real code in the worktree, capture the LIVE
+        // diff so the receiving stage (reviewer, tester, verifier) sees the
+        // actual changes — not just the producer's prose summary of them.
+        // Best-effort: any capture failure or an empty diff degrades to the
+        // old "inspect with your tools" hint, never blocks the run.
+        let worktree_diff = if refs_worktree {
+            self.workspace_path(run)
+                .and_then(|path| crate::git_ops::get_diff_text(&path, false))
+                .ok()
+                .filter(|d| !d.trim().is_empty())
+        } else {
+            None
+        };
+
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff })
     }
 
     /// Sum stage costs; recompute the baseline by re-pricing each stage's tokens
