@@ -26,13 +26,19 @@ pub(crate) const MAX_PUSH: usize = 500;
 /// build can still parse a blob written by a newer one (forward-compat).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SyncRun {
+    // `run_id` is the primary key — a blob without it is dropped on parse. Every
+    // other field is `#[serde(default)]` so a blob written by a newer build (or a
+    // slightly malformed one) still parses instead of dropping the whole run.
     pub run_id: String,
+    #[serde(default)]
     pub machine_id: String,
     #[serde(default)]
     pub machine_name: Option<String>,
     #[serde(default)]
     pub workspace_name: Option<String>,
+    #[serde(default)]
     pub task: String,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub cost_usd: f64,
@@ -40,6 +46,7 @@ pub struct SyncRun {
     pub input_tokens: i64,
     #[serde(default)]
     pub output_tokens: i64,
+    #[serde(default)]
     pub created_at: String,
     #[serde(default)]
     pub finished_at: Option<String>,
@@ -51,9 +58,11 @@ pub struct SyncRun {
 /// Deliberately excludes artifacts, diffs, and feedback (kept out of the cloud).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SyncStage {
+    #[serde(default)]
     pub role: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub cost_usd: f64,
@@ -65,17 +74,18 @@ pub fn machine_name_label() -> String {
 }
 
 /// Build a run's sync payload from the local DB (stages summed for tokens,
-/// workspace name resolved, this install's stable machine id + name attached).
-/// Reads only — the caller holds the DB lock for the duration.
-pub fn build_run_payload(db: &Db, run: &crate::db::RunRow) -> SyncRun {
+/// workspace name resolved, name attached). `machine_id` is resolved ONCE by the
+/// caller and passed in — so a rare DB failure to mint it aborts the whole push
+/// rather than sending rows with an empty (mis-attributing) machine id. Reads
+/// only — the caller holds the DB lock for the duration.
+pub fn build_run_payload(db: &Db, run: &crate::db::RunRow, machine_id: &str) -> SyncRun {
     let stages = db.list_run_stages(&run.id).unwrap_or_default();
     let input_tokens = stages.iter().map(|s| s.input_tokens).sum();
     let output_tokens = stages.iter().map(|s| s.output_tokens).sum();
     let workspace_name = db.get_workspace(&run.workspace_id).ok().flatten().map(|w| w.name);
-    let machine_id = db.get_or_create_machine_id().unwrap_or_default();
     SyncRun {
         run_id: run.id.clone(),
-        machine_id,
+        machine_id: machine_id.to_string(),
         machine_name: Some(machine_name_label()),
         workspace_name,
         task: run.task.clone(),

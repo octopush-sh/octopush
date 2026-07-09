@@ -331,6 +331,10 @@ mod workspace_tests {
         let got = db.list_synced_runs().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].run_id, "r3");
+
+        // Sign-out clears the mirror (privacy on shared machines).
+        db.clear_synced_runs().unwrap();
+        assert!(db.list_synced_runs().unwrap().is_empty());
     }
 
     #[test]
@@ -342,8 +346,10 @@ mod workspace_tests {
         let run_id = db.create_run("ws1", &pipeline_id, "ship it", None, None, &[]).unwrap();
         db.set_run_status(&run_id, "completed", true).unwrap();
         let run = db.get_run(&run_id).unwrap().unwrap();
-        let payload = crate::sync::build_run_payload(&db, &run);
+        let machine_id = db.get_or_create_machine_id().unwrap();
+        let payload = crate::sync::build_run_payload(&db, &run, &machine_id);
         assert_eq!(payload.run_id, run_id);
+        assert_eq!(payload.machine_id, machine_id);
         assert_eq!(payload.task, "ship it");
         assert_eq!(payload.status, "completed");
         assert_eq!(payload.workspace_name.as_deref(), Some("ws"));

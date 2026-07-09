@@ -157,8 +157,14 @@ impl Orchestrator {
         }
         let payload = {
             let db = self.db.lock();
+            // Resolve the machine id first — skip the whole push if we can't mint
+            // one (empty would mis-attribute the row, which the server keys on).
+            let machine_id = match db.get_or_create_machine_id() {
+                Ok(id) if !id.is_empty() => id,
+                _ => return,
+            };
             match db.get_run(run_id) {
-                Ok(Some(run)) => crate::sync::build_run_payload(&db, &run),
+                Ok(Some(run)) => crate::sync::build_run_payload(&db, &run, &machine_id),
                 _ => return,
             }
         };

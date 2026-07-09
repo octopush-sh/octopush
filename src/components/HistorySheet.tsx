@@ -56,6 +56,12 @@ export function HistorySheet() {
           </div>
         </div>
 
+        {error && runs.length > 0 && (
+          <div className="border-b border-octo-hairline px-6 py-1.5 font-mono text-[10px] text-octo-mute">
+            Couldn't refresh — showing last-known history.
+          </div>
+        )}
+
         <div className="min-h-0 flex-1 overflow-y-auto">
           {runs.length === 0 ? (
             <div className="px-6 py-12 text-center">

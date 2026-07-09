@@ -2419,6 +2419,13 @@ impl Db {
         Ok(())
     }
 
+    /// Drop the entire local history mirror. Called on sign-out so a shared
+    /// machine doesn't retain the previous user's cross-machine run history.
+    pub fn clear_synced_runs(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM synced_runs", [])?;
+        Ok(())
+    }
+
     /// The local history mirror, newest first. Skips any blob this build can't
     /// parse (forward/back compat) rather than failing the whole read.
     pub fn list_synced_runs(&self) -> AppResult<Vec<crate::sync::SyncRun>> {

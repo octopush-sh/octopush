@@ -1333,10 +1333,18 @@ fn require_history_sync() -> AppResult<()> {
 }
 
 /// The local read-only history mirror (instant, no network). The History view
-/// paints this first, then refreshes via `history_sync_pull`. Ungated: a Free
-/// user's mirror is simply empty (it's only ever filled by a Pro pull).
+/// paints this first, then refreshes via `history_sync_pull`. **Entitlement-gated
+/// on read** (not just on pull): the mirror can hold runs pulled by a *previous*
+/// signed-in Pro user, so a signed-out / Free user (e.g. the next person on a
+/// shared machine) must not be able to read it — return empty for them. (The
+/// mirror is also cleared on sign-out; this is the belt to that suspenders.)
 #[tauri::command]
 pub async fn history_list(state: State<'_, AppState>) -> AppResult<Vec<crate::sync::SyncRun>> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        return Ok(Vec::new());
+    }
     state.db.lock().list_synced_runs()
 }
 
@@ -1372,10 +1380,14 @@ pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
     }
     let runs = {
         let db = state.db.lock();
+        let machine_id = match db.get_or_create_machine_id() {
+            Ok(id) if !id.is_empty() => id,
+            _ => return Ok(0), // can't mint an id → skip (empty would mis-attribute)
+        };
         let terminal = db.list_terminal_runs(crate::sync::MAX_PUSH as u32)?;
         terminal
             .iter()
-            .map(|r| crate::sync::build_run_payload(&db, r))
+            .map(|r| crate::sync::build_run_payload(&db, r, &machine_id))
             .collect::<Vec<_>>()
     };
     let count = runs.len();
@@ -1392,10 +1404,15 @@ pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
     crate::auth::begin_sign_in().await
 }
 
-/// Clear the stored session (sign out locally).
+/// Clear the stored session (sign out locally). Also drops the local run-history
+/// mirror — it may hold history pulled by this user from their OTHER machines, so
+/// it must not linger for whoever uses this machine next (privacy on shared
+/// machines). Best-effort: a mirror-clear failure never blocks the sign-out.
 #[tauri::command]
-pub async fn auth_sign_out() -> AppResult<()> {
-    crate::auth::sign_out()
+pub async fn auth_sign_out(state: State<'_, AppState>) -> AppResult<()> {
+    crate::auth::sign_out()?;
+    let _ = state.db.lock().clear_synced_runs();
+    Ok(())
 }
 
 /// Abort an in-flight interactive sign-in (the loopback returns ~immediately).
