@@ -55,6 +55,7 @@ import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
+import { usePipelineStore } from "./stores/pipelineStore";
 import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
@@ -532,11 +533,14 @@ function App() {
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
-  // Refresh the rail when the window regains focus — calm, event-driven (no
-  // polling). As well as the (cheap, local libgit2) git signal and PRs, we
-  // re-list workspaces so any created out-of-band — e.g. by the octopush-mcp
-  // `create_workspace` tool while you were in another app — shows up the
-  // moment you return to Octopush.
+  // Refresh externally-authored data when the window regains focus — calm,
+  // event-driven (no polling). octopush-mcp is a separate process writing to
+  // the same SQLite store; it cannot emit Tauri events, so anything it authors
+  // while you're in another app (workspaces via `create_workspace`, pipelines
+  // via `create_pipeline`, draft runs via `create_run`) would otherwise sit
+  // invisible behind session-cached lists until a full reload. Each refetch is
+  // a background replace that never clobbers UI state: the launcher repairs
+  // its own selection against the new list, and run rows are keyed by id.
   useEffect(() => {
     const onFocus = () => {
       const byId = new Map<string, string>();
@@ -547,6 +551,14 @@ function App() {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
       });
+      // Pipelines (the ensemble picker) + the active workspace's runs list —
+      // both read via getState at fire time, so the listener neither
+      // re-registers per workspace switch nor closes over stale state. The
+      // background flag keeps the refetch passive: the runs list refreshes,
+      // but the viewed canvas is never reassigned under the user.
+      void usePipelineStore.getState().load();
+      const wsId = useWorkspaceStore.getState().activeId;
+      if (wsId) void useRunsStore.getState().loadRuns(wsId, { background: true });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);

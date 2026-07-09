@@ -20,11 +20,23 @@ const stage = (over: Partial<RunStage>): RunStage => ({
 });
 
 const handlers = () => ({
-  onPause: vi.fn(), onStopStage: vi.fn(), onAbort: vi.fn(), onApprove: vi.fn(),
+  onStart: vi.fn(), onPause: vi.fn(), onStopStage: vi.fn(), onAbort: vi.fn(), onApprove: vi.fn(),
   onReject: vi.fn(), onResume: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onRunAgain: vi.fn(),
 });
 
 describe("RunControlBar", () => {
+  it("draft: offers Begin this run and a discard — a staged run is never a dead end", () => {
+    // octopush-mcp stages runs as drafts for the user to launch from DIRECT;
+    // without this bar the draft's run view had no affordance at all.
+    const h = handlers();
+    render(<RunControlBar run={run("draft")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText("draft")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Begin this run/i }));
+    expect(h.onStart).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Discard this draft/i }));
+    expect(h.onAbort).toHaveBeenCalled();
+  });
+
   it("running: offers pause / stop / abort and wires them", () => {
     const h = handlers();
     render(<RunControlBar run={run("running")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);
