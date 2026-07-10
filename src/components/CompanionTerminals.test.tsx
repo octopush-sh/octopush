@@ -39,6 +39,7 @@ function seedTerminals(
         label: t.label,
         position: i,
         running: t.running ?? false,
+        busy: false,
         restored: t.restored ?? false,
       })),
     },

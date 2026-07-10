@@ -29,6 +29,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const selectedStageId = useRunsStore((s) => (viewedId ? s.getSelectedStageId(viewedId) : null));
   const selectStage = useRunsStore((s) => s.selectStage);
   const begin = useRunsStore((s) => s.begin);
+  const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
@@ -165,6 +166,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           blockedStage={blockedStage}
           loopTargetRole={loopTargetRole}
           loopState={loopState}
+          onStart={() => void start(run.id)}
           onPause={() => void pauseRun(run.id)}
           onStopStage={() => void stopStage(run.id)}
           onAbort={() => void abort(run.id)}

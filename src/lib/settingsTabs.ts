@@ -10,6 +10,7 @@ export type SettingsTab =
   | "shortcuts"
   | "privacy"
   | "integrations"
+  | "account"
   | "about";
 
 export const SETTINGS_TABS: SettingsTab[] = [
@@ -21,6 +22,7 @@ export const SETTINGS_TABS: SettingsTab[] = [
   "shortcuts",
   "privacy",
   "integrations",
+  "account",
   "about",
 ];
 
@@ -33,6 +35,7 @@ export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   shortcuts: "Shortcuts",
   privacy: "Privacy",
   integrations: "Integrations",
+  account: "Account",
   about: "About",
 };
 
@@ -47,5 +50,5 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
   { label: "Setup", tabs: ["general", "editor"] },
   { label: "Intelligence", tabs: ["models", "usage"] },
   { label: "Connections", tabs: ["integrations"] },
-  { label: "App", tabs: ["appearance", "shortcuts", "privacy", "about"] },
+  { label: "App", tabs: ["account", "appearance", "shortcuts", "privacy", "about"] },
 ];

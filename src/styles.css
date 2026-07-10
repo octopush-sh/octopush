@@ -178,6 +178,40 @@
   animation: attention-pulse 1.4s var(--ease-octo) infinite;
 }
 
+/* Rail row "processing" bar — while a workspace is actively working (TALK
+   streaming or a DIRECT run), its 3px identity edge turns into marching segments
+   that scroll upward, signalling live activity. This is mutually exclusive with
+   the attention pulse (which means paused/finished).
+   The colour comes from --rail-bar (brass on the active row, the workspace tint
+   otherwise). Reduced motion falls back to a solid bar — never a frozen dash. */
+@keyframes rail-march {
+  to {
+    background-position-y: -11px;
+  }
+}
+
+.rail-bar-running {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--rail-bar) 0 6px,
+    transparent 6px 11px
+  );
+  background-size: 100% 11px;
+  animation: rail-march 1.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-bar-running {
+    background: var(--rail-bar);
+    animation: none;
+  }
+}
+
 /* Utility classes that wire keyframes to Phase 1 ease/dur variables. */
 .animate-brass-grow {
   animation: brassgrow var(--dur-reveal) var(--ease-octo) forwards;
@@ -359,6 +393,31 @@ button:not(:disabled),
 .xterm-viewport::-webkit-scrollbar-thumb {
   background: var(--color-octo-border);
   border-radius: 4px;
+}
+
+/* Tokenized scrollbar for app scroll regions (e.g. the TALK canvas) — replaces
+   the OS default so it reads in the Atelier palette. Thin, quiet track; a brass
+   thumb on hover. Apply via `octo-scroll`. */
+.octo-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-octo-hairline) transparent;
+}
+.octo-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.octo-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.octo-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-octo-hairline);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.octo-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--brass-dim);
+  background-clip: padding-box;
 }
 
 /* Make terminal text selectable */

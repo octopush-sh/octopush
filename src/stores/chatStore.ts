@@ -55,6 +55,8 @@ export interface LiveProcess {
   callId: string;
   command: string;
   workspaceId: string;
+  /** The thread whose shell runs this process — targets interactive stdin/resize. */
+  threadId: string;
 }
 
 /** Buffered live-process output, kept so the pinned terminal can render even if
@@ -69,6 +71,14 @@ export interface LiveOutput {
 
 /** Cap on the in-memory live-output buffer (xterm holds its own scrollback). */
 const LIVE_OUTPUT_CAP = 262_144;
+
+/** A pending approval request for a destructive agent command (inline card). */
+export interface PendingApproval {
+  callId: string;
+  threadId: string;
+  command: string;
+  reason: string;
+}
 
 export type Effort = "swift" | "standard" | "deep";
 
@@ -141,6 +151,20 @@ const EMPTY_TIMELINE: ConversationItem[] = [];
 const EMPTY_LIVE_TOOLS: LiveTool[] = [];
 const EMPTY_THREADS: ChatThread[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];
+const EMPTY_HISTORY: string[] = [];
+const EMPTY_APPROVALS: PendingApproval[] = [];
+
+/** True when a turn must be blocked for budget — workspace or global cap is
+ *  exceeded and no per-turn override is available to consume. Mirrors the gate
+ *  inside `send`; shared by regenerate / editAndResend so they can refuse BEFORE
+ *  truncating (a blocked action must not delete the rows it can't re-run). */
+function overBudgetBlocked(workspaceId: string): boolean {
+  const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
+  if (isOverBudget("workspace", workspaceId) || isOverBudget("global", "")) {
+    return !consumeOverride();
+  }
+  return false;
+}
 
 /** Whether an event for `threadId` should apply to the workspace's currently
  *  shown thread. Lenient: when no active thread is recorded yet (e.g. tests) or
@@ -186,11 +210,20 @@ interface ChatState {
    *  after every `$`-direct command so the composer can show a cwd badge once
    *  the user has `cd`'d away from the workspace root. */
   shellCwdByThread: Record<string, string>;
+  /** Absolute cwd per thread — kept alongside the label so the badge tooltip can
+   *  show the full path (the label elides out-of-tree prefixes). */
+  shellCwdAbsByThread: Record<string, string>;
   /** A live (long-running) `$`-direct process per thread, shown as a pinned
    *  mini-terminal. Present between chat://shell-live-start and shell-exit. */
   liveProcessByThread: Record<string, LiveProcess>;
   /** Buffered output for each live process, keyed by callId. */
   liveOutputByCallId: Record<string, LiveOutput>;
+  /** Recent `$`-direct commands per workspace (newest first) — the recall
+   *  palette + `$ `↑ history. Persisted backend-side; cached here. */
+  shellHistoryByWs: Record<string, string[]>;
+  /** Pending dangerous-command approval requests per workspace (inline cards).
+   *  Present between chat://approval-request and approval-resolved. */
+  pendingApprovalsByWs: Record<string, PendingApproval[]>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -208,12 +241,18 @@ interface ChatState {
   getActiveThread: (workspaceId: string) => string | null;
   getActiveSkill: (workspaceId: string) => string | null;
   getAttachments: (workspaceId: string) => Attachment[];
-  /** The active thread's TALK shell cwd, or null if unknown / never run. */
+  /** The active thread's TALK shell cwd label (badge text), or null. */
   getShellCwd: (workspaceId: string) => string | null;
+  /** The active thread's absolute TALK shell cwd (for the badge tooltip). */
+  getShellCwdAbs: (workspaceId: string) => string | null;
   /** The active thread's live `$`-direct process, or null if none is running. */
   getLiveProcess: (workspaceId: string) => LiveProcess | null;
   /** Buffered output for a live process (by callId) — for the pinned terminal. */
   getLiveOutput: (callId: string) => LiveOutput | null;
+  /** Recent `$`-direct commands for a workspace (newest first). */
+  getShellHistory: (workspaceId: string) => string[];
+  /** Pending dangerous-command approvals for the active thread. */
+  getPendingApprovals: (workspaceId: string) => PendingApproval[];
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -221,6 +260,49 @@ interface ChatState {
     workspaceId: string,
     workspacePath: string,
     content: string,
+    systemPrompt?: string,
+  ) => Promise<void>;
+  /** Internal: dispatch one agentic turn (shared by send / regenerate). */
+  runTurn: (
+    workspaceId: string,
+    workspacePath: string,
+    threadId: string,
+    opts: {
+      userMessage: string;
+      systemPrompt?: string;
+      attachments?: Attachment[];
+      regenerate?: boolean;
+    },
+  ) => Promise<void>;
+  /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
+   *  Shared by regenerate / editAndResend. */
+  truncateAndRun: (
+    workspaceId: string,
+    workspacePath: string,
+    threadId: string,
+    cutoffId: number,
+    opts: {
+      userMessage: string;
+      systemPrompt?: string;
+      attachments?: Attachment[];
+      regenerate?: boolean;
+    },
+  ) => Promise<void>;
+  /** Regenerate an assistant turn: drop it (and any trailing tool rows) back to
+   *  the prompting user message, then re-run the loop on the unchanged history. */
+  regenerate: (
+    workspaceId: string,
+    workspacePath: string,
+    assistantMessageId: number,
+    systemPrompt?: string,
+  ) => Promise<void>;
+  /** Edit a user message and resend: truncate from it, then dispatch the new
+   *  text as a fresh turn. */
+  editAndResend: (
+    workspaceId: string,
+    workspacePath: string,
+    userMessageId: number,
+    newContent: string,
     systemPrompt?: string,
   ) => Promise<void>;
   /** Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -232,6 +314,14 @@ interface ChatState {
   ) => Promise<void>;
   /** SIGINT (Ctrl-C) the active thread's live `$`-direct process. */
   stopShellProcess: (workspaceId: string) => void;
+  /** Load the workspace's recent `$`-command history into the cache. */
+  loadShellHistory: (workspaceId: string) => Promise<void>;
+  /** Resolve a dangerous-command approval card (removes it + tells the backend). */
+  respondApproval: (
+    workspaceId: string,
+    callId: string,
+    decision: "approve" | "always" | "deny",
+  ) => void;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
   setActiveSkill: (workspaceId: string, skill: string | null) => void;
@@ -250,6 +340,8 @@ interface ChatState {
   selectThread: (workspaceId: string, threadId: string) => Promise<void>;
   newThread: (workspaceId: string) => Promise<void>;
   renameThread: (workspaceId: string, threadId: string, title: string) => Promise<void>;
+  /** Pin/unpin a conversation (pinned sort to the top). */
+  pinThread: (workspaceId: string, threadId: string, pinned: boolean) => Promise<void>;
   deleteThread: (workspaceId: string, threadId: string) => Promise<void>;
 }
 
@@ -348,12 +440,26 @@ export const useChatStore = create<ChatState>((set, get) => {
           ? { ...s.streamingThreadByWs, [wsId]: null }
           : s.streamingThreadByWs;
         if (!active) return { streamingThreadByWs };
+        // Clear any stragglers (e.g. a tool whose result errored before its
+        // resolved row landed) so no spinner outlives the turn — BUT keep the
+        // live card of a `$`-direct process that's still running in this
+        // workspace (its callId is tracked in liveProcessByThread); the LLM
+        // turn finishing must not erase a concurrently streaming process.
+        const liveCallIds = new Set(
+          Object.values(s.liveProcessByThread)
+            .filter((p) => p.workspaceId === wsId)
+            .map((p) => p.callId),
+        );
+        const kept = (s.liveToolsByWs[wsId] ?? EMPTY_LIVE_TOOLS).filter((t) =>
+          liveCallIds.has(t.callId),
+        );
         return {
           streamingByWs: { ...s.streamingByWs, [wsId]: false },
           streamBufferByWs: { ...s.streamBufferByWs, [wsId]: "" },
-          // Clear any stragglers (e.g. a tool whose result errored before its
-          // resolved row landed) so no spinner outlives the turn.
-          liveToolsByWs: { ...s.liveToolsByWs, [wsId]: EMPTY_LIVE_TOOLS },
+          liveToolsByWs: {
+            ...s.liveToolsByWs,
+            [wsId]: kept.length ? kept : EMPTY_LIVE_TOOLS,
+          },
           streamingThreadByWs,
         };
       });
@@ -435,6 +541,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           callId: p.callId,
           command: p.command,
           workspaceId: p.workspaceId,
+          threadId: p.threadId,
         },
       },
     }));
@@ -463,28 +570,90 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
   );
 
-  // ── chat://shell-exit ─────────────────────────────────────────
-  // The live process exited — close the pinned terminal and update the cwd.
-  listen<{ threadId: string; callId: string; exitCode: number; cwd: string }>(
-    "chat://shell-exit",
+  // ── chat://approval-request ───────────────────────────────────
+  // The agent wants to run a destructive command — show an inline Approve/Deny
+  // card; the backend turn is paused until respondApproval resolves it.
+  listen<{
+    workspaceId: string;
+    threadId: string;
+    callId: string;
+    command: string;
+    reason: string;
+  }>("chat://approval-request", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const cur = s.pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
+      if (cur.some((a) => a.callId === p.callId)) return {};
+      return {
+        pendingApprovalsByWs: {
+          ...s.pendingApprovalsByWs,
+          [p.workspaceId]: [
+            ...cur,
+            { callId: p.callId, threadId: p.threadId, command: p.command, reason: p.reason },
+          ],
+        },
+      };
+    });
+  });
+
+  // ── chat://approval-resolved ──────────────────────────────────
+  // The request was answered (or timed out) — retire the card.
+  listen<{ workspaceId: string; callId: string }>("chat://approval-resolved", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const cur = s.pendingApprovalsByWs[p.workspaceId];
+      if (!cur) return {};
+      return {
+        pendingApprovalsByWs: {
+          ...s.pendingApprovalsByWs,
+          [p.workspaceId]: cur.filter((a) => a.callId !== p.callId),
+        },
+      };
+    });
+  });
+
+  // ── chat://shell-cwd ──────────────────────────────────────────
+  // The agent's run_command moved the shared shell's cwd — update the badge so
+  // it stays accurate (the `$`-direct path updates from its result instead).
+  listen<{ threadId: string; cwd: string; cwdLabel: string }>(
+    "chat://shell-cwd",
     (ev) => {
       const p = ev.payload;
       if (!p.threadId) return;
-      set((s) => {
-        const next = { ...s.liveProcessByThread };
-        delete next[p.threadId];
-        const nextOut = { ...s.liveOutputByCallId };
-        delete nextOut[p.callId];
-        return {
-          liveProcessByThread: next,
-          liveOutputByCallId: nextOut,
-          shellCwdByThread: p.cwd
-            ? { ...s.shellCwdByThread, [p.threadId]: p.cwd }
-            : s.shellCwdByThread,
-        };
-      });
+      set((s) => ({
+        shellCwdByThread: { ...s.shellCwdByThread, [p.threadId]: p.cwdLabel ?? "" },
+        shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [p.threadId]: p.cwd ?? "" },
+      }));
     },
   );
+
+  // ── chat://shell-exit ─────────────────────────────────────────
+  // The live process exited — close the pinned terminal and update the cwd.
+  listen<{
+    threadId: string;
+    callId: string;
+    exitCode: number;
+    cwd: string;
+    cwdLabel: string;
+  }>("chat://shell-exit", (ev) => {
+    const p = ev.payload;
+    if (!p.threadId) return;
+    set((s) => {
+      const next = { ...s.liveProcessByThread };
+      delete next[p.threadId];
+      const nextOut = { ...s.liveOutputByCallId };
+      delete nextOut[p.callId];
+      return {
+        liveProcessByThread: next,
+        liveOutputByCallId: nextOut,
+        // Backend-computed label is the badge's single source (empty = root).
+        shellCwdByThread: { ...s.shellCwdByThread, [p.threadId]: p.cwdLabel ?? "" },
+        shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [p.threadId]: p.cwd ?? "" },
+      };
+    });
+  });
 
   return {
     messagesByWs: {},
@@ -498,8 +667,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     activeSkillByWs: {},
     attachmentsByWs: {},
     shellCwdByThread: {},
+    shellCwdAbsByThread: {},
     liveProcessByThread: {},
     liveOutputByCallId: {},
+    shellHistoryByWs: {},
+    pendingApprovalsByWs: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -516,11 +688,23 @@ export const useChatStore = create<ChatState>((set, get) => {
       const threadId = get().activeThreadByWs[workspaceId];
       return threadId ? get().shellCwdByThread[threadId] ?? null : null;
     },
+    getShellCwdAbs: (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      return threadId ? get().shellCwdAbsByThread[threadId] ?? null : null;
+    },
     getLiveProcess: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
       return threadId ? get().liveProcessByThread[threadId] ?? null : null;
     },
     getLiveOutput: (callId) => get().liveOutputByCallId[callId] ?? null,
+    getShellHistory: (workspaceId) => get().shellHistoryByWs[workspaceId] ?? EMPTY_HISTORY,
+    // Returns the workspace's pending approvals as a STABLE slice ref (no new
+    // array per call → no spurious re-renders). The consumer (ChatCanvas) scopes
+    // these to the on-screen thread at render time — approving a command you
+    // can't see would be unsafe. (Surfacing a "thread N needs approval" signal in
+    // the chat list for a backgrounded thread is a separate, future affordance.)
+    getPendingApprovals: (workspaceId) =>
+      get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS,
 
     getTimeline: (workspaceId) => {
       const msgs = get().messagesByWs[workspaceId];
@@ -593,6 +777,22 @@ export const useChatStore = create<ChatState>((set, get) => {
         void get().renameThread(workspaceId, threadId, title).catch(() => {});
       }
 
+      // Snapshot + clear pending attachments — they ride along on this turn only.
+      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
+      if (attachments.length > 0) {
+        set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
+      }
+
+      await get().runTurn(workspaceId, workspacePath, threadId, {
+        userMessage: content,
+        systemPrompt,
+        attachments,
+      });
+    },
+
+    // Core turn dispatch shared by send / regenerate. Sets the streaming flags,
+    // fires the IPC, and on failure restores the flags + any staged attachments.
+    runTurn: async (workspaceId, workspacePath, threadId, opts) => {
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
@@ -600,26 +800,21 @@ export const useChatStore = create<ChatState>((set, get) => {
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
-
-      // Snapshot + clear pending attachments — they ride along on this turn only.
-      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
-      if (attachments.length > 0) {
-        set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
-      }
-
+      const attachments = opts.attachments ?? EMPTY_ATTACHMENTS;
       try {
         await ipc.sendChatMessage({
           workspaceId,
           threadId,
           workspacePath,
           model: get().model,
-          userMessage: content,
-          system: systemPrompt,
+          userMessage: opts.userMessage,
+          system: opts.systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
           skill: get().activeSkillByWs[workspaceId] ?? undefined,
           attachments: attachments.length
             ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
             : undefined,
+          regenerate: opts.regenerate || undefined,
         });
       } catch (e) {
         set((s) => ({
@@ -632,7 +827,81 @@ export const useChatStore = create<ChatState>((set, get) => {
             ? { ...s.attachmentsByWs, [workspaceId]: attachments }
             : s.attachmentsByWs,
         }));
+        // Resync the visible conversation with the DB. Critical after a
+        // regenerate/editAndResend whose truncate committed but whose dispatch
+        // then failed — without this the UI keeps the optimistically-removed rows
+        // out of view while diverging from what's persisted. (For a plain send
+        // failure this is a harmless reload of the same rows.)
+        void get().loadHistory(workspaceId);
       }
+    },
+
+    // Shared core for regenerate / editAndResend: budget-gate, truncate from the
+    // cutoff (DB first, then local — no drift on failure), then dispatch. Both
+    // entry points must stay in sync, so the order lives in one place.
+    truncateAndRun: async (workspaceId, workspacePath, threadId, cutoffId, opts) => {
+      // Budget gate BEFORE truncating — a blocked action must never delete the
+      // rows it can't re-run.
+      if (overBudgetBlocked(workspaceId)) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG } }));
+        return;
+      }
+      try {
+        await ipc.truncateChatAfter(threadId, cutoffId);
+      } catch (e) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        return;
+      }
+      set((s) => ({
+        messagesByWs: {
+          ...s.messagesByWs,
+          [workspaceId]: (s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES).filter(
+            (m) => m.id < cutoffId,
+          ),
+        },
+      }));
+      // Clear staged attachments only now that we're committed to dispatching —
+      // if the budget gate above bailed, they stay staged for the next turn.
+      if (opts.attachments?.length) {
+        set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
+      }
+      await get().runTurn(workspaceId, workspacePath, threadId, opts);
+    },
+
+    regenerate: async (workspaceId, workspacePath, assistantMessageId, systemPrompt) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      if (!threadId) return;
+      const msgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+      const aIdx = msgs.findIndex((m) => m.id === assistantMessageId);
+      if (aIdx < 0) return;
+      // Find the user message that prompted this assistant turn. Without one we
+      // can't regenerate (re-running with empty history 400s) and truncating would
+      // wipe the whole thread — so bail. Otherwise truncate from the START of the
+      // turn (the row after that user message) so its TOOL rows go too; cutting at
+      // the assistant text id alone would leave orphaned tool rows.
+      let pu = aIdx - 1;
+      while (pu >= 0 && msgs[pu].role !== "user") pu--;
+      if (pu < 0) return;
+      const truncateFromId = msgs[pu + 1]?.id ?? assistantMessageId;
+      await get().truncateAndRun(workspaceId, workspacePath, threadId, truncateFromId, {
+        userMessage: "",
+        systemPrompt,
+        regenerate: true,
+      });
+    },
+
+    editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      if (!threadId || !newContent.trim()) return;
+      // Carry any staged attachments onto the resent turn (like send does).
+      // truncateAndRun clears them only after its budget gate passes, so a
+      // budget-blocked resend doesn't silently discard them.
+      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
+      await get().truncateAndRun(workspaceId, workspacePath, threadId, userMessageId, {
+        userMessage: newContent,
+        systemPrompt,
+        attachments,
+      });
     },
 
     runShell: async (workspaceId, workspacePath, command) => {
@@ -677,11 +946,18 @@ export const useChatStore = create<ChatState>((set, get) => {
           workspacePath,
           command,
         });
-        if (result?.cwd) {
+        // Update the badge from the backend-computed label (the single source).
+        // Only when a command actually RAN in the shell (result.cwd non-empty):
+        // skip live promotions (cwd known later, via shell-exit) and Busy/error
+        // results (cwd empty) so they don't wipe a valid badge.
+        if (result && !result.live && result.cwd) {
           set((s) => ({
-            shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwd },
+            shellCwdByThread: { ...s.shellCwdByThread, [threadId]: result.cwdLabel ?? "" },
+            shellCwdAbsByThread: { ...s.shellCwdAbsByThread, [threadId]: result.cwd },
           }));
         }
+        // Refresh the recall history so the just-run command surfaces.
+        void get().loadShellHistory(workspaceId);
       } catch (e) {
         set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
       } finally {
@@ -701,6 +977,47 @@ export const useChatStore = create<ChatState>((set, get) => {
     stopShellProcess: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (threadId) void ipc.stopShellCommand(threadId).catch(() => {});
+    },
+
+    respondApproval: (workspaceId, callId, decision) => {
+      // Snapshot the card so we can restore it if the IPC fails — otherwise the
+      // card vanishes (looks resolved) while the backend turn stays parked until
+      // its 300s timeout, with no way to retry the decision.
+      const card = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).find(
+        (a) => a.callId === callId,
+      );
+      // Optimistically retire the card; the backend also emits approval-resolved.
+      set((s) => {
+        const cur = s.pendingApprovalsByWs[workspaceId];
+        if (!cur) return {};
+        return {
+          pendingApprovalsByWs: {
+            ...s.pendingApprovalsByWs,
+            [workspaceId]: cur.filter((a) => a.callId !== callId),
+          },
+        };
+      });
+      void ipc.respondApproval(callId, decision).catch((e) => {
+        // Restore the card + surface the error so the decision can be retried.
+        set((s) => ({
+          errorByWs: { ...s.errorByWs, [workspaceId]: `Could not send approval: ${String(e)}` },
+          pendingApprovalsByWs: card
+            ? {
+                ...s.pendingApprovalsByWs,
+                [workspaceId]: [...(s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS), card],
+              }
+            : s.pendingApprovalsByWs,
+        }));
+      });
+    },
+
+    loadShellHistory: async (workspaceId) => {
+      try {
+        const items = await ipc.listShellHistory(workspaceId, 50);
+        set((s) => ({ shellHistoryByWs: { ...s.shellHistoryByWs, [workspaceId]: items } }));
+      } catch {
+        /* history is a convenience — ignore load failures */
+      }
     },
 
     setModel: (model) => set({ model }),
@@ -732,6 +1049,20 @@ export const useChatStore = create<ChatState>((set, get) => {
       // workspace's active thread (the one being shown).
       const threadId = get().activeThreadByWs[workspaceId];
       if (threadId) void ipc.cancelChat(threadId).catch(() => {});
+      // Retire the cancelled thread's pending approval card immediately — the
+      // backend also resolves it as Deny on cancel. Only this thread's cards are
+      // cleared (cancel() denies only this thread), so another thread's pending
+      // approval isn't wiped from the UI while its backend turn stays parked.
+      if (threadId && get().pendingApprovalsByWs[workspaceId]?.some((a) => a.threadId === threadId)) {
+        set((s) => ({
+          pendingApprovalsByWs: {
+            ...s.pendingApprovalsByWs,
+            [workspaceId]: (s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).filter(
+              (a) => a.threadId !== threadId,
+            ),
+          },
+        }));
+      }
     },
 
     clear: (workspaceId) =>
@@ -810,16 +1141,39 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
     },
 
+    pinThread: async (workspaceId, threadId, pinned) => {
+      await ipc.setThreadPinned(threadId, pinned);
+      // Update the flag + re-sort pinned-first (then most-recent), matching the
+      // backend's list ordering so the row jumps to its new position immediately.
+      set((s) => {
+        const list = (s.threadsByWs[workspaceId] ?? EMPTY_THREADS).map((t) =>
+          t.id === threadId ? { ...t, pinned } : t,
+        );
+        const sorted = [...list].sort((a, b) => {
+          if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+          return (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "");
+        });
+        return { threadsByWs: { ...s.threadsByWs, [workspaceId]: sorted } };
+      });
+    },
+
     deleteThread: async (workspaceId, threadId) => {
       const wasActive = get().activeThreadByWs[workspaceId] === threadId;
       await ipc.deleteChatThread(threadId);
       // Remove inside a functional update so interleaved deletes don't resurrect
-      // a row from a stale snapshot.
+      // a row from a stale snapshot. Also drop any pending approval card for the
+      // deleted thread (the backend cancels its parked turn).
       set((s) => ({
         threadsByWs: {
           ...s.threadsByWs,
           [workspaceId]: (s.threadsByWs[workspaceId] ?? EMPTY_THREADS).filter(
             (t) => t.id !== threadId,
+          ),
+        },
+        pendingApprovalsByWs: {
+          ...s.pendingApprovalsByWs,
+          [workspaceId]: (s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).filter(
+            (a) => a.threadId !== threadId,
           ),
         },
       }));

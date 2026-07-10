@@ -1,8 +1,8 @@
 /**
  * Tests for CompanionContext spending block.
  */
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { CompanionContext } from "./CompanionContext";
 import type { Budget, SpendSnapshot } from "../lib/types";
 
@@ -56,6 +56,33 @@ describe("CompanionContext spending block", () => {
     render(<CompanionContext {...baseProps} budgets={budgets} spend={spend} />);
     expect(screen.getByText("Today")).toBeTruthy();
     expect(screen.getByText("Month")).toBeTruthy();
+  });
+
+  it("shows a Capabilities section with the active skill and MCP servers", () => {
+    render(
+      <CompanionContext {...baseProps} activeSkill="code-review" mcpServers={["github", "linear"]} />,
+    );
+    expect(screen.getByText("Capabilities")).toBeTruthy();
+    expect(screen.getByText("code-review")).toBeTruthy();
+    expect(screen.getByText("github")).toBeTruthy();
+    expect(screen.getByText("linear")).toBeTruthy();
+  });
+
+  it("renders a 1M context window as 1M, not 1000k", () => {
+    render(<CompanionContext {...baseProps} tokensUsed={250_000} tokensLimit={1_000_000} />);
+    expect(screen.getByText("250k / 1M")).toBeTruthy();
+  });
+
+  it("omits Capabilities when there is no skill and no MCP server", () => {
+    render(<CompanionContext {...baseProps} />);
+    expect(screen.queryByText("Capabilities")).toBeNull();
+  });
+
+  it("the unstaged row navigates to Review when there are changes", () => {
+    const onReviewClick = vi.fn();
+    render(<CompanionContext {...baseProps} unstaged={3} onReviewClick={onReviewClick} />);
+    fireEvent.click(screen.getByText("unstaged"));
+    expect(onReviewClick).toHaveBeenCalled();
   });
 
   it("prefers workspace budget over global when workspaceId provided", () => {

@@ -35,9 +35,10 @@ describe("CompanionHistory — rendering & actions", () => {
     expect(screen.getByText("Second conversation")).toBeInTheDocument();
   });
 
-  it("shows empty message when no chats exist", () => {
+  it("shows an empty-state CTA when no chats exist", () => {
     renderHistory({ chats: [] });
-    expect(screen.getByText(/no active chats/i)).toBeInTheDocument();
+    expect(screen.getByText(/no conversations yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/begin a new conversation/i)).toBeInTheDocument();
   });
 
   it("clicking a row calls onSelectChat", async () => {
@@ -54,13 +55,41 @@ describe("CompanionHistory — rendering & actions", () => {
     expect(props.onNewChat).toHaveBeenCalled();
   });
 
-  it("clicking delete calls onDeleteChat without selecting the row", async () => {
+  it("delete requires a confirm step before calling onDeleteChat", async () => {
     const user = userEvent.setup();
     const props = renderHistory();
     const deleteButtons = screen.getAllByRole("button", { name: "Delete conversation" });
     await user.click(deleteButtons[1]);
+    // First click only arms the confirm — nothing deleted yet.
+    expect(props.onDeleteChat).not.toHaveBeenCalled();
+    expect(screen.getByText("Delete?")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Confirm delete" }));
     expect(props.onDeleteChat).toHaveBeenCalledWith("c2");
     expect(props.onSelectChat).not.toHaveBeenCalled();
+  });
+
+  it("pins a conversation via the pin action", async () => {
+    const user = userEvent.setup();
+    const props = renderHistory({ onPinChat: vi.fn() });
+    await user.click(screen.getAllByRole("button", { name: "Pin conversation" })[0]);
+    expect(props.onPinChat).toHaveBeenCalledWith("c1", true);
+  });
+
+  it("exports a conversation via the export action", async () => {
+    const user = userEvent.setup();
+    const props = renderHistory({ onExportChat: vi.fn() });
+    await user.click(screen.getAllByRole("button", { name: "Export conversation" })[0]);
+    expect(props.onExportChat).toHaveBeenCalledWith("c1");
+  });
+
+  it("renames a conversation via the rename action", async () => {
+    const user = userEvent.setup();
+    const props = renderHistory({ onRenameChat: vi.fn() });
+    await user.click(screen.getAllByRole("button", { name: "Rename conversation" })[0]);
+    const input = screen.getByRole("textbox", { name: "Conversation title" });
+    await user.clear(input);
+    await user.type(input, "Renamed{Enter}");
+    expect(props.onRenameChat).toHaveBeenCalledWith("c1", "Renamed");
   });
 
   it("hides delete buttons when onDeleteChat is not provided", () => {

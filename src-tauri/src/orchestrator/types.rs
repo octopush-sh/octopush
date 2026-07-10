@@ -203,6 +203,11 @@ pub struct StageInput {
     pub sections: Vec<InputSection>,
     /// True when any included artifact's real output is the worktree diff.
     pub refs_worktree: bool,
+    /// The LIVE worktree diff, captured when `refs_worktree` is set — so a
+    /// reviewer certifies the actual code, not the implementer's prose summary
+    /// of it. Best-effort (`None` on capture failure or an empty diff; the
+    /// prompt then falls back to "inspect with your tools"). Capped at render.
+    pub worktree_diff: Option<String>,
 }
 
 /// The runtime spec a runner needs to execute one stage.

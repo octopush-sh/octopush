@@ -107,6 +107,16 @@ pub enum AppError {
     /// The frontend detects `kind == "SshKeyMissing"` to show the SSH help panel.
     #[error("SSH key not found in agent for {host}")]
     SshKeyMissing { host: String },
+
+    /// Returned when a gated action exceeds the current plan's quota (e.g. the
+    /// monthly Direct-run cap). The frontend detects `kind == "UpgradeRequired"`
+    /// to show an upgrade sheet. Inert in P0 (Free grants everything).
+    #[error("upgrade required: {feature} ({used}/{limit})")]
+    UpgradeRequired {
+        feature: String,
+        used: u32,
+        limit: u32,
+    },
 }
 
 impl From<anyhow::Error> for AppError {
@@ -151,6 +161,14 @@ impl Serialize for AppError {
                 map.serialize_entry("host", host)?;
                 map.end()
             }
+            AppError::UpgradeRequired { feature, used, limit } => {
+                let mut map = ser.serialize_map(Some(4))?;
+                map.serialize_entry("kind", "UpgradeRequired")?;
+                map.serialize_entry("feature", feature)?;
+                map.serialize_entry("used", used)?;
+                map.serialize_entry("limit", limit)?;
+                map.end()
+            }
             other => ser.serialize_str(&other.to_string()),
         }
     }
@@ -180,6 +198,21 @@ mod tests {
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(val["kind"], "SshKeyMissing");
         assert_eq!(val["host"], "github.com");
+    }
+
+    #[test]
+    fn upgrade_required_serializes_as_structured_object() {
+        let err = AppError::UpgradeRequired {
+            feature: "direct.unlimited".into(),
+            used: 25,
+            limit: 25,
+        };
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(val["kind"], "UpgradeRequired");
+        assert_eq!(val["feature"], "direct.unlimited");
+        assert_eq!(val["used"], 25);
+        assert_eq!(val["limit"], 25);
     }
 
     #[test]
