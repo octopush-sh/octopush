@@ -166,6 +166,201 @@ mod workspace_tests {
     }
 
     #[test]
+    fn count_started_runs_excludes_drafts_and_counts_started() {
+        // Guards the free-tier Direct-runs meter/quota: only runs that have
+        // *left* `draft` (i.e. were started) this month are counted.
+        let db = test_db();
+        setup_workspace(&db, "p", "ws");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        // A freshly created run is a draft → not counted.
+        let run_id = db
+            .create_run("ws", &pipeline_id, "task", None, None, &[])
+            .unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 0);
+
+        // Once it leaves draft (started), it counts...
+        db.set_run_status(&run_id, "running", false).unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 1);
+
+        // ...and a terminal state still counts (it also left draft).
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        assert_eq!(db.count_started_runs_this_month().unwrap(), 1);
+    }
+
+    #[test]
+    fn count_active_runs_counts_running_and_paused_excluding_self() {
+        // Drives the concurrency gate: Free may have only ONE run executing at a
+        // time across all workspaces; Pro may run many.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        let a = db.create_run("ws1", &pipeline_id, "task", None, None, &[]).unwrap();
+        let b = db.create_run("ws2", &pipeline_id, "task", None, None, &[]).unwrap();
+
+        // Both draft → nothing active.
+        assert_eq!(db.count_active_runs_excluding(&b).unwrap(), 0);
+
+        // `a` running (a different workspace) → counts against starting `b`...
+        db.set_run_status(&a, "running", false).unwrap();
+        assert_eq!(db.count_active_runs_excluding(&b).unwrap(), 1);
+        // ...but a run is never counted against itself.
+        assert_eq!(db.count_active_runs_excluding(&a).unwrap(), 0);
+
+        // `paused` (suspended mid-run at a checkpoint) also holds the slot.
+        db.set_run_status(&a, "paused", false).unwrap();
+        assert_eq!(db.count_active_runs_excluding(&b).unwrap(), 1);
+
+        // A terminal state frees the slot.
+        db.set_run_status(&a, "completed", true).unwrap();
+        assert_eq!(db.count_active_runs_excluding(&b).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_active_runs_returns_running_and_paused_across_workspaces() {
+        // Feeds the global "Runs in progress" tray — running/paused runs from
+        // every workspace, terminal/draft excluded.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        let a = db.create_run("ws1", &pipeline_id, "task a", None, None, &[]).unwrap();
+        let b = db.create_run("ws2", &pipeline_id, "task b", None, None, &[]).unwrap();
+        let c = db.create_run("ws1", &pipeline_id, "task c", None, None, &[]).unwrap();
+
+        // Drafts aren't active.
+        assert!(db.list_active_runs().unwrap().is_empty());
+
+        db.set_run_status(&a, "running", false).unwrap();
+        db.set_run_status(&b, "paused", false).unwrap();
+        db.set_run_status(&c, "completed", true).unwrap();
+
+        let active = db.list_active_runs().unwrap();
+        let ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(active.len(), 2, "running + paused only");
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+        assert!(!ids.contains(&c.as_str()), "completed is excluded");
+    }
+
+    #[test]
+    fn db_opens_in_wal_with_normal_sync() {
+        // WAL + synchronous=NORMAL keep writes fast (short mutex hold) without
+        // corruption risk — matters under N concurrent runs.
+        let db = test_db();
+        let conn = db.conn_ref();
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL");
+    }
+
+    // ── Cross-machine run history (Pro-real Part B / B1) ─────────────────
+
+    #[test]
+    fn machine_id_is_stable_across_calls() {
+        // A stable per-install id: generated once, persisted, then returned as-is.
+        let db = test_db();
+        let a = db.get_or_create_machine_id().unwrap();
+        let b = db.get_or_create_machine_id().unwrap();
+        assert!(!a.is_empty());
+        assert_eq!(a, b, "machine id must not change once created");
+    }
+
+    #[test]
+    fn app_meta_kv_roundtrips_and_upserts() {
+        let db = test_db();
+        assert_eq!(db.meta_get("k").unwrap(), None);
+        db.meta_set("k", "v1").unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("v1"));
+        db.meta_set("k", "v2").unwrap(); // upsert same key
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn list_terminal_runs_returns_only_completed_and_aborted() {
+        // Feeds the one-shot launch backfill push: only terminal runs replicate.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let done = db.create_run("ws1", &pipeline_id, "done", None, None, &[]).unwrap();
+        let killed = db.create_run("ws1", &pipeline_id, "killed", None, None, &[]).unwrap();
+        let live = db.create_run("ws1", &pipeline_id, "live", None, None, &[]).unwrap();
+        db.set_run_status(&done, "completed", true).unwrap();
+        db.set_run_status(&killed, "aborted", true).unwrap();
+        db.set_run_status(&live, "running", false).unwrap();
+        let ids: Vec<String> =
+            db.list_terminal_runs(100).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&done) && ids.contains(&killed));
+        assert!(!ids.contains(&live), "a running run is not terminal");
+    }
+
+    #[test]
+    fn synced_runs_mirror_replaces_and_lists_newest_first() {
+        let db = test_db();
+        let mk = |id: &str, created: &str| crate::sync::SyncRun {
+            run_id: id.into(),
+            machine_id: "m1".into(),
+            machine_name: Some("Test Mac".into()),
+            workspace_name: Some("ws".into()),
+            task: "t".into(),
+            status: "completed".into(),
+            cost_usd: 1.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: created.into(),
+            finished_at: None,
+            stages: vec![],
+        };
+        db.replace_synced_runs(&[
+            mk("r1", "2026-01-01T00:00:00Z"),
+            mk("r2", "2026-02-01T00:00:00Z"),
+        ])
+        .unwrap();
+        let got = db.list_synced_runs().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].run_id, "r2", "newest (later created_at) first");
+        // A fresh pull fully REPLACES the mirror (cloud is source of truth).
+        db.replace_synced_runs(&[mk("r3", "2026-03-01T00:00:00Z")]).unwrap();
+        let got = db.list_synced_runs().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].run_id, "r3");
+
+        // Sign-out clears the mirror (privacy on shared machines).
+        db.clear_synced_runs().unwrap();
+        assert!(db.list_synced_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_run_payload_maps_run_and_sums_stage_tokens() {
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let run_id = db.create_run("ws1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        let run = db.get_run(&run_id).unwrap().unwrap();
+        let machine_id = db.get_or_create_machine_id().unwrap();
+        let payload = crate::sync::build_run_payload(&db, &run, &machine_id);
+        assert_eq!(payload.run_id, run_id);
+        assert_eq!(payload.machine_id, machine_id);
+        assert_eq!(payload.task, "ship it");
+        assert_eq!(payload.status, "completed");
+        assert_eq!(payload.workspace_name.as_deref(), Some("ws"));
+        assert!(!payload.machine_id.is_empty());
+        let stages = db.list_run_stages(&run_id).unwrap();
+        assert_eq!(payload.stages.len(), stages.len());
+        let sum_in: i64 = stages.iter().map(|s| s.input_tokens).sum();
+        assert_eq!(payload.input_tokens, sum_in, "input tokens summed over stages");
+    }
+
+    #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();
         setup_workspace(&db, "proj-1", "ws-1");
@@ -448,6 +643,81 @@ mod workspace_tests {
         db.delete_chat_thread(&a.id).unwrap();
         assert_eq!(db.list_chat_threads("ws").unwrap().len(), 1);
         assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pinned_threads_sort_to_the_top() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let a = db.create_chat_thread("ws", "A").unwrap();
+        let _b = db.create_chat_thread("ws", "B").unwrap();
+        let c = db.create_chat_thread("ws", "C").unwrap();
+        // Nothing pinned initially.
+        assert!(db.list_chat_threads("ws").unwrap().iter().all(|t| !t.pinned));
+
+        // Pin the oldest → it jumps to the top.
+        db.set_thread_pinned(&a.id, true).unwrap();
+        let list = db.list_chat_threads("ws").unwrap();
+        assert_eq!(list[0].id, a.id);
+        assert!(list[0].pinned);
+        assert_eq!(list[1].id, c.id); // remaining stay newest-first
+
+        // Unpin → back to pure recency (newest C first).
+        db.set_thread_pinned(&a.id, false).unwrap();
+        assert_eq!(db.list_chat_threads("ws").unwrap()[0].id, c.id);
+    }
+
+    #[test]
+    fn truncate_chat_after_removes_message_and_everything_following() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        db.insert_chat_message("ws", &t.id, "user", "one", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &t.id, "assistant", "two", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &t.id, "user", "three", None, None, None, None).unwrap();
+        let rows = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Truncate from the assistant message → keeps only the first row.
+        let assistant_id = rows[1].id;
+        db.truncate_chat_after(&t.id, assistant_id).unwrap();
+        let after = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].content, "one");
+
+        // Scoped per thread: another thread's rows are untouched by a truncate
+        // that targets only this one.
+        let t2 = db.create_chat_thread("ws", "T2").unwrap();
+        db.insert_chat_message("ws", &t2.id, "user", "other", None, None, None, None).unwrap();
+        db.truncate_chat_after(&t2.id, 0).unwrap(); // id >= 0 clears t2 only
+        assert_eq!(db.list_chat_messages(&t2.id).unwrap().len(), 0);
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn shell_history_recall_dedups_and_orders_by_recency() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        db.insert_workspace("ws2", "p", "ws2", "", "main", None, "", None).unwrap();
+
+        db.record_shell_history("ws", "npm test").unwrap();
+        db.record_shell_history("ws", "git status").unwrap();
+        db.record_shell_history("ws", "npm test").unwrap(); // repeat → bumps recency
+        db.record_shell_history("ws", "  ").unwrap(); // blank ignored
+        db.record_shell_history("ws2", "cargo build").unwrap(); // other workspace
+
+        let hist = db.list_shell_history("ws", 50).unwrap();
+        // Deduped (npm test once) and most-recent-first (npm test re-run last).
+        assert_eq!(hist, vec!["npm test".to_string(), "git status".to_string()]);
+
+        // Scoped per workspace.
+        assert_eq!(db.list_shell_history("ws2", 50).unwrap(), vec!["cargo build".to_string()]);
+
+        // Limit honored.
+        assert_eq!(db.list_shell_history("ws", 1).unwrap(), vec!["npm test".to_string()]);
     }
 
     #[test]
@@ -2024,6 +2294,7 @@ mod runner_helpers_tests {
                 refs_worktree: false,
             }],
             refs_worktree: false,
+            worktree_diff: None,
         }
     }
 
@@ -2148,6 +2419,7 @@ mod runner_helpers_tests {
                 },
             ],
             refs_worktree: false,
+            worktree_diff: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -2169,6 +2441,106 @@ mod runner_helpers_tests {
         input.refs_worktree = true;
         let some = user_input_for("code_review", "T", &input, None);
         assert!(some.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn dossier_includes_the_live_diff_so_reviewers_see_the_actual_code() {
+        // The #1 crew-quality fix: a reviewer must certify the CODE, not the
+        // implementer's prose summary of it. When the live worktree diff was
+        // captured it is rendered between BEGIN/END markers; the old tools
+        // hint remains the fallback (capture failure / empty diff).
+        let mut input = plan_input("plan text");
+        input.refs_worktree = true;
+        input.worktree_diff = Some("--- a/src/x.rs\n+++ b/src/x.rs\n+fn added() {}".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("===== BEGIN GIT DIFF ====="), "{s}");
+        assert!(s.contains("===== END GIT DIFF ====="));
+        assert!(s.contains("+fn added() {}"));
+        assert!(!s.contains("present in the workspace"), "diff replaces the vague hint");
+        assert!(!s.contains("too large to include"), "small diff carries no truncation note");
+
+        // Markers, not a ``` fence: a diff of a markdown file contains fence
+        // lines, which would terminate a fenced block early.
+        input.worktree_diff = Some("+```diff\n+nested fence\n+```".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        let begin = s.find("===== BEGIN GIT DIFF =====").unwrap();
+        let end = s.find("===== END GIT DIFF =====").unwrap();
+        let inside = &s[begin..end];
+        assert!(inside.contains("+```diff"), "fence lines survive inside the markers");
+
+        // A huge diff is capped like any dossier section (head + tail survive)
+        // and the prompt SAYS it was truncated (no silent coverage gap).
+        let mut big = String::from("DIFF-HEAD\n");
+        big.push_str(&"+x\n".repeat(20_000));
+        big.push_str("DIFF-TAIL");
+        input.worktree_diff = Some(big);
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("DIFF-HEAD") && s.contains("DIFF-TAIL"));
+        assert!(s.contains("section truncated for length"));
+        assert!(s.contains("too large to include in full"), "truncation is inventoried");
+
+        // Whitespace-only diff falls back to the hint (the render is the
+        // single owner of the emptiness decision).
+        input.worktree_diff = Some("   \n".into());
+        let s = user_input_for("code_review", "T", &input, None);
+        assert!(s.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn migrate_upgrades_stale_reviewer_tool_snapshots() {
+        // The builder snapshots a role's default tools into pipeline_stages at
+        // authoring time — so the ro()→run_() upgrade for reviewers must be
+        // retrofitted onto existing rows still carrying the old default, or
+        // the new prompt ("run the build or tests…") runs against a read-only
+        // allowlist. A user-customized allowlist is never touched, and the
+        // retrofit is ONE-SHOT: re-running every launch would re-escalate a
+        // reviewer a user deliberately set back to read-only. Drives the REAL
+        // migration by re-opening the same database file (app update).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let pid = db.insert_pipeline("p", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        let pid2 = db.insert_pipeline("p2", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid2, 0, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        // Simulate a pre-upgrade install: stale snapshot (pid), a user
+        // customization (pid2), and NO retrofit marker yet.
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\",\"list_files\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid],
+        ).unwrap();
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid2],
+        ).unwrap();
+        db.conn_ref().execute(
+            "DELETE FROM app_meta WHERE key='retrofit_reviewer_run_command'", [],
+        ).unwrap();
+        drop(db);
+
+        // Re-open (the app update's first launch) → the retrofit applies once.
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let tools_of = |db: &crate::db::Db, pid: &str| -> String {
+            db.conn_ref().query_row(
+                "SELECT tools FROM pipeline_stages WHERE pipeline_id=?1",
+                rusqlite::params![pid], |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(tools_of(&db, &pid), r#"["read_file","list_files","run_command"]"#);
+        assert_eq!(tools_of(&db, &pid2), r#"["read_file"]"#, "custom allowlists stay untouched");
+
+        // The user now DELIBERATELY sets the reviewer back to read-only — a
+        // later launch must respect that choice (one-shot, never re-escalate).
+        db.conn_ref().execute(
+            "UPDATE pipeline_stages SET tools='[\"read_file\",\"list_files\"]' WHERE pipeline_id=?1",
+            rusqlite::params![pid],
+        ).unwrap();
+        drop(db);
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        assert_eq!(
+            tools_of(&db, &pid),
+            r#"["read_file","list_files"]"#,
+            "the retrofit must not re-apply after its one-shot marker is set"
+        );
     }
 
     #[test]
@@ -2196,6 +2568,7 @@ mod runner_helpers_tests {
                 refs_worktree: false,
             }],
             refs_worktree: false,
+            worktree_diff: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -5719,7 +6092,7 @@ mod roles_tests {
     }
 
     #[test]
-    fn builtin_roles_seed_matches_legacy_prompts() {
+    fn builtin_roles_compose_with_the_right_preambles() {
         use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
         use crate::orchestrator::types::RoleEnvironment;
         let by = |k: &str| builtin_roles().into_iter().find(|r| r.key == k).unwrap();
@@ -5728,7 +6101,7 @@ mod roles_tests {
         let got = compose_system_prompt(&plan.prompt_body, plan.environment, None, None);
         assert!(got.contains("You are one stage in an automated, headless build pipeline."));
         assert!(got.contains("Do not commit, push, or otherwise manage git"));
-        assert!(got.contains("Produce a concise, concrete implementation plan"));
+        assert!(got.contains("produce a concrete implementation plan"));
         // there are 15 builtin roles, all keys unique
         let all = builtin_roles();
         assert_eq!(all.len(), 15);
@@ -5741,6 +6114,61 @@ mod roles_tests {
         let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None);
         assert!(rp.contains("may commit, push"));
         assert!(!rp.contains("Do not commit, push"));
+    }
+
+    #[test]
+    fn builtin_role_prompts_are_purpose_specific_not_clones() {
+        // The crew-quality invariant: fix/verify/critique were historically
+        // byte-identical clones of implement/code_review/plan_review, so
+        // `verify` never re-ran the repro and `fix` never targeted the root
+        // cause. Every builtin body must be unique, and the trio must speak
+        // to its actual purpose.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        let mut bodies: Vec<_> = all.iter().map(|r| r.prompt_body.clone()).collect();
+        bodies.sort();
+        let before = bodies.len();
+        bodies.dedup();
+        assert_eq!(bodies.len(), before, "duplicate builtin prompt bodies");
+        let by = |k: &str| all.iter().find(|r| r.key == k).unwrap();
+        assert!(by("fix").prompt_body.contains("ROOT CAUSE"));
+        assert!(by("verify").prompt_body.contains("by execution"));
+        assert!(by("verify").prompt_body.contains("Re-run the repro"));
+        assert!(!by("critique").prompt_body.contains("the proposed plan"),
+            "critique must not hard-code 'the plan' — it reviews any artifact");
+    }
+
+    #[test]
+    fn reviewer_prompts_carry_a_severity_rubric_and_anti_rubber_stamp_bar() {
+        // Automated review fails in two prompt-shaped ways: rubber-stamping
+        // and cosmetic-nitpick loops. Every looping reviewer must carry a
+        // severity rubric and the "nits alone don't send work back" bar.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        let by = |k: &str| all.iter().find(|r| r.key == k).unwrap();
+        for k in ["plan_review", "code_review", "critique"] {
+            assert!(by(k).prompt_body.contains("BLOCKING"), "{k} lacks a severity rubric");
+        }
+        assert!(by("code_review").prompt_body.contains("NITs alone are never grounds"));
+        assert!(by("security_review").prompt_body.contains("Critical"));
+        // The test role must be required to actually RUN the suite.
+        assert!(by("test").prompt_body.contains("running is not optional"));
+    }
+
+    #[test]
+    fn reviewers_can_run_commands_to_verify_findings() {
+        // code_review/security_review were read-only (`ro()`), so they could
+        // not run `git diff`, grep, or the test suite — structurally unable
+        // to verify what they certify. They now carry run_command.
+        use crate::orchestrator::roles::builtin_roles;
+        let all = builtin_roles();
+        for k in ["code_review", "security_review", "verify", "repro", "test"] {
+            let r = all.iter().find(|r| r.key == k).unwrap();
+            assert!(
+                r.default_tools.iter().any(|t| t == "run_command"),
+                "{k} must be able to run commands"
+            );
+        }
     }
 
     #[test]

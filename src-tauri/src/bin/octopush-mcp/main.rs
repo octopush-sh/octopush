@@ -3,9 +3,10 @@
 //! Speaks JSON-RPC 2.0 over stdio (the transport Claude Code and other MCP
 //! clients launch). It exposes a read-and-author slice of Octopush: list and
 //! inspect pipelines / projects / workspaces / runs, author DIRECT-mode
-//! pipeline templates, and stage runs in `draft`. It drives the same local
-//! SQLite store the desktop app uses, so it works whether or not the app is
-//! running. It never executes runs, spends tokens, or mutates a git tree.
+//! pipeline templates, stage runs in `draft`, and create workspaces. It drives
+//! the same local SQLite store the desktop app uses, so it works whether or
+//! not the app is running. It never executes runs or spends tokens; the only
+//! git mutation it performs is creating a workspace's worktree.
 //!
 //! The loop is deliberately synchronous: stdio MCP is one JSON object per line,
 //! and a single rusqlite connection is neither needed on multiple threads nor
@@ -17,13 +18,16 @@ mod tools;
 use std::io::{self, BufRead, Write};
 
 use octopush_lib::db::Db;
+use parking_lot::Mutex;
 use serde_json::Value;
 
 fn main() {
     // Open the store once. A failure here is fatal and worth surfacing on
-    // stderr (stdout is reserved for protocol frames).
+    // stderr (stdout is reserved for protocol frames). Wrapped in a Mutex so
+    // workspace creation can lock per-operation (and never across its git
+    // checkout); the loop is single-threaded so it's otherwise uncontended.
     let db = match Db::open(&Db::default_path()) {
-        Ok(db) => db,
+        Ok(db) => Mutex::new(db),
         Err(e) => {
             eprintln!("octopush-mcp: failed to open the Octopush database: {e}");
             std::process::exit(1);
@@ -58,7 +62,7 @@ fn main() {
 
 /// Parse and route one incoming line. Returns `Some(response)` for requests
 /// (messages with an `id`) and `None` for notifications.
-fn handle_message(db: &Db, line: &str) -> Option<Value> {
+fn handle_message(db: &Mutex<Db>, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -103,7 +107,7 @@ fn handle_message(db: &Db, line: &str) -> Option<Value> {
 /// `tools/call`: validate the envelope, then dispatch. Tool-level failures come
 /// back as a successful response whose result has `isError: true` (the MCP
 /// convention) so the model can read and recover from them.
-fn handle_tools_call(db: &Db, params: &Value) -> Result<Value, (i64, String)> {
+fn handle_tools_call(db: &Mutex<Db>, params: &Value) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)

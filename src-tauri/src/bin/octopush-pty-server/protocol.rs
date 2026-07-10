@@ -196,6 +196,13 @@ pub enum Event {
     /// stream (the frontend WebView's xterm.js buffer + React render
     /// cycle made this unreliable in 0.1.4–0.1.10).
     Attention { id: String },
+    /// The PTY's foreground process group flipped between the shell
+    /// (idle, at a prompt) and a non-shell child (a command is running).
+    /// Drives the rail's "processing" indicator. Distinct from
+    /// `Attention`, which fires once a *running* command goes idle: this
+    /// is a plain ownership signal (`fg != shell`) with no latch or grace
+    /// window, emitted only on a state change.
+    Foreground { id: String, busy: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -245,5 +252,19 @@ mod tests {
         assert!(s.contains("\"type\":\"version\""), "got: {s}");
         assert!(s.contains(&format!("\"protocol_version\":{DAEMON_PROTOCOL_VERSION}")), "got: {s}");
         assert!(s.contains("\"version\":\"9.9.9\""), "got: {s}");
+    }
+
+    #[test]
+    fn foreground_event_serializes_with_busy_flag() {
+        let line = Event::Foreground {
+            id: "term-1".into(),
+            busy: true,
+        }
+        .to_line();
+        let s = String::from_utf8(line).unwrap();
+        assert!(s.contains("\"event\":\"foreground\""), "got: {s}");
+        assert!(s.contains("\"id\":\"term-1\""), "got: {s}");
+        assert!(s.contains("\"busy\":true"), "got: {s}");
+        assert!(s.ends_with('\n'), "expected newline-terminated line");
     }
 }

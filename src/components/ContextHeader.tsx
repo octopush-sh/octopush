@@ -1,10 +1,12 @@
 import { useEffect } from "react";
+import { Copy } from "lucide-react";
 import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
+import { copyToClipboard } from "../lib/clipboard";
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -183,19 +185,35 @@ export function ContextHeader({
         {pr && (() => {
           const style = PR_STATE_STYLE[pr.state];
           return (
-            <button
-              type="button"
-              onClick={() => onOpenPr?.(pr.url)}
-              title={`${pr.state.charAt(0).toUpperCase() + pr.state.slice(1)} pull request — ${pr.title}`}
-              className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors"
+            <div
+              className="group flex items-center gap-1 rounded px-1.5 py-1 pr-1"
               style={{ background: style.bg, border: `1px solid ${style.border}` }}
             >
-              <span aria-hidden className={style.color} style={{ fontSize: 11, lineHeight: 1 }}>
-                {style.glyph}
-              </span>
-              <span className={style.color}>PR · #{pr.number}</span>
-              <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>↗</span>
-            </button>
+              <button
+                type="button"
+                onClick={() => onOpenPr?.(pr.url)}
+                title={`${pr.state.charAt(0).toUpperCase() + pr.state.slice(1)} pull request — ${pr.title}`}
+                className="flex items-center gap-1.5 rounded px-0.5 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors"
+              >
+                <span aria-hidden className={style.color} style={{ fontSize: 11, lineHeight: 1 }}>
+                  {style.glyph}
+                </span>
+                <span className={style.color}>PR · #{pr.number}</span>
+                <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>↗</span>
+              </button>
+              <button
+                type="button"
+                aria-label="Copy PR URL"
+                title="Copy PR URL"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void copyToClipboard(pr.url, "PR URL copied");
+                }}
+                className="flex shrink-0 items-center justify-center rounded p-1 text-octo-mute opacity-0 transition group-hover:opacity-70 hover:!text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <Copy size={11} />
+              </button>
+            </div>
           );
         })()}
 

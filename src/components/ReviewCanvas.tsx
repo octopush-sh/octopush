@@ -18,6 +18,7 @@ import {
   FlaskConical,
   Sparkles,
   X,
+  Eye,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
@@ -25,7 +26,9 @@ import { parseFullDiff } from "../lib/diffParser";
 import { revealDiffTarget } from "../lib/diffJump";
 import type { ChatMessage, FileEdit, GitStatus, TestRunResult } from "../lib/types";
 import { useReviewPrefs } from "../stores/reviewPrefsStore";
+import { useEditorStore } from "../stores/editorStore";
 import { useAiReview } from "../stores/aiReviewStore";
+import { isMarkdownFile } from "../lib/isMarkdownFile";
 import { DiffView } from "./review/DiffView";
 import { AiReviewPanel } from "./review/AiReviewPanel";
 import { TestDrawer } from "./review/TestDrawer";
@@ -88,6 +91,14 @@ export function ReviewCanvas({
   const ignoreWhitespace = useReviewPrefs((s) => s.ignoreWhitespace);
   const setReadingMode = useReviewPrefs((s) => s.setReadingMode);
   const setIgnoreWhitespace = useReviewPrefs((s) => s.setIgnoreWhitespace);
+  const mdPreview = useReviewPrefs((s) => s.mdPreview);
+  const toggleMdPreview = useReviewPrefs((s) => s.toggleMdPreview);
+  const activePath = useEditorStore((s) => s.getActivePath(workspaceId));
+  const editorFiles = useEditorStore((s) => s.getFiles(workspaceId));
+  const activeEditorFile = activePath
+    ? editorFiles.find((f) => f.path === activePath) ?? null
+    : null;
+  const showPreviewToggle = viewMode === "editor" && isMarkdownFile(activeEditorFile);
 
   // Reject-undo inline bar (error=true when applyHunk couldn't restore the change)
   const [undo, setUndo] = useState<{ rawText: string; error?: boolean } | null>(null);
@@ -281,6 +292,22 @@ export function ReviewCanvas({
               Editor
             </button>
           </div>
+
+          {/* Rendered Markdown preview toggle — editor view, .md files only */}
+          {showPreviewToggle && (
+            <button
+              onClick={toggleMdPreview}
+              aria-label="Toggle rendered preview"
+              aria-pressed={mdPreview}
+              title="Toggle rendered preview"
+              className={`flex shrink-0 items-center justify-center rounded-md border border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                mdPreview ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+              }`}
+              style={mdPreview ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" } : undefined}
+            >
+              <Eye size={13} />
+            </button>
+          )}
 
           {/* Reading mode + whitespace — only meaningful in Diff view.
               Icon-only with tooltips so the row stays compact. */}

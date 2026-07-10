@@ -49,6 +49,13 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // With WAL, synchronous=NORMAL stays crash-safe (no corruption — only a
+        // power/OS crash can drop the last commit) while committing with far fewer
+        // fsyncs. That shortens how long each write holds the single DB mutex —
+        // which matters under N concurrent Direct runs (Pro parallel runs). The
+        // busy_timeout lets a contended lock wait briefly instead of erroring.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Db { conn };
         db.migrate()?;
@@ -260,6 +267,17 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_run_events_run
                 ON run_events(run_id, id);
+
+            CREATE TABLE IF NOT EXISTS shell_history (
+                workspace_id  TEXT NOT NULL,
+                command       TEXT NOT NULL,
+                used_at       TEXT NOT NULL,
+                uses          INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (workspace_id, command),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_shell_history_ws
+                ON shell_history(workspace_id, used_at DESC);
             "#,
         )?;
         // Phase 2 — workspace customization columns (glyph + tint).
@@ -306,6 +324,22 @@ impl Db {
             // Retained for non-destructive cleanup (Plan 13/T4): column is no longer
             // read or written, but we keep it in place rather than dropping it.
             "ALTER TABLE workspaces ADD COLUMN issue_link_dismissed INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // `managed` = Octopush created this worktree (default true, matching every
+        // existing row). Adopted checkouts (a branch already checked out that we
+        // register a workspace over) set it false so delete/archive never
+        // `rm -rf` a directory Octopush didn't create.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN managed INTEGER NOT NULL DEFAULT 1",
+        )?;
+        // `created_branch` = Octopush created this workspace's git branch (vs
+        // reusing/adopting one that already existed). Default true preserves the
+        // historical behaviour (delete removes the branch); reused/adopted rows
+        // set it false so delete never deletes a branch Octopush didn't create.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN created_branch INTEGER NOT NULL DEFAULT 1",
         )?;
 
         // Phase 9 — drop the FK from token_events.session_id. The original
@@ -479,9 +513,68 @@ impl Db {
             "#,
         )?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN thread_id TEXT")?;
+        // Pinned conversations sort to the top of the chat list. (Must run AFTER
+        // chat_threads is created above.)
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE chat_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
+
+        // Cross-machine run-history sync (Pro-real Part B / B1):
+        //   • app_meta   — a tiny key/value store for app-global scalars (e.g. the
+        //                  stable per-install `machine_id`); no such table existed.
+        //   • synced_runs — a READ-ONLY local mirror of the user's run history
+        //                  pulled from the cloud. Kept SEPARATE from `runs` on
+        //                  purpose: pulled runs come from other machines and have
+        //                  no local workspace (the `runs` table FKs to workspaces).
+        //                  `data` is the JSON blob (SyncRun) rendered by the view.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS synced_runs (
+                run_id     TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_synced_runs_created ON synced_runs(created_at DESC);
+            "#,
+        )?;
+
+        // Crew-quality retrofit (ONE-SHOT, gated via app_meta — so it must run
+        // after the CREATE above): code_review/security_review gained
+        // `run_command` in their default tool preset, but the builder SNAPSHOTS
+        // a role's tools into each pipeline_stages row at authoring time (and
+        // create_run copies that into run_stages) — so existing pipelines would
+        // run the NEW prompt ("run the build or tests…") against the OLD
+        // read-only allowlist, unable to comply. Upgrade exactly the rows still
+        // carrying the old default snapshot, ONCE: re-running on every launch
+        // would silently re-escalate a reviewer a user had deliberately set
+        // back to read-only (the old snapshot is byte-identical to that choice).
+        if self.meta_get("retrofit_reviewer_run_command")?.is_none() {
+            const OLD_RO: &str = r#"["read_file","list_files"]"#;
+            const NEW_RUN: &str = r#"["read_file","list_files","run_command"]"#;
+            self.conn.execute(
+                "UPDATE pipeline_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2",
+                params![NEW_RUN, OLD_RO],
+            )?;
+            // Also stages of runs that haven't executed yet (drafts) — started
+            // and terminal runs keep their historical allowlist.
+            self.conn.execute(
+                "UPDATE run_stages SET tools = ?1
+                 WHERE role IN ('code_review','security_review') AND tools = ?2
+                   AND status = 'pending'",
+                params![NEW_RUN, OLD_RO],
+            )?;
+            self.meta_set("retrofit_reviewer_run_command", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1098,11 +1191,36 @@ impl Db {
         setup_script: &str,
         from_branch: Option<&str>,
     ) -> AppResult<()> {
+        // Octopush-created worktrees are managed and own their branch by default.
+        self.insert_workspace_managed(
+            id, project_id, name, task, branch, worktree_path, setup_script, from_branch, true, true,
+        )
+    }
+
+    /// Insert a workspace row with explicit `managed` / `created_branch` flags,
+    /// atomically. The adopt path uses `managed=false`, and a reused branch uses
+    /// `created_branch=false`, so the row is *born* with the right ownership —
+    /// there's no insert-then-flip window in which a crash could strand a row that
+    /// delete/archive would then wrongly `rm -rf` or `git branch -D`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_workspace_managed(
+        &self,
+        id: &str,
+        project_id: &str,
+        name: &str,
+        task: &str,
+        branch: &str,
+        worktree_path: Option<&str>,
+        setup_script: &str,
+        from_branch: Option<&str>,
+        managed: bool,
+        created_branch: bool,
+    ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO workspaces (id, project_id, name, task, branch, worktree_path, setup_script, created_at, last_active, from_branch)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![id, project_id, name, task, branch, worktree_path, setup_script, now, now, from_branch],
+            "INSERT INTO workspaces (id, project_id, name, task, branch, worktree_path, setup_script, created_at, last_active, from_branch, managed, created_branch)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![id, project_id, name, task, branch, worktree_path, setup_script, now, now, from_branch, managed as i64, created_branch as i64],
         )?;
         Ok(())
     }
@@ -1163,6 +1281,45 @@ impl Db {
         Ok(row)
     }
 
+    /// Find a workspace by `(project_id, branch)` regardless of status. There
+    /// is at most one meaningful workspace per branch (git can't check a branch
+    /// out twice); when both an active and an archived row somehow exist we
+    /// prefer the active one. Used to keep workspace creation idempotent —
+    /// including over *archived* rows, which `list_workspaces` hides.
+    pub fn find_workspace_by_branch(
+        &self,
+        project_id: &str,
+        branch: &str,
+    ) -> AppResult<Option<WorkspaceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+             FROM workspaces WHERE project_id = ?1 AND branch = ?2
+             ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![project_id, branch], |r| {
+                Ok(WorkspaceRow {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    name: r.get(2)?,
+                    task: r.get(3)?,
+                    branch: r.get(4)?,
+                    worktree_path: r.get(5)?,
+                    setup_script: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                    last_active: r.get(9)?,
+                    glyph: r.get(10)?,
+                    tint: r.get(11)?,
+                    test_command: r.get(12)?,
+                    linked_issue_key: r.get(13)?,
+                    from_branch: r.get(14)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn update_workspace_link(
         &self,
         workspace_id: &str,
@@ -1173,6 +1330,65 @@ impl Db {
             rusqlite::params![linked_issue_key, workspace_id],
         )?;
         Ok(())
+    }
+
+    /// Update a workspace's on-disk worktree path. Used when a worktree is
+    /// (re)created at a different location than the row originally recorded —
+    /// e.g. the original path was occupied, so `create_worktree` stepped aside.
+    pub fn set_workspace_worktree_path(&self, id: &str, worktree_path: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2",
+            params![worktree_path, id],
+        )?;
+        Ok(())
+    }
+
+    /// Set whether Octopush owns (manages) this workspace's worktree. Used by the
+    /// heal paths: adopting a branch's checkout at a different location marks it
+    /// not-ours (never rm on delete); rebuilding a gone worktree marks it ours.
+    pub fn set_workspace_managed(&self, id: &str, managed: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET managed = ?1 WHERE id = ?2",
+            params![managed as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// Does Octopush own (manage) this workspace's worktree? An existing row's
+    /// legacy default is `true` (every pre-existing worktree was Octopush-made),
+    /// but a MISSING ROW is `false`: these flags gate destruction, and "no such
+    /// row" is uncertainty — we never `rm -rf` on uncertainty (e.g. a double-fire
+    /// delete that finds the row already gone must not rm the path a second time).
+    /// The `managed` column is `NOT NULL DEFAULT 1`, so an existing row always
+    /// yields a value; `None` here means the row is absent, not legacy.
+    pub fn is_workspace_managed(&self, id: &str) -> AppResult<bool> {
+        let managed: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT managed FROM workspaces WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(managed.map(|m| m != 0).unwrap_or(false))
+    }
+
+    /// Did Octopush create this workspace's git branch (vs reuse/adopt an existing
+    /// one)? Only then may delete remove the branch. An existing row's legacy
+    /// default is `true` (historically delete always removed the branch), but a
+    /// MISSING ROW is `false` — same reasoning as `is_workspace_managed`: a
+    /// double-fire delete on an already-removed row must never `git branch -D` a
+    /// branch we may not have created.
+    pub fn is_branch_created_by_octopush(&self, id: &str) -> AppResult<bool> {
+        let created: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT created_branch FROM workspaces WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(created.map(|c| c != 0).unwrap_or(false))
     }
 
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
@@ -1292,14 +1508,25 @@ impl Db {
             title: title.to_string(),
             created_at: now.clone(),
             updated_at: now,
+            pinned: false,
         })
+    }
+
+    /// Pin/unpin a conversation — pinned threads sort to the top of the list.
+    pub fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_threads SET pinned = ?2 WHERE id = ?1",
+            params![thread_id, pinned as i64],
+        )?;
+        Ok(())
     }
 
     /// List a workspace's threads, most-recently-active first.
     pub fn list_chat_threads(&self, workspace_id: &str) -> AppResult<Vec<ChatThreadRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, title, created_at, updated_at
-             FROM chat_threads WHERE workspace_id = ?1 ORDER BY updated_at DESC",
+            "SELECT id, workspace_id, title, created_at, updated_at, pinned
+             FROM chat_threads WHERE workspace_id = ?1
+             ORDER BY pinned DESC, updated_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], |r| {
             Ok(ChatThreadRow {
@@ -1308,6 +1535,7 @@ impl Db {
                 title: r.get(2)?,
                 created_at: r.get(3)?,
                 updated_at: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1327,6 +1555,59 @@ impl Db {
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
         Ok(())
+    }
+
+    /// Delete a message and everything after it in a thread (ids are monotonic
+    /// per thread). Backs Regenerate (truncate from the assistant turn) and
+    /// Edit-and-resend (truncate from the edited user message). Scoped by
+    /// thread_id so it never touches another conversation's rows.
+    pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
+        self.conn.execute(
+            "DELETE FROM chat_messages WHERE thread_id = ?1 AND id >= ?2",
+            params![thread_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a `$`-direct command in the workspace's recall history (upsert:
+    /// bumps recency + use-count for a repeated command). Best-effort.
+    pub fn record_shell_history(&self, workspace_id: &str, command: &str) -> AppResult<()> {
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        self.conn.execute(
+            "INSERT INTO shell_history (workspace_id, command, used_at, uses)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(workspace_id, command)
+             DO UPDATE SET used_at = excluded.used_at, uses = uses + 1",
+            params![workspace_id, cmd, now],
+        )?;
+        Ok(())
+    }
+
+    /// Most-recently-used `$`-direct commands for a workspace (newest first).
+    pub fn list_shell_history(&self, workspace_id: &str, limit: i64) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT command FROM shell_history WHERE workspace_id = ?1
+             ORDER BY used_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![workspace_id, limit], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Whether a chat thread still exists — used to avoid persisting a late
+    /// live-process result row for a conversation the user already deleted.
+    pub fn chat_thread_exists(&self, thread_id: &str) -> AppResult<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     // ─── Terminals ────────────────────────────────────────────────
@@ -2062,6 +2343,133 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// All runs currently `running` or `paused`, across **all** workspaces
+    /// (newest first). Drives the global "Runs in progress" tray — including
+    /// background runs in workspaces the user hasn't opened this session.
+    pub fn list_active_runs(&self) -> AppResult<Vec<RunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+             FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_run)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count Direct runs that were *started* (i.e. left `draft`) since the start
+    /// of the current month — the unit the free-tier Direct-runs meter shows and
+    /// the quota gate counts. Mirrors the month-window convention in
+    /// `period_spend` (ISO `created_at` vs `datetime('now','start of month')`).
+    pub fn count_started_runs_this_month(&self) -> AppResult<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs
+             WHERE status != 'draft' AND created_at >= datetime('now', 'start of month')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// Count runs currently `running` or `paused` across **all** workspaces,
+    /// excluding `run_id` (a run is never counted against itself). Drives the
+    /// concurrency gate: Free may run only one at a time, Pro may run many.
+    pub fn count_active_runs_excluding(&self, run_id: &str) -> AppResult<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs
+             WHERE status IN ('running', 'paused') AND id != ?1",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// Terminal runs (`completed`/`aborted`) across all workspaces, newest first,
+    /// capped at `limit`. Drives the one-shot history backfill push on launch.
+    pub fn list_terminal_runs(&self, limit: u32) -> AppResult<Vec<RunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+             FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_run)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ── app_meta: tiny key/value store for app-global scalars ────────────────
+
+    /// Read a scalar from `app_meta`; `None` if the key was never set.
+    pub fn meta_get(&self, key: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM app_meta WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Upsert a scalar into `app_meta`.
+    pub fn meta_set(&self, key: &str, value: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// A stable, opaque per-install id (generated once, then persisted). Used to
+    /// attribute a synced run to the machine it ran on ("from …").
+    pub fn get_or_create_machine_id(&self) -> AppResult<String> {
+        if let Some(id) = self.meta_get("machine_id")? {
+            if !id.is_empty() {
+                return Ok(id);
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.meta_set("machine_id", &id)?;
+        Ok(id)
+    }
+
+    // ── synced_runs: read-only local mirror of cloud run history ─────────────
+
+    /// Replace the entire local history mirror with a freshly pulled set (the
+    /// cloud is the source of truth for cross-machine history). Atomic.
+    pub fn replace_synced_runs(&self, runs: &[crate::sync::SyncRun]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM synced_runs", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO synced_runs (run_id, data, created_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for r in runs {
+                let data = serde_json::to_string(r)?;
+                stmt.execute(params![r.run_id, data, r.created_at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the entire local history mirror. Called on sign-out so a shared
+    /// machine doesn't retain the previous user's cross-machine run history.
+    pub fn clear_synced_runs(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM synced_runs", [])?;
+        Ok(())
+    }
+
+    /// The local history mirror, newest first. Skips any blob this build can't
+    /// parse (forward/back compat) rather than failing the whole read.
+    pub fn list_synced_runs(&self) -> AppResult<Vec<crate::sync::SyncRun>> {
+        let mut stmt =
+            self.conn.prepare("SELECT data FROM synced_runs ORDER BY created_at DESC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(run) = serde_json::from_str::<crate::sync::SyncRun>(&row?) {
+                out.push(run);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn list_run_stages(&self, run_id: &str) -> AppResult<Vec<RunStageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, position, role, agent_model, substrate, checkpoint, status,
@@ -2549,6 +2957,8 @@ pub struct ChatThreadRow {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]

@@ -26,12 +26,13 @@ import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlert
 import { EmptyProjectState } from "./components/EmptyProjectState";
 import { ChatView } from "./components/ChatView";
 import { ReviewSidebar } from "./components/ReviewSidebar";
-import { EditorPane } from "./components/EditorPane";
+import { EditorWithPreview } from "./components/editor/EditorWithPreview";
 import { EditorTabs } from "./components/EditorTabs";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
 import { ModeOverlay } from "./components/ModeOverlay";
 import { useReviewPrefs } from "./stores/reviewPrefsStore";
+import { useWorkspacePrefs } from "./stores/workspacePrefsStore";
 import { CanvasSplit } from "./components/CanvasSplit";
 import { useEditorStore } from "./stores/editorStore";
 import { useAttentionStore } from "./stores/attentionStore";
@@ -40,6 +41,11 @@ import { TerminalPane } from "./components/TerminalPane";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
+import { UpgradeSheet } from "./components/UpgradeSheet";
+import { HistorySheet } from "./components/HistorySheet";
+import { MissionControl } from "./components/MissionControl";
+import { useHistoryStore } from "./stores/historyStore";
+import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
@@ -48,6 +54,10 @@ import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
+import { useRunsStore } from "./stores/runsStore";
+import { usePipelineStore } from "./stores/pipelineStore";
+import { useShallow } from "zustand/react/shallow";
+import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { listen } from "@tauri-apps/api/event";
@@ -58,6 +68,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { ipc } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
+import { conversationToMarkdown } from "./lib/exportConversation";
 import type { GitStatus, Pr, TintName, Issue, ProjectInfo } from "./lib/types";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
@@ -99,6 +110,57 @@ function App() {
   const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
   const prByWs = useWorkspaceStore((s) => s.prByWs);
   const loadProjectPrs = useWorkspaceStore((s) => s.loadProjectPrs);
+
+  // Per-workspace "actively processing" signal for the rail's marching bar.
+  // Each selector derives the SET of workspaces with live activity and is
+  // shallow-compared, so a DIRECT run's frequent cost ticks (which mutate
+  // runsByWs) don't re-render the shell unless the running set actually changes.
+  //
+  // RUN/terminal uses `TerminalState.busy` — the daemon's foreground signal
+  // ("a non-shell command owns the PTY"), NOT `running` (= shell session alive,
+  // which would mark the bar forever for any open terminal).
+  const chatRunningIds = useChatStore(
+    useShallow((s) => Object.keys(s.streamingByWs).filter((id) => s.streamingByWs[id])),
+  );
+  const directRunningIds = useRunsStore(
+    useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
+  );
+  const loadActiveRuns = useRunsStore((s) => s.loadActiveRuns);
+  // Hydrate the global runs tray on launch — surfaces background (running/paused)
+  // runs in workspaces not opened this session. Live events keep it fresh after.
+  useEffect(() => {
+    void loadActiveRuns();
+  }, [loadActiveRuns]);
+
+  // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
+  // `history.sync`, backfill this machine's runs + pull the full history so the
+  // History sheet opens populated. Runs when the entitlement flips to granted
+  // (on load, or right after an upgrade). Best-effort/silent for everyone else.
+  const historySyncEntitled = useEntitlementStore((s) =>
+    s.entitlement.features.includes("history.sync"),
+  );
+  useEffect(() => {
+    if (historySyncEntitled) void useHistoryStore.getState().syncOnLaunch();
+  }, [historySyncEntitled]);
+  const terminalBusyIds = useTerminalsStore(
+    useShallow((s) =>
+      Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
+    ),
+  );
+  // Workspaces with a live `$`-direct process (promoted long command) — these
+  // clear streamingByWs the moment they promote, so the rail would otherwise
+  // show idle while a dev server / build streams in the pinned terminal.
+  const shellLiveIds = useChatStore(
+    useShallow((s) => [...new Set(Object.values(s.liveProcessByThread).map((p) => p.workspaceId))]),
+  );
+  const runningByWs = useMemo(() => {
+    const out: Record<string, boolean> = {};
+    for (const id of chatRunningIds) out[id] = true;
+    for (const id of directRunningIds) out[id] = true;
+    for (const id of terminalBusyIds) out[id] = true;
+    for (const id of shellLiveIds) out[id] = true;
+    return out;
+  }, [chatRunningIds, directRunningIds, terminalBusyIds, shellLiveIds]);
 
   const [appView, setAppView] = useState<AppView>("project");
 
@@ -227,6 +289,7 @@ function App() {
 
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
+  const [missionControlOpen, setMissionControlOpen] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
@@ -472,21 +535,36 @@ function App() {
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
-  // Refresh the rail's git signal when the window regains focus — calm,
-  // event-driven (no polling). Summaries are cheap (local libgit2).
+  // Refresh externally-authored data when the window regains focus — calm,
+  // event-driven (no polling). octopush-mcp is a separate process writing to
+  // the same SQLite store; it cannot emit Tauri events, so anything it authors
+  // while you're in another app (workspaces via `create_workspace`, pipelines
+  // via `create_pipeline`, draft runs via `create_run`) would otherwise sit
+  // invisible behind session-cached lists until a full reload. Each refetch is
+  // a background replace that never clobbers UI state: the launcher repairs
+  // its own selection against the new list, and run rows are keyed by id.
   useEffect(() => {
     const onFocus = () => {
       const byId = new Map<string, string>();
       if (project) byId.set(project.id, project.path);
       recentProjects.forEach((p) => byId.set(p.id, p.path));
+      void loadAllWorkspaces([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
       });
+      // Pipelines (the ensemble picker) + the active workspace's runs list —
+      // both read via getState at fire time, so the listener neither
+      // re-registers per workspace switch nor closes over stale state. The
+      // background flag keeps the refetch passive: the runs list refreshes,
+      // but the viewed canvas is never reassigned under the user.
+      void usePipelineStore.getState().load();
+      const wsId = useWorkspaceStore.getState().activeId;
+      if (wsId) void useRunsStore.getState().loadRuns(wsId, { background: true });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, recentProjects, loadGitSummaries, loadProjectPrs]);
+  }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
   // ── Initialize per-workspace state when a new workspace becomes active ──
   useEffect(() => {
@@ -517,8 +595,13 @@ function App() {
   // user toggled workspaces. 3s is the sweet spot — fast enough to feel live,
   // not so often that we hammer git on huge repos.
   // ── Mode helpers ──
+  // The fallback for a workspace with no explicit mode this session is the
+  // user-configured default (Settings → General → Workspace defaults), not a
+  // hardcoded "talk". Applies to freshly created workspaces and any workspace
+  // after an app restart, since mode isn't persisted per-workspace.
+  const defaultMode = useWorkspacePrefs((s) => s.defaultMode);
   const activeMode: WorkspaceMode =
-    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || "talk";
+    (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || defaultMode;
 
   // Review whitespace pref — when it flips, the review diff is re-fetched
   // (the effect below depends on it) so the canvas honours the toggle.
@@ -698,6 +781,41 @@ function App() {
     [activeWorkspaceId],
   );
 
+  const handleRenameChat = useCallback(
+    (id: string, title: string) => {
+      if (!activeWorkspaceId) return;
+      void useChatStore.getState().renameThread(activeWorkspaceId, id, title).catch(console.error);
+    },
+    [activeWorkspaceId],
+  );
+
+  const handlePinChat = useCallback(
+    (id: string, pinned: boolean) => {
+      if (!activeWorkspaceId) return;
+      void useChatStore.getState().pinThread(activeWorkspaceId, id, pinned).catch(console.error);
+    },
+    [activeWorkspaceId],
+  );
+
+  const handleExportChat = useCallback(
+    (id: string) => {
+      void (async () => {
+        try {
+          const msgs = await ipc.listChatMessages(id);
+          const thread = useChatStore
+            .getState()
+            .getThreads(activeWorkspaceId ?? "")
+            .find((t) => t.id === id);
+          const md = conversationToMarkdown(thread?.title ?? "Conversation", msgs);
+          await copyToClipboard(md, "Conversation copied as Markdown");
+        } catch (e) {
+          console.error(e);
+        }
+      })();
+    },
+    [activeWorkspaceId],
+  );
+
   // ── Keyboard shortcuts (spec §3.6) ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -730,6 +848,13 @@ function App() {
       if (mod && e.shiftKey && (e.key === "D" || e.key === "d")) {
         e.preventDefault();
         setMode("direct");
+        return;
+      }
+
+      // ⌘⇧M → Mission Control (the fleet cockpit)
+      if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
+        e.preventDefault();
+        setMissionControlOpen((v) => !v);
         return;
       }
 
@@ -854,6 +979,31 @@ function App() {
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
+  // The thread currently running a turn (for the live pulse in the chat list).
+  const streamingThreadId = useChatStore((s) =>
+    activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
+  );
+  // Active skill for the conversation — surfaced in Context "Capabilities".
+  const activeSkill = useChatStore((s) =>
+    activeWorkspaceId ? (s.activeSkillByWs[activeWorkspaceId] ?? null) : null,
+  );
+  // Connected MCP servers for the workspace — also shown under Capabilities.
+  const [mcpServers, setMcpServers] = useState<string[]>([]);
+  useEffect(() => {
+    const path = activeWorkspace?.worktreePath;
+    if (!path) {
+      setMcpServers([]);
+      return;
+    }
+    let cancelled = false;
+    ipc
+      .listMcpServers(path)
+      .then((s) => !cancelled && setMcpServers(s))
+      .catch(() => !cancelled && setMcpServers([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace?.worktreePath]);
 
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
@@ -926,8 +1076,22 @@ function App() {
       toolCalls: liveToolCalls,
       budgets,
       spend,
+      activeSkill,
+      mcpServers,
+      onReviewClick: () => setMode("review"),
+      onSettingsClick: () => setSettingsTab("usage"),
     };
-  }, [gitStatus, lastTurnInputTokens, activeModelMaxContext, liveToolCalls, budgets, spend]);
+  }, [
+    gitStatus,
+    lastTurnInputTokens,
+    activeModelMaxContext,
+    liveToolCalls,
+    budgets,
+    spend,
+    activeSkill,
+    mcpServers,
+    setMode,
+  ]);
 
   // Re-derive titles whenever new messages arrive — title comes from the
   // first user message, meta comes from the relative time of the latest.
@@ -956,9 +1120,15 @@ function App() {
             id: t.id,
             title: deriveChatTitle(msgs) || t.title,
             meta: deriveChatMeta(msgs, tickerNow),
+            pinned: t.pinned,
           };
         }
-        return { id: t.id, title: t.title, meta: formatRelTime(t.updatedAt, tickerNow) };
+        return {
+          id: t.id,
+          title: t.title,
+          meta: formatRelTime(t.updatedAt, tickerNow),
+          pinned: t.pinned,
+        };
       });
       return {
         chats,
@@ -966,6 +1136,10 @@ function App() {
         onSelectChat: handleSelectChat,
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
+        onRenameChat: handleRenameChat,
+        onExportChat: handleExportChat,
+        onPinChat: handlePinChat,
+        streamingChatId: streamingThreadId,
       };
     },
     [
@@ -974,6 +1148,10 @@ function App() {
       handleSelectChat,
       handleNewChat,
       handleDeleteChat,
+      handleRenameChat,
+      handleExportChat,
+      handlePinChat,
+      streamingThreadId,
       activeWsPrimaryMessages,
       tickerNow,
     ],
@@ -1161,6 +1339,26 @@ function App() {
     },
     [workspacesByProjectId, project, selectWorkspace, recentProjects, rememberActiveForProject, openProject],
   );
+
+  // Jump from Mission Control to a run's workspace + its Direct surface.
+  // (Mode is App-local state, so the room can't navigate on its own.)
+  const handleJumpToRun = useCallback(
+    (workspaceId: string) => {
+      setMissionControlOpen(false);
+      handleSelectWorkspace(workspaceId);
+      setModePerWorkspace((p) => ({ ...p, [workspaceId]: "direct" }));
+    },
+    [handleSelectWorkspace],
+  );
+
+  // "Send out a crew" — close the room and land on the current workspace's
+  // Direct surface (its launcher when no run is executing).
+  const handleDispatchCrew = useCallback(() => {
+    setMissionControlOpen(false);
+    if (activeWorkspaceId) {
+      setModePerWorkspace((p) => ({ ...p, [activeWorkspaceId]: "direct" }));
+    }
+  }, [activeWorkspaceId]);
 
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
@@ -1404,6 +1602,7 @@ function App() {
       <AppTopBar
         onOpenSettings={() => setSettingsTab("general")}
         onToggleScratchpad={toggleScratchpad}
+        onOpenMissionControl={() => setMissionControlOpen(true)}
       />
       <div className="flex min-h-0 flex-1">
       <WorkspaceRail
@@ -1422,6 +1621,7 @@ function App() {
         onReopenProject={handleReopenProject}
         gitSummaryByWs={gitSummaryByWs}
         prByWs={prByWs}
+        runningByWs={runningByWs}
         isCollapsed={isRailCollapsed}
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
       />
@@ -1574,7 +1774,7 @@ function App() {
                       >
                         {/* Editor mode content */}
                         <EditorTabs workspaceId={activeWorkspaceId!} />
-                        <EditorPane
+                        <EditorWithPreview
                           workspaceId={activeWorkspaceId!}
                           workspacePath={activeWorkspace.worktreePath || project.path}
                           diffText={gitDiff}
@@ -2173,6 +2373,19 @@ function App() {
 
       <ToastContainer />
       <UpdateNotifier />
+      <UpgradeSheet />
+      <HistorySheet />
+      {/* Mounted only while open — the room subscribes to the whole runs
+          board, so an always-mounted instance would churn on every stage
+          event for nothing. OverlayRoom's fade-in covers the entrance. */}
+      {missionControlOpen && (
+        <MissionControl
+          open
+          onClose={() => setMissionControlOpen(false)}
+          onJumpToRun={handleJumpToRun}
+          onDispatch={handleDispatchCrew}
+        />
+      )}
     </div>
   );
 }

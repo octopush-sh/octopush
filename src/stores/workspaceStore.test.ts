@@ -159,52 +159,48 @@ describe("workspaceStore — load activation", () => {
   });
 });
 
-describe("workspaceStore — loadAllWorkspaces syncs the flat array (empty-state hardening)", () => {
+describe("workspaceStore — loadAllWorkspaces (focus-driven refresh)", () => {
   beforeEach(() => resetStore());
 
-  it("syncs `workspaces` for the currently-open project so activeWorkspace never resolves to null", async () => {
-    // Simulates the 2026-07-09 incident: a workspace (e.g. authored
-    // externally via octopush-mcp) is only reflected in the rail map until
-    // loadAllWorkspaces runs. Before the fix, the flat `workspaces` array —
-    // what App.tsx's `activeWorkspace = workspaces.find(...)` resolves
-    // against — stayed stale, so clicking the new workspace in the rail blew
-    // away the canvas onto "No workspaces here yet".
-    useProjectStore.setState({ current: makeProject("proj-1") });
-    const stale = makeWorkspace("proj-1", "alpha");
-    useWorkspaceStore.setState({
-      workspaces: [stale],
-      activeId: stale.id,
-      workspacesByProjectId: { "proj-1": [stale] },
-    });
-    const fresh = makeWorkspace("proj-1", "beta");
-    mockIpc.listWorkspaces.mockResolvedValueOnce([stale, fresh]);
+  it("merges results per project id and is safe to call repeatedly", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-2", "beta");
+    mockIpc.listWorkspaces.mockImplementation(async (projectId: string) =>
+      projectId === "proj-1" ? [a] : [b],
+    );
 
-    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1", "proj-2"]);
+    expect(useWorkspaceStore.getState().workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([a.id]);
+    expect(useWorkspaceStore.getState().workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([b.id]);
+
+    // Simulate a workspace authored externally (e.g. via octopush-mcp) showing
+    // up between two focus-driven refreshes — a second call must pick it up
+    // without corrupting the other project's entry.
+    const c = makeWorkspace("proj-1", "gamma-from-mcp");
+    mockIpc.listWorkspaces.mockImplementation(async (projectId: string) =>
+      projectId === "proj-1" ? [a, c] : [b],
+    );
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1", "proj-2"]);
 
     const s = useWorkspaceStore.getState();
-    expect(s.workspaces.map((w) => w.id)).toEqual([stale.id, fresh.id]);
-    expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([stale.id, fresh.id]);
-    // Previously-active workspace still exists, so activeId is untouched.
-    expect(s.activeId).toBe(stale.id);
+    expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([a.id, c.id]);
+    expect(s.workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([b.id]);
+    expect(s.loading).toBe(false);
   });
 
-  it("falls back activeId to the first workspace when the active one vanished externally", async () => {
-    useProjectStore.setState({ current: makeProject("proj-1") });
-    const gone = makeWorkspace("proj-1", "alpha");
-    const remaining = makeWorkspace("proj-1", "beta");
+  it("leaves other projects' entries untouched when called with a narrower id set", async () => {
     useWorkspaceStore.setState({
-      workspaces: [gone, remaining],
-      activeId: gone.id,
-      workspacesByProjectId: { "proj-1": [gone, remaining] },
+      workspacesByProjectId: { "proj-9": [makeWorkspace("proj-9", "untouched")] },
     });
-    mockIpc.listWorkspaces.mockResolvedValueOnce([remaining]);
+    mockIpc.listWorkspaces.mockResolvedValueOnce([makeWorkspace("proj-1", "alpha")]);
 
     await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
 
-    expect(useWorkspaceStore.getState().activeId).toBe(remaining.id);
+    expect(useWorkspaceStore.getState().workspacesByProjectId["proj-9"]).toHaveLength(1);
+    expect(useWorkspaceStore.getState().workspacesByProjectId["proj-1"]).toHaveLength(1);
   });
 
-  it("does not touch the flat array when refreshing a project other than the currently-open one", async () => {
+  it("syncs the flat `workspaces` array for the currently-open project, so a workspace surfaced only via the map isn't stuck unopenable", async () => {
     useProjectStore.setState({ current: makeProject("proj-1") });
     const a = makeWorkspace("proj-1", "alpha");
     useWorkspaceStore.setState({
@@ -212,15 +208,56 @@ describe("workspaceStore — loadAllWorkspaces syncs the flat array (empty-state
       activeId: a.id,
       workspacesByProjectId: { "proj-1": [a] },
     });
-    const b = makeWorkspace("proj-2", "beta");
+
+    // A workspace authored externally (e.g. via octopush-mcp) lands in the DB;
+    // the focus-driven refresh picks it up.
+    const b = makeWorkspace("proj-1", "beta-from-mcp");
+    mockIpc.listWorkspaces.mockResolvedValueOnce([a, b]);
+
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+
+    const s = useWorkspaceStore.getState();
+    // Present in the rail's map...
+    expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([a.id, b.id]);
+    // ...and resolvable as `activeWorkspace` would need it to be: in the flat list.
+    expect(s.workspaces.map((w) => w.id)).toEqual([a.id, b.id]);
+    // The previously active workspace is untouched.
+    expect(s.activeId).toBe(a.id);
+  });
+
+  it("falls back to the first remaining workspace when the active one vanished from the open project", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-1", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [a, b],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a, b] },
+    });
     mockIpc.listWorkspaces.mockResolvedValueOnce([b]);
+
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspaces.map((w) => w.id)).toEqual([b.id]);
+    expect(s.activeId).toBe(b.id);
+  });
+
+  it("does not touch the flat `workspaces` array when the refreshed ids don't include the open project", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a], "proj-2": [] },
+    });
+    mockIpc.listWorkspaces.mockResolvedValueOnce([makeWorkspace("proj-2", "gamma")]);
 
     await useWorkspaceStore.getState().loadAllWorkspaces(["proj-2"]);
 
     const s = useWorkspaceStore.getState();
     expect(s.workspaces.map((w) => w.id)).toEqual([a.id]);
     expect(s.activeId).toBe(a.id);
-    expect(s.workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([b.id]);
   });
 });
 

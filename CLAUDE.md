@@ -6,6 +6,14 @@ This file is read automatically by Claude Code (and is mirrored in `AGENTS.md` f
 
 ---
 
+## Feature map — the source of truth for what Octopush does
+
+[`docs/FEATURES.md`](docs/FEATURES.md) is the canonical, exhaustive catalogue of **every** Octopush feature and **how** it is implemented (Tauri commands, Zustand stores, components, mechanisms, data model). Read it to learn what already exists before you add or change behaviour — it is the fastest way to understand the product surface end-to-end.
+
+**Binding rule — keep it up to date.** Any change that adds, removes, or meaningfully alters a user-facing feature **must** update `docs/FEATURES.md` in the same change. A PR that ships or changes a feature without updating the map is **incomplete**. This applies to backend and frontend alike, down to the smallest toggle, context-menu item, keyboard shortcut, empty state, or command. When you add a new surface, add its entries; when you delete one, delete its entries. Treat the map as part of the change, not an afterthought.
+
+---
+
 ## Design system — read this before touching any UI
 
 Octopush has a deliberate visual identity called **Atelier in Onyx & Brass**. The source of truth is:
@@ -36,7 +44,7 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 - **`§` in brass** — every tool call card (`§ TOOL_NAME`) and Direct focus-pane role headers. Structural; do not retire.
 
 **Active branding details:**
-- **`&` in brass** — "Octopus & you" branding. The ampersand alone is brass.
+- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
 - **Roman numerals** — multi-step wizards use `I · II · III` in brass mono; Direct run-track stage numbers.
 - **Upright-serif phrases** — CTAs and placeholders use upright serif phrases (no italics anywhere; `em, i { font-style: normal }` enforced globally).
 
@@ -84,6 +92,7 @@ These complement the design rules above and govern all new surfaces:
 - [ ] No new layout chrome that breaks the Atelier surface contract.
 - [ ] No abrupt mount/unmount of overlays, menus, or panels — used the motion primitives (`.octo-modal-enter` / `.octo-menu-enter` / `.octo-fade-in` / grid-rows). Motion respects `prefers-reduced-motion`.
 - [ ] If you added a visual pattern not in the spec/cheatsheet, either reuse an existing one or propose extending the design system first.
+- [ ] **Updated [`docs/FEATURES.md`](docs/FEATURES.md)** if this change adds, removes, or alters any user-facing feature (backend or frontend).
 - [ ] `npm run typecheck` passes.
 
 ---
