@@ -203,6 +203,8 @@ pub fn run() {
             commands::abort_run,
             commands::stop_stage,
             commands::request_run_pause,
+            commands::update_run_stage,
+            commands::rerun_from_stage,
             commands::estimate_run_cost,
             commands::get_stage_log,
             commands::list_stage_iterations,

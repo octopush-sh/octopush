@@ -14,6 +14,8 @@ vi.mock("../lib/ipc", async () => {
       resolveCheckpoint: vi.fn(),
       abortRun: vi.fn(),
       stopStage: vi.fn(),
+      updateRunStage: vi.fn(),
+      rerunFromStage: vi.fn(),
     },
   };
 });
@@ -240,5 +242,59 @@ describe("runsStore", () => {
     expect(ipc.abortRun).toHaveBeenCalledWith("rDraft");
     // no explicit selection of the dead draft
     expect("w1" in (useRunsStore.getState() as any).selectedRunIdByWs).toBe(false);
+  });
+
+  it("updateStage patches the stage optimistically before the IPC call resolves", async () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } } });
+    let resolveIpc: () => void = () => {};
+    (ipc.updateRunStage as any).mockImplementation(
+      () => new Promise<void>((resolve) => { resolveIpc = resolve; }),
+    );
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [{ ...STAGE, checkpoint: true }] });
+
+    const pending = useRunsStore.getState().updateStage("r1", "st1", { checkpoint: true });
+    // The optimistic patch lands synchronously, ahead of the IPC round trip.
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(true);
+
+    resolveIpc();
+    await pending;
+    expect(ipc.updateRunStage).toHaveBeenCalledWith("r1", "st1", { checkpoint: true });
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(true);
+  });
+
+  it("updateStage reverts the optimistic patch when the backend rejects the edit", async () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } } }); // STAGE.checkpoint === false
+    (ipc.updateRunStage as any).mockRejectedValue(new Error("stage already started"));
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] }); // truth: unchanged
+
+    await expect(
+      useRunsStore.getState().updateStage("r1", "st1", { checkpoint: true }),
+    ).rejects.toThrow("stage already started");
+
+    // refreshDetail ran in `finally` and snapped the optimistic flip back to truth.
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(false);
+  });
+
+  it("rerunFromStage calls the IPC then refreshes detail", async () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, detailByRun: { r1: { run: RUN, stages: [STAGE] } },
+    });
+    (ipc.rerunFromStage as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [STAGE] });
+
+    await useRunsStore.getState().rerunFromStage("r1", "st1");
+    expect(ipc.rerunFromStage).toHaveBeenCalledWith("r1", "st1");
+    expect(useRunsStore.getState().getDetail("r1")?.run?.status).toBe("running");
+  });
+
+  it("rerunFromStage still refreshes detail (and rethrows) when the backend rejects", async () => {
+    useRunsStore.setState({ detailByRun: {} });
+    (ipc.rerunFromStage as any).mockRejectedValue(new Error("this run is executing"));
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+
+    await expect(
+      useRunsStore.getState().rerunFromStage("r1", "st1"),
+    ).rejects.toThrow("this run is executing");
+    expect(ipc.getRun).toHaveBeenCalledWith("r1");
   });
 });

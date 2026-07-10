@@ -31,6 +31,8 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
   const pauseRun = useRunsStore((s) => s.pauseRun);
+  const updateStage = useRunsStore((s) => s.updateStage);
+  const rerunFromStage = useRunsStore((s) => s.rerunFromStage);
   const selectRun = useRunsStore((s) => s.selectRun);
   const setLauncherPrefill = useRunsStore((s) => s.setLauncherPrefill);
 
@@ -146,7 +148,13 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
         <div className="border-b border-octo-hairline bg-octo-panel px-4 py-3">
           <RunFlow stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
         </div>
-        <StageFocus stage={shownStage} workspacePath={workspacePath} />
+        <StageFocus
+          stage={shownStage}
+          workspacePath={workspacePath}
+          run={run}
+          onUpdateStage={(patch) => (shownStage ? updateStage(run.id, shownStage.id, patch) : Promise.resolve())}
+          onRerunFromStage={() => (shownStage ? rerunFromStage(run.id, shownStage.id) : Promise.resolve())}
+        />
         <RunLedger run={run} stages={stages} />
         <RunControlBar
           run={run}

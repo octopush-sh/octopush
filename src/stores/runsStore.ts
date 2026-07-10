@@ -7,6 +7,7 @@ import {
   type Run,
   type RunDetail,
   type CheckpointActionName,
+  type RunStagePatch,
 } from "../lib/ipc";
 
 export const EMPTY_RUNS: Run[] = [];
@@ -80,6 +81,13 @@ interface RunsState {
   stopStage: (runId: string) => Promise<void>;
   /** Ask the run to pause at its next stage boundary (parks the next stage). */
   pauseRun: (runId: string) => Promise<void>;
+  /** Hot-edit a pending, not-yet-started stage. Applies `patch` optimistically
+   *  for instant gate/model feedback, then the validated IPC write, then
+   *  `refreshDetail` reconciles — or reverts, if the backend rejected it. */
+  updateStage: (runId: string, stageId: string, patch: RunStagePatch) => Promise<void>;
+  /** Re-run a finished (done/failed) stage and everything downstream of it,
+   *  in place — no restart, no reload. */
+  rerunFromStage: (runId: string, stageId: string) => Promise<void>;
   /** null clears a manual pin — the canvas falls back to the active stage. */
   selectStage: (runId: string, stageId: string | null) => void;
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
@@ -224,6 +232,43 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   pauseRun: async (runId) => {
     await ipc.requestRunPause(runId);
+  },
+
+  updateStage: async (runId, stageId, patch) => {
+    set((s) => {
+      const detail = s.detailByRun[runId];
+      if (!detail) return {};
+      const stages = detail.stages.map((st) => {
+        if (st.id !== stageId) return st;
+        return {
+          ...st,
+          ...(patch.checkpoint !== undefined ? { checkpoint: patch.checkpoint } : {}),
+          ...(patch.instructions !== undefined ? { instructions: patch.instructions } : {}),
+          ...(patch.agentModel !== undefined ? { agentModel: patch.agentModel } : {}),
+          ...(patch.maxIterations !== undefined ? { maxIterations: patch.maxIterations } : {}),
+          ...(patch.loopMode !== undefined ? { loopMode: patch.loopMode } : {}),
+        };
+      });
+      return { detailByRun: { ...s.detailByRun, [runId]: { ...detail, stages } } };
+    });
+    try {
+      await ipc.updateRunStage(runId, stageId, patch);
+    } finally {
+      // Reconciles the optimistic patch with truth — and snaps it back if the
+      // backend rejected the edit (e.g. the stage started in the meantime).
+      await get().refreshDetail(runId);
+    }
+  },
+
+  rerunFromStage: async (runId, stageId) => {
+    try {
+      await ipc.rerunFromStage(runId, stageId);
+    } finally {
+      // Re-syncs with backend truth whether the call succeeded or was
+      // rejected by a guard (e.g. a race with a concurrent resolve/rerun) —
+      // same reconciliation shape as updateStage.
+      await get().refreshDetail(runId);
+    }
   },
 
   selectStage: (runId, stageId) =>
