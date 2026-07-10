@@ -21,6 +21,8 @@ interface Props {
   /** Human label for a loop target when a gated send-back applies, else null. */
   loopTargetRole: string | null;
   loopState: LoopState | null;
+  /** Launch a STAGED (draft) run — e.g. one authored via octopush-mcp. */
+  onStart: () => void;
   onPause: () => void;
   onStopStage: () => void;
   onAbort: () => void;
@@ -79,6 +81,9 @@ export function RunControlBar(props: Props) {
   if (TERMINAL.has(run.status)) {
     return <TerminalBar run={run} onRunAgain={props.onRunAgain} />;
   }
+  if (run.status === "draft") {
+    return <DraftBar onStart={props.onStart} onDiscard={props.onAbort} />;
+  }
   if (blockedStage) {
     return <DecisionBar {...props} blockedStage={blockedStage} />;
   }
@@ -86,6 +91,31 @@ export function RunControlBar(props: Props) {
     return <RunningBar onPause={props.onPause} onStopStage={props.onStopStage} onAbort={props.onAbort} />;
   }
   return null;
+}
+
+/** A STAGED run awaiting its launch — e.g. authored by octopush-mcp with
+ *  `create_run`. Without this bar a draft was a dead end: DIRECT presented
+ *  its all-pending track with no way to start (or clear) it. */
+function DraftBar({ onStart, onDiscard }: { onStart: () => void; onDiscard: () => void }) {
+  return (
+    <div className="octo-fade-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">draft</span>
+      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-mute">
+        Staged and ready — nothing has run yet.
+      </span>
+      <IconCtl label="Discard this draft" onClick={onDiscard} danger>
+        <Ban size={14} strokeWidth={1.75} />
+      </IconCtl>
+      <button
+        type="button"
+        onClick={onStart}
+        className="flex items-center gap-1.5 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi"
+      >
+        <ChevronRight size={13} strokeWidth={1.75} />
+        Begin this run
+      </button>
+    </div>
+  );
 }
 
 function RunningBar({ onPause, onStopStage, onAbort }: { onPause: () => void; onStopStage: () => void; onAbort: () => void }) {

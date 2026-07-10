@@ -36,15 +36,20 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
           )}
           <span className="min-w-0 flex-1 truncate pr-6 font-serif text-[14px] text-octo-ivory">{name}</span>
         </div>
-        {/* Shape line: a dot per stage, brass connectors (⟜ after a gate). */}
+        {/* Shape line: a dot per stage, brass connectors (⟜ after a gate).
+            A 7-8 stage pipeline can't fit every dot in 184px — the dot run
+            clips (min-w-0 + overflow-hidden) while the stage count, the part
+            that actually matters at this width, always stays legible. */}
         <div className="flex items-center gap-1 font-mono text-[10px] text-octo-mute">
-          {stages.map((s, i) => (
-            <span key={s.id} className="flex items-center gap-1">
-              {i > 0 && <span className="text-octo-brass/70">{stages[i - 1].checkpoint ? "⟜" : "⟶"}</span>}
-              <span className="inline-block h-1 w-1 rounded-full bg-octo-sage" />
-            </span>
-          ))}
-          <span className="ml-1 whitespace-nowrap">{stages.length} {stages.length === 1 ? "stage" : "stages"}</span>
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+            {stages.map((s, i) => (
+              <span key={s.id} className="flex shrink-0 items-center gap-1">
+                {i > 0 && <span className="text-octo-brass/70">{stages[i - 1].checkpoint ? "⟜" : "⟶"}</span>}
+                <span className="inline-block h-1 w-1 rounded-full bg-octo-sage" />
+              </span>
+            ))}
+          </div>
+          <span className="ml-1 shrink-0 whitespace-nowrap">{stages.length} {stages.length === 1 ? "stage" : "stages"}</span>
         </div>
       </button>
       <button

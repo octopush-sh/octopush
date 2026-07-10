@@ -546,27 +546,22 @@ pub async fn create_workspace(
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
 
-    // Ensure the repo has at least one commit (empty repos can't branch).
-    crate::git_ops::ensure_initial_commit(project_path)?;
-
-    // Explicit base branch wins; blank falls back to the repo's default.
-    let base = crate::git_ops::resolve_base(
+    // Single shared code path with octopush-mcp. We pass the Mutex (not a held
+    // guard) so workspace::create locks only for its brief DB reads/writes and
+    // never across the worktree checkout. The UI doesn't need the outcome — the
+    // creator's inline "branch exists" hint already tells the user about reuse,
+    // and the store upserts by id so a reused row never duplicates in the rail.
+    let (ws, _outcome) = crate::workspace::create(
+        &state.db,
+        &project_id,
+        project_path,
+        &name,
+        &task,
+        &branch,
         &from_branch,
-        crate::git_ops::default_branch(project_path)?,
+        &setup_script,
     )?;
-
-    crate::git_ops::create_branch(project_path, &branch, &base)?;
-    let wt_path = project_path.parent().unwrap_or(project_path)
-        .join(format!(".octopus-worktrees/{}", &branch));
-    crate::git_ops::create_worktree(project_path, &branch, &wt_path)?;
-    let id = uuid::Uuid::new_v4().to_string();
-    state.db.lock().insert_workspace(
-        &id, &project_id, &name, &task, &branch,
-        Some(&wt_path.to_string_lossy()), &setup_script,
-        Some(&base), // the RESOLVED base, not the raw (possibly blank) request
-    )?;
-    let workspaces = state.db.lock().list_workspaces(&project_id)?;
-    Ok(workspaces.into_iter().find(|w| w.id == id).unwrap())
+    Ok(ws)
 }
 
 /// Local + remote-tracking branches for the workspace creator's base picker.
@@ -678,6 +673,31 @@ pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppR
 
 // ─── Delete workspace ────────────────────────────────────────────
 
+/// Does `worktree_path` resolve to the project root (i.e. the "main" workspace)?
+/// Uses a raw-string fallback when canonicalize fails so a missing/odd path is
+/// never mistaken for a non-root worktree and destructively removed.
+fn is_project_root(project_path: &str, worktree_path: &str) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    canon(project_path) == canon(worktree_path)
+}
+
+/// Should delete/archive touch the worktree on disk (and, for delete, the
+/// branch)? Only when Octopush *created* it (`managed`) AND it isn't the project
+/// root. Adopted checkouts and the main workspace are left on disk untouched.
+fn owns_worktree_on_disk(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: &str,
+    project_path: &str,
+    worktree_path: Option<&str>,
+) -> bool {
+    // Default to NOT-owned on a read error: a leaked worktree dir is a minor
+    // annoyance, but rm -rf'ing an adopted (external) checkout is irreversible
+    // data loss — so when uncertain, don't touch the disk.
+    let managed = db.lock().is_workspace_managed(workspace_id).unwrap_or(false);
+    let is_main = worktree_path.is_some_and(|wt| is_project_root(project_path, wt));
+    managed && !is_main
+}
+
 #[tauri::command]
 pub async fn delete_workspace(
     state: State<'_, AppState>,
@@ -687,34 +707,42 @@ pub async fn delete_workspace(
     worktree_path: Option<String>,
 ) -> AppResult<()> {
     let project_path = expand_tilde(&project_path);
-    let project_path_abs = std::fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
-
-    // The "main" workspace points at the project root itself. Deleting that
-    // would `rm -rf` the user's project — refuse to touch the disk or the
-    // branch, just remove the DB row. (The user can still recreate the main
-    // workspace via ensure_main_workspace on next open_project.)
-    let is_main_workspace = worktree_path
+    let is_main = worktree_path
         .as_deref()
-        .map(|wt| {
-            let wt_abs = std::fs::canonicalize(wt)
-                .unwrap_or_else(|_| std::path::PathBuf::from(wt));
-            wt_abs == project_path_abs
-        })
-        .unwrap_or(false);
+        .is_some_and(|wt| is_project_root(&project_path, wt));
 
-    if !is_main_workspace {
-        // Remove worktree directory
+    // Remove the worktree directory only when Octopush created it (`managed`) and
+    // it isn't the project root. An adopted checkout (made by the user/another
+    // tool) and the main workspace are left on disk — we just drop the DB row.
+    if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
         if let Some(wt) = &worktree_path {
+            // Prune the worktree's registry slot (by path — slot names aren't
+            // tied to the branch), then remove its working-tree directory.
+            let _ = crate::git_ops::delete_worktree(
+                std::path::Path::new(&project_path),
+                std::path::Path::new(wt),
+            );
             let wt_path = std::path::Path::new(wt);
             if wt_path.exists() {
                 let _ = std::fs::remove_dir_all(wt_path);
             }
         }
-        // Prune worktree ref and delete branch
-        let _ = crate::git_ops::delete_worktree(std::path::Path::new(&project_path), &branch);
+    }
+
+    // Delete the branch only when Octopush itself created it — a reused or adopted
+    // branch (someone else's work) is never destroyed. Gated separately from the
+    // worktree: a workspace can create a worktree over a *pre-existing* branch, and
+    // deleting that branch would throw away commits Octopush didn't make. Default
+    // to NOT deleting on a read error (data-loss is worse than a leftover branch).
+    let created_branch = state
+        .db
+        .lock()
+        .is_branch_created_by_octopush(&workspace_id)
+        .unwrap_or(false);
+    if created_branch && !is_main {
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
+
     // Remove from DB
     state.db.lock().delete_workspace(&workspace_id)?;
     Ok(())
@@ -730,33 +758,26 @@ pub async fn archive_workspace(
     branch: String,
     worktree_path: Option<String>,
 ) -> AppResult<()> {
+    // Archive keeps the branch; `branch` is retained in the signature for
+    // IPC/API symmetry but isn't needed here.
+    let _ = &branch;
     let project_path = expand_tilde(&project_path);
-    let project_path_abs = std::fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
 
-    // The "main" workspace points at the project root itself. Never touch the
-    // disk for it — just flip the DB row to archived. (Unlike delete, archive
-    // always keeps the branch.)
-    let is_main_workspace = worktree_path
-        .as_deref()
-        .map(|wt| {
-            let wt_abs = std::fs::canonicalize(wt)
-                .unwrap_or_else(|_| std::path::PathBuf::from(wt));
-            wt_abs == project_path_abs
-        })
-        .unwrap_or(false);
-
-    if !is_main_workspace {
-        // Remove worktree directory
+    // Only remove on disk what Octopush created. An adopted checkout and the
+    // main workspace (project root) keep their directory — archiving just flips
+    // the DB row. (Archive always keeps the branch.)
+    if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
         if let Some(wt) = &worktree_path {
+            // Prune the worktree's registry slot (by path), then remove its dir.
+            let _ = crate::git_ops::delete_worktree(
+                std::path::Path::new(&project_path),
+                std::path::Path::new(wt),
+            );
             let wt_path = std::path::Path::new(wt);
             if wt_path.exists() {
                 let _ = std::fs::remove_dir_all(wt_path);
             }
         }
-        // Prune worktree ref — but KEEP the branch (this is the whole point of
-        // archive vs delete).
-        let _ = crate::git_ops::delete_worktree(std::path::Path::new(&project_path), &branch);
     }
     // Mark archived in DB (row survives, hidden from the rail)
     state.db.lock().archive_workspace(&workspace_id)?;
@@ -780,27 +801,20 @@ pub async fn restore_workspace(
     worktree_path: Option<String>,
 ) -> AppResult<()> {
     let project_path = expand_tilde(&project_path);
-    let project_path_abs = std::fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&project_path));
-    // Recreate the worktree from the kept branch (create_worktree attaches to
-    // the existing refs/heads/<branch>; it does NOT create a new branch), then
-    // flip status back to active.
-    if let Some(wt) = worktree_path {
-        let wt = expand_tilde(&wt);
-        // The "main" workspace points at the project root itself. Never recreate
-        // a worktree there — create_worktree self-heals by remove_dir_all'ing an
-        // existing target path, which would wipe the repo root. (Mirrors the
-        // is_main_workspace guard in archive_workspace/delete_workspace.)
-        let wt_abs = std::fs::canonicalize(&wt)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&wt));
-        if wt_abs != project_path_abs {
-            crate::git_ops::create_worktree(
-                std::path::Path::new(&project_path),
-                &branch,
-                std::path::Path::new(&wt),
-            )?;
-        }
-    }
+    // `branch`/`worktree_path` are kept in the signature for IPC symmetry, but the
+    // heal re-derives everything from the authoritative DB row.
+    let _ = (&branch, &worktree_path);
+
+    // Make the worktree usable via the shared healer, which handles all three
+    // cases without ever destroying work: adopt the branch's live checkout if it
+    // moved, rebuild a managed worktree if the directory is entirely gone, or
+    // leave a present directory untouched. Then flip status back to active.
+    let mut ws = state
+        .db
+        .lock()
+        .get_workspace(&workspace_id)?
+        .ok_or_else(|| AppError::Other("workspace not found".into()))?;
+    crate::workspace::heal_worktree(&state.db, std::path::Path::new(&project_path), &mut ws)?;
     state.db.lock().restore_workspace(&workspace_id)
 }
 
@@ -844,6 +858,17 @@ pub async fn send_chat_message(
     state.chat.send_agentic(app, request).await
 }
 
+/// Delete a message and everything after it in a thread — backs Regenerate and
+/// Edit-and-resend (the frontend then re-dispatches the turn).
+#[tauri::command]
+pub async fn truncate_chat_after(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<()> {
+    state.db.lock().truncate_chat_after(&thread_id, message_id)
+}
+
 /// Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
 /// command + output into the conversation and returns the resulting cwd/exit
 /// for the composer's cwd badge.
@@ -864,6 +889,43 @@ pub async fn stop_shell_command(state: State<'_, AppState>, thread_id: String) -
     Ok(())
 }
 
+/// Forward keystrokes to a thread's live process (interactive stdin: REPLs,
+/// TUIs, prompts). Output streams back via `chat://shell-output`.
+#[tauri::command]
+pub async fn send_shell_input(
+    state: State<'_, AppState>,
+    thread_id: String,
+    data: String,
+) -> AppResult<()> {
+    state.chat.talk_shell.write_stdin(&thread_id, data.as_bytes());
+    Ok(())
+}
+
+/// Resize a thread's PTY so a full-screen TUI lays out to the live panel size.
+#[tauri::command]
+pub async fn resize_shell(
+    state: State<'_, AppState>,
+    thread_id: String,
+    rows: u16,
+    cols: u16,
+) -> AppResult<()> {
+    state.chat.talk_shell.resize(&thread_id, cols, rows);
+    Ok(())
+}
+
+/// Most-recently-used `$`-direct commands for a workspace (recall palette / ↑).
+#[tauri::command]
+pub async fn list_shell_history(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    limit: Option<i64>,
+) -> AppResult<Vec<String>> {
+    state
+        .db
+        .lock()
+        .list_shell_history(&workspace_id, limit.unwrap_or(50))
+}
+
 #[tauri::command]
 pub async fn list_chat_messages(
     state: State<'_, AppState>,
@@ -877,6 +939,20 @@ pub async fn list_chat_messages(
 #[tauri::command]
 pub async fn cancel_chat(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
     state.chat.cancel(&thread_id);
+    Ok(())
+}
+
+/// Resolve an inline approval request for a dangerous agent command.
+/// `decision` is "approve" | "always" | "deny".
+#[tauri::command]
+pub async fn respond_approval(
+    state: State<'_, AppState>,
+    call_id: String,
+    decision: String,
+) -> AppResult<()> {
+    state
+        .chat
+        .respond_approval(&call_id, crate::chat_engine::ApprovalDecision::parse(&decision));
     Ok(())
 }
 
@@ -911,8 +987,22 @@ pub async fn rename_chat_thread(
     state.db.lock().rename_chat_thread(&thread_id, &title)
 }
 
+/// Pin/unpin a conversation — pinned threads sort to the top of the chat list.
+#[tauri::command]
+pub async fn set_thread_pinned(
+    state: State<'_, AppState>,
+    thread_id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    state.db.lock().set_thread_pinned(&thread_id, pinned)
+}
+
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
+    // Stop any in-flight turn first — this also resolves a parked dangerous-
+    // command approval (as Deny) so the agent loop doesn't stay blocked for the
+    // full 300s timeout after the conversation is gone.
+    state.chat.cancel(&thread_id);
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.
     state.chat.talk_shell.close(&thread_id);
@@ -1136,6 +1226,33 @@ pub async fn start_run(
             "another run in this workspace is already executing".into(),
         ));
     }
+    // Entitlement gates (live). Pro is uncapped and may run many workspaces
+    // concurrently; Free / signed-out is capped at FREE_DIRECT_RUNS_PER_MONTH and
+    // may run only one at a time. (Same-workspace concurrency is blocked for
+    // everyone above — git-worktree safety.) Both surface as UpgradeRequired.
+    {
+        let ent = crate::entitlement::Entitlement::current();
+        // Monthly Direct-run cap.
+        let used = state.db.lock().count_started_runs_this_month()?;
+        if let Err(denied) = ent.check_direct_run_quota(used) {
+            return Err(AppError::UpgradeRequired {
+                feature: denied.feature.to_string(),
+                used: denied.used,
+                limit: denied.limit,
+            });
+        }
+        // Concurrency: Free runs one at a time; Pro (RUNS_PARALLEL) runs many.
+        if !ent.has_feature(crate::entitlement::feature::RUNS_PARALLEL) {
+            let active = state.db.lock().count_active_runs_excluding(&run_id)?;
+            if active >= 1 {
+                return Err(AppError::UpgradeRequired {
+                    feature: crate::entitlement::feature::RUNS_PARALLEL.to_string(),
+                    used: active,
+                    limit: 1,
+                });
+            }
+        }
+    }
     // Persist the optional spend cap before the drive starts. Only a finite
     // positive budget is meaningful; anything else stays NULL (no budget).
     if let Some(b) = budget_usd {
@@ -1164,6 +1281,181 @@ pub async fn list_runs(
     workspace_id: String,
 ) -> AppResult<Vec<crate::db::RunRow>> {
     state.db.lock().list_runs(&workspace_id)
+}
+
+/// All active (`running`/`paused`) runs across every workspace — drives the
+/// global "Runs in progress" tray (incl. background runs in unopened workspaces).
+#[tauri::command]
+pub async fn list_active_runs(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::db::RunRow>> {
+    state.db.lock().list_active_runs()
+}
+
+/// The current entitlement (derived from the signed-in user's Clerk plan). The
+/// frontend mirrors this for UX; the meaningful gates live in the Rust core.
+#[tauri::command]
+pub async fn get_entitlement() -> AppResult<crate::entitlement::Entitlement> {
+    Ok(crate::entitlement::Entitlement::current())
+}
+
+/// Monthly Direct-run usage for the launcher meter (`{used, limit, remaining}`).
+/// `limit == null` when the plan is uncapped (Pro).
+#[tauri::command]
+pub async fn direct_run_usage(
+    state: State<'_, AppState>,
+) -> AppResult<crate::entitlement::DirectRunUsage> {
+    let ent = crate::entitlement::Entitlement::current();
+    let used = state.db.lock().count_started_runs_this_month()?;
+    Ok(crate::entitlement::DirectRunUsage {
+        used,
+        limit: ent.direct_runs_per_month,
+        remaining: ent.direct_runs_remaining(used),
+    })
+}
+
+// ─── Cross-machine run history (Pro-real Part B / B1) ──────────────
+
+/// Pro-gate for the sync commands — mirrors the `start_run` concurrency gate so a
+/// non-entitled call surfaces the upgrade sheet.
+fn require_history_sync() -> AppResult<()> {
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        Ok(())
+    } else {
+        Err(AppError::UpgradeRequired {
+            feature: "history.sync".into(),
+            used: 0,
+            limit: 0,
+        })
+    }
+}
+
+/// The local read-only history mirror (instant, no network). The History view
+/// paints this first, then refreshes via `history_sync_pull`. **Entitlement-gated
+/// on read** (not just on pull): the mirror can hold runs pulled by a *previous*
+/// signed-in Pro user, so a signed-out / Free user (e.g. the next person on a
+/// shared machine) must not be able to read it — return empty for them. (The
+/// mirror is also cleared on sign-out; this is the belt to that suspenders.)
+#[tauri::command]
+pub async fn history_list(state: State<'_, AppState>) -> AppResult<Vec<crate::sync::SyncRun>> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        return Ok(Vec::new());
+    }
+    state.db.lock().list_synced_runs()
+}
+
+/// Pull the signed-in Pro user's run history from the cloud, replace the local
+/// mirror, and return it. Pro-gated (`history.sync`). Best-effort refresh: on a
+/// network/transient error it falls back to the current local mirror rather than
+/// failing (so opening History offline still shows the last-known data).
+#[tauri::command]
+pub async fn history_sync_pull(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::sync::SyncRun>> {
+    require_history_sync()?;
+    let client = crate::chat_engine::shared_http_client();
+    match crate::sync::pull_runs(client).await {
+        Ok(runs) => {
+            state.db.lock().replace_synced_runs(&runs)?;
+            Ok(runs)
+        }
+        Err(_) => state.db.lock().list_synced_runs(),
+    }
+}
+
+/// One-shot backfill: push this machine's terminal runs (newest first, capped at
+/// [`crate::sync::MAX_PUSH`]) so a Pro user's existing history is populated
+/// immediately — not only from the next run onward. No-op for non-Pro; the server
+/// upserts by run id so re-running it is idempotent. Returns the count attempted.
+#[tauri::command]
+pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
+    {
+        return Ok(0);
+    }
+    let runs = {
+        let db = state.db.lock();
+        let machine_id = match db.get_or_create_machine_id() {
+            Ok(id) if !id.is_empty() => id,
+            _ => return Ok(0), // can't mint an id → skip (empty would mis-attribute)
+        };
+        let terminal = db.list_terminal_runs(crate::sync::MAX_PUSH as u32)?;
+        terminal
+            .iter()
+            .map(|r| crate::sync::build_run_payload(&db, r, &machine_id))
+            .collect::<Vec<_>>()
+    };
+    let count = runs.len();
+    crate::sync::push_runs(crate::chat_engine::shared_http_client(), runs).await;
+    Ok(count)
+}
+
+// ─── Accounts (P1) ─────────────────────────────────────────────
+/// Run the interactive Clerk sign-in: opens the system browser, captures the
+/// loopback redirect, exchanges the code (PKCE, no secret), and stores the
+/// session in the OS keychain. Returns the resulting auth status.
+#[tauri::command]
+pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
+    crate::auth::begin_sign_in().await
+}
+
+/// Clear the stored session (sign out locally). Also drops the local run-history
+/// mirror — it may hold history pulled by this user from their OTHER machines, so
+/// it must not linger for whoever uses this machine next (privacy on shared
+/// machines). Best-effort: a mirror-clear failure never blocks the sign-out.
+#[tauri::command]
+pub async fn auth_sign_out(state: State<'_, AppState>) -> AppResult<()> {
+    crate::auth::sign_out()?;
+    let _ = state.db.lock().clear_synced_runs();
+    Ok(())
+}
+
+/// Abort an in-flight interactive sign-in (the loopback returns ~immediately).
+#[tauri::command]
+pub async fn auth_cancel_sign_in() -> AppResult<()> {
+    crate::auth::cancel_sign_in();
+    Ok(())
+}
+
+/// Current sign-in status (signed in + identity, or signed out). Refreshes the
+/// token silently if it has expired.
+#[tauri::command]
+pub async fn auth_status() -> AppResult<crate::auth::AuthStatus> {
+    Ok(crate::auth::status().await)
+}
+
+/// Re-fetch identity from Clerk (incl. the plan in public_metadata), refreshing
+/// the token if needed. Used to pick up a plan change after the user subscribes.
+#[tauri::command]
+pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
+    crate::auth::refresh_identity().await
+}
+
+/// Force a token refresh and return the current plan. Called right after the user
+/// returns from checkout so a freshly-minted access token reflects the new plan —
+/// lets Pro appear without a manual sign-out / sign-in.
+#[tauri::command]
+pub async fn auth_sync_plan() -> AppResult<Option<String>> {
+    crate::auth::sync_plan().await
+}
+
+/// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend
+/// opens it in the browser via `open_file_in_system`.
+#[tauri::command]
+pub async fn auth_account_portal_url() -> AppResult<String> {
+    Ok(crate::auth::account_portal_url())
+}
+
+/// Dodo checkout link for the signed-in user to subscribe to Pro. Opened in the
+/// browser; carries the user's email + Clerk id so the webhook maps it back.
+#[tauri::command]
+pub async fn billing_checkout_url() -> AppResult<String> {
+    crate::billing::checkout_url_for_current_user()
 }
 
 #[tauri::command]
@@ -1217,6 +1509,49 @@ pub async fn request_run_pause(
     run_id: String,
 ) -> AppResult<()> {
     orch.request_pause(&run_id);
+    Ok(())
+}
+
+/// Hot-edit a pending, not-yet-started run stage: gate, instructions, model,
+/// max turns, and (for a looping review stage) loop mode. `None` for any
+/// field leaves it unchanged. Only the run's own `run_stages` row is written
+/// — the pipeline template is never touched. Rejects synchronously (a clear
+/// English error) if the run has finished or the stage has already started.
+#[tauri::command]
+pub async fn update_run_stage(
+    state: State<'_, AppState>,
+    run_id: String,
+    stage_id: String,
+    checkpoint: Option<bool>,
+    instructions: Option<String>,
+    agent_model: Option<String>,
+    max_iterations: Option<i64>,
+    loop_mode: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().update_run_stage(
+        &run_id,
+        &stage_id,
+        checkpoint,
+        instructions.as_deref(),
+        agent_model.as_deref(),
+        max_iterations,
+        loop_mode.as_deref(),
+    )
+}
+
+/// Re-run a finished (done/failed) stage and everything downstream of it, in
+/// place: same pipeline row, same run. Validates + resets synchronously (a
+/// guard rejection — e.g. the stage hasn't finished, or the run is currently
+/// driving — surfaces immediately), then resumes the drive in the background;
+/// the frontend follows progress via the existing `run://` events.
+#[tauri::command]
+pub async fn rerun_from_stage(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+    stage_id: String,
+) -> AppResult<()> {
+    orch.prepare_rerun(&run_id, &stage_id)?;
+    Arc::clone(&*orch).resume_claimed_drive(run_id);
     Ok(())
 }
 

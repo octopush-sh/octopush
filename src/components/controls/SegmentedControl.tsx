@@ -4,6 +4,8 @@ export interface SegmentedOption<T extends string> {
   label: string;
   /** Active-state classes override (e.g. substrate state colors). Default: brass. */
   activeClass?: string;
+  /** Native tooltip — explains what the option does (e.g. its token budget). */
+  title?: string;
 }
 
 interface Props<T extends string> {
@@ -30,6 +32,7 @@ export function SegmentedControl<T extends string>({ options, value, onChange, a
             type="button"
             role="radio"
             aria-checked={active}
+            title={o.title}
             onClick={() => onChange(o.value)}
             className={`rounded-sm px-2 py-1 font-mono text-[10px] uppercase tracking-[0.25em] transition-colors duration-[220ms] ${
               active ? (o.activeClass ?? "bg-[var(--brass-ghost)] text-octo-brass") : "text-octo-mute hover:text-octo-sage"

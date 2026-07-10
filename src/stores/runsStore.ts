@@ -7,11 +7,16 @@ import {
   type Run,
   type RunDetail,
   type CheckpointActionName,
+  type RunStagePatch,
 } from "../lib/ipc";
+import { useUpgradeStore } from "./upgradeStore";
+import { isUpgradeRequired } from "../lib/upgradeError";
+import { pushToast } from "../components/Toasts";
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
 const beginningWs = new Set<string>();
+const startingRuns = new Set<string>();
 const MAX_LOG_LINES = 200;
 
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
@@ -43,6 +48,14 @@ interface RunsState {
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
+  /** Runs observed reaching a terminal state THIS SESSION (runId → epoch ms).
+   *  They linger on Mission Control's "Settled" band until dismissed — nothing
+   *  that finishes while you're away silently vanishes. Session-local. */
+  settledAt: Record<string, number>;
+  /** When each run's status last changed, as observed by this session (runId →
+   *  epoch ms). Drives Mission Control's time-in-state timer; best-effort — a
+   *  run hydrated at launch has no entry and falls back to createdAt. */
+  statusSince: Record<string, number>;
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
@@ -58,7 +71,14 @@ interface RunsState {
    *  fills an EMPTY buffer — a live stream is never clobbered. */
   hydrateLog: (stageId: string, entries: LiveEntry[]) => void;
 
-  loadRuns: (workspaceId: string) => Promise<void>;
+  /** `background: true` = a passive refetch (e.g. window focus): the runs
+   *  list refreshes, but the workspace's ACTIVE run — and therefore the
+   *  default-viewed canvas — is never reassigned under the user. A newly
+   *  staged draft surfaces in the RUNS list; it never steals the view. */
+  loadRuns: (workspaceId: string, opts?: { background?: boolean }) => Promise<void>;
+  /** Hydrate the `running`/`paused` runs across ALL workspaces (incl. ones not
+   *  opened this session) — drives the global "Runs in progress" tray. */
+  loadActiveRuns: () => Promise<void>;
   refreshDetail: (runId: string) => Promise<void>;
   begin: (
     workspaceId: string,
@@ -68,6 +88,11 @@ interface RunsState {
     linkedIssueKey?: string,
     budgetUsd?: number | null,
   ) => Promise<void>;
+  /** Start a STAGED (draft) run — e.g. one authored by octopush-mcp for the
+   *  user to launch from DIRECT. Unlike `begin`, there is nothing to create,
+   *  and the draft is prior user data: a refused start (over quota / the
+   *  concurrency gate) shows the upgrade sheet and LEAVES the draft intact. */
+  start: (runId: string) => Promise<void>;
   resolve: (
     runId: string,
     action: CheckpointActionName,
@@ -80,11 +105,22 @@ interface RunsState {
   stopStage: (runId: string) => Promise<void>;
   /** Ask the run to pause at its next stage boundary (parks the next stage). */
   pauseRun: (runId: string) => Promise<void>;
+  /** Hot-edit a pending, not-yet-started stage. Applies `patch` optimistically
+   *  for instant gate/model feedback, then the validated IPC write, then
+   *  `refreshDetail` reconciles — or reverts, if the backend rejected it. */
+  updateStage: (runId: string, stageId: string, patch: RunStagePatch) => Promise<void>;
+  /** Re-run a finished (done/failed) stage and everything downstream of it,
+   *  in place — no restart, no reload. */
+  rerunFromStage: (runId: string, stageId: string) => Promise<void>;
   /** null clears a manual pin — the canvas falls back to the active stage. */
   selectStage: (runId: string, stageId: string | null) => void;
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
   /** Returns the pending prefill and clears it — consumed exactly once. */
   consumeLauncherPrefill: () => LauncherPrefill | null;
+  /** Drop one settled run from the Mission Control board (session-local). */
+  dismissSettled: (runId: string) => void;
+  /** Clear the whole settled band. */
+  clearSettled: () => void;
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
@@ -98,6 +134,28 @@ function replaceRunInList(list: Run[], run: Run): Run[] {
   return next;
 }
 
+/** Mission Control board tracking, applied by EVERY path that writes a run row
+ *  into `runsByWs` (stage events, refreshDetail, loadRuns) — a terminal status
+ *  can arrive through any of them first, and a transition observed by one must
+ *  not be invisible to the others. Returns the `statusSince`/`settledAt` deltas
+ *  for an observed status change: stamps time-in-state, and parks an
+ *  active→terminal run on the Settled band. First sight of a row (no previous
+ *  status) stamps nothing — time-in-state falls back to `createdAt`, and a run
+ *  never seen active doesn't belong on the board. */
+function trackTransition(
+  s: Pick<RunsState, "runsByWs" | "statusSince" | "settledAt">,
+  acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> },
+  run: Run,
+): void {
+  const prev = (s.runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id)?.status;
+  if (prev === undefined || prev === run.status) return;
+  acc.statusSince = { ...(acc.statusSince ?? s.statusSince), [run.id]: Date.now() };
+  const wasActive = prev === "running" || prev === "paused";
+  if (wasActive && TERMINAL.has(run.status)) {
+    acc.settledAt = { ...(acc.settledAt ?? s.settledAt), [run.id]: Date.now() };
+  }
+}
+
 export const useRunsStore = create<RunsState>((set, get) => ({
   runsByWs: {},
   loadedByWs: {},
@@ -107,6 +165,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   selectedRunIdByWs: {},
   liveByStage: {},
   launcherPrefill: null,
+  settledAt: {},
+  statusSince: {},
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
@@ -151,15 +211,56 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return { liveByStage: next };
     }),
 
-  loadRuns: async (workspaceId) => {
+  loadRuns: async (workspaceId, opts) => {
     const runs = await ipc.listRuns(workspaceId);
-    const active = runs.find((r) => !TERMINAL.has(r.status)) ?? null;
-    set((s) => ({
-      runsByWs: { ...s.runsByWs, [workspaceId]: runs },
-      loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
-      activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: active?.id ?? null },
-    }));
-    if (active) await get().refreshDetail(active.id);
+    let nextActive: string | null = null;
+    set((s) => {
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      for (const run of runs) trackTransition(s, acc, run);
+      if (opts?.background) {
+        // Sticky active: keep the user's canvas exactly where it is. Only
+        // recompute when the current active run vanished or turned terminal —
+        // and even then adopt only an EXECUTING run (an externally staged
+        // draft must not clobber the launcher, incl. a half-typed brief).
+        const cur = s.activeRunIdByWs[workspaceId] ?? null;
+        const curValid = cur !== null && runs.some((r) => r.id === cur && !TERMINAL.has(r.status));
+        nextActive = curValid
+          ? cur
+          : runs.find((r) => r.status === "running" || r.status === "paused")?.id ?? null;
+      } else {
+        // First load / workspace switch: present the freshest non-terminal
+        // run (incl. a staged draft — the DraftBar makes it launchable).
+        nextActive = runs.find((r) => !TERMINAL.has(r.status))?.id ?? null;
+      }
+      return {
+        runsByWs: { ...s.runsByWs, [workspaceId]: runs },
+        loadedByWs: { ...s.loadedByWs, [workspaceId]: true },
+        activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: nextActive },
+        ...acc,
+      };
+    });
+    if (nextActive) await get().refreshDetail(nextActive);
+  },
+
+  loadActiveRuns: async () => {
+    let active: Run[];
+    try {
+      active = await ipc.listActiveRuns();
+    } catch (e) {
+      console.error("Failed to load active runs:", e);
+      return;
+    }
+    set((s) => {
+      const runsByWs = { ...s.runsByWs };
+      const activeRunIdByWs = { ...s.activeRunIdByWs };
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      for (const run of active) {
+        trackTransition(s, acc, run);
+        runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
+        activeRunIdByWs[run.workspaceId] = run.id;
+      }
+      return { runsByWs, activeRunIdByWs, ...acc };
+    });
   },
 
   refreshDetail: async (runId) => {
@@ -173,6 +274,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       set((s) => {
         const next: any = { detailByRun: { ...s.detailByRun, [runId]: detail } };
         if (detail.run) {
+          const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+          trackTransition(s, acc, detail.run);
+          Object.assign(next, acc);
           const wsId = detail.run.workspaceId;
           const wsList = s.runsByWs[wsId] ?? EMPTY_RUNS;
           next.runsByWs = { ...s.runsByWs, [wsId]: replaceRunInList(wsList, detail.run) };
@@ -196,8 +300,14 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       try {
         await ipc.startRun(runId, budgetUsd ?? null);
       } catch (e) {
-        // start was refused (e.g. another run is in progress) — drop the orphaned draft.
+        // start was refused — drop the orphaned draft.
         await ipc.abortRun(runId).catch(() => {});
+        // Over the Free monthly Direct-run cap → show the upgrade sheet, not an error.
+        const upgrade = isUpgradeRequired(e);
+        if (upgrade) {
+          useUpgradeStore.getState().show(upgrade);
+          return;
+        }
         throw e;
       }
       set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
@@ -205,6 +315,38 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       get().selectRun(workspaceId, runId);
     } finally {
       beginningWs.delete(workspaceId);
+    }
+  },
+
+  start: async (runId) => {
+    if (startingRuns.has(runId)) return; // guard against double-click double-start
+    startingRuns.add(runId);
+    try {
+      try {
+        await ipc.startRun(runId, null);
+      } catch (e) {
+        // Over the Free cap / concurrency gate → upgrade sheet; the draft
+        // survives (it's staged user data, not our own orphaned scaffolding).
+        const upgrade = isUpgradeRequired(e);
+        if (upgrade) {
+          useUpgradeStore.getState().show(upgrade);
+          return;
+        }
+        // Any other refusal must be VISIBLE — the caller fire-and-forgets, and
+        // a silently dead "Begin this run" button is indistinguishable from a bug.
+        pushToast({
+          level: "error",
+          title: "Couldn't start the run",
+          body: String(e).split("\n")[0],
+        });
+        return;
+      }
+      // Refresh INSIDE the guard: releasing early lets a fast second click
+      // re-enter while the just-started run still reads as draft (at the Free
+      // cap that second attempt pops a spurious upgrade sheet).
+      await get().refreshDetail(runId).catch(() => {});
+    } finally {
+      startingRuns.delete(runId);
     }
   },
 
@@ -226,6 +368,43 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     await ipc.requestRunPause(runId);
   },
 
+  updateStage: async (runId, stageId, patch) => {
+    set((s) => {
+      const detail = s.detailByRun[runId];
+      if (!detail) return {};
+      const stages = detail.stages.map((st) => {
+        if (st.id !== stageId) return st;
+        return {
+          ...st,
+          ...(patch.checkpoint !== undefined ? { checkpoint: patch.checkpoint } : {}),
+          ...(patch.instructions !== undefined ? { instructions: patch.instructions } : {}),
+          ...(patch.agentModel !== undefined ? { agentModel: patch.agentModel } : {}),
+          ...(patch.maxIterations !== undefined ? { maxIterations: patch.maxIterations } : {}),
+          ...(patch.loopMode !== undefined ? { loopMode: patch.loopMode } : {}),
+        };
+      });
+      return { detailByRun: { ...s.detailByRun, [runId]: { ...detail, stages } } };
+    });
+    try {
+      await ipc.updateRunStage(runId, stageId, patch);
+    } finally {
+      // Reconciles the optimistic patch with truth — and snaps it back if the
+      // backend rejected the edit (e.g. the stage started in the meantime).
+      await get().refreshDetail(runId);
+    }
+  },
+
+  rerunFromStage: async (runId, stageId) => {
+    try {
+      await ipc.rerunFromStage(runId, stageId);
+    } finally {
+      // Re-syncs with backend truth whether the call succeeded or was
+      // rejected by a guard (e.g. a race with a concurrent resolve/rerun) —
+      // same reconciliation shape as updateStage.
+      await get().refreshDetail(runId);
+    }
+  },
+
   selectStage: (runId, stageId) =>
     set((s) => ({ selectedStageByRun: { ...s.selectedStageByRun, [runId]: stageId } })),
 
@@ -237,6 +416,16 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     return prefill;
   },
 
+  dismissSettled: (runId) =>
+    set((s) => {
+      if (!(runId in s.settledAt)) return {};
+      const next = { ...s.settledAt };
+      delete next[runId];
+      return { settledAt: next };
+    }),
+
+  clearSettled: () => set({ settledAt: {} }),
+
   applyStageUpdate: (runId, run) => {
     set((s) => {
       const prevDetail = s.detailByRun[runId];
@@ -244,10 +433,14 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         ? { ...prevDetail, run }
         : { run, stages: [] };
       const wsList = s.runsByWs[run.workspaceId] ?? EMPTY_RUNS;
-      return {
+      const next: Partial<RunsState> = {
         detailByRun: { ...s.detailByRun, [runId]: detail },
         runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
       };
+      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      trackTransition(s, acc, run);
+      Object.assign(next, acc);
+      return next;
     });
     void get().refreshDetail(runId);
   },

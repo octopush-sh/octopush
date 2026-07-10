@@ -12,6 +12,9 @@ vi.mock("../lib/ipc", async () => {
       getGitDiff: vi.fn().mockResolvedValue(""),
       getStageLog: vi.fn().mockResolvedValue([]),
       listStageIterations: vi.fn().mockResolvedValue([]),
+      // The edit-stage modal renders <ModelPicker>, which fetches providers
+      // on mount — stub it so director-control tests don't hit real Tauri IPC.
+      listProviders: vi.fn().mockResolvedValue([]),
     },
   };
 });
@@ -314,5 +317,179 @@ describe("StageFocus journal hydration (D1)", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
     await waitFor(() => expect(ipc.getStageLog).toHaveBeenCalledWith("st1"));
     expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([]);
+  });
+});
+
+const runningRun = {
+  id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
+  costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+  createdAt: "t", finishedAt: null, budgetUsd: null,
+} as any;
+const pausedRun = { ...runningRun, status: "paused" };
+const completedRun = { ...runningRun, status: "completed" };
+
+const pendingStage = { ...baseStage, status: "pending", startedAt: null, checkpoint: false };
+const doneStage = {
+  ...baseStage, status: "done", startedAt: "t", finishedAt: "t",
+  artifact: JSON.stringify({ kind: "note", text: "done text" }),
+};
+const failedStage = { ...baseStage, status: "failed", error: "boom" };
+
+describe("StageFocus director controls", () => {
+  beforeEach(() => {
+    useRunsStore.setState({ liveByStage: {} });
+    vi.mocked(ipc.getStageLog).mockResolvedValue([]);
+    vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
+  });
+
+  it("shows the gate toggle and edit button for a pending stage on a live run", () => {
+    render(
+      <StageFocus
+        stage={pendingStage}
+        workspacePath="/tmp"
+        run={runningRun}
+        onUpdateStage={vi.fn()}
+        onRerunFromStage={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("switch", { name: /approval gate/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit stage" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Re-run from here" })).not.toBeInTheDocument();
+  });
+
+  it("hides director controls once the stage has started, even though it's still 'pending'", () => {
+    render(
+      <StageFocus
+        stage={{ ...pendingStage, startedAt: "t" }}
+        workspacePath="/tmp"
+        run={runningRun}
+        onUpdateStage={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("switch", { name: /approval gate/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit stage" })).not.toBeInTheDocument();
+  });
+
+  it("hides director controls entirely without a run (read-only callers)", () => {
+    render(<StageFocus stage={pendingStage} workspacePath="/tmp" />);
+    expect(screen.queryByRole("switch", { name: /approval gate/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit stage" })).not.toBeInTheDocument();
+  });
+
+  it("hides director controls once the run has finished", () => {
+    render(
+      <StageFocus
+        stage={pendingStage}
+        workspacePath="/tmp"
+        run={completedRun}
+        onUpdateStage={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("switch", { name: /approval gate/i })).not.toBeInTheDocument();
+  });
+
+  it("shows Re-run from here for a done stage once the run is paused", () => {
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={pausedRun} onRerunFromStage={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Re-run from here" })).toBeInTheDocument();
+  });
+
+  it("shows Re-run from here for a failed stage once the run is completed", () => {
+    render(<StageFocus stage={failedStage} workspacePath="/tmp" run={completedRun} onRerunFromStage={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Re-run from here" })).toBeInTheDocument();
+  });
+
+  it("does not offer Re-run while the run is actively running", () => {
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={runningRun} onRerunFromStage={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Re-run from here" })).not.toBeInTheDocument();
+  });
+
+  it("toggling the gate calls onUpdateStage with the flipped checkpoint", () => {
+    const onUpdateStage = vi.fn().mockResolvedValue(undefined);
+    render(<StageFocus stage={pendingStage} workspacePath="/tmp" run={runningRun} onUpdateStage={onUpdateStage} />);
+    fireEvent.click(screen.getByRole("switch", { name: /approval gate/i }));
+    expect(onUpdateStage).toHaveBeenCalledWith({ checkpoint: true });
+  });
+
+  it("surfaces a rejected gate toggle as an inline error instead of failing silently", async () => {
+    const onUpdateStage = vi.fn().mockRejectedValue(new Error("stage already started"));
+    render(<StageFocus stage={pendingStage} workspacePath="/tmp" run={runningRun} onUpdateStage={onUpdateStage} />);
+    fireEvent.click(screen.getByRole("switch", { name: /approval gate/i }));
+    expect(await screen.findByText("stage already started")).toBeInTheDocument();
+  });
+
+  it("opens the edit modal pre-filled and saves the patch", async () => {
+    const onUpdateStage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <StageFocus
+        stage={{ ...pendingStage, instructions: "old text", agentModel: "haiku", maxIterations: 25 }}
+        workspacePath="/tmp"
+        run={runningRun}
+        onUpdateStage={onUpdateStage}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit stage" }));
+    const textarea = screen.getByDisplayValue("old text");
+    fireEvent.change(textarea, { target: { value: "new text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save these changes" }));
+    await waitFor(() =>
+      expect(onUpdateStage).toHaveBeenCalledWith(
+        expect.objectContaining({ instructions: "new text", agentModel: "haiku", maxIterations: 25 }),
+      ),
+    );
+  });
+
+  it("shows an inline error banner in the modal when saving is rejected", async () => {
+    const onUpdateStage = vi.fn().mockRejectedValue(new Error("only stages that haven't begun can be edited"));
+    render(<StageFocus stage={pendingStage} workspacePath="/tmp" run={runningRun} onUpdateStage={onUpdateStage} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit stage" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save these changes" }));
+    expect(await screen.findByText("only stages that haven't begun can be edited")).toBeInTheDocument();
+  });
+
+  it("shows the loop-mode control only for a stage that actually loops", () => {
+    render(
+      <StageFocus
+        stage={{ ...pendingStage, loopTargetPosition: 0, loopMaxIterations: 3 }}
+        workspacePath="/tmp"
+        run={runningRun}
+        onUpdateStage={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit stage" }));
+    expect(screen.getByText("loop mode")).toBeInTheDocument();
+  });
+
+  it("omits the loop-mode control for a non-looping stage", () => {
+    render(<StageFocus stage={pendingStage} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit stage" }));
+    expect(screen.queryByText("loop mode")).not.toBeInTheDocument();
+  });
+
+  it("re-run needs an inline confirm before calling onRerunFromStage", () => {
+    const onRerunFromStage = vi.fn().mockResolvedValue(undefined);
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={pausedRun} onRerunFromStage={onRerunFromStage} />);
+    fireEvent.click(screen.getByRole("button", { name: "Re-run from here" }));
+    expect(screen.getByText(/discards results from this stage onward/)).toBeInTheDocument();
+    expect(onRerunFromStage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Re-run · discards downstream" }));
+    expect(onRerunFromStage).toHaveBeenCalled();
+  });
+
+  it("cancelling the re-run confirm does not call onRerunFromStage", () => {
+    const onRerunFromStage = vi.fn();
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={pausedRun} onRerunFromStage={onRerunFromStage} />);
+    fireEvent.click(screen.getByRole("button", { name: "Re-run from here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onRerunFromStage).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a rejected re-run as an inline error instead of failing silently", async () => {
+    const onRerunFromStage = vi.fn().mockRejectedValue(
+      new Error("this run is executing — stop the current stage first"),
+    );
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={pausedRun} onRerunFromStage={onRerunFromStage} />);
+    fireEvent.click(screen.getByRole("button", { name: "Re-run from here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Re-run · discards downstream" }));
+    expect(await screen.findByText("this run is executing — stop the current stage first")).toBeInTheDocument();
   });
 });

@@ -131,6 +131,17 @@ export interface RunDetail {
   run: Run | null;
   stages: RunStage[];
 }
+
+/** A hot-edit to a pending, not-yet-started run stage. Every field is
+ *  optional — `undefined` leaves it unchanged. `instructions: null` clears
+ *  the field (mirrors Rust `update_run_stage`'s `None` = "leave unchanged"). */
+export interface RunStagePatch {
+  checkpoint?: boolean;
+  instructions?: string | null;
+  agentModel?: string;
+  maxIterations?: number;
+  loopMode?: "gated" | "auto";
+}
 export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
 
 /** An archived stage attempt — a snapshot taken just before a loop-back /
@@ -260,6 +271,53 @@ import type {
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
 } from "./types";
+
+// ─── Entitlement (premium scaffolding — P0) ───────────────────────
+export type Plan = "free" | "pro" | "team" | "enterprise";
+export interface Entitlement {
+  plan: Plan;
+  features: string[];
+  /** Monthly Direct-run cap; null = unlimited (the P0 state). */
+  directRunsPerMonth: number | null;
+}
+export interface DirectRunUsage {
+  used: number;
+  limit: number | null;
+  remaining: number | null;
+}
+
+// ─── Accounts (P1) ────────────────────────────────────────────────
+export interface AuthStatus {
+  signedIn: boolean;
+  email: string | null;
+  name: string | null;
+}
+
+// ─── Cross-machine run history (Pro-real Part B / B1) ──────────────
+// NOTE: this mirrors the Rust `SyncRun` blob, which is intentionally
+// `snake_case` (it's a portable wire+storage format shared with the sync
+// server, which keys on `run_id`/`machine_id`) — unlike the camelCase IPC
+// types elsewhere. It is rendered as INERT TEXT only (never as HTML).
+export interface SyncedRunStage {
+  role: string;
+  model: string | null;
+  status: string;
+  cost_usd: number;
+}
+export interface SyncedRun {
+  run_id: string;
+  machine_id: string;
+  machine_name: string | null;
+  workspace_name: string | null;
+  task: string;
+  status: string;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  created_at: string;
+  finished_at: string | null;
+  stages: SyncedRunStage[];
+}
 
 export const ipc = {
   // ─── Sessions ─────────────────────────────────────────────────
@@ -410,10 +468,18 @@ export const ipc = {
     maxTokens: number;
     skill?: string;
     attachments?: { mediaType: string; data: string }[];
+    /** Re-run without inserting a new user row (history already ends with it). */
+    regenerate?: boolean;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  /** Delete a message and everything after it (Regenerate / Edit-and-resend). */
+  truncateChatAfter: (threadId: string, messageId: number) =>
+    invoke<void>("truncate_chat_after", { threadId, messageId }),
   /** Stop the in-flight agentic turn for this thread. */
   cancelChat: (threadId: string) => invoke<void>("cancel_chat", { threadId }),
+  /** Resolve an inline approval for a dangerous agent command. */
+  respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
+    invoke<void>("respond_approval", { callId, decision }),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
    *  command + output into the conversation; returns cwd/exit for the badge. */
   runShellCommand: (request: {
@@ -427,11 +493,21 @@ export const ipc = {
       exitCode: number;
       ok: boolean;
       cwd: string;
+      cwdLabel: string;
       live: boolean;
     }>("run_shell_command", { request }),
   /** SIGINT (Ctrl-C) a thread's live `$`-direct process. */
   stopShellCommand: (threadId: string) =>
     invoke<void>("stop_shell_command", { threadId }),
+  /** Forward keystrokes to a thread's live process (interactive stdin). */
+  sendShellInput: (threadId: string, data: string) =>
+    invoke<void>("send_shell_input", { threadId, data }),
+  /** Resize a thread's PTY so a full-screen TUI fits the live panel. */
+  resizeShell: (threadId: string, rows: number, cols: number) =>
+    invoke<void>("resize_shell", { threadId, rows, cols }),
+  /** Most-recently-used `$`-direct commands for a workspace (recall palette). */
+  listShellHistory: (workspaceId: string, limit?: number) =>
+    invoke<string[]>("list_shell_history", { workspaceId, limit }),
 
   // ─── Chat threads (conversations) ────────────────────────────────
   listChatThreads: (workspaceId: string) =>
@@ -440,6 +516,8 @@ export const ipc = {
     invoke<ChatThread>("create_chat_thread", { workspaceId, title }),
   renameChatThread: (threadId: string, title: string) =>
     invoke<void>("rename_chat_thread", { threadId, title }),
+  setThreadPinned: (threadId: string, pinned: boolean) =>
+    invoke<void>("set_thread_pinned", { threadId, pinned }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
 
@@ -785,6 +863,8 @@ export const ipc = {
   listRuns: (workspaceId: string) =>
     invoke<Run[]>("list_runs", { workspaceId }),
 
+  listActiveRuns: () => invoke<Run[]>("list_active_runs"),
+
   resolveCheckpoint: (
     runId: string,
     action: CheckpointActionName,
@@ -813,6 +893,26 @@ export const ipc = {
   requestRunPause: (runId: string) =>
     invoke<void>("request_run_pause", { runId }),
 
+  /** Hot-edit a pending, not-yet-started run stage. Any field left
+   *  `undefined` in `patch` is unchanged. `instructions: null` clears the
+   *  field (distinct from leaving it `undefined`, which leaves it as-is). */
+  updateRunStage: (runId: string, stageId: string, patch: RunStagePatch) =>
+    invoke<void>("update_run_stage", {
+      runId,
+      stageId,
+      checkpoint: patch.checkpoint ?? null,
+      instructions: patch.instructions === undefined ? null : (patch.instructions ?? ""),
+      agentModel: patch.agentModel ?? null,
+      maxIterations: patch.maxIterations ?? null,
+      loopMode: patch.loopMode ?? null,
+    }),
+
+  /** Re-run a finished (done/failed) stage and everything downstream of it,
+   *  in place — no restart, no reload. Rejects if the stage hasn't finished
+   *  or the run is currently driving. */
+  rerunFromStage: (runId: string, stageId: string) =>
+    invoke<void>("rerun_from_stage", { runId, stageId }),
+
   /** The persisted live journal for a stage, oldest first. Entries are
    *  LiveEntry-shaped JSON plus `{kind:"reset"}` marker objects that split
    *  the log into per-attempt segments. */
@@ -828,6 +928,30 @@ export const ipc = {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
+
+  // ─── Entitlement (premium scaffolding) ────────────────────────
+  getEntitlement: () => invoke<Entitlement>("get_entitlement"),
+  directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
+
+  // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
+  /** The local read-only history mirror (instant, no network). */
+  historyList: () => invoke<SyncedRun[]>("history_list"),
+  /** Pull the user's run history from the cloud, replace the mirror, return it.
+   *  Pro-gated (throws `UpgradeRequired` for Free). */
+  historySyncPull: () => invoke<SyncedRun[]>("history_sync_pull"),
+  /** One-shot backfill of this machine's terminal runs to the cloud (Pro-only,
+   *  no-op otherwise). Returns the count attempted. */
+  historySyncPushAll: () => invoke<number>("history_sync_push_all"),
+
+  // ─── Accounts (P1) ────────────────────────────────────────────
+  authStatus: () => invoke<AuthStatus>("auth_status"),
+  authBeginSignIn: () => invoke<AuthStatus>("auth_begin_sign_in"),
+  authCancelSignIn: () => invoke<void>("auth_cancel_sign_in"),
+  authRefresh: () => invoke<AuthStatus>("auth_refresh"),
+  authSyncPlan: () => invoke<string | null>("auth_sync_plan"),
+  authSignOut: () => invoke<void>("auth_sign_out"),
+  authAccountPortalUrl: () => invoke<string>("auth_account_portal_url"),
+  billingCheckoutUrl: () => invoke<string>("billing_checkout_url"),
 
   // ─── Roles ────────────────────────────────────────────────────
   listRoles: () => invoke<Role[]>("list_roles"),

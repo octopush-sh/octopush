@@ -18,6 +18,7 @@ export function SlashMenu({ items, activeIndex, onSelect, onHover }: Props) {
     <div
       className="octo-pop-in absolute bottom-full left-0 z-20 mb-1.5 max-h-64 w-[min(30rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg"
       role="listbox"
+      id="slash-popover"
       aria-label="Skills"
     >
       <div className="px-3 py-1 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
@@ -34,6 +35,7 @@ export function SlashMenu({ items, activeIndex, onSelect, onHover }: Props) {
           return (
             <button
               key={`${skill.source}:${skill.name}`}
+              id={`slash-opt-${i}`}
               type="button"
               role="option"
               aria-selected={active}

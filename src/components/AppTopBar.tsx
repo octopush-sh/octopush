@@ -1,4 +1,8 @@
-import { Settings, NotebookPen } from "lucide-react";
+import { Settings, NotebookPen, History } from "lucide-react";
+import { RunsTray } from "./RunsTray";
+import { useHistoryStore } from "../stores/historyStore";
+import { useUpgradeStore } from "../stores/upgradeStore";
+import { useEntitlement } from "../hooks/useEntitlement";
 
 /** A thin chrome bar at the very top of the app. Mirrors the bottom
  *  `PerfMonitorBar` in structure (full width, hairline border, panel bg)
@@ -16,15 +20,40 @@ import { Settings, NotebookPen } from "lucide-react";
 interface Props {
   onOpenSettings: () => void;
   onToggleScratchpad: () => void;
+  /** Open the Mission Control room (the fleet cockpit). */
+  onOpenMissionControl: () => void;
 }
 
-export function AppTopBar({ onOpenSettings, onToggleScratchpad }: Props) {
+export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionControl }: Props) {
+  const openHistory = useHistoryStore((s) => s.openSheet);
+  const showUpgrade = useUpgradeStore((s) => s.show);
+  const { hasFeature } = useEntitlement();
+
+  const onHistoryClick = () => {
+    if (hasFeature("history.sync")) {
+      void openHistory();
+    } else {
+      showUpgrade({ feature: "history.sync", used: 0, limit: 0 });
+    }
+  };
+
   return (
     <div
       data-tauri-drag-region
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
+      <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">
+        <button
+          type="button"
+          onClick={onHistoryClick}
+          aria-label="Run history across your machines"
+          title="Run history across your machines"
+          className="flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+        >
+          <History size={12} className="shrink-0" />
+          History
+        </button>
         <button
           type="button"
           onClick={onToggleScratchpad}

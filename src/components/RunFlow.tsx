@@ -1,10 +1,14 @@
+import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
 import { ROMAN, stageTitle, fmtTokens } from "../lib/stageMeta";
+import { lastActivity, lastNotice } from "../lib/liveLine";
 import { archetypeFor } from "./builder/graph";
 import { ARTIFACT_ICON } from "./builder/icons";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
+import { prefersReducedMotion } from "../lib/motion";
+import { RunFlowNav } from "./RunFlowNav";
 
 interface Props {
   stages: RunStage[];
@@ -14,62 +18,80 @@ interface Props {
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
-/** One-line "current activity" from the most recent meaningful live entry. */
-function lastActivity(entries: LiveEntry[]): string {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.kind === "tool") return `§ ${e.tool}${e.hint ? " " + e.hint : ""}`;
-    if (e.kind === "text") return e.text.split("\n")[0].slice(0, 60);
-  }
-  return "";
-}
-
-/** The latest verdict notice (for a finished review), or "". */
-function lastNotice(entries: LiveEntry[]): string {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].kind === "notice") return (entries[i] as { text: string }).text;
-  }
-  return "";
-}
-
 /** The running pipeline drawn as a LIVING node flow — the execution-aware
  *  sibling of the launcher's StageFlow. It speaks the same node language
- *  (archetype icon, Roman numeral, substrate pill, ⟶/⟜ connectors that WRAP,
- *  never scroll-hidden) but each card is alive: it pulses while running, carries
- *  the live activity / elapsed time, shows token + cost transparency when at
- *  rest, and marks loop-back edges. It supersedes the old RunTrack card strip. */
+ *  (archetype icon, Roman numeral, substrate pill, ⟶/⟜ connectors) but each
+ *  card is alive: it pulses while running, carries the live activity / elapsed
+ *  time, shows token + cost transparency when at rest, and marks loop-back
+ *  edges. Cards sit on ONE horizontal rail that SCROLLS (never wraps) — a
+ *  7–8 stage pipeline still reads as one continuous flow instead of a
+ *  saturated grid. RunFlowNav's chevrons page through overflow, and whichever
+ *  stage is in focus (selected, or running/awaiting your checkpoint) scrolls
+ *  into view. It supersedes the old RunTrack card strip. */
 export function RunFlow({ stages, selectedStageId, onSelectStage }: Props) {
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  // Focus follows the action: `selectedStageId` is already the shown-stage id
+  // computed upstream (explicit selection, else the active stage) — so simply
+  // following it here covers both a manual click and a stage turning running
+  // / awaiting_checkpoint.
+  useEffect(() => {
+    if (!selectedStageId) return;
+    const el = cardRefs.current.get(selectedStageId);
+    if (!el) return;
+    el.scrollIntoView({
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+      inline: "center",
+      block: "nearest",
+    });
+  }, [selectedStageId]);
+
   return (
-    <div className="flex flex-wrap items-stretch gap-y-3">
-      {stages.map((s, i) => {
-        const prev = stages[i - 1];
-        // Dim the connector until the handoff has actually completed, so a solid
-        // arrow reads as "work has flowed through here". The connector leading
-        // INTO the currently-running stage pulses calmly — work is flowing now.
-        const solid = prev && prev.status === "done";
-        const flowingHere = s.status === "running";
-        return (
-          <div key={s.id} className="flex items-stretch">
-            {i > 0 && (
-              <span
-                className={`flex w-7 shrink-0 items-center justify-center text-octo-brass transition-opacity duration-[280ms] ${
-                  solid ? "opacity-100" : "opacity-40"
-                } ${flowingHere ? "octo-stage-pulse rounded-full" : ""}`}
-                title={prev?.checkpoint ? "Gated handoff" : "Hands off to"}
+    <div className="flex items-stretch gap-2">
+      <div
+        ref={railRef}
+        className="octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth"
+      >
+        {stages.map((s, i) => {
+          const prev = stages[i - 1];
+          // Dim the connector until the handoff has actually completed, so a solid
+          // arrow reads as "work has flowed through here". The connector leading
+          // INTO the currently-running stage pulses calmly — work is flowing now.
+          const solid = prev && prev.status === "done";
+          const flowingHere = s.status === "running";
+          return (
+            <div key={s.id} className="flex shrink-0 items-stretch">
+              {i > 0 && (
+                <span
+                  className={`flex w-7 shrink-0 items-center justify-center text-octo-brass transition-opacity duration-[280ms] ${
+                    solid ? "opacity-100" : "opacity-40"
+                  } ${flowingHere ? "octo-stage-pulse rounded-full" : ""}`}
+                  title={prev?.checkpoint ? "Gated handoff" : "Hands off to"}
+                >
+                  {prev?.checkpoint ? "⟜" : "⟶"}
+                </span>
+              )}
+              <div
+                ref={(el) => {
+                  if (el) cardRefs.current.set(s.id, el);
+                  else cardRefs.current.delete(s.id);
+                }}
+                className="flex snap-start"
               >
-                {prev?.checkpoint ? "⟜" : "⟶"}
-              </span>
-            )}
-            <StageCard
-              stage={s}
-              index={i}
-              stages={stages}
-              selected={s.id === selectedStageId}
-              onSelect={() => onSelectStage(s.id)}
-            />
-          </div>
-        );
-      })}
+                <StageCard
+                  stage={s}
+                  index={i}
+                  stages={stages}
+                  selected={s.id === selectedStageId}
+                  onSelect={() => onSelectStage(s.id)}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <RunFlowNav containerRef={railRef} stageCount={stages.length} />
     </div>
   );
 }

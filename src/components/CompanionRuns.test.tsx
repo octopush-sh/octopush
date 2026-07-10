@@ -105,10 +105,10 @@ describe("CompanionRuns hub", () => {
     expect(runRow.textContent).toContain("running");
   });
 
-  it("gives truncated task text a full-task tooltip", () => {
+  it("does not use a native title tooltip for the task text (ModalShell handles long briefs)", () => {
     render(<CompanionRuns workspaceId="w1" />);
     const row = screen.getByText("task rDone").closest("button")!;
-    expect(row).toHaveAttribute("title", "task rDone");
+    expect(row).not.toHaveAttribute("title");
   });
 
   it("uses the new empty-state copy once loading has resolved", () => {

@@ -9,10 +9,23 @@ import type {
   PtyAttentionEvent,
   PtyDataEvent,
   PtyExitEvent,
+  PtyForegroundEvent,
   PtyReattachedEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { useTerminalsStore } from "../stores/terminalsStore";
 import { XTERM_FONT_FAMILY, XTERM_THEME } from "../lib/xtermTheme";
+
+// Terminal zoom bounds. The font size is session-local (not persisted): each
+// pane opens at ZOOM_DEFAULT and resets on remount.
+const ZOOM_MIN = 8;
+const ZOOM_MAX = 28;
+const ZOOM_DEFAULT = 13;
+
+// How long a foreground "idle" lingers before the rail bar stops marching, so a
+// brief mid-task quiet gap doesn't flicker it off. A re-busy within the window
+// cancels the pending idle.
+const BUSY_OFF_LINGER_MS = 1500;
 
 interface Props {
   /** Stable terminal record id — used as React key; never changes for this tab. */
@@ -74,11 +87,15 @@ export function TerminalPane({
   const containerRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // Current terminal font size (zoom level). Session-local, not persisted.
+  const fontSizeRef = useRef(ZOOM_DEFAULT);
   // Track last known size to avoid no-op resize IPC calls.
   const lastSizeRef = useRef<{ rows: number; cols: number }>({ rows: 0, cols: 0 });
   // The PTY session id — for TerminalPane this is always equal to `terminalId`
   // because we use the DB terminal record id as the PTY id end-to-end.
   const ptySessionIdRef = useRef<string | null>(null);
+  // Pending "stop marching" timer for the rail processing bar (linger debounce).
+  const busyOffTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
   const onExitRef = useRef(onExit);
@@ -129,6 +146,19 @@ export function TerminalPane({
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    fontSizeRef.current = ZOOM_DEFAULT;
+
+    // ── Zoom ──────────────────────────────────────────────────────────
+    // xterm has no built-in zoom: changing `fontSize` then refitting is the
+    // whole mechanism. `syncSize` recomputes rows/cols and notifies the PTY,
+    // so the inner app reflows to the new geometry.
+    const applyFontSize = (next: number) => {
+      const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(next)));
+      if (clamped === term.options.fontSize) return;
+      fontSizeRef.current = clamped;
+      term.options.fontSize = clamped;
+      syncSize();
+    };
 
     // ── Clipboard bridge ──────────────────────────────────────────────
     // xterm paints its OWN selection (not a native DOM range), so the
@@ -138,6 +168,25 @@ export function TerminalPane({
     // Cmd-C / Ctrl-Shift-C and on right-click-with-a-selection.
     if (typeof term.attachCustomKeyEventHandler === "function") {
       term.attachCustomKeyEventHandler((e) => {
+        // Zoom: Cmd/Ctrl with +, -, or 0. `+` is Shift+= on most layouts, so
+        // we don't exclude Shift here. Handled keys are not forwarded to the PTY.
+        if (e.type === "keydown" && (e.metaKey || e.ctrlKey) && !e.altKey) {
+          if (e.key === "=" || e.key === "+") {
+            applyFontSize(fontSizeRef.current + 1);
+            e.preventDefault();
+            return false;
+          }
+          if (e.key === "-" || e.key === "_") {
+            applyFontSize(fontSizeRef.current - 1);
+            e.preventDefault();
+            return false;
+          }
+          if (e.key === "0") {
+            applyFontSize(ZOOM_DEFAULT);
+            e.preventDefault();
+            return false;
+          }
+        }
         if (
           e.type === "keydown" &&
           (e.key === "c" || e.key === "C") &&
@@ -162,6 +211,15 @@ export function TerminalPane({
       }
     };
     copyEl.addEventListener("contextmenu", onContextMenu);
+
+    // Ctrl + mouse wheel zoom. `passive: false` so we can preventDefault and
+    // stop the browser's own pinch-zoom from firing underneath.
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      applyFontSize(fontSizeRef.current + (e.deltaY < 0 ? 1 : -1));
+    };
+    copyEl.addEventListener("wheel", onWheel, { passive: false });
 
     // File-path link provider — scans each rendered terminal line for
     // path-shaped tokens (anything with at least one slash + a short
@@ -279,6 +337,35 @@ export function TerminalPane({
       unlistenAttention = u;
     });
 
+    // Daemon-driven foreground state: a command started or stopped running in
+    // this PTY. Feeds the rail's processing bar — updated regardless of whether
+    // the pane is visible, so a background workspace's bar reflects its work.
+    //
+    // Busy=true applies immediately; busy=false lingers briefly so a short
+    // quiet gap mid-task (e.g. an agent waiting on its API between output
+    // bursts) doesn't flicker the bar off and back on — a re-busy within the
+    // window cancels the pending idle.
+    let unlistenForeground: UnlistenFn | undefined;
+    listen<PtyForegroundEvent>("pty://foreground", (ev) => {
+      const ptyId = ptySessionIdRef.current;
+      if (!ptyId || ev.payload.sessionId !== ptyId) return;
+      if (busyOffTimerRef.current) {
+        clearTimeout(busyOffTimerRef.current);
+        busyOffTimerRef.current = undefined;
+      }
+      const wsId = workspaceIdRef.current;
+      if (ev.payload.busy) {
+        useTerminalsStore.getState().setBusy(wsId, ptyId, true);
+      } else {
+        busyOffTimerRef.current = setTimeout(() => {
+          busyOffTimerRef.current = undefined;
+          useTerminalsStore.getState().setBusy(wsId, ptyId, false);
+        }, BUSY_OFF_LINGER_MS);
+      }
+    }).then((u) => {
+      unlistenForeground = u;
+    });
+
     listen<PtyExitEvent>("pty://exit", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       term.writeln("\r\n\x1b[2;37m[session exited]\x1b[0m");
@@ -388,7 +475,10 @@ export function TerminalPane({
       unlistenExit?.();
       unlistenReattached?.();
       unlistenAttention?.();
+      unlistenForeground?.();
+      if (busyOffTimerRef.current) clearTimeout(busyOffTimerRef.current);
       copyEl.removeEventListener("contextmenu", onContextMenu);
+      copyEl.removeEventListener("wheel", onWheel);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

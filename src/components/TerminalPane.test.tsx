@@ -39,7 +39,11 @@ Object.defineProperty(globalThis, "requestAnimationFrame", {
 // uses `new Terminal(...)` which requires a constructable function.
 
 const xtermHoisted = vi.hoisted(() => ({
-  last: null as unknown as { getSelection: ReturnType<typeof vi.fn> } | null,
+  last: null as unknown as {
+    getSelection: ReturnType<typeof vi.fn>;
+    options: { fontSize: number };
+    attachCustomKeyEventHandler: ReturnType<typeof vi.fn>;
+  } | null,
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -55,6 +59,7 @@ vi.mock("@xterm/xterm", () => {
     dispose = vi.fn();
     getSelection = vi.fn(() => "");
     attachCustomKeyEventHandler = vi.fn();
+    options = { fontSize: 13 };
     constructor() {
       xtermHoisted.last = this;
     }
@@ -165,6 +170,75 @@ describe("TerminalPane — clipboard", () => {
 
     expect(writeText).not.toHaveBeenCalled();
     expect(ev.defaultPrevented).toBe(false);
+  });
+});
+
+describe("TerminalPane — zoom", () => {
+  // Helper: grab the custom key-event handler the component registered.
+  function keyHandler() {
+    const calls = xtermHoisted.last!.attachCustomKeyEventHandler.mock.calls;
+    return calls[0][0] as (e: Partial<KeyboardEvent>) => boolean;
+  }
+
+  async function mounted() {
+    const { container } = render(
+      <TerminalPane terminalId="tz" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    return container;
+  }
+
+  it("increases font size on Cmd/Ctrl + and resets on Cmd/Ctrl 0", async () => {
+    await mounted();
+    const handler = keyHandler();
+
+    const inc = { type: "keydown", metaKey: true, key: "=", preventDefault: vi.fn() };
+    expect(handler(inc)).toBe(false);
+    expect(inc.preventDefault).toHaveBeenCalled();
+    expect(xtermHoisted.last!.options.fontSize).toBe(14);
+
+    const reset = { type: "keydown", metaKey: true, key: "0", preventDefault: vi.fn() };
+    expect(handler(reset)).toBe(false);
+    expect(xtermHoisted.last!.options.fontSize).toBe(13);
+  });
+
+  it("decreases font size on Cmd/Ctrl - and clamps at the minimum", async () => {
+    await mounted();
+    const handler = keyHandler();
+    // Drive well past the floor; size must clamp, not go below ZOOM_MIN (8).
+    for (let i = 0; i < 20; i++) {
+      handler({ type: "keydown", ctrlKey: true, key: "-", preventDefault: vi.fn() });
+    }
+    expect(xtermHoisted.last!.options.fontSize).toBe(8);
+  });
+
+  it("does not treat a plain '=' keystroke as zoom", async () => {
+    await mounted();
+    const handler = keyHandler();
+    const ev = { type: "keydown", key: "=", preventDefault: vi.fn() };
+    expect(handler(ev)).toBe(true); // forwarded to the PTY
+    expect(ev.preventDefault).not.toHaveBeenCalled();
+    expect(xtermHoisted.last!.options.fontSize).toBe(13);
+  });
+
+  it("zooms with Ctrl + mouse wheel", async () => {
+    const container = await mounted();
+    const el = container.querySelector(".xterm-container") as HTMLElement;
+
+    const up = new WheelEvent("wheel", { bubbles: true, cancelable: true, ctrlKey: true, deltaY: -1 });
+    el.dispatchEvent(up);
+    expect(xtermHoisted.last!.options.fontSize).toBe(14);
+    expect(up.defaultPrevented).toBe(true);
+
+    const down = new WheelEvent("wheel", { bubbles: true, cancelable: true, ctrlKey: true, deltaY: 1 });
+    el.dispatchEvent(down);
+    expect(xtermHoisted.last!.options.fontSize).toBe(13);
+
+    // Without Ctrl, the wheel scrolls normally and font size is untouched.
+    const plain = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -1 });
+    el.dispatchEvent(plain);
+    expect(xtermHoisted.last!.options.fontSize).toBe(13);
+    expect(plain.defaultPrevented).toBe(false);
   });
 });
 

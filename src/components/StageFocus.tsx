@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { ChevronLeft, ChevronRight } from "lucide-react";
-import type { LiveEntry, RunStage, StageIteration } from "../lib/ipc";
+import { ChevronLeft, ChevronRight, SlidersHorizontal, RotateCcw } from "lucide-react";
+import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
@@ -9,6 +9,11 @@ import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
 import { IconButton } from "./controls/IconButton";
+import { TogglePill } from "./controls/TogglePill";
+import { Stepper } from "./controls/Stepper";
+import { SegmentedControl } from "./controls/SegmentedControl";
+import { ModelPicker } from "./ModelPicker";
+import { ModalShell } from "./ModalShell";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
@@ -104,12 +109,27 @@ function SnapshotDiff({ diff }: { diff: string }) {
   );
 }
 
+const TERMINAL_RUN_STATUSES = new Set(["completed", "aborted"]);
+/** Rerun affordance only shows when the run isn't actively driving — the
+ *  backend also enforces this (rejecting a rerun while another drive holds
+ *  the run's exclusion claim), this just keeps the button from appearing in
+ *  a state where clicking it would only bounce off a guard error. */
+const RERUNNABLE_RUN_STATUSES = new Set(["paused", "completed"]);
+
 interface Props {
   stage: RunStage | null;
   workspacePath: string;
+  /** The stage's run — enables the director controls below (gate toggle,
+   *  edit, re-run). Omit (or pass null) to render read-only, as every
+   *  existing caller before this feature did. */
+  run?: Run | null;
+  /** Hot-edit the shown stage (only called while it's still pending). */
+  onUpdateStage?: (patch: RunStagePatch) => Promise<void>;
+  /** Re-run the shown stage — and everything downstream — in place. */
+  onRerunFromStage?: () => Promise<void>;
 }
 
-export function StageFocus({ stage, workspacePath }: Props) {
+export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, onRerunFromStage }: Props) {
   const [diff, setDiff] = useState<string>("");
   const [diffLoading, setDiffLoading] = useState(false);
   // D5 — archived attempts + the persisted log split into per-attempt segments.
@@ -119,6 +139,69 @@ export function StageFocus({ stage, workspacePath }: Props) {
   const [viewedAttempt, setViewedAttempt] = useState<number | null>(null);
   const liveEntries = useRunsStore((s) => s.liveByStage[stage?.id ?? ""] ?? EMPTY_ENTRIES);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // ── Director controls: gate toggle, edit-stage modal, re-run confirm ──
+  const [editOpen, setEditOpen] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [draftInstructions, setDraftInstructions] = useState("");
+  const [draftModel, setDraftModel] = useState("");
+  const [draftMaxIterations, setDraftMaxIterations] = useState(25);
+  const [draftLoopMode, setDraftLoopMode] = useState<"gated" | "auto">("gated");
+  const [confirmRerun, setConfirmRerun] = useState(false);
+  /** Surfaces a rejected gate toggle or re-run — both fire outside the edit
+   *  modal (which has its own inline `editError`), so a bare `void` on their
+   *  promises would otherwise fail silently. */
+  const [directorError, setDirectorError] = useState<string | null>(null);
+
+  // A different stage came into focus — close any director controls left
+  // open on the previous one instead of carrying them over.
+  useEffect(() => {
+    setEditOpen(false);
+    setConfirmRerun(false);
+    setDirectorError(null);
+  }, [stage?.id]);
+
+  const editable =
+    !!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status) &&
+    stage.status === "pending" && stage.startedAt === null;
+  const rerunnable =
+    !!stage && !!run && RERUNNABLE_RUN_STATUSES.has(run.status) &&
+    (stage.status === "done" || stage.status === "failed");
+  const showsLoopMode = !!stage && stage.loopTargetPosition !== null && stage.loopMaxIterations > 0;
+
+  function reportDirectorError(e: unknown) {
+    setDirectorError(e instanceof Error ? e.message : String(e));
+  }
+
+  function openEdit() {
+    if (!stage) return;
+    setDraftInstructions(stage.instructions ?? "");
+    setDraftModel(stage.agentModel);
+    setDraftMaxIterations(stage.maxIterations);
+    setDraftLoopMode(stage.loopMode === "auto" ? "auto" : "gated");
+    setEditError(null);
+    setEditOpen(true);
+  }
+
+  async function saveEdit() {
+    if (!onUpdateStage) return;
+    setSaving(true);
+    setEditError(null);
+    try {
+      await onUpdateStage({
+        instructions: draftInstructions,
+        agentModel: draftModel,
+        maxIterations: draftMaxIterations,
+        ...(showsLoopMode ? { loopMode: draftLoopMode } : {}),
+      });
+      setEditOpen(false);
+    } catch (e) {
+      setEditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const artifact = useMemo<ParsedArtifact | null>(() => {
     if (!stage?.artifact) return null;
@@ -221,6 +304,7 @@ export function StageFocus({ stage, workspacePath }: Props) {
   const swapKey = viewedRow ? `${stage.id}:attempt-${attemptN}` : `${stage.id}:${mode}`;
 
   return (
+    <>
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-2.5">
         <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
@@ -249,6 +333,31 @@ export function StageFocus({ stage, workspacePath }: Props) {
             </IconButton>
           </span>
         )}
+        {(editable || rerunnable) && (
+          <span className="flex shrink-0 items-center gap-1.5">
+            {editable && (
+              <>
+                <TogglePill
+                  on={stage.checkpoint}
+                  label="⟜ gate"
+                  ariaLabel="Approval gate — pause before hand-off"
+                  onChange={(v) => {
+                    setDirectorError(null);
+                    onUpdateStage?.({ checkpoint: v }).catch(reportDirectorError);
+                  }}
+                />
+                <IconButton label="Edit stage" onClick={openEdit}>
+                  <SlidersHorizontal size={12} />
+                </IconButton>
+              </>
+            )}
+            {rerunnable && (
+              <IconButton label="Re-run from here" onClick={() => setConfirmRerun((v) => !v)}>
+                <RotateCcw size={12} />
+              </IconButton>
+            )}
+          </span>
+        )}
         <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
           {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
             <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
@@ -258,6 +367,38 @@ export function StageFocus({ stage, workspacePath }: Props) {
           <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
         </span>
       </div>
+      {rerunnable && (
+        <Reveal open={confirmRerun}>
+          <div className="flex items-center gap-3 border-b border-octo-hairline bg-octo-panel-2 px-4 py-2">
+            <span className="min-w-0 flex-1 font-serif text-[13px] text-octo-sage">
+              Re-run from here? This discards results from this stage onward.
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmRerun(false);
+                setDirectorError(null);
+                onRerunFromStage?.().catch(reportDirectorError);
+              }}
+              className="shrink-0 rounded-md border border-octo-brass px-3 py-1.5 font-serif text-xs text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
+            >
+              Re-run · discards downstream
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmRerun(false)}
+              className="shrink-0 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory"
+            >
+              Cancel
+            </button>
+          </div>
+        </Reveal>
+      )}
+      {directorError && (
+        <div className="octo-rise-in border-b border-octo-hairline bg-[var(--rouge-ghost)] px-4 py-2 text-xs text-octo-rouge">
+          {directorError}
+        </div>
+      )}
       <div
         ref={scrollRef}
         className="chat-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
@@ -355,6 +496,77 @@ export function StageFocus({ stage, workspacePath }: Props) {
         </FadeSwap>
       </div>
     </div>
+    {editOpen && (
+      <ModalShell
+        onClose={() => !saving && setEditOpen(false)}
+        closeOnBackdrop={!saving}
+        ariaLabel="Edit stage"
+        panelClassName="w-[480px] rounded-lg border border-octo-hairline bg-octo-panel p-6"
+      >
+        <p className="font-sans text-[15px] font-semibold text-octo-ivory">
+          Edit {stageTitle(stage)}
+        </p>
+        <p className="mt-1 text-xs text-octo-mute">
+          Changes apply when this stage starts — the pipeline template is untouched.
+        </p>
+        <div className="mt-4 flex flex-col gap-4">
+          <label className="flex flex-col gap-1.5">
+            <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">instructions</span>
+            <textarea
+              value={draftInstructions}
+              onChange={(e) => setDraftInstructions(e.target.value)}
+              placeholder="Additional guidance for this stage…"
+              className="h-28 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
+            />
+          </label>
+          <div className="flex flex-wrap items-center gap-4">
+            <span className="flex items-center gap-2 font-mono text-[11px] text-octo-mute">
+              model
+              <ModelPicker activeModel={draftModel} onSelectModel={setDraftModel} />
+            </span>
+            <span className="flex items-center gap-2 font-mono text-[11px] text-octo-mute">
+              turn budget
+              <Stepper value={draftMaxIterations} min={1} max={100} step={5} ariaLabel="Turn budget" onChange={setDraftMaxIterations} />
+            </span>
+            {showsLoopMode && (
+              <span className="flex items-center gap-2 font-mono text-[11px] text-octo-mute">
+                loop mode
+                <SegmentedControl
+                  options={[{ value: "gated", label: "gated" }, { value: "auto", label: "auto" }]}
+                  value={draftLoopMode}
+                  onChange={setDraftLoopMode}
+                  ariaLabel="Loop mode"
+                />
+              </span>
+            )}
+          </div>
+          {editError && (
+            <div className="rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2 text-xs text-octo-rouge">
+              {editError}
+            </div>
+          )}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setEditOpen(false)}
+            disabled={saving}
+            className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => void saveEdit()}
+            disabled={saving}
+            className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
+          >
+            Save these changes
+          </button>
+        </div>
+      </ModalShell>
+    )}
+    </>
   );
 }
 

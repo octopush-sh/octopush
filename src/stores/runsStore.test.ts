@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
+const { pushToastMock } = vi.hoisted(() => ({ pushToastMock: vi.fn() }));
+vi.mock("../components/Toasts", () => ({ pushToast: pushToastMock }));
+
 vi.mock("../lib/ipc", async () => {
   const actual = await vi.importActual<any>("../lib/ipc");
   return {
@@ -14,6 +17,8 @@ vi.mock("../lib/ipc", async () => {
       resolveCheckpoint: vi.fn(),
       abortRun: vi.fn(),
       stopStage: vi.fn(),
+      updateRunStage: vi.fn(),
+      rerunFromStage: vi.fn(),
     },
   };
 });
@@ -39,7 +44,7 @@ describe("runsStore", () => {
   beforeEach(() => {
     useRunsStore.setState({
       runsByWs: {}, loadedByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
-      selectedRunIdByWs: {}, liveByStage: {},
+      selectedRunIdByWs: {}, liveByStage: {}, settledAt: {}, statusSince: {},
     });
     vi.clearAllMocks();
   });
@@ -100,6 +105,24 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().getRuns("w1")).toHaveLength(1);
     expect(useRunsStore.getState().getActiveRunId("w1")).toBe("r1");
     expect(useRunsStore.getState().getDetail("r1")?.stages).toHaveLength(1);
+  });
+
+  it("loadRuns is safe to call repeatedly and picks up a run staged externally (e.g. via octopush-mcp)", async () => {
+    (ipc.listRuns as any).mockResolvedValue([RUN]);
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().getRuns("w1")).toHaveLength(1);
+
+    // A focus-driven refresh must not disturb any live log buffer already
+    // streaming for this workspace's stages.
+    useRunsStore.getState().appendEntry("st1", { kind: "text", text: "live" });
+
+    const DRAFT: Run = { ...RUN, id: "r2", status: "draft" };
+    (ipc.listRuns as any).mockResolvedValue([RUN, DRAFT]);
+    await useRunsStore.getState().loadRuns("w1");
+
+    expect(useRunsStore.getState().getRuns("w1").map((r) => r.id)).toEqual(["r1", "r2"]);
+    expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([{ kind: "text", text: "live" }]);
   });
 
   it("applyStageUpdate replaces the run row in detail and runs list", () => {
@@ -240,5 +263,209 @@ describe("runsStore", () => {
     expect(ipc.abortRun).toHaveBeenCalledWith("rDraft");
     // no explicit selection of the dead draft
     expect("w1" in (useRunsStore.getState() as any).selectedRunIdByWs).toBe(false);
+  });
+
+  it("updateStage patches the stage optimistically before the IPC call resolves", async () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } } });
+    let resolveIpc: () => void = () => {};
+    (ipc.updateRunStage as any).mockImplementation(
+      () => new Promise<void>((resolve) => { resolveIpc = resolve; }),
+    );
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [{ ...STAGE, checkpoint: true }] });
+
+    const pending = useRunsStore.getState().updateStage("r1", "st1", { checkpoint: true });
+    // The optimistic patch lands synchronously, ahead of the IPC round trip.
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(true);
+
+    resolveIpc();
+    await pending;
+    expect(ipc.updateRunStage).toHaveBeenCalledWith("r1", "st1", { checkpoint: true });
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(true);
+  });
+
+  it("updateStage reverts the optimistic patch when the backend rejects the edit", async () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } } }); // STAGE.checkpoint === false
+    (ipc.updateRunStage as any).mockRejectedValue(new Error("stage already started"));
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] }); // truth: unchanged
+
+    await expect(
+      useRunsStore.getState().updateStage("r1", "st1", { checkpoint: true }),
+    ).rejects.toThrow("stage already started");
+
+    // refreshDetail ran in `finally` and snapped the optimistic flip back to truth.
+    expect(useRunsStore.getState().getDetail("r1")?.stages[0].checkpoint).toBe(false);
+  });
+
+  it("rerunFromStage calls the IPC then refreshes detail", async () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, detailByRun: { r1: { run: RUN, stages: [STAGE] } },
+    });
+    (ipc.rerunFromStage as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [STAGE] });
+
+    await useRunsStore.getState().rerunFromStage("r1", "st1");
+    expect(ipc.rerunFromStage).toHaveBeenCalledWith("r1", "st1");
+    expect(useRunsStore.getState().getDetail("r1")?.run?.status).toBe("running");
+  });
+
+  it("rerunFromStage still refreshes detail (and rethrows) when the backend rejects", async () => {
+    useRunsStore.setState({ detailByRun: {} });
+    (ipc.rerunFromStage as any).mockRejectedValue(new Error("this run is executing"));
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+
+    await expect(
+      useRunsStore.getState().rerunFromStage("r1", "st1"),
+    ).rejects.toThrow("this run is executing");
+    expect(ipc.getRun).toHaveBeenCalledWith("r1");
+  });
+
+  // ── Staged (draft) runs — e.g. authored by octopush-mcp ──
+
+  it("start launches a staged draft and refreshes its detail", async () => {
+    (ipc.startRun as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [] });
+    await useRunsStore.getState().start("r1");
+    expect(ipc.startRun).toHaveBeenCalledWith("r1", null);
+    expect(ipc.getRun).toHaveBeenCalledWith("r1");
+  });
+
+  it("start over the quota gate shows the upgrade sheet and LEAVES the draft intact", async () => {
+    // Unlike begin() (which aborts its own just-created orphan), a staged
+    // draft is prior user data — a refused start must never destroy it.
+    const { useUpgradeStore } = await import("./upgradeStore");
+    useUpgradeStore.setState({ info: null });
+    (ipc.startRun as any).mockRejectedValue(
+      JSON.stringify({ kind: "UpgradeRequired", feature: "direct.unlimited", used: 25, limit: 25 }),
+    );
+
+    await useRunsStore.getState().start("r1");
+
+    expect(useUpgradeStore.getState().info?.feature).toBe("direct.unlimited");
+    expect(ipc.abortRun).not.toHaveBeenCalled();
+  });
+
+  it("start surfaces a non-upgrade failure as a toast (the CTA must never look dead)", async () => {
+    (ipc.startRun as any).mockRejectedValue(new Error("engine on fire"));
+    await expect(useRunsStore.getState().start("r1")).resolves.toBeUndefined();
+    expect(pushToastMock).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "error", title: "Couldn't start the run" }),
+    );
+  });
+
+  it("start guards against a double-click double-start", async () => {
+    let release!: () => void;
+    (ipc.startRun as any).mockImplementation(
+      () => new Promise<void>((res) => { release = res; }),
+    );
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [] });
+    const first = useRunsStore.getState().start("r1");
+    const second = useRunsStore.getState().start("r1"); // while the first is in flight
+    release();
+    await Promise.all([first, second]);
+    expect(ipc.startRun).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Background (focus) refresh: sticky active, never clobber the canvas ──
+
+  it("background loadRuns keeps the current active run in place", async () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, // r1 running
+      activeRunIdByWs: { w1: "r1" },
+    });
+    // An MCP-staged draft appears, newer than the running run.
+    const draft: Run = { ...RUN, id: "rDraft", status: "draft" };
+    (ipc.listRuns as any).mockResolvedValue([draft, RUN]);
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [] });
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("r1");
+    // …but the draft IS in the list (Companion RUNS shows it).
+    expect(useRunsStore.getState().getRuns("w1").some((r) => r.id === "rDraft")).toBe(true);
+  });
+
+  it("background loadRuns never lets a staged draft steal the launcher", async () => {
+    // User is composing on the launcher (no active run); MCP stages a draft.
+    useRunsStore.setState({ runsByWs: { w1: [] }, activeRunIdByWs: { w1: null } });
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, id: "rDraft", status: "draft" }]);
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBeNull();
+  });
+
+  it("background loadRuns adopts an executing run when the active one is gone", async () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] }, activeRunIdByWs: { w1: "r1" } });
+    const other: Run = { ...RUN, id: "r2", status: "paused" };
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "completed" }, other]);
+    (ipc.getRun as any).mockResolvedValue({ run: other, stages: [] });
+    await useRunsStore.getState().loadRuns("w1", { background: true });
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("r2");
+  });
+
+  it("foreground loadRuns still presents a staged draft (first load / ws switch)", async () => {
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, id: "rDraft", status: "draft" }]);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, id: "rDraft", status: "draft" }, stages: [] });
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().getActiveRunId("w1")).toBe("rDraft");
+  });
+
+  // ── Mission Control board tracking (settled band + time-in-state) ──
+
+  it("applyStageUpdate stamps statusSince on a status change and settles an active→terminal run", () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // RUN is running
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "paused" });
+    const s1 = useRunsStore.getState();
+    expect(s1.statusSince["r1"]).toBeTypeOf("number");
+    expect(s1.settledAt["r1"]).toBeUndefined(); // paused is not terminal
+
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "completed" });
+    const s2 = useRunsStore.getState();
+    expect(s2.settledAt["r1"]).toBeTypeOf("number"); // active → terminal lands on the board
+  });
+
+  it("applyStageUpdate does not settle a run that was never seen active", () => {
+    // e.g. a draft aborted by the failed-start cleanup, or a first-ever event
+    // that already arrives terminal for a row we never held as active.
+    useRunsStore.setState({ runsByWs: { w1: [{ ...RUN, status: "draft" as const }] } });
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, status: "aborted" });
+    expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
+  });
+
+  it("applyStageUpdate with an unchanged status stamps nothing", () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } });
+    useRunsStore.getState().applyStageUpdate("r1", { ...RUN, costUsd: 0.2 });
+    expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
+
+  it("dismissSettled and clearSettled clear the board (session-local)", () => {
+    useRunsStore.setState({ settledAt: { r1: 1, r2: 2 } });
+    useRunsStore.getState().dismissSettled("r1");
+    expect(useRunsStore.getState().settledAt).toEqual({ r2: 2 });
+    useRunsStore.getState().clearSettled();
+    expect(useRunsStore.getState().settledAt).toEqual({});
+  });
+
+  it("refreshDetail also settles an active→terminal transition (no race with events)", async () => {
+    // A run completes while a refreshDetail is in flight: getRun returns the
+    // already-terminal row. The transition tracker must fire on THIS write
+    // path too, or the later run:// event sees no change and the run silently
+    // vanishes from the board.
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "completed" }, stages: [] });
+    await useRunsStore.getState().refreshDetail("r1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns settles an active→terminal transition seen via the list", async () => {
+    useRunsStore.setState({ runsByWs: { w1: [RUN] } }); // running
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "aborted" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeTypeOf("number");
+  });
+
+  it("loadRuns first sight of terminal history rows stamps nothing", async () => {
+    // Bulk-loading a workspace's run history must not reset time-in-state or
+    // put old completed runs on the board.
+    (ipc.listRuns as any).mockResolvedValue([{ ...RUN, status: "completed" }]);
+    await useRunsStore.getState().loadRuns("w1");
+    expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
+    expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
   });
 });
