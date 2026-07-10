@@ -68,7 +68,7 @@ export function RunFlow({ stages, selectedStageId, onSelectStage }: Props) {
     <div className="flex items-stretch gap-2">
       <div
         ref={railRef}
-        className="octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-mandatory flex-nowrap items-stretch gap-y-3 overflow-x-auto py-1 scroll-smooth"
+        className="octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth"
       >
         {stages.map((s, i) => {
           const prev = stages[i - 1];
