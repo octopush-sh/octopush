@@ -1,4 +1,4 @@
-// Thin typed wrappers around Tauri's `invoke` for the Octopus core.
+// Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 
 // ─── Direct mode (orchestration) — types ──────────────────────────────────
 

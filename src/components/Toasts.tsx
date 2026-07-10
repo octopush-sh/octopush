@@ -56,7 +56,7 @@ export function ToastContainer() {
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
-    listen<{ sessionId: string; message: string }>("octopus://budget-warning", (ev) => {
+    listen<{ sessionId: string; message: string }>("octopush://budget-warning", (ev) => {
       push({
         level: "warning",
         title: "Budget warning",
@@ -64,7 +64,7 @@ export function ToastContainer() {
       });
     }).then((u) => unsubs.push(u));
 
-    listen<{ sessionId: string; error: string }>("octopus://session-error", (ev) => {
+    listen<{ sessionId: string; error: string }>("octopush://session-error", (ev) => {
       push({
         level: "error",
         title: "Session error",

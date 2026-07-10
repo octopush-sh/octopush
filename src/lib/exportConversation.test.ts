@@ -18,7 +18,7 @@ describe("conversationToMarkdown", () => {
     expect(md).toContain("# My chat");
     expect(md).toContain("## You");
     expect(md).toContain("hello");
-    expect(md).toContain("## Octopus");
+    expect(md).toContain("## Octopush");
     expect(md).toContain("claude-sonnet-4-6");
     expect(md).toContain("hi there");
   });

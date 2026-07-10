@@ -207,8 +207,8 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     await renderIntegrationsPane();
 
     expect(await screen.findByText(/project links/i)).toBeInTheDocument();
-    expect(screen.getByText("Octopush")).toBeInTheDocument();
-    expect(screen.getByText("Sandbox")).toBeInTheDocument();
+    expect(screen.getByTitle("Octopush")).toBeInTheDocument();
+    expect(screen.getByTitle("Sandbox")).toBeInTheDocument();
 
     const inputs = screen.getAllByPlaceholderText(/project key/i) as HTMLInputElement[];
     expect(inputs[0].value).toBe("CLPNSNS");

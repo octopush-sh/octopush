@@ -7,7 +7,7 @@ export function ShortcutsPane() {
       <PaneHeader
         eyebrow="Shortcuts"
         title="The grammar of the keyboard."
-        subtitle="A reference of every keybinding Octopus respects."
+        subtitle="A reference of every keybinding Octopush respects."
       />
 
       <div className="max-w-[640px]">

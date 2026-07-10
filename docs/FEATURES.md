@@ -137,7 +137,7 @@
 
 ### Toasts & notifications
 - **Toast system** — Bottom-right stacked toasts (info/success/warning/error), auto-dismiss after `timeout` (default 5000ms) or manual `X`; imperative global `pushToast(...)`. _Support:_ `src/components/Toasts.tsx`. _Entry:_ programmatic across the app.
-- **Backend-event toasts** — Listens for `octopus://budget-warning`, `octopus://session-error`, `pty://exit` and raises matching toasts. _Support:_ `Toasts.tsx`.
+- **Backend-event toasts** — Listens for `octopush://budget-warning`, `octopush://session-error`, `pty://exit` and raises matching toasts. _Support:_ `Toasts.tsx`.
 - **Startup "restored sessions" toast** — Fires once if any terminals were restored. _Support:_ `App.tsx`.
 - **Budget-threshold toasts** — On chat-stream completion, fires 50% (info) / 80% (warning) / 100% (error, "Budget cap hit — Send blocked") toasts once per threshold per scope. _Support:_ `App.tsx`; `budgetsStore.notifiedThresholds`.
 - **Attention chime** — Background chat/terminal completions ring a synthesized two-note brass chime (~250ms), rate-limited to one per 2s, with an AudioContext autoplay-unlock on first gesture; toggle in Settings → General. _Support:_ `src/stores/attentionStore.ts`. _Entry:_ automatic.
@@ -636,9 +636,9 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### Session restore & env injection
 - **`restore_active_sessions`** — On `.setup()`, re-spawns a PTY for each `Active`/`Idle` session, re-applying ContextGuard env + the token hook; marks `Error` on failure. _Support:_ `lib.rs`.
-- **`ContextGuard::auto_configure`** — Produces the isolated PTY env: `HISTFILE` (per-session isolated history), `OCTOPUS_PROJECT_TYPE` (Rust/Node/Python/Go/Java/Ruby/Unknown), `OCTOPUS_GIT_BRANCH`. _Support:_ `context_guard.rs`.
+- **`ContextGuard::auto_configure`** — Produces the isolated PTY env: `HISTFILE` (per-session isolated history), `OCTOPUSH_PROJECT_TYPE` (Rust/Node/Python/Go/Java/Ruby/Unknown), `OCTOPUSH_GIT_BRANCH`. _Support:_ `context_guard.rs`.
 - **Context-file detection** — Detects `CLAUDE.md`, `.claude/settings.json`, `AGENTS.md`, `GEMINI.md`, `.cursorrules`, `.github/copilot-instructions.md`, `CONVENTIONS.md` (stored on the session, not exported). _Support:_ `context_guard.rs`.
-- **`OCTOPUS_MODEL` injection** — `create_session` injects the model id so CLI agents can read it. _Support:_ `commands.rs`.
+- **`OCTOPUSH_MODEL` injection** — `create_session` injects the model id so CLI agents can read it. _Support:_ `commands.rs`.
 - **Token-scan output hook** — The per-chunk `OutputHook` runs `token_engine::scan_pty_output` → `TokenEngine.record`. _Support:_ `commands.rs`, `lib.rs`.
 
 ### xterm.js front-end (TerminalPane)
@@ -652,12 +652,12 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### UI surfaces
 - **CompanionTerminals** — Run-mode terminal list with status dots, `+`, inline rename, close, restored badge (see §1). _Support:_ `CompanionTerminals.tsx`.
-- **SessionSidebar / NewSessionDialog** — The legacy "session" model UI: a session list with status dot, icon, name, project•model, cost•tokens, budget gauge, tags; new-session dialog with template/name/root/model (sets `OCTOPUS_MODEL`)/icon/color/tags. _Support:_ `SessionSidebar.tsx`, `NewSessionDialog.tsx` (predates the Atelier redesign). _Entry:_ ⌘T.
+- **SessionSidebar / NewSessionDialog** — The legacy "session" model UI: a session list with status dot, icon, name, project•model, cost•tokens, budget gauge, tags; new-session dialog with template/name/root/model (sets `OCTOPUSH_MODEL`)/icon/color/tags. _Support:_ `SessionSidebar.tsx`, `NewSessionDialog.tsx` (predates the Atelier redesign). _Entry:_ ⌘T.
 
 ### Notable implementation details
 - **Why out-of-process** — PTYs are owned by their spawner; the split lets shells survive app restarts/auto-updates (like JetBrains/VS Code). Protocol v2 forces a one-time daemon replacement that deploys the eager-fd-release + `remove` fixes; running a pre-v2 and v2 build simultaneously makes them fight over the single daemon.
 - **Restart flow** — App quits → daemon + shells keep running. Relaunch → reconnect, `list_terminals` reconciles DB rows with live daemon ids (`running`/`restored`); each `TerminalPane` calls `spawn_or_attach` (replays scrollback, fires `pty://reattached`).
-- **Env injection summary** — Curated host-env allowlist + `TERM`/`COLORTERM` (daemon) → `HISTFILE`/`OCTOPUS_PROJECT_TYPE`/`OCTOPUS_GIT_BRANCH` (ContextGuard) → `OCTOPUS_MODEL` (session create). Login shell in the project cwd.
+- **Env injection summary** — Curated host-env allowlist + `TERM`/`COLORTERM` (daemon) → `HISTFILE`/`OCTOPUSH_PROJECT_TYPE`/`OCTOPUSH_GIT_BRANCH` (ContextGuard) → `OCTOPUSH_MODEL` (session create). Login shell in the project cwd.
 
 ---
 
@@ -806,7 +806,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 ## 10. Settings, Theming, Updates & Platform
 
 ### Settings shell & navigation
-- **Settings overlay** — Full-screen overlay (not a modal); header eyebrow `Preferences` + serif `Octopus` + `ESC · CLOSE`. _Support:_ `Settings.tsx`. _Entry:_ top-bar gear; `⌘,` (General); `⌘⇧T` (Usage).
+- **Settings overlay** — Full-screen overlay (not a modal); header eyebrow `Preferences` + serif `Octopush` + `ESC · CLOSE`. _Support:_ `Settings.tsx`. _Entry:_ top-bar gear; `⌘,` (General); `⌘⇧T` (Usage).
 - **Grouped master-detail nav** — 4 groups: **Setup** (General, Editor), **Intelligence** (Models, Usage), **Connections** (Integrations), **App** (Appearance, Shortcuts, Privacy, About). Active tab brass; pane crossfades. _Support:_ `lib/settingsTabs.ts`, `Settings.tsx`.
 - **Escape handling** — Capture-phase Esc closes but always `preventDefault`s (never exits macOS full-screen); defers to a stacked ModalShell; ignores Esc in inputs. _Support:_ `Settings.tsx`.
 

@@ -1,4 +1,4 @@
-# Octopus Design System — Cheatsheet
+# Octopush Design System — Cheatsheet
 
 One‑page reference for **Atelier in Onyx & Brass**. For the full design, motion, and rollout, see [`superpowers/specs/2026-05-16-octopus-ux-redesign-design.md`](superpowers/specs/2026-05-16-octopus-ux-redesign-design.md).
 
@@ -115,7 +115,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
   className="border border-octo-hairline rounded-lg px-3 py-2 bg-octo-onyx
              text-octo-ivory focus:border-octo-brass-dim
              placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
-  placeholder="Ask Octopus anything…"
+  placeholder="Ask Octopush anything…"
 />
 ```
 

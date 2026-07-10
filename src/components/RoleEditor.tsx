@@ -305,10 +305,10 @@ export function RoleEditor({ initial, onSaved, onClose }: Props) {
           />
         </div>
 
-        {/* ── Brief ("Octopus reads your role as...") ─────────────────── */}
+        {/* ── Brief ("Octopush reads your role as...") ─────────────────── */}
         <div className="mx-[18px] border-t border-octo-hairline pb-[4px] pt-[13px]">
           <p className="mb-[9px] font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute">
-            Octopus reads your role as
+            Octopush reads your role as
           </p>
           <p className="text-[14px] leading-[2.0] text-octo-sage">
             {isAction ? (

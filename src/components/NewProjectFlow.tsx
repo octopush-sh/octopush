@@ -466,7 +466,7 @@ export function NewProjectFlow({ onBack }: Props) {
               Clone a repository.
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
-              Paste the remote URL and Octopus will detect the name automatically.
+              Paste the remote URL and Octopush will detect the name automatically.
             </p>
 
             <div className="mt-8 max-w-[520px] space-y-5">
@@ -605,7 +605,7 @@ export function NewProjectFlow({ onBack }: Props) {
                   SSH KEY · {sshKeyMissingHost}
                 </div>
                 <p className="text-[13px] leading-[1.55] text-octo-sage">
-                  Octopus couldn't find an SSH key in your agent for{" "}
+                  Octopush couldn't find an SSH key in your agent for{" "}
                   <span className="font-mono text-octo-ivory">{sshKeyMissingHost}</span>.
                   Add one in a terminal, then click{" "}
                   <em className="font-serif text-octo-ivory">Try again</em>:
@@ -614,7 +614,7 @@ export function NewProjectFlow({ onBack }: Props) {
                   ssh-add ~/.ssh/id_ed25519
                 </div>
                 <p className="text-[13px] leading-[1.55] text-octo-sage">
-                  Or paste an HTTPS URL instead — Octopus will ask for a Personal Access Token.
+                  Or paste an HTTPS URL instead — Octopush will ask for a Personal Access Token.
                 </p>
                 <div className="flex gap-3">
                   <button

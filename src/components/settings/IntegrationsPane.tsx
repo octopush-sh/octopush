@@ -1,4 +1,4 @@
-// Settings → Integrations — external services Octopus connects to: the issue
+// Settings → Integrations — external services Octopush connects to: the issue
 // tracker (master-detail, Jira today), the bundled Octopush MCP server for
 // coding agents, and the stdio MCP servers whose tools appear in chat.
 import { useEffect, useState } from "react";
@@ -15,7 +15,7 @@ export function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void
       <PaneHeader
         eyebrow="Integrations"
         title="Connect your tools."
-        subtitle="Wire up external services so Octopus can surface context right where you work."
+        subtitle="Wire up external services so Octopush can surface context right where you work."
       />
 
       {/* ── Issue tracking — master-detail over trackers ── */}
