@@ -164,7 +164,7 @@ describe("terminalsStore — createTerminal", () => {
     const existing = makeRecord(ws, "Main", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: existing.id, label: existing.label, position: 0, running: false, restored: false }],
+        [ws]: [{ id: existing.id, label: existing.label, position: 0, running: false, busy: false, restored: false }],
       },
       activeByWs: { [ws]: existing.id },
     });
@@ -214,7 +214,7 @@ describe("terminalsStore — renameTerminal", () => {
     const rec = makeRecord(ws, "Old", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Old", position: 0, running: false, restored: false }],
+        [ws]: [{ id: rec.id, label: "Old", position: 0, running: false, busy: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -236,7 +236,7 @@ describe("terminalsStore — renameTerminal", () => {
     const rec = makeRecord(ws, "Original", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Original", position: 0, running: false, restored: false }],
+        [ws]: [{ id: rec.id, label: "Original", position: 0, running: false, busy: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -253,6 +253,23 @@ describe("terminalsStore — renameTerminal", () => {
 describe("terminalsStore — deleteTerminal", () => {
   beforeEach(() => resetStore());
 
+  it("setBusy toggles the busy flag and markRunning(false) clears it", () => {
+    const ws = "ws-busy";
+    useTerminalsStore.setState({
+      terminalsByWs: {
+        [ws]: [{ id: "t1", label: "Main", position: 0, running: true, busy: false, restored: false }],
+      },
+      activeByWs: { [ws]: "t1" },
+    });
+
+    useTerminalsStore.getState().setBusy(ws, "t1", true);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].busy).toBe(true);
+
+    // A dead session can't be busy — stopping the PTY clears it.
+    useTerminalsStore.getState().markRunning(ws, "t1", false);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].busy).toBe(false);
+  });
+
   it("removes terminal from list", async () => {
     const ws = "ws-delete";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
@@ -260,7 +277,7 @@ describe("terminalsStore — deleteTerminal", () => {
     const rec = makeRecord(ws, "Main", 0);
     useTerminalsStore.setState({
       terminalsByWs: {
-        [ws]: [{ id: rec.id, label: "Main", position: 0, running: false, restored: false }],
+        [ws]: [{ id: rec.id, label: "Main", position: 0, running: false, busy: false, restored: false }],
       },
       activeByWs: { [ws]: rec.id },
     });
@@ -275,9 +292,9 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-active";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-a", label: "A", position: 0, running: false, restored: false };
-    const b = { id: "t-b", label: "B", position: 1, running: false, restored: false };
-    const c = { id: "t-c", label: "C", position: 2, running: false, restored: false };
+    const a = { id: "t-a", label: "A", position: 0, running: false, busy: false, restored: false };
+    const b = { id: "t-b", label: "B", position: 1, running: false, busy: false, restored: false };
+    const c = { id: "t-c", label: "C", position: 2, running: false, busy: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b, c] },
@@ -296,8 +313,8 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-last";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-a2", label: "A", position: 0, running: false, restored: false };
-    const b = { id: "t-b2", label: "B", position: 1, running: false, restored: false };
+    const a = { id: "t-a2", label: "A", position: 0, running: false, busy: false, restored: false };
+    const b = { id: "t-b2", label: "B", position: 1, running: false, busy: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b] },
@@ -313,8 +330,8 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-nonactive";
     mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
 
-    const a = { id: "t-na-a", label: "A", position: 0, running: false, restored: false };
-    const b = { id: "t-na-b", label: "B", position: 1, running: false, restored: false };
+    const a = { id: "t-na-a", label: "A", position: 0, running: false, busy: false, restored: false };
+    const b = { id: "t-na-b", label: "B", position: 1, running: false, busy: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b] },
@@ -330,7 +347,7 @@ describe("terminalsStore — deleteTerminal", () => {
     const ws = "ws-delete-fail";
     mockIpc.deleteTerminal.mockRejectedValueOnce(new Error("daemon unreachable"));
 
-    const t = { id: "t-fail", label: "Main", position: 0, running: true, restored: false };
+    const t = { id: "t-fail", label: "Main", position: 0, running: true, busy: false, restored: false };
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [t] },
       activeByWs: { [ws]: t.id },
@@ -354,8 +371,8 @@ describe("terminalsStore — load/mutation races", () => {
 
   it("discards a stale loadTerminals result after an interleaved delete", async () => {
     const ws = "ws-stale-load";
-    const a = { id: "t-stale-a", label: "A", position: 0, running: false, restored: false };
-    const b = { id: "t-stale-b", label: "B", position: 1, running: false, restored: false };
+    const a = { id: "t-stale-a", label: "A", position: 0, running: false, busy: false, restored: false };
+    const b = { id: "t-stale-b", label: "B", position: 1, running: false, busy: false, restored: false };
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [a, b] },
       activeByWs: { [ws]: a.id },
@@ -439,7 +456,7 @@ describe("terminalsStore — markRunning", () => {
 
   it("sets running true/false on the targeted terminal", () => {
     const ws = "ws-running";
-    const t = { id: "t-run", label: "Main", position: 0, running: false, restored: false };
+    const t = { id: "t-run", label: "Main", position: 0, running: false, busy: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [ws]: [t] },
@@ -486,8 +503,8 @@ describe("terminalsStore — workspace isolation", () => {
     const wsA = "ws-iso-rename-a";
     const wsB = "ws-iso-rename-b";
 
-    const tA = { id: "ti-a", label: "A", position: 0, running: false, restored: false };
-    const tB = { id: "ti-b", label: "B", position: 0, running: false, restored: false };
+    const tA = { id: "ti-a", label: "A", position: 0, running: false, busy: false, restored: false };
+    const tB = { id: "ti-b", label: "B", position: 0, running: false, busy: false, restored: false };
 
     useTerminalsStore.setState({
       terminalsByWs: { [wsA]: [tA], [wsB]: [tB] },

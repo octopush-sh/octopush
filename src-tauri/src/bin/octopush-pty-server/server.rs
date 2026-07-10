@@ -122,6 +122,10 @@ pub fn run_accept_loop(
                         if sess.check_attention(fg) {
                             sess.emit_attention();
                         }
+                        // Continuous "a command is running" signal for the rail.
+                        if let Some(busy) = sess.check_foreground(fg) {
+                            sess.emit_foreground(busy);
+                        }
                     }
                 }
             }

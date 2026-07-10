@@ -22,9 +22,11 @@ SQLite store the desktop app uses.
 - **Hand-rolled protocol.** JSON-RPC 2.0 over stdio, newline-delimited, written
   against `serde_json` only (no SDK dependency). Synchronous loop — one rusqlite
   connection, one thread.
-- **Read-and-author, never execute.** The server never runs a pipeline, spends
-  tokens, or mutates a git working tree. Pipelines are saved as reusable
-  templates; runs are staged in `draft` for you to launch from the app.
+- **Read-and-author, never execute.** The server never runs a pipeline or spends
+  tokens. Pipelines are saved as reusable templates; runs are staged in `draft`
+  for you to launch from the app. The single git mutation it performs is
+  `create_workspace`, which materialises a worktree (the same thing the app's
+  workspace creator does).
 
 ### Files
 
@@ -47,6 +49,7 @@ SQLite store the desktop app uses.
 | `list_projects` | read | Open projects (git repos). |
 | `list_workspaces` | read | Workspaces (worktrees) of a project. |
 | `get_workspace` | read | One workspace: branch, path, status, linked issue. |
+| `create_workspace` | author | Ensure a workspace for a branch (explicit branch used **verbatim**; task-derived ones slugified). Returns `status`: created \| adopted \| existed \| restored. Reuses a tracked workspace, **adopts** an already-checked-out branch rather than failing, else creates a worktree. Never duplicates. The one tool that touches git. Shows in the rail on next focus/refresh. |
 | `link_workspace_issue` | author | Link/unlink a workspace to an issue key (metadata only). |
 | `create_run` | author | Stage a run in `draft` from a pipeline + task (does **not** start it). |
 | `list_runs` | read | Runs of a workspace, newest first. |
@@ -100,6 +103,5 @@ transport; the handshake is the standard `initialize` → `notifications/initial
 - **Execution control-plane** (hybrid): start a staged run — delegated to the
   running app when open, or headless when not. Gated behind explicit opt-in
   because it spends tokens and mutates the worktree.
-- **Workspace creation** (creates a git worktree + branch).
 - **TALK / REVIEW** surfaces: one-shot chat turn, AI review of a diff.
 - Issue-tracker reads (Jira), git status/diff context tools.

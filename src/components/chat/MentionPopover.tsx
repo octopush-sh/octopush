@@ -17,6 +17,7 @@ export function MentionPopover({ items, activeIndex, onSelect, onHover }: Props)
     <div
       className="octo-pop-in absolute bottom-full left-0 z-20 mb-1.5 max-h-64 w-[min(28rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg"
       role="listbox"
+      id="mention-popover"
       aria-label="Worktree files"
     >
       <div className="px-3 py-1 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
@@ -30,6 +31,7 @@ export function MentionPopover({ items, activeIndex, onSelect, onHover }: Props)
         return (
           <button
             key={path}
+            id={`mention-opt-${i}`}
             type="button"
             role="option"
             aria-selected={active}

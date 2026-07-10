@@ -206,7 +206,7 @@ step("Writing latest.json");
 // both `darwin-aarch64` and `darwin-x86_64` to the same tarball URL.
 // The Tauri updater on each client picks whichever key matches its
 // host arch — both resolve to the same lipo-merged .app.tar.gz.
-const releaseUrl = `https://github.com/johnatan-velez/octopush/releases/download/v${newVersion}/${encodeURIComponent(
+const releaseUrl = `https://github.com/octopush-sh/octopush/releases/download/v${newVersion}/${encodeURIComponent(
   tarball,
 )}`;
 
@@ -285,5 +285,5 @@ ok(
 );
 console.log("");
 console.log(
-  `   ↗ https://github.com/johnatan-velez/octopush/releases/tag/v${newVersion}`,
+  `   ↗ https://github.com/octopush-sh/octopush/releases/tag/v${newVersion}`,
 );

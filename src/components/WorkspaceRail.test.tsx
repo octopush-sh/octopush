@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { WorkspaceRail, type ProjectGroup } from "./WorkspaceRail";
+import { useAttentionStore } from "../stores/attentionStore";
 import type { Workspace } from "../lib/types";
 
 function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
@@ -400,5 +401,94 @@ describe("WorkspaceRail", () => {
       }
     });
     expect(activeRowFound).toBe(true);
+  });
+
+  it("shows the marching processing bar when a workspace is running", () => {
+    const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    const { container, rerender } = render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        runningByWs={{}}
+      />,
+    );
+    // Not running → no processing bar.
+    expect(container.querySelector("[data-running-bar]")).toBeNull();
+
+    rerender(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        runningByWs={{ a: true }}
+      />,
+    );
+    // Running → the marching bar appears, and the tooltip reflects it.
+    expect(container.querySelector("[data-running-bar]")).not.toBeNull();
+    expect(screen.getByTitle(/Alpha — working/i)).toBeInTheDocument();
+  });
+
+  it("suppresses the attention pulse while a workspace is running (mutually exclusive)", () => {
+    const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    // Seed an attention flag for the workspace.
+    useAttentionStore.setState({ flagsByWs: { a: { kind: "chat", at: Date.now() } } });
+
+    const { container, rerender } = render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        runningByWs={{}}
+      />,
+    );
+    // Flag present, not running → the monogram pulses.
+    expect(container.querySelector(".animate-attention-pulse")).not.toBeNull();
+
+    rerender(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        runningByWs={{ a: true }}
+      />,
+    );
+    // Running wins: the bar marches, the pulse is gone.
+    expect(container.querySelector("[data-running-bar]")).not.toBeNull();
+    expect(container.querySelector(".animate-attention-pulse")).toBeNull();
+
+    useAttentionStore.setState({ flagsByWs: {} });
+  });
+
+  it("keeps the attention pulse in the collapsed rail even while running (no bar there)", () => {
+    const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    useAttentionStore.setState({ flagsByWs: { a: { kind: "chat", at: Date.now() } } });
+
+    const { container } = render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={true}
+        onCustomize={vi.fn()}
+        runningByWs={{ a: true }}
+      />,
+    );
+    // Collapsed has no bar to show, so running must NOT swallow the pulse.
+    expect(container.querySelector("[data-running-bar]")).toBeNull();
+    expect(container.querySelector(".animate-attention-pulse")).not.toBeNull();
+
+    useAttentionStore.setState({ flagsByWs: {} });
   });
 });

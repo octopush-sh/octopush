@@ -1,10 +1,10 @@
 import { SegmentedControl } from "../controls/SegmentedControl";
 import { useChatStore, type Effort } from "../../stores/chatStore";
 
-const OPTIONS: { value: Effort; label: string }[] = [
-  { value: "swift", label: "Swift" },
-  { value: "standard", label: "Standard" },
-  { value: "deep", label: "Deep" },
+const OPTIONS: { value: Effort; label: string; title: string }[] = [
+  { value: "swift", label: "Swift", title: "Swift · up to 8K output tokens · fastest, lowest cost" },
+  { value: "standard", label: "Standard", title: "Standard · up to 32K output tokens · balanced (default)" },
+  { value: "deep", label: "Deep", title: "Deep · up to 64K output tokens · longest answers, highest cost" },
 ];
 
 /**

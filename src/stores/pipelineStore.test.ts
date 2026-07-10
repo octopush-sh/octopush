@@ -42,6 +42,37 @@ describe("pipelineStore", () => {
     expect(usePipelineStore.getState().pipelines).toHaveLength(0);
   });
 
+  it("replaces the list on repeated calls (focus-driven refresh is safe to call unconditionally)", async () => {
+    (ipc.listPipelines as any).mockResolvedValue(SAMPLE);
+    await usePipelineStore.getState().load();
+    expect(usePipelineStore.getState().pipelines).toHaveLength(1);
+
+    const externallyAuthored = [
+      ...SAMPLE,
+      {
+        pipeline: { id: "p2", name: "MCP Pipeline", description: "d2", isBuiltin: false, createdAt: "t2" },
+        stages: [
+          { id: "s2", pipelineId: "p2", position: 0, role: "plan", agentModel: "m", substrate: "api", checkpoint: false },
+        ],
+      },
+    ];
+    (ipc.listPipelines as any).mockResolvedValue(externallyAuthored);
+    await usePipelineStore.getState().load();
+    expect(usePipelineStore.getState().pipelines).toHaveLength(2);
+    expect(usePipelineStore.getState().pipelines.map((p) => p.pipeline.id)).toEqual(["p1", "p2"]);
+  });
+
+  it("clears a previous error once a repeated call succeeds", async () => {
+    (ipc.listPipelines as any).mockRejectedValue(new Error("boom"));
+    await usePipelineStore.getState().load();
+    expect(usePipelineStore.getState().error).toBe("boom");
+
+    (ipc.listPipelines as any).mockResolvedValue(SAMPLE);
+    await usePipelineStore.getState().load();
+    expect(usePipelineStore.getState().error).toBeNull();
+    expect(usePipelineStore.getState().pipelines).toHaveLength(1);
+  });
+
   it("save calls savePipeline and reloads the list", async () => {
     (ipc.savePipeline as any) = vi.fn().mockResolvedValue("new-id");
     (ipc.listPipelines as any).mockResolvedValue([]);

@@ -16,6 +16,8 @@ export function ShortcutsPane() {
           <Shortcut keys="⌘⇧1" desc="Talk mode" />
           <Shortcut keys="⌘⇧2" desc="Run mode" />
           <Shortcut keys="⌘⇧3" desc="Review mode" />
+          <Shortcut keys="⌘⇧D" desc="Direct mode" />
+          <Shortcut keys="⌘⇧M" desc="Mission Control" />
           <Shortcut keys="⌘\\" desc="Toggle companion" />
         </ShortcutGroup>
 

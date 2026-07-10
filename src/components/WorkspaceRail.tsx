@@ -56,6 +56,10 @@ interface Props {
   gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
   /** Open PR per workspace id (null = none), for the PR indicator (§4.3). */
   prByWs?: Record<string, Pr | null>;
+  /** Per-workspace "actively processing" signal (TALK streaming / RUN executing
+   *  / DIRECT run). When true the row's identity bar animates; mutually
+   *  exclusive with the attention pulse. */
+  runningByWs?: Record<string, boolean>;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
   /** Persist a new project order (ids top→bottom). */
@@ -87,6 +91,7 @@ export function WorkspaceRail({
   onReopenProject,
   gitSummaryByWs,
   prByWs,
+  runningByWs,
   isCollapsed,
   onReorderProjects,
 }: Props) {
@@ -166,6 +171,7 @@ export function WorkspaceRail({
                   activeWorkspaceId={activeWorkspaceId}
                   gitSummaryByWs={gitSummaryByWs}
                   prByWs={prByWs}
+                  runningByWs={runningByWs}
                   onSelect={onSelect}
                   onCustomize={onCustomize}
                   onContextMenu={onContextMenu}
@@ -215,6 +221,7 @@ interface SortableProjectGroupProps {
   activeWorkspaceId: string | null;
   gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
   prByWs?: Record<string, Pr | null>;
+  runningByWs?: Record<string, boolean>;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
@@ -226,7 +233,7 @@ interface SortableProjectGroupProps {
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
     project, projectIndex, projectCount, isCollapsed, q, collapsedProjects,
-    toggleProjectCollapsed, activeWorkspaceId, gitSummaryByWs, prByWs,
+    toggleProjectCollapsed, activeWorkspaceId, gitSummaryByWs, prByWs, runningByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
     dragEnabled,
   } = props;
@@ -277,6 +284,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
               ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
               behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
               hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+              running={!!runningByWs?.[ws?.id ?? ""]}
               onSelect={() => ws?.id && onSelect(ws.id)}
               onCustomize={() => ws?.id && onCustomize(ws.id)}
               onContextMenu={
@@ -417,6 +425,8 @@ interface WorkspaceRowProps {
   ahead?: number;
   behind?: number;
   hasOpenPr?: boolean;
+  /** Workspace is actively processing — animates the identity bar. */
+  running?: boolean;
   onSelect: () => void;
   onCustomize: () => void;
   onContextMenu?: (x: number, y: number) => void;
@@ -431,6 +441,7 @@ function WorkspaceRow({
   ahead,
   behind,
   hasOpenPr,
+  running,
   onSelect,
   onCustomize,
   onContextMenu,
@@ -452,7 +463,12 @@ function WorkspaceRow({
     return null;
   }
 
-  const showPulse = !!attentionFlag && !active;
+  // "Needs attention" and "processing" are mutually exclusive: a running
+  // workspace shows the marching bar, never the pulse. (A run that pauses or
+  // finishes drops `running`, at which point the attention flag may take over.)
+  // The suppression only applies in the expanded rail, where the bar exists to
+  // replace the pulse — the collapsed rail has no bar, so it keeps pulsing.
+  const showPulse = !!attentionFlag && !active && (isCollapsed || !running);
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
@@ -500,14 +516,36 @@ function WorkspaceRow({
   // Expanded mode — Console row: tint left edge (brass when active), a neutral
   // monogram, the name, then an aligned status-chip column. Brass marks only
   // the active workspace; git/PR status is sage/verdigris/mute.
+  const barColor = active ? "var(--color-octo-brass)" : tint?.accent || "transparent";
+
   return (
     <div
       className={`octo-fade-in group relative flex h-9 items-center gap-2.5 rounded-r-md border-l-[3px] pl-2.5 pr-2 transition-colors duration-[180ms] ${
         active ? "border-octo-brass bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
       }`}
-      style={active ? undefined : { borderLeftColor: tint?.accent || "transparent" }}
+      // While running, the static colored edge is replaced by the marching bar
+      // overlay below — hide the border so its solid color doesn't fill the
+      // gradient's gaps. Idle/active rendering is unchanged.
+      style={
+        running
+          ? { borderLeftColor: "transparent" }
+          : active
+            ? undefined
+            : { borderLeftColor: tint?.accent || "transparent" }
+      }
       onContextMenu={handleContextMenu}
     >
+      {/* Processing bar — marches over the identity edge while the workspace
+          works. aria-hidden: the running state is conveyed in the name tooltip. */}
+      {running && (
+        <span
+          aria-hidden
+          data-running-bar
+          className="rail-bar-running"
+          style={{ "--rail-bar": barColor } as React.CSSProperties}
+        />
+      )}
+
       {/* Monogram (24px, neutral — identity color lives on the row edge) */}
       <button
         type="button"
@@ -532,9 +570,11 @@ function WorkspaceRow({
         type="button"
         onClick={onSelect}
         title={
-          showPulse
-            ? `${workspace?.name || "Workspace"} — needs your attention${attentionFlag?.kind ? ` (${attentionFlag.kind})` : ""}`
-            : `${workspace?.name || "Workspace"} (right-click to customize)`
+          running
+            ? `${workspace?.name || "Workspace"} — working…`
+            : showPulse
+              ? `${workspace?.name || "Workspace"} — needs your attention${attentionFlag?.kind ? ` (${attentionFlag.kind})` : ""}`
+              : `${workspace?.name || "Workspace"} (right-click to customize)`
         }
         className="min-w-0 flex-1 cursor-pointer truncate bg-transparent text-left text-[13px] transition"
         style={{ color: active ? "var(--color-octo-ivory)" : "var(--color-octo-sage)" }}

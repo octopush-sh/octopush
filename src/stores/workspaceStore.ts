@@ -22,10 +22,24 @@ interface WorkspaceState {
   prByWs: Record<string, Pr | null>;
 
   load: (projectId: string) => Promise<void>;
+  /** Fetches + replaces workspacesByProjectId for the given ids; also syncs
+   *  the flat `workspaces` array (and reconciles `activeId`) when the
+   *  currently-open project is among them, so `activeWorkspace` resolves
+   *  correctly. Called on project-set changes, on archived-workspace
+   *  restore, and (unconditionally, since it's idempotent) on window focus —
+   *  the last picks up workspaces authored externally via octopush-mcp. */
   loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
   create: (projectId: string, projectPath: string, name: string, task: string,
            branch: string, fromBranch: string, setupScript: string) => Promise<Workspace>;
   select: (id: string | null) => void;
+  /** Self-heal for the currently-open project: call when `activeId` doesn't
+   *  resolve to a workspace even though `workspacesByProjectId[projectId]` is
+   *  non-empty — a stale/inconsistent state that must never render the
+   *  "No workspaces here yet" screen (see App.tsx's empty-project gate).
+   *  Syncs the flat `workspaces` array from the map and activates the
+   *  remembered workspace, falling back to the first. Returns false (no-op)
+   *  when the project genuinely has none. */
+  healActiveForProject: (projectId: string) => boolean;
   /**
    * Record (and persist) which workspace was last active for a project without
    * changing the currently-active workspace. Used when switching INTO another
@@ -125,12 +139,42 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         results.forEach(({ projectId, workspaces }) => {
           newByProject[projectId] = workspaces;
         });
-        return { workspacesByProjectId: newByProject, loading: false };
+        // `activeWorkspace` in App.tsx resolves against the flat `workspaces`
+        // array, not this map. If the currently-open project is among the
+        // refreshed ids, keep that array in sync too — otherwise a workspace
+        // that just appeared in the rail (via the map) resolves to null when
+        // clicked, blanking the canvas.
+        const currentProjectId = useProjectStore.getState().current?.id;
+        const current = currentProjectId
+          ? results.find((r) => r.projectId === currentProjectId)
+          : undefined;
+        if (!current) {
+          return { workspacesByProjectId: newByProject, loading: false };
+        }
+        const activeStillExists = current.workspaces.some((w) => w.id === s.activeId);
+        return {
+          workspacesByProjectId: newByProject,
+          loading: false,
+          workspaces: current.workspaces,
+          activeId: activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null),
+        };
       });
     } catch (err) {
       console.error("loadAllWorkspaces failed:", err);
       set({ loading: false });
     }
+  },
+
+  healActiveForProject: (projectId) => {
+    const state = get();
+    const wss = state.workspacesByProjectId[projectId] ?? [];
+    if (wss.length === 0) return false;
+    const remembered = state.lastActiveByProject[projectId];
+    const nextActive = remembered && wss.some((w) => w.id === remembered)
+      ? remembered
+      : wss[0].id;
+    set({ workspaces: wss, activeId: nextActive });
+    return true;
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript) => {
@@ -139,6 +183,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // Creating for any other project must not steal focus or corrupt that
     // list — it just lands in the per-project map for the rail (C3).
     const isActiveProject = useProjectStore.getState().current?.id === projectId;
+    // Creation is idempotent on (project, branch): the backend may return a
+    // workspace that already exists (e.g. reusing an existing branch). Upsert by
+    // id so the rail never grows a duplicate row / duplicate React key.
+    const upsert = (list: Workspace[]) => {
+      const i = list.findIndex((w) => w.id === ws.id);
+      if (i === -1) return [...list, ws];
+      const next = list.slice();
+      next[i] = ws;
+      return next;
+    };
     set((s) => {
       const updated = { ...s.lastActiveByProject, [projectId]: ws.id };
       try {
@@ -148,13 +202,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       return {
         // New workspaces sit at the end of their project's list (matching the
-        // backend's created_at ASC ordering).
-        workspaces: isActiveProject ? [...s.workspaces, ws] : s.workspaces,
+        // backend's created_at ASC ordering); reused ones replace in place.
+        workspaces: isActiveProject ? upsert(s.workspaces) : s.workspaces,
         activeId: isActiveProject ? ws.id : s.activeId,
         lastActiveByProject: updated,
         workspacesByProjectId: {
           ...s.workspacesByProjectId,
-          [projectId]: [...(s.workspacesByProjectId[projectId] || []), ws],
+          [projectId]: upsert(s.workspacesByProjectId[projectId] || []),
         },
       };
     });
