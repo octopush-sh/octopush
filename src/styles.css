@@ -276,6 +276,11 @@
   .octo-stage-pulse { animation: none; }
 }
 
+/* Hides scrollbar chrome on rails whose own affordance (chevron nav) signals
+   overflow — the element stays keyboard/trackpad scrollable. */
+.octo-no-scrollbar { scrollbar-width: none; }
+.octo-no-scrollbar::-webkit-scrollbar { display: none; }
+
 /* ── Direct premium polish · stability utilities ─────────────────
    S2: every live numeric value renders tabular so digits never shift width. */
 .octo-tabular { font-variant-numeric: tabular-nums; }
