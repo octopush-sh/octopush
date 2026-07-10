@@ -91,7 +91,7 @@ pub async fn create_session(
     guard.apply_env(&mut env);
 
     // Inject the selected model so CLI agents can read it.
-    env.insert("OCTOPUS_MODEL".into(), session.agent.model.clone());
+    env.insert("OCTOPUSH_MODEL".into(), session.agent.model.clone());
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -299,7 +299,7 @@ pub async fn switch_agent(
         // In the future, we'll detect which agent is running and
         // send the right command.
         //
-        // For now: update the OCTOPUS_MODEL env var hint for
+        // For now: update the OCTOPUSH_MODEL env var hint for
         // reference. The actual switch depends on the agent:
         // - aider: /model <name> works mid-session
         // - claude: no mid-session switch, applies on next launch
@@ -2027,11 +2027,11 @@ async fn clone_via_shell(
 
     if let Some(creds) = credentials {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%%s' \"$OCTOPUS_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%%s' \"$OCTOPUS_GIT_TOKEN\" ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n"
         );
 
         let mut tmp = tempfile::Builder::new()
-            .prefix("octopus-askpass-")
+            .prefix("octopush-askpass-")
             .suffix(".sh")
             .tempfile()
             .map_err(|e| AppError::Other(format!("failed to create askpass tempfile: {e}")))?;
@@ -2045,8 +2045,8 @@ async fn clone_via_shell(
             .map_err(|e| AppError::Other(format!("failed to chmod askpass: {e}")))?;
 
         let askpass_path = tmp.path().to_string_lossy().to_string();
-        env_overrides.push(("OCTOPUS_GIT_USERNAME".into(), creds.username.clone()));
-        env_overrides.push(("OCTOPUS_GIT_TOKEN".into(), creds.token.clone()));
+        env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.clone()));
+        env_overrides.push(("OCTOPUSH_GIT_TOKEN".into(), creds.token.clone()));
         env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
 
         _askpass_tmp = Some(tmp);

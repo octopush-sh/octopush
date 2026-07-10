@@ -49,11 +49,11 @@ impl ContextGuard {
 
         // Isolated history per session.
         env_vars.insert("HISTFILE".into(), shell_history_file.to_string_lossy().into_owned());
-        env_vars.insert("OCTOPUS_PROJECT_TYPE".into(),
+        env_vars.insert("OCTOPUSH_PROJECT_TYPE".into(),
             project_type.as_ref().map(|t| format!("{t:?}")).unwrap_or_default());
 
         if let Some(ref branch) = git_branch {
-            env_vars.insert("OCTOPUS_GIT_BRANCH".into(), branch.clone());
+            env_vars.insert("OCTOPUSH_GIT_BRANCH".into(), branch.clone());
         }
 
         Self {

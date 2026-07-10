@@ -13,7 +13,7 @@ export function conversationToMarkdown(title: string, messages: ChatMessage[]): 
       lines.push("## You", "", m.content.trim(), "");
     } else if (m.role === "assistant") {
       const model = m.model ? ` _(${m.model})_` : "";
-      lines.push(`## Octopus${model}`, "", m.content.trim(), "");
+      lines.push(`## Octopush${model}`, "", m.content.trim(), "");
     } else if (m.role === "error") {
       lines.push("> **Error:** " + m.content.trim(), "");
     } else if (m.role === "stopped") {

@@ -7,7 +7,7 @@ export function PrivacyPane() {
       <PaneHeader
         eyebrow="Privacy"
         title="What stays, what leaves."
-        subtitle="Octopus stores all chat history, API keys, and tokens locally. Provider API requests go directly to Anthropic/OpenAI from this machine."
+        subtitle="Octopush stores all chat history, API keys, and tokens locally. Provider API requests go directly to Anthropic/OpenAI from this machine."
       />
 
       <ul className="max-w-[640px] space-y-2 text-[13px] leading-[1.6] text-octo-sage">

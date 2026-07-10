@@ -179,7 +179,7 @@ export function NewSessionDialog({ open, onClose }: Props) {
             <span className="mb-1 block text-xs uppercase tracking-wider text-zinc-500">
               Model{" "}
               <span className="text-zinc-600">
-                (sets OCTOPUS_MODEL env var in terminal)
+                (sets OCTOPUSH_MODEL env var in terminal)
               </span>
             </span>
             <select

@@ -42,7 +42,7 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
         <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
           Preferences
         </span>
-        <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Octopus</h1>
+        <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Octopush</h1>
         <RoomClose onClose={onClose} label="Close settings" className="ml-auto" />
       </header>
 

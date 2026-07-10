@@ -427,7 +427,7 @@ function EmptyState() {
         Begin a conversation.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
-        Ask anything — Octopus will read files, run commands, and write changes
+        Ask anything — Octopush will read files, run commands, and write changes
         inside this workspace's worktree.
       </p>
       <BrassRule className="mt-2 w-7" />
