@@ -1,11 +1,50 @@
+import { useEffect } from "react";
+import { X } from "lucide-react";
+import { isModalOpen } from "./ModalShell";
+
 interface Props {
   projectName: string;
   onCreateWorkspace: () => void;
+  /** When set, renders a dismiss affordance (X icon + Escape) that leaves
+   *  this screen — present only when there's somewhere else to go (another
+   *  project with workspaces), so the screen never traps the user but also
+   *  never shows a dead control. */
+  onDismiss?: () => void;
+  /** Name of the workspace `onDismiss` returns to, shown in the tooltip. */
+  dismissWorkspaceName?: string;
 }
 
-export function EmptyProjectState({ projectName, onCreateWorkspace }: Props) {
+export function EmptyProjectState({
+  projectName,
+  onCreateWorkspace,
+  onDismiss,
+  dismissWorkspaceName,
+}: Props) {
+  useEffect(() => {
+    if (!onDismiss) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isModalOpen()) {
+        e.preventDefault();
+        onDismiss();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
+
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
+    <div className="relative flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          title={dismissWorkspaceName ? `Back to ${dismissWorkspaceName}` : "Dismiss"}
+          aria-label={dismissWorkspaceName ? `Back to ${dismissWorkspaceName}` : "Dismiss"}
+          className="absolute right-4 top-4 rounded p-1 text-octo-mute transition hover:text-octo-brass"
+        >
+          <X size={14} />
+        </button>
+      )}
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Project
       </div>

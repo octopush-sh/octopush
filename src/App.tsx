@@ -90,8 +90,10 @@ function App() {
   const updateCustomization = useWorkspaceStore((s) => s.updateCustomization);
   const selectWorkspace = useWorkspaceStore((s) => s.select);
   const rememberActiveForProject = useWorkspaceStore((s) => s.rememberActiveForProject);
+  const healActiveForProject = useWorkspaceStore((s) => s.healActiveForProject);
   const removeWorkspace = useWorkspaceStore((s) => s.remove);
   const workspacesByProjectId = useWorkspaceStore((s) => s.workspacesByProjectId);
+  const lastActiveByProject = useWorkspaceStore((s) => s.lastActiveByProject);
   const pruneProject = useWorkspaceStore((s) => s.pruneProject);
   const gitSummaryByWs = useWorkspaceStore((s) => s.gitSummaryByWs);
   const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
@@ -804,6 +806,47 @@ function App() {
   // ── Computed values ──
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
   const activeProject = recentProjects.find((p) => p.id === activeWorkspace?.projectId) ?? (project?.id === activeWorkspace?.projectId ? project : null) ?? null;
+
+  // Gates the empty-project screen so it can never lie: `activeWorkspace`
+  // resolving to null does NOT by itself mean the project has no workspaces
+  // — a stale flat array or a future bug could leave `activeId` pointing at
+  // nothing while `workspacesByProjectId` (what the rail itself renders
+  // from) still lists them. Only that map decides genuine emptiness.
+  const projectWorkspaceCount = project ? (workspacesByProjectId[project.id]?.length ?? 0) : 0;
+  const hasStaleActiveState = !activeWorkspace && projectWorkspaceCount > 0;
+
+  // Self-heal instead of ever showing "No workspaces here yet" for a project
+  // that actually has workspaces (2026-07-09 incident: an MCP-created
+  // workspace was visible in the rail but activeWorkspace resolved to null).
+  useEffect(() => {
+    if (hasStaleActiveState && project) {
+      healActiveForProject(project.id);
+    }
+  }, [hasStaleActiveState, project, healActiveForProject]);
+
+  // Dismiss/Escape target for the genuinely-empty screen — the nearest other
+  // project that already has workspaces loaded, so the screen is always
+  // leavable instead of trapping the user. No target (and no dismiss
+  // affordance) when no other project has workspaces yet, e.g. a brand-new
+  // install with a single empty project.
+  const dismissTarget = useMemo(() => {
+    if (!project) return null;
+    const candidateProject = recentProjects.find(
+      (p) => p.id !== project.id && (workspacesByProjectId[p.id]?.length ?? 0) > 0,
+    );
+    if (!candidateProject) return null;
+    const candidateWorkspaces = workspacesByProjectId[candidateProject.id] ?? [];
+    const remembered = lastActiveByProject[candidateProject.id];
+    const workspace = candidateWorkspaces.find((w) => w.id === remembered) ?? candidateWorkspaces[0];
+    return { projectPath: candidateProject.path, workspace };
+  }, [project, recentProjects, workspacesByProjectId, lastActiveByProject]);
+
+  const handleDismissEmptyState = useCallback(() => {
+    if (!dismissTarget) return;
+    rememberActiveForProject(dismissTarget.workspace.projectId, dismissTarget.workspace.id);
+    openProject(dismissTarget.projectPath);
+  }, [dismissTarget, rememberActiveForProject, openProject]);
+
   // Chat state in chatStore is keyed by the real workspace id (the store tracks
   // which thread is active internally). `activeChatId` is therefore the
   // workspace id; the active *thread* id (for highlighting the History row) is
@@ -1410,7 +1453,7 @@ function App() {
             {activeWorkspace ? <shell> : <EmptyState>} conditional was
             unmounting every running PTY whenever the user crossed that
             boundary. */}
-        <div className="flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
+        <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
           <CanvasSplit>
             <div className="relative w-full h-full min-w-0 flex-1 overflow-hidden">
               {/* Talk panel — chat for the active workspace. */}
@@ -1580,11 +1623,21 @@ function App() {
               ) : null;
             })()}
 
-            {/* Empty-project layer — overlays the canvas when there is no
-                active workspace. The shell underneath stays mounted so any
-                running terminals from other projects keep their PTYs and
-                scrollback intact. */}
-            {!activeWorkspace && (
+            {/* Empty-project layer — overlays the canvas when the project is
+                genuinely empty. The LEFT COLUMN div (immediately above,
+                `relative flex min-w-0 flex-1 ...`) is this layer's nearest
+                positioned ancestor, so `absolute inset-0` is scoped to that
+                column only — WorkspaceRail and PerfMonitorBar are siblings
+                further up the tree (outside LEFT COLUMN entirely) and stay
+                mounted/interactive underneath it. The shell underneath also
+                stays mounted so any running terminals from other projects
+                keep their PTYs and scrollback intact. While
+                `hasStaleActiveState` is true (a workspace exists but
+                `activeId` doesn't resolve to it yet) this deliberately
+                renders nothing — the effect above self-heals and the next
+                render picks up `activeWorkspace`, so the screen never lies
+                about a project having no workspaces. */}
+            {!activeWorkspace && !hasStaleActiveState && (
               <div className="absolute inset-0 z-40 bg-octo-bg octo-fade-in">
                 {showInlineCreator ? (
                   <WorkspaceCreator
@@ -1597,6 +1650,8 @@ function App() {
                   <EmptyProjectState
                     projectName={project.name}
                     onCreateWorkspace={() => setShowInlineCreator(true)}
+                    onDismiss={dismissTarget ? handleDismissEmptyState : undefined}
+                    dismissWorkspaceName={dismissTarget?.workspace.name}
                   />
                 )}
               </div>

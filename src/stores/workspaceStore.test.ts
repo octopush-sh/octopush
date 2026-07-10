@@ -159,6 +159,122 @@ describe("workspaceStore — load activation", () => {
   });
 });
 
+describe("workspaceStore — loadAllWorkspaces syncs the flat array (empty-state hardening)", () => {
+  beforeEach(() => resetStore());
+
+  it("syncs `workspaces` for the currently-open project so activeWorkspace never resolves to null", async () => {
+    // Simulates the 2026-07-09 incident: a workspace (e.g. authored
+    // externally via octopush-mcp) is only reflected in the rail map until
+    // loadAllWorkspaces runs. Before the fix, the flat `workspaces` array —
+    // what App.tsx's `activeWorkspace = workspaces.find(...)` resolves
+    // against — stayed stale, so clicking the new workspace in the rail blew
+    // away the canvas onto "No workspaces here yet".
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const stale = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [stale],
+      activeId: stale.id,
+      workspacesByProjectId: { "proj-1": [stale] },
+    });
+    const fresh = makeWorkspace("proj-1", "beta");
+    mockIpc.listWorkspaces.mockResolvedValueOnce([stale, fresh]);
+
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspaces.map((w) => w.id)).toEqual([stale.id, fresh.id]);
+    expect(s.workspacesByProjectId["proj-1"].map((w) => w.id)).toEqual([stale.id, fresh.id]);
+    // Previously-active workspace still exists, so activeId is untouched.
+    expect(s.activeId).toBe(stale.id);
+  });
+
+  it("falls back activeId to the first workspace when the active one vanished externally", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const gone = makeWorkspace("proj-1", "alpha");
+    const remaining = makeWorkspace("proj-1", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [gone, remaining],
+      activeId: gone.id,
+      workspacesByProjectId: { "proj-1": [gone, remaining] },
+    });
+    mockIpc.listWorkspaces.mockResolvedValueOnce([remaining]);
+
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+
+    expect(useWorkspaceStore.getState().activeId).toBe(remaining.id);
+  });
+
+  it("does not touch the flat array when refreshing a project other than the currently-open one", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [a],
+      activeId: a.id,
+      workspacesByProjectId: { "proj-1": [a] },
+    });
+    const b = makeWorkspace("proj-2", "beta");
+    mockIpc.listWorkspaces.mockResolvedValueOnce([b]);
+
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-2"]);
+
+    const s = useWorkspaceStore.getState();
+    expect(s.workspaces.map((w) => w.id)).toEqual([a.id]);
+    expect(s.activeId).toBe(a.id);
+    expect(s.workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([b.id]);
+  });
+});
+
+describe("workspaceStore — healActiveForProject (empty-state self-heal gate)", () => {
+  beforeEach(() => resetStore());
+
+  it("activates the remembered workspace when the project has workspaces but no active one resolves", () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-1", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [a, b] },
+      lastActiveByProject: { "proj-1": b.id },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(healed).toBe(true);
+    expect(s.workspaces.map((w) => w.id)).toEqual([a.id, b.id]);
+    expect(s.activeId).toBe(b.id);
+  });
+
+  it("falls back to the first workspace when nothing is remembered", () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [a] },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    expect(healed).toBe(true);
+    expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+  });
+
+  it("is a no-op when the project genuinely has zero workspaces — the true empty state", () => {
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [] },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(healed).toBe(false);
+    expect(s.activeId).toBeNull();
+    expect(s.workspaces).toEqual([]);
+  });
+});
+
 describe("workspaceStore — create (project-aware, C3)", () => {
   beforeEach(() => resetStore());
 
