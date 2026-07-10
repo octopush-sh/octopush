@@ -1512,6 +1512,49 @@ pub async fn request_run_pause(
     Ok(())
 }
 
+/// Hot-edit a pending, not-yet-started run stage: gate, instructions, model,
+/// max turns, and (for a looping review stage) loop mode. `None` for any
+/// field leaves it unchanged. Only the run's own `run_stages` row is written
+/// — the pipeline template is never touched. Rejects synchronously (a clear
+/// English error) if the run has finished or the stage has already started.
+#[tauri::command]
+pub async fn update_run_stage(
+    state: State<'_, AppState>,
+    run_id: String,
+    stage_id: String,
+    checkpoint: Option<bool>,
+    instructions: Option<String>,
+    agent_model: Option<String>,
+    max_iterations: Option<i64>,
+    loop_mode: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().update_run_stage(
+        &run_id,
+        &stage_id,
+        checkpoint,
+        instructions.as_deref(),
+        agent_model.as_deref(),
+        max_iterations,
+        loop_mode.as_deref(),
+    )
+}
+
+/// Re-run a finished (done/failed) stage and everything downstream of it, in
+/// place: same pipeline row, same run. Validates + resets synchronously (a
+/// guard rejection — e.g. the stage hasn't finished, or the run is currently
+/// driving — surfaces immediately), then resumes the drive in the background;
+/// the frontend follows progress via the existing `run://` events.
+#[tauri::command]
+pub async fn rerun_from_stage(
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+    stage_id: String,
+) -> AppResult<()> {
+    orch.prepare_rerun(&run_id, &stage_id)?;
+    Arc::clone(&*orch).resume_claimed_drive(run_id);
+    Ok(())
+}
+
 /// The persisted live journal for a stage, oldest first. Rows that fail to
 /// parse (shouldn't happen — we wrote them) are skipped rather than erroring.
 #[tauri::command]

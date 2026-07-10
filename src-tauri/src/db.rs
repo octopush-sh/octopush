@@ -2539,6 +2539,18 @@ impl Db {
         Ok(())
     }
 
+    /// Clear a run's terminal status so `prepare_rerun` can resume a
+    /// `completed` run past `drive_inner`'s early-return check. `paused` /
+    /// `running` runs are unaffected in practice (they already read as
+    /// resumable), this just makes `completed` resumable too.
+    pub fn reopen_run(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
     /// Set (or clear, with `None`) the run's optional spend cap.
     pub fn set_run_budget(&self, run_id: &str, budget_usd: Option<f64>) -> AppResult<()> {
         self.conn.execute(
@@ -2690,6 +2702,135 @@ impl Db {
             "UPDATE run_stages SET loop_iterations = loop_iterations + 1 WHERE id = ?1",
             params![stage_id],
         )?;
+        Ok(())
+    }
+
+    /// Zero a stage's loop-back counter. `reset_run_stage` deliberately
+    /// preserves `loop_iterations` (the ordinary loop-back path relies on
+    /// that to keep counting toward the cap) — `prepare_rerun` needs the
+    /// opposite when it rewinds a looping review stage, so it calls this
+    /// explicitly instead of `reset_run_stage`.
+    pub fn set_stage_loop_iterations(&self, stage_id: &str, iterations: i64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET loop_iterations = ?2 WHERE id = ?1",
+            params![stage_id, iterations],
+        )?;
+        Ok(())
+    }
+
+    /// Hot-edit a **pending, not-yet-started** run-stage row in place — the
+    /// validated write path behind the director's live gate-toggle / "Edit
+    /// stage" controls. Only ever touches `run_stages`; the pipeline template
+    /// is never written, so every other run created from that template is
+    /// unaffected. `None` for any field leaves it unchanged.
+    ///
+    /// The guard read + the UPDATE run inside one `Db` call, and callers only
+    /// ever reach `Db` through `Arc<Mutex<Db>>` — so this can't race the
+    /// orchestrator's own fresh `list_run_stages` read / `StageSpec` build
+    /// right before a stage starts (`orchestrator::run_stage_once`): an edit
+    /// either lands while the stage is still `pending` (and is honored when
+    /// the orchestrator reaches it) or is atomically rejected the moment the
+    /// stage has moved past `pending`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_run_stage(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        checkpoint: Option<bool>,
+        instructions: Option<&str>,
+        agent_model: Option<&str>,
+        max_iterations: Option<i64>,
+        loop_mode: Option<&str>,
+    ) -> AppResult<()> {
+        use crate::error::AppError;
+
+        let run_status: String = self
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::Other("run not found".into()))?;
+        if matches!(run_status.as_str(), "completed" | "aborted") {
+            return Err(AppError::Other(
+                "this run has finished — its stages can't be edited".into(),
+            ));
+        }
+
+        let (status, started_at, role, loop_target_position, loop_max_iterations): (
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            i64,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT status, started_at, role, loop_target_position, loop_max_iterations
+                 FROM run_stages WHERE id = ?1 AND run_id = ?2",
+                params![stage_id, run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::Other("stage not found".into()))?;
+
+        if status != "pending" || started_at.is_some() {
+            return Err(AppError::Other(format!(
+                "{} has already started — only stages that haven't begun can be edited",
+                role.replace('_', " ")
+            )));
+        }
+
+        if let Some(mode) = loop_mode {
+            if loop_target_position.is_none() || loop_max_iterations <= 0 {
+                return Err(AppError::Other(
+                    "only a looping review stage can switch loop mode".into(),
+                ));
+            }
+            if crate::orchestrator::types::LoopMode::from_db(mode).is_none() {
+                return Err(AppError::Other(format!("unknown loop mode '{mode}'")));
+            }
+        }
+        if let Some(model) = agent_model {
+            if model.trim().is_empty() {
+                return Err(AppError::Other("agent model can't be empty".into()));
+            }
+        }
+
+        if let Some(cp) = checkpoint {
+            self.conn.execute(
+                "UPDATE run_stages SET checkpoint = ?2 WHERE id = ?1",
+                params![stage_id, cp as i64],
+            )?;
+        }
+        if let Some(text) = instructions {
+            let trimmed = text.trim();
+            let stored: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+            self.conn.execute(
+                "UPDATE run_stages SET instructions = ?2 WHERE id = ?1",
+                params![stage_id, stored],
+            )?;
+        }
+        if let Some(model) = agent_model {
+            self.conn.execute(
+                "UPDATE run_stages SET agent_model = ?2 WHERE id = ?1",
+                params![stage_id, model],
+            )?;
+        }
+        if let Some(mt) = max_iterations {
+            self.conn.execute(
+                "UPDATE run_stages SET max_iterations = ?2 WHERE id = ?1",
+                params![stage_id, mt.clamp(1, 100)],
+            )?;
+        }
+        if let Some(mode) = loop_mode {
+            self.conn.execute(
+                "UPDATE run_stages SET loop_mode = ?2 WHERE id = ?1",
+                params![stage_id, mode],
+            )?;
+        }
         Ok(())
     }
 

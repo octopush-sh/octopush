@@ -65,6 +65,57 @@ pub(crate) fn ancestors_of(
     seen
 }
 
+/// Every stage downstream of `target_pos` (inclusive) — the inverse of
+/// [`ancestors_of`]. Used by `prepare_rerun` to find the full range a re-run
+/// must reset. Authored graph: any stage whose ancestor set contains
+/// `target_pos`, plus the target itself, so a sibling branch that doesn't
+/// depend on the target is left untouched. Legacy/linear run (no stage
+/// records a `parents` link): every stage at or after `target_pos`, mirroring
+/// `loop_back`'s full-contiguous-window fallback. Returned in position order.
+pub(crate) fn downstream_of(
+    stages: &[crate::db::RunStageRow],
+    target_pos: i64,
+) -> Vec<crate::db::RunStageRow> {
+    let authored = stages.iter().any(|s| !s.parents.is_empty());
+    stages
+        .iter()
+        .filter(|s| {
+            if authored {
+                s.position == target_pos || ancestors_of(stages, s.position).contains(&target_pos)
+            } else {
+                s.position >= target_pos
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// RAII claim on a run's `active` slot (see [`Orchestrator::claim_active`]).
+/// Dropping releases the claim — including on an early `?` return — so a
+/// rejected guard check or a mid-work error can never leave a run stuck as
+/// "executing" forever. Call [`ActiveGuard::forget`] to hand a still-held
+/// claim off to a later step instead of releasing it (e.g. the background
+/// drive that follows a synchronous `prepare_rerun`).
+struct ActiveGuard<'o> {
+    orchestrator: &'o Orchestrator,
+    run_id: String,
+    forgotten: bool,
+}
+
+impl<'o> ActiveGuard<'o> {
+    fn forget(mut self) {
+        self.forgotten = true;
+    }
+}
+
+impl<'o> Drop for ActiveGuard<'o> {
+    fn drop(&mut self) {
+        if !self.forgotten {
+            self.orchestrator.active.lock().remove(&self.run_id);
+        }
+    }
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -116,6 +167,20 @@ impl Orchestrator {
             cancels: Mutex::new(std::collections::HashMap::new()),
             pause_requests: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Atomically check-and-claim this run's `active` slot: the single
+    /// mutual-exclusion mechanism serializing a drive, a checkpoint
+    /// resolution, and a re-run preparation on the same run. `HashSet::insert`
+    /// is the atomic primitive — it reports whether the value was newly
+    /// inserted under the SAME lock acquisition that makes the check, so two
+    /// concurrent callers can never both observe "free" and both proceed.
+    /// Returns a guard that releases the claim on drop (see [`ActiveGuard`]).
+    fn claim_active(&self, run_id: &str, busy_msg: &str) -> AppResult<ActiveGuard<'_>> {
+        if !self.active.lock().insert(run_id.to_string()) {
+            return Err(AppError::Other(busy_msg.into()));
+        }
+        Ok(ActiveGuard { orchestrator: self, run_id: run_id.to_string(), forgotten: false })
     }
 
     fn runner_for(&self, substrate: &AgentSubstrate) -> Box<dyn AgentRunner> {
@@ -207,6 +272,30 @@ impl Orchestrator {
                 == Some(crate::orchestrator::types::LoopMode::Auto)
     }
 
+    /// Archive a stage's current attempt (if it produced anything — a
+    /// pending/unstarted stage with no artifact and no error isn't an
+    /// "attempt") and reset it to pending, retiring its spend so the run's
+    /// cost meter keeps counting work the reset is about to erase. Shared by
+    /// `loop_back` (partial in-lineage window) and `prepare_rerun` (full
+    /// downstream range) — the two places that discard a stage's attempt and
+    /// rewind it to run again.
+    fn archive_and_reset_stage(
+        &self,
+        run_id: &str,
+        stage: &crate::db::RunStageRow,
+        closing_feedback: Option<&str>,
+        reset_feedback: Option<&str>,
+    ) -> AppResult<()> {
+        if stage.artifact.is_some() || stage.error.is_some() {
+            self.db.lock().archive_stage_attempt(stage, closing_feedback)?;
+        }
+        self.db
+            .lock()
+            .retire_stage_cost(run_id, stage.cost_usd, stage.input_tokens, stage.output_tokens)?;
+        self.db.lock().reset_run_stage(&stage.id, None, reset_feedback)?;
+        Ok(())
+    }
+
     /// Reset the contiguous [target..=review] range to pending (re-running the
     /// target + intervening stages with `feedback` on the target), retiring the
     /// erased cost and bumping the loop counter. Shared by gated SendBack and the
@@ -230,16 +319,11 @@ impl Orchestrator {
                 None => true,
             };
             if in_window && feeds_review {
-                // Archive the attempt before the reset wipes it. Pending/unstarted
-                // stages (no artifact, no error) aren't attempts. The feedback that
-                // closed the iteration is recorded on the review row only.
-                if s.artifact.is_some() || s.error.is_some() {
-                    let cf = if s.id == review.id { feedback } else { None };
-                    self.db.lock().archive_stage_attempt(s, cf)?;
-                }
-                self.db.lock().retire_stage_cost(run_id, s.cost_usd, s.input_tokens, s.output_tokens)?;
+                // The feedback that closed the iteration is recorded on the
+                // review row only.
+                let cf = if s.id == review.id { feedback } else { None };
                 let fb = if s.position == target_pos { feedback } else { None };
-                self.db.lock().reset_run_stage(&s.id, None, fb)?;
+                self.archive_and_reset_stage(run_id, s, cf, fb)?;
             }
         }
         self.db.lock().increment_loop_iteration(&review.id)?;
@@ -707,17 +791,8 @@ impl Orchestrator {
     /// the budget gate — set only when the user just approved a budget pause
     /// (conscious override). The gate re-arms for every following stage.
     async fn run_to_pause_with(&self, run_id: &str, skip_budget_once: bool) -> AppResult<RunStatus> {
-        // Enforce single active drive.
-        {
-            let mut active = self.active.lock();
-            if active.contains(run_id) {
-                return Err(AppError::Other("run is already executing".into()));
-            }
-            active.insert(run_id.to_string());
-        }
-        let result = self.drive_inner(run_id, skip_budget_once).await;
-        self.active.lock().remove(run_id);
-        result
+        let _guard = self.claim_active(run_id, "run is already executing")?;
+        self.drive_inner(run_id, skip_budget_once).await
     }
 
     /// Park a pending stage behind a checkpoint because spend reached the run
@@ -903,11 +978,22 @@ impl Orchestrator {
     }
 
     /// Resolve a checkpoint and continue driving.
+    ///
+    /// Claims this run's `active` slot for the ENTIRE function — the action
+    /// match below (archiving, cost-retiring, resets) through the final
+    /// re-drive — not just the re-drive. Every mutating arm uses `?`, and the
+    /// held [`ActiveGuard`] releases on any of those early returns, so this
+    /// can never leak a stuck claim. This is what makes checkpoint resolution
+    /// and `prepare_rerun` mutually exclusive on the same run: without it, a
+    /// concurrent `rerun_from_stage` could reset rows this function is still
+    /// mutating (`spawn_resolve_checkpoint` fires this in the background —
+    /// the command that kicked it off has already returned).
     pub async fn resolve_checkpoint(
         &self,
         run_id: &str,
         action: CheckpointAction,
     ) -> AppResult<RunStatus> {
+        let _guard = self.claim_active(run_id, "run is already executing")?;
         let stages = self.db.lock().list_run_stages(run_id)?;
         let blocked = stages
             .iter()
@@ -1098,7 +1184,112 @@ impl Orchestrator {
             }
         }
 
-        self.run_to_pause_with(run_id, budget_override).await
+        // NOT `run_to_pause_with` — `_guard` above already holds this run's
+        // `active` claim for the whole function; claiming again would reject
+        // with "run is already executing".
+        self.drive_inner(run_id, budget_override).await
+    }
+
+    /// Validate + perform the synchronous reset for a director-initiated
+    /// re-run: guard checks, then archiving/retiring the target..downstream
+    /// range via `archive_and_reset_stage`, clearing CLI sessions/resume
+    /// flags and loop counters for that range, and reopening the run.
+    /// Synchronous and fast (no agent work), so a Tauri command can surface a
+    /// guard rejection to the frontend immediately, before the (potentially
+    /// long) resumed drive runs in the background.
+    ///
+    /// On success this claims — and KEEPS claimed — this run's `active` slot:
+    /// the caller is responsible for releasing it once the resumed drive
+    /// finishes (see `rerun_from_stage` below and `resume_claimed_drive`,
+    /// used by `commands::rerun_from_stage`). That makes "validate + reset +
+    /// resume" one atomic per-run section end to end — neither a concurrent
+    /// `resolve_checkpoint` nor a second `rerun_from_stage` can interleave
+    /// with it (see `ActiveGuard`/`claim_active`). On failure the claim is
+    /// released immediately — nothing to hand off.
+    pub(crate) fn prepare_rerun(&self, run_id: &str, stage_id: &str) -> AppResult<()> {
+        let guard =
+            self.claim_active(run_id, "this run is executing — stop the current stage first")?;
+        let result = self.prepare_rerun_locked(run_id, stage_id);
+        if result.is_ok() {
+            guard.forget();
+        }
+        result
+    }
+
+    fn prepare_rerun_locked(&self, run_id: &str, stage_id: &str) -> AppResult<()> {
+        let run = self
+            .db
+            .lock()
+            .get_run(run_id)?
+            .ok_or_else(|| AppError::Other("run not found".into()))?;
+        if run.status == "aborted" {
+            return Err(AppError::Other(
+                "this run was aborted — start a new run instead".into(),
+            ));
+        }
+        let stages = self.db.lock().list_run_stages(run_id)?;
+        let target = stages
+            .iter()
+            .find(|s| s.id == stage_id)
+            .ok_or_else(|| AppError::Other("stage not found".into()))?;
+        if !matches!(target.status.as_str(), "done" | "failed") {
+            return Err(AppError::Other(
+                "re-run applies to a finished stage — resolve the checkpoint or stop the stage first".into(),
+            ));
+        }
+
+        // Downstream stages may still be parked awaiting a checkpoint (e.g. a
+        // later review) — resetting them to pending invalidates that park;
+        // it re-gates on its own `checkpoint`/loop config when re-reached.
+        let range = downstream_of(&stages, target.position);
+        for s in &range {
+            self.archive_and_reset_stage(run_id, s, None, None)?;
+            // `reset_run_stage` deliberately preserves session/resume/loop
+            // state (loop-back relies on that) — a re-run wants the opposite:
+            // never resume the old CLI session, and start the loop fresh.
+            self.db.lock().set_stage_session(&s.id, None)?;
+            self.db.lock().set_stage_resume_pending(&s.id, false)?;
+            self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+        }
+        // `archive_and_reset_stage` already retired each stage's spend onto
+        // the run (append, never reset) — recompute folds that in.
+        self.recompute_run_cost(run_id)?;
+        self.db.lock().reopen_run(run_id)?;
+        self.emit_run_update(run_id);
+        Ok(())
+    }
+
+    /// Re-run a finished stage — and everything downstream of it — in place:
+    /// same pipeline row, same run, no restart, no reload. Used directly by
+    /// tests (fully awaited, deterministic); the Tauri command instead calls
+    /// `prepare_rerun` synchronously and resumes via `resume_claimed_drive` in
+    /// the background, so a guard rejection surfaces immediately without
+    /// blocking on the (possibly long) re-drive.
+    pub async fn rerun_from_stage(&self, run_id: &str, stage_id: &str) -> AppResult<RunStatus> {
+        self.prepare_rerun(run_id, stage_id)?;
+        let result = self.drive_inner(run_id, false).await;
+        self.active.lock().remove(run_id);
+        result
+    }
+
+    /// Spawn the resumed drive assuming the caller (`prepare_rerun`, called
+    /// synchronously just before this) already holds this run's `active`
+    /// claim — releases it once the drive finishes. Distinct from
+    /// `start_run`, which claims for itself: the two must never be chained
+    /// for the same call, or the claim would be taken twice and the second
+    /// attempt would reject with "run is already executing".
+    pub fn resume_claimed_drive(self: Arc<Self>, run_id: String) {
+        tokio::spawn(async move {
+            let result = self.drive_inner(&run_id, false).await;
+            self.active.lock().remove(&run_id);
+            if let Err(e) = result {
+                tracing::error!(run_id = %run_id, error = %e, "rerun drive failed");
+                self.events.emit(
+                    "run://error",
+                    serde_json::json!({ "runId": run_id, "error": e.to_string() }),
+                );
+            }
+        });
     }
 
     /// Signal the run's in-flight stage (if any) to stop. The substrate halts
