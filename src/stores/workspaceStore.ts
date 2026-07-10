@@ -32,6 +32,14 @@ interface WorkspaceState {
   create: (projectId: string, projectPath: string, name: string, task: string,
            branch: string, fromBranch: string, setupScript: string) => Promise<Workspace>;
   select: (id: string | null) => void;
+  /** Self-heal for the currently-open project: call when `activeId` doesn't
+   *  resolve to a workspace even though `workspacesByProjectId[projectId]` is
+   *  non-empty — a stale/inconsistent state that must never render the
+   *  "No workspaces here yet" screen (see App.tsx's empty-project gate).
+   *  Syncs the flat `workspaces` array from the map and activates the
+   *  remembered workspace, falling back to the first. Returns false (no-op)
+   *  when the project genuinely has none. */
+  healActiveForProject: (projectId: string) => boolean;
   /**
    * Record (and persist) which workspace was last active for a project without
    * changing the currently-active workspace. Used when switching INTO another
@@ -155,6 +163,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       console.error("loadAllWorkspaces failed:", err);
       set({ loading: false });
     }
+  },
+
+  healActiveForProject: (projectId) => {
+    const state = get();
+    const wss = state.workspacesByProjectId[projectId] ?? [];
+    if (wss.length === 0) return false;
+    const remembered = state.lastActiveByProject[projectId];
+    const nextActive = remembered && wss.some((w) => w.id === remembered)
+      ? remembered
+      : wss[0].id;
+    set({ workspaces: wss, activeId: nextActive });
+    return true;
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript) => {

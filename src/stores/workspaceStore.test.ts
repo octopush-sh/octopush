@@ -261,6 +261,57 @@ describe("workspaceStore — loadAllWorkspaces (focus-driven refresh)", () => {
   });
 });
 
+describe("workspaceStore — healActiveForProject (empty-state self-heal gate)", () => {
+  beforeEach(() => resetStore());
+
+  it("activates the remembered workspace when the project has workspaces but no active one resolves", () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-1", "beta");
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [a, b] },
+      lastActiveByProject: { "proj-1": b.id },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(healed).toBe(true);
+    expect(s.workspaces.map((w) => w.id)).toEqual([a.id, b.id]);
+    expect(s.activeId).toBe(b.id);
+  });
+
+  it("falls back to the first workspace when nothing is remembered", () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [a] },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    expect(healed).toBe(true);
+    expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+  });
+
+  it("is a no-op when the project genuinely has zero workspaces — the true empty state", () => {
+    useWorkspaceStore.setState({
+      workspaces: [],
+      activeId: null,
+      workspacesByProjectId: { "proj-1": [] },
+    });
+
+    const healed = useWorkspaceStore.getState().healActiveForProject("proj-1");
+
+    const s = useWorkspaceStore.getState();
+    expect(healed).toBe(false);
+    expect(s.activeId).toBeNull();
+    expect(s.workspaces).toEqual([]);
+  });
+});
+
 describe("workspaceStore — create (project-aware, C3)", () => {
   beforeEach(() => resetStore());
 
