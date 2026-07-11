@@ -38,7 +38,7 @@ describe("StageFocus live journal", () => {
     vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
   });
 
-  it("renders text as prose and a tool+result as one § card", () => {
+  it("renders text as prose and a tool+result as one flat line", () => {
     useRunsStore.setState({ liveByStage: { st1: [
       { kind: "text", text: "Inspecting the changes." },
       { kind: "tool", tool: "Read", hint: "src/auth.rs" },
