@@ -359,7 +359,10 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               </span>
             );
           })()}
-          <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+          <span
+            className="min-w-0 truncate font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass"
+            title={stage.role.replace(/_/g, " ")}
+          >
             {stage.role.replace(/_/g, " ").toUpperCase()}
           </span>
           <span className="truncate font-mono text-[10px] text-octo-mute">{stage.agentModel}</span>

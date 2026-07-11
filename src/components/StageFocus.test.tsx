@@ -50,6 +50,7 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("src/auth.rs")).toBeInTheDocument();   // hint
     expect(screen.getByText(/142 lines/)).toBeInTheDocument();     // result detail
     expect(screen.getByText(/reviewing…/)).toBeInTheDocument();    // running pulse (role verb for code_review)
+    expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
   it("shows the running indicator even when there are no entries yet", () => {
