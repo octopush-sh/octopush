@@ -32,4 +32,16 @@ describe("beaconAnchor — exactly one brass beacon", () => {
     expect(beaconAnchor({ run: null, blockedStage: null, runningStage: null, launcherReady: true })).toEqual({ kind: "launcher" });
     expect(beaconAnchor({ run: null, blockedStage: null, runningStage: null, launcherReady: false })).toBeNull();
   });
+
+  it("a paused run with a blocked stage still surfaces the decision", () => {
+    expect(
+      beaconAnchor({ run: { status: "paused" } as any, blockedStage: { id: "g" } as any, runningStage: null, launcherReady: false }),
+    ).toEqual({ kind: "decision" });
+  });
+
+  it("a paused run with a running stage and no block keeps the stage beacon", () => {
+    expect(
+      beaconAnchor({ run: { status: "paused" } as any, blockedStage: null, runningStage: { id: "s3" } as any, launcherReady: false }),
+    ).toEqual({ kind: "stage", stageId: "s3" });
+  });
 });

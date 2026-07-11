@@ -59,10 +59,10 @@
 
 /* ── Brass alpha utilities — not Tailwind-class-generated, used directly ── */
 :root {
-  --brass-dim:      rgba(212, 165, 116, 0.4);
   /* Solid traversed-connector ink (no gradients — lines are solid or hairline). */
   --brass-line:     rgba(212, 165, 116, 0.55);
-  /* "Done, long settled" quiet dot in StageDots. */
+  --brass-dim:      rgba(212, 165, 116, 0.4);
+  /* Reserved: "done, long settled" quiet dot (StageDots settled variant, Plan 4). */
   --brass-quiet:    rgba(212, 165, 116, 0.22);
   --brass-ghost:    rgba(212, 165, 116, 0.08);
   --brass-faint:    rgba(212, 165, 116, 0.04);

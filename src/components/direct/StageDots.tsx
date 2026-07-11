@@ -1,7 +1,8 @@
+import type { RunStageStatus } from "../../lib/ipc";
 import { isTransientHalt, stageStatusWord } from "../../lib/runStatus";
 
 export interface DotStage {
-  status: string;
+  status: RunStageStatus | string;
   checkpoint?: boolean;
   error?: string | null;
   /** Optional per-dot tooltip subject (role name). */

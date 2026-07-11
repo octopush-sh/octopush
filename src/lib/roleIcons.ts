@@ -39,6 +39,7 @@ export function iconForTool(tool: string): LucideIcon {
   if (t.includes("read") || t.includes("view") || t.includes("cat")) return Eye;
   if (t.includes("edit") || t.includes("write") || t.includes("patch")) return Pencil;
   if (t.includes("bash") || t.includes("run") || t.includes("exec") || t.includes("command") || t.includes("terminal")) return SquareTerminal;
+  // web before search: "web_search" is a web tool, not a search tool.
   if (t.includes("web") || t.includes("fetch") || t.includes("http")) return Globe;
   if (t.includes("grep") || t.includes("glob") || t.includes("search") || t.includes("find")) return Search;
   return CircleDashed;

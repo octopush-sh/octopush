@@ -21,10 +21,11 @@ export function beaconAnchor(opts: {
   launcherReady: boolean;
 }): BeaconAnchor {
   const { run, blockedStage, runningStage, launcherReady } = opts;
-  if (run && !TERMINAL.has(run.status) && (blockedStage || run.status === "draft")) {
+  const active = run !== null && !TERMINAL.has(run.status);
+  if (active && (blockedStage || run.status === "draft")) {
     return { kind: "decision" };
   }
-  if (run && !TERMINAL.has(run.status) && runningStage) {
+  if (active && runningStage) {
     return { kind: "stage", stageId: runningStage.id };
   }
   if (!run && launcherReady) return { kind: "launcher" };

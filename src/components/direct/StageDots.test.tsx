@@ -29,4 +29,14 @@ describe("StageDots — the universal micro-track", () => {
     const { container } = render(<StageDots stages={[{ status: "running", title: "implementer" }]} />);
     expect(container.querySelector("span[data-dot]")!.getAttribute("title")).toBe("implementer — running");
   });
+
+  it("renders the hairline pending fallback for an unknown status", () => {
+    const { container } = render(<StageDots stages={[{ status: "mystery" }]} />);
+    expect(container.querySelector("span[data-dot]")!.className).toContain("bg-octo-hairline");
+  });
+
+  it("renders awaiting_checkpoint in brass", () => {
+    const { container } = render(<StageDots stages={[{ status: "awaiting_checkpoint" }]} />);
+    expect(container.querySelector("span[data-dot]")!.className).toContain("bg-octo-brass");
+  });
 });
