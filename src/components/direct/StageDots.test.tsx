@@ -39,4 +39,18 @@ describe("StageDots — the universal micro-track", () => {
     const { container } = render(<StageDots stages={[{ status: "awaiting_checkpoint" }]} />);
     expect(container.querySelector("span[data-dot]")!.className).toContain("bg-octo-brass");
   });
+
+  it("shape tone renders neutral sage dots regardless of status, keeping gate rings", () => {
+    const { container } = render(
+      <StageDots
+        tone="shape"
+        stages={[{ status: "pending" }, { status: "pending", checkpoint: true }]}
+      />,
+    );
+    const dots = container.querySelectorAll("span[data-dot]");
+    expect(dots[0].className).toContain("bg-octo-sage");
+    expect(dots[1].className).toContain("bg-octo-sage");
+    expect(dots[1].className).toContain("ring-1");
+    expect(dots[1].getAttribute("title")).toBe("Pauses for your approval");
+  });
 });
