@@ -37,15 +37,15 @@ describe("RunControlBar", () => {
     expect(h.onAbort).toHaveBeenCalled();
   });
 
-  it("running: offers pause / stop / abort and wires them", () => {
+  it("running: renders nothing — pause / stop / abort live in the run header", () => {
+    // While the run simply runs, the bar yields: the controls moved to the
+    // DirectCanvas run header and the beacon sits on the running stage card.
     const h = handlers();
-    render(<RunControlBar run={run("running")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);
-    fireEvent.click(screen.getByRole("button", { name: /Pause at the next stage/i }));
-    fireEvent.click(screen.getByRole("button", { name: /Stop the current stage/i }));
-    fireEvent.click(screen.getByRole("button", { name: /Abort the run/i }));
-    expect(h.onPause).toHaveBeenCalled();
-    expect(h.onStopStage).toHaveBeenCalled();
-    expect(h.onAbort).toHaveBeenCalled();
+    const { container } = render(
+      <RunControlBar run={run("running")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("terminal: offers Run it again", () => {
