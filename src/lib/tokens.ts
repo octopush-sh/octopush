@@ -19,6 +19,8 @@ export const tokens = {
   brassHi: "#e8c39a",
   brassDim: "rgba(212, 165, 116, 0.4)",
   brassGhost: "rgba(212, 165, 116, 0.08)",
+  brassLine: "rgba(212, 165, 116, 0.55)",
+  brassQuiet: "rgba(212, 165, 116, 0.22)",
 
   // Text
   ivory: "#f4ecdb",

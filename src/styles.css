@@ -60,6 +60,10 @@
 /* ── Brass alpha utilities — not Tailwind-class-generated, used directly ── */
 :root {
   --brass-dim:      rgba(212, 165, 116, 0.4);
+  /* Solid traversed-connector ink (no gradients — lines are solid or hairline). */
+  --brass-line:     rgba(212, 165, 116, 0.55);
+  /* "Done, long settled" quiet dot in StageDots. */
+  --brass-quiet:    rgba(212, 165, 116, 0.22);
   --brass-ghost:    rgba(212, 165, 116, 0.08);
   --brass-faint:    rgba(212, 165, 116, 0.04);
   /* One step brighter than `--brass-ghost`, used for keyboard-driven row
@@ -106,6 +110,8 @@
   --dur-standard: 280ms;
   --dur-slow:     320ms;
   --dur-reveal:   600ms;
+  /* Shared list-entrance stagger step (was a magic 45ms in RunFlow/StageFlow). */
+  --stagger-step: 45ms;
 
   /* Font synthesis lock — prevent browser font-synthesis from fabricating
      italic or bold variants, ensuring the Spectral upright faces always
