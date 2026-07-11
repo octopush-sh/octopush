@@ -1544,13 +1544,30 @@ pub async fn update_run_stage(
 /// guard rejection — e.g. the stage hasn't finished, or the run is currently
 /// driving — surfaces immediately), then resumes the drive in the background;
 /// the frontend follows progress via the existing `run://` events.
+///
+/// The optional patch fields let the director re-run *after changes* — the
+/// edit is validated before anything resets and applied before the drive
+/// resumes, atomically under the run's exclusion claim.
 #[tauri::command]
 pub async fn rerun_from_stage(
     orch: State<'_, Arc<Orchestrator>>,
     run_id: String,
     stage_id: String,
+    checkpoint: Option<bool>,
+    instructions: Option<String>,
+    agent_model: Option<String>,
+    max_iterations: Option<i64>,
+    loop_mode: Option<String>,
 ) -> AppResult<()> {
-    orch.prepare_rerun(&run_id, &stage_id)?;
+    let patch = crate::orchestrator::types::StageRerunPatch {
+        checkpoint,
+        instructions,
+        agent_model,
+        max_iterations,
+        loop_mode,
+    };
+    let patch = if patch.is_empty() { None } else { Some(patch) };
+    orch.prepare_rerun(&run_id, &stage_id, patch.as_ref())?;
     Arc::clone(&*orch).resume_claimed_drive(run_id);
     Ok(())
 }

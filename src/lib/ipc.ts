@@ -909,9 +909,19 @@ export const ipc = {
 
   /** Re-run a finished (done/failed) stage and everything downstream of it,
    *  in place — no restart, no reload. Rejects if the stage hasn't finished
-   *  or the run is currently driving. */
-  rerunFromStage: (runId: string, stageId: string) =>
-    invoke<void>("rerun_from_stage", { runId, stageId }),
+   *  or the run is currently driving. An optional `patch` rides along — the
+   *  director's "re-run after changes": validated before anything resets,
+   *  applied before the drive resumes. Field encoding matches updateRunStage. */
+  rerunFromStage: (runId: string, stageId: string, patch?: RunStagePatch) =>
+    invoke<void>("rerun_from_stage", {
+      runId,
+      stageId,
+      checkpoint: patch?.checkpoint ?? null,
+      instructions: patch?.instructions === undefined ? null : (patch.instructions ?? ""),
+      agentModel: patch?.agentModel ?? null,
+      maxIterations: patch?.maxIterations ?? null,
+      loopMode: patch?.loopMode ?? null,
+    }),
 
   /** The persisted live journal for a stage, oldest first. Entries are
    *  LiveEntry-shaped JSON plus `{kind:"reset"}` marker objects that split

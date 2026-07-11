@@ -2776,13 +2776,53 @@ impl Db {
             .optional()?
             .ok_or_else(|| AppError::Other("stage not found".into()))?;
 
-        if status != "pending" || started_at.is_some() {
+        // Two editable moments: a pending stage the run hasn't reached, and a
+        // stage parked at its OWN pre-start gate (awaiting_checkpoint before
+        // any work began — including budget parks). Everything after work
+        // starts is redirected via re-run, not edits.
+        let pending_unstarted = status == "pending" && started_at.is_none();
+        let parked_unstarted = status == "awaiting_checkpoint" && started_at.is_none();
+        if !pending_unstarted && !parked_unstarted {
             return Err(AppError::Other(format!(
                 "{} has already started — only stages that haven't begun can be edited",
                 role.replace('_', " ")
             )));
         }
+        // Toggling the gate of a stage already parked AT that gate would not
+        // release the park (that's what approve/reject are for) — reject it
+        // rather than let the toggle silently do nothing.
+        if parked_unstarted && checkpoint.is_some() {
+            return Err(AppError::Other(
+                "this stage is parked at its gate — approve or reject it instead of toggling the gate".into(),
+            ));
+        }
 
+        Self::validate_stage_patch_fields(
+            loop_target_position,
+            loop_max_iterations,
+            loop_mode,
+            agent_model,
+        )?;
+
+        self.apply_run_stage_patch(
+            stage_id,
+            checkpoint,
+            instructions,
+            agent_model,
+            max_iterations,
+            loop_mode,
+        )
+    }
+
+    /// Field-level validation for a stage patch, shared by `update_run_stage`
+    /// and the rerun path (which must validate BEFORE it resets anything).
+    pub fn validate_stage_patch_fields(
+        loop_target_position: Option<i64>,
+        loop_max_iterations: i64,
+        loop_mode: Option<&str>,
+        agent_model: Option<&str>,
+    ) -> AppResult<()> {
+        use crate::error::AppError;
         if let Some(mode) = loop_mode {
             if loop_target_position.is_none() || loop_max_iterations <= 0 {
                 return Err(AppError::Other(
@@ -2798,7 +2838,21 @@ impl Db {
                 return Err(AppError::Other("agent model can't be empty".into()));
             }
         }
+        Ok(())
+    }
 
+    /// Apply a stage patch with NO state guards — callers are responsible for
+    /// having validated the run/stage state (`update_run_stage`) or for having
+    /// just reset the stage to pending (the rerun path).
+    pub fn apply_run_stage_patch(
+        &self,
+        stage_id: &str,
+        checkpoint: Option<bool>,
+        instructions: Option<&str>,
+        agent_model: Option<&str>,
+        max_iterations: Option<i64>,
+        loop_mode: Option<&str>,
+    ) -> AppResult<()> {
         if let Some(cp) = checkpoint {
             self.conn.execute(
                 "UPDATE run_stages SET checkpoint = ?2 WHERE id = ?1",

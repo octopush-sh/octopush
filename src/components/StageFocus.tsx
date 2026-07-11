@@ -113,8 +113,12 @@ const TERMINAL_RUN_STATUSES = new Set(["completed", "aborted"]);
 /** Rerun affordance only shows when the run isn't actively driving — the
  *  backend also enforces this (rejecting a rerun while another drive holds
  *  the run's exclusion claim), this just keeps the button from appearing in
- *  a state where clicking it would only bounce off a guard error. */
-const RERUNNABLE_RUN_STATUSES = new Set(["paused", "completed"]);
+ *  a state where clicking it would only bounce off a guard error. `failed`
+ *  belongs here: a run halted by a failed stage is exactly the moment the
+ *  director wants to fix the stage and re-run it. A `running` run qualifies
+ *  too when it is PARKED at a checkpoint rather than actively driving — the
+ *  caller signals that via `runBlocked`. */
+const RERUNNABLE_RUN_STATUSES = new Set(["paused", "completed", "failed"]);
 
 interface Props {
   stage: RunStage | null;
@@ -123,13 +127,18 @@ interface Props {
    *  edit, re-run). Omit (or pass null) to render read-only, as every
    *  existing caller before this feature did. */
   run?: Run | null;
-  /** Hot-edit the shown stage (only called while it's still pending). */
+  /** True when the run is parked at a checkpoint / failed stage instead of
+   *  actively driving — earlier finished stages are re-runnable then even
+   *  though the run's status still reads "running". */
+  runBlocked?: boolean;
+  /** Hot-edit the shown stage (only called while it hasn't started). */
   onUpdateStage?: (patch: RunStagePatch) => Promise<void>;
-  /** Re-run the shown stage — and everything downstream — in place. */
-  onRerunFromStage?: () => Promise<void>;
+  /** Re-run the shown stage — and everything downstream — in place. The
+   *  patch carries the director's edits ("re-run after changes"). */
+  onRerunFromStage?: (patch?: RunStagePatch) => Promise<void>;
 }
 
-export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, onRerunFromStage }: Props) {
+export function StageFocus({ stage, workspacePath, run = null, runBlocked = false, onUpdateStage, onRerunFromStage }: Props) {
   const [diff, setDiff] = useState<string>("");
   const [diffLoading, setDiffLoading] = useState(false);
   // D5 — archived attempts + the persisted log split into per-attempt segments.
@@ -148,6 +157,7 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
   const [draftModel, setDraftModel] = useState("");
   const [draftMaxIterations, setDraftMaxIterations] = useState(25);
   const [draftLoopMode, setDraftLoopMode] = useState<"gated" | "auto">("gated");
+  const [draftCheckpoint, setDraftCheckpoint] = useState(false);
   const [confirmRerun, setConfirmRerun] = useState(false);
   /** Surfaces a rejected gate toggle or re-run — both fire outside the edit
    *  modal (which has its own inline `editError`), so a bare `void` on their
@@ -162,12 +172,23 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
     setDirectorError(null);
   }, [stage?.id]);
 
-  const editable =
+  // The gate toggle needs a stage the run hasn't reached; a stage parked at
+  // its OWN pre-start gate can still take field edits (instructions, model,
+  // turns) — the gate itself is resolved via approve/reject, not a toggle.
+  const gateTogglable =
     !!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status) &&
     stage.status === "pending" && stage.startedAt === null;
+  const fieldsEditable =
+    gateTogglable ||
+    (!!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status) &&
+      stage.status === "awaiting_checkpoint" && stage.startedAt === null);
   const rerunnable =
-    !!stage && !!run && RERUNNABLE_RUN_STATUSES.has(run.status) &&
+    !!stage && !!run &&
+    (RERUNNABLE_RUN_STATUSES.has(run.status) || (run.status === "running" && runBlocked)) &&
     (stage.status === "done" || stage.status === "failed");
+  /** Finished stages open the same modal in "edit & re-run" mode — the only
+   *  way an edit to a finished stage can mean anything. */
+  const editRerunsStage = rerunnable && !fieldsEditable;
   const showsLoopMode = !!stage && stage.loopTargetPosition !== null && stage.loopMaxIterations > 0;
 
   function reportDirectorError(e: unknown) {
@@ -180,21 +201,34 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
     setDraftModel(stage.agentModel);
     setDraftMaxIterations(stage.maxIterations);
     setDraftLoopMode(stage.loopMode === "auto" ? "auto" : "gated");
+    setDraftCheckpoint(stage.checkpoint);
     setEditError(null);
     setEditOpen(true);
   }
 
   async function saveEdit() {
-    if (!onUpdateStage) return;
+    if (!stage) return;
     setSaving(true);
     setEditError(null);
+    const patch: RunStagePatch = {
+      instructions: draftInstructions,
+      agentModel: draftModel,
+      maxIterations: draftMaxIterations,
+      ...(showsLoopMode ? { loopMode: draftLoopMode } : {}),
+      // The re-run path resets the stage to pending first, so the gate is
+      // legitimately patchable there — offered as a field in the modal.
+      ...(editRerunsStage && draftCheckpoint !== stage.checkpoint
+        ? { checkpoint: draftCheckpoint }
+        : {}),
+    };
     try {
-      await onUpdateStage({
-        instructions: draftInstructions,
-        agentModel: draftModel,
-        maxIterations: draftMaxIterations,
-        ...(showsLoopMode ? { loopMode: draftLoopMode } : {}),
-      });
+      if (editRerunsStage) {
+        if (!onRerunFromStage) return;
+        await onRerunFromStage(patch);
+      } else {
+        if (!onUpdateStage) return;
+        await onUpdateStage(patch);
+      }
       setEditOpen(false);
     } catch (e) {
       setEditError(e instanceof Error ? e.message : String(e));
@@ -333,24 +367,25 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
             </IconButton>
           </span>
         )}
-        {(editable || rerunnable) && (
+        {(fieldsEditable || rerunnable) && (
           <span className="flex shrink-0 items-center gap-1.5">
-            {editable && (
-              <>
-                <TogglePill
-                  on={stage.checkpoint}
-                  label="⟜ gate"
-                  ariaLabel="Approval gate — pause before hand-off"
-                  onChange={(v) => {
-                    setDirectorError(null);
-                    onUpdateStage?.({ checkpoint: v }).catch(reportDirectorError);
-                  }}
-                />
-                <IconButton label="Edit stage" onClick={openEdit}>
-                  <SlidersHorizontal size={12} />
-                </IconButton>
-              </>
+            {gateTogglable && (
+              <TogglePill
+                on={stage.checkpoint}
+                label="⟜ gate"
+                ariaLabel="Approval gate — pause before hand-off"
+                onChange={(v) => {
+                  setDirectorError(null);
+                  onUpdateStage?.({ checkpoint: v }).catch(reportDirectorError);
+                }}
+              />
             )}
+            <IconButton
+              label={editRerunsStage ? "Edit & re-run stage" : "Edit stage"}
+              onClick={openEdit}
+            >
+              <SlidersHorizontal size={12} />
+            </IconButton>
             {rerunnable && (
               <IconButton label="Re-run from here" onClick={() => setConfirmRerun((v) => !v)}>
                 <RotateCcw size={12} />
@@ -507,7 +542,9 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
           Edit {stageTitle(stage)}
         </p>
         <p className="mt-1 text-xs text-octo-mute">
-          Changes apply when this stage starts — the pipeline template is untouched.
+          {editRerunsStage
+            ? "Saving re-runs from this stage and discards results from here onward — the pipeline template is untouched."
+            : "Changes apply when this stage starts — the pipeline template is untouched."}
         </p>
         <div className="mt-4 flex flex-col gap-4">
           <label className="flex flex-col gap-1.5">
@@ -539,6 +576,14 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
                 />
               </span>
             )}
+            {editRerunsStage && (
+              <TogglePill
+                on={draftCheckpoint}
+                label="⟜ gate"
+                ariaLabel="Approval gate — pause before hand-off on the re-run"
+                onChange={setDraftCheckpoint}
+              />
+            )}
           </div>
           {editError && (
             <div className="rounded-md border-l-2 border-octo-rouge bg-[var(--rouge-ghost)] px-3 py-2 text-xs text-octo-rouge">
@@ -561,7 +606,7 @@ export function StageFocus({ stage, workspacePath, run = null, onUpdateStage, on
             disabled={saving}
             className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
           >
-            Save these changes
+            {editRerunsStage ? "Save & re-run from here" : "Save these changes"}
           </button>
         </div>
       </ModalShell>
