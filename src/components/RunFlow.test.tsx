@@ -55,6 +55,14 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(container.querySelectorAll(".opacity-\\[0\\.38\\]")).toHaveLength(2);
   });
 
+  it("renders no connector for a single-stage run", () => {
+    const { container } = render(
+      <RunFlow stages={[mk({ id: "solo" })]} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    // Connectors are the only aria-hidden spans in RunFlow.
+    expect(container.querySelectorAll("span[aria-hidden]")).toHaveLength(0);
+  });
+
   it("draws connectors as lines — no arrows, no romans", () => {
     const { container } = render(
       <RunFlow stages={stages} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,

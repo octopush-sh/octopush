@@ -69,6 +69,22 @@ describe("RunControlBar", () => {
     expect(h.onReject).toHaveBeenCalledWith("fix the imports", undefined);
   });
 
+  it("checkpoint: the beacon pulses the primary CTA — and only when granted", () => {
+    // Law 2 — the single brass beacon. With beacon the decide row pulses
+    // exactly one element (Approve & continue); without it, nothing pulses.
+    const h = handlers();
+    const withBeacon = render(
+      <RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} beacon {...h} />,
+    );
+    expect(withBeacon.container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
+    withBeacon.unmount();
+
+    const withoutBeacon = render(
+      <RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />,
+    );
+    expect(withoutBeacon.container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
+  });
+
   it("checkpoint with a loop target: offers Send back and shows loop state", async () => {
     const h = handlers();
     render(

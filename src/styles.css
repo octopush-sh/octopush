@@ -279,7 +279,7 @@
 }
 .octo-stage-pulse { animation: octo-stage-pulse 2.4s var(--ease-octo, cubic-bezier(0.2,0.8,0.3,1)) infinite; }
 @media (prefers-reduced-motion: reduce) {
-  .octo-stage-pulse { animation: none; }
+  .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--brass-dim); }
 }
 
 /* Hides scrollbar chrome on rails whose own affordance (chevron nav) signals

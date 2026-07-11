@@ -152,8 +152,8 @@ function StageCard({
       type="button"
       onClick={onSelect}
       style={{ animationDelay: `calc(${Math.min(index, 8)} * var(--stagger-step))` }}
-      className={`octo-rise-in flex shrink-0 flex-col gap-2 rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color] duration-[280ms] ${
-        subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70"
+      className={`octo-rise-in flex shrink-0 flex-col gap-2 rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color,background-color,color] duration-[280ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+        subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70 focus-visible:opacity-70"
       } ${beacon ? "octo-stage-pulse " : ""}${skin}`}
     >
       {/* Header — gate mark · role icon · title · status glyph. */}
@@ -181,7 +181,7 @@ function StageCard({
       </div>
 
       {subject ? (
-        <>
+        <span key="subject" className="octo-fade-in flex min-w-0 flex-col gap-2">
           {/* Status word + fixed-width timer (S1/S2). */}
           <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
             <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
@@ -231,17 +231,12 @@ function StageCard({
               )}
             </span>
           )}
-        </>
+        </span>
       ) : (
         /* Essence meta — discreet position · cost · tokens. */
-        <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
+        <span key="essence" className="octo-fade-in flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
           <span className="octo-tabular shrink-0">{index + 1}</span>
-          {s.costUsd > 0 && <span className="octo-tabular text-octo-brass">${s.costUsd.toFixed(2)}</span>}
-          {(s.inputTokens > 0 || s.outputTokens > 0) && (
-            <span className="octo-tabular truncate" title="input / output tokens">
-              ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}
-            </span>
-          )}
+          {(s.costUsd > 0 || s.inputTokens > 0 || s.outputTokens > 0) && <MetaTokens stage={s} />}
         </span>
       )}
     </button>

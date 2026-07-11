@@ -162,19 +162,27 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             </div>
             <Maximize2 size={12} className="shrink-0 text-octo-mute transition-colors duration-[180ms] group-hover:text-octo-brass" />
           </button>
-          {run.status === "running" && !blockedStage && (
-            <span className="flex shrink-0 items-center gap-1.5">
-              <IconButton label="Pause at the next stage" onClick={() => void pauseRun(run.id)}>
-                <Pause size={12} strokeWidth={1.75} />
-              </IconButton>
-              <IconButton label="Stop the current stage" onClick={() => void stopStage(run.id)}>
-                <CircleStop size={12} strokeWidth={1.75} />
-              </IconButton>
-              <IconButton label="Abort the run" onClick={() => void abort(run.id)} danger>
-                <Ban size={12} strokeWidth={1.75} />
-              </IconButton>
-            </span>
-          )}
+          {(() => {
+            const showRunControls = run.status === "running" && !blockedStage;
+            return (
+              <span
+                aria-hidden={!showRunControls}
+                className={`flex shrink-0 items-center gap-1.5 transition-opacity duration-[220ms] ${
+                  showRunControls ? "opacity-100" : "pointer-events-none opacity-0"
+                }`}
+              >
+                <IconButton label="Pause at the next stage" onClick={() => void pauseRun(run.id)} disabled={!showRunControls}>
+                  <Pause size={12} strokeWidth={1.75} />
+                </IconButton>
+                <IconButton label="Stop the current stage" onClick={() => void stopStage(run.id)} disabled={!showRunControls}>
+                  <CircleStop size={12} strokeWidth={1.75} />
+                </IconButton>
+                <IconButton label="Abort the run" onClick={() => void abort(run.id)} danger disabled={!showRunControls}>
+                  <Ban size={12} strokeWidth={1.75} />
+                </IconButton>
+              </span>
+            );
+          })()}
         </div>
         {/* The living pipeline. */}
         <div className="border-b border-octo-hairline bg-octo-panel px-4 py-2">
