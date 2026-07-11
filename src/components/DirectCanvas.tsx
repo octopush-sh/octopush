@@ -93,6 +93,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     body = (
       <PipelineSetup
         defaultTask={defaultTask}
+        linkedIssueKey={linkedIssueKey}
         onBegin={(pipelineId, task, stageOverrides, budgetUsd) =>
           void begin(workspaceId, pipelineId, task, stageOverrides, linkedIssueKey ?? undefined, budgetUsd)
         }
