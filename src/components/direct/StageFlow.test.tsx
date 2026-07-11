@@ -1,8 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 
-// Stub ModelPicker to a button that surfaces the active model and lets us
-// trigger a change — so we can assert the crew-override wiring.
 vi.mock("../ModelPicker", () => ({
   ModelPicker: ({ activeModel, onSelectModel }: { activeModel: string; onSelectModel: (m: string) => void }) => (
     <button onClick={() => onSelectModel("new-model")}>model:{activeModel}</button>
@@ -24,23 +22,33 @@ const stages = [
   },
 ] as any;
 
-describe("StageFlow", () => {
-  it("draws a card per stage with title, numeral, and gate/loop markers", () => {
+describe("StageFlow — quiet crew line", () => {
+  it("renders one line: role names, the ⟜ gate mark, the loop badge — no romans, no arrows", () => {
     render(<StageFlow stages={stages} overrides={{}} onOverride={vi.fn()} />);
     expect(screen.getByText("Plan")).toBeInTheDocument();
     expect(screen.getByText("Code review")).toBeInTheDocument();
-    expect(screen.getByText("I")).toBeInTheDocument();
-    expect(screen.getByText("II")).toBeInTheDocument();
-    expect(screen.getByText("⟜ gate")).toBeInTheDocument(); // s1 gates
-    expect(screen.getByText("⟲ ×2")).toBeInTheDocument(); // s1 loops back ×2
+    expect(screen.getByText("⟜")).toBeInTheDocument();          // gate mark on the gated stage
+    expect(screen.getByText("⟲ ×2")).toBeInTheDocument();       // loop badge
+    expect(screen.queryByText("⟶")).not.toBeInTheDocument();
+    expect(screen.queryByText("I")).not.toBeInTheDocument();
+    expect(screen.queryByText("II")).not.toBeInTheDocument();
+    // the crew editor is folded — no model chips at rest
+    expect(screen.queryByText(/^model:/)).not.toBeInTheDocument();
   });
 
-  it("reflects the crew override and fires onOverride from the model chip", () => {
+  it("shows the overridden model in mute on the line", () => {
+    render(<StageFlow stages={stages} overrides={{ 0: "override-0" }} onOverride={vi.fn()} />);
+    expect(screen.getByText("· override-0")).toBeInTheDocument();
+  });
+
+  it("unfolds the crew editor from the pencil and wires overrides", () => {
     const onOverride = vi.fn();
     render(<StageFlow stages={stages} overrides={{ 0: "override-0" }} onOverride={onOverride} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit the crew" }));
     expect(screen.getByText("model:override-0")).toBeInTheDocument(); // stage 0 uses the override
-    expect(screen.getByText("model:m1")).toBeInTheDocument(); // stage 1 keeps its default
-    fireEvent.click(screen.getByText("model:m1")); // change stage 1's model
+    expect(screen.getByText("model:m1")).toBeInTheDocument();         // stage 1 keeps its default
+    fireEvent.click(screen.getByText("model:m1"));
     expect(onOverride).toHaveBeenCalledWith(1, "new-model");
+    expect(screen.getByText("⟜ gate")).toBeInTheDocument();           // gate badge inside the editor card
   });
 });
