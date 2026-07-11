@@ -31,10 +31,9 @@ function parseBudget(text: string): number | null {
  *  a cap, rouge at the cap. Uncapped stays mute. (Folded in from the retired
  *  DirectRunsMeter — the count now lives inside the ledger line.) */
 function runsTone(used: number, limit: number | null): string {
-  if (limit == null || limit <= 0) return "text-octo-mute";
-  const ratio = used / limit;
-  if (ratio >= 1) return "text-octo-rouge";
-  if (ratio >= 0.8) return "text-octo-warning";
+  if (limit == null) return "text-octo-mute";
+  if (used >= limit) return "text-octo-rouge";
+  if (limit > 0 && used / limit >= 0.8) return "text-octo-warning";
   return "text-octo-sage";
 }
 
@@ -87,6 +86,7 @@ export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, exe
   }, [loaded]);
   useEffect(() => {
     if (!selectedId) return;
+    setEstimate(null);
     const tuples: [number, string][] = Object.entries(overrides)
       .map(([pos, model]) => [Number(pos), model] as [number, string]);
     let cancelled = false;
@@ -295,7 +295,7 @@ export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, exe
                   type="button"
                   disabled={!ready}
                   onClick={beginNow}
-                  className={`rounded-lg border px-6 py-2.5 font-serif text-base transition-colors duration-[180ms] ${
+                  className={`rounded-lg border px-6 py-2.5 font-serif text-base transition-[color,background-color,border-color,opacity] duration-[180ms] ${
                     beacon
                       ? "octo-stage-pulse border-octo-brass bg-octo-brass text-octo-onyx hover:bg-octo-brass-hi"
                       : "border-octo-hairline bg-transparent text-octo-sage opacity-60"

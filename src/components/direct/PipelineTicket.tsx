@@ -24,7 +24,7 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
         onClick={onSelect}
         aria-pressed={selected}
         title={name}
-        className={`flex w-[184px] flex-col gap-2 rounded-md border px-3.5 py-3 text-left transition-colors duration-[180ms] ${
+        className={`flex w-[184px] flex-col gap-2 rounded-md border px-3.5 py-3 text-left transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
           selected
             ? "border-octo-brass bg-[var(--brass-ghost)]"
             : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"

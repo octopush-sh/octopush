@@ -46,6 +46,7 @@ beforeEach(() => {
   storeState.pipelines = [PIPE];
   storeState.loaded = true;
   storeState.error = null;
+  entitlementState.usage = { used: 4, limit: 25 };
   estimateMock.mockReset();
   estimateMock.mockResolvedValue({ estimateUsd: 0.05, baselineUsd: 0.4 });
   useRunsStore.setState({ launcherPrefill: null });
@@ -160,6 +161,16 @@ describe("PipelineSetup designed states", () => {
     fireEvent.change(screen.getByLabelText("The brief"), { target: { value: "   " } });
     fireEvent.keyDown(screen.getByLabelText("The brief"), { key: "Enter", metaKey: true });
     expect(onBegin).not.toHaveBeenCalled(); // blank brief → not ready
+  });
+
+  it("an exhausted quota ghosts the CTA and says why", () => {
+    entitlementState.usage = { used: 25, limit: 25 };
+    const { container } = render(
+      <PipelineSetup defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />,
+    );
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: /Begin the run/i })).toBeDisabled();
+    expect(screen.getByText("Monthly Direct runs are used up.")).toBeInTheDocument();
   });
 });
 
