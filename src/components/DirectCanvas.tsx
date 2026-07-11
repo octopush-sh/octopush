@@ -165,8 +165,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           stage={shownStage}
           workspacePath={workspacePath}
           run={run}
+          runBlocked={blockedStage !== null}
           onUpdateStage={(patch) => (shownStage ? updateStage(run.id, shownStage.id, patch) : Promise.resolve())}
-          onRerunFromStage={() => (shownStage ? rerunFromStage(run.id, shownStage.id) : Promise.resolve())}
+          onRerunFromStage={(patch) => (shownStage ? rerunFromStage(run.id, shownStage.id, patch) : Promise.resolve())}
         />
         <RunLedger run={run} stages={stages} />
         <RunControlBar

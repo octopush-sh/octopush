@@ -210,6 +210,19 @@ pub struct StageInput {
     pub worktree_diff: Option<String>,
 }
 
+/// A director's hot-edit riding along with a re-run: validated BEFORE any
+/// stage is reset (a bad patch must leave the run untouched) and applied once
+/// the target stage is back to pending, so the re-driven stage builds its
+/// `StageSpec` from the edited row. All-`None` means "re-run as-is".
+#[derive(Clone, Debug, Default)]
+pub struct StageRerunPatch {
+    pub checkpoint: Option<bool>,
+    pub instructions: Option<String>,
+    pub agent_model: Option<String>,
+    pub max_iterations: Option<i64>,
+    pub loop_mode: Option<String>,
+}
+
 /// The runtime spec a runner needs to execute one stage.
 #[derive(Clone, Debug)]
 pub struct StageSpec {

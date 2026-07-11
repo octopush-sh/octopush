@@ -4568,7 +4568,7 @@ mod orchestrator_tests {
         let implement_id = first_pass[1].id.clone();
         let review_id = first_pass[2].id.clone();
 
-        assert_eq!(orch.rerun_from_stage(&run_id, &implement_id).await.unwrap(), RunStatus::Completed);
+        assert_eq!(orch.rerun_from_stage(&run_id, &implement_id, None).await.unwrap(), RunStatus::Completed);
 
         let after = db.lock().list_run_stages(&run_id).unwrap();
         assert!(after.iter().all(|s| s.status == "done"), "the resumed drive must finish the rerun stages too");
@@ -4599,7 +4599,7 @@ mod orchestrator_tests {
         let plan_id = stages[0].id.clone();
         let implement_id = stages[1].id.clone();
 
-        assert_eq!(orch.rerun_from_stage(&run_id, &plan_id).await.unwrap(), RunStatus::Completed);
+        assert_eq!(orch.rerun_from_stage(&run_id, &plan_id, None).await.unwrap(), RunStatus::Completed);
 
         let after = db.lock().list_run_stages(&run_id).unwrap();
         assert!(after.iter().all(|s| s.status == "done"));
@@ -4628,7 +4628,7 @@ mod orchestrator_tests {
         let review_id = parked[2].id.clone();
         let stale_started_at = parked[2].started_at.clone();
 
-        assert_eq!(orch.rerun_from_stage(&run_id, &implement_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(orch.rerun_from_stage(&run_id, &implement_id, None).await.unwrap(), RunStatus::Paused);
 
         let after = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(after[1].status, "done");
@@ -4659,7 +4659,7 @@ mod orchestrator_tests {
         db.lock().set_stage_resume_pending(&implement_id, true).unwrap();
         db.lock().set_stage_loop_iterations(&implement_id, 3).unwrap();
 
-        orch.prepare_rerun(&run_id, &implement_id).unwrap();
+        orch.prepare_rerun(&run_id, &implement_id, None).unwrap();
 
         let reset = db
             .lock()
@@ -4682,7 +4682,7 @@ mod orchestrator_tests {
         let (db, orch, run_id, flag, drive) = spawn_cancellable_run().await;
         let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
 
-        let err = orch.prepare_rerun(&run_id, &stage_id).unwrap_err();
+        let err = orch.prepare_rerun(&run_id, &stage_id, None).unwrap_err();
         assert!(err.to_string().contains("executing"), "err={err}");
 
         // Let the in-flight stage finish so the spawned drive task doesn't leak.
@@ -4734,7 +4734,7 @@ mod orchestrator_tests {
         // mutations into the re-drive it triggers.
         wait_until_stage_running(&db, &run_id, 2).await;
 
-        let err = orch.prepare_rerun(&run_id, &implement_id).unwrap_err();
+        let err = orch.prepare_rerun(&run_id, &implement_id, None).unwrap_err();
         assert!(err.to_string().contains("executing"), "err={err}");
 
         open.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4744,7 +4744,140 @@ mod orchestrator_tests {
         // released — a later `prepare_rerun` on the same run must succeed
         // (proving this isn't a permanent leak).
         let plan_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
-        orch.prepare_rerun(&run_id, &plan_id).expect("active claim must release once the drive it guarded finishes");
+        orch.prepare_rerun(&run_id, &plan_id, None).expect("active claim must release once the drive it guarded finishes");
+    }
+
+    /// "Re-run after changes": the director's patch rides the re-run — it is
+    /// applied once the target stage is back to pending, so the re-driven
+    /// stage builds its spec from the edited row.
+    #[tokio::test]
+    async fn rerun_applies_the_directors_patch_after_reset() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+
+        let implement_id = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        let patch = crate::orchestrator::types::StageRerunPatch {
+            checkpoint: Some(true),
+            instructions: Some("sharper brief".into()),
+            agent_model: Some("m2".into()),
+            max_iterations: Some(40),
+            loop_mode: None,
+        };
+        orch.prepare_rerun(&run_id, &implement_id, Some(&patch)).unwrap();
+
+        let row = db
+            .lock()
+            .list_run_stages(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == implement_id)
+            .unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.instructions.as_deref(), Some("sharper brief"));
+        assert_eq!(row.agent_model, "m2");
+        assert!(row.checkpoint, "the re-run honors the patched gate");
+        assert_eq!(row.max_iterations, 40);
+    }
+
+    /// A bad patch must reject BEFORE anything resets — the run and its
+    /// stages stay exactly as they were.
+    #[tokio::test]
+    async fn rerun_with_invalid_patch_rejects_before_resetting_anything() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+
+        let implement_id = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        // `implement` doesn't loop — switching its loop mode is invalid.
+        let patch = crate::orchestrator::types::StageRerunPatch {
+            loop_mode: Some("auto".into()),
+            ..Default::default()
+        };
+        let err = orch.prepare_rerun(&run_id, &implement_id, Some(&patch)).unwrap_err();
+        assert!(err.to_string().contains("looping review stage"), "err={err}");
+
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages.iter().all(|s| s.status == "done"), "nothing was reset");
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed", "the run was not reopened");
+    }
+
+    /// A stage parked BEFORE it began — a budget park or a director pause,
+    /// which hold the NEXT pending stage with neither started_at nor an
+    /// artifact — takes field edits (the spec is built from the row after
+    /// approval), but not a gate toggle, which could never release the park.
+    /// (A checkpoint-gate park is different: it holds a FINISHED stage's
+    /// hand-off, artifact and all, and is redirected via the decision bar or
+    /// a re-run — update_run_stage keeps rejecting it as "already started".)
+    #[tokio::test]
+    async fn parked_unbegun_stage_takes_field_edits_but_not_a_gate_toggle() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        // Park the un-begun stage exactly as pause_for_budget / a director
+        // pause does: status flips to awaiting_checkpoint, nothing else —
+        // started_at is only ever stamped on 'running', no artifact exists.
+        let implement_id = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().set_run_stage_status(&implement_id, "awaiting_checkpoint").unwrap();
+        let parked = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert!(parked.started_at.is_none() && parked.artifact.is_none(), "a pre-work park has neither");
+
+        // Field edits land: the spec is built from the row after approval.
+        db.lock()
+            .update_run_stage(&run_id, &parked.id, None, Some("focus on the edge cases"), Some("m2"), None, None)
+            .unwrap();
+        let row = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert_eq!(row.instructions.as_deref(), Some("focus on the edge cases"));
+        assert_eq!(row.agent_model, "m2");
+
+        // The park is released via approve/reject — toggling the gate while
+        // parked is rejected, not silently ignored.
+        let err = db
+            .lock()
+            .update_run_stage(&run_id, &parked.id, Some(false), None, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("parked awaiting your decision"), "err={err}");
+    }
+
+    /// The inverse of the test above: a stage parked at its checkpoint GATE
+    /// has finished its work (artifact present) — field edits are rejected,
+    /// because there is nothing left for them to affect.
+    #[tokio::test]
+    async fn gate_parked_finished_stage_rejects_field_edits() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", true, None, 0, None, 25).unwrap(); // gated hand-off
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let parked = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert_eq!(parked.status, "awaiting_checkpoint");
+        assert!(parked.artifact.is_some(), "a gate park holds a finished stage's hand-off");
+
+        let err = db
+            .lock()
+            .update_run_stage(&run_id, &parked.id, None, Some("too late"), None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("already started"), "err={err}");
     }
 }
 

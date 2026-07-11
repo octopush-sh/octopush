@@ -1206,17 +1206,27 @@ impl Orchestrator {
     /// `resolve_checkpoint` nor a second `rerun_from_stage` can interleave
     /// with it (see `ActiveGuard`/`claim_active`). On failure the claim is
     /// released immediately — nothing to hand off.
-    pub(crate) fn prepare_rerun(&self, run_id: &str, stage_id: &str) -> AppResult<()> {
+    pub(crate) fn prepare_rerun(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        patch: Option<&crate::orchestrator::types::StageRerunPatch>,
+    ) -> AppResult<()> {
         let guard =
             self.claim_active(run_id, "this run is executing — stop the current stage first")?;
-        let result = self.prepare_rerun_locked(run_id, stage_id);
+        let result = self.prepare_rerun_locked(run_id, stage_id, patch);
         if result.is_ok() {
             guard.forget();
         }
         result
     }
 
-    fn prepare_rerun_locked(&self, run_id: &str, stage_id: &str) -> AppResult<()> {
+    fn prepare_rerun_locked(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        patch: Option<&crate::orchestrator::types::StageRerunPatch>,
+    ) -> AppResult<()> {
         let run = self
             .db
             .lock()
@@ -1237,6 +1247,17 @@ impl Orchestrator {
                 "re-run applies to a finished stage — resolve the checkpoint or stop the stage first".into(),
             ));
         }
+        // Validate the director's hot-edit BEFORE resetting anything, so a bad
+        // patch (e.g. loop mode on a non-looping stage) rejects cleanly and
+        // leaves every stage exactly as it was.
+        if let Some(p) = patch {
+            crate::db::Db::validate_stage_patch_fields(
+                target.loop_target_position,
+                target.loop_max_iterations,
+                p.loop_mode.as_deref(),
+                p.agent_model.as_deref(),
+            )?;
+        }
 
         // Downstream stages may still be parked awaiting a checkpoint (e.g. a
         // later review) — resetting them to pending invalidates that park;
@@ -1250,6 +1271,20 @@ impl Orchestrator {
             self.db.lock().set_stage_session(&s.id, None)?;
             self.db.lock().set_stage_resume_pending(&s.id, false)?;
             self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+        }
+        // The target is back to pending + un-started, so the no-guard applier
+        // is safe here; the re-driven stage builds its StageSpec from this row
+        // and picks the edits up. Applied before the drive resumes — the two
+        // are one atomic per-run section under the caller's active-slot claim.
+        if let Some(p) = patch {
+            self.db.lock().apply_run_stage_patch(
+                stage_id,
+                p.checkpoint,
+                p.instructions.as_deref(),
+                p.agent_model.as_deref(),
+                p.max_iterations,
+                p.loop_mode.as_deref(),
+            )?;
         }
         // `archive_and_reset_stage` already retired each stage's spend onto
         // the run (append, never reset) — recompute folds that in.
@@ -1265,8 +1300,13 @@ impl Orchestrator {
     /// `prepare_rerun` synchronously and resumes via `resume_claimed_drive` in
     /// the background, so a guard rejection surfaces immediately without
     /// blocking on the (possibly long) re-drive.
-    pub async fn rerun_from_stage(&self, run_id: &str, stage_id: &str) -> AppResult<RunStatus> {
-        self.prepare_rerun(run_id, stage_id)?;
+    pub async fn rerun_from_stage(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        patch: Option<&crate::orchestrator::types::StageRerunPatch>,
+    ) -> AppResult<RunStatus> {
+        self.prepare_rerun(run_id, stage_id, patch)?;
         let result = self.drive_inner(run_id, false).await;
         self.active.lock().remove(run_id);
         result

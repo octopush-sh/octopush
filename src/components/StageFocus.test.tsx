@@ -492,4 +492,96 @@ describe("StageFocus director controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "Re-run · discards downstream" }));
     expect(await screen.findByText("this run is executing — stop the current stage first")).toBeInTheDocument();
   });
+
+  // ── Round 2: re-run after changes, failed/parked runs, gate-parked edits ──
+
+  it("shows Re-run from here for a done stage on a FAILED run", () => {
+    render(
+      <StageFocus stage={doneStage} workspacePath="/tmp" run={{ ...runningRun, status: "failed" }} onRerunFromStage={vi.fn()} />,
+    );
+    expect(screen.getByRole("button", { name: "Re-run from here" })).toBeInTheDocument();
+  });
+
+  it("shows Re-run from here on a running run that is PARKED at a checkpoint (runBlocked)", () => {
+    render(
+      <StageFocus stage={doneStage} workspacePath="/tmp" run={runningRun} runBlocked onRerunFromStage={vi.fn()} />,
+    );
+    expect(screen.getByRole("button", { name: "Re-run from here" })).toBeInTheDocument();
+  });
+
+  it("still hides Re-run while the run is actively driving (runBlocked false)", () => {
+    render(
+      <StageFocus stage={doneStage} workspacePath="/tmp" run={runningRun} runBlocked={false} onRerunFromStage={vi.fn()} />,
+    );
+    expect(screen.queryByRole("button", { name: "Re-run from here" })).not.toBeInTheDocument();
+  });
+
+  it("offers field edits — but not the gate toggle — for a budget/director-parked stage that never began", () => {
+    // Pre-work parks (budget park, director pause) hold the NEXT stage with
+    // neither startedAt nor an artifact; "no artifact yet" is the
+    // no-work-done signal (mirrors the backend guard).
+    const parked = { ...baseStage, status: "awaiting_checkpoint", startedAt: null, artifact: null, checkpoint: true };
+    render(<StageFocus stage={parked} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Edit stage" })).toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: /approval gate/i })).not.toBeInTheDocument();
+  });
+
+  it("a stage parked at its checkpoint GATE (finished work, artifact set) is not field-editable", () => {
+    const gateParked = {
+      ...baseStage, status: "awaiting_checkpoint", startedAt: "t",
+      artifact: JSON.stringify({ kind: "note", text: "verdict", payload: null, refsWorktree: false }),
+    };
+    render(<StageFocus stage={gateParked} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Edit/ })).not.toBeInTheDocument();
+  });
+
+  it("edit on a finished stage becomes Edit & re-run: saving routes the patch through onRerunFromStage", async () => {
+    const onRerunFromStage = vi.fn().mockResolvedValue(undefined);
+    const onUpdateStage = vi.fn();
+    render(
+      <StageFocus
+        stage={{ ...doneStage, instructions: "old text" }}
+        workspacePath="/tmp"
+        run={pausedRun}
+        onUpdateStage={onUpdateStage}
+        onRerunFromStage={onRerunFromStage}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit & re-run stage" }));
+    expect(screen.getByText(/Saving re-runs from this stage/)).toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue("old text"), { target: { value: "sharper text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save & re-run from here" }));
+    await waitFor(() =>
+      expect(onRerunFromStage).toHaveBeenCalledWith(
+        expect.objectContaining({ instructions: "sharper text" }),
+      ),
+    );
+    expect(onUpdateStage).not.toHaveBeenCalled();
+  });
+
+  it("edit & re-run can flip the gate for the re-run via the in-modal toggle", async () => {
+    const onRerunFromStage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <StageFocus
+        stage={{ ...doneStage, checkpoint: false }}
+        workspacePath="/tmp"
+        run={pausedRun}
+        onRerunFromStage={onRerunFromStage}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit & re-run stage" }));
+    fireEvent.click(screen.getByRole("switch", { name: /approval gate/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Save & re-run from here" }));
+    await waitFor(() =>
+      expect(onRerunFromStage).toHaveBeenCalledWith(expect.objectContaining({ checkpoint: true })),
+    );
+  });
+
+  it("the plain quick action still re-runs with no patch", () => {
+    const onRerunFromStage = vi.fn().mockResolvedValue(undefined);
+    render(<StageFocus stage={doneStage} workspacePath="/tmp" run={pausedRun} onRerunFromStage={onRerunFromStage} />);
+    fireEvent.click(screen.getByRole("button", { name: "Re-run from here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Re-run · discards downstream" }));
+    expect(onRerunFromStage).toHaveBeenCalledWith();
+  });
 });

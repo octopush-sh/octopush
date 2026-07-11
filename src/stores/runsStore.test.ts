@@ -304,8 +304,23 @@ describe("runsStore", () => {
     (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [STAGE] });
 
     await useRunsStore.getState().rerunFromStage("r1", "st1");
-    expect(ipc.rerunFromStage).toHaveBeenCalledWith("r1", "st1");
+    expect(ipc.rerunFromStage).toHaveBeenCalledWith("r1", "st1", undefined);
     expect(useRunsStore.getState().getDetail("r1")?.run?.status).toBe("running");
+  });
+
+  it("rerunFromStage forwards the director's patch to the IPC", async () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [RUN] }, detailByRun: { r1: { run: RUN, stages: [STAGE] } },
+    });
+    (ipc.rerunFromStage as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: { ...RUN, status: "running" }, stages: [STAGE] });
+
+    await useRunsStore.getState().rerunFromStage("r1", "st1", {
+      instructions: "tightened brief", agentModel: "claude-sonnet-5", checkpoint: true,
+    });
+    expect(ipc.rerunFromStage).toHaveBeenCalledWith("r1", "st1", {
+      instructions: "tightened brief", agentModel: "claude-sonnet-5", checkpoint: true,
+    });
   });
 
   it("rerunFromStage still refreshes detail (and rethrows) when the backend rejects", async () => {

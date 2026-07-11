@@ -2759,30 +2759,74 @@ impl Db {
             ));
         }
 
-        let (status, started_at, role, loop_target_position, loop_max_iterations): (
+        let (status, started_at, role, loop_target_position, loop_max_iterations, artifact): (
             String,
             Option<String>,
             String,
             Option<i64>,
             i64,
+            Option<String>,
         ) = self
             .conn
             .query_row(
-                "SELECT status, started_at, role, loop_target_position, loop_max_iterations
+                "SELECT status, started_at, role, loop_target_position, loop_max_iterations, artifact
                  FROM run_stages WHERE id = ?1 AND run_id = ?2",
                 params![stage_id, run_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?
             .ok_or_else(|| AppError::Other("stage not found".into()))?;
 
-        if status != "pending" || started_at.is_some() {
+        // Two editable moments: a pending stage the run hasn't reached, and a
+        // stage parked BEFORE it began — a budget park or a director pause,
+        // which hold the NEXT stage with no work done. "No artifact yet" is
+        // the no-work-done signal: those pre-work parks produce nothing (and
+        // never stamp started_at), while a checkpoint-GATE park holds a
+        // FINISHED stage's hand-off, artifact and all — that one is past
+        // editing and is redirected via the decision bar or a re-run.
+        let pending_unstarted = status == "pending" && started_at.is_none();
+        let parked_unbegun = status == "awaiting_checkpoint" && artifact.is_none();
+        if !pending_unstarted && !parked_unbegun {
             return Err(AppError::Other(format!(
                 "{} has already started — only stages that haven't begun can be edited",
                 role.replace('_', " ")
             )));
         }
+        // Toggling the gate of a stage that is already parked would not
+        // release the park (that's what approve/reject are for) — reject it
+        // rather than let the toggle silently do nothing.
+        if parked_unbegun && checkpoint.is_some() {
+            return Err(AppError::Other(
+                "this stage is parked awaiting your decision — approve or reject it instead of toggling the gate".into(),
+            ));
+        }
 
+        Self::validate_stage_patch_fields(
+            loop_target_position,
+            loop_max_iterations,
+            loop_mode,
+            agent_model,
+        )?;
+
+        self.apply_run_stage_patch(
+            stage_id,
+            checkpoint,
+            instructions,
+            agent_model,
+            max_iterations,
+            loop_mode,
+        )
+    }
+
+    /// Field-level validation for a stage patch, shared by `update_run_stage`
+    /// and the rerun path (which must validate BEFORE it resets anything).
+    pub fn validate_stage_patch_fields(
+        loop_target_position: Option<i64>,
+        loop_max_iterations: i64,
+        loop_mode: Option<&str>,
+        agent_model: Option<&str>,
+    ) -> AppResult<()> {
+        use crate::error::AppError;
         if let Some(mode) = loop_mode {
             if loop_target_position.is_none() || loop_max_iterations <= 0 {
                 return Err(AppError::Other(
@@ -2798,7 +2842,21 @@ impl Db {
                 return Err(AppError::Other("agent model can't be empty".into()));
             }
         }
+        Ok(())
+    }
 
+    /// Apply a stage patch with NO state guards — callers are responsible for
+    /// having validated the run/stage state (`update_run_stage`) or for having
+    /// just reset the stage to pending (the rerun path).
+    pub fn apply_run_stage_patch(
+        &self,
+        stage_id: &str,
+        checkpoint: Option<bool>,
+        instructions: Option<&str>,
+        agent_model: Option<&str>,
+        max_iterations: Option<i64>,
+        loop_mode: Option<&str>,
+    ) -> AppResult<()> {
         if let Some(cp) = checkpoint {
             self.conn.execute(
                 "UPDATE run_stages SET checkpoint = ?2 WHERE id = ?1",

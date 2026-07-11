@@ -110,8 +110,9 @@ interface RunsState {
    *  `refreshDetail` reconciles — or reverts, if the backend rejected it. */
   updateStage: (runId: string, stageId: string, patch: RunStagePatch) => Promise<void>;
   /** Re-run a finished (done/failed) stage and everything downstream of it,
-   *  in place — no restart, no reload. */
-  rerunFromStage: (runId: string, stageId: string) => Promise<void>;
+   *  in place — no restart, no reload. The optional patch is the director's
+   *  "re-run after changes": applied atomically as part of the re-run. */
+  rerunFromStage: (runId: string, stageId: string, patch?: RunStagePatch) => Promise<void>;
   /** null clears a manual pin — the canvas falls back to the active stage. */
   selectStage: (runId: string, stageId: string | null) => void;
   setLauncherPrefill: (prefill: LauncherPrefill | null) => void;
@@ -394,9 +395,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  rerunFromStage: async (runId, stageId) => {
+  rerunFromStage: async (runId, stageId, patch) => {
     try {
-      await ipc.rerunFromStage(runId, stageId);
+      await ipc.rerunFromStage(runId, stageId, patch);
     } finally {
       // Re-syncs with backend truth whether the call succeeded or was
       // rejected by a guard (e.g. a race with a concurrent resolve/rerun) —

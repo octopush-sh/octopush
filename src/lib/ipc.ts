@@ -142,6 +142,20 @@ export interface RunStagePatch {
   maxIterations?: number;
   loopMode?: "gated" | "auto";
 }
+
+/** The one wire encoding of a RunStagePatch, shared by `updateRunStage` and
+ *  `rerunFromStage` so the two paths can never drift: `undefined` → `null`
+ *  (Rust `None`, "leave unchanged"); `instructions: null` → `""` (Rust
+ *  `Some("")`, which trims to a cleared field). */
+function stagePatchArgs(patch?: RunStagePatch) {
+  return {
+    checkpoint: patch?.checkpoint ?? null,
+    instructions: patch?.instructions === undefined ? null : (patch.instructions ?? ""),
+    agentModel: patch?.agentModel ?? null,
+    maxIterations: patch?.maxIterations ?? null,
+    loopMode: patch?.loopMode ?? null,
+  };
+}
 export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
 
 /** An archived stage attempt — a snapshot taken just before a loop-back /
@@ -897,21 +911,15 @@ export const ipc = {
    *  `undefined` in `patch` is unchanged. `instructions: null` clears the
    *  field (distinct from leaving it `undefined`, which leaves it as-is). */
   updateRunStage: (runId: string, stageId: string, patch: RunStagePatch) =>
-    invoke<void>("update_run_stage", {
-      runId,
-      stageId,
-      checkpoint: patch.checkpoint ?? null,
-      instructions: patch.instructions === undefined ? null : (patch.instructions ?? ""),
-      agentModel: patch.agentModel ?? null,
-      maxIterations: patch.maxIterations ?? null,
-      loopMode: patch.loopMode ?? null,
-    }),
+    invoke<void>("update_run_stage", { runId, stageId, ...stagePatchArgs(patch) }),
 
   /** Re-run a finished (done/failed) stage and everything downstream of it,
    *  in place — no restart, no reload. Rejects if the stage hasn't finished
-   *  or the run is currently driving. */
-  rerunFromStage: (runId: string, stageId: string) =>
-    invoke<void>("rerun_from_stage", { runId, stageId }),
+   *  or the run is currently driving. An optional `patch` rides along — the
+   *  director's "re-run after changes": validated before anything resets,
+   *  applied before the drive resumes. */
+  rerunFromStage: (runId: string, stageId: string, patch?: RunStagePatch) =>
+    invoke<void>("rerun_from_stage", { runId, stageId, ...stagePatchArgs(patch) }),
 
   /** The persisted live journal for a stage, oldest first. Entries are
    *  LiveEntry-shaped JSON plus `{kind:"reset"}` marker objects that split
