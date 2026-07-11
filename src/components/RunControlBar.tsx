@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pause, CircleStop, Ban, RotateCcw, ChevronRight } from "lucide-react";
+import { Ban, RotateCcw, ChevronRight } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "../lib/stageMeta";
@@ -21,6 +21,8 @@ interface Props {
   /** Human label for a loop target when a gated send-back applies, else null. */
   loopTargetRole: string | null;
   loopState: LoopState | null;
+  /** True when the beaconAnchor is this bar's primary CTA (Law 2). */
+  beacon?: boolean;
   /** Launch a STAGED (draft) run — e.g. one authored via octopush-mcp. */
   onStart: () => void;
   onPause: () => void;
@@ -82,21 +84,20 @@ export function RunControlBar(props: Props) {
     return <TerminalBar run={run} onRunAgain={props.onRunAgain} />;
   }
   if (run.status === "draft") {
-    return <DraftBar onStart={props.onStart} onDiscard={props.onAbort} />;
+    return <DraftBar onStart={props.onStart} onDiscard={props.onAbort} beacon={props.beacon ?? false} />;
   }
   if (blockedStage) {
     return <DecisionBar {...props} blockedStage={blockedStage} />;
   }
-  if (run.status === "running") {
-    return <RunningBar onPause={props.onPause} onStopStage={props.onStopStage} onAbort={props.onAbort} />;
-  }
+  // While the run simply runs, the bar yields: pause / stop / abort live in
+  // the run header (DirectCanvas) and the beacon is on the running card.
   return null;
 }
 
 /** A STAGED run awaiting its launch — e.g. authored by octopush-mcp with
  *  `create_run`. Without this bar a draft was a dead end: DIRECT presented
  *  its all-pending track with no way to start (or clear) it. */
-function DraftBar({ onStart, onDiscard }: { onStart: () => void; onDiscard: () => void }) {
+function DraftBar({ onStart, onDiscard, beacon }: { onStart: () => void; onDiscard: () => void; beacon: boolean }) {
   return (
     <div className="octo-fade-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2.5">
       <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">draft</span>
@@ -109,28 +110,11 @@ function DraftBar({ onStart, onDiscard }: { onStart: () => void; onDiscard: () =
       <button
         type="button"
         onClick={onStart}
-        className="flex items-center gap-1.5 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi"
+        className={`${beacon ? "octo-stage-pulse " : ""}flex items-center gap-1.5 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi`}
       >
         <ChevronRight size={13} strokeWidth={1.75} />
         Begin this run
       </button>
-    </div>
-  );
-}
-
-function RunningBar({ onPause, onStopStage, onAbort }: { onPause: () => void; onStopStage: () => void; onAbort: () => void }) {
-  return (
-    <div className="octo-fade-in flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-4 py-2.5">
-      <span className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-        <span className="octo-stage-pulse inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" aria-hidden="true" />
-        running
-      </span>
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-mute">
-        Pause parks the next stage for you · stop ends the current stage.
-      </span>
-      <IconCtl label="Pause at the next stage" onClick={onPause}><Pause size={14} strokeWidth={1.75} /></IconCtl>
-      <IconCtl label="Stop the current stage" onClick={onStopStage}><CircleStop size={14} strokeWidth={1.75} /></IconCtl>
-      <IconCtl label="Abort the run" onClick={onAbort} danger><Ban size={14} strokeWidth={1.75} /></IconCtl>
     </div>
   );
 }
@@ -158,6 +142,7 @@ function DecisionBar({
   blockedStage,
   loopTargetRole,
   loopState,
+  beacon = false,
   onApprove,
   onReject,
   onResume,
@@ -230,7 +215,7 @@ function DecisionBar({
                   <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {cause.title}
                 </span>
                 <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
-                  className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]`}>
                   {canResume ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
                 </button>
                 {canResume && (
@@ -319,7 +304,7 @@ function DecisionBar({
               </span>
               {transient ? (
                 <button type="button" onClick={() => onResume()}
-                  className="rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]">
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}>
                   Resume the stage
                 </button>
               ) : failed ? (
@@ -329,7 +314,7 @@ function DecisionBar({
                 </button>
               ) : (
                 <button type="button" onClick={onApprove}
-                  className="rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi">
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
                   Approve &amp; continue
                 </button>
               )}

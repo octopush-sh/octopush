@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import { Maximize2 } from "lucide-react";
+import { Ban, CircleStop, Maximize2, Pause } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { labelForRole } from "../lib/stageMeta";
+import { beaconAnchor } from "../lib/beacon";
+import { IconButton } from "./controls/IconButton";
 import { PipelineSetup } from "./PipelineSetup";
 import { PipelineBuilder } from "./PipelineBuilder";
 import { RunFlow } from "./RunFlow";
@@ -107,6 +109,10 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     const shownStageId = selectedStageId ?? activeStage?.id ?? null;
     const shownStage = stages.find((s) => s.id === shownStageId) ?? null;
 
+    const runningStage = stages.find((s) => s.status === "running") ?? null;
+    // Law 2 — one beacon per canvas: decision CTA → running card → calm.
+    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false });
+
     // Loop props (unchanged logic, but computed off blockedStage)
     let loopTargetRole: string | null = null;
     let loopState: { iteration: number; max: number } | null = null;
@@ -156,10 +162,28 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             </div>
             <Maximize2 size={12} className="shrink-0 text-octo-mute transition-colors duration-[180ms] group-hover:text-octo-brass" />
           </button>
+          {run.status === "running" && !blockedStage && (
+            <span className="flex shrink-0 items-center gap-1.5">
+              <IconButton label="Pause at the next stage" onClick={() => void pauseRun(run.id)}>
+                <Pause size={12} strokeWidth={1.75} />
+              </IconButton>
+              <IconButton label="Stop the current stage" onClick={() => void stopStage(run.id)}>
+                <CircleStop size={12} strokeWidth={1.75} />
+              </IconButton>
+              <IconButton label="Abort the run" onClick={() => void abort(run.id)} danger>
+                <Ban size={12} strokeWidth={1.75} />
+              </IconButton>
+            </span>
+          )}
         </div>
         {/* The living pipeline. */}
         <div className="border-b border-octo-hairline bg-octo-panel px-4 py-2">
-          <RunFlow stages={stages} selectedStageId={shownStageId} onSelectStage={(id) => selectStage(run.id, id)} />
+          <RunFlow
+            stages={stages}
+            selectedStageId={shownStageId}
+            beaconStageId={anchor?.kind === "stage" ? anchor.stageId : null}
+            onSelectStage={(id) => selectStage(run.id, id)}
+          />
         </div>
         <StageFocus
           stage={shownStage}
@@ -175,6 +199,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           blockedStage={blockedStage}
           loopTargetRole={loopTargetRole}
           loopState={loopState}
+          beacon={anchor?.kind === "decision"}
           onStart={() => void start(run.id)}
           onPause={() => void pauseRun(run.id)}
           onStopStage={() => void stopStage(run.id)}

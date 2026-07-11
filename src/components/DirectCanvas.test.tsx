@@ -21,7 +21,6 @@ vi.mock("./RunControlBar", () => ({
   RunControlBar: ({ run, blockedStage, onRunAgain }: any) => (
     <div>
       {blockedStage && <div>CHECKPOINT</div>}
-      {run.status === "running" && !blockedStage && <div>RUNNINGBAR</div>}
       {TERMINAL.has(run.status) && <button onClick={onRunAgain}>again</button>}
     </div>
   ),
@@ -152,7 +151,7 @@ describe("DirectCanvas viewed-run routing", () => {
 
     // Paused at a checkpoint: the decision surface is shown.
     expect(screen.getByText("CHECKPOINT")).toBeInTheDocument();
-    expect(screen.queryByText("RUNNINGBAR")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Pause at the next stage")).not.toBeInTheDocument();
 
     // Resumed: the control bar adapts to the running controls (no decision).
     act(() => {
@@ -161,6 +160,6 @@ describe("DirectCanvas viewed-run routing", () => {
       });
     });
     expect(screen.queryByText("CHECKPOINT")).not.toBeInTheDocument();
-    expect(screen.getByText("RUNNINGBAR")).toBeInTheDocument();
+    expect(screen.getByTitle("Pause at the next stage")).toBeInTheDocument();
   });
 });
