@@ -1,4 +1,6 @@
+import { Pencil } from "lucide-react";
 import type { PipelineWithStages } from "../../lib/ipc";
+import { StageDots } from "./StageDots";
 
 interface Props {
   pipeline: PipelineWithStages;
@@ -36,19 +38,14 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
           )}
           <span className="min-w-0 flex-1 truncate pr-6 font-serif text-[14px] text-octo-ivory">{name}</span>
         </div>
-        {/* Shape line: a dot per stage, brass connectors (⟜ after a gate).
-            A 7-8 stage pipeline can't fit every dot in 184px — the dot run
-            clips (min-w-0 + overflow-hidden) while the stage count, the part
-            that actually matters at this width, always stays legible. */}
+        {/* Shape line — the universal micro-track in its neutral tone; the dot
+            run clips while the stage count always stays legible. */}
         <div className="flex items-center gap-1 font-mono text-[10px] text-octo-mute">
-          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
-            {stages.map((s, i) => (
-              <span key={s.id} className="flex shrink-0 items-center gap-1">
-                {i > 0 && <span className="text-octo-brass/70">{stages[i - 1].checkpoint ? "⟜" : "⟶"}</span>}
-                <span className="inline-block h-1 w-1 rounded-full bg-octo-sage" />
-              </span>
-            ))}
-          </div>
+          <StageDots
+            tone="shape"
+            stages={stages.map((s) => ({ status: "pending", checkpoint: s.checkpoint }))}
+            className="min-w-0 flex-1 overflow-hidden"
+          />
           <span className="ml-1 shrink-0 whitespace-nowrap">{stages.length} {stages.length === 1 ? "stage" : "stages"}</span>
         </div>
       </button>
@@ -57,9 +54,9 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
         onClick={onEdit}
         aria-label={`Edit ${name}`}
         title="Edit pipeline"
-        className="absolute right-2 top-2 rounded-sm border border-transparent px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.1em] text-octo-mute opacity-0 transition-opacity duration-[180ms] hover:border-octo-hairline hover:text-octo-brass focus:opacity-100 group-hover:opacity-100"
+        className="absolute right-2 top-2 flex items-center justify-center rounded p-1 text-octo-mute opacity-0 transition-opacity duration-[180ms] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass group-hover:opacity-100"
       >
-        Edit
+        <Pencil size={11} strokeWidth={1.75} />
       </button>
     </div>
   );
