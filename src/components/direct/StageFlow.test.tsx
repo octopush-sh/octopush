@@ -45,6 +45,7 @@ describe("StageFlow — quiet crew line", () => {
     const onOverride = vi.fn();
     render(<StageFlow stages={stages} overrides={{ 0: "override-0" }} onOverride={onOverride} />);
     fireEvent.click(screen.getByRole("button", { name: "Edit the crew" }));
+    expect(screen.getByRole("button", { name: "Close the crew editor" })).toBeInTheDocument();
     expect(screen.getByText("model:override-0")).toBeInTheDocument(); // stage 0 uses the override
     expect(screen.getByText("model:m1")).toBeInTheDocument();         // stage 1 keeps its default
     fireEvent.click(screen.getByText("model:m1"));

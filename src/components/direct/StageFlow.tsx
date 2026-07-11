@@ -49,7 +49,7 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
                 <span className="text-octo-sage" title={s.role.replace(/_/g, " ")}>
                   <Icon size={11} strokeWidth={1.75} />
                 </span>
-                <span className="ml-1.5 text-[12px] text-octo-sage" title={stageTitle(s)}>
+                <span className="ml-1.5 max-w-[32ch] truncate text-[12px] text-octo-sage" title={stageTitle(s)}>
                   {stageTitle(s)}
                 </span>
                 {override && (
@@ -71,13 +71,12 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
         </div>
         <IconButton
           label={editing ? "Close the crew editor" : "Edit the crew"}
-          onClick={() =>
-            setEditing((v) => {
-              const next = !v;
-              if (next) setEverOpened(true);
-              return next;
-            })
-          }
+          ariaExpanded={editing}
+          onClick={() => {
+            const next = !editing;
+            setEditing(next);
+            if (next) setEverOpened(true);
+          }}
         >
           <Pencil size={12} strokeWidth={1.75} />
         </IconButton>

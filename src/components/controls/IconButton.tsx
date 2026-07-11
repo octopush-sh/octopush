@@ -6,15 +6,18 @@ interface Props {
   onClick: () => void;
   disabled?: boolean;
   danger?: boolean;
+  /** Pass-through for disclosure toggles; undefined leaves the attribute off. */
+  ariaExpanded?: boolean;
   children: ReactNode;
 }
 
 /** Square ghost button for lucide icons — replaces ASCII ↑ ↓ ✕ buttons. */
-export function IconButton({ label, onClick, disabled = false, danger = false, children }: Props) {
+export function IconButton({ label, onClick, disabled = false, danger = false, ariaExpanded, children }: Props) {
   return (
     <button
       type="button"
       aria-label={label}
+      aria-expanded={ariaExpanded}
       title={label}
       onClick={onClick}
       disabled={disabled}
