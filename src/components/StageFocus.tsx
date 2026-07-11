@@ -172,23 +172,31 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     setDirectorError(null);
   }, [stage?.id]);
 
-  // The gate toggle needs a stage the run hasn't reached; a stage parked at
-  // its OWN pre-start gate can still take field edits (instructions, model,
-  // turns) — the gate itself is resolved via approve/reject, not a toggle.
+  // The gate toggle needs a stage the run hasn't reached. A stage parked
+  // BEFORE it began — a budget park or a director pause, which hold the
+  // next stage with no work done — still takes field edits; the park itself
+  // is released via approve/reject, not a toggle. "No artifact yet" is the
+  // no-work-done signal: pre-work parks produce nothing, while a checkpoint
+  // GATE park holds a FINISHED stage's hand-off (artifact present) and is
+  // redirected via the decision bar or a re-run instead. The backend
+  // enforces the same rule.
+  const controllable = !!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status);
   const gateTogglable =
-    !!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status) &&
-    stage.status === "pending" && stage.startedAt === null;
+    controllable && stage.status === "pending" && stage.startedAt === null;
   const fieldsEditable =
     gateTogglable ||
-    (!!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status) &&
-      stage.status === "awaiting_checkpoint" && stage.startedAt === null);
+    (controllable && stage.status === "awaiting_checkpoint" && stage.artifact === null);
+  // NOTE: not `controllable` — a COMPLETED run can't take edits but its
+  // stages can be re-run ("completed" is in the rerunnable set).
   const rerunnable =
     !!stage && !!run &&
     (RERUNNABLE_RUN_STATUSES.has(run.status) || (run.status === "running" && runBlocked)) &&
     (stage.status === "done" || stage.status === "failed");
   /** Finished stages open the same modal in "edit & re-run" mode — the only
-   *  way an edit to a finished stage can mean anything. */
-  const editRerunsStage = rerunnable && !fieldsEditable;
+   *  way an edit to a finished stage can mean anything. (rerunnable requires
+   *  done/failed and fieldsEditable requires pending/awaiting, so the two
+   *  never overlap for one stage.) */
+  const editRerunsStage = rerunnable;
   const showsLoopMode = !!stage && stage.loopTargetPosition !== null && stage.loopMaxIterations > 0;
 
   function reportDirectorError(e: unknown) {
@@ -207,7 +215,8 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   }
 
   async function saveEdit() {
-    if (!stage) return;
+    const action = editRerunsStage ? onRerunFromStage : onUpdateStage;
+    if (!stage || !action) return;
     setSaving(true);
     setEditError(null);
     const patch: RunStagePatch = {
@@ -217,18 +226,10 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       ...(showsLoopMode ? { loopMode: draftLoopMode } : {}),
       // The re-run path resets the stage to pending first, so the gate is
       // legitimately patchable there — offered as a field in the modal.
-      ...(editRerunsStage && draftCheckpoint !== stage.checkpoint
-        ? { checkpoint: draftCheckpoint }
-        : {}),
+      ...(editRerunsStage ? { checkpoint: draftCheckpoint } : {}),
     };
     try {
-      if (editRerunsStage) {
-        if (!onRerunFromStage) return;
-        await onRerunFromStage(patch);
-      } else {
-        if (!onUpdateStage) return;
-        await onUpdateStage(patch);
-      }
+      await action(patch);
       setEditOpen(false);
     } catch (e) {
       setEditError(e instanceof Error ? e.message : String(e));

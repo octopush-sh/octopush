@@ -1559,6 +1559,9 @@ pub async fn rerun_from_stage(
     max_iterations: Option<i64>,
     loop_mode: Option<String>,
 ) -> AppResult<()> {
+    // An all-None patch is a plain "re-run as-is": validation passes
+    // vacuously and the applier is a per-field no-op, so no emptiness
+    // special-case is needed.
     let patch = crate::orchestrator::types::StageRerunPatch {
         checkpoint,
         instructions,
@@ -1566,8 +1569,7 @@ pub async fn rerun_from_stage(
         max_iterations,
         loop_mode,
     };
-    let patch = if patch.is_empty() { None } else { Some(patch) };
-    orch.prepare_rerun(&run_id, &stage_id, patch.as_ref())?;
+    orch.prepare_rerun(&run_id, &stage_id, Some(&patch))?;
     Arc::clone(&*orch).resume_claimed_drive(run_id);
     Ok(())
 }

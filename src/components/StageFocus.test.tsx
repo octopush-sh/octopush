@@ -516,11 +516,23 @@ describe("StageFocus director controls", () => {
     expect(screen.queryByRole("button", { name: "Re-run from here" })).not.toBeInTheDocument();
   });
 
-  it("offers field edits — but not the gate toggle — for a stage parked at its own pre-start gate", () => {
-    const parked = { ...baseStage, status: "awaiting_checkpoint", startedAt: null, checkpoint: true };
+  it("offers field edits — but not the gate toggle — for a budget/director-parked stage that never began", () => {
+    // Pre-work parks (budget park, director pause) hold the NEXT stage with
+    // neither startedAt nor an artifact; "no artifact yet" is the
+    // no-work-done signal (mirrors the backend guard).
+    const parked = { ...baseStage, status: "awaiting_checkpoint", startedAt: null, artifact: null, checkpoint: true };
     render(<StageFocus stage={parked} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
     expect(screen.getByRole("button", { name: "Edit stage" })).toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: /approval gate/i })).not.toBeInTheDocument();
+  });
+
+  it("a stage parked at its checkpoint GATE (finished work, artifact set) is not field-editable", () => {
+    const gateParked = {
+      ...baseStage, status: "awaiting_checkpoint", startedAt: "t",
+      artifact: JSON.stringify({ kind: "note", text: "verdict", payload: null, refsWorktree: false }),
+    };
+    render(<StageFocus stage={gateParked} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Edit/ })).not.toBeInTheDocument();
   });
 
   it("edit on a finished stage becomes Edit & re-run: saving routes the patch through onRerunFromStage", async () => {

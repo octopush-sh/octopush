@@ -4814,24 +4814,28 @@ mod orchestrator_tests {
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed", "the run was not reopened");
     }
 
-    /// A stage parked at its OWN pre-start gate takes field edits (the spec
-    /// is built after approval, from the row) — but not a gate toggle, which
-    /// could never release the park it belongs to.
+    /// A stage parked BEFORE it began — a budget park or a director pause,
+    /// which hold the NEXT pending stage with neither started_at nor an
+    /// artifact — takes field edits (the spec is built from the row after
+    /// approval), but not a gate toggle, which could never release the park.
+    /// (A checkpoint-gate park is different: it holds a FINISHED stage's
+    /// hand-off, artifact and all, and is redirected via the decision bar or
+    /// a re-run — update_run_stage keeps rejecting it as "already started".)
     #[tokio::test]
-    async fn parked_unstarted_stage_takes_field_edits_but_not_a_gate_toggle() {
+    async fn parked_unbegun_stage_takes_field_edits_but_not_a_gate_toggle() {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", true, None, 0, None, 25).unwrap(); // gated
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
 
-        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
-        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
-        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
-
+        // Park the un-begun stage exactly as pause_for_budget / a director
+        // pause does: status flips to awaiting_checkpoint, nothing else —
+        // started_at is only ever stamped on 'running', no artifact exists.
+        let implement_id = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().set_run_stage_status(&implement_id, "awaiting_checkpoint").unwrap();
         let parked = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
-        assert_eq!(parked.status, "awaiting_checkpoint");
-        assert!(parked.started_at.is_none(), "pre-start park — no work has begun");
+        assert!(parked.started_at.is_none() && parked.artifact.is_none(), "a pre-work park has neither");
 
         // Field edits land: the spec is built from the row after approval.
         db.lock()
@@ -4841,13 +4845,39 @@ mod orchestrator_tests {
         assert_eq!(row.instructions.as_deref(), Some("focus on the edge cases"));
         assert_eq!(row.agent_model, "m2");
 
-        // The gate itself is resolved via approve/reject — toggling it while
+        // The park is released via approve/reject — toggling the gate while
         // parked is rejected, not silently ignored.
         let err = db
             .lock()
             .update_run_stage(&run_id, &parked.id, Some(false), None, None, None, None)
             .unwrap_err();
-        assert!(err.to_string().contains("parked at its gate"), "err={err}");
+        assert!(err.to_string().contains("parked awaiting your decision"), "err={err}");
+    }
+
+    /// The inverse of the test above: a stage parked at its checkpoint GATE
+    /// has finished its work (artifact present) — field edits are rejected,
+    /// because there is nothing left for them to affect.
+    #[tokio::test]
+    async fn gate_parked_finished_stage_rejects_field_edits() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", true, None, 0, None, 25).unwrap(); // gated hand-off
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let parked = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        assert_eq!(parked.status, "awaiting_checkpoint");
+        assert!(parked.artifact.is_some(), "a gate park holds a finished stage's hand-off");
+
+        let err = db
+            .lock()
+            .update_run_stage(&run_id, &parked.id, None, Some("too late"), None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("already started"), "err={err}");
     }
 }
 

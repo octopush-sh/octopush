@@ -223,16 +223,6 @@ pub struct StageRerunPatch {
     pub loop_mode: Option<String>,
 }
 
-impl StageRerunPatch {
-    pub fn is_empty(&self) -> bool {
-        self.checkpoint.is_none()
-            && self.instructions.is_none()
-            && self.agent_model.is_none()
-            && self.max_iterations.is_none()
-            && self.loop_mode.is_none()
-    }
-}
-
 /// The runtime spec a runner needs to execute one stage.
 #[derive(Clone, Debug)]
 pub struct StageSpec {
