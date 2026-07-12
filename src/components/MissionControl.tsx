@@ -12,10 +12,11 @@ import { Plus, Square, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
-import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
+import { runStatusMeta, isTransientHalt, needsYou } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
-import { ROMAN, stageTitle } from "../lib/stageMeta";
+import { stageTitle } from "../lib/stageMeta";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
+import { StageDots } from "./direct/StageDots";
 
 interface Props {
   open: boolean;
@@ -50,7 +51,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
     };
     const fifo = (a: Run, b: Run) => since(a) - since(b);
     return {
-      needsYou: active.filter((r) => r.status === "paused").sort(fifo),
+      needsYou: active.filter(needsYou).sort(fifo),
       inFlight: active.filter((r) => r.status === "running").sort(fifo),
       settled: settled.sort(fifo),
     };
@@ -235,13 +236,25 @@ function CrewCard({
           ? { label: "⟜", cls: "text-octo-brass", word: "at the gate" }
           : { label: meta.glyph, cls: meta.className, word: meta.word };
 
-  // Needs-you cards carry the brass border + calm pulse — the same "needs the
-  // human" convention as an awaiting stage card. Everything else stays hairline
-  // (position in the band is the salience).
+  // Needs-you cards carry the brass border; everything else stays hairline
+  // (position in the band is the salience). Law 2 fleet scope: exactly one
+  // card pulses at a time — the longest-waiting needs-you card (index 0; the
+  // band's runs arrive fifo-sorted, oldest first). Every other needs-you card
+  // keeps the brass border, calm, no pulse.
+  const isLongestWaiting = band === "needs-you" && index === 0;
   const skin =
     band === "needs-you"
-      ? "border-octo-brass octo-stage-pulse"
+      ? `border-octo-brass ${isLongestWaiting ? "octo-stage-pulse" : ""}`
       : "border-octo-hairline hover:border-[var(--brass-dim)]";
+
+  // Law 1 ink grading by band: needs-you full ink, in-flight 75%, settled 45%
+  // rising to 85% on hover/focus (progressive disclosure, nothing removed).
+  const ink =
+    band === "in-flight"
+      ? "opacity-75"
+      : band === "settled"
+        ? "opacity-45 hover:opacity-85 focus-within:opacity-85"
+        : "";
 
   // The whole card jumps to the crew's workspace. A div-with-role (not a
   // <button>) so inner action buttons stay valid HTML and child `title`
@@ -269,7 +282,7 @@ function CrewCard({
     <div
       {...jumpProps}
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
-      className={`octo-rise-in group relative flex flex-col gap-1.5 rounded-lg border bg-octo-panel px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${canJump ? "cursor-pointer" : ""} ${skin}`}
+      className={`octo-rise-in group relative flex flex-col gap-1.5 rounded-lg border bg-octo-panel px-4 py-3 text-left transition duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${canJump ? "cursor-pointer" : ""} ${skin} ${ink}`}
     >
       {/* Row 1 — status glyph · word · time-in-state. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
@@ -295,7 +308,7 @@ function CrewCard({
         {run.task}
       </span>
 
-      {/* Row 4 — micro-track: numerals + connectors, the run at a glance. */}
+      {/* Row 4 — micro-track: the run's shape at a glance. */}
       <MicroTrack stages={stages} />
 
       {/* Row 5 — the live slot: ticker / gate / halt / savings. */}
@@ -307,36 +320,20 @@ function CrewCard({
   );
 }
 
-/** The run's stages compressed to one mono line: colored roman numerals joined
- *  by ⟶ (handoff) or ⟜ (gate). Fixed-height slot; renders reserved dots until
- *  the stage detail arrives (S1: the slot exists in every state). */
+/** The run's stages compressed to the universal micro-track (spec §4.1) —
+ *  one dot per stage, same status colour family everywhere a run is
+ *  miniaturised. Fixed-height slot; renders a reserved placeholder until the
+ *  stage detail arrives (S1: the slot exists in every state). Replaces the
+ *  retired roman-numeral track. */
 function MicroTrack({ stages }: { stages: RunStage[] }) {
   if (stages.length === 0) {
     return <span className="block h-4 font-mono text-[10px] leading-4 text-octo-mute">· · ·</span>;
   }
-  const colorFor = (s: RunStage): string => {
-    if (s.status === "done") return "text-octo-verdigris";
-    if (s.status === "running") return "text-octo-verdigris octo-stage-pulse rounded-sm";
-    if (s.status === "awaiting_checkpoint") return "text-octo-brass";
-    if (s.status === "failed")
-      return isTransientHalt(s.error) ? "text-octo-warning" : "text-octo-rouge";
-    return "text-octo-mute";
-  };
   return (
-    <span className="flex h-4 items-center gap-1 overflow-hidden font-mono text-[10px] leading-4">
-      {stages.map((s, i) => {
-        const prev = stages[i - 1];
-        return (
-          <span key={s.id} className="flex shrink-0 items-center gap-1" title={`${stageTitle(s)} — ${s.status}`}>
-            {i > 0 && (
-              <span className={`text-octo-brass transition-opacity duration-[280ms] ${prev?.status === "done" ? "opacity-100" : "opacity-40"}`}>
-                {prev?.checkpoint ? "⟜" : "⟶"}
-              </span>
-            )}
-            <span className={colorFor(s)}>{ROMAN[i] ?? i + 1}</span>
-          </span>
-        );
-      })}
+    <span className="flex h-4 items-center">
+      <StageDots
+        stages={stages.map((s) => ({ status: s.status, checkpoint: s.checkpoint, error: s.error, title: stageTitle(s) }))}
+      />
     </span>
   );
 }

@@ -4,8 +4,6 @@
 
 import { useRolesStore } from "../stores/rolesStore";
 
-export const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
-
 /** Compact token count — the single format across every Direct surface:
  *  1240 → "1.2k", 980 → "980". */
 export function fmtTokens(n: number): string {
