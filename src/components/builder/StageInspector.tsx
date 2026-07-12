@@ -7,6 +7,7 @@ import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
 import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
+import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
 
 const SUBSTRATE_OPTIONS = [
@@ -75,7 +76,13 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
     <div className="octo-rise-in flex w-[300px] flex-col gap-4 overflow-y-auto rounded-lg border border-octo-hairline bg-octo-panel/95 p-4 backdrop-blur-sm">
       <div className="flex items-start justify-between">
         <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">{a.label}</p>
+          <p className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
+            {(() => {
+              const HeaderIcon = iconForRole(data.role);
+              return <HeaderIcon size={11} strokeWidth={1.75} />;
+            })()}
+            {a.label}
+          </p>
           <p className="font-serif text-[16px] text-octo-ivory">{stageLabel(data)}</p>
         </div>
         <button
@@ -188,7 +195,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
       {/* Loop — review archetypes only */}
       <Reveal open={a.canLoop}>
         <div className="flex flex-col gap-2 border-t border-octo-hairline pt-3">
-          <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">⟜ Loop</span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">⟲ Loop</span>
           <label className="flex flex-col gap-1">
             <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute">Return to</span>
             <Listbox

@@ -2,7 +2,7 @@ import { memo } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { X, AlertTriangle } from "lucide-react";
 import { archetypeFor, stageLabel, TOOLS, type StageNode as StageNodeT } from "./graph";
-import { ARTIFACT_ICON } from "./icons";
+import { iconForRole } from "../../lib/roleIcons";
 import { useBuilder } from "./BuilderContext";
 
 /** A short, human model id: drop the provider prefix and date suffix noise. */
@@ -12,7 +12,7 @@ function shortModel(model: string): string {
 
 function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
   const a = archetypeFor(data.role);
-  const Icon = ARTIFACT_ICON[a.artifact];
+  const Icon = iconForRole(data.role);
   const { validation, onRemove, canRemove } = useBuilder();
   const issue = validation[id];
 
@@ -44,7 +44,12 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
       <Handle type="source" position={Position.Bottom} className="octo-flow-handle" title="Feeds downstream stages" />
 
       <div className="flex items-start gap-2">
-        <span className="mt-0.5 text-octo-brass">
+        {data.checkpoint && (
+          <span className="mt-0.5 shrink-0 font-mono text-[12px] leading-none text-octo-brass" title="Pauses for your approval">
+            ⟜
+          </span>
+        )}
+        <span className={`mt-0.5 ${selected ? "text-octo-brass" : "text-octo-sage"}`}>
           <Icon size={14} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1">
@@ -88,20 +93,14 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
           {TOOLS.map((t) => (
             <span
               key={t.id}
-              className={`h-1.5 w-1.5 rounded-full ${granted(t.id) ? "bg-octo-brass" : "border border-octo-hairline"}`}
+              className={`h-1.5 w-1.5 rounded-full ${granted(t.id) ? "bg-octo-sage" : "border border-octo-hairline"}`}
             />
           ))}
         </span>
-        {/* Right cluster — gate and the validation marker coexist (each in its
-            own slot) so a flagged stage is never silent just because it gates.
-            The icon's tooltip names the cause; selecting the node shows it in
-            full in the inspector. */}
+        {/* Right cluster — the validation marker; the gate mark lives in the
+            header now. The icon's tooltip names the cause; selecting the node
+            shows it in full in the inspector. */}
         <span className="ml-auto flex items-center gap-2">
-          {data.checkpoint && (
-            <span className="font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass" title="Pauses for your approval">
-              ⟜ gate
-            </span>
-          )}
           {issue?.error ? (
             <span className="text-octo-rouge" title={issue.error} aria-label={issue.error}>
               <AlertTriangle size={11} strokeWidth={1.75} />

@@ -295,7 +295,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               pannable
               zoomable
               className="octo-flow-minimap"
-              maskColor="rgba(12,10,8,0.72)"
+              maskColor={`${tokens.onyx}b8`}
               nodeColor={() => tokens.hairline}
               nodeStrokeColor={() => tokens.brassDim}
             />

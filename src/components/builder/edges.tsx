@@ -8,7 +8,7 @@ export function FlowEdge({ id, sourceX, sourceY, targetX, targetY, sourcePositio
 }
 
 /** A loop back-edge from a review stage to an ancestor: a dashed brass arc with
- *  a small `⟜ ×N` pill so the loop reads at a glance even when zoomed out. */
+ *  a small `⟲ ×N` pill so the loop reads at a glance even when zoomed out. */
 export function LoopEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, markerEnd }: EdgeProps) {
   const [path, labelX, labelY] = getSmoothStepPath({
     sourceX,
@@ -37,7 +37,7 @@ export function LoopEdge({ id, sourceX, sourceY, targetX, targetY, sourcePositio
           style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
           title={auto ? "Loops automatically on a parsed verdict" : "Pauses for your decision before looping"}
         >
-          ⟜ ×{max}
+          ⟲ ×{max}
           {auto ? " · auto" : ""}
         </div>
       </EdgeLabelRenderer>
