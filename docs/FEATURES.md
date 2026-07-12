@@ -653,7 +653,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **Token-scan output hook** — The per-chunk `OutputHook` runs `token_engine::scan_pty_output` → `TokenEngine.record`. _Support:_ `commands.rs`, `lib.rs`.
 
 ### xterm.js front-end (TerminalPane)
-- **Terminal instance** — `@xterm/xterm` with cursorBlink, JetBrains Mono, shared `XTERM_THEME` (Onyx bg, purple cursor, full ANSI palette; RUN & TALK identical), 10000-line scrollback. _Support:_ `TerminalPane.tsx`, `lib/xtermTheme.ts`.
+- **Terminal instance** — `@xterm/xterm` with cursorBlink, JetBrains Mono, 10000-line scrollback. Theme is built live from the active Octopush theme's tokens (`getXtermTheme()`), not a fixed palette, so RUN & TALK terminals stay legible under every theme including the light "vellum" theme — reassigned on the `octo:theme` event without remounting. _Support:_ `TerminalPane.tsx`, `TerminalView.tsx`, `lib/xtermTheme.ts`, `stores/themeStore.ts`.
 - **FitAddon + ResizeObserver** — Fits xterm; debounced resize sends `resizeSession` only on actual change; refits on visible toggle + `layoutVersion` bumps. _Support:_ `TerminalPane.tsx`.
 - **WebLinksAddon + file-path link provider** — Linkifies URLs; path-shaped tokens (with `:line[:col]`) become clickable links routing to Review/editor. _Support:_ `TerminalPane.tsx`.
 - **Clipboard bridge** — Cmd-C / Ctrl-Shift-C / right-click-with-selection copy via `term.getSelection()`. _Support:_ `TerminalPane.tsx`.

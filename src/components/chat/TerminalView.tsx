@@ -3,7 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useChatStore } from "../../stores/chatStore";
 import { ipc } from "../../lib/ipc";
-import { XTERM_FONT_FAMILY, XTERM_THEME } from "../../lib/xtermTheme";
+import { XTERM_FONT_FAMILY, getXtermTheme } from "../../lib/xtermTheme";
 
 interface Props {
   /** Correlates this view to its live process's buffered output. */
@@ -40,7 +40,7 @@ export function TerminalView({ callId, threadId, className }: Props) {
       fontFamily: XTERM_FONT_FAMILY,
       fontSize: 12,
       lineHeight: 1.3,
-      theme: XTERM_THEME,
+      theme: getXtermTheme(),
       cursorBlink: true,
       allowProposedApi: true,
       scrollback: 5000,
@@ -50,6 +50,15 @@ export function TerminalView({ callId, threadId, className }: Props) {
     term.open(el);
     termRef.current = term;
     writtenRef.current = 0;
+
+    // Follow Octopush theme switches: themeStore.applyThemeToDom fires
+    // `octo:theme` after writing the new tokens to :root. xterm can't read
+    // `var(--…)` directly, so rebuild its theme from the live tokens (see
+    // lib/xtermTheme.ts · getXtermTheme) and assign it in place — no remount.
+    const onThemeChange = () => {
+      term.options.theme = getXtermTheme();
+    };
+    window.addEventListener("octo:theme", onThemeChange);
 
     // Forward keystrokes to the live process's stdin (REPLs / TUIs / prompts).
     // Guard against the brief window after the process exits but before the panel
@@ -81,6 +90,7 @@ export function TerminalView({ callId, threadId, className }: Props) {
     return () => {
       onData.dispose();
       ro.disconnect();
+      window.removeEventListener("octo:theme", onThemeChange);
       term.dispose();
       termRef.current = null;
     };
