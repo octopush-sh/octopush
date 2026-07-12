@@ -1,5 +1,5 @@
-// Add a provider — a two-step ModalShell wizard (I · II). Step I is identity
-// (name, protocol, local); step II is the endpoint. Replaces the inline form and
+// Add a provider — a two-step ModalShell wizard (1 · 2). Step 1 is identity
+// (name, protocol, local); step 2 is the endpoint. Replaces the inline form and
 // its native <select>/<checkbox> with Atelier controls.
 import { useState } from "react";
 import type { ProviderConfig } from "../../lib/types";
@@ -70,8 +70,8 @@ export function AddProviderDialog({
         <div className="mb-4 flex items-baseline justify-between">
           <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">New provider</div>
           <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
-            <span className={step === 1 ? "text-octo-brass" : ""}>I</span>
-            {!local && <> · <span className={step === 2 ? "text-octo-brass" : ""}>II</span></>}
+            <span className={step === 1 ? "text-octo-brass" : ""}>1</span>
+            {!local && <> · <span className={step === 2 ? "text-octo-brass" : ""}>2</span></>}
           </div>
         </div>
 

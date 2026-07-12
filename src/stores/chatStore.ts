@@ -931,7 +931,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Note: if the command is promoted to a live process the IPC resolves
       // (live:true) and this clears — re-enabling the composer ON PURPOSE so the
       // user can keep working; the pinned LiveProcessPanel + the still-running
-      // `§ RUN` card are the "process running" indicators while it streams.
+      // `RUN` card are the "process running" indicators while it streams.
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },

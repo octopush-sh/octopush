@@ -1,5 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { isTransientHalt } from "./runStatus";
+import { isTransientHalt, needsYou } from "./runStatus";
+
+describe("needsYou", () => {
+  it("a paused run needs the director — the engine's one 'human must act' run status", () => {
+    // `paused` covers every waiting reason at run level: gate, halted stage,
+    // budget park, director pause (the stage detail says which).
+    expect(needsYou({ status: "paused" })).toBe(true);
+  });
+
+  it("every other run status does not", () => {
+    for (const status of ["running", "completed", "aborted", "failed"] as const) {
+      expect(needsYou({ status }), status).toBe(false);
+    }
+  });
+});
 
 describe("isTransientHalt", () => {
   it("flags rate-limit / overload / server / network faults as transient", () => {

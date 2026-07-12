@@ -25,7 +25,7 @@ import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
 import { parseShellCommand } from "../../lib/shellCommand";
 import { FadeSwap } from "../primitives/FadeSwap";
-import { X, Paperclip, TerminalSquare, HelpCircle } from "lucide-react";
+import { X, Paperclip, TerminalSquare, HelpCircle, Slash } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -403,13 +403,13 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             try {
               const res = await ipc.readFileChecked(`${workspacePath}/${rel}`, 64_000);
               if (res.kind === "text") {
-                return `\n\n§ ${rel}\n\`\`\`\n${res.content}\n\`\`\``;
+                return `\n\n${rel}\n\`\`\`\n${res.content}\n\`\`\``;
               }
-              return `\n\n§ ${rel} _(not included: ${res.kind})_`;
+              return `\n\n${rel} _(not included: ${res.kind})_`;
             } catch {
               // Surface the failure in the message instead of silently dropping
               // it, so both the user and the model see the file was unreadable.
-              return `\n\n§ ${rel} _(not included: unreadable)_`;
+              return `\n\n${rel} _(not included: unreadable)_`;
             }
           }),
         );
@@ -600,7 +600,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
               className="flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono text-[10px] text-octo-brass"
               style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
             >
-              <span className="font-serif" aria-hidden>§</span>
+              <span title="Active skill" className="flex items-center">
+                <Slash size={12} strokeWidth={1.75} />
+              </span>
               {activeSkill}
               <button
                 type="button"

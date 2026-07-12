@@ -1,3 +1,4 @@
+import { FileWarning } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { formatBytes } from "../lib/formatBytes";
 import type { BinaryReason } from "../stores/editorStore";
@@ -20,8 +21,11 @@ export function EditorBinaryPane({ path, size, reason }: Props) {
 
   return (
     <div className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 text-center">
-      <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-        § Binary
+      <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+        <span title="Binary file" className="flex items-center">
+          <FileWarning size={12} strokeWidth={1.75} />
+        </span>
+        Binary
       </span>
       <span className="font-mono text-[13px] text-octo-ivory">{name}</span>
       <span className="font-mono text-[11px] text-octo-mute">{formatBytes(size)}</span>

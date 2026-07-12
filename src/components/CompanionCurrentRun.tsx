@@ -2,6 +2,7 @@ import type { RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { runStatusMeta } from "../lib/runStatus";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
+import { StageDots } from "./direct/StageDots";
 
 interface Props {
   workspaceId: string;
@@ -16,17 +17,6 @@ function activeStage(stages: RunStage[]): RunStage | null {
     stages[0] ??
     null
   );
-}
-
-/** A filled status dot — colour carries the state so the strip is glanceable. */
-function dotClass(status: string): string {
-  switch (status) {
-    case "running": return "bg-octo-verdigris octo-stage-pulse";
-    case "done": return "bg-octo-verdigris";
-    case "awaiting_checkpoint": return "bg-octo-brass";
-    case "failed": return "bg-octo-rouge";
-    default: return "bg-octo-mute";
-  }
 }
 
 /**
@@ -54,19 +44,17 @@ export function CompanionCurrentRun({ workspaceId }: Props) {
         <span className={`ml-auto ${meta.className}`} title={meta.word}>{meta.glyph} {meta.word}</span>
       </div>
 
-      {/* Glanceable stage progress — filled dots, colour per status. */}
-      <div className="mb-2 flex flex-wrap items-center gap-1.5">
-        {stages.map((s) => (
-          <span
-            key={s.id}
-            title={`${stageTitle(s)} — ${s.status}`}
-            className={`inline-block h-1.5 w-1.5 rounded-full ${dotClass(s.status)}`}
-          />
-        ))}
+      {/* Glanceable stage progress — the universal micro-track. */}
+      <div className="mb-2">
+        <StageDots stages={stages.map((s) => ({ status: s.status, checkpoint: s.checkpoint, error: s.error, title: stageTitle(s) }))} />
       </div>
 
-      {/* Which stage is current (static label — the canvas streams the activity). */}
-      {stage && <div className="mb-1.5 truncate font-serif text-[13px] text-octo-ivory">{stageTitle(stage)}</div>}
+      {/* Which stage is current — fixed-height truncating slot (S1), rendered
+          unconditionally so pre-hydration layout never shifts; the canvas
+          RunFlow owns the live activity stream, this is a static label. */}
+      <div className="mb-1.5 h-[18px] truncate font-serif text-[13px] leading-[18px] text-octo-ivory">
+        {stage ? stageTitle(stage) : ""}
+      </div>
 
       <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
         <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>

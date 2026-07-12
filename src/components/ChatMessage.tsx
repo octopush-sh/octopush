@@ -141,12 +141,7 @@ function makeMarkdownComponents(
     );
   },
   hr() {
-    return (
-      <hr
-        className="my-4 h-px border-0"
-        style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-      />
-    );
+    return <hr className="my-4 h-px border-0 bg-octo-hairline" />;
   },
   strong({ children }) {
     return <strong className="font-semibold text-octo-ivory">{children}</strong>;

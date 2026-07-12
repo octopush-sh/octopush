@@ -25,8 +25,10 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 **Alpha utilities:**
 - `--brass-dim:   rgba(212, 165, 116, 0.4)` — borders on active fills
 - `--brass-ghost: rgba(212, 165, 116, 0.08)` — subtle active backgrounds
+- `--brass-line:  rgba(212, 165, 116, 0.55)` — solid traversed/active connector ink (Direct run-track, builder review-loop edges). Lines are drawn solid or hairline — never a gradient.
+- `--brass-quiet: rgba(212, 165, 116, 0.22)` — reserved for a quieter "done, long settled" dot shade (`StageDots`); not yet wired into a consumer as of the fleet redesign.
 
-**Surgical brass rule:** in any screen, brass should occupy ≤ 5% of pixels. If you're using brass on more than 2–3 elements at once, you're using it too much.
+**Surgical brass norm:** in any screen, brass should occupy ≤ 5% of pixels. If you're using brass on more than 2–3 elements at once, you're using it too much. (Not to be confused with the "brass rule" divider component, which is fully retired — see §3.)
 
 ---
 
@@ -60,7 +62,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 - **Spacing scale (base 4):** `4 · 8 · 12 · 16 · 24 · 32 · 48`. Default gaps: 12 / 16 / 24. Premium breath: 24 / 32.
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
-- **Brass rule:** 28px gradient `linear-gradient(90deg, var(--brass), transparent)` — the signature divider for moments. **RETIRED for new surfaces (2026-06-16).** Existing uses in legacy surfaces remain; do not add this pattern to any new UI. Use `--hairline` borders or spacing for visual separation instead.
+- **Brass rule: fully deleted (2026-07-11).** The 28px gradient divider (`linear-gradient(90deg, var(--brass), transparent)`), `.animate-brass-grow`, and `@keyframes brassgrow` are **removed from the codebase**, not just retired-for-new-surfaces — there is no legacy allowance left; `grep -rn "linear-gradient" src` returns only non-divider uses (a repeating-stripe running-bar texture, a scrim fade behind tool output, and `mask-image` edge-fades — none of them a rule/line). Use `--hairline` borders or spacing for visual separation; use the solid `--brass-line` token where an *active* connector is needed (see §6, §8).
 
 ---
 
@@ -100,14 +102,15 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 ```tsx
 <div className="border-l border-octo-brass-dim bg-octo-brass-ghost
                 rounded-r-md px-3 py-2 flex items-center gap-3">
-  <span className="font-mono text-[9px] tracking-[0.2em] uppercase text-octo-brass">
-    § READ
+  <span className="flex items-center gap-1.5 font-mono text-[9px] tracking-[0.2em] uppercase text-octo-brass">
+    <Eye size={12} strokeWidth={1.75} title="Read" /> READ
   </span>
   <span className="font-mono text-[11px] text-octo-sage ml-auto">
     auth/middleware.ts
   </span>
 </div>
 ```
+The `§` prefix is retired — the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
 ### Input with italic-serif placeholder
 ```tsx
@@ -119,32 +122,32 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 />
 ```
 
-### Brass rule (animated reveal)
+### Solid connector line (traversed vs. pending)
 ```tsx
-<div
-  className="h-px bg-gradient-to-r from-octo-brass to-transparent
-             animate-[brassgrow_600ms_cubic-bezier(.2,.8,.3,1)_forwards]"
-  style={{ width: 28 }}
+<span
+  className={`h-px w-7 transition-colors duration-[280ms] ${
+    traversed ? "bg-[var(--brass-line)]" : "bg-octo-hairline"
+  }`}
 />
 ```
-
-```css
-@keyframes brassgrow { from { width: 0 } to { width: 28px } }
-```
+This replaces the retired brass-rule/gradient recipe everywhere a "flow has passed through here" signal is needed (Direct run-track, builder review-loop edges). No gradient, no grow animation — the color itself is the state; width transitions on the connector's own color property.
 
 ---
 
 ## 5. Signature details — structural glyphs and active patterns
 
-> **Decorative flourish retirement (2026-06-16):** The brass *rule* divider (§3), the `⟶` glyph used as **ornament** (prompt decoration, input nudges, button accents), and the `✦` flourish are **retired for all new surfaces**. Do not introduce them in new components. See §9 (Minimalism doctrine) for the replacement principles. What remains of `⟶` is its **structural/functional** role in Direct mode (see below) — that is not retired.
+> **Decorative flourish retirement (2026-06-16), extended by the Direct beauty redesign (2026-07-11):** the brass *rule* divider, the `✦` flourish, `§` as a typographic mark, and Roman numerals are **gone app-wide** — not just retired-for-new-surfaces. `⟶` is retired as both ornament *and* as the Direct run-track/Mission-Control connector glyph; it survives only at three sanctioned structural sites (below). See §9 (Minimalism doctrine) for the replacement principles.
 
 | Detail        | Status | Where to use                                                        |
 |---------------|--------|---------------------------------------------------------------------|
-| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass"), used sparingly  |
-| `⟶` in brass — **structural only** | Active (structural); **RETIRED as ornament** | **KEEP:** Direct run-track stage connector; Direct checkpoint gate flow. **DO NOT add** as prompt glyph, input nudge, or button decoration on any new surface. |
-| `⟜` in brass | Active | Direct run-track checkpoint gate — pauses the pipeline for human approval |
-| `§` in brass  | Active | Tool call cards — `§ READ`, `§ WRITE`, `§ RUN`; Direct focus-pane role headers — `§ PLANNER`, `§ IMPLEMENTER`. This prefix is structural; do not retire it. |
-| Roman numerals| Active | Multi-step wizards: `STEP I · OF II`, `I.`, `II.`, etc.; Direct run-track stage numbers |
+| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass"); also the Welcome-screen logomark (replaced the retired `§` mark) |
+| `⟜` in brass — structural | Active | Direct run-track / builder checkpoint gate — pauses the pipeline for human approval. Renders on the gate card's own header, not on a connector line. |
+| `⟲` in brass — structural | Active | Loop badge (`⟲ {iter}/{max}`) on a looping run-track card, and the builder's review-loop edge pill. |
+| `§`           | **RETIRED (app-wide, 2026-07-11)** | Was: tool call cards (`§ READ`), Direct focus-pane role headers (`§ PLANNER`), the Welcome logomark, Markdown export tool headings, the Composer/SlashMenu skill chip, the CommandPalette settings glyph, `@path` mention fences, EditorBinaryPane. All replaced by a `lucide-react` icon (`src/lib/roleIcons.ts` `iconForRole`/`iconForTool`, or a one-off like `FileWarning`/`Slash`) with a `title`, or dropped outright where the surrounding fence/label already carried the meaning. `grep -rn "§ " src` should only match doc comments citing a spec section number (`§4.1`), never a rendered string. |
+| Roman numerals | **RETIRED (app-wide, 2026-07-11)** | Was: multi-step wizards (`I · II`), Direct run-track stage numbers, Mission Control's micro-track. All wizards (`NewProjectFlow`, `WorkspaceCreator`, `AddProviderDialog`) now render plain arabic (`STEP 1 OF 2`, `1 · 2`); run-track/Mission-Control position numbers are arabic in the mono meta line (`3 · sonnet · api`); the miniature run shape is `StageDots` (below), not numerals at all. |
+| `⟶`           | **RETIRED as ornament and as the Direct connector/Mission-Control micro-track glyph.** Sanctioned structural survivors (exactly three, nowhere else): Composer's send-button glyph, `InlineTicketPicker`'s input prompt, `HunkRail`'s focus marker. | Do not add anywhere else. Flow between stages is now drawn as a **solid 1px line** (`--brass-line` traversed / `--hairline` pending) — see §6, §8. |
+| Gradient lines | **BANNED — solid ink only.** Any `linear-gradient` used *as a rule, divider, or connector* is forbidden, full stop (not just "retired for new surfaces"). `.animate-brass-grow`/`@keyframes brassgrow` are deleted; the completion sweep (`.octo-sweep`) is a solid brass line, not a gradient streak. Radial/mask washes (`OverlayRoom`, `WelcomeScreen` background, `WorkContextPanel` edge-fades) are surfaces, not lines — untouched. | n/a |
+| `StageDots` + the single beacon | **Active — the new signature mechanics.** `StageDots` (`src/components/direct/StageDots.tsx`) is the universal micro-track (5px dots, one per stage) replacing every bespoke shape line and the roman-numeral track. Exactly one brass-pulsing element per attention scope at a time (`lib/beacon.ts`'s `beaconAnchor`; fleet scope = the longest-waiting needs-you card, FIFO by `statusSince`) — see §6. | Launcher tickets, Companion, Mission Control. |
 | Italic phrases| Active — **upright only** | CTAs and placeholders use upright serif phrases (italics banned app-wide; see §9) |
 | `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass. |
 | Substrate pills | Active | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
@@ -159,16 +162,18 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 --dur-quick:    220ms;
 --dur-standard: 280ms;
 --dur-slow:     320ms;
---dur-reveal:   600ms;   /* brass rule grow */
+--dur-reveal:   600ms;   /* one-shot ceremonies: completion sweep, etc. */
+--stagger-step: 45ms;    /* shared list-entrance stagger step (RunFlow, StageFlow cards) */
 ```
 
 | Use case                  | Duration / easing                            |
 |---------------------------|----------------------------------------------|
 | Key phrase fade-in        | 280ms ease-out, staggered (eyebrow → key → body → tool) |
 | Mode glide (Talk/Run/Review) | 320ms ease-in-out                         |
-| Brass rule reveal         | 600ms cubic-bezier(.2,.8,.3,1)               |
+| Completion sweep (`.octo-sweep`) | 600ms cubic-bezier(.2,.8,.3,1) — solid brass line, no gradient |
 | Workspace switch          | 260ms ease-in-out                            |
 | Hover lift                | 180ms ease-out, `translateY(-1px)`           |
+| Depth-of-field opacity (essence↔hover, band ink) | 180ms ease-out (`duration-[180ms]`) |
 
 **Forbidden:** spring physics, bouncing, confetti, jittering icons, scale > 1.05, rotation animations.
 
@@ -185,7 +190,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 | `<FadeSwap swapKey>` | mutually exclusive view swaps (canvas states, pane modes) | exit fade 120ms → `.octo-fade-in` (`src/components/primitives/FadeSwap.tsx`) |
 | `<Reveal open>` | expanding/collapsing regions (decision strips, sub-panels) | grid-rows 0fr↔1fr · --dur-standard (`src/components/primitives/Reveal.tsx`) |
 | `.octo-tabular` | every live numeric value (cost, %, mm:ss, counters) | `font-variant-numeric: tabular-nums` |
-| `.octo-sweep` | one-shot brass rule sweep (Direct run-completion moment only) | width 0→100% · --dur-reveal |
+| `.octo-sweep` | one-shot **solid** brass line sweep (Direct run-completion moment only; no gradient) | width 0→100% · --dur-reveal |
 
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
@@ -197,6 +202,20 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 - **S6 — Smooth, calm scrolling.** Autoscroll uses `scrollTo({behavior:"smooth"})`; entries enter with `.octo-rise-in`.
 
 Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPanel`, the rail project collapse, the Recently-closed drawer). All entrance/collapse motion respects `prefers-reduced-motion`.
+
+### The single beacon (Direct beauty redesign, binding for live surfaces)
+
+At any moment there is **exactly one** brass-accented *live* element per attention scope — never two pulses at once. `src/lib/beacon.ts`'s `beaconAnchor()` is the pure priority selector (decision strip CTA → running stage card → ready launcher CTA → calm/`null`); components only ask "am I the anchor?" via the id it returns. Fleet scope (Mission Control / the `RunsTray` chip) has its own rule: only the **longest-waiting** needs-you card pulses (FIFO by `statusSince`), and the top-bar chip pulses only when at least one run needs the director.
+
+- The pulse itself is `.octo-stage-pulse` — a 2.4s looping `box-shadow` keyframe (`0%,100% → 0 0 0 0 transparent`, `50% → 0 0 0 3px var(--brass-ghost)`), never `infinite`-scaling or springy.
+- **Under `prefers-reduced-motion`:** the pulse animation is disabled and replaced with a **static halo** — a permanent `0 0 0 1px var(--brass-dim)` box-shadow — so the anchor is still legible without motion.
+- PRM handling lives at the CSS layer (the class's own `@media (prefers-reduced-motion: reduce)` block), not in `beacon.ts` — the selector is presentation-agnostic; only the visual expression of "this is the anchor" changes under PRM.
+
+### Entrance keyframes are from-only — do not add a `to{}` block
+
+`octo-enter-fade` / `octo-enter-pop` / `octo-enter-rise` (backing `.octo-fade-in` / `.octo-pop-in` / `.octo-rise-in` / `.octo-overlay-enter` / `.octo-modal-enter` / `.octo-menu-enter`) declare **only a `from{}` block** — no `to{}`. This is a fixed bug, not a stylistic choice: a `to{}` block combined with `animation-fill-mode: both` pins the element's opacity/transform at the animation's end state *forever*, silently overriding whatever utility opacity the element should settle into (e.g. an essence card's `opacity-[0.38]` or a settled row's `opacity-45`) — the depth-of-field dimming never actually rendered while the bug was in place. From-only keyframes animate *to the element's own underlying computed style* and then hand control back to it, so `0 → 0.38` (or whatever the resting opacity is) applies correctly and hover/focus opacity bumps keep working. `animation-fill-mode: both` still back-fills the `from` state during a stagger `animation-delay`, so there's no flash-of-unstyled-content.
+
+**Exception:** genuine one-shot animations with a defined terminal state — `octo-exit-fade` (fades **to** 0, an exit), `octo-sweep` (width **to** 100%, a ceremony), `octo-flash` (a flash-and-settle) — legitimately keep both `from{}` and `to{}`. The from-only rule applies specifically to *entrance* keyframes that hand off into a resting, possibly-dimmed state.
 
 **Centered/top dialogs → use `<ModalShell>` (`src/components/ModalShell.tsx`).** Don't hand-roll a backdrop. It bundles the canonical scrim (`bg-octo-onyx/80`), `.octo-overlay-enter` + `.octo-modal-enter`, Escape-to-close, optional click-outside (`closeOnBackdrop` — set `false` for confirm/alert dialogs), and `align="top"` for command palettes. Pass only the panel content as children. Left-anchored popovers (e.g. the rail customizer menus) are NOT dialogs — they keep their lightweight anchored backdrop.
 
@@ -282,30 +301,35 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 
 **Atelier form controls** (`src/components/controls/`) — `SegmentedControl`, `TogglePill`, `Stepper`, `Listbox` (portal + fixed positioning), `IconButton`. Direct surfaces never use native `<select>`, checkboxes, or number spinners; new form UI should reach for these first.
 
-**Run track** — the horizontal stage list across the canvas top.
+**Run track (`RunFlow`)** — the horizontal stage list across the canvas top, governed by Law 1 (depth of field) and Law 2 (single beacon).
 
-- Each stage is a **fixed-geometry card** (S1): roman numeral + status glyph + status word, role in serif, model + substrate pill, and one reserved live line that shows activity (running), verdict (done), or cost (idle) — geometry never changes while a run executes.
-- Stages connect left-to-right with `⟶` in brass (connector) or `⟜` in brass (checkpoint gate — pauses for human approval). Connectors render at 40% opacity until the stage on their left is done — progress visibly fills the line.
-- A running stage pulses (`octo-stage-pulse`) with a verdigris dot and a `5ch` tabular timer. Done = verdigris `✓`. Failed = rouge accent.
-- The track scrolls horizontally when stages overflow the canvas width; the focus pane below is always visible.
+- Each stage is a **two-geometry card**: the **subject** (running / awaiting-checkpoint / failed / selected) renders at full ink, 210px wide — gate mark (if any) + role icon (`iconForRole`) + serif title + status glyph, then status word + a fixed-width `5ch` tabular timer, one fixed-height live line (running activity / done verdict / idle tokens, S1), and a meta line (arabic position · model · substrate pill), plus a loop badge (`⟲ {iter}/{max}`, brass) when the stage loops back. Every other stage recedes to a dimmed **essence** — 150px, `opacity-[0.38]` rising to `opacity-70` on hover/focus (180ms) — role icon + title + status glyph + arabic position · cost · tokens only. Nothing is dropped; full detail is one click away in the focus pane.
+- Stages connect left-to-right with **solid 1px drawn lines**, not glyphs: `--brass-line` (55% alpha brass) once the stage to the left is done, `--hairline` ahead — progress visibly fills in as solid ink, never a gradient. The `⟜` gate mark renders on the gated card's own header, not on the connector.
+- Only the card matching the single beacon (`beaconStageId`, from `lib/beacon.ts`) carries `octo-stage-pulse`; a card's own status color (running verdigris border, awaiting brass, failed rouge, stalled amber) is independent of whether it currently holds the beacon.
+- The track scrolls horizontally (`RunFlowNav` chevrons appear only on overflow); the focus pane below is always visible.
 
-**Focus pane** — the lower half of the Direct canvas.
+**Focus pane (`StageFocus`)** — the lower half of the Direct canvas.
 
 - Shows the selected stage's artifact: a markdown plan, a code diff, or a test result.
-- Header: `§ ROLE` (e.g., `§ PLANNER`, `§ IMPLEMENTER`) in brass mono — the same `§` signature as tool call cards.
+- Header: role icon (`iconForRole`, with `title`) + mono uppercase role eyebrow (e.g. `IMPLEMENTER`) in brass — no `§`, no dash. Model, iteration-history navigator, director controls, and tokens/cost share the row; stage title sits below in serif ivory.
+- Journal entries are flat icon lines — tool icon (`iconForTool`) + tool name + hint + ✓/✕ + truncated result detail, sitting behind a single left hairline (no nested/boxed tool cards).
 - For code stages, the worktree diff is embedded beneath the artifact using the same diff styling as Review mode (`--verdigris` adds / `--rouge` dels).
 
 **Checkpoint decision strip** — docked at the canvas bottom when the run pauses at a `⟜` gate; it *unfolds* through `<Reveal>` and folds away on resolve (never mounts abruptly).
 
-- Button hierarchy (surgical brass): **Approve & continue** is the only solid-brass button; **Send back to {role} ⟜** is brass-outlined serif; Reject/Re-run and Abort are ghost (Abort gets a rouge hover). Serif phrases stay upright.
+- Button hierarchy (surgical brass): **Approve & continue** is the only solid-brass button and carries the beacon; **Send back with notes** is brass-outlined serif; Re-run/Reject and Abort are ghost (Abort gets a rouge hover). Serif phrases stay upright, no arrow suffix.
 - The loop meter (`review loop · 2 of 3 used`) renders in a fixed slot with tabular numerals and turns brass at the cap.
-- A failed stage swaps the accent to rouge with a `✕ stage halted` eyebrow.
+- A failed stage swaps the accent to rouge with a `✕ stage halted` eyebrow; a transient halt is amber and offers **Resume** (which takes the beacon).
 
-**Ledger strip** (cost meter) — a single calm line at the canvas bottom, **savings-first** (the differentiator leads).
+**Ledger strip (`RunLedger`)** — a single calm line at the canvas bottom, **savings-first** (the differentiator leads).
 
-- Format: `saved $0.089 · 86% under all-premium  ·  spent $0.014` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
-- A 2px progress inset beneath (brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
-- **Completion moment:** when a run completes, a one-shot brass sweep (`.octo-sweep`) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
+- Format: `saved $0.089 · 86% under all-premium · spent $0.014 · budget $0.50` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
+- A 2px progress inset beneath (solid brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
+- **Completion moment:** when a run completes, a one-shot **solid** brass line (`.octo-sweep`, no gradient) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
+
+**The launcher ("The Commission", `PipelineSetup`)** — a composition surface, not a wizard: no step numbering anywhere (the old `I · The brief / II · The ensemble` framing is gone). Reading order is ceremony header (serif "Direct the work" + one sans line) → **the brief** (Spectral serif, 15px/1.5, on `--panel` inside a hairline card, linked-issue chip + `⌘⏎ to begin` hint in its footer) → **the ensemble** (`PipelineTicket` cards under Law 1: selected = full ink + `--brass-dim` border + `StageDots`; others `opacity-[0.38]`→`0.70` hover; a "Compose a new one" dashed ticket opens the builder) → the selected ticket's crew line (`StageFlow`: role icon + name + model in mute, solid hairline connectors, `⟜` before a gated role, pencil-icon edit) → **the foot**, the same ledger grammar as the run (`est. saves ~$0.31 · 78% under all-premium · N runs left` — the retired standalone `DirectRunsMeter` folds its quota fragment into this line — + a budget input + **Begin the run**, ghost until brief + quota + concurrency are satisfied, then solid brass carrying the beacon).
+
+**The builder (`PipelineBuilder` + `builder/*`)** — nodes are essence cards (role icon + name + status glyph, meta `n · model · substrate`; gate nodes carry `⟜` before the icon; a looping node's meta line carries `⟲ ×N` in brass); the selected node takes subject styling. **No beacon in the builder** — nothing needs the user in an editor, brass marks selection only. Edges: normal flow is a solid hairline with a minimal arrowhead; a review-loop edge is a **dashed** `--brass-line` arc with an `⟲ ×N` pill (dashed is structure, not a gradient). The palette groups role rows under mono eyebrows; the inspector header is role icon + mono eyebrow (no `§`); validation is one quiet header line (`✓ VALID` verdigris, or the first concrete error in rouge) — no jumping panels.
 
 ### Full-screen rooms (Settings · Mission Control)
 
@@ -325,11 +349,19 @@ frames a destination, not an interruption. Rules:
   persistent — it adds zero standing pixels. One room per concept (§9).
 - Current residents: **Settings** (`⌘,`) and **Mission Control** (`⌘⇧M`) — the
   fleet cockpit: every active Direct run across all workspaces as live crew
-  cards in triage bands (Needs you / In flight / Settled), each with the
-  micro-track (`I ⟶ II ⟜ III` — sanctioned Direct glyphs; Mission Control is a
-  Direct-family surface), a fixed-slot live ticker (S1/S5), and the savings-first
-  fleet ledger. Its cards follow the Direct status-color convention (needs-you =
-  brass border + calm pulse, exactly like an awaiting stage card).
+  cards in triage bands (Needs you / In flight / Settled) with Law 1 ink
+  grading (needs-you full ink, in-flight `opacity-75`, settled `opacity-45`
+  rising to `0.85` on hover/focus), each card carrying `StageDots` (not
+  numerals — the roman-numeral micro-track is retired) plus a fixed-width
+  time-in-state slot (`mm:ss` rolling to `Hh MMm`, S1/S2 — there is no
+  `WAITING {n} MIN` eyebrow), a fixed-slot live ticker (S1/S5: activity /
+  "{stage} holds the gate" / halt reason / settled epitaph), and the
+  savings-first fleet ledger. Law 2's fleet scope: only the **longest-waiting**
+  needs-you card pulses (FIFO by `statusSince`); every other needs-you card
+  keeps a static brass border. The header shows a combined live-cost figure
+  (`saved $X · Y% under all-premium · spent $Z`) over active runs only — this
+  figure is Mission-Control-only; the top-bar `RunsTray` chip dropped it (see
+  §9/FEATURES for the chip's own vocabulary).
 
 ### Status bar (bottom)
 

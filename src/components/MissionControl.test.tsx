@@ -179,7 +179,7 @@ describe("MissionControl", () => {
       liveByStage: { st1: [{ kind: "tool", tool: "EDIT", hint: "src/x.rs" }] },
     });
     renderRoom();
-    expect(screen.getByText("§ EDIT src/x.rs")).toBeTruthy();
+    expect(screen.getByText("EDIT src/x.rs")).toBeTruthy();
   });
 
   it("a paused run at a gate says who holds it", () => {

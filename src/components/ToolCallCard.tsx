@@ -1,6 +1,7 @@
 import { useState, useRef, useLayoutEffect, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
+import { iconForTool } from "../lib/roleIcons";
 import type { ToolExecution } from "../stores/chatStore";
 
 interface Props {
@@ -136,6 +137,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
 
   const label = toolLabel(tool.toolName);
   const summary = summarizeTool(tool.toolName, tool.toolInput);
+  const ToolIcon = iconForTool(tool.toolName);
   const filePath = getFilePath(tool);
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
   const command =
@@ -164,16 +166,10 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
           style={headerStyle}
         >
           <span
-            style={{
-              fontSize: 13,
-              color: BRASS,
-              fontFamily: "'Spectral', serif",
-              
-              flexShrink: 0,
-            }}
-            aria-hidden
+            title={tool.toolName}
+            style={{ display: "inline-flex", flexShrink: 0 }}
           >
-            §
+            <ToolIcon size={12} color={BRASS} strokeWidth={1.75} />
           </span>
           <span
             style={{

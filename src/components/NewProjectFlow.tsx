@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
-import { BrassRule } from "./BrassRule";
+import { Folder, Globe } from "lucide-react";
 import { useProjectStore } from "../stores/projectStore";
 import { ipc } from "../lib/ipc";
 import { parseGitUrl } from "../lib/parseGitUrl";
@@ -294,20 +294,18 @@ export function NewProjectFlow({ onBack }: Props) {
         <div className="mt-6 space-y-1">
           <StepIndex
             active={step === 1}
-            numeral="I"
+            numeral="1"
             label="Type"
             onClick={() => setStep(1)}
           />
           <StepIndex
             active={step === 2}
-            numeral="II"
+            numeral="2"
             label="Details"
             onClick={() => setStep(2)}
             disabled={step === 1}
           />
         </div>
-
-        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}
@@ -316,7 +314,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step I — Type selection ─────────────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP I · OF II
+              STEP 1 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Where does it begin?
@@ -364,7 +362,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Open existing folder ─────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Open a folder.
@@ -391,8 +389,11 @@ export function NewProjectFlow({ onBack }: Props) {
                     background: "var(--brass-ghost)",
                   }}
                 >
-                  <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
-                    § {openFolderPath.split("/").filter(Boolean).pop() ?? openFolderPath}
+                  <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
+                    <span title="Local folder" className="flex items-center text-octo-mute">
+                      <Folder size={11} strokeWidth={1.75} />
+                    </span>
+                    {openFolderPath.split("/").filter(Boolean).pop() ?? openFolderPath}
                   </div>
                   <div className="mt-1 font-mono text-[11px] text-octo-mute">
                     {openFolderPath}
@@ -460,7 +461,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Clone details ─────────────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Clone a repository.
@@ -481,8 +482,11 @@ export function NewProjectFlow({ onBack }: Props) {
                     className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
                   {parsedCloneUrl && (
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
-                      § {parsedCloneUrl.host}
+                    <span className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
+                      <span title="Git host" className="flex items-center text-octo-mute">
+                        <Globe size={11} strokeWidth={1.75} />
+                      </span>
+                      {parsedCloneUrl.host}
                     </span>
                   )}
                 </div>
@@ -673,7 +677,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Empty project details ─────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Name your new study.

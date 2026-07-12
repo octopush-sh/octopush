@@ -1,3 +1,4 @@
+import { Slash } from "lucide-react";
 import type { SkillMeta } from "../../lib/types";
 
 interface Props {
@@ -49,7 +50,9 @@ export function SlashMenu({ items, activeIndex, onSelect, onHover }: Props) {
               }`}
             >
               <div className="flex items-baseline gap-2">
-                <span className="font-serif text-[12px] text-octo-brass">§</span>
+                <span title="Skill" className="flex items-center text-octo-brass">
+                  <Slash size={12} strokeWidth={1.75} />
+                </span>
                 <span className={`font-mono text-[11px] ${active ? "text-octo-brass" : "text-octo-ivory"}`}>
                   {skill.name}
                 </span>

@@ -3,7 +3,8 @@ import type { Components } from "react-markdown";
 
 /** Document-grade renderers for the REVIEW Markdown preview, styled with
  *  Onyx & Brass tokens. Separate from ChatMessage's chat-tuned map (which
- *  renders h3 as a brass eyebrow and hr as the retired brass gradient). */
+ *  renders h3 as a brass eyebrow; both maps render hr as a solid hairline —
+ *  the brass gradient rule is retired). */
 export function markdownComponents(): Components {
   return {
     h1: ({ children }) => (

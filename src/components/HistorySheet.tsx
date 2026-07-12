@@ -88,7 +88,7 @@ export function HistorySheet() {
                 return (
                   <li
                     key={run.run_id}
-                    className="border-b border-octo-hairline/60 px-6 py-3 last:border-b-0"
+                    className="border-b border-octo-hairline/60 px-6 py-3 opacity-45 transition-opacity duration-[180ms] last:border-b-0 hover:opacity-85 focus-within:opacity-85"
                   >
                     <div className="flex items-center gap-2">
                       <span className={`shrink-0 ${meta.className}`}>{meta.glyph}</span>

@@ -3,7 +3,7 @@ import type { ChatMessage } from "./types";
 /**
  * Render a conversation's messages as portable Markdown for export (copy to
  * clipboard). User/assistant turns become labeled sections; tool rows render as
- * a `§ TOOL` block with their parsed input + result. Mirrors what the timeline
+ * a `### TOOL` block with their parsed input + result. Mirrors what the timeline
  * shows, so the export reads like the on-screen conversation.
  */
 export function conversationToMarkdown(title: string, messages: ChatMessage[]): string {
@@ -33,7 +33,7 @@ function toolToMarkdown(raw: string): string[] {
       result?: string;
     };
     const name = (t.toolName ?? "tool").toUpperCase();
-    const out: string[] = [`### § ${name}`, ""];
+    const out: string[] = [`### ${name}`, ""];
     const cmd =
       t.toolName === "run_command" ? String(t.toolInput?.command ?? "") : "";
     if (cmd) out.push("```sh", `$ ${cmd}`, "```", "");

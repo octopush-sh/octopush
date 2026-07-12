@@ -35,7 +35,7 @@ describe("conversationToMarkdown", () => {
         }),
       }),
     ]);
-    expect(md).toContain("§ RUN_COMMAND");
+    expect(md).toContain("### RUN_COMMAND");
     expect(md).toContain("$ npm test");
     expect(md).toContain("ok");
   });

@@ -47,7 +47,7 @@ export function AiFindingCard({
             onClick={() => onJump(finding.file!, finding.line)}
             className="font-mono text-[10px] text-octo-brass hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           >
-            {finding.file}{finding.line != null ? `:${finding.line}` : ""} ⟶
+            {finding.file}{finding.line != null ? `:${finding.line}` : ""}
           </button>
           {onEdit && (
             <button

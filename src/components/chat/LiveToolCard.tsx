@@ -3,6 +3,7 @@ import type { LiveTool } from "../../stores/chatStore";
 import { toolLabel, summarizeTool } from "../ToolCallCard";
 import { formatDuration } from "../../lib/duration";
 import { prefersReducedMotion } from "../../lib/motion";
+import { iconForTool } from "../../lib/roleIcons";
 
 interface Props {
   tool: LiveTool;
@@ -10,8 +11,8 @@ interface Props {
 
 /**
  * The running state of a tool call — shown between `chat://tool-start` and the
- * resolved `ToolCallCard`. Renders the same `§ LABEL summary` chrome with a
- * live elapsed timer in a fixed-width slot (stability S1/S2: no reflow), a
+ * resolved `ToolCallCard`. Renders the same tool-icon · LABEL · summary chrome
+ * with a live elapsed timer in a fixed-width slot (stability S1/S2: no reflow), a
  * pulsing brass dot while running, and a verdict glyph once `done`.
  *
  * Renders in the timeline shell (outside react-markdown), so it uses design
@@ -20,6 +21,7 @@ interface Props {
 export function LiveToolCard({ tool }: Props) {
   const label = toolLabel(tool.toolName);
   const summary = summarizeTool(tool.toolName, tool.toolInput);
+  const ToolIcon = iconForTool(tool.toolName);
 
   // Elapsed measures from the backend's real start timestamp (not card mount),
   // so a slow first paint doesn't under-report. While running we tick a `now`
@@ -68,11 +70,8 @@ export function LiveToolCard({ tool }: Props) {
             : "var(--color-octo-brass)",
         }}
       />
-      <span
-        aria-hidden
-        className="shrink-0 font-serif text-[13px] text-octo-brass"
-      >
-        §
+      <span title={tool.toolName} className="shrink-0 text-octo-brass">
+        <ToolIcon size={12} strokeWidth={1.75} />
       </span>
       <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
         {label}

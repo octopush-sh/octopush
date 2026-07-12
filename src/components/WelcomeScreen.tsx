@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { BrassRule } from "./BrassRule";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 
@@ -77,7 +76,8 @@ export function WelcomeScreen({ onNewProject }: Props) {
           "radial-gradient(ellipse at center top, rgba(212,165,116,0.06), transparent 55%), var(--color-octo-onyx)",
       }}
     >
-      {/* Mark — § logomark matching the app icon. Same brass-on-onyx
+      {/* Mark — & logomark matching the app icon. The ampersand is the one
+          brass typographic accent in the design system. Same brass-on-onyx
           treatment as the .icns, rendered as type so it sharps at every
           DPI without a separate asset. */}
       <div
@@ -85,7 +85,7 @@ export function WelcomeScreen({ onNewProject }: Props) {
         className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif text-[34px] font-bold leading-none text-octo-brass"
         style={{ border: "1px solid var(--brass-dim)" }}
       >
-        §
+        &amp;
         <span
           className="absolute -inset-2 rounded-full"
           style={{ border: "1px solid rgba(212, 165, 116, 0.15)" }}
@@ -102,14 +102,11 @@ export function WelcomeScreen({ onNewProject }: Props) {
         an atelier for agentic developers
       </div>
 
-      {/* Brass rule */}
-      <BrassRule className="my-6 w-7" />
-
       {/* Primary CTA */}
       <button
         type="button"
         onClick={onNewProject}
-        className="rounded-md px-5 py-2.5 font-serif text-[14px] text-octo-brass transition"
+        className="mt-6 rounded-md px-5 py-2.5 font-serif text-[14px] text-octo-brass transition"
         style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
       >
         Begin a new study

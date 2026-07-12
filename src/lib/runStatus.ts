@@ -1,4 +1,4 @@
-import type { RunStageStatus, RunStatus } from "./ipc";
+import type { Run, RunStageStatus, RunStatus } from "./ipc";
 
 export interface StatusMeta {
   label: string;
@@ -44,6 +44,15 @@ export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
     case "failed": return { glyph: "✕", word: "failed", className: "text-octo-rouge" };
     default: return { glyph: "○", word: status, className: "text-octo-mute" };
   }
+}
+
+/** Whether a run needs the director's attention right now. `paused` always
+ *  means a human must act in this engine (gate / halted stage / budget park /
+ *  director pause) — the one predicate Mission Control's Needs-you band and
+ *  the fleet chip (`RunsTray`) both read, so the two surfaces never disagree
+ *  on what counts as "needs you". */
+export function needsYou(run: Pick<Run, "status">): boolean {
+  return run.status === "paused";
 }
 
 /** Whether a halted stage's error is a *transient* substrate fault (rate

@@ -3,7 +3,6 @@ import { ChevronLeft, X } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
 import type { PrInfo } from "../lib/types";
-import { BrassRule } from "./BrassRule";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
@@ -207,17 +206,15 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         </div>
 
         <div className="mt-6 space-y-1">
-          <StepIndex active={step === 1} numeral="I" label="Task & intent" onClick={() => setStep(1)} />
+          <StepIndex active={step === 1} numeral="1" label="Task & intent" onClick={() => setStep(1)} />
           <StepIndex
             active={step === 2}
-            numeral="II"
+            numeral="2"
             label="Setup script"
             onClick={() => taskValid && setStep(2)}
             disabled={!taskValid && step !== 2}
           />
         </div>
-
-        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}
@@ -226,7 +223,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         {step === 1 ? (
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP I · OF II
+              STEP 1 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               What are you setting out to do?
@@ -322,7 +319,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         ) : (
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               How does it start?

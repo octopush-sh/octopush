@@ -59,7 +59,7 @@ export function AiReviewPanel({
     <div className="space-y-1.5">
       {stale && (
         <button onClick={start} className="font-mono text-[10px] text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass">
-          diff changed — re-run ⟶
+          diff changed — re-run
         </button>
       )}
       <p className="text-[11px] leading-[1.5] text-octo-sage">{review.result!.summary}</p>
@@ -110,7 +110,7 @@ export function AiReviewPanel({
                     onClick={start}
                     className="shrink-0 whitespace-nowrap font-mono text-[10px] text-octo-brass transition hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
-                    re-review ⟶
+                    re-review
                   </button>
                 )}
               </div>
@@ -135,7 +135,7 @@ export function AiReviewPanel({
                     className="flex w-full items-center justify-center gap-2 rounded-md py-2 font-serif text-[13px] text-octo-brass transition-colors hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                     style={{ border: "1px solid var(--brass-dim)" }}
                   >
-                    Review this change ⟶
+                    Review this change
                   </button>
                 )}
               </FadeSwap>
@@ -196,7 +196,7 @@ export function AiReviewPanel({
               onClick={start}
               className="rounded font-mono text-[10px] text-octo-brass transition hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
-              {review.status === "done" ? "re-review ⟶" : "review this change ⟶"}
+              {review.status === "done" ? "re-review" : "review this change"}
             </button>
           )}
         </span>
