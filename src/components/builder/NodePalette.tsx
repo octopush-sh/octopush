@@ -2,7 +2,7 @@ import { Lock, Pencil, Plus } from "lucide-react";
 import { useRolesStore } from "../../stores/rolesStore";
 import type { Role } from "../../lib/ipc";
 import { archetypes } from "./graph";
-import { ARTIFACT_ICON } from "./icons";
+import { iconForRole } from "../../lib/roleIcons";
 
 export const ARCHETYPE_DND_MIME = "application/octopush-archetype";
 
@@ -75,7 +75,7 @@ export function NodePalette({ onAdd, onNewRole, onEditRole }: Props) {
                 {items.map((a) => {
                   const role = roles.find((r) => r.key === a.role);
                   const isBuiltin = role?.isBuiltin ?? true;
-                  const Icon = ARTIFACT_ICON[a.artifact];
+                  const Icon = iconForRole(a.role);
                   return (
                     <div key={a.role} className="group flex items-center">
                       <button
@@ -104,7 +104,7 @@ export function NodePalette({ onAdd, onNewRole, onEditRole }: Props) {
                         )}
                         {a.canLoop && (
                           <span className="ml-0 shrink-0 font-mono text-[9px] text-octo-mute" title="Can loop work back">
-                            ⟜
+                            ⟲
                           </span>
                         )}
                       </button>
