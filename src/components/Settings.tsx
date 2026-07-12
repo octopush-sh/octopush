@@ -6,6 +6,7 @@ import {
   SETTINGS_TAB_LABELS,
   type SettingsTab,
 } from "../lib/settingsTabs";
+import { OctoMark } from "./icons/OctoMark";
 import { GeneralPane } from "./settings/GeneralPane";
 import { EditorPane } from "./settings/EditorPane";
 import { ModelsPane } from "./settings/ModelsPane";
@@ -42,7 +43,10 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
         <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
           Preferences
         </span>
-        <h1 className="font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Octopush</h1>
+        <span className="flex items-center gap-2.5">
+          <OctoMark size={18} />
+          <h1 className="brand-wordmark text-[22px] text-octo-ivory">Octopush</h1>
+        </span>
         <RoomClose onClose={onClose} label="Close settings" className="ml-auto" />
       </header>
 

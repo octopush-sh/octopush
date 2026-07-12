@@ -4,6 +4,7 @@ import { useSessionStore } from "../stores/sessionStore";
 import type { Session, SessionStatus } from "../lib/types";
 import { useTokenStore } from "../stores/tokenStore";
 import { useEffect } from "react";
+import { OctoMark } from "./icons/OctoMark";
 
 interface Props {
   onNewSession: () => void;
@@ -45,7 +46,7 @@ export function SessionSidebar({ onNewSession }: Props) {
     <aside className="flex h-full w-72 flex-col border-r border-octo-border bg-octo-panel">
       <header className="flex items-center justify-between border-b border-octo-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="text-lg">🐙</span>
+          <OctoMark size={18} />
           <span className="font-semibold tracking-tight">Octopush</span>
         </div>
         <button

@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { X } from "lucide-react";
 import { isModalOpen } from "./ModalShell";
+import { OctoMark } from "./icons/OctoMark";
 
 interface Props {
   projectName: string;
@@ -45,6 +46,7 @@ export function EmptyProjectState({
           <X size={14} />
         </button>
       )}
+      <OctoMark size={28} state="idle" className="opacity-80" />
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Project
       </div>
