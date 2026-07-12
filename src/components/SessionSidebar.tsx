@@ -46,7 +46,7 @@ export function SessionSidebar({ onNewSession }: Props) {
     <aside className="flex h-full w-72 flex-col border-r border-octo-border bg-octo-panel">
       <header className="flex items-center justify-between border-b border-octo-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <OctoMark size={18} />
+          <OctoMark size={18} className="[--octo-eye:var(--color-octo-panel)]" />
           <span className="font-semibold tracking-tight">Octopush</span>
         </div>
         <button
@@ -210,7 +210,7 @@ function SessionRow({
 function EmptyState({ onNewSession }: { onNewSession: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-      <div className="text-4xl">🐙</div>
+      <OctoMark size={40} state="idle" className="[--octo-eye:var(--color-octo-panel)] opacity-80" />
       <div className="text-sm text-zinc-400">No sessions yet</div>
       <button
         onClick={onNewSession}

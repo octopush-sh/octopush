@@ -332,7 +332,7 @@
    and scans, pushed rises once with a brass halo, blocked freezes.
    Spec: docs/superpowers/specs/2026-07-11-octopush-logo-brand-design.md §5.
    All transforms ≤2.5px; loops ease-in-out, moments var(--ease-octo). */
-.octo-mascot .octo-m-eye,
+.octo-mascot .octo-m-eye, .octo-mascot .octo-m-eyes,
 .octo-mascot .octo-m-f1, .octo-mascot .octo-m-f2,
 .octo-mascot .octo-m-f3, .octo-mascot .octo-m-f4,
 .octo-mascot .octo-m-b1, .octo-mascot .octo-m-b2,
@@ -380,7 +380,10 @@
 .octo-mascot--working .octo-m-b2 { animation: octo-m-float 1.7s ease-in-out 1.07s infinite; }
 .octo-mascot--working .octo-m-b3 { animation: octo-m-float 1.7s ease-in-out 1.29s infinite; }
 .octo-mascot--working .octo-m-b4 { animation: octo-m-float 1.7s ease-in-out 1.51s infinite; }
-.octo-mascot--working .octo-m-eye { animation: octo-m-scan 4.8s ease-in-out infinite, octo-m-blink 7s infinite; }
+/* scan lives on the eye GROUP, blink on each eye — two animations on one
+   element's transform would override each other (last one wins). */
+.octo-mascot--working .octo-m-eyes { animation: octo-m-scan 4.8s ease-in-out infinite; }
+.octo-mascot--working .octo-m-eye { animation: octo-m-blink 7s infinite; }
 
 /* pushed — one-shot rise + halo, happy eyes (no loop) */
 .octo-mascot--pushed .octo-m-body { animation: octo-m-rise 900ms var(--ease-octo) 1; }
@@ -392,13 +395,8 @@
 .octo-mascot--blocked .octo-m-eye { animation: octo-m-slowblink 7s infinite; }
 
 @media (prefers-reduced-motion: reduce) {
-  .octo-mascot .octo-m-body, .octo-mascot .octo-m-eye,
-  .octo-mascot .octo-m-f1, .octo-mascot .octo-m-f2, .octo-mascot .octo-m-f3, .octo-mascot .octo-m-f4,
-  .octo-mascot .octo-m-b1, .octo-mascot .octo-m-b2, .octo-mascot .octo-m-b3, .octo-mascot .octo-m-b4,
-  .octo-mascot .octo-m-ring {
-    animation: none !important;
-  }
-  /* state still readable from the eyes alone */
+  /* The app-wide neutralizer below freezes every mascot loop at its base
+     pose; the only extra work is keeping the blocked pose readable. */
   .octo-mascot--blocked .octo-m-eye { transform: scaleY(0.45) translateY(0.6px); }
 }
 

@@ -96,7 +96,12 @@ export function RunLedger({ run, stages }: Props) {
         <div className="px-4 pb-3 pt-2">
           <div className="octo-sweep mb-2 h-px bg-octo-brass" />
           <div className="flex items-center gap-2.5">
-            <OctoMark size={20} state="pushed" />
+            {/* Mount only when the moment opens — Reveal keeps closed content
+                mounted, and the one-shot rise/halo would otherwise play
+                invisibly at first render. */}
+            {moment && (
+              <OctoMark size={20} state="pushed" className="[--octo-eye:var(--color-octo-panel)]" />
+            )}
             <p className="m-0 font-serif text-sm text-octo-ivory">
               This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
             </p>

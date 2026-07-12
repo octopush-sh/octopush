@@ -1,5 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 import { useMascotState } from "./useMascotState";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useChatStore } from "../stores/chatStore";
@@ -40,5 +44,13 @@ describe("useMascotState", () => {
     const { result } = renderHook(() => useMascotState());
     expect(result.current.state).toBe("blocked");
     expect(result.current.label).toContain("need");
+  });
+
+  it("a paused Direct run counts as needs-you, not working", () => {
+    useRunsStore.setState({
+      runsByWs: { ws1: [{ status: "paused" } as never] },
+    });
+    const { result } = renderHook(() => useMascotState());
+    expect(result.current.state).toBe("blocked");
   });
 });

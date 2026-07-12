@@ -52,7 +52,7 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
         role="img"
         aria-label={mascot.label}
         title={mascot.label}
-        className="mr-2 flex shrink-0 items-center"
+        className="mr-2 flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
       >
         <OctoMark size={20} state={mascot.state} />
       </span>

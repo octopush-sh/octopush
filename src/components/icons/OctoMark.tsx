@@ -84,8 +84,13 @@ export function OctoMark({ size = 20, state = "static", className }: OctoMarkPro
           <ellipse className="octo-m-f3" cx="37.5" cy="47" rx="5.5" ry="5.2" />
           <ellipse className="octo-m-f4" cx="48.5" cy="47" rx="5.5" ry="5.2" />
         </g>
-        <ellipse className="octo-m-eye" cx="25" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
-        <ellipse className="octo-m-eye" cx="39" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
+        {/* Eyes ride in their own group: the working-state scan animates the
+            group's transform while blink animates each eye's — CSS animations
+            on the SAME element's transform would override each other. */}
+        <g className="octo-m-eyes">
+          <ellipse className="octo-m-eye" cx="25" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
+          <ellipse className="octo-m-eye" cx="39" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
+        </g>
         <g
           className="octo-m-happy"
           stroke={eyeFill}
