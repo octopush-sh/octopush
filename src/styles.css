@@ -15,6 +15,16 @@
   font-display: swap;
 }
 
+/* Fraunces — brand-only face for the wordmark (never a UI font).
+   Soft terminals + generous bowls: shares DNA with The Octo mark. */
+@font-face {
+  font-family: "Fraunces";
+  src: url('./assets/fonts/Fraunces-Variable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
 
@@ -134,6 +144,16 @@
 /* ── Word-diff inline segments ───────────────────────────────── */
 .wd-add { background: var(--verdigris-strong); border-radius: 2px; }
 .wd-del { background: var(--rouge-strong); border-radius: 2px; }
+
+/* The wordmark's voice — brand surfaces only (welcome, settings, about).
+   Not a fourth UI font: body/serif/mono roles are unchanged. */
+.brand-wordmark {
+  font-family: "Fraunces", "Spectral", Georgia, serif;
+  font-weight: 560;
+  font-variation-settings: "opsz" 60;
+  font-style: normal;
+  letter-spacing: -0.02em;
+}
 
 /* ── Motion · Phase 7 signature animations ───────────────────── */
 
