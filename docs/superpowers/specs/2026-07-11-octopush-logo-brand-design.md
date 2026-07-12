@@ -56,7 +56,7 @@ Anatomy rules:
 |---|---------|-------------|-----------|
 | 1 | macOS app icon | `src-tauri/icons/source.svg` + regenerate via `npm run tauri icon -- src-tauri/icons/source.svg` | Onyx rounded-rect field (rx 229/1024, keep hairline inner border, **no gradients**), mark centered at ≈ 62% field width, back arms included |
 | 2 | Dev favicon + title | `index.html` | Add SVG favicon (mark only, transparent bg) |
-| 3 | Welcome screen | `src/components/WelcomeScreen.tsx:80-103` | Replace `§` circle with `<OctoMark size={116} state="idle" />` (animated); wordmark → `.brand-wordmark`; tagline unchanged; keep CTA |
+| 3 | Welcome screen | `src/components/WelcomeScreen.tsx:79-103` | Replace the interim `&` logomark circle (post-v0.3.0) with `<OctoMark size={116} state="idle" />` (animated); wordmark → `.brand-wordmark`; tagline unchanged; keep CTA |
 | 4 | Top bar — live mascot | `src/components/AppTopBar.tsx:41` (left of RunsTray) | `<OctoMark size={20} state={derived} />` — **the personality hub**: state derived `blocked` if attentionStore non-empty, else `working` if any run/stream active, else `idle`. Tooltip states it plainly ("Octopush — 2 agents working"). No click behavior in v1 |
 | 5 | Talk empty state | `src/components/chat/ChatCanvas.tsx:420-435` | Small idle mark (28 px) above the eyebrow |
 | 6 | Thinking indicator | `src/components/chat/ChatCanvas.tsx:438-449` | Replace pulsing dot with `<OctoMark size={18} state="working" />` + "Thinking…" |
