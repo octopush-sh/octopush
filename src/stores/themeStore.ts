@@ -79,6 +79,11 @@ function applyThemeToDom(t: ThemeConfig) {
   root.style.setProperty("--color-octo-verdigris", t.success);
   root.style.setProperty("--color-octo-rouge", t.danger);
 
+  // xterm.js can't read CSS variables directly, so terminal surfaces
+  // (TerminalPane, TerminalView) resolve this token themselves off :root
+  // via lib/xtermTheme.ts's getXtermTheme() — see that file for why.
+  root.style.setProperty("--color-octo-terminal-bg", t.terminalBg);
+
   // Accent-derived alpha tokens. These were hardcoded to the brass
   // colorway in styles.css; deriving them from the active accent makes
   // hover/active surfaces follow the theme instead of staying brass
@@ -96,9 +101,11 @@ function applyThemeToDom(t: ThemeConfig) {
   // Body bg for first paint before React mounts.
   document.body.style.backgroundColor = t.bg;
 
-  // Notify non-CSS surfaces that can't read `var(--…)` directly — chiefly the
-  // CodeMirror editor, whose theme() spec needs concrete colors. EditorPane
-  // listens for this and reconfigures its theme compartment from the live
-  // tokens (see components/editor/atelierTheme.ts · buildEditorTheme).
+  // Notify non-CSS surfaces that can't read `var(--…)` directly — the
+  // CodeMirror editor and xterm.js terminals, whose theme APIs need
+  // concrete colors. EditorPane and TerminalPane/TerminalView listen for
+  // this and rebuild their theme from the live tokens (see
+  // components/editor/atelierTheme.ts · buildEditorTheme and
+  // lib/xtermTheme.ts · getXtermTheme).
   window.dispatchEvent(new CustomEvent("octo:theme"));
 }

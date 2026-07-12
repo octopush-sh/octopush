@@ -65,6 +65,10 @@
   --color-octo-success:    #8fc9a8;
   --color-octo-warning:    #dfae4a; /* amber — distinct from brass: warning/caution, never the accent */
   --color-octo-danger:     #d18b8b;
+
+  /* xterm.js background — may differ from --color-octo-bg per theme.
+     Read by lib/xtermTheme.ts · getXtermTheme() since xterm can't use var(--…). */
+  --color-octo-terminal-bg: #0c0a08;
 }
 
 /* ── Brass alpha utilities — not Tailwind-class-generated, used directly ── */

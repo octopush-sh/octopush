@@ -14,7 +14,7 @@ import type {
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useTerminalsStore } from "../stores/terminalsStore";
-import { XTERM_FONT_FAMILY, XTERM_THEME } from "../lib/xtermTheme";
+import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
 // pane opens at ZOOM_DEFAULT and resets on remount.
@@ -135,7 +135,7 @@ export function TerminalPane({
       fontFamily: XTERM_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.3,
-      theme: XTERM_THEME,
+      theme: getXtermTheme(),
       allowProposedApi: true,
       scrollback: 10000,
     });
@@ -147,6 +147,15 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
     fontSizeRef.current = ZOOM_DEFAULT;
+
+    // Follow Octopush theme switches: themeStore.applyThemeToDom fires
+    // `octo:theme` after writing the new tokens to :root. xterm can't read
+    // `var(--…)` directly, so rebuild its theme from the live tokens (see
+    // lib/xtermTheme.ts · getXtermTheme) and assign it in place — no remount.
+    const onThemeChange = () => {
+      term.options.theme = getXtermTheme();
+    };
+    window.addEventListener("octo:theme", onThemeChange);
 
     // ── Zoom ──────────────────────────────────────────────────────────
     // xterm has no built-in zoom: changing `fontSize` then refitting is the
@@ -477,6 +486,7 @@ export function TerminalPane({
       unlistenAttention?.();
       unlistenForeground?.();
       if (busyOffTimerRef.current) clearTimeout(busyOffTimerRef.current);
+      window.removeEventListener("octo:theme", onThemeChange);
       copyEl.removeEventListener("contextmenu", onContextMenu);
       copyEl.removeEventListener("wheel", onWheel);
       term.dispose();
