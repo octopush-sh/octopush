@@ -3406,76 +3406,83 @@ pub(crate) fn parse_open_pr_list(values: &[serde_json::Value]) -> Vec<BranchPr> 
 #[tauri::command]
 pub async fn list_prs(path: String) -> AppResult<Vec<crate::github::PrInfo>> {
     let path = expand_tilde(&path);
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let output = tokio::process::Command::new(&shell)
-        .arg("-l").arg("-c")
-        .arg("gh pr list --json number,title,headRefName,author --limit 30")
-        .current_dir(&path)
-        .output()
-        .await
-        .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let snippet: String = stderr.trim().chars().take(200).collect();
-        return Err(AppError::Other(format!("GitHub CLI not available: {snippet}")));
-    }
-
-    crate::github::pr_infos_from_json(&String::from_utf8_lossy(&output.stdout))
+    let stdout = run_gh_in(&path, "gh pr list --json number,title,headRefName,author --limit 30").await?;
+    crate::github::pr_infos_from_json(&stdout)
         .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
 }
 
-/// Open GitHub issues for the project — the "Ship it" picker's source. Runs
-/// `gh issue list` in the user's login shell (same pattern as `list_prs`) so
-/// PATH and keychain credentials behave like in a terminal. Any failure maps
-/// to a friendly error the picker renders as an honest empty state.
-#[tauri::command]
-pub async fn list_github_issues(path: String) -> AppResult<Vec<crate::github::GhIssue>> {
-    let path = expand_tilde(&path);
+/// Run a `gh …` invocation in the user's login shell (PATH + keychain behave
+/// like a terminal) and return stdout, mapping any failure to a friendly
+/// "GitHub CLI not available" error with a short stderr snippet. Shared by
+/// `list_prs`-style callers so the spawn/status/snippet block lives once.
+async fn run_gh_in(path: &str, gh_cmd: &str) -> AppResult<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let output = tokio::process::Command::new(&shell)
         .arg("-l").arg("-c")
-        .arg("gh issue list --state open --json number,title,body,url --limit 30")
-        .current_dir(&path)
+        .arg(gh_cmd)
+        .current_dir(path)
         .output()
         .await
         .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
-
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let snippet: String = stderr.trim().chars().take(200).collect();
         return Err(AppError::Other(format!("GitHub CLI not available: {snippet}")));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    crate::github::issues_from_json(&String::from_utf8_lossy(&output.stdout))
+/// True when `host` is GitHub-the-service, incl. the documented SSH-over-HTTPS
+/// firewall fallback (`ssh.github.com`, with or without an explicit port).
+fn is_github_host(host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or(host);
+    host == "github.com" || host == "ssh.github.com"
+}
+
+/// Open GitHub issues for the project — the "Ship it" picker's source. Any
+/// failure maps to a friendly error the picker renders as an honest state.
+#[tauri::command]
+pub async fn list_github_issues(path: String) -> AppResult<Vec<crate::github::GhIssue>> {
+    let path = expand_tilde(&path);
+    let stdout = run_gh_in(&path, "gh issue list --state open --json number,title,body,url --limit 30").await?;
+    crate::github::issues_from_json(&stdout)
         .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
 }
 
 /// Preflight for "Ship it": the crew's `pull_request` stage needs BOTH a
-/// github.com origin and an authenticated `gh` — discovering that mid-run,
-/// after the crew already built the change, is the failure mode this check
-/// exists to prevent. Best-effort on the git side (no repo/origin → false).
+/// GitHub remote and a `gh` authenticated FOR GITHUB.COM — discovering that
+/// mid-run, after the crew already built the change, is the failure mode this
+/// check exists to prevent. ANY remote pointing at GitHub counts (not just
+/// "origin" — `gh` resolves the repo itself), incl. the ssh.github.com:443
+/// fallback. The auth probe is skipped when there's no GitHub remote (the
+/// picker dead-ends on that first), and is host-scoped so an unrelated broken
+/// GHE login can't fail it — nor a GHE-only login pass it.
 #[tauri::command]
 pub async fn github_ship_readiness(path: String) -> AppResult<crate::github::ShipReadiness> {
     let path = expand_tilde(&path);
     let github_remote = (|| -> Option<bool> {
         let repo = git2::Repository::discover(&path).ok()?;
-        let remote = repo.find_remote("origin").ok()?;
-        let url = remote.url()?.to_string();
-        let parsed = crate::git_url::parse_git_url(&url)?;
-        Some(parsed.host == "github.com")
+        let names = repo.remotes().ok()?;
+        for name in names.iter().flatten() {
+            if let Ok(remote) = repo.find_remote(name) {
+                if let Some(url) = remote.url() {
+                    if let Some(parsed) = crate::git_url::parse_git_url(url) {
+                        if is_github_host(&parsed.host) {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+        Some(false)
     })()
     .unwrap_or(false);
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let gh_authenticated = tokio::process::Command::new(&shell)
-        .arg("-l").arg("-c")
-        .arg("gh auth status")
-        .current_dir(&path)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let gh_authenticated = if github_remote {
+        run_gh_in(&path, "gh auth status --hostname github.com").await.is_ok()
+    } else {
+        false // moot — the picker dead-ends on the missing remote
+    };
 
     Ok(crate::github::ShipReadiness { github_remote, gh_authenticated })
 }

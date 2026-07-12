@@ -9,6 +9,7 @@ import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
+import { pushToast } from "./Toasts";
 import { Github } from "lucide-react";
 
 interface Props {
@@ -205,12 +206,34 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
             onPick={(issue) => {
               setShowIssuePicker(false);
               setTask(composeIssueTask(issue));
-              // Prefer the flagship shipping crew — it ends in the
-              // pull_request stage that actually opens the PR.
-              const shipIt = pipelines.find(
-                (p) => p.pipeline.isBuiltin && p.pipeline.name === "Ship it",
-              );
-              if (shipIt) setSelectedId(shipIt.pipeline.id);
+              void (async () => {
+                // Prefer the flagship shipping crew — the only one ending in
+                // the pull_request stage that actually opens the PR. Load on
+                // demand if the list hasn't arrived yet; if it's genuinely
+                // absent, say so — a silently wrong crew would finish the
+                // build and never open the PR the task promises.
+                let list = usePipelineStore.getState().pipelines;
+                if (list.length === 0) {
+                  await usePipelineStore.getState().load();
+                  list = usePipelineStore.getState().pipelines;
+                }
+                const shipIt = list.find(
+                  (p) => p.pipeline.isBuiltin && p.pipeline.name === "Ship it",
+                );
+                if (shipIt) {
+                  setSelectedId(shipIt.pipeline.id);
+                  // A selection change keeps overrides by design (stageSig
+                  // effect skips it) — but a stale position-keyed override
+                  // from the PREVIOUS crew must not retarget onto this one.
+                  setOverrides({});
+                } else {
+                  pushToast({
+                    level: "warning",
+                    title: "Pick a crew that opens the PR",
+                    body: "The 'Ship it' pipeline isn't available — choose one ending in a pull request stage.",
+                  });
+                }
+              })();
             }}
           />
         )}

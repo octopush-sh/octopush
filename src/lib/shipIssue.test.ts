@@ -26,11 +26,22 @@ describe("composeIssueTask", () => {
     expect(t).toContain("Closes #42");
   });
 
-  it("caps a huge body with an explicit truncation note pointing at the issue", () => {
+  it("caps a huge body with an explicit truncation note — and NO pointer to the rest", () => {
     const t = composeIssueTask(issue({ body: "x".repeat(20_000) }));
     expect(t.length).toBeLessThan(5_000);
     expect(t).toContain("issue body truncated");
-    expect(t).toContain("https://github.com/o/r/issues/42");
+    // Anti-injection: never invite the crew to fetch the uncapped remainder —
+    // that would let an attacker-authored body smuggle instructions past the cap.
+    expect(t).not.toContain("read the full issue");
     expect(t).toContain("Closes #42"); // the instruction survives the cap
+  });
+
+  it("never splits a surrogate pair at the cap boundary", () => {
+    // An astral char straddling the cap must not leave a lone surrogate —
+    // serde rejects it at the IPC boundary and the run couldn't start.
+    const body = "x".repeat(3_999) + "🐙" + "y".repeat(100);
+    const t = composeIssueTask(issue({ body }));
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(t)).toBe(false);
+    expect(t).toContain("issue body truncated");
   });
 });

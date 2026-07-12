@@ -54,7 +54,8 @@ export function GithubIssuePicker({
 
   const filtered = useMemo(() => {
     if (state.kind !== "ready") return [];
-    const q = filter.trim().toLowerCase();
+    // "#42" must match — the rows themselves display the number that way.
+    const q = filter.trim().toLowerCase().replace(/^#/, "");
     if (!q) return state.issues;
     return state.issues.filter(
       (i) => i.title.toLowerCase().includes(q) || String(i.number).includes(q),
