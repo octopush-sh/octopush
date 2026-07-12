@@ -60,11 +60,6 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, gitDiff
       <div className="border-b border-octo-hairline px-4 py-3">
         <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Review</div>
         <div className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
-        <div
-          className="mt-2 h-px w-7"
-          style={{ background: "linear-gradient(90deg, var(--color-octo-brass), transparent)" }}
-          aria-hidden
-        />
         {fileCount > 0 && (
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute octo-tabular">
             <span>{fileCount} file{fileCount !== 1 ? "s" : ""}</span>

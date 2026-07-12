@@ -4,7 +4,6 @@ import { useChatStore, buildTimeline, type ConversationItem } from "../../stores
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
-import { BrassRule } from "../BrassRule";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
 import { ToolCallCard } from "../ToolCallCard";
@@ -430,7 +429,6 @@ function EmptyState() {
         Ask anything — Octopush will read files, run commands, and write changes
         inside this workspace's worktree.
       </p>
-      <BrassRule className="mt-2 w-7" />
     </div>
   );
 }

@@ -3,7 +3,6 @@ import { ChevronLeft, X } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
 import type { PrInfo } from "../lib/types";
-import { BrassRule } from "./BrassRule";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
@@ -216,8 +215,6 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
             disabled={!taskValid && step !== 2}
           />
         </div>
-
-        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}

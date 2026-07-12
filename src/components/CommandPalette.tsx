@@ -186,7 +186,7 @@ export function CommandPalette({
                 }
               />
               <Item
-                glyph="§"
+                glyph="&"
                 label="Open Settings · Usage"
                 shortcut="⌘⇧T"
                 onSelect={() => run(onToggleTokens)}

@@ -162,7 +162,7 @@ describe("NewProjectFlow — Step II Clone: URL auto-detection", () => {
     fireEvent.change(urlInput, { target: { value: "https://github.com/octocat/Hello-World.git" } });
 
     await waitFor(() => {
-      expect(screen.getByText(/§ github\.com/i)).toBeInTheDocument();
+      expect(screen.getByText(/github\.com/i)).toBeInTheDocument();
     });
   });
 
@@ -558,7 +558,7 @@ describe("NewProjectFlow — Open existing folder flow", () => {
 
     await waitFor(() => {
       // basename in brass mono
-      expect(screen.getByText(/§ repo/)).toBeInTheDocument();
+      expect(screen.getByText("repo")).toBeInTheDocument();
       // full path in muted mono below
       expect(screen.getByText("/Users/jonathan/some/repo")).toBeInTheDocument();
     });
@@ -580,7 +580,7 @@ describe("NewProjectFlow — Open existing folder flow", () => {
     });
 
     // Wait for preview row
-    await waitFor(() => screen.getByText(/§ repo/));
+    await waitFor(() => screen.getByText("repo"));
 
     // Click Open
     await act(async () => {
@@ -603,7 +603,7 @@ describe("NewProjectFlow — Open existing folder flow", () => {
       fireEvent.click(screen.getByRole("button", { name: /pick a folder/i }));
     });
 
-    await waitFor(() => screen.getByText(/§ not-a-repo/));
+    await waitFor(() => screen.getByText("not-a-repo"));
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /^open$/i }));

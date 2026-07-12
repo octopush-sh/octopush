@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
-import { BrassRule } from "./BrassRule";
+import { Folder, Globe } from "lucide-react";
 import { useProjectStore } from "../stores/projectStore";
 import { ipc } from "../lib/ipc";
 import { parseGitUrl } from "../lib/parseGitUrl";
@@ -306,8 +306,6 @@ export function NewProjectFlow({ onBack }: Props) {
             disabled={step === 1}
           />
         </div>
-
-        <BrassRule className="mt-10 w-7" />
       </aside>
 
       {/* Right content pane */}
@@ -391,8 +389,11 @@ export function NewProjectFlow({ onBack }: Props) {
                     background: "var(--brass-ghost)",
                   }}
                 >
-                  <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
-                    § {openFolderPath.split("/").filter(Boolean).pop() ?? openFolderPath}
+                  <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass">
+                    <span title="Local folder" className="flex items-center text-octo-mute">
+                      <Folder size={11} strokeWidth={1.75} />
+                    </span>
+                    {openFolderPath.split("/").filter(Boolean).pop() ?? openFolderPath}
                   </div>
                   <div className="mt-1 font-mono text-[11px] text-octo-mute">
                     {openFolderPath}
@@ -481,8 +482,11 @@ export function NewProjectFlow({ onBack }: Props) {
                     className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
                   {parsedCloneUrl && (
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
-                      § {parsedCloneUrl.host}
+                    <span className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
+                      <span title="Git host" className="flex items-center text-octo-mute">
+                        <Globe size={11} strokeWidth={1.75} />
+                      </span>
+                      {parsedCloneUrl.host}
                     </span>
                   )}
                 </div>
