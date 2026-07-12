@@ -51,7 +51,7 @@ beforeEach(() => {
     error: null,
     viewedRunId: null,
     detailByRun: {},
-    detailLoading: false,
+    detailLoading: null,
     detailError: null,
   });
   historyListMock.mockReset();

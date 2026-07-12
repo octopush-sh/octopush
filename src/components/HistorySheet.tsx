@@ -171,7 +171,7 @@ function RunList({ runs, loading, error }: { runs: SyncedRun[]; loading: boolean
 /** One synced run's full story, fetched lazily (B2). Read-only; inert text. */
 function RunDetailView({ run }: { run: SyncedRun }) {
   const detail = useHistoryStore((s) => s.detailByRun[run.run_id]);
-  const detailLoading = useHistoryStore((s) => s.detailLoading);
+  const detailLoading = useHistoryStore((s) => s.detailLoading === run.run_id);
   const detailError = useHistoryStore((s) => s.detailError);
   const openRun = useHistoryStore((s) => s.openRun);
   const meta = runStatusMeta(run.status);
@@ -227,7 +227,13 @@ function RunDetailView({ run }: { run: SyncedRun }) {
         </p>
       )}
 
-      {!detailLoading && !detailError && detail && (
+      {!detailLoading && !detailError && detail && detail.stages.length === 0 && (
+        <p className="py-10 text-center text-[13px] text-octo-mute">
+          No stage records were captured for this run.
+        </p>
+      )}
+
+      {!detailLoading && !detailError && detail && detail.stages.length > 0 && (
         <div className="mt-3 flex flex-col gap-5">
           {detail.stages.map((stage) => (
             <StageSection key={`${detail.run_id}-${stage.position}`} stage={stage} />
@@ -285,12 +291,20 @@ function StageSection({ stage }: { stage: SyncedRunStageDetail }) {
 }
 
 /** A journal entry as this build understands it. Anything else is skipped —
- *  the wire format is forward-compatible by ignoring the unknown. */
+ *  the wire format is forward-compatible by ignoring the unknown.
+ *
+ *  Deliberately a SEPARATE renderer from StageFocus's live journal: this one
+ *  feeds on cross-machine, cloud-transited values (untrusted — everything must
+ *  stay inert text with a narrow parsed shape), is read-only, and must never
+ *  inherit interactive affordances the live view grows. It does speak the same
+ *  visual vocabulary (iconForTool lines, verdigris notices, rise-in rows). */
 interface JournalLine {
   kind: string;
   text?: string;
   tool?: string;
   hint?: string;
+  ok?: boolean;
+  detail?: string;
 }
 
 function asJournalLine(v: unknown): JournalLine | null {
@@ -302,6 +316,8 @@ function asJournalLine(v: unknown): JournalLine | null {
     text: typeof o.text === "string" ? o.text : undefined,
     tool: typeof o.tool === "string" ? o.tool : undefined,
     hint: typeof o.hint === "string" ? o.hint : undefined,
+    ok: typeof o.ok === "boolean" ? o.ok : undefined,
+    detail: typeof o.detail === "string" ? o.detail : undefined,
   };
 }
 
@@ -312,13 +328,27 @@ function Journal({ entries }: { entries: unknown[] }) {
   return (
     <div className="mt-2 max-h-64 overflow-y-auto rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2">
       {lines.map((l, i) => {
+        if (l.kind === "reset") {
+          return (
+            <div key={i} className="octo-rise-in py-1 text-center font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
+              — new attempt —
+            </div>
+          );
+        }
         if (l.kind === "tool" && l.tool) {
           const ToolIcon = iconForTool(l.tool);
           return (
-            <div key={i} className="flex items-baseline gap-1.5 py-0.5 font-mono text-[11px] text-octo-sage">
+            <div key={i} className="octo-rise-in flex items-baseline gap-1.5 py-0.5 font-mono text-[11px] text-octo-sage">
               <ToolIcon size={11} className="shrink-0 translate-y-[1.5px] text-octo-mute" aria-hidden />
               <span className="shrink-0">{l.tool}</span>
               {l.hint && <span className="min-w-0 truncate text-octo-mute">{l.hint}</span>}
+            </div>
+          );
+        }
+        if (l.kind === "tool_result" && (l.detail || l.ok !== undefined)) {
+          return (
+            <div key={i} className={`octo-rise-in truncate py-0.5 pl-4 font-mono text-[11px] ${l.ok === false ? "text-octo-rouge" : "text-octo-mute"}`}>
+              {l.detail ?? (l.ok === false ? "failed" : "ok")}
             </div>
           );
         }
@@ -326,7 +356,7 @@ function Journal({ entries }: { entries: unknown[] }) {
           return (
             <div
               key={i}
-              className={`whitespace-pre-wrap py-0.5 font-mono text-[11px] leading-relaxed ${
+              className={`octo-rise-in whitespace-pre-wrap py-0.5 font-mono text-[11px] leading-relaxed ${
                 l.kind === "notice" ? "text-octo-verdigris" : "text-octo-sage"
               }`}
             >
@@ -334,7 +364,7 @@ function Journal({ entries }: { entries: unknown[] }) {
             </div>
           );
         }
-        return null; // reset markers, tool_results, unknown kinds
+        return null; // unknown kinds — forward-compat by omission
       })}
     </div>
   );

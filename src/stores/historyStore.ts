@@ -20,7 +20,9 @@ interface HistoryState {
   /** Session cache of fetched details. `null` = the server has none for that
    *  run (synced before B2 / its detail push failed) — an honest empty state. */
   detailByRun: Record<string, SyncedRunDetail | null>;
-  detailLoading: boolean;
+  /** The runId whose detail fetch is in flight, or null. Keyed — a stale
+   *  fetch settling must never dress a DIFFERENT viewed run in its outcome. */
+  detailLoading: string | null;
   detailError: string | null;
   /** Open the sheet: paint the local mirror instantly, then refresh from cloud. */
   openSheet: () => Promise<void>;
@@ -44,7 +46,7 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   error: null,
   viewedRunId: null,
   detailByRun: {},
-  detailLoading: false,
+  detailLoading: null,
   detailError: null,
 
   openSheet: async () => {
@@ -85,17 +87,21 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   openRun: async (runId) => {
     set({ viewedRunId: runId, detailError: null });
     if (runId in get().detailByRun) return; // cached (incl. a cached "none")
-    set({ detailLoading: true });
+    set({ detailLoading: runId });
     try {
       const detail = await ipc.historyRunDetail(runId);
       set((s) => ({
-        detailByRun: { ...s.detailByRun, [runId]: detail },
-        detailLoading: false,
+        detailByRun: { ...s.detailByRun, [runId]: detail }, // cache always
+        // Only release the spinner if this fetch is still the one in flight.
+        detailLoading: s.detailLoading === runId ? null : s.detailLoading,
       }));
     } catch (e) {
-      // Fetch failed (offline / transient) — stay on the detail view with an
-      // honest error; NOT cached, so re-opening retries.
-      set({ detailLoading: false, detailError: String(e) });
+      // Fetch failed (offline / transient) — honest error, NOT cached, so
+      // re-opening retries. A stale failure never dresses another run.
+      set((s) => ({
+        detailLoading: s.detailLoading === runId ? null : s.detailLoading,
+        detailError: s.viewedRunId === runId ? String(e) : s.detailError,
+      }));
     }
   },
 

@@ -145,52 +145,101 @@ fn cap_str(s: &str, max: usize) -> String {
     )
 }
 
-/// Build a run's detail payload from the local DB. Reads only — the caller
-/// holds the DB lock for the duration.
-pub fn build_run_detail_payload(db: &Db, run: &crate::db::RunRow) -> SyncRunDetail {
-    let stages = db.list_run_stages(&run.id).unwrap_or_default();
-    let details = stages
-        .iter()
-        .map(|s| {
-            // Journal: newest entries win the budget (the tail explains the
-            // outcome); malformed lines are skipped, not fatal.
-            let raw = db.list_stage_log(&s.id).unwrap_or_default();
-            let mut journal: Vec<serde_json::Value> = Vec::new();
-            let mut bytes = 0usize;
-            for line in raw.iter().rev().take(JOURNAL_ENTRIES_PER_STAGE) {
-                if bytes + line.len() > JOURNAL_BYTES_PER_STAGE {
-                    break;
-                }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    bytes += line.len();
-                    journal.push(v);
-                }
-            }
-            journal.reverse(); // back to chronological order
+/// One journal entry's own text budget. Entries are persisted UNCAPPED (a
+/// plan/report stage's final message can exceed the whole per-stage budget),
+/// so without a per-entry cap one oversized newest line would empty the
+/// journal (the budget loop broke on it before admitting anything).
+const JOURNAL_ENTRY_TEXT_CAP: usize = 6_000;
 
-            // Artifact: the human-readable text inside the StageArtifact JSON;
-            // a legacy/opaque artifact falls back to its raw (capped) form.
-            let artifact = s.artifact.as_deref().map(|json| {
-                let text = serde_json::from_str::<crate::orchestrator::types::StageArtifact>(json)
-                    .map(|a| a.text)
-                    .unwrap_or_else(|_| json.to_string());
-                cap_str(&text, ARTIFACT_CAP_CHARS)
-            });
+/// Serialized whole-payload budget, under the server's 1.5MB backstop with
+/// headroom for JSON string-escaping inflation. Enforced by degradation
+/// (oldest diffs drop first, then oldest journals) — a many-stage run must
+/// arrive trimmed, never be 413'd into silent loss.
+const DETAIL_TOTAL_BUDGET: usize = 1_200_000;
 
-            SyncStageDetail {
-                position: s.position,
-                role: s.role.clone(),
-                model: Some(s.agent_model.clone()),
-                status: s.status.clone(),
-                cost_usd: s.cost_usd,
-                error: s.error.as_deref().map(|e| cap_str(e, 2_000)),
-                artifact,
-                journal,
-                diff: s.diff_snapshot.as_deref().map(|d| cap_str(d, DIFF_CAP_CHARS)),
+/// Build ONE stage's detail from its row + raw journal lines. Pure — no DB
+/// access — so the caller can read each stage's journal under its own short
+/// lock and do all the string work outside (the global DB mutex must stay
+/// short: every live run://log line of every other run takes it).
+pub fn build_stage_detail(s: &crate::db::RunStageRow, raw_log: Vec<String>) -> SyncStageDetail {
+    // Journal: newest entries win the budget (the tail explains the outcome);
+    // oversized text entries are truncated rather than sinking the whole
+    // journal; malformed lines are skipped WITHOUT consuming an entry slot.
+    let mut journal: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0usize;
+    for line in raw_log.iter().rev() {
+        if journal.len() >= JOURNAL_ENTRIES_PER_STAGE {
+            break;
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // malformed — skip, don't burn an entry slot
+        };
+        // Cap the entry's own text so no single line can dominate (or, worse,
+        // exceed) the per-stage budget.
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            if text.len() > JOURNAL_ENTRY_TEXT_CAP {
+                let capped = cap_str(text, JOURNAL_ENTRY_TEXT_CAP);
+                v["text"] = serde_json::Value::String(capped);
             }
-        })
-        .collect();
-    SyncRunDetail { run_id: run.id.clone(), stages: details }
+        }
+        let size = v.to_string().len();
+        if bytes + size > JOURNAL_BYTES_PER_STAGE {
+            break; // older entries only from here — the budget is spent
+        }
+        bytes += size;
+        journal.push(v);
+    }
+    journal.reverse(); // back to chronological order
+
+    // Artifact: the human-readable text inside the StageArtifact JSON;
+    // a legacy/opaque artifact falls back to its raw (capped) form.
+    let artifact = s.artifact.as_deref().map(|json| {
+        let text = serde_json::from_str::<crate::orchestrator::types::StageArtifact>(json)
+            .map(|a| a.text)
+            .unwrap_or_else(|_| json.to_string());
+        cap_str(&text, ARTIFACT_CAP_CHARS)
+    });
+
+    SyncStageDetail {
+        position: s.position,
+        role: s.role.clone(),
+        model: Some(s.agent_model.clone()),
+        status: s.status.clone(),
+        cost_usd: s.cost_usd,
+        error: s.error.as_deref().map(|e| cap_str(e, 2_000)),
+        artifact,
+        journal,
+        diff: s.diff_snapshot.as_deref().map(|d| cap_str(d, DIFF_CAP_CHARS)),
+    }
+}
+
+/// Enforce the whole-payload budget by degradation, never by silent loss at
+/// the server: drop diffs oldest-first, then journals oldest-first, then
+/// artifacts oldest-first. The story survives trimmed; the 413 path is only
+/// ever a backstop for a hostile client.
+pub fn enforce_detail_budget(detail: &mut SyncRunDetail) {
+    fn size(d: &SyncRunDetail) -> usize {
+        serde_json::to_string(d).map(|s| s.len()).unwrap_or(usize::MAX)
+    }
+    if size(detail) <= DETAIL_TOTAL_BUDGET {
+        return;
+    }
+    for i in 0..detail.stages.len() {
+        if detail.stages[i].diff.take().is_some() && size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
+    for i in 0..detail.stages.len() {
+        detail.stages[i].journal.clear();
+        if size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
+    for i in 0..detail.stages.len() {
+        if detail.stages[i].artifact.take().is_some() && size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
 }
 
 /// POST a run's detail blob. **Best-effort** — logs and returns on any error;

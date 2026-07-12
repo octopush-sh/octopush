@@ -220,7 +220,12 @@ impl Orchestrator {
         {
             return;
         }
-        let (payload, detail) = {
+        // Metadata payload under ONE short lock (the B1 shape). The heavy B2
+        // detail is built inside the spawned task with GRANULAR locks — one
+        // short lock per stage-journal read, all string work outside — because
+        // this mutex is on the hot path of every other run's live journal
+        // (PersistingSink::emit) and must stay short.
+        let (payload, run_id_owned, stage_rows) = {
             let db = self.db.lock();
             // Resolve the machine id first — skip the whole push if we can't mint
             // one (empty would mis-attribute the row, which the server keys on).
@@ -229,18 +234,24 @@ impl Orchestrator {
                 _ => return,
             };
             match db.get_run(run_id) {
-                Ok(Some(run)) => (
-                    crate::sync::build_run_payload(&db, &run, &machine_id),
-                    // B2: the heavy story — journals · artifacts · diffs —
-                    // built under the same lock, pushed after the metadata.
-                    crate::sync::build_run_detail_payload(&db, &run),
-                ),
+                Ok(Some(run)) => {
+                    let stages = db.list_run_stages(run_id).unwrap_or_default();
+                    (crate::sync::build_run_payload(&db, &run, &machine_id), run.id, stages)
+                }
                 _ => return,
             }
         };
         let client = self.client.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             crate::sync::push_runs(&client, vec![payload]).await;
+            let mut details = Vec::with_capacity(stage_rows.len());
+            for stage in &stage_rows {
+                let raw = db.lock().list_stage_log(&stage.id).unwrap_or_default();
+                details.push(crate::sync::build_stage_detail(stage, raw));
+            }
+            let mut detail = crate::sync::SyncRunDetail { run_id: run_id_owned, stages: details };
+            crate::sync::enforce_detail_budget(&mut detail);
             crate::sync::push_run_detail(&client, detail).await;
         });
     }

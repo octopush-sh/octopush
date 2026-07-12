@@ -1391,7 +1391,32 @@ pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
             .collect::<Vec<_>>()
     };
     let count = runs.len();
-    crate::sync::push_runs(crate::chat_engine::shared_http_client(), runs).await;
+    let client = crate::chat_engine::shared_http_client();
+    crate::sync::push_runs(client, runs).await;
+
+    // Heal the B2 detail for the MOST RECENT terminal runs. The terminal-time
+    // detail push is fire-and-forget with no retry — a run finishing offline
+    // (or into a 503) would otherwise lose its story cloud-side FOREVER. The
+    // server upserts by run id, so re-pushing is idempotent; bounding to the
+    // newest few keeps launch traffic small while covering the common case
+    // (the run that finished right before the network hiccup). Granular locks:
+    // one short lock per read, all string work outside.
+    const DETAIL_HEAL_RECENT: usize = 10;
+    let recent: Vec<crate::db::RunRow> = {
+        let db = state.db.lock();
+        db.list_terminal_runs(DETAIL_HEAL_RECENT as u32)?
+    };
+    for run in recent {
+        let stage_rows = state.db.lock().list_run_stages(&run.id).unwrap_or_default();
+        let mut details = Vec::with_capacity(stage_rows.len());
+        for stage in &stage_rows {
+            let raw = state.db.lock().list_stage_log(&stage.id).unwrap_or_default();
+            details.push(crate::sync::build_stage_detail(stage, raw));
+        }
+        let mut detail = crate::sync::SyncRunDetail { run_id: run.id.clone(), stages: details };
+        crate::sync::enforce_detail_budget(&mut detail);
+        crate::sync::push_run_detail(client, detail).await;
+    }
     Ok(count)
 }
 

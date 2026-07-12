@@ -388,8 +388,17 @@ mod workspace_tests {
         db.set_stage_diff_snapshot(&s0.id, &big_diff).unwrap();
 
         db.set_run_status(&run_id, "completed", true).unwrap();
-        let run = db.get_run(&run_id).unwrap().unwrap();
-        let detail = crate::sync::build_run_detail_payload(&db, &run);
+        // Build the way the orchestrator does: per-stage rows + raw logs
+        // through the PURE builder (granular locks in production), then the
+        // whole-payload budget. Re-list AFTER the setters above — the builder
+        // reads the row it is given.
+        let stages = db.list_run_stages(&run_id).unwrap();
+        let details: Vec<_> = stages
+            .iter()
+            .map(|st| crate::sync::build_stage_detail(st, db.list_stage_log(&st.id).unwrap_or_default()))
+            .collect();
+        let mut detail = crate::sync::SyncRunDetail { run_id: run_id.clone(), stages: details };
+        crate::sync::enforce_detail_budget(&mut detail);
 
         assert_eq!(detail.run_id, run_id);
         assert_eq!(detail.stages.len(), stages.len());
@@ -408,6 +417,64 @@ mod workspace_tests {
         assert!(diff.contains("truncated for sync"));
         // The whole blob serializes comfortably under the server's 1.5MB cap.
         assert!(serde_json::to_string(&detail).unwrap().len() < 1_000_000);
+    }
+
+    #[test]
+    fn oversized_journal_entry_is_truncated_not_journal_sinking() {
+        // A stage's final message can exceed the whole per-stage budget; it
+        // must arrive TRUNCATED — an empty journal (the old break-on-first
+        // behavior) loses exactly the line that explains the outcome.
+        use crate::db::RunStageRow;
+        let stage = RunStageRow {
+            id: "s1".into(), run_id: "r1".into(), position: 0, role: "plan".into(),
+            agent_model: "m".into(), substrate: "api".into(), checkpoint: false,
+            status: "done".into(), input_tokens: 0, output_tokens: 0, cost_usd: 0.0,
+            artifact: None, feedback: None, error: None, started_at: None, finished_at: None,
+            loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
+            tools: None, custom_name: None, instructions: None, session_id: None,
+            resume_pending: false, baseline_commit: None,
+        };
+        let huge = format!(
+            r#"{{"kind":"text","text":"HEAD{}TAIL"}}"#,
+            "x".repeat(80_000)
+        );
+        let detail = crate::sync::build_stage_detail(&stage, vec![
+            r#"{"kind":"text","text":"older line"}"#.into(),
+            huge,
+        ]);
+        assert_eq!(detail.journal.len(), 2, "the oversized entry must not sink the journal");
+        let newest = detail.journal[1]["text"].as_str().unwrap();
+        assert!(newest.contains("HEAD") && newest.contains("TAIL"));
+        assert!(newest.len() < 10_000, "entry text capped");
+        assert_eq!(detail.journal[0]["text"], "older line");
+    }
+
+    #[test]
+    fn detail_budget_degrades_diffs_then_journals_never_413s() {
+        // Many-stage runs must arrive TRIMMED at the server, never be dropped
+        // by its 1.5MB backstop: diffs go first (oldest→), then journals.
+        use crate::db::RunStageRow;
+        let mk = |pos: i64| RunStageRow {
+            id: format!("s{pos}"), run_id: "r1".into(), position: pos, role: "implement".into(),
+            agent_model: "m".into(), substrate: "api".into(), checkpoint: false,
+            status: "done".into(), input_tokens: 0, output_tokens: 0, cost_usd: 0.0,
+            artifact: None, feedback: None, error: None, started_at: None, finished_at: None,
+            loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            session_id: None, resume_pending: false, baseline_commit: None,
+        };
+        // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
+        let stages: Vec<_> = (0..16).map(|p| crate::sync::build_stage_detail(&mk(p), vec![])).collect();
+        let mut detail = crate::sync::SyncRunDetail { run_id: "r1".into(), stages };
+        let before = serde_json::to_string(&detail).unwrap().len();
+        assert!(before > 1_200_000, "fixture must exceed the budget, got {before}");
+        crate::sync::enforce_detail_budget(&mut detail);
+        let after = serde_json::to_string(&detail).unwrap().len();
+        assert!(after <= 1_200_000, "budget enforced, got {after}");
+        // Degradation is oldest-first: the LAST stage keeps its diff longest.
+        assert!(detail.stages[0].diff.is_none(), "oldest diff dropped first");
     }
 
     #[test]
