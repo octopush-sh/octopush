@@ -21,6 +21,8 @@ interface FirstRunState {
   checkEligibility: () => Promise<void>;
   dismiss: () => void;
   markUsed: () => void;
+  /** A run started via any path this session — the invite must retire NOW. */
+  noteRunStarted: () => void;
 }
 
 export const useFirstRunStore = create<FirstRunState>()(
@@ -33,8 +35,7 @@ export const useFirstRunStore = create<FirstRunState>()(
       checkEligibility: async () => {
         if (get().dismissed || get().everRan !== null) return;
         try {
-          const count = await ipc.countRunsAllTime();
-          set({ everRan: count > 0 });
+          set({ everRan: await ipc.hasEverStartedRun() });
         } catch {
           // Can't tell → don't invite (never nag on a broken read).
           set({ everRan: true });
@@ -43,6 +44,9 @@ export const useFirstRunStore = create<FirstRunState>()(
 
       dismiss: () => set({ dismissed: true }),
       markUsed: () => set({ usedThisSession: true }),
+      // A crew started through ANY path (launcher, draft bar, re-run) makes
+      // the "you've never run a crew" invite a lie — retire it immediately.
+      noteRunStarted: () => set({ everRan: true }),
     }),
     {
       name: "octo-first-run",
@@ -51,16 +55,18 @@ export const useFirstRunStore = create<FirstRunState>()(
   ),
 );
 
-/** Provider readiness for the crew: any enabled local provider, or any
- *  provider with a configured key. Checked at CTA time so the invite can
- *  route honestly (crew vs. Settings · Models first). */
-export async function anyProviderReady(): Promise<boolean> {
+/** Readiness for THE FLAGSHIP CREW specifically: Feature Factory's stages
+ *  all run claude-* models on the api substrate, which resolve to the
+ *  Anthropic provider — so only an ENABLED Anthropic provider with a
+ *  configured key counts. A lone local provider (Ollama) or a key parked on
+ *  a disabled provider would wave the user into a guaranteed stage-1
+ *  failure — the exact first impression this check exists to prevent. */
+export async function crewProviderReady(): Promise<boolean> {
   try {
     const [providers, settings] = await Promise.all([ipc.listProviders(), ipc.getSettings()]);
     const keys = (settings as { providerKeys?: Record<string, string> }).providerKeys ?? {};
-    return providers.some(
-      (p) => (p.local && p.enabled) || (keys[p.name] ?? "").trim().length > 0,
-    );
+    const anthropic = providers.find((p) => p.name === "anthropic");
+    return !!anthropic && anthropic.enabled && (keys["anthropic"] ?? "").trim().length > 0;
   } catch {
     return false;
   }

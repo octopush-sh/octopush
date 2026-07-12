@@ -27,6 +27,10 @@ export interface LauncherPrefill {
   pipelineId: string;
   /** [stage position, agent model] for every stage of the source run. */
   overrides: [number, string][];
+  /** When set, only THIS workspace's launcher may consume the prefill — a
+   *  prefill parked while another workspace's launcher mounts must never
+   *  leak someone else's brief into it. Absent = any launcher (legacy). */
+  workspaceId?: string;
 }
 
 const inflightDetail = new Set<string>();
@@ -312,6 +316,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         throw e;
       }
       set((s) => ({ activeRunIdByWs: { ...s.activeRunIdByWs, [workspaceId]: runId } }));
+      // Any started crew retires the first-run invite immediately.
+      const { useFirstRunStore } = await import("./firstRunStore");
+      useFirstRunStore.getState().noteRunStarted();
       await get().loadRuns(workspaceId);
       get().selectRun(workspaceId, runId);
     } finally {
@@ -342,6 +349,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         });
         return;
       }
+      // Any started crew retires the first-run invite immediately.
+      const { useFirstRunStore } = await import("./firstRunStore");
+      useFirstRunStore.getState().noteRunStarted();
       // Refresh INSIDE the guard: releasing early lets a fast second click
       // re-enter while the just-started run still reads as draft (at the Free
       // cap that second attempt pops a spurious upgrade sheet).

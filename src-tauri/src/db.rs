@@ -2380,17 +2380,32 @@ impl Db {
         Ok(n.max(0) as u32)
     }
 
-    /// All-time count of Direct runs ever STARTED (left `draft`) on this
-    /// install — the "has this user ever run a crew?" signal behind the
-    /// one-shot first-run invite. Unlike the monthly quota counter, it never
-    /// resets (a returning user in a fresh month must not be re-invited).
-    pub fn count_started_runs_all_time(&self) -> AppResult<u32> {
+    /// Stamp the durable "this install has started a Direct run" marker.
+    /// Kept in `app_meta` because run ROWS cascade-delete with their
+    /// workspace — a veteran who cleans up finished workspaces must never be
+    /// re-invited by the first-run card. Idempotent.
+    pub fn mark_ever_ran(&self) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('ever_ran_direct', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The "has this user ever run a crew?" signal behind the one-shot
+    /// first-run invite: the durable marker, OR any surviving started run
+    /// (backfill for installs that ran crews before the marker existed).
+    /// Never resets — not monthly, and not via workspace-delete cascade.
+    pub fn has_ever_started_run(&self) -> AppResult<bool> {
+        if self.meta_get("ever_ran_direct")?.is_some() {
+            return Ok(true);
+        }
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM runs WHERE status != 'draft'",
             [],
             |r| r.get(0),
         )?;
-        Ok(n.max(0) as u32)
+        Ok(n > 0)
     }
 
     /// Count runs currently `running` or `paused` across **all** workspaces,

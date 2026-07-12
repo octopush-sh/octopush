@@ -45,7 +45,7 @@ import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
 import { FirstRunInvite } from "./components/FirstRunInvite";
-import { useFirstRunStore, anyProviderReady } from "./stores/firstRunStore";
+import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -1395,29 +1395,41 @@ function App() {
   // is ready, route honestly to Settings · Models instead (the invite
   // survives; Feature Factory is all-api and would otherwise fail mid-run).
   const handleSendFirstCrew = useCallback(async () => {
-    if (!activeWorkspaceId) return;
-    if (!(await anyProviderReady())) {
+    // Capture the click-time workspace: the readiness check awaits two IPC
+    // round-trips, and a workspace switch mid-await must not hijack the new
+    // one (the prefill is also workspace-scoped as a second guard).
+    const wsId = activeWorkspaceId;
+    const ws = workspaces.find((w) => w.id === wsId);
+    if (!wsId) return;
+    if (!(await crewProviderReady())) {
       setSettingsTab("models");
       pushToast({
         level: "info",
-        title: "Add a model key first",
-        body: "Your crew needs a provider — one key and they're ready to work.",
+        title: "Add your Anthropic key first",
+        body: "The crew runs on Claude — one key in Settings · Models and they're ready to work.",
       });
       return;
     }
-    const pipelines = usePipelineStore.getState().pipelines;
+    let pipelines = usePipelineStore.getState().pipelines;
+    if (pipelines.length === 0) {
+      await usePipelineStore.getState().load(); // first-ever session may click before the list loads
+      pipelines = usePipelineStore.getState().pipelines;
+    }
     const flagship =
       pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
       pipelines.find((p) => p.pipeline.isBuiltin);
-    if (!flagship) return; // builtins are always seeded; defensive only
-    const ws = workspaces.find((w) => w.id === activeWorkspaceId);
+    if (!flagship) {
+      pushToast({ level: "error", title: "Couldn't load the crew's pipeline" });
+      return;
+    }
     useRunsStore.getState().setLauncherPrefill({
       task: ws?.task ?? "",
       pipelineId: flagship.pipeline.id,
       overrides: [],
+      workspaceId: wsId,
     });
     useFirstRunStore.getState().markUsed();
-    setModePerWorkspace((p) => ({ ...p, [activeWorkspaceId]: "direct" }));
+    setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
   }, [activeWorkspaceId, workspaces]);
 
   // ── Project context menu handler ──

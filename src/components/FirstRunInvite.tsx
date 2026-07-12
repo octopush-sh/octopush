@@ -19,7 +19,7 @@ export function FirstRunInvite({ onSendCrew }: { onSendCrew: () => void }) {
   if (dismissed || usedThisSession || everRan !== false) return null;
 
   return (
-    <div className="octo-rise-in pointer-events-none absolute inset-x-0 bottom-24 z-30 flex justify-center px-6">
+    <div className="octo-rise-in pointer-events-none absolute inset-x-0 bottom-36 z-30 flex justify-center px-6">
       <div className="pointer-events-auto w-full max-w-[520px] rounded-xl border border-octo-hairline bg-octo-panel p-5 shadow-2xl">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">

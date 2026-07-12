@@ -8,42 +8,42 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const countRunsAllTimeMock = vi.fn();
+const hasEverStartedRunMock = vi.fn();
 const listProvidersMock = vi.fn();
 const getSettingsMock = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
-    countRunsAllTime: countRunsAllTimeMock,
+    hasEverStartedRun: hasEverStartedRunMock,
     listProviders: listProvidersMock,
     getSettings: getSettingsMock,
   },
 }));
 
-const { useFirstRunStore, anyProviderReady } = await import("./firstRunStore");
+const { useFirstRunStore, crewProviderReady } = await import("./firstRunStore");
 
 beforeEach(() => {
   localStorage.clear();
   useFirstRunStore.setState({ dismissed: false, usedThisSession: false, everRan: null });
-  countRunsAllTimeMock.mockReset();
+  hasEverStartedRunMock.mockReset();
   listProvidersMock.mockReset();
   getSettingsMock.mockReset();
 });
 
 describe("firstRunStore", () => {
   it("marks eligible only when the user has NEVER started a run", async () => {
-    countRunsAllTimeMock.mockResolvedValue(0);
+    hasEverStartedRunMock.mockResolvedValue(false);
     await useFirstRunStore.getState().checkEligibility();
     expect(useFirstRunStore.getState().everRan).toBe(false);
 
     useFirstRunStore.setState({ everRan: null });
-    countRunsAllTimeMock.mockResolvedValue(3);
+    hasEverStartedRunMock.mockResolvedValue(true);
     await useFirstRunStore.getState().checkEligibility();
     expect(useFirstRunStore.getState().everRan).toBe(true);
   });
 
-  it("a failed count read never nags", async () => {
-    countRunsAllTimeMock.mockRejectedValue(new Error("offline"));
+  it("a failed read never nags", async () => {
+    hasEverStartedRunMock.mockRejectedValue(new Error("offline"));
     await useFirstRunStore.getState().checkEligibility();
     expect(useFirstRunStore.getState().everRan).toBe(true);
   });
@@ -51,35 +51,49 @@ describe("firstRunStore", () => {
   it("dismissed short-circuits the backend check", async () => {
     useFirstRunStore.setState({ dismissed: true });
     await useFirstRunStore.getState().checkEligibility();
-    expect(countRunsAllTimeMock).not.toHaveBeenCalled();
+    expect(hasEverStartedRunMock).not.toHaveBeenCalled();
   });
 
-  it("checkEligibility runs the count only once per session", async () => {
-    countRunsAllTimeMock.mockResolvedValue(0);
+  it("checkEligibility reads the signal only once per session", async () => {
+    hasEverStartedRunMock.mockResolvedValue(false);
     await useFirstRunStore.getState().checkEligibility();
     await useFirstRunStore.getState().checkEligibility();
-    expect(countRunsAllTimeMock).toHaveBeenCalledTimes(1);
+    expect(hasEverStartedRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a run started via ANY path retires the invite immediately", async () => {
+    hasEverStartedRunMock.mockResolvedValue(false);
+    await useFirstRunStore.getState().checkEligibility();
+    expect(useFirstRunStore.getState().everRan).toBe(false);
+    useFirstRunStore.getState().noteRunStarted();
+    expect(useFirstRunStore.getState().everRan).toBe(true);
   });
 });
 
-describe("anyProviderReady", () => {
-  it("true for an enabled local provider with no key", async () => {
+describe("crewProviderReady", () => {
+  it("requires the ANTHROPIC provider specifically — a lone local provider is not enough", async () => {
+    // Feature Factory is all-api on claude-* models; waving an Ollama-only
+    // user through means a guaranteed stage-1 failure on their first crew.
     listProvidersMock.mockResolvedValue([{ name: "ollama", local: true, enabled: true }]);
     getSettingsMock.mockResolvedValue({ providerKeys: {} });
-    expect(await anyProviderReady()).toBe(true);
+    expect(await crewProviderReady()).toBe(false);
   });
 
-  it("true for a configured key; false when nothing is ready", async () => {
+  it("true only for an ENABLED anthropic provider with a real key", async () => {
     listProvidersMock.mockResolvedValue([{ name: "anthropic", local: false, enabled: true }]);
     getSettingsMock.mockResolvedValue({ providerKeys: { anthropic: "sk-x" } });
-    expect(await anyProviderReady()).toBe(true);
+    expect(await crewProviderReady()).toBe(true);
 
     getSettingsMock.mockResolvedValue({ providerKeys: { anthropic: "   " } });
-    expect(await anyProviderReady()).toBe(false);
+    expect(await crewProviderReady()).toBe(false);
+
+    listProvidersMock.mockResolvedValue([{ name: "anthropic", local: false, enabled: false }]);
+    getSettingsMock.mockResolvedValue({ providerKeys: { anthropic: "sk-x" } });
+    expect(await crewProviderReady()).toBe(false);
   });
 
   it("false when the read fails (route to Settings, never crash)", async () => {
     listProvidersMock.mockRejectedValue(new Error("boom"));
-    expect(await anyProviderReady()).toBe(false);
+    expect(await crewProviderReady()).toBe(false);
   });
 });

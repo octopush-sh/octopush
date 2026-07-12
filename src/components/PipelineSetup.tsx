@@ -9,6 +9,8 @@ import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
 
 interface Props {
+  /** The workspace whose launcher this is — guards prefill consumption. */
+  workspaceId: string;
   defaultTask: string;
   linkedIssueKey?: string | null;
   onBegin: (
@@ -45,7 +47,7 @@ function runsTone(used: number, limit: number | null): string {
  * lands on "Begin the run" only when brief + ensemble + quota + concurrency
  * are all satisfied; until then the CTA is a ghost.
  */
-export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, executingRun, onEditPipeline }: Props) {
+export function PipelineSetup({ workspaceId, defaultTask, linkedIssueKey = null, onBegin, executingRun, onEditPipeline }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
@@ -73,8 +75,15 @@ export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, exe
   // list is in, so the existence check is meaningful. The task always applies;
   // pipeline + crew only when that pipeline still exists.
   const consumeLauncherPrefill = useRunsStore((s) => s.consumeLauncherPrefill);
+  const pendingPrefill = useRunsStore((s) => s.launcherPrefill);
   useEffect(() => {
-    if (!loaded) return;
+    // REACTIVE consume: the launcher is often already mounted (hidden under
+    // the mode overlay) when a prefill is set — e.g. the first-run invite —
+    // so waiting for a mount would strand the prefill to leak into whichever
+    // launcher mounts NEXT. Also workspace-guarded: a prefill addressed to
+    // another workspace stays parked until ITS launcher looks.
+    if (!loaded || !pendingPrefill) return;
+    if (pendingPrefill.workspaceId && pendingPrefill.workspaceId !== workspaceId) return;
     const prefill = consumeLauncherPrefill();
     if (!prefill) return;
     setTask(prefill.task);
@@ -82,8 +91,8 @@ export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, exe
       setSelectedId(prefill.pipelineId);
       setOverrides(Object.fromEntries(prefill.overrides));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- consume exactly once, when loaded
-  }, [loaded]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- consume exactly once per prefill
+  }, [loaded, pendingPrefill]);
   useEffect(() => {
     if (!selectedId) return;
     setEstimate(null);
