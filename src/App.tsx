@@ -44,6 +44,8 @@ import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
+import { FirstRunInvite } from "./components/FirstRunInvite";
+import { useFirstRunStore, anyProviderReady } from "./stores/firstRunStore";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -131,6 +133,9 @@ function App() {
   // runs in workspaces not opened this session. Live events keep it fresh after.
   useEffect(() => {
     void loadActiveRuns();
+    // One-shot first-run invite eligibility (all-time backend count; the
+    // persisted dismissed flag short-circuits inside the store).
+    void useFirstRunStore.getState().checkEligibility();
   }, [loadActiveRuns]);
 
   // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
@@ -1384,6 +1389,37 @@ function App() {
     }
   }, [activeWorkspaceId]);
 
+  // First-run invite CTA: hand off to the Direct launcher with the flagship
+  // crew (Feature Factory) preselected and the workspace's task as the brief —
+  // one more click ("Begin the run") and the crew is working. If no provider
+  // is ready, route honestly to Settings · Models instead (the invite
+  // survives; Feature Factory is all-api and would otherwise fail mid-run).
+  const handleSendFirstCrew = useCallback(async () => {
+    if (!activeWorkspaceId) return;
+    if (!(await anyProviderReady())) {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add a model key first",
+        body: "Your crew needs a provider — one key and they're ready to work.",
+      });
+      return;
+    }
+    const pipelines = usePipelineStore.getState().pipelines;
+    const flagship =
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
+      pipelines.find((p) => p.pipeline.isBuiltin);
+    if (!flagship) return; // builtins are always seeded; defensive only
+    const ws = workspaces.find((w) => w.id === activeWorkspaceId);
+    useRunsStore.getState().setLauncherPrefill({
+      task: ws?.task ?? "",
+      pipelineId: flagship.pipeline.id,
+      overrides: [],
+    });
+    useFirstRunStore.getState().markUsed();
+    setModePerWorkspace((p) => ({ ...p, [activeWorkspaceId]: "direct" }));
+  }, [activeWorkspaceId, workspaces]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1691,6 +1727,9 @@ function App() {
                     onRunInTerminal={handleRunInTerminal}
                   />
                 )}
+                {/* One-shot first-run invite — floats over the Talk canvas
+                    (where every new user lands); eligibility gated inside. */}
+                {activeWorkspace && <FirstRunInvite onSendCrew={() => void handleSendFirstCrew()} />}
               </ModeOverlay>
 
               {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs

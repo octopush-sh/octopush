@@ -477,6 +477,24 @@ mod workspace_tests {
         assert!(detail.stages[0].diff.is_none(), "oldest diff dropped first");
     }
 
+    #[test]
+    fn all_time_run_count_never_resets_and_excludes_drafts() {
+        // Backs the one-shot first-run invite: "has this user EVER run a
+        // crew?" — drafts don't count, and unlike the monthly quota counter
+        // there is no window to reset.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        assert_eq!(db.count_started_runs_all_time().unwrap(), 0);
+        let draft = db.create_run("ws1", &pipeline_id, "t", None, None, &[]).unwrap();
+        assert_eq!(db.count_started_runs_all_time().unwrap(), 0, "drafts never count");
+        db.set_run_status(&draft, "running", false).unwrap();
+        assert_eq!(db.count_started_runs_all_time().unwrap(), 1);
+        db.set_run_status(&draft, "completed", true).unwrap();
+        assert_eq!(db.count_started_runs_all_time().unwrap(), 1, "terminal still counts");
+    }
+
     // ── Library sync (Pro): custom pipelines + roles follow the user ──
 
     #[test]

@@ -1349,6 +1349,13 @@ pub async fn direct_run_usage(
     })
 }
 
+/// All-time started-run count — drives the one-shot "put a crew on it"
+/// first-run invite (shown only to users who have NEVER run a Direct crew).
+#[tauri::command]
+pub async fn count_runs_all_time(state: State<'_, AppState>) -> AppResult<u32> {
+    state.db.lock().count_started_runs_all_time()
+}
+
 // ─── Cross-machine run history (Pro-real Part B / B1) ──────────────
 
 /// Pro-gate for the sync commands — mirrors the `start_run` concurrency gate so a

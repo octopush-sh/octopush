@@ -2380,6 +2380,19 @@ impl Db {
         Ok(n.max(0) as u32)
     }
 
+    /// All-time count of Direct runs ever STARTED (left `draft`) on this
+    /// install — the "has this user ever run a crew?" signal behind the
+    /// one-shot first-run invite. Unlike the monthly quota counter, it never
+    /// resets (a returning user in a fresh month must not be re-invited).
+    pub fn count_started_runs_all_time(&self) -> AppResult<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE status != 'draft'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
     /// Count runs currently `running` or `paused` across **all** workspaces,
     /// excluding `run_id` (a run is never counted against itself). Drives the
     /// concurrency gate: Free may run only one at a time, Pro may run many.

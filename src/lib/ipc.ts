@@ -957,6 +957,8 @@ export const ipc = {
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
   directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
+  /** All-time started-run count — the "never ran a crew" first-run signal. */
+  countRunsAllTime: () => invoke<number>("count_runs_all_time"),
 
   // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
   /** The local read-only history mirror (instant, no network). */
