@@ -251,18 +251,21 @@
 /* ── Motion · reusable entrance primitives ───────────────────────
    The canonical way to reveal overlays, dialogs, menus, and panels.
    Built on --ease-octo / --dur-* so everything reads as one family.
-   See CLAUDE.md (motion rule) + docs/design-system.md §6. */
+   See CLAUDE.md (motion rule) + docs/design-system.md §6.
+
+   from-only on purpose: a to{} block + fill both would pin opacity/transform
+   forever, overriding utility opacities (depth-of-field dimming). From-only
+   keyframes animate to the element's underlying computed values, so 0 → 0.45
+   dims correctly and hover raises work; `both` still back-fills `from` during
+   animationDelay staggers. */
 @keyframes octo-enter-fade {
   from { opacity: 0; }
-  to   { opacity: 1; }
 }
 @keyframes octo-enter-pop {
   from { opacity: 0; transform: scale(0.97); }
-  to   { opacity: 1; transform: none; }
 }
 @keyframes octo-enter-rise {
   from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 1; transform: none; }
 }
 
 .octo-overlay-enter { animation: octo-enter-fade var(--dur-quick) var(--ease-octo) both; }

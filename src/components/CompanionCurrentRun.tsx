@@ -49,13 +49,12 @@ export function CompanionCurrentRun({ workspaceId }: Props) {
         <StageDots stages={stages.map((s) => ({ status: s.status, checkpoint: s.checkpoint, error: s.error, title: stageTitle(s) }))} />
       </div>
 
-      {/* Which stage is current — fixed-height truncating slot (S1); the
-          canvas RunFlow owns the live activity stream, this is a static label. */}
-      {stage && (
-        <div className="mb-1.5 h-[18px] truncate font-serif text-[13px] leading-[18px] text-octo-ivory">
-          {stageTitle(stage)}
-        </div>
-      )}
+      {/* Which stage is current — fixed-height truncating slot (S1), rendered
+          unconditionally so pre-hydration layout never shifts; the canvas
+          RunFlow owns the live activity stream, this is a static label. */}
+      <div className="mb-1.5 h-[18px] truncate font-serif text-[13px] leading-[18px] text-octo-ivory">
+        {stage ? stageTitle(stage) : ""}
+      </div>
 
       <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
         <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>
