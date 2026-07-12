@@ -133,3 +133,43 @@ pub fn pr_from_json(v: &serde_json::Value) -> Pr {
         state,
     }
 }
+
+/// An open GitHub issue, as listed for the "Ship it" flow. Parsed from
+/// `gh issue list --json number,title,body,url` output.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GhIssue {
+    pub number: i64,
+    pub title: String,
+    /// Body capped by the CALLER when folded into a run task; carried whole
+    /// here so the picker can show a preview line.
+    pub body: String,
+    pub url: String,
+}
+
+/// Parse `gh issue list --json number,title,body,url` output. Lenient: rows
+/// missing a number or title are skipped, never fatal.
+pub fn issues_from_json(raw: &str) -> Result<Vec<GhIssue>, serde_json::Error> {
+    let vals: Vec<serde_json::Value> = serde_json::from_str(raw)?;
+    Ok(vals
+        .into_iter()
+        .filter_map(|v| {
+            Some(GhIssue {
+                number: v.get("number")?.as_i64()?,
+                title: v.get("title")?.as_str()?.to_string(),
+                body: v.get("body").and_then(|b| b.as_str()).unwrap_or_default().to_string(),
+                url: v.get("url").and_then(|u| u.as_str()).unwrap_or_default().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Readiness preflight for the "Ship it" flow — the `pull_request` stage
+/// needs BOTH a github.com remote and an authenticated `gh`; failing that
+/// mid-run (after the crew already built) is a terrible way to find out.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShipReadiness {
+    pub github_remote: bool,
+    pub gh_authenticated: bool,
+}

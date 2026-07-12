@@ -327,6 +327,20 @@ export interface PrInfo {
   author: string | null;
 }
 
+/** An open GitHub issue (the "Ship it" picker's source). */
+export interface GhIssue {
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+}
+
+/** Preflight for "Ship it": github.com origin + authenticated gh. */
+export interface ShipReadiness {
+  githubRemote: boolean;
+  ghAuthenticated: boolean;
+}
+
 /** A branch and its open PR, from open_prs_for_project (rail PR indicator). */
 export interface BranchPr {
   branch: string;

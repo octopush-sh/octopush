@@ -2125,6 +2125,17 @@ impl Db {
                 ],
             ),
             (
+                "Ship it",
+                "Issue to pull request: plan, implement, review, test, open the PR.",
+                &[
+                    ("plan",         "claude-haiku-4-5",  "api", false, None,    0, None),
+                    ("implement",    "claude-sonnet-4-6", "api", true,  None,    0, None),
+                    ("code_review",  "claude-haiku-4-5",  "api", true,  Some(1), 2, Some("gated")),
+                    ("test",         "claude-haiku-4-5",  "api", true,  None,    0, None),
+                    ("pull_request", "claude-sonnet-4-6", "cli", true,  None,    0, None),
+                ],
+            ),
+            (
                 "Claude Code build",
                 "Plan via API, then implement, review, and test with Claude Code (CLI).",
                 &[
