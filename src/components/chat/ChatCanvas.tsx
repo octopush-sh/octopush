@@ -6,6 +6,7 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
+import { OctoMark } from "../icons/OctoMark";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -419,6 +420,7 @@ function RowAction({
 function EmptyState() {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
+      <OctoMark size={28} state="idle" className="opacity-80" />
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Talk
       </div>
@@ -436,11 +438,7 @@ function EmptyState() {
 function ThinkingIndicator() {
   return (
     <div className="flex items-center gap-2 self-start">
-      <span
-        aria-hidden
-        className="inline-block h-1.5 w-1.5 animate-pulse rounded-full"
-        style={{ background: "var(--color-octo-brass)" }}
-      />
+      <OctoMark size={18} state="working" />
       <span className="font-serif text-[13px] text-octo-sage">Thinking…</span>
     </div>
   );
