@@ -294,13 +294,13 @@ export function NewProjectFlow({ onBack }: Props) {
         <div className="mt-6 space-y-1">
           <StepIndex
             active={step === 1}
-            numeral="I"
+            numeral="1"
             label="Type"
             onClick={() => setStep(1)}
           />
           <StepIndex
             active={step === 2}
-            numeral="II"
+            numeral="2"
             label="Details"
             onClick={() => setStep(2)}
             disabled={step === 1}
@@ -314,7 +314,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step I — Type selection ─────────────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP I · OF II
+              STEP 1 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Where does it begin?
@@ -362,7 +362,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Open existing folder ─────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Open a folder.
@@ -461,7 +461,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Clone details ─────────────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Clone a repository.
@@ -677,7 +677,7 @@ export function NewProjectFlow({ onBack }: Props) {
           /* ── Step II — Empty project details ─────────────────────── */
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP II · OF II
+              STEP 2 OF 2
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               Name your new study.

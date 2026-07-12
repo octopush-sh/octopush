@@ -124,7 +124,7 @@ describe("NewProjectFlow — Step I (type selection)", () => {
     await waitFor(() => {
       expect(screen.getByText("REPOSITORY URL")).toBeInTheDocument();
     });
-    expect(screen.getByText("STEP II · OF II")).toBeInTheDocument();
+    expect(screen.getByText("STEP 2 OF 2")).toBeInTheDocument();
   });
 
   it("clicking Empty advances to Step II with project name field", async () => {
@@ -541,7 +541,7 @@ describe("NewProjectFlow — Open existing folder flow", () => {
   it("clicking Open card advances to Step II with Pick a folder button", async () => {
     goToOpenStep();
     await waitFor(() => {
-      expect(screen.getByText("STEP II · OF II")).toBeInTheDocument();
+      expect(screen.getByText("STEP 2 OF 2")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /pick a folder/i })).toBeInTheDocument();
     });
   });
