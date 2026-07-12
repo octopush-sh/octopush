@@ -478,6 +478,45 @@ mod workspace_tests {
     }
 
     #[test]
+    fn gh_issues_parse_leniently() {
+        use crate::github::issues_from_json;
+        let raw = r#"[
+            {"number": 42, "title": "Add CSV export", "body": "Details here", "url": "https://github.com/o/r/issues/42"},
+            {"title": "no number — skipped"},
+            {"number": 7, "title": "Empty body ok"}
+        ]"#;
+        let issues = issues_from_json(raw).unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].number, 42);
+        assert_eq!(issues[0].title, "Add CSV export");
+        assert_eq!(issues[1].body, "");
+        assert!(issues_from_json("not json").is_err());
+    }
+
+    #[test]
+    fn ship_it_builtin_ends_in_pull_request_with_a_gated_review_loop() {
+        // The "Ship a GitHub issue" flow's crew: it must actually END by
+        // opening the PR, and the review must gate implement (not run wild).
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let ship = db
+            .list_pipelines()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Ship it" && p.is_builtin)
+            .expect("Ship it builtin seeded");
+        let stages = db.get_pipeline_stages(&ship.id).unwrap();
+        let roles: Vec<&str> = stages.iter().map(|s| s.role.as_str()).collect();
+        assert_eq!(roles, ["plan", "implement", "code_review", "test", "pull_request"]);
+        let last = stages.last().unwrap();
+        assert_eq!(last.substrate, "cli", "the PR opener runs on the CLI substrate");
+        assert!(last.checkpoint, "opening a PR is gated on the director");
+        let review = &stages[2];
+        assert_eq!(review.loop_target_position, Some(1), "review loops back to implement");
+        assert_eq!(review.loop_mode.as_deref(), Some("gated"));
+    }
+
+    #[test]
     fn ever_ran_signal_is_durable_across_workspace_deletion() {
         // Backs the one-shot first-run invite: "has this user EVER run a
         // crew?" — drafts don't count, and the signal survives BOTH the
@@ -2892,12 +2931,12 @@ mod pipeline_crud_tests {
     }
 
     #[test]
-    fn seed_is_idempotent_and_lists_three() {
+    fn seed_is_idempotent_and_lists_the_builtins() {
         let db = test_db();
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 4);
+        assert_eq!(pipelines.len(), 5); // incl. "Ship it" (issue → PR)
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();

@@ -261,8 +261,10 @@ import type {
   IssueTrackerConfig,
   ModelSuggestion,
   ModelWithProvider,
+  GhIssue,
   Pr,
   PrInfo,
+  ShipReadiness,
   PerfStats,
   ProjectInfo,
   ProviderConfig,
@@ -802,6 +804,11 @@ export const ipc = {
    *  Rejects with a friendly message when the GitHub CLI is missing or not
    *  authenticated — the UI maps any failure to a quiet empty state. */
   listPrs: (path: string) => invoke<PrInfo[]>("list_prs", { path }),
+  /** Open GitHub issues for the project (the "Ship it" picker's source). */
+  listGithubIssues: (path: string) => invoke<GhIssue[]>("list_github_issues", { path }),
+  /** Preflight for "Ship it": github.com origin + authenticated gh. */
+  githubShipReadiness: (path: string) =>
+    invoke<ShipReadiness>("github_ship_readiness", { path }),
 
   /** Fetch a PR's head ref as a local branch (no-op if it already exists),
    *  so it can serve as the base of a new workspace. */

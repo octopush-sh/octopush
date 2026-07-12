@@ -7,10 +7,15 @@ import { beaconAnchor } from "../lib/beacon";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
+import { GithubIssuePicker } from "./GithubIssuePicker";
+import { composeIssueTask } from "../lib/shipIssue";
+import { Github } from "lucide-react";
 
 interface Props {
   /** The workspace whose launcher this is — guards prefill consumption. */
   workspaceId: string;
+  /** Worktree path — the "Ship an issue" picker runs `gh` here. */
+  workspacePath: string;
   defaultTask: string;
   linkedIssueKey?: string | null;
   onBegin: (
@@ -47,7 +52,7 @@ function runsTone(used: number, limit: number | null): string {
  * lands on "Begin the run" only when brief + ensemble + quota + concurrency
  * are all satisfied; until then the CTA is a ghost.
  */
-export function PipelineSetup({ workspaceId, defaultTask, linkedIssueKey = null, onBegin, executingRun, onEditPipeline }: Props) {
+export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedIssueKey = null, onBegin, executingRun, onEditPipeline }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
@@ -58,6 +63,7 @@ export function PipelineSetup({ workspaceId, defaultTask, linkedIssueKey = null,
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<number, string>>({});
   const [budgetText, setBudgetText] = useState("");
+  const [showIssuePicker, setShowIssuePicker] = useState(false);
   const [estimate, setEstimate] = useState<{ estimateUsd: number; baselineUsd: number } | null>(null);
 
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
@@ -178,9 +184,36 @@ export function PipelineSetup({ workspaceId, defaultTask, linkedIssueKey = null,
                 {linkedIssueKey}
               </span>
             )}
-            <span className="ml-auto font-mono text-[9px] text-octo-mute">⌘⏎ to begin</span>
+            <button
+              type="button"
+              onClick={() => setShowIssuePicker(true)}
+              aria-label="Ship a GitHub issue"
+              title="Ship a GitHub issue — the crew plans, builds, reviews, tests, and opens the PR"
+              className="ml-auto flex items-center gap-1 rounded p-1 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <Github size={11} aria-hidden />
+              ship an issue
+            </button>
+            <span className="font-mono text-[9px] text-octo-mute">⌘⏎ to begin</span>
           </div>
         </div>
+
+        {showIssuePicker && (
+          <GithubIssuePicker
+            workspacePath={workspacePath}
+            onClose={() => setShowIssuePicker(false)}
+            onPick={(issue) => {
+              setShowIssuePicker(false);
+              setTask(composeIssueTask(issue));
+              // Prefer the flagship shipping crew — it ends in the
+              // pull_request stage that actually opens the PR.
+              const shipIt = pipelines.find(
+                (p) => p.pipeline.isBuiltin && p.pipeline.name === "Ship it",
+              );
+              if (shipIt) setSelectedId(shipIt.pipeline.id);
+            }}
+          />
+        )}
 
         {/* The ensemble. */}
         <p className="mb-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>

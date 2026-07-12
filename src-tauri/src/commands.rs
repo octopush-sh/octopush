@@ -3425,6 +3425,61 @@ pub async fn list_prs(path: String) -> AppResult<Vec<crate::github::PrInfo>> {
         .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
 }
 
+/// Open GitHub issues for the project — the "Ship it" picker's source. Runs
+/// `gh issue list` in the user's login shell (same pattern as `list_prs`) so
+/// PATH and keychain credentials behave like in a terminal. Any failure maps
+/// to a friendly error the picker renders as an honest empty state.
+#[tauri::command]
+pub async fn list_github_issues(path: String) -> AppResult<Vec<crate::github::GhIssue>> {
+    let path = expand_tilde(&path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c")
+        .arg("gh issue list --state open --json number,title,body,url --limit 30")
+        .current_dir(&path)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.trim().chars().take(200).collect();
+        return Err(AppError::Other(format!("GitHub CLI not available: {snippet}")));
+    }
+
+    crate::github::issues_from_json(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| AppError::Other(format!("GitHub CLI returned unexpected output: {e}")))
+}
+
+/// Preflight for "Ship it": the crew's `pull_request` stage needs BOTH a
+/// github.com origin and an authenticated `gh` — discovering that mid-run,
+/// after the crew already built the change, is the failure mode this check
+/// exists to prevent. Best-effort on the git side (no repo/origin → false).
+#[tauri::command]
+pub async fn github_ship_readiness(path: String) -> AppResult<crate::github::ShipReadiness> {
+    let path = expand_tilde(&path);
+    let github_remote = (|| -> Option<bool> {
+        let repo = git2::Repository::discover(&path).ok()?;
+        let remote = repo.find_remote("origin").ok()?;
+        let url = remote.url()?.to_string();
+        let parsed = crate::git_url::parse_git_url(&url)?;
+        Some(parsed.host == "github.com")
+    })()
+    .unwrap_or(false);
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let gh_authenticated = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c")
+        .arg("gh auth status")
+        .current_dir(&path)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    Ok(crate::github::ShipReadiness { github_remote, gh_authenticated })
+}
+
 /// Make a PR's head ref available as a local branch so it can serve as a
 /// workspace base. No-op when the branch already exists locally; otherwise
 /// `git fetch origin pull/<n>/head:<headRefName>` in the login shell (works
