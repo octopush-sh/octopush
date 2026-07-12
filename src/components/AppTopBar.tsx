@@ -1,8 +1,10 @@
 import { Settings, NotebookPen, History } from "lucide-react";
 import { RunsTray } from "./RunsTray";
+import { OctoMark } from "./icons/OctoMark";
 import { useHistoryStore } from "../stores/historyStore";
 import { useUpgradeStore } from "../stores/upgradeStore";
 import { useEntitlement } from "../hooks/useEntitlement";
+import { useMascotState } from "../hooks/useMascotState";
 
 /** A thin chrome bar at the very top of the app. Mirrors the bottom
  *  `PerfMonitorBar` in structure (full width, hairline border, panel bg)
@@ -28,6 +30,7 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
   const openHistory = useHistoryStore((s) => s.openSheet);
   const showUpgrade = useUpgradeStore((s) => s.show);
   const { hasFeature } = useEntitlement();
+  const mascot = useMascotState();
 
   const onHistoryClick = () => {
     if (hasFeature("history.sync")) {
@@ -42,6 +45,17 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
       data-tauri-drag-region
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
+      {/* The live mascot — body language mirrors app state (spec §4.4):
+          needs-you → blocked (frozen, eyes half-mast), agents busy →
+          working (paddling, eyes scanning), otherwise idle. */}
+      <span
+        role="img"
+        aria-label={mascot.label}
+        title={mascot.label}
+        className="mr-2 flex shrink-0 items-center"
+      >
+        <OctoMark size={20} state={mascot.state} />
+      </span>
       <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">
         <button
