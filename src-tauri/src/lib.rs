@@ -338,6 +338,7 @@ pub fn run() {
             // Entitlement (premium scaffolding — P0)
             commands::get_entitlement,
             commands::direct_run_usage,
+            commands::has_ever_started_run,
             // Cross-machine run history (Pro-real Part B / B1)
             commands::history_list,
             commands::history_sync_pull,

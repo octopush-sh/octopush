@@ -1295,6 +1295,9 @@ pub async fn start_run(
             state.db.lock().set_run_budget(&run_id, Some(b))?;
         }
     }
+    // Durable first-run marker (survives workspace-delete cascades) — the
+    // one-shot invite must never re-appear for a user who has run a crew.
+    let _ = state.db.lock().mark_ever_ran();
     Arc::clone(&*orch).start_run(run_id);
     Ok(())
 }
@@ -1347,6 +1350,13 @@ pub async fn direct_run_usage(
         limit: ent.direct_runs_per_month,
         remaining: ent.direct_runs_remaining(used),
     })
+}
+
+/// "Has this user ever started a Direct run?" — drives the one-shot "put a
+/// crew on it" first-run invite. Durable (app_meta marker OR surviving rows).
+#[tauri::command]
+pub async fn has_ever_started_run(state: State<'_, AppState>) -> AppResult<bool> {
+    state.db.lock().has_ever_started_run()
 }
 
 // ─── Cross-machine run history (Pro-real Part B / B1) ──────────────

@@ -477,6 +477,30 @@ mod workspace_tests {
         assert!(detail.stages[0].diff.is_none(), "oldest diff dropped first");
     }
 
+    #[test]
+    fn ever_ran_signal_is_durable_across_workspace_deletion() {
+        // Backs the one-shot first-run invite: "has this user EVER run a
+        // crew?" — drafts don't count, and the signal survives BOTH the
+        // monthly window (no window at all) and the workspace-delete cascade
+        // that erases run rows (the app_meta marker is the durable half).
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        assert!(!db.has_ever_started_run().unwrap());
+        let draft = db.create_run("ws1", &pipeline_id, "t", None, None, &[]).unwrap();
+        assert!(!db.has_ever_started_run().unwrap(), "drafts never count");
+        db.set_run_status(&draft, "running", false).unwrap();
+        db.mark_ever_ran().unwrap(); // what start_run stamps
+        assert!(db.has_ever_started_run().unwrap());
+        // A veteran deletes the workspace → run rows cascade away…
+        db.conn_ref().execute("DELETE FROM workspaces WHERE id='ws1'", []).unwrap();
+        let left: i64 = db.conn_ref().query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "cascade erased the rows");
+        // …but the invite must never come back.
+        assert!(db.has_ever_started_run().unwrap());
+    }
+
     // ── Library sync (Pro): custom pipelines + roles follow the user ──
 
     #[test]

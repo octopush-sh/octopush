@@ -92,6 +92,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   } else if (!viewedId || !run) {
     body = (
       <PipelineSetup
+        workspaceId={workspaceId}
         defaultTask={defaultTask}
         linkedIssueKey={linkedIssueKey}
         onBegin={(pipelineId, task, stageOverrides, budgetUsd) =>

@@ -957,6 +957,8 @@ export const ipc = {
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
   directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
+  /** Durable "has ever started a Direct run" — the first-run invite signal. */
+  hasEverStartedRun: () => invoke<boolean>("has_ever_started_run"),
 
   // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
   /** The local read-only history mirror (instant, no network). */

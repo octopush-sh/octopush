@@ -44,6 +44,8 @@ import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
+import { FirstRunInvite } from "./components/FirstRunInvite";
+import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -131,6 +133,9 @@ function App() {
   // runs in workspaces not opened this session. Live events keep it fresh after.
   useEffect(() => {
     void loadActiveRuns();
+    // One-shot first-run invite eligibility (all-time backend count; the
+    // persisted dismissed flag short-circuits inside the store).
+    void useFirstRunStore.getState().checkEligibility();
   }, [loadActiveRuns]);
 
   // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
@@ -1384,6 +1389,49 @@ function App() {
     }
   }, [activeWorkspaceId]);
 
+  // First-run invite CTA: hand off to the Direct launcher with the flagship
+  // crew (Feature Factory) preselected and the workspace's task as the brief —
+  // one more click ("Begin the run") and the crew is working. If no provider
+  // is ready, route honestly to Settings · Models instead (the invite
+  // survives; Feature Factory is all-api and would otherwise fail mid-run).
+  const handleSendFirstCrew = useCallback(async () => {
+    // Capture the click-time workspace: the readiness check awaits two IPC
+    // round-trips, and a workspace switch mid-await must not hijack the new
+    // one (the prefill is also workspace-scoped as a second guard).
+    const wsId = activeWorkspaceId;
+    const ws = workspaces.find((w) => w.id === wsId);
+    if (!wsId) return;
+    if (!(await crewProviderReady())) {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "The crew runs on Claude — one key in Settings · Models and they're ready to work.",
+      });
+      return;
+    }
+    let pipelines = usePipelineStore.getState().pipelines;
+    if (pipelines.length === 0) {
+      await usePipelineStore.getState().load(); // first-ever session may click before the list loads
+      pipelines = usePipelineStore.getState().pipelines;
+    }
+    const flagship =
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
+      pipelines.find((p) => p.pipeline.isBuiltin);
+    if (!flagship) {
+      pushToast({ level: "error", title: "Couldn't load the crew's pipeline" });
+      return;
+    }
+    useRunsStore.getState().setLauncherPrefill({
+      task: ws?.task ?? "",
+      pipelineId: flagship.pipeline.id,
+      overrides: [],
+      workspaceId: wsId,
+    });
+    useFirstRunStore.getState().markUsed();
+    setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
+  }, [activeWorkspaceId, workspaces]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1691,6 +1739,9 @@ function App() {
                     onRunInTerminal={handleRunInTerminal}
                   />
                 )}
+                {/* One-shot first-run invite — floats over the Talk canvas
+                    (where every new user lands); eligibility gated inside. */}
+                {activeWorkspace && <FirstRunInvite onSendCrew={() => void handleSendFirstCrew()} />}
               </ModeOverlay>
 
               {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs
