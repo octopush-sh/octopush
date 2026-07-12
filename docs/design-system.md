@@ -140,7 +140,7 @@ This replaces the retired brass-rule/gradient recipe everywhere a "flow has pass
 
 | Detail        | Status | Where to use                                                        |
 |---------------|--------|---------------------------------------------------------------------|
-| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass"); also the Welcome-screen logomark (replaced the retired `§` mark) |
+| `&` in brass  | Active | One brass typographic accent (e.g. "Onyx & Brass") — typographic only; the product mark is **The Octo** (see "The Octo — mark & mascot" below), which replaced the interim `&` Welcome logomark |
 | `⟜` in brass — structural | Active | Direct run-track / builder checkpoint gate — pauses the pipeline for human approval. Renders on the gate card's own header, not on a connector line. |
 | `⟲` in brass — structural | Active | Loop badge (`⟲ {iter}/{max}`) on a looping run-track card, and the builder's review-loop edge pill. |
 | `§`           | **RETIRED (app-wide, 2026-07-11)** | Was: tool call cards (`§ READ`), Direct focus-pane role headers (`§ PLANNER`), the Welcome logomark, Markdown export tool headings, the Composer/SlashMenu skill chip, the CommandPalette settings glyph, `@path` mention fences, EditorBinaryPane. All replaced by a `lucide-react` icon (`src/lib/roleIcons.ts` `iconForRole`/`iconForTool`, or a one-off like `FileWarning`/`Slash`) with a `title`, or dropped outright where the surrounding fence/label already carried the meaning. `grep -rn "§ " src` should only match doc comments citing a spec section number (`§4.1`), never a rendered string. |
@@ -152,6 +152,33 @@ This replaces the retired brass-rule/gradient recipe everywhere a "flow has pass
 | `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass. |
 | Substrate pills | Active | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
 | `✦` flourish  | **RETIRED** | Never use. Not in any existing surface; do not introduce. |
+
+---
+
+## The Octo — mark & mascot
+
+The brand mark is **The Octo**: a solid-brass octopus creature (dome head, two
+negative-space eyes, four front arms, four muted back arms) defined canonically
+in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
+`docs/superpowers/specs/2026-07-11-octopush-logo-brand-design.md`.
+
+- **Colors:** body `--color-octo-brass`, back arms `--brass-line`, eyes
+  `--octo-eye` (defaults to `--color-octo-bg`). Never recolor, add gradients,
+  outline, rotate, or drop the eyes.
+- **Adaptive detail:** below 20px the back-arm row is dropped automatically.
+- **States** (`<OctoMark state=…>`): `static` (icon placements), `idle`
+  (floats/paddles/blinks), `working` (double tempo + eye scan), `pushed`
+  (one-shot rise + brass halo, happy eyes), `blocked` (freezes, eyes at
+  half-mast — stillness is the signal). All motion ≤2.5px, reduced-motion safe
+  (`octo-m-*` keyframes, §6).
+- **Placements:** app icon (`src-tauri/icons/source.svg`), Welcome hero (idle),
+  top-bar live mascot (`useMascotState`: blocked > working > idle), Talk/Project
+  empty states (idle), thinking indicator (working), run-ledger completion
+  moment (pushed), Settings/About/legacy-sidebar (static), dev favicon.
+- **Wordmark:** "Octopush" in Fraunces via `.brand-wordmark` — brand surfaces
+  only (welcome, settings header, about). Spectral remains the UI serif; body,
+  sans, and mono roles are unchanged.
+- The `§` glyph and the interim `&` logomark are fully retired as logos.
 
 ---
 

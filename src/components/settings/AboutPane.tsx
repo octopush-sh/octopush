@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { Download, RefreshCw, CheckCircle, Loader2 } from "lucide-react";
 import { useUpdaterStore } from "../../stores/updaterStore";
 import { PaneHeader, formatRelative } from "./shared";
+import { OctoMark } from "../icons/OctoMark";
 
 export function AboutPane() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -31,6 +32,7 @@ export function AboutPane() {
 
   return (
     <>
+      <div className="mb-4"><OctoMark size={48} /></div>
       <PaneHeader
         eyebrow="About"
         title="Octopush."

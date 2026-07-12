@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
+import { OctoMark } from "./icons/OctoMark";
 
 interface Props {
   onNewProject: () => void;
@@ -76,24 +77,12 @@ export function WelcomeScreen({ onNewProject }: Props) {
           "radial-gradient(ellipse at center top, rgba(212,165,116,0.06), transparent 55%), var(--color-octo-onyx)",
       }}
     >
-      {/* Mark — & logomark matching the app icon. The ampersand is the one
-          brass typographic accent in the design system. Same brass-on-onyx
-          treatment as the .icns, rendered as type so it sharps at every
-          DPI without a separate asset. */}
-      <div
-        aria-hidden
-        className="relative flex h-14 w-14 items-center justify-center rounded-full font-serif text-[34px] font-bold leading-none text-octo-brass"
-        style={{ border: "1px solid var(--brass-dim)" }}
-      >
-        &amp;
-        <span
-          className="absolute -inset-2 rounded-full"
-          style={{ border: "1px solid rgba(212, 165, 116, 0.15)" }}
-        />
-      </div>
+      {/* Mark — The Octo, idling. Matches the app icon; rendered as SVG so
+          it sharps at every DPI without a separate asset. */}
+      <OctoMark size={116} state="idle" />
 
       {/* Wordmark */}
-      <h1 className="mt-6 font-serif text-[32px] leading-[1.05] tracking-[-0.01em] text-octo-ivory">
+      <h1 className="brand-wordmark mt-6 text-[32px] leading-[1.05] text-octo-ivory">
         Octopush
       </h1>
 
