@@ -73,6 +73,230 @@ pub fn machine_name_label() -> String {
     sysinfo::System::host_name().unwrap_or_else(|| "Unknown machine".to_string())
 }
 
+// ─── B2: the heavy per-run detail (journals · artifacts · diffs) ────────────
+
+/// Caps applied when BUILDING a detail payload (the server backstops at 1.5MB
+/// per blob). Journals dominate volume, so they get per-stage entry AND byte
+/// budgets; artifacts and diffs are head+tail capped like dossier sections.
+const JOURNAL_ENTRIES_PER_STAGE: usize = 200;
+const JOURNAL_BYTES_PER_STAGE: usize = 48_000;
+const ARTIFACT_CAP_CHARS: usize = 16_000;
+const DIFF_CAP_CHARS: usize = 96_000;
+
+/// One synced run's full story: per-stage journals, artifact texts, and diff
+/// snapshots. Pushed ONCE when the run turns terminal; fetched lazily when the
+/// user opens the run in History on another machine. Same wire discipline as
+/// [`SyncRun`]: snake_case, `run_id` is the only required field, everything
+/// else `#[serde(default)]` for forward/back compat. Rendered as INERT TEXT.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SyncRunDetail {
+    pub run_id: String,
+    #[serde(default)]
+    pub stages: Vec<SyncStageDetail>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SyncStageDetail {
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The stage artifact's human-readable text (plan/review/summary), capped.
+    #[serde(default)]
+    pub artifact: Option<String>,
+    /// The persisted work journal — LiveEntry-shaped JSON values plus
+    /// `{kind:"reset"}` markers, passed through verbatim (capped). The
+    /// receiving view renders known kinds as inert text and skips the rest.
+    #[serde(default)]
+    pub journal: Vec<serde_json::Value>,
+    /// The worktree diff snapshot as this stage left it, capped.
+    #[serde(default)]
+    pub diff: Option<String>,
+}
+
+/// Head+tail cap on char boundaries — intent and conclusions survive,
+/// boilerplate middles drop (the dossier `cap_section` convention).
+fn cap_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let head_budget = max * 3 / 4;
+    let tail_budget = max - head_budget;
+    let mut head_end = head_budget.min(s.len());
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - tail_budget;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… [truncated for sync — beginning and end preserved] …\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
+/// One journal entry's own text budget. Entries are persisted UNCAPPED (a
+/// plan/report stage's final message can exceed the whole per-stage budget),
+/// so without a per-entry cap one oversized newest line would empty the
+/// journal (the budget loop broke on it before admitting anything).
+const JOURNAL_ENTRY_TEXT_CAP: usize = 6_000;
+
+/// Serialized whole-payload budget, under the server's 1.5MB backstop with
+/// headroom for JSON string-escaping inflation. Enforced by degradation
+/// (oldest diffs drop first, then oldest journals) — a many-stage run must
+/// arrive trimmed, never be 413'd into silent loss.
+const DETAIL_TOTAL_BUDGET: usize = 1_200_000;
+
+/// Build ONE stage's detail from its row + raw journal lines. Pure — no DB
+/// access — so the caller can read each stage's journal under its own short
+/// lock and do all the string work outside (the global DB mutex must stay
+/// short: every live run://log line of every other run takes it).
+pub fn build_stage_detail(s: &crate::db::RunStageRow, raw_log: Vec<String>) -> SyncStageDetail {
+    // Journal: newest entries win the budget (the tail explains the outcome);
+    // oversized text entries are truncated rather than sinking the whole
+    // journal; malformed lines are skipped WITHOUT consuming an entry slot.
+    let mut journal: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0usize;
+    for line in raw_log.iter().rev() {
+        if journal.len() >= JOURNAL_ENTRIES_PER_STAGE {
+            break;
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // malformed — skip, don't burn an entry slot
+        };
+        // Cap the entry's own text so no single line can dominate (or, worse,
+        // exceed) the per-stage budget.
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            if text.len() > JOURNAL_ENTRY_TEXT_CAP {
+                let capped = cap_str(text, JOURNAL_ENTRY_TEXT_CAP);
+                v["text"] = serde_json::Value::String(capped);
+            }
+        }
+        let size = v.to_string().len();
+        if bytes + size > JOURNAL_BYTES_PER_STAGE {
+            break; // older entries only from here — the budget is spent
+        }
+        bytes += size;
+        journal.push(v);
+    }
+    journal.reverse(); // back to chronological order
+
+    // Artifact: the human-readable text inside the StageArtifact JSON;
+    // a legacy/opaque artifact falls back to its raw (capped) form.
+    let artifact = s.artifact.as_deref().map(|json| {
+        let text = serde_json::from_str::<crate::orchestrator::types::StageArtifact>(json)
+            .map(|a| a.text)
+            .unwrap_or_else(|_| json.to_string());
+        cap_str(&text, ARTIFACT_CAP_CHARS)
+    });
+
+    SyncStageDetail {
+        position: s.position,
+        role: s.role.clone(),
+        model: Some(s.agent_model.clone()),
+        status: s.status.clone(),
+        cost_usd: s.cost_usd,
+        error: s.error.as_deref().map(|e| cap_str(e, 2_000)),
+        artifact,
+        journal,
+        diff: s.diff_snapshot.as_deref().map(|d| cap_str(d, DIFF_CAP_CHARS)),
+    }
+}
+
+/// Enforce the whole-payload budget by degradation, never by silent loss at
+/// the server: drop diffs oldest-first, then journals oldest-first, then
+/// artifacts oldest-first. The story survives trimmed; the 413 path is only
+/// ever a backstop for a hostile client.
+pub fn enforce_detail_budget(detail: &mut SyncRunDetail) {
+    fn size(d: &SyncRunDetail) -> usize {
+        serde_json::to_string(d).map(|s| s.len()).unwrap_or(usize::MAX)
+    }
+    if size(detail) <= DETAIL_TOTAL_BUDGET {
+        return;
+    }
+    for i in 0..detail.stages.len() {
+        if detail.stages[i].diff.take().is_some() && size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
+    for i in 0..detail.stages.len() {
+        detail.stages[i].journal.clear();
+        if size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
+    for i in 0..detail.stages.len() {
+        if detail.stages[i].artifact.take().is_some() && size(detail) <= DETAIL_TOTAL_BUDGET {
+            return;
+        }
+    }
+}
+
+/// POST a run's detail blob. **Best-effort** — logs and returns on any error;
+/// the run (and its already-pushed metadata) are never affected.
+pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) {
+    let Some(token) = crate::auth::current_access_token().await else {
+        return; // signed out → skip silently
+    };
+    let body = serde_json::json!({ "run_id": detail.run_id, "data": detail });
+    let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
+    match client.post(&url).bearer_auth(token).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!("history sync: pushed run detail");
+        }
+        Ok(resp) => tracing::warn!("history sync detail push failed: HTTP {}", resp.status()),
+        Err(e) => tracing::warn!("history sync detail push error: {e}"),
+    }
+}
+
+/// GET one run's detail. `Ok(None)` when the server has none (a run synced
+/// before B2, or whose detail push failed) — the view says so honestly.
+pub async fn pull_run_detail(
+    client: &reqwest::Client,
+    run_id: &str,
+) -> AppResult<Option<SyncRunDetail>> {
+    let token = crate::auth::current_access_token()
+        .await
+        .ok_or_else(|| AppError::Other("not signed in".into()))?;
+    let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
+    let resp = client
+        .get(&url)
+        .query(&[("run_id", run_id)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Other(format!("history detail fetch failed: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(AppError::Other(format!(
+            "history detail fetch failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    #[derive(Deserialize)]
+    struct DetailResp {
+        detail: serde_json::Value,
+    }
+    let parsed: DetailResp = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Other(format!("history detail decode failed: {e}")))?;
+    // Lenient parse — an unreadable blob is "no detail", not a hard failure.
+    Ok(serde_json::from_value::<SyncRunDetail>(parsed.detail).ok())
+}
+
 /// Build a run's sync payload from the local DB (stages summed for tokens,
 /// workspace name resolved, name attached). `machine_id` is resolved ONCE by the
 /// caller and passed in — so a rare DB failure to mint it aborts the whole push

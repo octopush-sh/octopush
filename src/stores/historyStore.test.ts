@@ -14,12 +14,14 @@ import type { SyncedRun } from "../lib/ipc";
 const historyListMock = vi.fn<() => Promise<SyncedRun[]>>();
 const historySyncPullMock = vi.fn<() => Promise<SyncedRun[]>>();
 const historySyncPushAllMock = vi.fn<() => Promise<number>>();
+const historyRunDetailMock = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
     historyList: historyListMock,
     historySyncPull: historySyncPullMock,
     historySyncPushAll: historySyncPushAllMock,
+    historyRunDetail: historyRunDetailMock,
   },
 }));
 
@@ -47,10 +49,15 @@ beforeEach(() => {
     loading: false,
     loaded: false,
     error: null,
+    viewedRunId: null,
+    detailByRun: {},
+    detailLoading: null,
+    detailError: null,
   });
   historyListMock.mockReset();
   historySyncPullMock.mockReset();
   historySyncPushAllMock.mockReset();
+  historyRunDetailMock.mockReset();
 });
 
 describe("historyStore", () => {
@@ -105,5 +112,40 @@ describe("historyStore", () => {
 
     await expect(useHistoryStore.getState().syncOnLaunch()).resolves.toBeUndefined();
     expect(useHistoryStore.getState().runs).toHaveLength(0);
+  });
+
+  // ── B2: the drill-in detail ──
+
+  it("openRun fetches the detail once and serves the cache after", async () => {
+    historyRunDetailMock.mockResolvedValue({ run_id: "a", stages: [] });
+    await useHistoryStore.getState().openRun("a");
+    expect(useHistoryStore.getState().viewedRunId).toBe("a");
+    expect(useHistoryStore.getState().detailByRun["a"]).toEqual({ run_id: "a", stages: [] });
+
+    useHistoryStore.getState().closeRun();
+    expect(useHistoryStore.getState().viewedRunId).toBeNull();
+
+    await useHistoryStore.getState().openRun("a"); // cached — no second fetch
+    expect(historyRunDetailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("openRun caches a server 'none' (pre-B2 run) as null — honest empty state", async () => {
+    historyRunDetailMock.mockResolvedValue(null);
+    await useHistoryStore.getState().openRun("old");
+    expect(useHistoryStore.getState().detailByRun["old"]).toBeNull();
+    await useHistoryStore.getState().openRun("old");
+    expect(historyRunDetailMock).toHaveBeenCalledTimes(1); // the 'none' is cached too
+  });
+
+  it("openRun records a fetch failure WITHOUT caching it, so reopening retries", async () => {
+    historyRunDetailMock.mockRejectedValue(new Error("offline"));
+    await useHistoryStore.getState().openRun("b");
+    expect(useHistoryStore.getState().detailError).toContain("offline");
+    expect("b" in useHistoryStore.getState().detailByRun).toBe(false);
+
+    historyRunDetailMock.mockResolvedValue({ run_id: "b", stages: [] });
+    await useHistoryStore.getState().openRun("b"); // retry succeeds
+    expect(useHistoryStore.getState().detailByRun["b"]).toBeTruthy();
+    expect(useHistoryStore.getState().detailError).toBeNull();
   });
 });
