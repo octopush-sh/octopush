@@ -307,6 +307,81 @@
 }
 .octo-flash { animation: octo-flash 1.2s var(--ease-octo) both; }
 
+/* ── Motion · The Octo mascot ─────────────────────────────────────────
+   Body language, not badges: idle floats+paddles, working paddles fast
+   and scans, pushed rises once with a brass halo, blocked freezes.
+   Spec: docs/superpowers/specs/2026-07-11-octopush-logo-brand-design.md §5.
+   All transforms ≤2.5px; loops ease-in-out, moments var(--ease-octo). */
+.octo-mascot .octo-m-eye,
+.octo-mascot .octo-m-f1, .octo-mascot .octo-m-f2,
+.octo-mascot .octo-m-f3, .octo-mascot .octo-m-f4,
+.octo-mascot .octo-m-b1, .octo-mascot .octo-m-b2,
+.octo-mascot .octo-m-b3, .octo-mascot .octo-m-b4 {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.octo-mascot .octo-m-happy { opacity: 0; }
+
+@keyframes octo-m-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1.6px); } }
+@keyframes octo-m-blink { 0%, 91.5%, 95.5%, 100% { transform: scaleY(1); } 93.5% { transform: scaleY(0.07); } }
+@keyframes octo-m-slowblink { 0%, 88%, 100% { transform: scaleY(0.45) translateY(0.6px); } 92% { transform: scaleY(0.07) translateY(0.6px); } }
+@keyframes octo-m-scan {
+  0%, 12% { transform: translateX(0); }
+  20%, 42% { transform: translateX(-2.4px); }
+  52%, 78% { transform: translateX(2.4px); }
+  88%, 100% { transform: translateX(0); }
+}
+@keyframes octo-m-rise { 0% { transform: translateY(0); } 30% { transform: translateY(-2.4px); } 100% { transform: translateY(0); } }
+@keyframes octo-m-halo {
+  0% { r: 13px; opacity: 0; }
+  20% { r: 15px; opacity: 0.45; }
+  100% { r: 30px; opacity: 0; }
+}
+
+/* idle — slow float, paddling wave; back row half a cycle behind */
+.octo-mascot--idle .octo-m-body { animation: octo-m-float 6s ease-in-out infinite; }
+.octo-mascot--idle .octo-m-f1 { animation: octo-m-float 3.4s ease-in-out infinite; }
+.octo-mascot--idle .octo-m-f2 { animation: octo-m-float 3.4s ease-in-out 0.45s infinite; }
+.octo-mascot--idle .octo-m-f3 { animation: octo-m-float 3.4s ease-in-out 0.9s infinite; }
+.octo-mascot--idle .octo-m-f4 { animation: octo-m-float 3.4s ease-in-out 1.35s infinite; }
+.octo-mascot--idle .octo-m-b1 { animation: octo-m-float 3.4s ease-in-out 1.7s infinite; }
+.octo-mascot--idle .octo-m-b2 { animation: octo-m-float 3.4s ease-in-out 2.15s infinite; }
+.octo-mascot--idle .octo-m-b3 { animation: octo-m-float 3.4s ease-in-out 2.6s infinite; }
+.octo-mascot--idle .octo-m-b4 { animation: octo-m-float 3.4s ease-in-out 3.05s infinite; }
+.octo-mascot--idle .octo-m-eye { animation: octo-m-blink 5.6s infinite; }
+
+/* working — double tempo, eyes scanning */
+.octo-mascot--working .octo-m-body { animation: octo-m-float 4.2s ease-in-out infinite; }
+.octo-mascot--working .octo-m-f1 { animation: octo-m-float 1.7s ease-in-out infinite; }
+.octo-mascot--working .octo-m-f2 { animation: octo-m-float 1.7s ease-in-out 0.22s infinite; }
+.octo-mascot--working .octo-m-f3 { animation: octo-m-float 1.7s ease-in-out 0.44s infinite; }
+.octo-mascot--working .octo-m-f4 { animation: octo-m-float 1.7s ease-in-out 0.66s infinite; }
+.octo-mascot--working .octo-m-b1 { animation: octo-m-float 1.7s ease-in-out 0.85s infinite; }
+.octo-mascot--working .octo-m-b2 { animation: octo-m-float 1.7s ease-in-out 1.07s infinite; }
+.octo-mascot--working .octo-m-b3 { animation: octo-m-float 1.7s ease-in-out 1.29s infinite; }
+.octo-mascot--working .octo-m-b4 { animation: octo-m-float 1.7s ease-in-out 1.51s infinite; }
+.octo-mascot--working .octo-m-eye { animation: octo-m-scan 4.8s ease-in-out infinite, octo-m-blink 7s infinite; }
+
+/* pushed — one-shot rise + halo, happy eyes (no loop) */
+.octo-mascot--pushed .octo-m-body { animation: octo-m-rise 900ms var(--ease-octo) 1; }
+.octo-mascot--pushed .octo-m-eye { opacity: 0; }
+.octo-mascot--pushed .octo-m-happy { opacity: 1; }
+.octo-mascot--pushed .octo-m-ring { animation: octo-m-halo 1200ms var(--ease-octo) 1 forwards; }
+
+/* blocked — stillness IS the signal; eyes at half-mast */
+.octo-mascot--blocked .octo-m-eye { animation: octo-m-slowblink 7s infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .octo-mascot .octo-m-body, .octo-mascot .octo-m-eye,
+  .octo-mascot .octo-m-f1, .octo-mascot .octo-m-f2, .octo-mascot .octo-m-f3, .octo-mascot .octo-m-f4,
+  .octo-mascot .octo-m-b1, .octo-mascot .octo-m-b2, .octo-mascot .octo-m-b3, .octo-mascot .octo-m-b4,
+  .octo-mascot .octo-m-ring {
+    animation: none !important;
+  }
+  /* state still readable from the eyes alone */
+  .octo-mascot--blocked .octo-m-eye { transform: scaleY(0.45) translateY(0.6px); }
+}
+
 /* Accessibility: honor reduced-motion — neutralize all motion app-wide
    (entrance primitives, grid-rows collapses, glides, pulses). */
 @media (prefers-reduced-motion: reduce) {
