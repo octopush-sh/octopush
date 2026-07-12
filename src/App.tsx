@@ -56,6 +56,7 @@ import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
+import { useRolesStore } from "./stores/rolesStore";
 import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
@@ -142,6 +143,29 @@ function App() {
   useEffect(() => {
     if (historySyncEntitled) void useHistoryStore.getState().syncOnLaunch();
   }, [historySyncEntitled]);
+
+  // Library sync (Pro): once entitled, heal-push the whole custom library,
+  // pull + merge the other machines' edits (per-item LWW), and refresh the
+  // stores that render it. Best-effort and silent — offline just means the
+  // library syncs on a later launch.
+  const librarySyncEntitled = useEntitlementStore((s) =>
+    s.entitlement.features.includes("library.sync"),
+  );
+  useEffect(() => {
+    if (!librarySyncEntitled) return;
+    void (async () => {
+      try {
+        await ipc.librarySyncPushAll();
+        const applied = await ipc.librarySyncPull();
+        if (applied > 0) {
+          await usePipelineStore.getState().load();
+          await useRolesStore.getState().load();
+        }
+      } catch {
+        // Offline / transient — the local library is untouched.
+      }
+    })();
+  }, [librarySyncEntitled]);
   const terminalBusyIds = useTerminalsStore(
     useShallow((s) =>
       Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
