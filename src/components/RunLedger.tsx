@@ -3,6 +3,7 @@ import type { Run, RunStage } from "../lib/ipc";
 import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
+import { OctoMark } from "./icons/OctoMark";
 
 interface Props {
   run: Run;
@@ -94,9 +95,12 @@ export function RunLedger({ run, stages }: Props) {
       <Reveal open={moment}>
         <div className="px-4 pb-3 pt-2">
           <div className="octo-sweep mb-2 h-px bg-octo-brass" />
-          <p className="m-0 font-serif text-sm text-octo-ivory">
-            This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
-          </p>
+          <div className="flex items-center gap-2.5">
+            <OctoMark size={20} state="pushed" />
+            <p className="m-0 font-serif text-sm text-octo-ivory">
+              This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
+            </p>
+          </div>
         </div>
       </Reveal>
       <div className="pb-1.5" />
