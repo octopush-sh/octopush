@@ -1395,6 +1395,19 @@ pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
     Ok(count)
 }
 
+/// Fetch one synced run's full story — per-stage journals, artifact texts, and
+/// diff snapshots — from the cloud, on demand (B2). `None` when the server has
+/// no detail for that run (synced before B2, or its detail push failed); the
+/// History view says so honestly. Pro-gated (`history.sync`); the local run's
+/// detail never goes through here (DIRECT reads the local DB directly).
+#[tauri::command]
+pub async fn history_run_detail(
+    run_id: String,
+) -> AppResult<Option<crate::sync::SyncRunDetail>> {
+    require_history_sync()?;
+    crate::sync::pull_run_detail(crate::chat_engine::shared_http_client(), &run_id).await
+}
+
 // ─── Accounts (P1) ─────────────────────────────────────────────
 /// Run the interactive Clerk sign-in: opens the system browser, captures the
 /// loopback redirect, exchanges the code (PKCE, no secret), and stores the

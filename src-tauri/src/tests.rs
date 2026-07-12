@@ -361,6 +361,56 @@ mod workspace_tests {
     }
 
     #[test]
+    fn build_run_detail_payload_carries_journals_artifacts_and_diffs_capped() {
+        // B2: the heavy story a reviewer reads from another machine. The
+        // payload must carry each stage's journal (chronological, newest-win
+        // budget), the artifact's human TEXT (not its JSON wrapper), and the
+        // diff snapshot — all capped so one run can't blow the sync blob.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let run_id = db.create_run("ws1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+        let stages = db.list_run_stages(&run_id).unwrap();
+        let s0 = &stages[0];
+
+        // A journal (two entries + one malformed line that must be skipped)…
+        db.append_stage_log(&run_id, &s0.id, r#"{"kind":"text","text":"thinking"}"#).unwrap();
+        db.append_stage_log(&run_id, &s0.id, "not json at all").unwrap();
+        db.append_stage_log(&run_id, &s0.id, r#"{"kind":"tool","tool":"EDIT","hint":"src/x.rs"}"#).unwrap();
+        // …an artifact (JSON-wrapped; the payload sends the TEXT)…
+        db.set_run_stage_artifact(
+            &s0.id,
+            r#"{"kind":"plan","text":"The plan body","refsWorktree":false}"#,
+        ).unwrap();
+        // …and an oversized diff snapshot that must come back capped.
+        let big_diff = format!("DIFF-HEAD\n{}\nDIFF-TAIL", "+x\n".repeat(60_000));
+        db.set_stage_diff_snapshot(&s0.id, &big_diff).unwrap();
+
+        db.set_run_status(&run_id, "completed", true).unwrap();
+        let run = db.get_run(&run_id).unwrap().unwrap();
+        let detail = crate::sync::build_run_detail_payload(&db, &run);
+
+        assert_eq!(detail.run_id, run_id);
+        assert_eq!(detail.stages.len(), stages.len());
+        let d0 = &detail.stages[0];
+        assert_eq!(d0.role, s0.role);
+        // Journal: both valid entries, chronological, malformed line skipped.
+        assert_eq!(d0.journal.len(), 2);
+        assert_eq!(d0.journal[0]["kind"], "text");
+        assert_eq!(d0.journal[1]["tool"], "EDIT");
+        // Artifact: the human text, not the JSON wrapper.
+        assert_eq!(d0.artifact.as_deref(), Some("The plan body"));
+        // Diff: capped head+tail (never the full 180KB).
+        let diff = d0.diff.as_deref().unwrap();
+        assert!(diff.len() < 100_000, "diff must be capped, got {}", diff.len());
+        assert!(diff.contains("DIFF-HEAD") && diff.contains("DIFF-TAIL"));
+        assert!(diff.contains("truncated for sync"));
+        // The whole blob serializes comfortably under the server's 1.5MB cap.
+        assert!(serde_json::to_string(&detail).unwrap().len() < 1_000_000);
+    }
+
+    #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();
         setup_workspace(&db, "proj-1", "ws-1");

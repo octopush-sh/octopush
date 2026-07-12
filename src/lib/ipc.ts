@@ -318,6 +318,23 @@ export interface SyncedRunStage {
   status: string;
   cost_usd: number;
 }
+export interface SyncedRunStageDetail {
+  position: number;
+  role: string;
+  model: string | null;
+  status: string;
+  cost_usd: number;
+  error: string | null;
+  artifact: string | null;
+  /** LiveEntry-shaped values + {kind:"reset"} markers, passed through verbatim.
+   *  Rendered as INERT TEXT only; unknown kinds are skipped. */
+  journal: unknown[];
+  diff: string | null;
+}
+export interface SyncedRunDetail {
+  run_id: string;
+  stages: SyncedRunStageDetail[];
+}
 export interface SyncedRun {
   run_id: string;
   machine_id: string;
@@ -947,6 +964,10 @@ export const ipc = {
   /** Pull the user's run history from the cloud, replace the mirror, return it.
    *  Pro-gated (throws `UpgradeRequired` for Free). */
   historySyncPull: () => invoke<SyncedRun[]>("history_sync_pull"),
+  /** One synced run's full story (journals · artifacts · diffs), fetched on
+   *  demand (B2). Null when the server has no detail for that run. Pro-gated. */
+  historyRunDetail: (runId: string) =>
+    invoke<SyncedRunDetail | null>("history_run_detail", { runId }),
   /** One-shot backfill of this machine's terminal runs to the cloud (Pro-only,
    *  no-op otherwise). Returns the count attempted. */
   historySyncPushAll: () => invoke<number>("history_sync_push_all"),

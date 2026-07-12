@@ -342,6 +342,7 @@ pub fn run() {
             commands::history_list,
             commands::history_sync_pull,
             commands::history_sync_push_all,
+            commands::history_run_detail,
             // Accounts (P1)
             commands::auth_begin_sign_in,
             commands::auth_sign_out,

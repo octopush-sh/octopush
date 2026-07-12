@@ -220,7 +220,7 @@ impl Orchestrator {
         {
             return;
         }
-        let payload = {
+        let (payload, detail) = {
             let db = self.db.lock();
             // Resolve the machine id first — skip the whole push if we can't mint
             // one (empty would mis-attribute the row, which the server keys on).
@@ -229,13 +229,19 @@ impl Orchestrator {
                 _ => return,
             };
             match db.get_run(run_id) {
-                Ok(Some(run)) => crate::sync::build_run_payload(&db, &run, &machine_id),
+                Ok(Some(run)) => (
+                    crate::sync::build_run_payload(&db, &run, &machine_id),
+                    // B2: the heavy story — journals · artifacts · diffs —
+                    // built under the same lock, pushed after the metadata.
+                    crate::sync::build_run_detail_payload(&db, &run),
+                ),
                 _ => return,
             }
         };
         let client = self.client.clone();
         tokio::spawn(async move {
             crate::sync::push_runs(&client, vec![payload]).await;
+            crate::sync::push_run_detail(&client, detail).await;
         });
     }
 
