@@ -34,18 +34,19 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 7. **No new colors without spec update.** If a feature needs a hue not in the palette, propose updating the spec first — don't slip new accents in via a PR.
 8. **UI copy is English. Always. No exceptions.** Every visible string (labels, buttons, placeholders, helper text, empty states, error messages, aria-labels, tooltips, eyebrow text, modal titles) is English regardless of the developer's chat language. Mixing languages is a bug. The one exception is **user data** displayed verbatim from third-party APIs (e.g. Jira's `statusName` is whatever Jira returns in the user's account locale — we never translate it; if the user wants English statuses, they change their Jira profile language).
 
-### Signature details and decorative retirement (2026-06-16)
+### Signature details and decorative retirement (2026-06-16; extended app-wide by the Direct beauty redesign, 2026-07-11)
 
-> **Retired for new surfaces:** The brass *rule* divider (28px gradient), the `⟶` glyph used as **ornament** (prompt decoration, input nudges, button accents), and the `✦` flourish are **banned on all new UI**. Do not introduce them. Structural/functional glyphs are explicitly preserved (see below).
+> **Retired app-wide — not just for new surfaces:** the brass *rule* divider (28px gradient, `.animate-brass-grow`), `§` as a typographic mark, Roman numerals, the `✦` flourish, and `⟶` used as ornament or as the Direct run-track/Mission-Control connector glyph are **gone from the codebase**. There is no legacy allowance left for these five — `grep -rn "§ \|Roman numeral\|brass rule\|⟶" docs CLAUDE.md` should only surface retirement statements or the sanctioned-site list below. Any gradient used as a rule/divider/connector is banned outright; radial/mask washes (backgrounds, edge-fades) are unaffected.
 
-**Structural glyphs — keep these:**
-- **`⟶` in brass — structural only** — Direct run-track stage connector. NOT as prompt glyph or ornament on new surfaces.
-- **`⟜` in brass** — Direct run-track checkpoint gate.
-- **`§` in brass** — every tool call card (`§ TOOL_NAME`) and Direct focus-pane role headers. Structural; do not retire.
+**Structural glyphs — keep these (the only survivors):**
+- **`⟜` in brass** — Direct/builder checkpoint gate. Renders on the gate card's own header, never on a connector line.
+- **`⟲` in brass** — loop badge (`⟲ {iter}/{max}`) on a looping run-track card; the builder's review-loop edge pill (`⟲ ×N`).
+- **`⟶`** — retired everywhere except three sanctioned structural sites: Composer's send-button glyph, `InlineTicketPicker`'s input prompt, `HunkRail`'s focus marker. Do not add a fourth.
 
 **Active branding details:**
-- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
-- **Roman numerals** — multi-step wizards use `I · II · III` in brass mono; Direct run-track stage numbers.
+- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly; it is also the Welcome-screen logomark (replacing the retired `§` mark). The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
+- **`StageDots` + the single beacon** — the new signature mechanics for anything that used to be a roman-numeral micro-track or a bespoke pulse: `StageDots` (`src/components/direct/StageDots.tsx`) is the universal 5px-dot micro-track (Direct canvas, launcher tickets, Companion, Mission Control, HistorySheet); `src/lib/beacon.ts`'s `beaconAnchor()` guarantees exactly one brass-pulsing element per attention scope (fleet scope = the longest-waiting needs-you card, FIFO). See `docs/design-system.md` §6/§8 for the full mechanics and the PRM (static-halo) fallback.
+- **Arabic numerals** — every wizard and stage-position label now uses plain arabic (`STEP 1 OF 2`, `1 · 2`, `3 · sonnet · api`). No surface numbers steps in Roman.
 - **Upright-serif phrases** — CTAs and placeholders use upright serif phrases (no italics anywhere; `em, i { font-style: normal }` enforced globally).
 
 ### Minimalism principles (binding)
@@ -53,7 +54,7 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 These complement the design rules above and govern all new surfaces:
 
 - **Theme-agnostic via tokens. Never hardcode.** Colors, fonts, and spacing go through `--color-octo-*` CSS variables and Tailwind token classes. No hex literals, no raw font strings outside `styles.css`.
-- **No decorative flourishes on new surfaces.** Brass rule, `⟶` as ornament, and `✦` are retired (see above).
+- **No decorative flourishes, anywhere.** The brass rule divider, `⟶` as ornament (or as a connector glyph), `§`, Roman numerals, and `✦` are retired app-wide, not just for new surfaces — see above.
 - **Icons over text where possible, with `title` tooltips.** Use a `lucide-react` icon + `title` attribute instead of a text label wherever the icon is unambiguous. Never ship an icon without a tooltip.
 - **Smooth, token-driven transitions.** Every element that mounts/unmounts uses the motion primitives in `src/styles.css` (§6 of the cheatsheet). Do not hand-roll or mount abruptly.
 - **Intuitive and professional.** Controls behave exactly as a developer expects. No surprising gestures, no undiscoverable interactions, no status requiring decoding.
