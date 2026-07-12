@@ -45,17 +45,23 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
       data-tauri-drag-region
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
-      {/* The live mascot — body language mirrors app state (spec §4.4):
-          needs-you → blocked (frozen, eyes half-mast), agents busy →
-          working (paddling, eyes scanning), otherwise idle. */}
-      <span
-        role="img"
-        aria-label={mascot.label}
-        title={mascot.label}
-        className="mr-2 flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
-      >
-        <OctoMark size={20} state={mascot.state} />
-      </span>
+      {/* Center logo + wordmark */}
+      <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
+        {/* The live mascot — body language mirrors app state (spec §4.4):
+            needs-you → blocked (frozen, eyes half-mast), agents busy →
+            working (paddling, eyes scanning), otherwise idle. */}
+        <span
+          role="img"
+          aria-label={mascot.label}
+          title={mascot.label}
+          className="flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
+        >
+          <OctoMark size={20} state={mascot.state} />
+        </span>
+        <span className="brand-wordmark text-[13px] text-octo-brass">
+          Octopush
+        </span>
+      </div>
       <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">
         <button
