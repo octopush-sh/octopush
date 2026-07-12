@@ -93,7 +93,7 @@ export function RunLedger({ run, stages }: Props) {
       </Reveal>
       <Reveal open={moment}>
         <div className="px-4 pb-3 pt-2">
-          <div className="octo-sweep mb-2 h-px bg-gradient-to-r from-octo-brass to-transparent" />
+          <div className="octo-sweep mb-2 h-px bg-octo-brass" />
           <p className="m-0 font-serif text-sm text-octo-ivory">
             This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
           </p>

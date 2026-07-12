@@ -4,6 +4,7 @@ import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "..
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
+import { iconForRole, iconForTool } from "../lib/roleIcons";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -53,7 +54,7 @@ function splitLogSegments(raw: unknown[]): LiveEntry[][] {
 }
 
 /** Render live-journal entries as elements — prose lines, brass notices, and
- *  § tool cards with their paired results. Shared by the live view and the
+ *  flat tool lines with their paired results. Shared by the live view and the
  *  archived-attempt view so both journals read identically. */
 function buildJournalItems(entries: LiveEntry[]): ReactElement[] {
   const items: ReactElement[] = [];
@@ -67,18 +68,25 @@ function buildJournalItems(entries: LiveEntry[]): ReactElement[] {
       const next = entries[i + 1];
       const res = next && next.kind === "tool_result" ? next : null;
       if (res) i++; // consume the paired result
+      const ToolIcon = iconForTool(e.tool);
       items.push(
-        <div key={i} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel-2 px-3 py-2">
-          <div className="flex items-center gap-2 font-mono text-[12px]">
-            <span className="text-octo-brass">§</span>
-            <span className="text-octo-ivory">{e.tool}</span>
-            {e.hint && <><span className="text-octo-sage">·</span><span className="text-octo-sage">{e.hint}</span></>}
-          </div>
+        <div key={i} className="octo-rise-in flex items-baseline gap-2 font-mono text-[12px]">
+          <span className="translate-y-[1px] shrink-0 text-octo-mute" title={e.tool}>
+            <ToolIcon size={11} strokeWidth={1.75} />
+          </span>
+          <span className="shrink-0 text-octo-ivory">{e.tool}</span>
+          {e.hint && (
+            <span className="min-w-0 truncate text-octo-sage" title={e.hint}>
+              {e.hint}
+            </span>
+          )}
           {res && (
-            <div className="mt-1 flex items-center gap-1.5 font-mono text-[11px] text-octo-mute">
+            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px]">
               <span className={res.ok ? "text-octo-verdigris" : "text-octo-rouge"}>{res.ok ? "✓" : "✕"}</span>
-              <span>{res.detail}</span>
-            </div>
+              <span className="max-w-[28ch] truncate text-octo-mute" title={res.detail}>
+                {res.detail}
+              </span>
+            </span>
           )}
         </div>,
       );
@@ -341,67 +349,82 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   return (
     <>
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-2.5">
-        <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-          § {stage.role.replace(/_/g, " ").toUpperCase()}
-        </span>
-        <span className="font-serif text-sm text-octo-ivory">{stageTitle(stage)}</span>
-        <span className="truncate font-mono text-[10px] text-octo-mute">{stage.agentModel}</span>
-        {iterations.length > 0 && (
-          <span className="flex shrink-0 items-center gap-1.5">
-            <IconButton
-              label="Previous attempt"
-              onClick={() => setViewedAttempt(attemptN - 1)}
-              disabled={attemptN <= 1}
-            >
-              <ChevronLeft size={12} />
-            </IconButton>
-            <span className="octo-tabular whitespace-nowrap font-mono text-[10px] text-octo-mute">
-              attempt {attemptN} of {totalAttempts}
-            </span>
-            <IconButton
-              label="Next attempt"
-              onClick={() => setViewedAttempt(attemptN + 1 >= totalAttempts ? null : attemptN + 1)}
-              disabled={attemptN >= totalAttempts}
-            >
-              <ChevronRight size={12} />
-            </IconButton>
+      <div className="flex flex-col gap-1 border-b border-octo-hairline px-4 py-2.5">
+        <div className="flex items-center gap-2.5">
+          {(() => {
+            const RoleIcon = iconForRole(stage.role);
+            return (
+              <span className="shrink-0 text-octo-brass" title={stage.role.replace(/_/g, " ")}>
+                <RoleIcon size={12} strokeWidth={1.75} />
+              </span>
+            );
+          })()}
+          <span
+            className="min-w-0 truncate font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass"
+            title={stage.role.replace(/_/g, " ")}
+          >
+            {stage.role.replace(/_/g, " ").toUpperCase()}
           </span>
-        )}
-        {(fieldsEditable || rerunnable) && (
-          <span className="flex shrink-0 items-center gap-1.5">
-            {gateTogglable && (
-              <TogglePill
-                on={stage.checkpoint}
-                label="⟜ gate"
-                ariaLabel="Approval gate — pause before hand-off"
-                onChange={(v) => {
-                  setDirectorError(null);
-                  onUpdateStage?.({ checkpoint: v }).catch(reportDirectorError);
-                }}
-              />
-            )}
-            <IconButton
-              label={editRerunsStage ? "Edit & re-run stage" : "Edit stage"}
-              onClick={openEdit}
-            >
-              <SlidersHorizontal size={12} />
-            </IconButton>
-            {rerunnable && (
-              <IconButton label="Re-run from here" onClick={() => setConfirmRerun((v) => !v)}>
-                <RotateCcw size={12} />
+          <span className="truncate font-mono text-[10px] text-octo-mute">{stage.agentModel}</span>
+          {iterations.length > 0 && (
+            <span className="flex shrink-0 items-center gap-1.5">
+              <IconButton
+                label="Previous attempt"
+                onClick={() => setViewedAttempt(attemptN - 1)}
+                disabled={attemptN <= 1}
+              >
+                <ChevronLeft size={12} />
               </IconButton>
-            )}
-          </span>
-        )}
-        <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
-          {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
-            <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
-              ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
+              <span className="octo-tabular whitespace-nowrap font-mono text-[10px] text-octo-mute">
+                attempt {attemptN} of {totalAttempts}
+              </span>
+              <IconButton
+                label="Next attempt"
+                onClick={() => setViewedAttempt(attemptN + 1 >= totalAttempts ? null : attemptN + 1)}
+                disabled={attemptN >= totalAttempts}
+              >
+                <ChevronRight size={12} />
+              </IconButton>
             </span>
           )}
-          <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
-        </span>
+          {(fieldsEditable || rerunnable) && (
+            <span className="flex shrink-0 items-center gap-1.5">
+              {gateTogglable && (
+                <TogglePill
+                  on={stage.checkpoint}
+                  label="⟜ gate"
+                  ariaLabel="Approval gate — pause before hand-off"
+                  onChange={(v) => {
+                    setDirectorError(null);
+                    onUpdateStage?.({ checkpoint: v }).catch(reportDirectorError);
+                  }}
+                />
+              )}
+              <IconButton
+                label={editRerunsStage ? "Edit & re-run stage" : "Edit stage"}
+                onClick={openEdit}
+              >
+                <SlidersHorizontal size={12} />
+              </IconButton>
+              {rerunnable && (
+                <IconButton label="Re-run from here" onClick={() => setConfirmRerun((v) => !v)}>
+                  <RotateCcw size={12} />
+                </IconButton>
+              )}
+            </span>
+          )}
+          <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
+            {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
+              <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
+                ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
+              </span>
+            )}
+            <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
+          </span>
+        </div>
+        <div className="truncate font-serif text-[15px] text-octo-ivory" title={stageTitle(stage)}>
+          {stageTitle(stage)}
+        </div>
       </div>
       {rerunnable && (
         <Reveal open={confirmRerun}>
@@ -520,7 +543,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             <>
               {journal}
               <div className="flex items-center gap-2 font-mono text-[11px] text-octo-brass">
-                <span className="octo-stage-pulse inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" />
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" />
                 <span>{ROLE_VERBS[stage.role] ?? "working…"}</span>
               </div>
             </>
@@ -628,7 +651,6 @@ function JournalDrawer({ items }: { items: ReactElement[] }) {
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass"
       >
-        <span className="text-octo-brass">§</span>
         <span>work journal · <span className="octo-tabular tracking-normal">{items.length}</span></span>
         <span>{open ? "▾" : "▸"}</span>
       </button>

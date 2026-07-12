@@ -1,10 +1,9 @@
 import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
-import { ROMAN, stageTitle, fmtTokens } from "../lib/stageMeta";
+import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
-import { archetypeFor } from "./builder/graph";
-import { ARTIFACT_ICON } from "./builder/icons";
+import { iconForRole } from "../lib/roleIcons";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
@@ -13,29 +12,26 @@ import { RunFlowNav } from "./RunFlowNav";
 interface Props {
   stages: RunStage[];
   selectedStageId: string | null;
+  /** Law 2 — the one stage allowed to pulse (beaconAnchor kind "stage"). */
+  beaconStageId: string | null;
   onSelectStage: (id: string) => void;
 }
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
-/** The running pipeline drawn as a LIVING node flow — the execution-aware
- *  sibling of the launcher's StageFlow. It speaks the same node language
- *  (archetype icon, Roman numeral, substrate pill, ⟶/⟜ connectors) but each
- *  card is alive: it pulses while running, carries the live activity / elapsed
- *  time, shows token + cost transparency when at rest, and marks loop-back
- *  edges. Cards sit on ONE horizontal rail that SCROLLS (never wraps) — a
- *  7–8 stage pipeline still reads as one continuous flow instead of a
- *  saturated grid. RunFlowNav's chevrons page through overflow, and whichever
- *  stage is in focus (selected, or running/awaiting your checkpoint) scrolls
- *  into view. It supersedes the old RunTrack card strip. */
-export function RunFlow({ stages, selectedStageId, onSelectStage }: Props) {
+/** The living pipeline as ONE horizontal scrolling rail, governed by the two
+ *  redesign laws. Depth of field: the subject (running / awaiting / halted /
+ *  selected) keeps full ink at full width; every other stage recedes to a
+ *  dimmed essence card. The single beacon: only `beaconStageId` may pulse.
+ *  Connectors are drawn solid lines — brass once work has flowed through,
+ *  hairline ahead (gradients and the ⟶ glyph are retired); the ⟜ gate mark
+ *  lives on the gated card itself. */
+export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage }: Props) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // Focus follows the action: `selectedStageId` is already the shown-stage id
-  // computed upstream (explicit selection, else the active stage) — so simply
-  // following it here covers both a manual click and a stage turning running
-  // / awaiting_checkpoint.
+  // computed upstream (explicit selection, else the active stage).
   useEffect(() => {
     if (!selectedStageId) return;
     const el = cardRefs.current.get(selectedStageId);
@@ -55,21 +51,16 @@ export function RunFlow({ stages, selectedStageId, onSelectStage }: Props) {
       >
         {stages.map((s, i) => {
           const prev = stages[i - 1];
-          // Dim the connector until the handoff has actually completed, so a solid
-          // arrow reads as "work has flowed through here". The connector leading
-          // INTO the currently-running stage pulses calmly — work is flowing now.
           const solid = prev && prev.status === "done";
-          const flowingHere = s.status === "running";
           return (
             <div key={s.id} className="flex shrink-0 items-stretch">
               {i > 0 && (
-                <span
-                  className={`flex w-7 shrink-0 items-center justify-center text-octo-brass transition-opacity duration-[280ms] ${
-                    solid ? "opacity-100" : "opacity-40"
-                  } ${flowingHere ? "octo-stage-pulse rounded-full" : ""}`}
-                  title={prev?.checkpoint ? "Gated handoff" : "Hands off to"}
-                >
-                  {prev?.checkpoint ? "⟜" : "⟶"}
+                <span className="flex w-7 shrink-0 items-center" aria-hidden="true">
+                  <span
+                    className={`h-px w-full transition-colors duration-[280ms] ${
+                      solid ? "bg-[var(--brass-line)]" : "bg-octo-hairline"
+                    }`}
+                  />
                 </span>
               )}
               <div
@@ -84,6 +75,7 @@ export function RunFlow({ stages, selectedStageId, onSelectStage }: Props) {
                   index={i}
                   stages={stages}
                   selected={s.id === selectedStageId}
+                  beacon={s.id === beaconStageId}
                   onSelect={() => onSelectStage(s.id)}
                 />
               </div>
@@ -101,149 +93,158 @@ function StageCard({
   index,
   stages,
   selected,
+  beacon,
   onSelect,
 }: {
   stage: RunStage;
   index: number;
   stages: RunStage[];
   selected: boolean;
+  beacon: boolean;
   onSelect: () => void;
 }) {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
   const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
   const running = s.status === "running";
   const awaiting = s.status === "awaiting_checkpoint";
+  const failed = s.status === "failed";
+  const transientHalt = failed && isTransientHalt(s.error);
 
-  // A transient halt is a recoverable caution — amber ⟳, not the rouge ✕ of a
-  // hard failure. Mirrors RunTrack / the StageFocus banner.
-  const transientHalt = s.status === "failed" && isTransientHalt(s.error);
+  // Depth of field (Law 1): the subject keeps full ink; everything else
+  // recedes to its essence — 38% ink, rising on hover. Nothing is removed:
+  // the full detail lives in the focus pane one click away.
+  const subject = running || awaiting || failed || selected;
+
   const base = stageStatusGlyph(s.status);
   const glyph = transientHalt ? "⟳" : base.label;
   const glyphCls = transientHalt ? "text-octo-warning" : base.className;
-  // "stalled", not "paused": the run-level brass "◆ paused" is a deliberate
-  // human gate — this amber state is an infra stall awaiting Resume.
   const word = transientHalt ? "stalled" : stageStatusWord(s.status);
-
-  const a = archetypeFor(s.role);
-  const Icon = ARTIFACT_ICON[a.artifact];
+  const Icon = iconForRole(s.role);
   const cliManaged = s.substrate === "cli";
 
-  // ONE fixed-height live/meta line; content picked by status, geometry constant.
+  // ONE fixed-height live/meta line on the subject; content picked by status.
   const verdict = s.status === "done" ? lastNotice(entries) : "";
   const live: { node: React.ReactNode; cls: string } = running
     ? { node: lastActivity(entries), cls: "text-octo-sage" }
     : verdict
       ? { node: verdict, cls: "text-octo-verdigris" }
-      : { node: <MetaLine stage={s} />, cls: "text-octo-mute" };
+      : { node: <MetaTokens stage={s} />, cls: "text-octo-mute" };
 
-  // The loop badge marks a review that can return work to an earlier stage.
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
-  // The loop is "live" while the review is gating (and still has iterations
-  // left) or mid-replay — pulse the badge then to signal motion in the cycle.
-  const loopActive =
-    looping &&
-    ((awaiting && s.loopIterations < s.loopMaxIterations) || running);
 
-  // Status carries its own colour family so the run reads at a glance and brass
-  // stays surgical: running is VERDIGRIS (liveness), a checkpoint that needs you
-  // is BRASS, a stall is AMBER, a hard fail is ROUGE. Selection only styles a
-  // resting card (brass ghost) — an active card already announces itself, so
-  // running (verdigris) never collides with selected (brass).
+  // Status keeps its own colour family (running verdigris, needs-you brass,
+  // stall amber, hard fail rouge) — but the PULSE belongs to the beacon alone.
   const skin = transientHalt
     ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
-    : s.status === "failed"
+    : failed
       ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
       : running
         ? "border-octo-verdigris bg-octo-panel-2"
         : awaiting
           ? "border-octo-brass bg-octo-panel-2"
           : selected
-            ? "border-octo-brass bg-[var(--brass-ghost)]"
-            : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]";
-
-  // Running + awaiting both earn the calm pulse: one says "work here now", the
-  // other "needs you". A resting selected card reads via the brass ghost alone.
-  const pulse = (running || awaiting) ? "octo-stage-pulse " : "";
+            ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)]"
+            : "border-octo-hairline bg-octo-panel-2";
 
   return (
     <button
       type="button"
       onClick={onSelect}
-      style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
-      className={`octo-rise-in flex w-[210px] shrink-0 flex-col gap-2 rounded-lg border px-3.5 py-3 text-left transition-colors ${pulse}${skin}`}
+      style={{ animationDelay: `calc(${Math.min(index, 8)} * var(--stagger-step))` }}
+      className={`octo-rise-in flex shrink-0 flex-col gap-2 rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color,background-color,color] duration-[280ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+        subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70 focus-visible:opacity-70"
+      } ${beacon ? "octo-stage-pulse " : ""}${skin}`}
     >
-      {/* Header — archetype icon · title · Roman numeral. */}
+      {/* Header — gate mark · role icon · title · status glyph. */}
       <div className="flex items-center gap-2">
-        <span className="text-octo-sage">
-          <Icon size={14} strokeWidth={1.75} />
+        {s.checkpoint && (
+          <span
+            className="shrink-0 font-mono text-[12px] text-octo-brass"
+            title="Checkpoint — pauses for your approval"
+          >
+            ⟜
+          </span>
+        )}
+        <span className={subject ? "text-octo-brass" : "text-octo-sage"}>
+          <Icon size={13} strokeWidth={1.75} />
         </span>
-        <span className="min-w-0 flex-1 truncate font-serif text-[14px] text-octo-ivory" title={stageTitle(s)}>
+        <span
+          className={`min-w-0 flex-1 truncate font-serif text-[13px] ${subject ? "text-octo-ivory" : "text-octo-sage"}`}
+          title={stageTitle(s)}
+        >
           {stageTitle(s)}
         </span>
-        <span className="font-mono text-[11px] text-octo-brass">{ROMAN[index] ?? index + 1}</span>
-      </div>
-
-      {/* Status row — glyph · word · elapsed (running only). */}
-      <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
-        <span key={`${s.status}-${transientHalt}`} className={`octo-pop-in ${glyphCls}`} title={word}>
+        <span key={`${s.status}-${transientHalt}`} className={`octo-pop-in font-mono text-[10px] ${glyphCls}`} title={word}>
           {glyph}
         </span>
-        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
-        <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-verdigris">
-          {running ? elapsed : ""}
-        </span>
-      </span>
+      </div>
 
-      {/* Model · substrate pill. */}
-      <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
-        <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
-        <span
-          className={`shrink-0 rounded-sm px-1.5 py-0.5 text-[8px] uppercase tracking-[0.18em] ${
-            cliManaged
-              ? "bg-[var(--state-purple-ghost)] text-octo-state-purple"
-              : "bg-[var(--state-blue-ghost)] text-octo-state-blue"
-          }`}
-        >
-          {s.substrate}
-        </span>
-      </span>
-
-      {/* Live activity / verdict / cost+tokens — fixed height, status-picked. */}
-      <span
-        key={`${s.status}-live`}
-        className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
-      >
-        {live.node}
-      </span>
-
-      {/* Loop badge — pulses while the cycle is live. */}
-      {looping && (
-        <span
-          className={`flex h-4 items-center font-mono text-[10px] text-octo-brass ${loopActive ? "octo-stage-pulse rounded-sm" : ""}`}
-          title={
-            target
-              ? `Loops back to ${stageTitle(target)} (${s.loopIterations} of max ${s.loopMaxIterations})`
-              : `Loops back (${s.loopIterations} of max ${s.loopMaxIterations})`
-          }
-        >
-          <span className="octo-tabular">
-            ⟲ {s.loopIterations}/{s.loopMaxIterations}
+      {subject ? (
+        <span key="subject" className="octo-fade-in flex min-w-0 flex-col gap-2">
+          {/* Status word + fixed-width timer (S1/S2). */}
+          <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
+            <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
+            <span className="octo-tabular ml-auto w-[5ch] shrink-0 text-right text-octo-verdigris">
+              {running ? elapsed : ""}
+            </span>
           </span>
-          {s.loopTargetPosition !== null && (
-            // "back to" — the loop hands work to an EARLIER stage; a plain → read
-            // as forward flow, contradicting the ⟶ connectors on the same card.
-            <span className="ml-1">back to {ROMAN[s.loopTargetPosition] ?? s.loopTargetPosition + 1}</span>
+
+          {/* Live activity / verdict / tokens — fixed height, status-picked. */}
+          <span
+            key={`${s.status}-live`}
+            className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
+          >
+            {live.node}
+          </span>
+
+          {/* Meta — discreet position · model · substrate pill. */}
+          <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
+            <span className="octo-tabular shrink-0">{index + 1}</span>
+            <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
+            <span
+              className={`shrink-0 rounded-sm px-1.5 py-0.5 text-[8px] uppercase tracking-[0.18em] ${
+                cliManaged
+                  ? "bg-[var(--state-purple-ghost)] text-octo-state-purple"
+                  : "bg-[var(--state-blue-ghost)] text-octo-state-blue"
+              }`}
+            >
+              {s.substrate}
+            </span>
+          </span>
+
+          {/* Loop badge — arabic target, no pulse (the beacon is singular). */}
+          {looping && (
+            <span
+              className="flex h-4 items-center font-mono text-[10px] text-octo-brass"
+              title={
+                target
+                  ? `Loops back to ${stageTitle(target)} (${s.loopIterations} of max ${s.loopMaxIterations})`
+                  : `Loops back (${s.loopIterations} of max ${s.loopMaxIterations})`
+              }
+            >
+              <span className="octo-tabular">
+                ⟲ {s.loopIterations}/{s.loopMaxIterations}
+              </span>
+              {s.loopTargetPosition !== null && (
+                <span className="ml-1">back to {s.loopTargetPosition + 1}</span>
+              )}
+            </span>
           )}
+        </span>
+      ) : (
+        /* Essence meta — discreet position · cost · tokens. */
+        <span key="essence" className="octo-fade-in flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
+          <span className="octo-tabular shrink-0">{index + 1}</span>
+          {(s.costUsd > 0 || s.inputTokens > 0 || s.outputTokens > 0) && <MetaTokens stage={s} />}
         </span>
       )}
     </button>
   );
 }
 
-/** Cost + token transparency for an at-rest stage. Cost in brass (the only
- *  quirurgical brass here), tokens quiet in mute, both tabular. */
-function MetaLine({ stage: s }: { stage: RunStage }) {
+/** Token transparency for an at-rest subject card's live line. */
+function MetaTokens({ stage: s }: { stage: RunStage }) {
   const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
   return (
     <span className="flex items-center gap-2">

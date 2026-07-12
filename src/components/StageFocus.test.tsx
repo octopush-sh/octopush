@@ -38,7 +38,7 @@ describe("StageFocus live journal", () => {
     vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
   });
 
-  it("renders text as prose and a tool+result as one § card", () => {
+  it("renders text as prose and a tool+result as one flat line", () => {
     useRunsStore.setState({ liveByStage: { st1: [
       { kind: "text", text: "Inspecting the changes." },
       { kind: "tool", tool: "Read", hint: "src/auth.rs" },
@@ -50,6 +50,7 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("src/auth.rs")).toBeInTheDocument();   // hint
     expect(screen.getByText(/142 lines/)).toBeInTheDocument();     // result detail
     expect(screen.getByText(/reviewing…/)).toBeInTheDocument();    // running pulse (role verb for code_review)
+    expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
   it("shows the running indicator even when there are no entries yet", () => {

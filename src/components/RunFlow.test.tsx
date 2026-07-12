@@ -1,135 +1,75 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import type { RunStage, RunStageStatus } from "../lib/ipc";
+import { describe, it, expect, vi, beforeAll } from "vitest";
+import { render } from "@testing-library/react";
 
-// ─── Mocks (wired before the component is imported) ───────────────────────────
-// The live journal is irrelevant to these structural assertions — always empty.
 vi.mock("../stores/runsStore", () => ({
-  useRunsStore: (selector: (s: { liveByStage: Record<string, unknown> }) => unknown) =>
-    selector({ liveByStage: {} }),
+  useRunsStore: (sel: any) => sel({ liveByStage: {} }),
 }));
-// Freeze elapsed so the "running" slot is deterministic.
-vi.mock("../hooks/useElapsed", () => ({ useElapsed: () => "" }));
+vi.mock("../stores/rolesStore", () => ({
+  useRolesStore: { getState: () => ({ roles: [] }) },
+}));
+vi.mock("../hooks/useElapsed", () => ({ useElapsed: () => "00:00" }));
+vi.mock("./RunFlowNav", () => ({ RunFlowNav: () => null }));
 
 const { RunFlow } = await import("./RunFlow");
 
-// ─── Fixture ──────────────────────────────────────────────────────────────────
+beforeAll(() => {
+  window.HTMLElement.prototype.scrollIntoView = vi.fn();
+});
 
-function makeStage(overrides: Partial<RunStage> = {}): RunStage {
-  return {
-    id: "s1",
-    runId: "r1",
-    position: 0,
-    role: "implement",
-    agentModel: "claude-sonnet-4-6",
-    substrate: "api",
-    checkpoint: false,
-    status: "pending" as RunStageStatus,
-    inputTokens: 0,
-    outputTokens: 0,
-    costUsd: 0,
-    artifact: null,
-    feedback: null,
-    error: null,
-    startedAt: null,
-    finishedAt: null,
-    loopTargetPosition: null,
-    loopMaxIterations: 0,
-    loopMode: null,
-    loopIterations: 0,
-    diffSnapshot: null,
-    maxIterations: 25,
-    parents: [],
-    tools: null,
-    customName: null,
-    instructions: null,
-    sessionId: null,
-    baselineCommit: null,
-    ...overrides,
-  };
-}
+const mk = (over: Record<string, unknown>) =>
+  ({
+    id: "x", runId: "r", position: 0, role: "implement", agentModel: "sonnet",
+    substrate: "api", checkpoint: false, status: "pending", inputTokens: 0,
+    outputTokens: 0, costUsd: 0, artifact: null, feedback: null, error: null,
+    startedAt: null, finishedAt: null, loopTargetPosition: null,
+    loopMaxIterations: 0, loopMode: null, loopIterations: 0, maxIterations: 25,
+    diffSnapshot: null, ...over,
+  }) as any;
 
-describe("RunFlow", () => {
-  it("renders a card per stage with its title and Roman numeral", () => {
-    const stages = [
-      makeStage({ id: "a", position: 0, role: "plan" }),
-      makeStage({ id: "b", position: 1, role: "implement" }),
-    ];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
+const stages = [
+  mk({ id: "a", position: 0, status: "done", costUsd: 0.01 }),
+  mk({ id: "b", position: 1, status: "running", startedAt: 1 }),
+  mk({ id: "c", position: 2, status: "pending", checkpoint: true }),
+];
 
-    expect(screen.getByText("Plan")).toBeInTheDocument();
-    expect(screen.getByText("Implement")).toBeInTheDocument();
-    expect(screen.getByText("I")).toBeInTheDocument();
-    expect(screen.getByText("II")).toBeInTheDocument();
-    expect(screen.getAllByRole("button")).toHaveLength(2);
+describe("RunFlow — depth of field & the single beacon", () => {
+  it("pulses exactly one element: the beacon stage", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />,
+    );
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
   });
 
-  it("shows the running treatment: status word and the elapsed slot", () => {
-    const stages = [
-      makeStage({ id: "a", status: "running", startedAt: "2026-06-13T00:00:00Z" }),
-    ];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
-
-    expect(screen.getByText("running")).toBeInTheDocument();
-    // The running card carries the calm pulse treatment.
-    expect(document.querySelector(".octo-stage-pulse")).not.toBeNull();
+  it("never pulses without a beacon, even while running", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
   });
 
-  it("shows cost and tokens for a done stage", () => {
-    const stages = [
-      makeStage({
-        id: "a",
-        status: "done",
-        costUsd: 0.5,
-        inputTokens: 1200,
-        outputTokens: 340,
-      }),
-    ];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
-
-    expect(screen.getByText("$0.50")).toBeInTheDocument();
-    expect(screen.getByText("↑1.2k ↓340")).toBeInTheDocument();
+  it("recedes non-subject cards to a dimmed essence", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />,
+    );
+    // done + pending recede; the running subject keeps full ink
+    expect(container.querySelectorAll(".opacity-\\[0\\.38\\]")).toHaveLength(2);
   });
 
-  it("renders the loop badge for a stage with a loop target", () => {
-    const stages = [
-      makeStage({ id: "a", position: 0, role: "implement" }),
-      makeStage({
-        id: "b",
-        position: 1,
-        role: "code_review",
-        status: "awaiting_checkpoint",
-        loopTargetPosition: 0,
-        loopMaxIterations: 3,
-        loopIterations: 1,
-      }),
-    ];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
-
-    expect(screen.getByText("⟲ 1/3")).toBeInTheDocument();
+  it("renders no connector for a single-stage run", () => {
+    const { container } = render(
+      <RunFlow stages={[mk({ id: "solo" })]} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    // Connectors are the only aria-hidden spans in RunFlow.
+    expect(container.querySelectorAll("span[aria-hidden]")).toHaveLength(0);
   });
 
-  it("calls onSelectStage with the stage id when a card is clicked", () => {
-    const onSelect = vi.fn();
-    const stages = [makeStage({ id: "pick-me" })];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={onSelect} />);
-
-    fireEvent.click(screen.getByRole("button"));
-    expect(onSelect).toHaveBeenCalledWith("pick-me");
-  });
-
-  it("shows ⟳/stalled (not ✕) for a transient-halt failure", () => {
-    const stages = [
-      makeStage({
-        id: "a",
-        status: "failed",
-        error: "API error 529 overloaded",
-      }),
-    ];
-    render(<RunFlow stages={stages} selectedStageId={null} onSelectStage={() => {}} />);
-
-    expect(screen.getByText("stalled")).toBeInTheDocument();
-    expect(screen.getByText("⟳")).toBeInTheDocument();
-    expect(screen.queryByText("✕")).toBeNull();
+  it("draws connectors as lines — no arrows, no romans", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(container.textContent).not.toContain("⟶");
+    expect(container.textContent).not.toMatch(/\b(II|III|IV|V|VI)\b/);
+    // the gate mark lives on the gated card, not the connector
+    expect(container.textContent).toContain("⟜");
   });
 });

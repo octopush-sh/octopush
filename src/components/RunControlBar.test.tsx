@@ -37,15 +37,15 @@ describe("RunControlBar", () => {
     expect(h.onAbort).toHaveBeenCalled();
   });
 
-  it("running: offers pause / stop / abort and wires them", () => {
+  it("running: renders nothing — pause / stop / abort live in the run header", () => {
+    // While the run simply runs, the bar yields: the controls moved to the
+    // DirectCanvas run header and the beacon sits on the running stage card.
     const h = handlers();
-    render(<RunControlBar run={run("running")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);
-    fireEvent.click(screen.getByRole("button", { name: /Pause at the next stage/i }));
-    fireEvent.click(screen.getByRole("button", { name: /Stop the current stage/i }));
-    fireEvent.click(screen.getByRole("button", { name: /Abort the run/i }));
-    expect(h.onPause).toHaveBeenCalled();
-    expect(h.onStopStage).toHaveBeenCalled();
-    expect(h.onAbort).toHaveBeenCalled();
+    const { container } = render(
+      <RunControlBar run={run("running")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("terminal: offers Run it again", () => {
@@ -67,6 +67,22 @@ describe("RunControlBar", () => {
     fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
     // Non-failed checkpoint reject must NOT pass a turn override (FIX 3).
     expect(h.onReject).toHaveBeenCalledWith("fix the imports", undefined);
+  });
+
+  it("checkpoint: the beacon pulses the primary CTA — and only when granted", () => {
+    // Law 2 — the single brass beacon. With beacon the decide row pulses
+    // exactly one element (Approve & continue); without it, nothing pulses.
+    const h = handlers();
+    const withBeacon = render(
+      <RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} beacon {...h} />,
+    );
+    expect(withBeacon.container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
+    withBeacon.unmount();
+
+    const withoutBeacon = render(
+      <RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />,
+    );
+    expect(withoutBeacon.container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
   });
 
   it("checkpoint with a loop target: offers Send back and shows loop state", async () => {

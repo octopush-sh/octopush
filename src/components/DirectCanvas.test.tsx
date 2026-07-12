@@ -13,7 +13,14 @@ vi.mock("./PipelineSetup", () => ({
   ),
 }));
 vi.mock("./PipelineBuilder", () => ({ PipelineBuilder: () => <div>BUILDER</div> }));
-vi.mock("./RunFlow", () => ({ RunFlow: () => <div>RUNVIEW</div> }));
+vi.mock("./RunFlow", () => ({
+  RunFlow: ({ beaconStageId }: any) => (
+    <>
+      <div>RUNVIEW</div>
+      <div>beacon:{String(beaconStageId)}</div>
+    </>
+  ),
+}));
 vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
 vi.mock("./RunLedger", () => ({ RunLedger: () => <div /> }));
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
@@ -21,7 +28,6 @@ vi.mock("./RunControlBar", () => ({
   RunControlBar: ({ run, blockedStage, onRunAgain }: any) => (
     <div>
       {blockedStage && <div>CHECKPOINT</div>}
-      {run.status === "running" && !blockedStage && <div>RUNNINGBAR</div>}
       {TERMINAL.has(run.status) && <button onClick={onRunAgain}>again</button>}
     </div>
   ),
@@ -150,9 +156,12 @@ describe("DirectCanvas viewed-run routing", () => {
     useRunsStore.getState().selectRun("w1", "r1");
     render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
 
-    // Paused at a checkpoint: the decision surface is shown.
+    // Paused at a checkpoint: the decision surface is shown; the header run
+    // controls stay mounted but disabled (they fade, no layout shift), and
+    // the decision suppresses the stage beacon (Law 2 — one beacon).
     expect(screen.getByText("CHECKPOINT")).toBeInTheDocument();
-    expect(screen.queryByText("RUNNINGBAR")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Pause at the next stage")).toBeDisabled();
+    expect(screen.getByText("beacon:null")).toBeInTheDocument();
 
     // Resumed: the control bar adapts to the running controls (no decision).
     act(() => {
@@ -161,6 +170,6 @@ describe("DirectCanvas viewed-run routing", () => {
       });
     });
     expect(screen.queryByText("CHECKPOINT")).not.toBeInTheDocument();
-    expect(screen.getByText("RUNNINGBAR")).toBeInTheDocument();
+    expect(screen.getByTitle("Pause at the next stage")).toBeEnabled();
   });
 });
