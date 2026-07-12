@@ -130,6 +130,11 @@ describe("PipelineBuilder (node canvas)", () => {
     // The palette offers archetypes to drop.
     expect(screen.getByText("Stages")).toBeInTheDocument();
     expect(screen.getByText("Code review")).toBeInTheDocument();
+    // Loop marker is ⟲ everywhere in the builder — ⟜ is the gate mark only,
+    // and it never appears in the palette (only on a gated node's header).
+    expect(screen.getAllByTitle("Can loop work back").length).toBeGreaterThan(0);
+    expect(screen.queryByText("⟜")).not.toBeInTheDocument(); // gate mark only appears on gated nodes, never in the palette
+    expect(screen.getAllByText("⟲").length).toBeGreaterThan(0);
   });
 
   it("renders the stage nodes inside the builder context (no provider-scope crash)", () => {
