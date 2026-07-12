@@ -461,6 +461,10 @@ impl SyncLibraryItem {
 /// POST library items (edits and tombstones alike — the server does per-item
 /// LWW). **Best-effort**: a failed push never affects the local library; the
 /// launch push-all heals it later.
+/// Server batch limit is 300 — chunk under it so a large library's heal push
+/// can never be rejected wholesale.
+const LIBRARY_PUSH_CHUNK: usize = 200;
+
 pub async fn push_library_items(client: &reqwest::Client, items: Vec<SyncLibraryItem>) {
     if items.is_empty() {
         return;
@@ -468,15 +472,16 @@ pub async fn push_library_items(client: &reqwest::Client, items: Vec<SyncLibrary
     let Some(token) = crate::auth::current_access_token().await else {
         return; // signed out → skip silently
     };
-    let count = items.len();
-    let body = serde_json::json!({ "items": items });
     let url = format!("{SYNC_API_BASE}/api/sync-library");
-    match client.post(&url).bearer_auth(token).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::debug!("library sync: pushed {count} item(s)");
+    for chunk in items.chunks(LIBRARY_PUSH_CHUNK) {
+        let body = serde_json::json!({ "items": chunk });
+        match client.post(&url).bearer_auth(token.clone()).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!("library sync: pushed {} item(s)", chunk.len());
+            }
+            Ok(resp) => tracing::warn!("library sync push failed: HTTP {}", resp.status()),
+            Err(e) => tracing::warn!("library sync push error: {e}"),
         }
-        Ok(resp) => tracing::warn!("library sync push failed: HTTP {}", resp.status()),
-        Err(e) => tracing::warn!("library sync push error: {e}"),
     }
 }
 

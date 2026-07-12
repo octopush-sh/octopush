@@ -2605,6 +2605,18 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Bump a CUSTOM role's LWW stamp to now — the local "I'm keeping this"
+    /// decision when a pulled tombstone is refused because the role is still
+    /// in use here. The bumped stamp beats the tombstone on the next push, so
+    /// the keep actually propagates (revives the item cloud-side).
+    pub fn touch_role(&self, key: &str) -> AppResult<bool> {
+        self.conn.execute(
+            "UPDATE roles SET updated_at = ?2 WHERE key = ?1 AND is_builtin = 0",
+            params![key, Utc::now().to_rfc3339()],
+        )?;
+        Ok(self.conn.changes() > 0)
+    }
+
     /// Apply a pulled role (per-item LWW). Returns true when applied. Never
     /// touches a builtin key; never regresses a NEWER local edit.
     pub fn upsert_role_from_sync(

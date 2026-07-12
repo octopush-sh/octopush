@@ -1188,9 +1188,12 @@ pub async fn save_pipeline(
     if crate::entitlement::Entitlement::current()
         .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
     {
+        // Best-effort from here: the save already COMMITTED — a bookkeeping
+        // read failure must never turn a successful save into an error.
         let item = {
             let db = state.db.lock();
-            db.list_custom_pipelines_for_sync()?
+            db.list_custom_pipelines_for_sync()
+                .unwrap_or_default()
                 .into_iter()
                 .find(|p| p.id == saved_id)
                 .map(|sp| crate::sync::SyncLibraryItem::pipeline(&sp))
@@ -1503,36 +1506,37 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     require_feature_gate(crate::entitlement::feature::LIBRARY_SYNC)?;
     let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
     let mut applied = 0usize;
-    let db = state.db.lock();
-    // Roles first — a pulled pipeline's stages must validate against them.
-    for item in items.iter().filter(|i| i.kind == "role") {
-        if item.deleted {
-            match db.role_sync_state(&item.item_id) {
-                Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
-                    if db.role_in_use(&item.item_id).unwrap_or(true) {
-                        continue; // still referenced here — keep it (next push revives)
-                    }
-                    if db.delete_role(&item.item_id).is_ok() {
-                        applied += 1;
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
+
+    // Apply order matters (and each step takes its own SHORT lock — this is a
+    // launch-time merge, but the mutex is shared with every live surface):
+    //   1. role UPSERTS — pipelines validate against roles;
+    //   2. pipelines (upserts + tombstones);
+    //   3. role TOMBSTONES LAST — so a role referenced by a pipeline pulled in
+    //      this very merge counts as in-use and survives its own tombstone.
+    for item in items.iter().filter(|i| i.kind == "role" && !i.deleted) {
         let Some(data) = &item.data else { continue };
         let Ok(mut role) =
             serde_json::from_value::<crate::orchestrator::roles::RoleDef>(data.clone())
         else {
             continue; // unparseable → skip, never fatal
         };
+        if role.key != item.item_id {
+            continue; // envelope/data identity mismatch — refuse quietly
+        }
         role.is_builtin = false; // the wire never carries builtin authority
-        if db.upsert_role_from_sync(&role, &item.updated_at).unwrap_or(false) {
+        if state
+            .db
+            .lock()
+            .upsert_role_from_sync(&role, &item.updated_at)
+            .unwrap_or(false)
+        {
             applied += 1;
         }
     }
+
     for item in items.iter().filter(|i| i.kind == "pipeline") {
         if item.deleted {
+            let db = state.db.lock();
             match db.pipeline_sync_state(&item.item_id) {
                 Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                     if db.delete_pipeline(&item.item_id).is_ok() {
@@ -1550,10 +1554,29 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
         if sp.id != item.item_id {
             continue; // envelope/data mismatch — refuse quietly
         }
-        match db.upsert_pipeline_from_sync(&sp) {
+        match state.db.lock().upsert_pipeline_from_sync(&sp) {
             Ok(true) => applied += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}"),
+        }
+    }
+
+    for item in items.iter().filter(|i| i.kind == "role" && i.deleted) {
+        let db = state.db.lock();
+        match db.role_sync_state(&item.item_id) {
+            Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
+                if db.role_in_use(&item.item_id).unwrap_or(true) {
+                    // Still referenced here: KEEPING it is a genuine local
+                    // decision — bump its stamp so the next push beats the
+                    // tombstone and the keep propagates (revives cloud-side).
+                    let _ = db.touch_role(&item.item_id);
+                    continue;
+                }
+                if db.delete_role(&item.item_id).is_ok() {
+                    applied += 1;
+                }
+            }
+            _ => {}
         }
     }
     Ok(applied)
@@ -4592,8 +4615,11 @@ pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::ro
         }
     }
     db.upsert_role(&role)?;
+    // Best-effort from here: the save already COMMITTED.
     let sync_item = db
-        .role_sync_state(&role.key)?
+        .role_sync_state(&role.key)
+        .ok()
+        .flatten()
         .map(|(updated_at, _)| crate::sync::SyncLibraryItem::role(&role, &updated_at));
     drop(db);
     // Library sync (Pro): the edited role follows the user. Best-effort.
