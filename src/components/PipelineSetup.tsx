@@ -3,12 +3,14 @@ import { ipc, type PipelineWithStages } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
 import { savingsVsBaseline } from "../lib/runStatus";
+import { beaconAnchor } from "../lib/beacon";
+import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
-import { DirectRunsMeter } from "./DirectRunsMeter";
 
 interface Props {
   defaultTask: string;
+  linkedIssueKey?: string | null;
   onBegin: (
     pipelineId: string,
     task: string,
@@ -25,18 +27,30 @@ function parseBudget(text: string): number | null {
   return Number.isFinite(v) && v > 0 ? v : null;
 }
 
+/** Tint for the runs-left fragment: sage while comfortable, amber past 80% of
+ *  a cap, rouge at the cap. Uncapped stays mute. (Folded in from the retired
+ *  DirectRunsMeter — the count now lives inside the ledger line.) */
+function runsTone(used: number, limit: number | null): string {
+  if (limit == null) return "text-octo-mute";
+  if (used >= limit) return "text-octo-rouge";
+  if (limit > 0 && used / limit >= 0.8) return "text-octo-warning";
+  return "text-octo-sage";
+}
+
 /**
- * The Direct launcher — "The Commission". One calm composition: state the brief,
- * choose an ensemble (pipeline) from a readable ticket rail, see it drawn as a
- * stage flow that doubles as the crew editor, and read the cost ledger before
- * you begin. No separate crew table, no runs gallery (runs live in the
- * Companion). Stages and tickets never collapse — they scroll.
+ * The Direct launcher — "The Commission". One composition surface, not a
+ * wizard (the roman step framing is retired): the brief composed in serif on
+ * panel, the ensemble tickets under depth-of-field optics, the crew as a
+ * quiet line, and a run-grammar ledger foot. The single brass beacon (Law 2)
+ * lands on "Begin the run" only when brief + ensemble + quota + concurrency
+ * are all satisfied; until then the CTA is a ghost.
  */
-export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeline }: Props) {
+export function PipelineSetup({ defaultTask, linkedIssueKey = null, onBegin, executingRun, onEditPipeline }: Props) {
   const pipelines = usePipelineStore((s) => s.pipelines);
   const loaded = usePipelineStore((s) => s.loaded);
   const load = usePipelineStore((s) => s.load);
   const error = usePipelineStore((s) => s.error);
+  const { usage } = useEntitlement();
 
   const [task, setTask] = useState(defaultTask);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -72,6 +86,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
   }, [loaded]);
   useEffect(() => {
     if (!selectedId) return;
+    setEstimate(null);
     const tuples: [number, string][] = Object.entries(overrides)
       .map(([pos, model]) => [Number(pos), model] as [number, string]);
     let cancelled = false;
@@ -111,29 +126,55 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
           .map((s) => [s.position, overrides[s.position]] as [number, string])
       : [];
 
+  // Law 2 — the launcher is ready when brief + ensemble + concurrency + quota
+  // all hold; only then does the beacon land on the CTA.
+  const quotaExhausted = !!usage && usage.limit != null && usage.used >= usage.limit;
+  const ready = !!selected && task.trim().length > 0 && !executingRun && !quotaExhausted;
+  const beacon =
+    beaconAnchor({ run: null, blockedStage: null, runningStage: null, launcherReady: ready })?.kind === "launcher";
+
+  const beginNow = () => {
+    if (!ready || !selected) return;
+    onBegin(selected.pipeline.id, task.trim(), overrideTuples(), parseBudget(budgetText));
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-auto px-8 py-7 octo-fade-in">
       <div className="mx-auto max-w-[940px]">
-        {/* Ceremony */}
-        <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— direct</p>
-        <h1 className="m-0 mb-2 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
-        <div className="animate-brass-grow mb-9 h-px bg-gradient-to-r from-octo-brass to-transparent" style={{ width: 28 }} />
+        {/* Ceremony — serif title + one sans line. No eyebrow, no rule. */}
+        <h1 className="m-0 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
+        <p className="mb-7 mt-1 text-[12px] text-octo-sage">A crew of agents, your brief, one run.</p>
 
-        {/* I — The brief (hero). The ⟶ glyph reads as intent entering the ensemble. */}
-        <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">I · The brief</p>
-        <div className="mb-10 flex items-start gap-3 rounded-lg border border-octo-hairline bg-octo-panel-2 px-4 py-3 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
-          <span aria-hidden="true" className="mt-1 select-none font-mono text-base text-octo-brass">⟶</span>
+        {/* The brief — the noblest object: serif on panel. ⌘⏎ begins. */}
+        <div className="mb-8 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
           <textarea
             value={task}
             onChange={(e) => setTask(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                beginNow();
+              }
+            }}
             placeholder="What should the ensemble take on?"
             aria-label="The brief"
-            className="h-20 w-full resize-none bg-transparent font-serif text-[16px] leading-relaxed text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
+            className="h-20 w-full resize-none bg-transparent font-serif text-[15px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
           />
+          <div className="mt-2 flex h-5 items-center gap-2">
+            {linkedIssueKey && (
+              <span
+                className="rounded-[5px] border border-octo-hairline px-1.5 py-px font-mono text-[9px] text-octo-mute"
+                title="Linked issue — attached to this run"
+              >
+                {linkedIssueKey}
+              </span>
+            )}
+            <span className="ml-auto font-mono text-[9px] text-octo-mute">⌘⏎ to begin</span>
+          </div>
         </div>
 
-        {/* II — The ensemble (pipeline + crew, unified). */}
-        <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">II · The ensemble</p>
+        {/* The ensemble. */}
+        <p className="mb-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>
         {!loaded ? (
           <div className="mb-10 flex gap-2">
             {[0, 1, 2].map((i) => (
@@ -157,22 +198,32 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
           )
         ) : (
           <div className="mb-6">
-            {/* Selector rail — readable tickets that scroll, never squish. */}
+            {/* Selector rail — depth of field: the chosen ticket at full ink,
+                the rest receding (the tickets own their selected styling; the
+                rail dims the unselected ones). */}
             <div className="flex gap-2 overflow-x-auto pb-2">
               {pipelines.map((p) => (
-                <PipelineTicket
+                <div
                   key={p.pipeline.id}
-                  pipeline={p}
-                  selected={p.pipeline.id === selectedId}
-                  onSelect={() => { setSelectedId(p.pipeline.id); setOverrides({}); }}
-                  onEdit={() => onEditPipeline(p.pipeline.id)}
-                />
+                  className={
+                    p.pipeline.id === selectedId
+                      ? undefined
+                      : "opacity-[0.38] transition-opacity duration-[180ms] focus-within:opacity-70 hover:opacity-70"
+                  }
+                >
+                  <PipelineTicket
+                    pipeline={p}
+                    selected={p.pipeline.id === selectedId}
+                    onSelect={() => { setSelectedId(p.pipeline.id); setOverrides({}); }}
+                    onEdit={() => onEditPipeline(p.pipeline.id)}
+                  />
+                </div>
               ))}
               {/* Compose ticket — the way into the builder. */}
               <button
                 type="button"
                 onClick={() => onEditPipeline(null)}
-                className="flex w-[184px] shrink-0 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-octo-hairline px-3.5 py-3 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass-hi"
+                className="flex w-[184px] shrink-0 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-octo-hairline px-3.5 py-3 font-serif text-[13px] text-octo-brass opacity-[0.38] transition-opacity duration-[180ms] hover:opacity-100 focus-visible:opacity-100"
               >
                 <span className="font-mono text-base">＋</span>
                 Compose a new one
@@ -185,6 +236,7 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                   <p className="mb-3 font-serif text-[13px] text-octo-sage">{selected.pipeline.description}</p>
                 )}
                 <StageFlow
+                  key={selected.pipeline.id}
                   stages={selected.stages}
                   overrides={overrides}
                   onOverride={(position, model) => setOverrides((prev) => ({ ...prev, [position]: model }))}
@@ -194,30 +246,34 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
           </div>
         )}
 
-        {/* The ledger — savings, budget, begin. */}
+        {/* The foot — the same ledger grammar as the run's strip. */}
         {selected && (
           <>
             <div className="my-6 h-px bg-octo-hairline" />
-            <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
-              <div className="min-w-0">
-                <div className="mb-0.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">this ensemble</div>
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <div className="flex h-5 min-w-0 items-center gap-2 font-mono text-[11px]">
                 {estimate ? (
                   <>
-                    <div className="octo-tabular font-serif text-2xl text-octo-verdigris">
-                      saves ~${saved.toFixed(2)}
-                      <span className="ml-2 font-mono text-xs text-octo-mute">{savedPct}%</span>
-                    </div>
-                    <div className="octo-tabular font-mono text-xs text-octo-mute">
-                      runs at <span className="text-octo-brass">~${estimate.estimateUsd.toFixed(2)}</span> · all-premium ${estimate.baselineUsd.toFixed(2)}
-                    </div>
+                    <span className="octo-tabular text-octo-verdigris">est. saves ~${saved.toFixed(2)}</span>
+                    <span className="octo-tabular text-octo-mute">· {savedPct}% under all-premium</span>
+                    <span className="octo-tabular text-octo-mute">
+                      · runs at <span className="text-octo-brass">~${estimate.estimateUsd.toFixed(2)}</span>
+                    </span>
                   </>
                 ) : (
-                  <div className="h-12 font-mono text-xs text-octo-mute">estimating…</div>
+                  <span className="text-octo-mute">estimating…</span>
+                )}
+                {usage && (
+                  <span className={`octo-tabular ${runsTone(usage.used, usage.limit)}`} title="Direct runs this month">
+                    · {usage.limit != null
+                      ? `${Math.max(0, usage.limit - usage.used)} runs left`
+                      : `${usage.used} run${usage.used === 1 ? "" : "s"} this month`}
+                  </span>
                 )}
               </div>
 
-              <div className="shrink-0">
-                <label htmlFor="run-budget" className="mb-1.5 block font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
+              <div className="flex shrink-0 items-center gap-2">
+                <label htmlFor="run-budget" className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
                   budget
                 </label>
                 <div className="flex h-8 items-center gap-1 rounded-md border border-octo-hairline bg-octo-onyx px-2 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
@@ -234,19 +290,25 @@ export function PipelineSetup({ defaultTask, onBegin, executingRun, onEditPipeli
                 </div>
               </div>
 
-              <DirectRunsMeter />
-
               <div className="ml-auto flex flex-col items-end gap-1.5">
                 <button
                   type="button"
-                  disabled={!task.trim() || executingRun}
-                  onClick={() => onBegin(selected.pipeline.id, task.trim(), overrideTuples(), parseBudget(budgetText))}
-                  className="rounded-lg bg-octo-brass px-6 py-2.5 font-serif text-base text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-40"
+                  disabled={!ready}
+                  onClick={beginNow}
+                  className={`rounded-lg border px-6 py-2.5 font-serif text-base transition-[color,background-color,border-color,opacity] duration-[180ms] ${
+                    beacon
+                      ? "octo-stage-pulse border-octo-brass bg-octo-brass text-octo-onyx hover:bg-octo-brass-hi"
+                      : "border-octo-hairline bg-transparent text-octo-sage opacity-60"
+                  }`}
                 >
                   Begin the run
                 </button>
                 <p className="m-0 h-4 font-mono text-[10px] text-octo-mute">
-                  {executingRun ? "A run is in progress — finish or abort it before starting another." : ""}
+                  {executingRun
+                    ? "A run is in progress — finish or abort it before starting another."
+                    : quotaExhausted
+                      ? "Monthly Direct runs are used up."
+                      : ""}
                 </p>
               </div>
             </div>

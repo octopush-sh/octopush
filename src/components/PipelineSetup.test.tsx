@@ -19,6 +19,10 @@ vi.mock("../stores/pipelineStore", () => ({
   usePipelineStore: (sel: any) => sel(storeState),
 }));
 vi.mock("./ModelPicker", () => ({ ModelPicker: () => <div /> }));
+const entitlementState = vi.hoisted(() => ({ usage: { used: 4, limit: 25 } as { used: number; limit: number | null } | null }));
+vi.mock("../hooks/useEntitlement", () => ({
+  useEntitlement: () => ({ usage: entitlementState.usage }),
+}));
 const estimateMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
@@ -42,6 +46,7 @@ beforeEach(() => {
   storeState.pipelines = [PIPE];
   storeState.loaded = true;
   storeState.error = null;
+  entitlementState.usage = { used: 4, limit: 25 };
   estimateMock.mockReset();
   estimateMock.mockResolvedValue({ estimateUsd: 0.05, baselineUsd: 0.4 });
   useRunsStore.setState({ launcherPrefill: null });
@@ -100,7 +105,7 @@ describe("PipelineSetup designed states", () => {
   it("renders the ceremony header", () => {
     render(<PipelineSetup defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     expect(screen.getByRole("heading", { name: "Direct the work" })).toBeInTheDocument();
-    expect(screen.getByText("— direct")).toBeInTheDocument(); // the brass eyebrow
+    expect(screen.getByText("A crew of agents, your brief, one run.")).toBeInTheDocument();
   });
 
   it("shows skeletons while pipelines load, not the error card", () => {
@@ -120,12 +125,13 @@ describe("PipelineSetup designed states", () => {
     expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument(); // no zero flash
   });
 
-  it("draws the selected pipeline as a stage flow (Roman numerals + connector)", () => {
+  it("draws the crew as a quiet line — no numerals, no arrows", () => {
     render(<PipelineSetup defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
-    expect(screen.getByText("I")).toBeInTheDocument();
-    expect(screen.getByText("II")).toBeInTheDocument();
-    // ⟶ appears both as the brief's prompt glyph and as the flow connector.
-    expect(screen.getAllByText("⟶").length).toBeGreaterThan(0);
+    expect(screen.getByText("Plan")).toBeInTheDocument();
+    expect(screen.getByText("Implement")).toBeInTheDocument();
+    expect(screen.queryByText("⟶")).not.toBeInTheDocument();
+    expect(screen.queryByText("I")).not.toBeInTheDocument();
+    expect(screen.queryByText("II")).not.toBeInTheDocument();
   });
 
   it("leads the estimate with savings", async () => {
@@ -135,6 +141,36 @@ describe("PipelineSetup designed states", () => {
     // savings (verdigris serif) leads; the spent figure follows it
     expect(saves.compareDocumentPosition(spent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(saves.className).toContain("text-octo-verdigris");
+  });
+
+  it("the beacon lands on Begin only when ready (Law 2)", () => {
+    const { container, rerender } = render(
+      <PipelineSetup defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />,
+    );
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1); // the CTA
+    rerender(<PipelineSetup defaultTask="build it" onBegin={vi.fn()} executingRun onEditPipeline={vi.fn()} />);
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0); // executing → ghost, calm
+  });
+
+  it("⌘⏎ in the brief begins the run when ready — and only then", () => {
+    const onBegin = vi.fn();
+    render(<PipelineSetup defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    fireEvent.keyDown(screen.getByLabelText("The brief"), { key: "Enter", metaKey: true });
+    expect(onBegin).toHaveBeenCalledWith("p1", "build it", [], null);
+    onBegin.mockClear();
+    fireEvent.change(screen.getByLabelText("The brief"), { target: { value: "   " } });
+    fireEvent.keyDown(screen.getByLabelText("The brief"), { key: "Enter", metaKey: true });
+    expect(onBegin).not.toHaveBeenCalled(); // blank brief → not ready
+  });
+
+  it("an exhausted quota ghosts the CTA and says why", () => {
+    entitlementState.usage = { used: 25, limit: 25 };
+    const { container } = render(
+      <PipelineSetup defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />,
+    );
+    expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: /Begin the run/i })).toBeDisabled();
+    expect(screen.getByText("Monthly Direct runs are used up.")).toBeInTheDocument();
   });
 });
 
