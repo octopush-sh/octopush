@@ -1182,7 +1182,27 @@ pub async fn save_pipeline(
     description: String,
     stages: Vec<crate::db::StageDraft>,
 ) -> AppResult<String> {
-    state.db.lock().save_pipeline(pipeline_id, &name, &description, &stages)
+    let saved_id = state.db.lock().save_pipeline(pipeline_id, &name, &description, &stages)?;
+    // Library sync (Pro): fire-and-forget the edited item to the cloud so it
+    // follows the user to their other machines. Never affects the save.
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
+    {
+        let item = {
+            let db = state.db.lock();
+            db.list_custom_pipelines_for_sync()?
+                .into_iter()
+                .find(|p| p.id == saved_id)
+                .map(|sp| crate::sync::SyncLibraryItem::pipeline(&sp))
+        };
+        if let Some(item) = item {
+            tokio::spawn(async move {
+                let client = crate::chat_engine::shared_http_client();
+                crate::sync::push_library_items(client, vec![item]).await;
+            });
+        }
+    }
+    Ok(saved_id)
 }
 
 #[tauri::command]
@@ -1190,7 +1210,19 @@ pub async fn delete_pipeline(
     state: State<'_, AppState>,
     pipeline_id: String,
 ) -> AppResult<()> {
-    state.db.lock().delete_pipeline(&pipeline_id)
+    state.db.lock().delete_pipeline(&pipeline_id)?;
+    // Tombstone so the deletion follows the user (an edit made LATER on
+    // another machine revives the item — newest intent wins).
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
+    {
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", &pipeline_id);
+        tokio::spawn(async move {
+            let client = crate::chat_engine::shared_http_client();
+            crate::sync::push_library_items(client, vec![item]).await;
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1318,18 +1350,16 @@ pub async fn direct_run_usage(
 
 /// Pro-gate for the sync commands — mirrors the `start_run` concurrency gate so a
 /// non-entitled call surfaces the upgrade sheet.
-fn require_history_sync() -> AppResult<()> {
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
-    {
+fn require_feature_gate(feature: &str) -> AppResult<()> {
+    if crate::entitlement::Entitlement::current().has_feature(feature) {
         Ok(())
     } else {
-        Err(AppError::UpgradeRequired {
-            feature: "history.sync".into(),
-            used: 0,
-            limit: 0,
-        })
+        Err(AppError::UpgradeRequired { feature: feature.into(), used: 0, limit: 0 })
     }
+}
+
+fn require_history_sync() -> AppResult<()> {
+    require_feature_gate(crate::entitlement::feature::HISTORY_SYNC)
 }
 
 /// The local read-only history mirror (instant, no network). The History view
@@ -1431,6 +1461,102 @@ pub async fn history_run_detail(
 ) -> AppResult<Option<crate::sync::SyncRunDetail>> {
     require_history_sync()?;
     crate::sync::pull_run_detail(crate::chat_engine::shared_http_client(), &run_id).await
+}
+
+/// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
+/// heal for edits made offline or whose fire-and-forget push failed. The server
+/// does per-item LWW, so re-pushing is idempotent and never regresses a newer
+/// edit from another machine. No-op for non-Pro. Returns the count pushed.
+#[tauri::command]
+pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
+    if !crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
+    {
+        return Ok(0);
+    }
+    let items: Vec<crate::sync::SyncLibraryItem> = {
+        let db = state.db.lock();
+        let mut items: Vec<crate::sync::SyncLibraryItem> = db
+            .list_custom_pipelines_for_sync()?
+            .iter()
+            .map(crate::sync::SyncLibraryItem::pipeline)
+            .collect();
+        items.extend(
+            db.list_custom_roles_for_sync()?
+                .iter()
+                .map(|(role, updated_at)| crate::sync::SyncLibraryItem::role(role, updated_at)),
+        );
+        items
+    };
+    let count = items.len();
+    crate::sync::push_library_items(crate::chat_engine::shared_http_client(), items).await;
+    Ok(count)
+}
+
+/// Pull the user's library and merge it per-item LWW into the local DB —
+/// roles FIRST (pipelines reference role keys), then pipelines; tombstones
+/// delete locally only when NEWER than the local edit (and tolerantly: an
+/// in-use role or unknown id is skipped, never an error). Pro-gated. Returns
+/// the number of items applied.
+#[tauri::command]
+pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
+    require_feature_gate(crate::entitlement::feature::LIBRARY_SYNC)?;
+    let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
+    let mut applied = 0usize;
+    let db = state.db.lock();
+    // Roles first — a pulled pipeline's stages must validate against them.
+    for item in items.iter().filter(|i| i.kind == "role") {
+        if item.deleted {
+            match db.role_sync_state(&item.item_id) {
+                Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
+                    if db.role_in_use(&item.item_id).unwrap_or(true) {
+                        continue; // still referenced here — keep it (next push revives)
+                    }
+                    if db.delete_role(&item.item_id).is_ok() {
+                        applied += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(data) = &item.data else { continue };
+        let Ok(mut role) =
+            serde_json::from_value::<crate::orchestrator::roles::RoleDef>(data.clone())
+        else {
+            continue; // unparseable → skip, never fatal
+        };
+        role.is_builtin = false; // the wire never carries builtin authority
+        if db.upsert_role_from_sync(&role, &item.updated_at).unwrap_or(false) {
+            applied += 1;
+        }
+    }
+    for item in items.iter().filter(|i| i.kind == "pipeline") {
+        if item.deleted {
+            match db.pipeline_sync_state(&item.item_id) {
+                Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
+                    if db.delete_pipeline(&item.item_id).is_ok() {
+                        applied += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(data) = &item.data else { continue };
+        let Ok(sp) = serde_json::from_value::<crate::sync::SyncPipeline>(data.clone()) else {
+            continue;
+        };
+        if sp.id != item.item_id {
+            continue; // envelope/data mismatch — refuse quietly
+        }
+        match db.upsert_pipeline_from_sync(&sp) {
+            Ok(true) => applied += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}"),
+        }
+    }
+    Ok(applied)
 }
 
 // ─── Accounts (P1) ─────────────────────────────────────────────
@@ -4466,6 +4592,21 @@ pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::ro
         }
     }
     db.upsert_role(&role)?;
+    let sync_item = db
+        .role_sync_state(&role.key)?
+        .map(|(updated_at, _)| crate::sync::SyncLibraryItem::role(&role, &updated_at));
+    drop(db);
+    // Library sync (Pro): the edited role follows the user. Best-effort.
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
+    {
+        if let Some(item) = sync_item {
+            tokio::spawn(async move {
+                let client = crate::chat_engine::shared_http_client();
+                crate::sync::push_library_items(client, vec![item]).await;
+            });
+        }
+    }
     Ok(role)
 }
 
@@ -4478,7 +4619,18 @@ pub async fn delete_role(state: State<'_, AppState>, key: String) -> AppResult<(
         }
     }
     if db.role_in_use(&key)? { return Err(crate::error::AppError::Other(format!("role '{key}' is used by a pipeline"))); }
-    db.delete_role(&key)
+    db.delete_role(&key)?;
+    drop(db);
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
+    {
+        let item = crate::sync::SyncLibraryItem::tombstone("role", &key);
+        tokio::spawn(async move {
+            let client = crate::chat_engine::shared_http_client();
+            crate::sync::push_library_items(client, vec![item]).await;
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -391,3 +391,126 @@ pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
         .collect();
     Ok(runs)
 }
+
+// ─── Library sync: custom pipelines + roles follow the user (Pro) ───────────
+
+/// One custom pipeline as it travels: the exact [`StageDraft`] shape the
+/// builder's `save_pipeline` consumes, so sync round-trips losslessly.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SyncPipeline {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The item's LWW timestamp (RFC3339 — lexicographic order IS time order).
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub stages: Vec<crate::db::StageDraft>,
+}
+
+/// The generic per-item envelope the server stores verbatim. `kind` is
+/// "pipeline" (item_id = pipeline id) or "role" (item_id = role key).
+/// A `deleted` item is a TOMBSTONE: it wins LWW like any edit, so a delete on
+/// machine A propagates — and an EDIT made after the delete revives the item
+/// (newer timestamp beats the tombstone), which is the least surprising rule.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SyncLibraryItem {
+    pub kind: String,
+    pub item_id: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+impl SyncLibraryItem {
+    pub fn pipeline(sp: &SyncPipeline) -> Self {
+        Self {
+            kind: "pipeline".into(),
+            item_id: sp.id.clone(),
+            updated_at: sp.updated_at.clone(),
+            deleted: false,
+            data: serde_json::to_value(sp).ok(),
+        }
+    }
+    pub fn role(role: &crate::orchestrator::roles::RoleDef, updated_at: &str) -> Self {
+        Self {
+            kind: "role".into(),
+            item_id: role.key.clone(),
+            updated_at: updated_at.to_string(),
+            deleted: false,
+            data: serde_json::to_value(role).ok(),
+        }
+    }
+    /// A deletion, stamped NOW so it beats every earlier edit under LWW.
+    pub fn tombstone(kind: &str, item_id: &str) -> Self {
+        Self {
+            kind: kind.into(),
+            item_id: item_id.into(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            deleted: true,
+            data: None,
+        }
+    }
+}
+
+/// POST library items (edits and tombstones alike — the server does per-item
+/// LWW). **Best-effort**: a failed push never affects the local library; the
+/// launch push-all heals it later.
+pub async fn push_library_items(client: &reqwest::Client, items: Vec<SyncLibraryItem>) {
+    if items.is_empty() {
+        return;
+    }
+    let Some(token) = crate::auth::current_access_token().await else {
+        return; // signed out → skip silently
+    };
+    let count = items.len();
+    let body = serde_json::json!({ "items": items });
+    let url = format!("{SYNC_API_BASE}/api/sync-library");
+    match client.post(&url).bearer_auth(token).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!("library sync: pushed {count} item(s)");
+        }
+        Ok(resp) => tracing::warn!("library sync push failed: HTTP {}", resp.status()),
+        Err(e) => tracing::warn!("library sync push error: {e}"),
+    }
+}
+
+/// GET the user's whole library (items + tombstones). Lenient: an item this
+/// build can't parse is skipped by the caller, never fatal.
+pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibraryItem>> {
+    let token = crate::auth::current_access_token()
+        .await
+        .ok_or_else(|| AppError::Other("not signed in".into()))?;
+    let url = format!("{SYNC_API_BASE}/api/sync-library");
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Other(format!("library sync pull failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Other(format!(
+            "library sync pull failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    #[derive(Deserialize)]
+    struct PullResp {
+        #[serde(default)]
+        items: Vec<serde_json::Value>,
+    }
+    let parsed: PullResp = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Other(format!("library sync decode failed: {e}")))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<SyncLibraryItem>(v).ok())
+        .collect())
+}

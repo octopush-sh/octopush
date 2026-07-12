@@ -575,6 +575,16 @@ impl Db {
             self.meta_set("retrofit_reviewer_run_command", "done")?;
         }
 
+        // Library sync (Pro): per-item LWW needs an edit timestamp on the
+        // template tables. Backfill = created_at (a never-edited item is as
+        // old as its creation).
+        add_column_if_missing(&self.conn, "ALTER TABLE pipelines ADD COLUMN updated_at TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE roles ADD COLUMN updated_at TEXT")?;
+        self.conn.execute_batch(
+            "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
+             UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
+        )?;
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -670,11 +680,11 @@ impl Db {
     pub fn upsert_role(&self, role: &crate::orchestrator::roles::RoleDef) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-             ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12
+            "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12,updated_at=?15
              WHERE roles.is_builtin=0",
-            params![role.key, role.label, role.description, role.prompt_body, role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64, serde_json::to_string(&role.default_tools)?, role.default_substrate, role.default_checkpoint as i64, role.token_est_in, role.token_est_out, role.is_builtin as i64, now],
+            params![role.key, role.label, role.description, role.prompt_body, role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64, serde_json::to_string(&role.default_tools)?, role.default_substrate, role.default_checkpoint as i64, role.token_est_in, role.token_est_out, role.is_builtin as i64, now, now],
         )?;
         // Defense-in-depth: if 0 rows were changed, check whether the key belongs
         // to a built-in.  The save_role command guard fires first for normal callers,
@@ -2204,8 +2214,8 @@ impl Db {
             // Update a custom pipeline in place.
             Some((id, false)) => {
                 tx.execute(
-                    "UPDATE pipelines SET name = ?2, description = ?3 WHERE id = ?1",
-                    params![id, name, description],
+                    "UPDATE pipelines SET name = ?2, description = ?3, updated_at = ?4 WHERE id = ?1",
+                    params![id, name, description, Utc::now().to_rfc3339()],
                 )?;
                 tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![id])?;
                 id
@@ -2215,8 +2225,8 @@ impl Db {
                 let id = Uuid::new_v4().to_string();
                 let now = Utc::now().to_rfc3339();
                 tx.execute(
-                    "INSERT INTO pipelines (id, name, description, is_builtin, created_at)
-                     VALUES (?1,?2,?3,0,?4)",
+                    "INSERT INTO pipelines (id, name, description, is_builtin, created_at, updated_at)
+                     VALUES (?1,?2,?3,0,?4,?4)",
                     params![id, name, description, now],
                 )?;
                 id
@@ -2453,6 +2463,172 @@ impl Db {
     pub fn clear_synced_runs(&self) -> AppResult<()> {
         self.conn.execute("DELETE FROM synced_runs", [])?;
         Ok(())
+    }
+
+    // ── Library sync (Pro): custom pipelines + roles follow the user ────────
+
+    /// Every CUSTOM pipeline as a sync payload (builtins never travel).
+    pub fn list_custom_pipelines_for_sync(&self) -> AppResult<Vec<crate::sync::SyncPipeline>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, COALESCE(updated_at, created_at)
+             FROM pipelines WHERE is_builtin = 0",
+        )?;
+        let heads = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(heads.len());
+        for (id, name, description, updated_at) in heads {
+            out.push(crate::sync::SyncPipeline {
+                stages: self.pipeline_stage_drafts(&id)?,
+                id,
+                name,
+                description,
+                updated_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A pipeline's stages re-expressed as the builder's [`StageDraft`] shape —
+    /// the exact input `save_pipeline` consumes, so sync round-trips losslessly.
+    pub fn pipeline_stage_drafts(&self, pipeline_id: &str) -> AppResult<Vec<StageDraft>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT role, agent_model, substrate, checkpoint, loop_target_position,
+                    loop_max_iterations, loop_mode, max_iterations, pos_x, pos_y,
+                    parents, tools, custom_name, instructions
+             FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![pipeline_id], |r| {
+            let parents_json: Option<String> = r.get(10)?;
+            let tools_json: Option<String> = r.get(11)?;
+            Ok(StageDraft {
+                role: r.get(0)?,
+                agent_model: r.get(1)?,
+                substrate: r.get(2)?,
+                checkpoint: r.get::<_, i64>(3)? != 0,
+                loop_target_position: r.get(4)?,
+                loop_max_iterations: r.get(5)?,
+                loop_mode: r.get(6)?,
+                max_iterations: r.get(7)?,
+                pos_x: r.get(8)?,
+                pos_y: r.get(9)?,
+                parents: parents_json
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_default(),
+                tools: tools_json.and_then(|j| serde_json::from_str(&j).ok()),
+                custom_name: r.get(12)?,
+                instructions: r.get(13)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// A pipeline's local LWW state: (updated_at, is_builtin). `None` = absent.
+    pub fn pipeline_sync_state(&self, id: &str) -> AppResult<Option<(String, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(updated_at, created_at), is_builtin FROM pipelines WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// A role's local LWW state: (updated_at, is_builtin). `None` = absent.
+    pub fn role_sync_state(&self, key: &str) -> AppResult<Option<(String, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(updated_at, created_at), is_builtin FROM roles WHERE key = ?1",
+                params![key],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Apply a pulled pipeline (per-item LWW). Returns true when applied.
+    /// Never touches a builtin id; never regresses a NEWER local edit; the
+    /// pulled stages go through the same validator as the builder's saves
+    /// (an unparseable/invalid item is skipped by the caller, not written).
+    pub fn upsert_pipeline_from_sync(&self, sp: &crate::sync::SyncPipeline) -> AppResult<bool> {
+        match self.pipeline_sync_state(&sp.id)? {
+            Some((_, true)) => return Ok(false), // builtin ids never sync
+            Some((local, _)) if local.as_str() >= sp.updated_at.as_str() => return Ok(false),
+            _ => {}
+        }
+        self.validate_pipeline_stages(&sp.stages)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO pipelines (id, name, description, is_builtin, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = ?2, description = ?3, updated_at = ?4
+             WHERE pipelines.is_builtin = 0",
+            params![sp.id, sp.name, sp.description, sp.updated_at],
+        )?;
+        tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![sp.id])?;
+        for (i, st) in sp.stages.iter().enumerate() {
+            let parents_json = serde_json::to_string(&st.parents).ok();
+            let tools_json = st.tools.as_ref().and_then(|t| serde_json::to_string(t).ok());
+            tx.execute(
+                "INSERT INTO pipeline_stages
+                    (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                     pos_x, pos_y, parents, tools, custom_name, instructions)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![Uuid::new_v4().to_string(), sp.id, i as i64, st.role, st.agent_model,
+                        st.substrate, st.checkpoint as i64,
+                        st.loop_target_position, st.loop_max_iterations, st.loop_mode,
+                        st.max_iterations, st.pos_x, st.pos_y, parents_json, tools_json,
+                        st.custom_name, st.instructions],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Every CUSTOM role with its LWW timestamp (builtins never travel).
+    pub fn list_custom_roles_for_sync(
+        &self,
+    ) -> AppResult<Vec<(crate::orchestrator::roles::RoleDef, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, COALESCE(updated_at, created_at) FROM roles WHERE is_builtin = 0",
+            Self::ROLE_COLS
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            let role = Self::row_to_role(r)?;
+            let updated_at: String = r.get(13)?;
+            Ok((role, updated_at))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Apply a pulled role (per-item LWW). Returns true when applied. Never
+    /// touches a builtin key; never regresses a NEWER local edit.
+    pub fn upsert_role_from_sync(
+        &self,
+        role: &crate::orchestrator::roles::RoleDef,
+        updated_at: &str,
+    ) -> AppResult<bool> {
+        match self.role_sync_state(&role.key)? {
+            Some((_, true)) => return Ok(false), // builtin keys never sync
+            Some((local, _)) if local.as_str() >= updated_at => return Ok(false),
+            _ => {}
+        }
+        self.conn.execute(
+            "INSERT INTO roles (key,label,description,prompt_body,artifact_kind,environment,can_loop,default_tools,default_substrate,default_checkpoint,token_est_in,token_est_out,is_builtin,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?13)
+             ON CONFLICT(key) DO UPDATE SET label=?2,description=?3,prompt_body=?4,artifact_kind=?5,environment=?6,can_loop=?7,default_tools=?8,default_substrate=?9,default_checkpoint=?10,token_est_in=?11,token_est_out=?12,updated_at=?13
+             WHERE roles.is_builtin=0",
+            params![role.key, role.label, role.description, role.prompt_body,
+                    role.artifact_kind.as_db(), role.environment.as_db(), role.can_loop as i64,
+                    serde_json::to_string(&role.default_tools)?, role.default_substrate,
+                    role.default_checkpoint as i64, role.token_est_in, role.token_est_out,
+                    updated_at],
+        )?;
+        Ok(self.conn.changes() > 0)
     }
 
     /// The local history mirror, newest first. Skips any blob this build can't

@@ -20,6 +20,8 @@ pub mod feature {
     pub const RUNS_PARALLEL: &str = "runs.parallel";
     /// Unlimited run history + cross-machine sync.
     pub const HISTORY_SYNC: &str = "history.sync";
+    /// Custom pipelines + roles follow the user across machines.
+    pub const LIBRARY_SYNC: &str = "library.sync";
 }
 
 /// The Free monthly Direct-run cap (live). Shared by the meter, the restricted
@@ -84,6 +86,7 @@ impl Entitlement {
                 feature::DIRECT_UNLIMITED.into(),
                 feature::RUNS_PARALLEL.into(),
                 feature::HISTORY_SYNC.into(),
+                feature::LIBRARY_SYNC.into(),
             ],
             direct_runs_per_month: None,
         }
@@ -98,6 +101,7 @@ impl Entitlement {
                 feature::DIRECT_UNLIMITED.into(),
                 feature::RUNS_PARALLEL.into(),
                 feature::HISTORY_SYNC.into(),
+                feature::LIBRARY_SYNC.into(),
             ],
             direct_runs_per_month: None,
         }

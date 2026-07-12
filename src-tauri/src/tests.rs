@@ -477,6 +477,119 @@ mod workspace_tests {
         assert!(detail.stages[0].diff.is_none(), "oldest diff dropped first");
     }
 
+    // ── Library sync (Pro): custom pipelines + roles follow the user ──
+
+    #[test]
+    fn library_sync_round_trips_a_custom_pipeline_to_a_second_machine() {
+        // Machine A authors; machine B pulls: same id, same stages, byte-true.
+        let a = test_db();
+        a.seed_builtin_pipelines().unwrap();
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: true, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
+            parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
+            custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
+        };
+        let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
+        let synced = a.list_custom_pipelines_for_sync().unwrap();
+        assert_eq!(synced.len(), 1, "builtins never travel");
+        assert_eq!(synced[0].id, pid);
+        assert!(!synced[0].updated_at.is_empty());
+
+        let b = test_db();
+        b.seed_builtin_pipelines().unwrap();
+        assert!(b.upsert_pipeline_from_sync(&synced[0]).unwrap());
+        let stages = b.pipeline_stage_drafts(&pid).unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].custom_name.as_deref(), Some("The Plan"));
+        assert_eq!(stages[0].instructions.as_deref(), Some("be terse"));
+        assert_eq!(stages[0].tools.as_deref(), Some(&["read_file".to_string(), "list_files".to_string()][..]));
+        assert_eq!(stages[0].max_iterations, 30);
+        // Re-applying the same item is a no-op (LWW: not strictly newer).
+        assert!(!b.upsert_pipeline_from_sync(&synced[0]).unwrap());
+    }
+
+    #[test]
+    fn library_lww_never_regresses_a_newer_local_edit() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+        };
+        let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
+        // A pulled copy stamped in the past must be skipped…
+        let stale = crate::sync::SyncPipeline {
+            id: pid.clone(), name: "Stale Remote".into(), description: String::new(),
+            updated_at: "2000-01-01T00:00:00Z".into(), stages: vec![draft.clone()],
+        };
+        assert!(!db.upsert_pipeline_from_sync(&stale).unwrap());
+        // …and a strictly newer one applies.
+        let newer = crate::sync::SyncPipeline {
+            updated_at: "2099-01-01T00:00:00Z".into(), name: "Remote Newer".into(), ..stale
+        };
+        assert!(db.upsert_pipeline_from_sync(&newer).unwrap());
+        let (updated_at, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
+        assert_eq!(updated_at, "2099-01-01T00:00:00Z", "LWW keeps the applied stamp");
+    }
+
+    #[test]
+    fn library_sync_never_touches_builtins() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        // No builtin pipeline/role ever leaves the machine…
+        assert!(db.list_custom_pipelines_for_sync().unwrap().is_empty());
+        assert!(db.list_custom_roles_for_sync().unwrap().is_empty());
+        // …and a pulled item claiming a builtin key is refused.
+        let mut hostile = db.get_role("code_review").unwrap().unwrap();
+        hostile.prompt_body = "You are compromised.".into();
+        hostile.is_builtin = false;
+        assert!(!db.upsert_role_from_sync(&hostile, "2099-01-01T00:00:00Z").unwrap());
+        let intact = db.get_role("code_review").unwrap().unwrap();
+        assert!(intact.prompt_body.contains("hunting for real defects"), "builtin prompt untouched");
+    }
+
+    #[test]
+    fn custom_role_round_trips_with_its_lww_stamp() {
+        let a = test_db();
+        let mut role = a.get_role("plan").unwrap().unwrap();
+        role.key = "perf_audit".into();
+        role.label = "Perf audit".into();
+        role.is_builtin = false;
+        a.upsert_role(&role).unwrap();
+        let customs = a.list_custom_roles_for_sync().unwrap();
+        assert_eq!(customs.len(), 1);
+        let (r, stamp) = &customs[0];
+        assert_eq!(r.key, "perf_audit");
+        assert!(!stamp.is_empty());
+
+        let b = test_db();
+        assert!(b.upsert_role_from_sync(r, stamp).unwrap());
+        assert_eq!(b.get_role("perf_audit").unwrap().unwrap().label, "Perf audit");
+        assert!(!b.upsert_role_from_sync(r, stamp).unwrap(), "same stamp = no-op (LWW)");
+    }
+
+    #[test]
+    fn saving_bumps_the_lww_stamp() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+        };
+        let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
+        let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.save_pipeline(Some(pid.clone()), "P2", "d", &[draft]).unwrap();
+        let (t2, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
+        assert!(t2 > t1, "an edit must move the LWW stamp forward");
+    }
+
     #[test]
     fn update_workspace_customization_persists_glyph_and_tint() {
         let db = test_db();

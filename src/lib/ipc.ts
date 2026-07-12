@@ -968,6 +968,12 @@ export const ipc = {
    *  demand (B2). Null when the server has no detail for that run. Pro-gated. */
   historyRunDetail: (runId: string) =>
     invoke<SyncedRunDetail | null>("history_run_detail", { runId }),
+
+  // ─── Library sync (Pro): custom pipelines + roles follow the user ──
+  /** Push the whole custom library (launch heal; idempotent LWW upserts). */
+  librarySyncPushAll: () => invoke<number>("library_sync_push_all"),
+  /** Pull + merge the library per-item LWW (roles first). Pro-gated. */
+  librarySyncPull: () => invoke<number>("library_sync_pull"),
   /** One-shot backfill of this machine's terminal runs to the cloud (Pro-only,
    *  no-op otherwise). Returns the count attempted. */
   historySyncPushAll: () => invoke<number>("history_sync_push_all"),
