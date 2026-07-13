@@ -4095,6 +4095,96 @@ mod orchestrator_tests {
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
     }
 
+    /// The double-drive guard: `spawn_detached_segment` on a run a LIVE worker
+    /// already owns must return `AlreadyRunning` (an `Ok`), NOT an `Err` — so
+    /// the command callers never fall back to an in-process drive alongside
+    /// the worker. The reserve is refused before any binary resolution, and
+    /// the existing lease is left intact.
+    #[tokio::test]
+    async fn spawn_detached_segment_yields_already_running_when_leased() {
+        use crate::orchestrator::worker::SegmentSpawn;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PLD", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        // A live foreign worker (fresh heartbeat) owns the run.
+        assert!(db.lock().reserve_worker_lease(&run_id, "w1").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "w1", std::process::id() as i64).unwrap());
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        );
+        let outcome = orch.spawn_detached_segment(&run_id, false).unwrap();
+        assert_eq!(outcome, SegmentSpawn::AlreadyRunning);
+        // The original lease is untouched — no clobber, no clear.
+        assert!(db.lock().beat_worker_lease(&run_id, "w1").unwrap(), "w1 still owns the lease");
+    }
+
+    /// Reused-pid safety: startup recovery uses HEARTBEAT-ONLY freshness, so a
+    /// run whose lease heartbeat is stale is repaired even when its persisted
+    /// `worker_pid` happens to be alive (after a reboot the pid may belong to
+    /// an unrelated system process). Without this the run would be pinned
+    /// "running" forever. Contrast `worker_lease_fresh`, which DOES trust the
+    /// live pid (for the in-session sleep-wake race) — proven divergent here.
+    #[tokio::test]
+    async fn startup_recovery_repairs_stale_lease_even_if_pid_alive() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PLR", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        db.lock().set_run_status(&run_id, "running", false).unwrap();
+        // Our OWN pid is guaranteed alive — stands in for a reboot-reused pid.
+        let live_pid = std::process::id() as i64;
+        assert!(db.lock().reserve_worker_lease(&run_id, "n").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "n", live_pid).unwrap());
+        // Heartbeat goes stale (a reboot killed the real worker long ago).
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, run_id])
+            .unwrap();
+        // The pid-aware view still says "live" (this is the trap)…
+        assert!(db.lock().worker_lease_fresh(&run_id).unwrap());
+        // …but heartbeat-only recovery repairs it anyway.
+        assert!(!db.lock().worker_heartbeat_fresh(&run_id).unwrap());
+        assert_eq!(db.lock().recover_interrupted_runs().unwrap(), 1);
+        assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[0].status, "failed");
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+    }
+
+    /// A `reserve` must refuse to supersede a LIVE-but-stale worker (heartbeat
+    /// lapsed during a sleep, pid still answering) — else two workers would
+    /// briefly drive one worktree. The pid-aware pre-check in
+    /// `reserve_worker_lease` is what enforces this.
+    #[tokio::test]
+    async fn reserve_refuses_to_supersede_a_live_but_stale_worker() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PLS", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let live_pid = std::process::id() as i64;
+        assert!(db.lock().reserve_worker_lease(&run_id, "w1").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "w1", live_pid).unwrap());
+        // Heartbeat lapses (sleep) but the worker pid still answers.
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, run_id])
+            .unwrap();
+        // A second reserve must be refused — the live pid protects the claim.
+        assert!(!db.lock().reserve_worker_lease(&run_id, "w2").unwrap());
+        assert_eq!(
+            db.lock().get_run(&run_id).unwrap().unwrap().detached,
+            true,
+            "the original lease is untouched"
+        );
+    }
+
     /// The detached-run exception: startup recovery must NEVER repair a run
     /// whose worker lease heartbeat is fresh — a live `octopush-run-worker`
     /// owns it, and "repairing" would mark its in-flight stage failed and

@@ -17,6 +17,20 @@ use super::Orchestrator;
 
 pub const WORKER_BIN: &str = "octopush-run-worker";
 
+/// Outcome of asking for a detached segment. The distinction is load-bearing:
+/// `AlreadyRunning` (a live worker owns the run) must NOT fall back to an
+/// in-process drive — that would put two processes on the same run/worktree.
+/// Only a genuine `Err` (spawn machinery failed: binary missing, exec error)
+/// is a fallback trigger.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SegmentSpawn {
+    /// A worker process was launched for this segment.
+    Spawned,
+    /// A live worker already owns this run — nothing to do, and above all do
+    /// NOT drive it in-process.
+    AlreadyRunning,
+}
+
 /// Resolve the worker binary: sibling of the current executable (production
 /// `.app/Contents/MacOS` and `cargo run`/`cargo test` target dirs), then
 /// `$PATH`, then the dev target fallbacks — the same ladder as the PTY daemon.
@@ -57,15 +71,22 @@ impl Orchestrator {
     /// Hand the next drive segment of `run_id` to a detached worker process
     /// (Pro, `runs.detached`). Reserves the cross-process lease, spawns the
     /// worker in its own session, and primes the bridge so live events flow
-    /// from the first tick. On ANY failure the lease is released and the
-    /// error returned — callers fall back to the in-process drive, so a
-    /// missing worker binary can never cost the user their run.
-    pub fn spawn_detached_segment(&self, run_id: &str, budget_override: bool) -> AppResult<()> {
+    /// from the first tick. On a genuine spawn failure (missing binary, exec
+    /// error) the lease is released and an `Err` returned — callers fall back
+    /// to the in-process drive, so a missing worker binary can never cost the
+    /// user their run. A refused reserve (a live worker already owns the run)
+    /// returns `Ok(AlreadyRunning)`, NOT an `Err` — the caller must not fall
+    /// back, or two processes would drive one run/worktree.
+    pub fn spawn_detached_segment(
+        &self,
+        run_id: &str,
+        budget_override: bool,
+    ) -> AppResult<SegmentSpawn> {
         let nonce = uuid::Uuid::new_v4().to_string();
         if !self.db.lock().reserve_worker_lease(run_id, &nonce)? {
-            return Err(AppError::Other(
-                "run is already executing in the background".into(),
-            ));
+            // A live worker owns this run — do nothing (and above all, no
+            // in-process fallback). This is the double-spawn guard firing.
+            return Ok(SegmentSpawn::AlreadyRunning);
         }
         let bin = match resolve_worker_binary() {
             Ok(b) => b,
@@ -109,7 +130,7 @@ impl Orchestrator {
                 });
                 self.prime_detached_watch(run_id);
                 tracing::info!(run_id = %run_id, "detached segment worker spawned");
-                Ok(())
+                Ok(SegmentSpawn::Spawned)
             }
             Err(e) => {
                 let _ = self.db.lock().clear_worker_lease(run_id, &nonce);

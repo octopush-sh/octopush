@@ -1312,7 +1312,9 @@ pub async fn start_run(
     // back to the in-process drive — detachment must never cost a run.
     if detached_entitled {
         match orch.spawn_detached_segment(&run_id, false) {
-            Ok(()) => return Ok(()),
+            // Spawned OR AlreadyRunning: a worker owns the drive — never fall
+            // back to in-process (that would double-drive one worktree).
+            Ok(_) => return Ok(()),
             Err(e) => {
                 tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
             }

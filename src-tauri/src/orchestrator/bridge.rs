@@ -134,6 +134,16 @@ impl Orchestrator {
         };
         if needs_replay {
             self.replay_current_attempt(run_id)?;
+            // Advance the cursor past everything replay could have covered:
+            // adopt seated the cursor at the log's end at the START of this
+            // tick, but a foreign-process worker write can land between that
+            // read and replay's stage-log read — such a row would then be
+            // emitted twice (once by replay, once by the flush below on
+            // `id > cursor`). Re-seating at the current MAX closes that gap.
+            let max = self.db.lock().last_run_log_id(run_id).unwrap_or(0);
+            if let Some(w) = self.bridge_watch.lock().get_mut(run_id) {
+                w.cursor = w.cursor.max(max);
+            }
         }
         self.flush_log_tail(run_id)?;
 
@@ -167,6 +177,22 @@ impl Orchestrator {
         self.flush_log_tail(run_id)?;
         self.bridge_watch.lock().remove(run_id);
         let Some(run) = self.db.lock().get_run(run_id)? else { return Ok(()) };
+        // A worker that cleared its lease while the run was still `running`
+        // did NOT settle it — its `drive_segment` returned a hard infra error
+        // the null-sink worker couldn't surface (the in-process path emits
+        // `run://error` here; the worker can't). Repair it into the
+        // interrupted/Resume shape so it never sits "running" with no driver,
+        // then fall through to announce the resulting park.
+        let run = if run.status == "running" {
+            self.db.lock().repair_interrupted_run(run_id)?;
+            tracing::warn!(run_id = %run_id, "detached worker exited without settling — run repaired");
+            match self.db.lock().get_run(run_id)? {
+                Some(r) => r,
+                None => return Ok(()),
+            }
+        } else {
+            run
+        };
         self.emit_run_update(run_id);
         self.emit_cost(run_id, run.cost_usd, run.baseline_usd);
         match run.status.as_str() {

@@ -2880,7 +2880,15 @@ impl Db {
         };
         let mut n = 0;
         for run_id in run_ids {
-            if self.worker_lease_fresh(&run_id)? {
+            // STARTUP uses heartbeat-only freshness, NOT the pid-aware
+            // `worker_lease_fresh`: a persisted `worker_pid` may belong to a
+            // PREVIOUS boot and now map to an unrelated live process (`kill
+            // pid,0` would falsely say "alive" forever, pinning a dead run as
+            // running). A genuinely-alive worker from a prior app session
+            // keeps heartbeating every ~1s regardless of the app, so it reads
+            // fresh here anyway; only a truly dead worker (crash, reboot) has
+            // a stale heartbeat, and those we must repair.
+            if self.worker_heartbeat_fresh(&run_id)? {
                 continue; // a live detached worker owns this run
             }
             n += self.repair_interrupted_run(&run_id)?;
@@ -2954,10 +2962,19 @@ impl Db {
     }
 
     /// App side, before spawning a worker: claim the run for `nonce`. Refuses
-    /// (returns `false`) while another FRESH lease exists — the double-spawn
-    /// guard. Also stamps `detached` and resets the request flags so a new
-    /// segment never inherits a stale stop/pause.
+    /// (returns `false`) while another LIVE lease exists — the double-spawn
+    /// guard. "Live" is the pid-aware `worker_lease_fresh`, not the SQL
+    /// staleness alone: a worker mid-`claude` whose heartbeat lapsed during a
+    /// system sleep is still alive (its pid answers), and superseding it would
+    /// briefly double-drive one worktree until it noticed the nonce change.
+    /// The pre-check and the UPDATE are atomic within the app process (single
+    /// `Mutex<Db>`; workers never reserve). On success it stamps `detached`
+    /// and resets the request flags so a new segment never inherits a stale
+    /// stop/pause.
     pub fn reserve_worker_lease(&self, run_id: &str, nonce: &str) -> AppResult<bool> {
+        if self.worker_lease_fresh(run_id)? {
+            return Ok(false);
+        }
         let n = self.conn.execute(
             "UPDATE runs SET worker_nonce = ?2, worker_pid = NULL, heartbeat_at = ?3,
                     stop_requested = 0, pause_requested = 0, detached = 1
@@ -3000,6 +3017,21 @@ impl Db {
             params![run_id, nonce],
         )?;
         Ok(())
+    }
+
+    /// Heartbeat-ONLY freshness (no pid trust): nonce present AND heartbeat
+    /// within the window. Used by STARTUP recovery, where a persisted pid may
+    /// belong to a previous boot — see `recover_interrupted_runs`.
+    pub fn worker_heartbeat_fresh(&self, run_id: &str) -> AppResult<bool> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT worker_nonce, heartbeat_at FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(matches!(row, Some((Some(_), Some(hb))) if hb >= Self::lease_stale_before()))
     }
 
     /// `true` while a worker lease is LIVE: nonce present AND (heartbeat
