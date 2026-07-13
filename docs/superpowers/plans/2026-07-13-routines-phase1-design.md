@@ -102,5 +102,23 @@ mirroring the History mirror read-gate).
 
 ## Deferred (phase 2+)
 
-LaunchAgent fire-while-fully-closed; fresh-workspace auto-reaper/retention; weekly/cron schedules; per-routine
-notification preferences; a Mission Control routines strip; "Schedule this pipeline…" deep-link from Direct.
+LaunchAgent fire-while-fully-closed; fresh-workspace auto-reaper/retention (which re-opens frequent-fresh —
+phase 1 constrains `fresh` to `daily`); weekly/cron schedules; per-routine notification preferences; a
+Mission Control routines strip; "Schedule this pipeline…" deep-link from Direct.
+
+**Known phase-1 limitation — externally-created workspace surfacing (shared with the MCP `create_workspace`
+path):** a scheduler-created fresh workspace isn't pushed to the frontend's `workspacesByProjectId`, so until
+that project's workspace list reloads, its Mission Control card shows the generic "workspace" (not the
+`{routine} · {stamp}` name) and a "jump to run" on it can land on the empty-workspace screen. It self-heals on
+navigation/reload. The proper fix (a "workspaces changed" event → store reload) lands with phase 2 and would
+also benefit MCP-authored workspaces.
+
+## Post-review hardening (2026-07-13)
+
+Four review rounds (3 pre-PR + 2 post-PR fresh subagents) landed: the `set_routine_enabled` re-entrant
+deadlock (self-caught), the fresh+short-interval worktree footgun (→ fresh⇒daily), aborted-draft meter
+pollution (→ delete_run), the cross-project fixed-workspace bug (→ clear on project switch), a downgraded
+user's orphaned routines (→ manage-not-hide pane), a fixed routine's deleted workspace becoming a silent
+zombie (→ auto-disable), a misleading run-now success toast (→ FireOutcome dispatched/skipped), and copy that
+implied fires happen while the app is closed (→ corrected). The `launch_run` extraction was verified
+byte-for-byte parity with the old inline `start_run`.

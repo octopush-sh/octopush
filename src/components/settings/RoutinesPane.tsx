@@ -62,7 +62,7 @@ export function RoutinesPane() {
       <PaneHeader
         eyebrow="Routines"
         title="Crews that clock in on their own."
-        subtitle="Put a pipeline on a schedule — a review each morning, a dependency sweep every few hours. When a routine fires it runs detached, so the crew keeps going even if Octopush is closed."
+        subtitle="Put a pipeline on a schedule — a review each morning, a dependency sweep every few hours. Routines fire while Octopush is running (a window missed while it was closed catches up on next launch); once a run starts it's detached, so the crew keeps going even if you quit."
       />
 
       <div className="max-w-[720px] space-y-6">

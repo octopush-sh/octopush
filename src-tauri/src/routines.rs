@@ -29,6 +29,17 @@ const TICK_SECS: u64 = 30;
 pub const KIND_INTERVAL: &str = "interval";
 pub const KIND_DAILY: &str = "daily";
 
+/// Whether a routine fire actually dispatched a run (vs. skipped the window —
+/// busy/missing workspace, previous fresh run still active, or a launch
+/// refusal). Lets `run_routine_now` report honestly instead of always
+/// celebrating a dispatch.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FireOutcome {
+    Dispatched,
+    Skipped,
+}
+
 /// Compute a routine's next fire as a UTC RFC3339 string, from its schedule and
 /// a reference instant (`after`, in machine-local time). Pure — the scheduler
 /// passes `Local::now()`, tests pass a fixed instant. `None` for an invalid
@@ -147,7 +158,7 @@ impl Orchestrator {
 
     /// Fire a specific routine now (the "run now" affordance), regardless of
     /// schedule or enabled state — but through the identical guarded fire path.
-    pub async fn run_routine_now(self: Arc<Self>, routine_id: &str) -> crate::error::AppResult<()> {
+    pub async fn run_routine_now(self: Arc<Self>, routine_id: &str) -> crate::error::AppResult<FireOutcome> {
         let routine = self.db()
             .lock()
             .get_routine(routine_id)?
@@ -189,8 +200,9 @@ impl Orchestrator {
 
     /// Fire one due routine: advance its window first (so a crash mid-fire can
     /// never re-fire it), resolve/create its workspace, create the run, stamp
-    /// it on the routine, then launch through the shared guarded path.
-    async fn fire_routine(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<()> {
+    /// it on the routine, then launch through the shared guarded path. Returns
+    /// whether a run was actually dispatched or the window was skipped.
+    async fn fire_routine(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
         // Advance the schedule window BEFORE any side effect (worktree, run):
         // a window must fire at most once, even if the work below crashes or a
         // second tick races. A skip below just consumes this window cleanly.
@@ -204,7 +216,7 @@ impl Orchestrator {
             if let Some(prev) = &r.last_run_id {
                 if let Some(run) = self.db().lock().get_run(prev)? {
                     if run.status == "running" || run.status == "paused" {
-                        return Ok(());
+                        return Ok(FireOutcome::Skipped);
                     }
                 }
             }
@@ -213,7 +225,7 @@ impl Orchestrator {
         let workspace_id = match self.resolve_routine_workspace(r).await? {
             Some(id) => id,
             // A busy fixed workspace (or a missing/off-disk target) — skip.
-            None => return Ok(()),
+            None => return Ok(FireOutcome::Skipped),
         };
 
         let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
@@ -237,8 +249,9 @@ impl Orchestrator {
             // Delete the never-started draft (NOT abort — an aborted run counts
             // in the monthly meter and shows as a settled card; this one never ran).
             let _ = self.db().lock().delete_run(&run_id);
+            return Ok(FireOutcome::Skipped);
         }
-        Ok(())
+        Ok(FireOutcome::Dispatched)
     }
 
     /// Resolve the workspace to run in. `Some(id)` to proceed, `None` to skip
@@ -253,17 +266,31 @@ impl Orchestrator {
                 "routine has no fixed workspace configured".into(),
             ));
         };
-        // Skip cleanly (rather than fire a doomed or refused run) if the
-        // workspace vanished, is busy, or its worktree was deleted off disk —
-        // firing into a missing directory would hard-fail every window forever.
-        let worktree = {
+        // Read the workspace once (drop the guard before any re-lock below —
+        // the mutex is non-reentrant).
+        let (exists, busy, worktree) = {
             let db = self.db().lock();
-            let Some(ws) = db.get_workspace(&ws_id)? else { return Ok(None) };
-            if db.workspace_has_active_run(&ws_id)? {
-                return Ok(None);
+            match db.get_workspace(&ws_id)? {
+                None => (false, false, None),
+                Some(ws) => (true, db.workspace_has_active_run(&ws_id)?, ws.worktree_path),
             }
-            ws.worktree_path
         };
+        // The target workspace was DELETED — the routine can never run again.
+        // Auto-disable it (surfaces as paused in the UI) rather than skipping
+        // every window forever with no signal.
+        if !exists {
+            tracing::warn!(routine = %r.id, workspace = %ws_id, "routine's fixed workspace no longer exists — disabling the routine");
+            self.db()
+                .lock()
+                .set_routine_enabled(&r.id, false, r.next_due_at.as_deref())?;
+            return Ok(None);
+        }
+        // Busy is transient (a previous run is still going) — just skip.
+        if busy {
+            return Ok(None);
+        }
+        // Worktree deleted off disk but the row survives — skip (firing into a
+        // missing directory would hard-fail); don't disable, it may be restored.
         match worktree {
             Some(path) if !std::path::Path::new(&path).is_dir() => {
                 tracing::warn!(routine = %r.id, workspace = %ws_id, "routine's fixed worktree is missing on disk — skipping");

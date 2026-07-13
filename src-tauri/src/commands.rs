@@ -1408,7 +1408,7 @@ pub async fn set_routine_enabled(
 pub async fn run_routine_now(
     orch: State<'_, Arc<Orchestrator>>,
     routine_id: String,
-) -> AppResult<()> {
+) -> AppResult<crate::routines::FireOutcome> {
     require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
     Arc::clone(&*orch).run_routine_now(&routine_id).await
 }

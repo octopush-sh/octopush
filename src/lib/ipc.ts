@@ -928,7 +928,8 @@ export const ipc = {
   deleteRoutine: (routineId: string) => invoke<void>("delete_routine", { routineId }),
   setRoutineEnabled: (routineId: string, enabled: boolean) =>
     invoke<void>("set_routine_enabled", { routineId, enabled }),
-  runRoutineNow: (routineId: string) => invoke<void>("run_routine_now", { routineId }),
+  runRoutineNow: (routineId: string) =>
+    invoke<"dispatched" | "skipped">("run_routine_now", { routineId }),
 
   createRun: (
     workspaceId: string,

@@ -4437,6 +4437,31 @@ mod orchestrator_tests {
         assert!(db.lock().list_routines().unwrap().is_empty());
     }
 
+    /// A fixed routine whose target workspace was deleted auto-disables (rather
+    /// than skipping every window forever with no signal), and reports Skipped.
+    #[tokio::test]
+    async fn routine_with_deleted_fixed_workspace_auto_disables() {
+        use crate::routines::FireOutcome;
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RPG", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "daily", "09:00");
+        input.fixed_workspace_id = Some("ghost-ws".into()); // never existed
+        db.lock().insert_routine("r-ghost", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = orch.run_routine_now("r-ghost").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped);
+        assert!(
+            !db.lock().get_routine("r-ghost").unwrap().unwrap().enabled,
+            "a routine pointing at a deleted workspace disables itself"
+        );
+    }
+
     /// The fixed-mode overlap guard reads active runs in the target workspace.
     #[test]
     fn workspace_has_active_run_reflects_running_peers() {

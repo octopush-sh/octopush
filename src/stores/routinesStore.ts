@@ -92,8 +92,12 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
 
   runNow: async (id) => {
     try {
-      await ipc.runRoutineNow(id);
-      pushToast({ level: "success", title: "Routine dispatched", body: "The crew is on it — follow along in Mission Control." });
+      const outcome = await ipc.runRoutineNow(id);
+      if (outcome === "dispatched") {
+        pushToast({ level: "success", title: "Routine dispatched", body: "The crew is on it — follow along in Mission Control." });
+      } else {
+        pushToast({ level: "info", title: "Nothing to run", body: "The window was skipped — its workspace is busy, or a previous run is still going." });
+      }
       await get().load();
     } catch (e) {
       handleError(e, "Couldn't run the routine");
