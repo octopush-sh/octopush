@@ -3303,12 +3303,22 @@ impl Db {
     }
 
     /// Advance `next_due_at` WITHOUT recording a fire — used when a due window
-    /// is skipped (workspace busy / previous fresh run still active), so the
-    /// scheduler doesn't retry every tick.
+    /// is skipped (workspace busy / previous fresh run still active) OR up
+    /// front on every fire (so a crash mid-fire can't re-fire the window).
     pub fn set_routine_next_due(&self, id: &str, next_due_at: Option<&str>) -> AppResult<()> {
         self.conn.execute(
             "UPDATE routines SET next_due_at = ?2 WHERE id = ?1",
             params![id, next_due_at],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a fire's run onto the routine (`last_fired_at`/`last_run_id`) —
+    /// paired with `set_routine_next_due`, which the scheduler calls first.
+    pub fn stamp_routine_run(&self, id: &str, run_id: &str, fired_at: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET last_fired_at = ?2, last_run_id = ?3 WHERE id = ?1",
+            params![id, fired_at, run_id],
         )?;
         Ok(())
     }

@@ -84,6 +84,21 @@ pub fn validate_schedule(kind: &str, spec: &str) -> Result<(), String> {
     }
 }
 
+/// Cross-field validation at authoring time. Phase-1 rule: a `fresh`-workspace
+/// routine must be `daily`. A fresh fire creates a NEW worktree, and phase 1
+/// has no auto-reaper — a sub-daily `fresh` cadence (e.g. every minute) would
+/// generate worktrees without bound. Daily caps it to one/day (the accepted
+/// no-reaper tradeoff) and matches fresh's natural "a clean PR each morning"
+/// shape. Frequent-fresh returns with the retention reaper in phase 2.
+pub fn validate_routine(workspace_mode: &str, schedule_kind: &str) -> Result<(), String> {
+    if workspace_mode == "fresh" && schedule_kind != KIND_DAILY {
+        return Err(
+            "a fresh-workspace routine must run daily — a new worktree per run needs a daily cadence (frequent fresh runs arrive with automatic cleanup)".into(),
+        );
+    }
+    Ok(())
+}
+
 fn parse_hhmm(spec: &str) -> Option<(u32, u32)> {
     let (h, m) = spec.trim().split_once(':')?;
     let hh: u32 = h.parse().ok()?;
@@ -172,25 +187,33 @@ impl Orchestrator {
         self.db().lock().set_routine_next_due(&r.id, next.as_deref())
     }
 
-    /// Fire one due routine: resolve/create its workspace, create the run,
-    /// record the window, then launch through the shared guarded path.
+    /// Fire one due routine: advance its window first (so a crash mid-fire can
+    /// never re-fire it), resolve/create its workspace, create the run, stamp
+    /// it on the routine, then launch through the shared guarded path.
     async fn fire_routine(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<()> {
+        // Advance the schedule window BEFORE any side effect (worktree, run):
+        // a window must fire at most once, even if the work below crashes or a
+        // second tick races. A skip below just consumes this window cleanly.
+        let next = next_due_for(r, Local::now());
+        self.db().lock().set_routine_next_due(&r.id, next.as_deref())?;
+
         // Runaway guard (fresh mode): don't stack a new worktree while this
-        // routine's previous crew is still active — skip this window.
+        // routine's previous crew is still active — skip this (already-advanced)
+        // window.
         if r.workspace_mode == "fresh" {
             if let Some(prev) = &r.last_run_id {
                 if let Some(run) = self.db().lock().get_run(prev)? {
                     if run.status == "running" || run.status == "paused" {
-                        return self.advance_routine_window(r);
+                        return Ok(());
                     }
                 }
             }
         }
 
-        let workspace_id = match self.resolve_routine_workspace(r)? {
+        let workspace_id = match self.resolve_routine_workspace(r).await? {
             Some(id) => id,
-            // A busy fixed workspace (or a missing target) — skip this window.
-            None => return self.advance_routine_window(r),
+            // A busy fixed workspace (or a missing/off-disk target) — skip.
+            None => return Ok(()),
         };
 
         let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
@@ -203,12 +226,10 @@ impl Orchestrator {
             &overrides,
         )?;
 
-        // Record the fire + advance the window BEFORE the launch's side effects,
-        // so a crash or a double tick can't fire the same window twice.
-        let next = next_due_for(r, Local::now());
+        // Stamp the run onto the routine (the window was already advanced above).
         self.db()
             .lock()
-            .mark_routine_fired(&r.id, &run_id, &Utc::now().to_rfc3339(), next.as_deref())?;
+            .stamp_routine_run(&r.id, &run_id, &Utc::now().to_rfc3339())?;
 
         // The single shared guarded launch (quota / parallel / lease / detached).
         if let Err(e) = launch::launch_run(self, self.db(), &run_id, r.budget_usd).await {
@@ -221,10 +242,10 @@ impl Orchestrator {
     }
 
     /// Resolve the workspace to run in. `Some(id)` to proceed, `None` to skip
-    /// this window (fixed workspace missing or busy).
-    fn resolve_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<Option<String>> {
+    /// this window (fixed workspace missing/off-disk or busy).
+    async fn resolve_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<Option<String>> {
         if r.workspace_mode == "fresh" {
-            return self.create_fresh_routine_workspace(r).map(Some);
+            return self.create_fresh_routine_workspace(r).await.map(Some);
         }
         // Fixed mode.
         let Some(ws_id) = r.fixed_workspace_id.clone() else {
@@ -232,19 +253,32 @@ impl Orchestrator {
                 "routine has no fixed workspace configured".into(),
             ));
         };
-        // Skip if the workspace vanished or is busy (a fire would be refused by
-        // has_concurrent_run — skip cleanly rather than create a doomed run).
-        let db = self.db().lock();
-        if db.get_workspace(&ws_id)?.is_none() || db.workspace_has_active_run(&ws_id)? {
-            return Ok(None);
+        // Skip cleanly (rather than fire a doomed or refused run) if the
+        // workspace vanished, is busy, or its worktree was deleted off disk —
+        // firing into a missing directory would hard-fail every window forever.
+        let worktree = {
+            let db = self.db().lock();
+            let Some(ws) = db.get_workspace(&ws_id)? else { return Ok(None) };
+            if db.workspace_has_active_run(&ws_id)? {
+                return Ok(None);
+            }
+            ws.worktree_path
+        };
+        match worktree {
+            Some(path) if !std::path::Path::new(&path).is_dir() => {
+                tracing::warn!(routine = %r.id, workspace = %ws_id, "routine's fixed worktree is missing on disk — skipping");
+                Ok(None)
+            }
+            _ => Ok(Some(ws_id)),
         }
-        Ok(Some(ws_id))
     }
 
     /// Create a fresh worktree for this fire, on a UNIQUE branch (the routine's
     /// prefix + a timestamp + a short id) so `workspace::create`'s
-    /// idempotency-on-branch yields a genuinely clean tree each time.
-    fn create_fresh_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<String> {
+    /// idempotency-on-branch yields a genuinely clean tree each time. The git
+    /// checkout runs on a blocking thread so a large-repo fire can't stall the
+    /// async runtime (the DB mutex is not held across it).
+    async fn create_fresh_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<String> {
         // (id, name, path)
         let project = self.db()
             .lock()
@@ -253,27 +287,36 @@ impl Orchestrator {
         let project_path = project.2;
         let stamp = Local::now().format("%Y%m%d-%H%M%S");
         let short = uuid::Uuid::new_v4().to_string();
-        let short = &short[..6];
+        let short = short[..6].to_string();
         let prefix = r
             .branch_prefix
             .as_deref()
             .map(str::trim)
             .filter(|p| !p.is_empty())
-            .unwrap_or("routine");
+            .unwrap_or("routine")
+            .to_string();
         let branch = format!("{prefix}/{stamp}-{short}");
         let name = format!("{} · {stamp}", r.name);
-        let base = r.base_branch.as_deref().unwrap_or("");
-        let (ws, _outcome) = crate::workspace::create(
-            self.db(),
-            &r.project_id,
-            Path::new(&project_path),
-            &name,
-            &r.task,
-            &branch,
-            base,
-            "",
-        )?;
-        Ok(ws.id)
+        let base = r.base_branch.as_deref().unwrap_or("").to_string();
+        let db = self.db().clone();
+        let project_id = r.project_id.clone();
+        let task = r.task.clone();
+        let ws = tokio::task::spawn_blocking(move || {
+            crate::workspace::create(
+                &db,
+                &project_id,
+                Path::new(&project_path),
+                &name,
+                &task,
+                &branch,
+                &base,
+                "",
+            )
+            .map(|(ws, _outcome)| ws)
+        })
+        .await
+        .map_err(|e| crate::error::AppError::Other(format!("worktree task panicked: {e}")))?;
+        ws.map(|w| w.id)
     }
 }
 

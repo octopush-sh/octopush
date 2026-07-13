@@ -37,15 +37,28 @@ unit-testable without a clock. Weekly/cron are deferred (no cron crate; not wort
 - **`fixed`** (recommended, simple): the routine targets an existing workspace; each fire runs the pipeline
   there. Overlap is naturally prevented by `has_concurrent_run` (a still-running fire → the next is skipped +
   logged). Right for recurring audits / triage / a long-lived branch.
-- **`fresh`**: each fire creates a NEW worktree with a **unique timestamped branch** (`{branch_prefix}-{ts}`)
+- **`fresh`**: each fire creates a NEW worktree with a **unique timestamped branch** (`{branch_prefix}-{ts}-{id6}`)
   off `base_branch` — a genuinely clean tree per fire (the "PR waiting each morning" mode). Because
   `workspace::create` is idempotent on `(project, branch)`, uniqueness is mandatory; a fixed branch would
-  return last fire's dirty tree.
+  return last fire's dirty tree. The git checkout runs on a `spawn_blocking` thread (a big repo can't stall
+  the async runtime).
+  - **Fresh ⇒ daily (phase-1 rule, `validate_routine`):** because there is **no auto-reaper yet**, a fresh
+    routine must be `daily` — one worktree/day, the accepted no-reaper rate. A sub-daily fresh cadence (e.g.
+    `interval=60s`) would generate worktrees without bound (~1,440/day), so it's rejected at create/update
+    and hidden in the editor. Frequent-fresh returns with the phase-2 retention reaper.
   - **Runaway guard:** a `fresh` routine will not fire while its own previous run (`last_run_id`) is still
-    active — bounds accumulation to ~one worktree per cadence.
+    active — so a crew parked at a gate holds at exactly one live worktree, not a stack.
   - **No auto-reaper in phase 1** (documented limitation): fresh workspaces persist for review; the user
     archives them via the existing workspace flow. Phase 2 adds retention (auto-archive terminal routine
-    workspaces older than N days).
+    workspaces older than N days) and re-opens frequent-fresh.
+  - **Refusal cleanup:** a run refused at launch is **deleted** (not aborted — an aborted run counts in the
+    monthly meter and shows as a settled card). For a Pro user (the only routine owner) launch is
+    essentially never refused, so this path is near-unreachable; a fresh workspace it leaves is the one
+    documented edge (phase-2 reaper territory).
+
+**Fire ordering (crash-safe):** the scheduler advances `next_due` **first**, before creating any worktree or
+run, so a crash or a raced tick can never fire one window twice; the run is stamped onto the routine
+(`last_fired_at`/`last_run_id`) only after it's created.
 
 ## The guard-sharing spine (correctness)
 

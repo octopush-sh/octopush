@@ -1328,6 +1328,14 @@ fn routine_next_due(kind: &str, spec: &str) -> AppResult<Option<String>> {
     Ok(crate::routines::next_due(kind, spec, chrono::Local::now()))
 }
 
+/// Full input validation (schedule spec + cross-field rules like fresh⇒daily),
+/// shared by create and update.
+fn validate_routine_input(input: &crate::db::RoutineInput) -> AppResult<Option<String>> {
+    crate::routines::validate_routine(&input.workspace_mode, &input.schedule_kind)
+        .map_err(AppError::Other)?;
+    routine_next_due(&input.schedule_kind, &input.schedule_spec)
+}
+
 #[tauri::command]
 pub async fn list_routines(state: State<'_, AppState>) -> AppResult<Vec<crate::db::RoutineRow>> {
     state.db.lock().list_routines()
@@ -1339,7 +1347,7 @@ pub async fn create_routine(
     input: crate::db::RoutineInput,
 ) -> AppResult<String> {
     require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
-    let next_due = routine_next_due(&input.schedule_kind, &input.schedule_spec)?;
+    let next_due = validate_routine_input(&input)?;
     let id = uuid::Uuid::new_v4().to_string();
     state.db.lock().insert_routine(&id, &input, next_due.as_deref())?;
     Ok(id)
@@ -1352,7 +1360,7 @@ pub async fn update_routine(
     input: crate::db::RoutineInput,
 ) -> AppResult<()> {
     require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
-    let next_due = routine_next_due(&input.schedule_kind, &input.schedule_spec)?;
+    let next_due = validate_routine_input(&input)?;
     state.db.lock().update_routine(&routine_id, &input, next_due.as_deref())
 }
 

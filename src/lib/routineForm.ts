@@ -82,6 +82,15 @@ export function draftFromRoutine(r: Routine | null, defaultProject: string): Rou
   };
 }
 
+/** Validate a daily "HH:MM" with 24-hour bounds (mirrors the backend). */
+function validDailyTime(spec: string): boolean {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(spec.trim());
+  if (!m) return false;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  return hh < 24 && mm < 60;
+}
+
 /** Build the wire input, or an error string if the draft is incomplete. */
 export function draftToInput(d: RoutineDraft): RoutineInput | string {
   if (!d.name.trim()) return "Give the routine a name.";
@@ -89,6 +98,10 @@ export function draftToInput(d: RoutineDraft): RoutineInput | string {
   if (!d.pipelineId) return "Choose a pipeline.";
   if (d.workspaceMode === "fixed" && !d.fixedWorkspaceId)
     return "Choose a workspace, or switch to a fresh one each run.";
+  // Phase-1 rule (mirrors the backend): a fresh worktree per run needs a daily
+  // cadence — there's no automatic cleanup yet.
+  if (d.workspaceMode === "fresh" && d.scheduleKind !== "daily")
+    return "A fresh-workspace routine runs daily (frequent fresh runs arrive with automatic cleanup).";
 
   let scheduleSpec: string;
   if (d.scheduleKind === "interval") {
@@ -98,12 +111,12 @@ export function draftToInput(d: RoutineDraft): RoutineInput | string {
     if (secs < 60) return "The interval must be at least a minute.";
     scheduleSpec = String(Math.round(secs));
   } else {
-    if (!/^\d{1,2}:\d{2}$/.test(d.dailyTime.trim())) return "Daily time must be HH:MM.";
+    if (!validDailyTime(d.dailyTime)) return "Daily time must be HH:MM (24-hour).";
     scheduleSpec = d.dailyTime.trim();
   }
 
   const budget = d.budgetUsd.trim() === "" ? null : Number(d.budgetUsd);
-  if (budget != null && (!Number.isFinite(budget) || budget < 0)) return "Budget must be a positive number.";
+  if (budget != null && (!Number.isFinite(budget) || budget < 0)) return "Budget must be zero or a positive number.";
 
   return {
     name: d.name.trim(),

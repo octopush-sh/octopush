@@ -4386,6 +4386,18 @@ mod orchestrator_tests {
         assert!(validate_schedule("cron", "* * * * *").is_err());
     }
 
+    /// Phase-1 cross-field rule: a fresh-workspace routine must be daily (no
+    /// auto-reaper yet — a sub-daily fresh cadence would spawn worktrees
+    /// without bound). Fixed mode is unconstrained.
+    #[test]
+    fn routine_validate_fresh_requires_daily() {
+        use crate::routines::validate_routine;
+        assert!(validate_routine("fresh", "daily").is_ok());
+        assert!(validate_routine("fresh", "interval").is_err());
+        assert!(validate_routine("fixed", "interval").is_ok());
+        assert!(validate_routine("fixed", "daily").is_ok());
+    }
+
     /// CRUD roundtrip + the due filter: a routine is `due` only when enabled and
     /// its `next_due_at` is in the past.
     #[test]

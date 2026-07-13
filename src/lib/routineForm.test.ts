@@ -64,10 +64,21 @@ describe("draftToInput validation", () => {
     expect(draftToInput({ ...baseDraft, scheduleKind: "interval", intervalValue: "0.5", intervalUnit: "minutes" })).toContain("at least a minute");
   });
 
-  it("validates the daily HH:MM shape", () => {
-    expect(draftToInput({ ...baseDraft, scheduleKind: "daily", dailyTime: "9am" })).toBe("Daily time must be HH:MM.");
+  it("validates the daily HH:MM shape with 24-hour bounds", () => {
+    expect(draftToInput({ ...baseDraft, scheduleKind: "daily", dailyTime: "9am" })).toContain("HH:MM");
+    expect(draftToInput({ ...baseDraft, scheduleKind: "daily", dailyTime: "25:00" })).toContain("HH:MM");
+    expect(draftToInput({ ...baseDraft, scheduleKind: "daily", dailyTime: "12:70" })).toContain("HH:MM");
     const ok = draftToInput({ ...baseDraft, scheduleKind: "daily", dailyTime: "07:30" });
     expect(typeof ok === "object" && ok.scheduleSpec).toBe("07:30");
+  });
+
+  it("forbids a fresh workspace on a non-daily schedule (phase-1 rule)", () => {
+    expect(
+      draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "interval", fixedWorkspaceId: "" }),
+    ).toContain("fresh-workspace routine runs daily");
+    // fresh + daily is allowed.
+    const ok = draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "daily", fixedWorkspaceId: "" });
+    expect(typeof ok).toBe("object");
   });
 
   it("drops the fixed workspace and keeps branch fields in fresh mode", () => {

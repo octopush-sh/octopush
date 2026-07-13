@@ -11,6 +11,7 @@ import { usePipelineStore } from "../../stores/pipelineStore";
 import { useEntitlementStore } from "../../stores/entitlementStore";
 import { ipc, type Routine } from "../../lib/ipc";
 import type { Workspace } from "../../lib/types";
+import { pushToast } from "../Toasts";
 import {
   draftFromRoutine,
   draftToInput,
@@ -47,6 +48,15 @@ export function RoutinesPane() {
     return (id: string) => m.get(id) ?? "unknown project";
   }, [recent]);
 
+  const openUpgrade = async () => {
+    try {
+      const url = await ipc.billingCheckoutUrl();
+      await ipc.openFileInSystem(url);
+    } catch {
+      pushToast({ level: "error", title: "Couldn't open checkout" });
+    }
+  };
+
   return (
     <>
       <PaneHeader
@@ -62,6 +72,13 @@ export function RoutinesPane() {
           <p className="mx-auto mt-2 max-w-[46ch] text-[12px] leading-[1.55] text-octo-sage">
             Upgrade to let saved pipelines run themselves on a cadence you set.
           </p>
+          <button
+            type="button"
+            onClick={() => void openUpgrade()}
+            className="mt-5 rounded-md border border-octo-brass px-4 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
+          >
+            Upgrade to Pro
+          </button>
         </div>
       ) : (
         <div className="max-w-[720px] space-y-6">
@@ -193,16 +210,37 @@ function RoutineEditor({
   const [saving, setSaving] = useState(false);
   const set = <K extends keyof RoutineDraft>(k: K, v: RoutineDraft[K]) => setDraft((d) => ({ ...d, [k]: v }));
 
-  // Load workspaces for the chosen project (fixed mode).
+  // Switching project invalidates the chosen fixed workspace (it belongs to
+  // the old project) — clear it so a stale id can't be saved silently.
+  const onProjectChange = (v: string) => setDraft((d) => ({ ...d, projectId: v, fixedWorkspaceId: "" }));
+
+  // A fresh-workspace routine must be daily (phase-1 rule) — force it when the
+  // user picks fresh, so the schedule control can't hold an invalid combo.
+  const onWorkspaceMode = (v: "fixed" | "fresh") =>
+    setDraft((d) => ({ ...d, workspaceMode: v, scheduleKind: v === "fresh" ? "daily" : d.scheduleKind }));
+
+  // Load workspaces for the chosen project (fixed mode). Clear any stale
+  // selection if the reloaded list no longer contains it.
   useEffect(() => {
     if (!draft.projectId) {
       setWorkspaces([]);
       return;
     }
     let cancelled = false;
-    void ipc.listWorkspaces(draft.projectId).then((ws) => {
-      if (!cancelled) setWorkspaces(ws);
-    });
+    ipc
+      .listWorkspaces(draft.projectId)
+      .then((ws) => {
+        if (cancelled) return;
+        setWorkspaces(ws);
+        setDraft((d) =>
+          d.fixedWorkspaceId && !ws.some((w) => w.id === d.fixedWorkspaceId)
+            ? { ...d, fixedWorkspaceId: "" }
+            : d,
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaces([]);
+      });
     return () => {
       cancelled = true;
     };
@@ -214,8 +252,13 @@ function RoutineEditor({
       setError(input);
       return;
     }
+    // Preserve fields the editor doesn't surface (reference model, per-stage
+    // overrides) so editing a routine authored elsewhere doesn't wipe them.
+    const full = routine
+      ? { ...input, referenceModel: routine.referenceModel, stageOverrides: routine.stageOverrides }
+      : input;
     setSaving(true);
-    const ok = routine ? await update(routine.id, input) : await create(input);
+    const ok = routine ? await update(routine.id, full) : await create(full);
     setSaving(false);
     if (ok) onClose();
   };
@@ -239,7 +282,7 @@ function RoutineEditor({
 
           <div className="grid grid-cols-2 gap-4">
             <Field label="Project">
-              <Select value={draft.projectId} onChange={(v) => set("projectId", v)}>
+              <Select value={draft.projectId} onChange={onProjectChange}>
                 <option value="">Choose…</option>
                 {projects.map((p) => (
                   <option key={p.id} value={p.id}>{p.name}</option>
@@ -260,10 +303,15 @@ function RoutineEditor({
             <div className="flex flex-wrap items-center gap-2">
               <Segmented
                 value={draft.scheduleKind}
-                options={[
-                  { value: "daily", label: "Daily at" },
-                  { value: "interval", label: "Every" },
-                ]}
+                options={
+                  // Fresh routines are daily-only in phase 1 — offer just Daily.
+                  draft.workspaceMode === "fresh"
+                    ? [{ value: "daily", label: "Daily at" }]
+                    : [
+                        { value: "daily", label: "Daily at" },
+                        { value: "interval", label: "Every" },
+                      ]
+                }
                 onChange={(v) => set("scheduleKind", v as "interval" | "daily")}
               />
               {draft.scheduleKind === "daily" ? (
@@ -304,7 +352,7 @@ function RoutineEditor({
                 { value: "fixed", label: "A fixed workspace" },
                 { value: "fresh", label: "Fresh each run" },
               ]}
-              onChange={(v) => set("workspaceMode", v as "fixed" | "fresh")}
+              onChange={(v) => onWorkspaceMode(v as "fixed" | "fresh")}
             />
             {draft.workspaceMode === "fixed" ? (
               <div className="mt-2">
@@ -323,7 +371,7 @@ function RoutineEditor({
                 <TextInput value={draft.baseBranch} onChange={(v) => set("baseBranch", v)} placeholder="base branch (blank = default)" />
                 <TextInput value={draft.branchPrefix} onChange={(v) => set("branchPrefix", v)} placeholder="branch prefix" />
                 <p className="col-span-2 text-[11px] leading-snug text-octo-mute">
-                  A new worktree is created each fire, on a unique branch — the isolated way to ship a change every run.
+                  A new worktree is created each run, on a unique branch — the isolated way to ship a change every day. Fresh runs are daily.
                 </p>
               </div>
             )}
