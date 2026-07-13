@@ -3313,6 +3313,16 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a run and its stages (FK cascade). Used to clean up a routine's
+    /// draft run that was refused at launch and never started — leaving it
+    /// `aborted` would wrongly count it in the monthly meter (`status !=
+    /// 'draft'`) and surface it as a settled card. Only ever called on a
+    /// never-started draft.
+    pub fn delete_run(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM runs WHERE id = ?1", params![run_id])?;
+        Ok(())
+    }
+
     /// `true` if the workspace has a `running`/`paused` run — the fixed-mode
     /// overlap guard (a fresh fire would be refused by `has_concurrent_run`).
     pub fn workspace_has_active_run(&self, workspace_id: &str) -> AppResult<bool> {

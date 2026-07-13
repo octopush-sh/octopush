@@ -213,8 +213,9 @@ impl Orchestrator {
         // The single shared guarded launch (quota / parallel / lease / detached).
         if let Err(e) = launch::launch_run(self, self.db(), &run_id, r.budget_usd).await {
             tracing::warn!(routine = %r.id, run = %run_id, error = %e, "routine run refused at launch");
-            // Don't leave a stuck draft that never started.
-            let _ = self.db().lock().set_run_status(&run_id, "aborted", true);
+            // Delete the never-started draft (NOT abort — an aborted run counts
+            // in the monthly meter and shows as a settled card; this one never ran).
+            let _ = self.db().lock().delete_run(&run_id);
         }
         Ok(())
     }

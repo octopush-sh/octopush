@@ -1373,27 +1373,23 @@ pub async fn set_routine_enabled(
     if enabled {
         require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
     }
-    // Enabling re-seats the schedule from now; disabling leaves next_due as-is.
+    // Read the routine once (its own lock, released before the write below —
+    // parking_lot's mutex is NOT re-entrant, so the receiver-and-argument must
+    // never both take the lock in one statement).
+    let routine = state
+        .db
+        .lock()
+        .get_routine(&routine_id)?
+        .ok_or_else(|| AppError::Other("routine not found".into()))?;
+    // Enabling re-seats the schedule from now; disabling preserves the stored
+    // next_due (re-enabling from the UI is then instant) — the scheduler
+    // ignores disabled rows regardless.
     let next_due = if enabled {
-        let r = state
-            .db
-            .lock()
-            .get_routine(&routine_id)?
-            .ok_or_else(|| AppError::Other("routine not found".into()))?;
-        routine_next_due(&r.schedule_kind, &r.schedule_spec)?
+        routine_next_due(&routine.schedule_kind, &routine.schedule_spec)?
     } else {
-        None
+        routine.next_due_at
     };
-    if enabled {
-        state.db.lock().set_routine_enabled(&routine_id, true, next_due.as_deref())
-    } else {
-        // Preserve next_due on disable so re-enabling from the UI is instant;
-        // the scheduler ignores disabled rows regardless.
-        state.db.lock().set_routine_enabled(&routine_id, false, {
-            let existing = state.db.lock().get_routine(&routine_id)?;
-            existing.and_then(|r| r.next_due_at)
-        }.as_deref())
-    }
+    state.db.lock().set_routine_enabled(&routine_id, enabled, next_due.as_deref())
 }
 
 /// Fire a routine immediately (the "run now" test affordance), independent of
