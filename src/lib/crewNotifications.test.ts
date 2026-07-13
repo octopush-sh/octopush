@@ -1,6 +1,9 @@
-/** decideNotification — the pure anti-noise contract of crew notifications. */
+/** The pure notification decisions — needs-you (checkpoint) + finished. */
 import { describe, it, expect } from "vitest";
-import { decideNotification } from "./crewNotifications";
+import {
+  decideCompletionNotification,
+  decideCheckpointNotification,
+} from "./crewNotifications";
 import type { Run } from "./ipc";
 
 const run = (status: Run["status"], over: Partial<Run> = {}): Run => ({
@@ -9,41 +12,53 @@ const run = (status: Run["status"], over: Partial<Run> = {}): Run => ({
   createdAt: "t", finishedAt: null, budgetUsd: null, ...over,
 });
 
-describe("decideNotification", () => {
-  it("running → paused: the crew needs you", () => {
-    const n = decideNotification("running", run("paused"), "checkout-flow");
+describe("decideCheckpointNotification (needs you)", () => {
+  it("fires once per parked stage, with workspace and task", () => {
+    const seen = new Set<string>();
+    const n = decideCheckpointNotification("st1", seen, run("paused"), "checkout-flow");
     expect(n?.title).toBe("The crew needs you");
     expect(n?.body).toContain("checkout-flow");
     expect(n?.body).toContain("Add CSV export");
   });
 
-  it("running → completed: crew finished, with the cost", () => {
-    const n = decideNotification("running", run("completed"), "checkout-flow");
+  it("dedupes a re-emitted checkpoint for the same stage", () => {
+    const seen = new Set(["st1"]);
+    expect(decideCheckpointNotification("st1", seen, run("paused"), "ws")).toBeNull();
+  });
+
+  it("stays silent when the run row isn't hydrated yet — silent beats wrong", () => {
+    expect(decideCheckpointNotification("st1", new Set(), undefined, null)).toBeNull();
+  });
+});
+
+describe("decideCompletionNotification (finished)", () => {
+  it("active → completed: crew finished with the cost", () => {
+    const n = decideCompletionNotification("running", run("completed"), "checkout-flow");
     expect(n?.title).toBe("Crew finished");
     expect(n?.body).toContain("$0.42");
   });
 
   it("aborted is the director's own hand — silence", () => {
-    expect(decideNotification("running", run("aborted"), "ws")).toBeNull();
+    expect(decideCompletionNotification("running", run("aborted"), "ws")).toBeNull();
   });
 
-  it("first sight records but never notifies", () => {
-    expect(decideNotification(undefined, run("paused"), "ws")).toBeNull();
+  it("a paused transition is NOT completion news (checkpoints own needs-you)", () => {
+    expect(decideCompletionNotification("running", run("paused"), "ws")).toBeNull();
   });
 
-  it("same status re-observed is not news", () => {
-    expect(decideNotification("paused", run("paused"), "ws")).toBeNull();
+  it("first sight records but never notifies; same status is not news", () => {
+    expect(decideCompletionNotification(undefined, run("completed"), "ws")).toBeNull();
+    expect(decideCompletionNotification("completed", run("completed"), "ws")).toBeNull();
   });
 
-  it("a draft becoming active is not news either", () => {
-    expect(decideNotification("draft", run("running"), "ws")).toBeNull();
-    expect(decideNotification("draft", run("completed"), "ws")).toBeNull();
+  it("drafts becoming active are not news", () => {
+    expect(decideCompletionNotification("draft", run("completed"), "ws")).toBeNull();
   });
 
-  it("long tasks are trimmed; a missing workspace name degrades honestly", () => {
-    const n = decideNotification("running", run("paused", { task: "x".repeat(200) }), null);
-    expect(n?.body.length).toBeLessThan(120);
+  it("long tasks trim surrogate-safe; a missing workspace name degrades honestly", () => {
+    const emojiTask = "x".repeat(69) + "🐙" + "y".repeat(50);
+    const n = decideCompletionNotification("running", run("completed", { task: emojiTask }), null);
     expect(n?.body).toContain("a workspace");
-    expect(n?.body).toContain("…");
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(n!.body)).toBe(false);
   });
 });

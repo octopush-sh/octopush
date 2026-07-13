@@ -397,3 +397,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       notifications: { ...s.notifications, [workspaceId]: 0 },
     })),
 }));
+
+/** The workspace's display name from whichever project list holds it — the
+ *  ONE lookup shared by Mission Control, crew notifications, and friends. */
+export function findWorkspaceName(
+  workspacesByProjectId: Record<string, { id: string; name: string }[]>,
+  workspaceId: string,
+): string | null {
+  for (const list of Object.values(workspacesByProjectId)) {
+    const ws = list.find((w) => w.id === workspaceId);
+    if (ws) return ws.name;
+  }
+  return null;
+}

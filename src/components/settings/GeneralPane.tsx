@@ -49,7 +49,7 @@ export function GeneralPane() {
           />
           <ToggleRow
             label="Notify when a crew needs you"
-            description="A native notification when a Direct run reaches a gate, halts, or finishes while Octopush isn't focused — so a fleet can work unattended."
+            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused. So a fleet can work unattended."
             checked={crewNotifications}
             onChange={setCrewNotifications}
           />

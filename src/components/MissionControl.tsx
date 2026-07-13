@@ -11,7 +11,7 @@ import { useShallow } from "zustand/react/shallow";
 import { Plus, Square, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
-import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
 import { runStatusMeta, isTransientHalt, needsYou } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
 import { stageTitle } from "../lib/stageMeta";
@@ -499,15 +499,9 @@ function useTimeInState(sinceIso: string | null): string {
   return `${h}h ${mm}m`;
 }
 
-/** The workspace's display name, from whichever project list holds it. */
+/** The workspace's display name — thin hook over the shared selector. */
 function useWorkspaceName(workspaceId: string): string | null {
   return useWorkspaceStore(
-    useShallow((s) => {
-      for (const list of Object.values(s.workspacesByProjectId)) {
-        const ws = list.find((w) => w.id === workspaceId);
-        if (ws) return ws.name;
-      }
-      return null;
-    }),
+    useShallow((s) => findWorkspaceName(s.workspacesByProjectId, workspaceId)),
   );
 }
