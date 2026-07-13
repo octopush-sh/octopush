@@ -4110,7 +4110,10 @@ mod orchestrator_tests {
         db.lock().set_run_status(&run_id, "running", false).unwrap();
         // A live worker: reserved by the app, confirmed + beating.
         assert!(db.lock().reserve_worker_lease(&run_id, "nonce-1").unwrap());
-        assert!(db.lock().confirm_worker_lease(&run_id, "nonce-1", 4242).unwrap());
+        // A pid beyond every OS's pid space: the liveness probe must read DEAD
+        // once the heartbeat goes stale (a small literal pid could be a real,
+        // living process on the test machine — flaky).
+        assert!(db.lock().confirm_worker_lease(&run_id, "nonce-1", i32::MAX as i64).unwrap());
 
         assert_eq!(db.lock().recover_interrupted_runs().unwrap(), 0);
         let stages = db.lock().list_run_stages(&run_id).unwrap();

@@ -11,6 +11,28 @@ use uuid::Uuid;
 /// Idempotently add a SQLite column. SQLite has no `ADD COLUMN IF NOT EXISTS`,
 /// so we run the ALTER and ignore the specific "duplicate column name" error.
 /// Any other error (corrupted DB, locked file, disk full) is propagated.
+/// Is the lease-owning worker process still alive? `kill(pid, 0)` probes
+/// without signaling (EPERM would also mean "exists", but workers run as the
+/// same user). Only meaningful on unix; elsewhere the heartbeat is the sole
+/// liveness signal.
+fn lease_owner_alive(pid: Option<i64>) -> bool {
+    #[cfg(unix)]
+    {
+        match pid {
+            Some(p) if p > 0 && p <= i32::MAX as i64 => {
+                // SAFETY: kill(pid, 0) performs no action — existence probe only.
+                unsafe { libc::kill(p as i32, 0) == 0 }
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 fn add_column_if_missing(conn: &rusqlite::Connection, alter_sql: &str) -> rusqlite::Result<()> {
     match conn.execute(alter_sql, []) {
         Ok(_) => Ok(()),
@@ -2980,18 +3002,29 @@ impl Db {
         Ok(())
     }
 
-    /// `true` while a worker lease exists with a fresh heartbeat — the signal
-    /// that an out-of-process worker owns this run RIGHT NOW.
+    /// `true` while a worker lease is LIVE: nonce present AND (heartbeat
+    /// fresh OR the owner pid still alive). The pid check exists for the
+    /// sleep race — after a long system sleep every heartbeat is stale the
+    /// instant the machine wakes, and repairing a healthy overnight crew on
+    /// that evidence would defeat the whole feature. A reused pid can delay a
+    /// repair (the run stays "running"; abort remains available), but it
+    /// self-heals when that process exits — the safer failure by far.
     pub fn worker_lease_fresh(&self, run_id: &str) -> AppResult<bool> {
-        let row: Option<(Option<String>, Option<String>)> = self
+        let row: Option<(Option<String>, Option<String>, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT worker_nonce, heartbeat_at FROM runs WHERE id = ?1",
+                "SELECT worker_nonce, heartbeat_at, worker_pid FROM runs WHERE id = ?1",
                 params![run_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        Ok(matches!(row, Some((Some(_), Some(hb))) if hb >= Self::lease_stale_before()))
+        Ok(match row {
+            Some((Some(_), hb, pid)) => {
+                matches!(&hb, Some(hb) if *hb >= Self::lease_stale_before())
+                    || lease_owner_alive(pid)
+            }
+            _ => false,
+        })
     }
 
     /// Every run currently carrying a worker lease (fresh or stale) — the
@@ -3004,22 +3037,30 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Repair every stale-leased run (its worker died mid-segment) and return
-    /// the repaired ids so the bridge can emit their updated state. Fresh
-    /// leases are untouched.
+    /// Repair every DEAD-leased run (its worker died mid-segment) and return
+    /// the repaired ids so the bridge can emit their updated state. A lease
+    /// is dead only when the heartbeat is stale AND the owner pid is gone —
+    /// see `worker_lease_fresh` for why both signals are required.
     pub fn reconcile_stale_leases(&self) -> AppResult<Vec<String>> {
-        let ids: Vec<String> = {
+        let candidates: Vec<(String, Option<i64>)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id FROM runs WHERE worker_nonce IS NOT NULL
+                "SELECT id, worker_pid FROM runs WHERE worker_nonce IS NOT NULL
                  AND (heartbeat_at IS NULL OR heartbeat_at < ?1)",
             )?;
-            let rows = stmt.query_map(params![Self::lease_stale_before()], |r| r.get(0))?;
+            let rows = stmt.query_map(params![Self::lease_stale_before()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        for id in &ids {
-            self.repair_interrupted_run(id)?;
+        let mut repaired = Vec::new();
+        for (id, pid) in candidates {
+            if lease_owner_alive(pid) {
+                continue; // stale heartbeat but the worker breathes (sleep wake)
+            }
+            self.repair_interrupted_run(&id)?;
+            repaired.push(id);
         }
-        Ok(ids)
+        Ok(repaired)
     }
 
     /// Mark whether the run's CURRENT segment is worker-driven. Set by
