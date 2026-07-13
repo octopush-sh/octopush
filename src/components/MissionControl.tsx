@@ -8,7 +8,7 @@
 // canvas instead), no launching, no history (HistorySheet owns the past).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { Plus, Square, X } from "lucide-react";
+import { Moon, Plus, Square, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
@@ -288,6 +288,14 @@ function CrewCard({
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
         <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`}>{glyph.label}</span>
         <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
+        {run.detached && run.status === "running" && (
+          <span
+            title="Working detached — this crew keeps going even if you quit Octopush"
+            className="octo-pop-in flex shrink-0 items-center text-octo-mute"
+          >
+            <Moon size={11} aria-label="Working detached" />
+          </span>
+        )}
         <span
           className="octo-tabular ml-auto w-[7ch] shrink-0 text-right text-octo-mute"
           title="Time in this state"

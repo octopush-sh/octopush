@@ -88,6 +88,9 @@ export interface Run {
   /** Optional spend cap — the run pauses before any stage that would start
    *  at/over it. Null = no budget. */
   budgetUsd: number | null;
+  /** True when the run executes in a detached segment worker (Pro) — the
+   *  crew keeps working even if the app quits. */
+  detached: boolean;
 }
 export interface RunStage {
   id: string;

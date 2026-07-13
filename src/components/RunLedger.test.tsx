@@ -38,7 +38,7 @@ describe("RunLedger", () => {
   });
 
   it("renders the budget fragment in mute tabular numerals when under budget", () => {
-    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05 } as Run} stages={stages} />);
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={stages} />);
     const frag = screen.getByText(/budget \$0\.05/);
     expect(frag.className).toContain("octo-tabular");
     expect(frag.className).toContain("text-octo-mute");
@@ -46,13 +46,13 @@ describe("RunLedger", () => {
 
   it("turns the budget fragment rouge when spend reaches the budget", () => {
     render(
-      <RunLedger run={{ ...baseRun, costUsd: 0.05, budgetUsd: 0.05 } as Run} stages={stages} />,
+      <RunLedger run={{ ...baseRun, costUsd: 0.05, budgetUsd: 0.05, detached: false } as Run} stages={stages} />,
     );
     expect(screen.getByText(/budget \$0\.05/).className).toContain("text-octo-rouge");
   });
 
   it("omits the budget fragment when the run has no budget", () => {
-    render(<RunLedger run={{ ...baseRun, budgetUsd: null } as Run} stages={stages} />);
+    render(<RunLedger run={{ ...baseRun, budgetUsd: null, detached: false } as Run} stages={stages} />);
     expect(screen.queryByText(/budget/)).not.toBeInTheDocument();
   });
 

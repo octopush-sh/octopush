@@ -7,6 +7,7 @@ function run(status: RunStatus): Run {
     id: "r", workspaceId: "w", pipelineId: "p", task: "", status,
     costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
     createdAt: "", finishedAt: null, budgetUsd: null,
+  detached: false,
   };
 }
 

@@ -8,7 +8,7 @@ vi.mock("../stores/runsStore", () => ({
 
 const { CompanionCurrentRun } = await import("./CompanionCurrentRun");
 
-const run = { id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running", costUsd: 0.42, baselineUsd: 1, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null };
+const run = { id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running", costUsd: 0.42, baselineUsd: 1, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, detached: false };
 const stage = (over: any) => ({
   id: over.id, runId: "r1", position: over.position ?? 0, role: over.role ?? "implement", agentModel: "m", substrate: "api",
   checkpoint: false, status: over.status ?? "pending", inputTokens: over.inputTokens ?? 0, outputTokens: over.outputTokens ?? 0,

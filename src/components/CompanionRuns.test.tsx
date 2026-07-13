@@ -13,7 +13,7 @@ const { useRunsStore } = await import("../stores/runsStore");
 
 const mkRun = (id: string, status: RunStatus, over: Record<string, unknown> = {}) => ({
   id, workspaceId: "w1", pipelineId: "p", task: `task ${id}`,
-  status, costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, ...over });
+  status, costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, detached: false, ...over });
 
 describe("CompanionRuns hub", () => {
   beforeEach(() => {

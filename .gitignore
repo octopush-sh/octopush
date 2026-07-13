@@ -19,6 +19,7 @@ src-tauri/gen/schemas/
 # Build-generated triple-suffixed sidecar binaries (created by build.rs)
 src-tauri/octopush-pty-server-*
 src-tauri/octopush-mcp-*
+src-tauri/octopush-run-worker-*
 
 # Editor
 .vscode/*

@@ -22,6 +22,8 @@ pub mod feature {
     pub const HISTORY_SYNC: &str = "history.sync";
     /// Custom pipelines + roles follow the user across machines.
     pub const LIBRARY_SYNC: &str = "library.sync";
+    /// Runs execute in detached segment workers that survive quitting the app.
+    pub const RUNS_DETACHED: &str = "runs.detached";
 }
 
 /// The Free monthly Direct-run cap (live). Shared by the meter, the restricted
@@ -87,6 +89,7 @@ impl Entitlement {
                 feature::RUNS_PARALLEL.into(),
                 feature::HISTORY_SYNC.into(),
                 feature::LIBRARY_SYNC.into(),
+                feature::RUNS_DETACHED.into(),
             ],
             direct_runs_per_month: None,
         }
@@ -102,6 +105,7 @@ impl Entitlement {
                 feature::RUNS_PARALLEL.into(),
                 feature::HISTORY_SYNC.into(),
                 feature::LIBRARY_SYNC.into(),
+                feature::RUNS_DETACHED.into(),
             ],
             direct_runs_per_month: None,
         }

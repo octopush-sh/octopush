@@ -325,6 +325,7 @@ const runningRun = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
   costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
   createdAt: "t", finishedAt: null, budgetUsd: null,
+  detached: false,
 } as any;
 const pausedRun = { ...runningRun, status: "paused" };
 const completedRun = { ...runningRun, status: "completed" };

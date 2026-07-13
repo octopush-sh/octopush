@@ -24,6 +24,13 @@ path = "src/bin/octopush-pty-server/main.rs"
 name = "octopush-mcp"
 path = "src/bin/octopush-mcp/main.rs"
 
+# Detached run worker: drives ONE segment of a Direct run out of process so
+# crews survive the app quitting (Pro `runs.detached`). Uses octopush_lib's
+# orchestrator directly; never migrates the DB, never touches the keychain.
+[[bin]]
+name = "octopush-run-worker"
+path = "src/bin/octopush-run-worker/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
