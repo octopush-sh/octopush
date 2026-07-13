@@ -76,12 +76,34 @@ async fn main() {
         }
     };
 
-    // Prove the claim. Zero rows affected ⇒ a newer reserve superseded this
-    // nonce ⇒ yield silently — the successor owns the run.
+    // Prove the claim. `Ok(false)` = a newer reserve superseded this nonce →
+    // yield silently, the successor owns the run. `Err` = a transient DB
+    // error (e.g. SQLITE_BUSY racing the app's reserve write): retry a few
+    // times before giving up, because a silent yield here would strand the
+    // lease `reserve` just wrote for the full freshness window (~45s) with no
+    // in-process fallback (the spawning command already returned Ok). If the
+    // DB stays unreachable, best-effort clear the lease so recovery doesn't
+    // wait out that window, then exit non-zero.
     let pid = std::process::id() as i64;
-    match db.lock().confirm_worker_lease(&args.run_id, &args.nonce, pid) {
-        Ok(true) => {}
-        _ => std::process::exit(0),
+    let mut confirmed = false;
+    for attempt in 0..5 {
+        match db.lock().confirm_worker_lease(&args.run_id, &args.nonce, pid) {
+            Ok(true) => {
+                confirmed = true;
+                break;
+            }
+            Ok(false) => std::process::exit(0), // superseded — not our run
+            Err(_) if attempt < 4 => {}          // transient — retry
+            Err(e) => {
+                eprintln!("octopush-run-worker: could not confirm lease: {e}");
+                let _ = db.lock().clear_worker_lease(&args.run_id, &args.nonce);
+                std::process::exit(1);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !confirmed {
+        std::process::exit(1);
     }
 
     let orch = Arc::new(Orchestrator::new_headless(
