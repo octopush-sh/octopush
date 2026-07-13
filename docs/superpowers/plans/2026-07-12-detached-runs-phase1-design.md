@@ -74,7 +74,9 @@ worker:                    confirm lease (nonce UPDATE, pid=me) → 0 rows? exit
 `runs`: `worker_pid INTEGER`, `worker_nonce TEXT`, `heartbeat_at TEXT`, `stop_requested INTEGER DEFAULT 0`,
 `pause_requested INTEGER DEFAULT 0`, `detached INTEGER DEFAULT 0`.
 
-Freshness: heartbeat every ~2s; a lease is *fresh* within 45s. Startup recovery and the bridge use the same rule.
+Freshness: heartbeat every ~1s; a lease is *fresh* within 45s. Startup recovery uses heartbeat-only
+freshness (a reboot-reused pid must not pin a dead run); the bridge/command guards additionally trust a
+live owner pid (the in-session sleep-wake race).
 
 ## Command routing (app side)
 

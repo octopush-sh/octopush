@@ -2951,7 +2951,7 @@ impl Db {
     // on exit. Heartbeat freshness is the only liveness signal recovery
     // trusts — PIDs get reused, nonces don't.
 
-    /// Seconds a lease heartbeat stays *fresh*. Workers beat every ~2s, so a
+    /// Seconds a lease heartbeat stays *fresh*. Workers beat every ~1s, so a
     /// lease older than this belongs to a dead worker (crash, SIGKILL, power
     /// loss) and its run is safe to repair. Startup recovery and the bridge
     /// reconciler share this one rule.
