@@ -65,86 +65,109 @@ export function RoutinesPane() {
         subtitle="Put a pipeline on a schedule — a review each morning, a dependency sweep every few hours. When a routine fires it runs detached, so the crew keeps going even if Octopush is closed."
       />
 
-      {!entitled ? (
-        <div className="max-w-[640px] rounded-xl border border-octo-hairline bg-octo-panel px-6 py-10 text-center">
-          <CalendarClock size={22} className="mx-auto text-octo-brass" aria-hidden />
-          <p className="mt-3 font-serif text-[16px] text-octo-ivory">Scheduled crews are a Pro craft.</p>
-          <p className="mx-auto mt-2 max-w-[46ch] text-[12px] leading-[1.55] text-octo-sage">
-            Upgrade to let saved pipelines run themselves on a cadence you set.
-          </p>
-          <button
-            type="button"
-            onClick={() => void openUpgrade()}
-            className="mt-5 rounded-md border border-octo-brass px-4 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
-          >
-            Upgrade to Pro
-          </button>
-        </div>
-      ) : (
-        <div className="max-w-[720px] space-y-6">
-          <div className="flex items-center justify-between">
-            <SectionLabel>Your routines</SectionLabel>
+      <div className="max-w-[720px] space-y-6">
+        {/* Upgrade banner (not a full replacement): a user who made routines
+            while Pro then downgraded must still see and manage them. */}
+        {!entitled && (
+          <div className="flex items-center gap-4 rounded-xl border border-octo-hairline bg-octo-panel px-5 py-4">
+            <CalendarClock size={20} className="shrink-0 text-octo-brass" aria-hidden />
+            <div className="min-w-0 flex-1">
+              <p className="font-serif text-[14px] text-octo-ivory">Scheduled crews are a Pro craft.</p>
+              <p className="mt-0.5 text-[12px] leading-snug text-octo-sage">
+                {routines.length > 0
+                  ? "Your routines are paused until you upgrade — you can still manage them below."
+                  : "Upgrade to let saved pipelines run themselves on a cadence you set."}
+              </p>
+            </div>
             <button
               type="button"
-              onClick={() => setEditing("new")}
-              className="flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-ivory transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
+              onClick={() => void openUpgrade()}
+              className="shrink-0 rounded-md border border-octo-brass px-4 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
             >
-              <Plus size={13} className="text-octo-brass" aria-hidden />
-              Compose a routine
+              Upgrade to Pro
             </button>
           </div>
+        )}
 
-          {routines.length === 0 ? (
-            <p className="rounded-xl border border-dashed border-octo-hairline px-6 py-10 text-center text-[13px] text-octo-mute">
-              No routines yet — compose one to put a pipeline on a schedule.
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {routines.map((r) => (
-                <li
-                  key={r.id}
-                  className="octo-rise-in flex items-center gap-3 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3"
+        {(entitled || routines.length > 0) && (
+          <>
+            <div className="flex items-center justify-between">
+              <SectionLabel>Your routines</SectionLabel>
+              {entitled && (
+                <button
+                  type="button"
+                  onClick={() => setEditing("new")}
+                  className="flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-ivory transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
                 >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
-                      <span className="truncate font-serif text-[15px] text-octo-ivory">{r.name}</span>
-                      {!r.enabled && (
-                        <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                          paused
-                        </span>
+                  <Plus size={13} className="text-octo-brass" aria-hidden />
+                  Compose a routine
+                </button>
+              )}
+            </div>
+
+            {routines.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-octo-hairline px-6 py-10 text-center text-[13px] text-octo-mute">
+                No routines yet — compose one to put a pipeline on a schedule.
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {routines.map((r) => (
+                  <li
+                    key={r.id}
+                    className="octo-rise-in flex items-center gap-3 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline gap-2">
+                        <span className="truncate font-serif text-[15px] text-octo-ivory">{r.name}</span>
+                        {!r.enabled && (
+                          <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                            paused
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[10px] text-octo-sage">
+                        <span className="text-octo-brass">{scheduleSummary(r.scheduleKind, r.scheduleSpec)}</span>
+                        <span>· {projectName(r.projectId)}</span>
+                        <span>· {r.workspaceMode === "fresh" ? "fresh workspace" : "fixed workspace"}</span>
+                        {r.enabled && entitled && <span>· next {untilLabel(r.nextDueAt)}</span>}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {/* Run-now and enable need entitlement; pause and delete
+                          are always available so a downgraded user can clean up. */}
+                      {entitled && (
+                        <>
+                          <IconButton title="Run now" onClick={() => void runNow(r.id)}>
+                            <Play size={13} />
+                          </IconButton>
+                          <IconButton
+                            title={r.enabled ? "Pause this routine" : "Resume this routine"}
+                            onClick={() => void setEnabled(r.id, !r.enabled)}
+                            active={r.enabled}
+                          >
+                            <Power size={13} />
+                          </IconButton>
+                          <IconButton title="Edit" onClick={() => setEditing(r)}>
+                            <Pencil size={13} />
+                          </IconButton>
+                        </>
                       )}
+                      {!entitled && r.enabled && (
+                        <IconButton title="Pause this routine" onClick={() => void setEnabled(r.id, false)} active>
+                          <Power size={13} />
+                        </IconButton>
+                      )}
+                      <IconButton title="Delete" onClick={() => void remove(r.id)} danger>
+                        <Trash2 size={13} />
+                      </IconButton>
                     </div>
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[10px] text-octo-sage">
-                      <span className="text-octo-brass">{scheduleSummary(r.scheduleKind, r.scheduleSpec)}</span>
-                      <span>· {projectName(r.projectId)}</span>
-                      <span>· {r.workspaceMode === "fresh" ? "fresh workspace" : "fixed workspace"}</span>
-                      {r.enabled && <span>· next {untilLabel(r.nextDueAt)}</span>}
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1">
-                    <IconButton title="Run now" onClick={() => void runNow(r.id)}>
-                      <Play size={13} />
-                    </IconButton>
-                    <IconButton
-                      title={r.enabled ? "Pause this routine" : "Resume this routine"}
-                      onClick={() => void setEnabled(r.id, !r.enabled)}
-                      active={r.enabled}
-                    >
-                      <Power size={13} />
-                    </IconButton>
-                    <IconButton title="Edit" onClick={() => setEditing(r)}>
-                      <Pencil size={13} />
-                    </IconButton>
-                    <IconButton title="Delete" onClick={() => void remove(r.id)} danger>
-                      <Trash2 size={13} />
-                    </IconButton>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
 
       {editing && (
         <RoutineEditor
