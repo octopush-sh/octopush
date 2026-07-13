@@ -5,10 +5,13 @@ import { useAttentionStore } from "../../stores/attentionStore";
 import { useWorkspacePrefs } from "../../stores/workspacePrefsStore";
 import { MODES, MODE_LABELS } from "../../lib/modes";
 import { PaneHeader, SectionLabel, SegmentedRow, ToggleRow } from "./shared";
+import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
 
 export function GeneralPane() {
+  const crewNotifications = useNotifyPrefs((s) => s.crewNotifications);
+  const setCrewNotifications = useNotifyPrefs((s) => s.setCrewNotifications);
   const soundEnabled = useAttentionStore((s) => s.soundEnabled);
   const setSoundEnabled = useAttentionStore((s) => s.setSoundEnabled);
   const defaultMode = useWorkspacePrefs((s) => s.defaultMode);
@@ -43,6 +46,12 @@ export function GeneralPane() {
             description="A short chime plays when a chat finishes a response or a terminal rings the bell in a workspace you're not currently looking at."
             checked={soundEnabled}
             onChange={setSoundEnabled}
+          />
+          <ToggleRow
+            label="Notify when a crew needs you"
+            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused. So a fleet can work unattended."
+            checked={crewNotifications}
+            onChange={setCrewNotifications}
           />
         </div>
       </div>
