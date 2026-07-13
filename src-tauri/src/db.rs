@@ -2886,8 +2886,16 @@ impl Db {
             // pid,0` would falsely say "alive" forever, pinning a dead run as
             // running). A genuinely-alive worker from a prior app session
             // keeps heartbeating every ~1s regardless of the app, so it reads
-            // fresh here anyway; only a truly dead worker (crash, reboot) has
-            // a stale heartbeat, and those we must repair.
+            // fresh here anyway; a truly dead worker (crash, reboot) has a
+            // stale heartbeat and must be repaired.
+            //
+            // The one cost: an app relaunch within ~1s of a machine WAKE —
+            // before the just-resumed worker re-beats — can wrongly repair a
+            // still-live run. That is transient and self-healing (the worker's
+            // nonce-guarded next beat fails, so it stops into the very same
+            // Resume shape), a strictly better failure than a permanent pin.
+            // The in-session bridge reconciler keeps the pid signal for the
+            // sleep-wake race; only cross-boot startup drops it.
             if self.worker_heartbeat_fresh(&run_id)? {
                 continue; // a live detached worker owns this run
             }

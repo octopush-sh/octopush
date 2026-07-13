@@ -4123,6 +4123,43 @@ mod orchestrator_tests {
         assert!(db.lock().beat_worker_lease(&run_id, "w1").unwrap(), "w1 still owns the lease");
     }
 
+    /// H4 guard: `rerun_from_stage` must refuse while a detached worker holds
+    /// a live lease. `claim_active` only excludes an IN-PROCESS drive; a
+    /// cross-process worker never enters that set, so without the lease check
+    /// a re-run would reset the stage rows the worker is actively writing.
+    #[tokio::test]
+    async fn rerun_is_refused_while_a_detached_worker_is_live() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PLRR", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        // Stage 0 done, stage 1 driving under a live worker lease.
+        db.lock().set_run_stage_status(&stages[0].id, "done").unwrap();
+        db.lock().set_run_stage_status(&stages[1].id, "running").unwrap();
+        db.lock().set_run_status(&run_id, "running", false).unwrap();
+        assert!(db.lock().reserve_worker_lease(&run_id, "w").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "w", std::process::id() as i64).unwrap());
+
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        );
+        // Re-run the earlier done stage while the worker drives the later one.
+        let err = orch
+            .rerun_from_stage(&run_id, &stages[0].id, None)
+            .await
+            .expect_err("must refuse while a worker is live");
+        assert!(
+            err.to_string().contains("in the background"),
+            "clear cross-process rejection, got: {err}"
+        );
+        // The worker's stage row is untouched — no reset happened.
+        assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[1].status, "running");
+    }
+
     /// Reused-pid safety: startup recovery uses HEARTBEAT-ONLY freshness, so a
     /// run whose lease heartbeat is stale is repaired even when its persisted
     /// `worker_pid` happens to be alive (after a reboot the pid may belong to

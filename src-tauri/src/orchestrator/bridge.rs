@@ -183,9 +183,15 @@ impl Orchestrator {
         // `run://error` here; the worker can't). Repair it into the
         // interrupted/Resume shape so it never sits "running" with no driver,
         // then fall through to announce the resulting park.
-        let run = if run.status == "running" {
+        let repaired_error = run.status == "running";
+        let run = if repaired_error {
             self.db.lock().repair_interrupted_run(run_id)?;
             tracing::warn!(run_id = %run_id, "detached worker exited without settling — run repaired");
+            // A pending director-pause is meaningless now — the worker ERRORED,
+            // it did not honor a pause. Drop the stale flag so this park (and
+            // no future segment's) is wrongly silenced: an infra failure must
+            // always ping ("decision"), never inherit "director".
+            self.director_pauses.lock().remove(run_id);
             match self.db.lock().get_run(run_id)? {
                 Some(r) => r,
                 None => return Ok(()),
@@ -205,7 +211,9 @@ impl Orchestrator {
                     .iter()
                     .find(|s| s.status == "awaiting_checkpoint" || s.status == "failed")
                 {
-                    let reason = if self.director_pauses.lock().remove(run_id) {
+                    // A repaired error is always news; only a clean pause can
+                    // be the director's own (silent) hand.
+                    let reason = if !repaired_error && self.director_pauses.lock().remove(run_id) {
                         "director"
                     } else {
                         "decision"

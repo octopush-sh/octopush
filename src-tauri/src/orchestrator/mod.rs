@@ -1319,6 +1319,17 @@ impl Orchestrator {
         stage_id: &str,
         patch: Option<&crate::orchestrator::types::StageRerunPatch>,
     ) -> AppResult<()> {
+        // `claim_active` excludes a concurrent IN-PROCESS drive, but a
+        // DETACHED worker drives cross-process and never enters the `active`
+        // set — so the claim alone would let a re-run reset the very stage
+        // rows a live worker is writing (cross-process corruption). The lease
+        // is the cross-process interlock; refuse while one is live. (Mirrors
+        // the `worker_lease_fresh` guard in `commands::start_run`.)
+        if self.db.lock().worker_lease_fresh(run_id)? {
+            return Err(AppError::Other(
+                "this run is executing in the background — stop it first".into(),
+            ));
+        }
         let guard =
             self.claim_active(run_id, "this run is executing — stop the current stage first")?;
         let result = self.prepare_rerun_locked(run_id, stage_id, patch);
