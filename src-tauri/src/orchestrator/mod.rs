@@ -263,10 +263,15 @@ impl Orchestrator {
         );
     }
 
-    fn emit_checkpoint(&self, run_id: &str, stage_id: &str) {
+    /// `reason` distinguishes a genuine DECISION park (gate / halted stage /
+    /// loop-at-cap / budget) from the director's own requested pause — crew
+    /// notifications must ping for the former and stay silent for the latter
+    /// (a false "needs you" for the user's own action trains them to ignore
+    /// the ping). Other consumers ignore the extra field.
+    fn emit_checkpoint(&self, run_id: &str, stage_id: &str, reason: &str) {
         self.events.emit(
             "run://checkpoint",
-            serde_json::json!({ "runId": run_id, "stageId": stage_id }),
+            serde_json::json!({ "runId": run_id, "stageId": stage_id, "reason": reason }),
         );
     }
 
@@ -830,7 +835,7 @@ impl Orchestrator {
             }),
         );
         self.emit_run_update(run_id);
-        self.emit_checkpoint(run_id, stage_id);
+        self.emit_checkpoint(run_id, stage_id, "decision");
         Ok(())
     }
 
@@ -855,7 +860,7 @@ impl Orchestrator {
             }),
         );
         self.emit_run_update(run_id);
-        self.emit_checkpoint(run_id, stage_id);
+        self.emit_checkpoint(run_id, stage_id, "director");
         Ok(())
     }
 
@@ -946,7 +951,7 @@ impl Orchestrator {
             match status {
                 StageStatus::Failed => {
                     self.db.lock().set_run_status(run_id, "paused", false)?;
-                    self.emit_checkpoint(run_id, &stage.id);
+                    self.emit_checkpoint(run_id, &stage.id, "decision");
                     return Ok(RunStatus::Paused);
                 }
                 StageStatus::Done => {
@@ -973,7 +978,7 @@ impl Orchestrator {
                                 // ChangesRequested at cap, or unparseable verdict → gate.
                                 self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
                                 self.db.lock().set_run_status(run_id, "paused", false)?;
-                                self.emit_checkpoint(run_id, &stage.id);
+                                self.emit_checkpoint(run_id, &stage.id, "decision");
                                 return Ok(RunStatus::Paused);
                             }
                         }
@@ -984,7 +989,7 @@ impl Orchestrator {
                             .lock()
                             .set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
                         self.db.lock().set_run_status(run_id, "paused", false)?;
-                        self.emit_checkpoint(run_id, &stage.id);
+                        self.emit_checkpoint(run_id, &stage.id, "decision");
                         return Ok(RunStatus::Paused);
                     }
                     // else continue to next stage

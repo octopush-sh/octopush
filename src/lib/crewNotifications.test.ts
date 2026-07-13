@@ -13,21 +13,23 @@ const run = (status: Run["status"], over: Partial<Run> = {}): Run => ({
 });
 
 describe("decideCheckpointNotification (needs you)", () => {
-  it("fires once per parked stage, with workspace and task", () => {
-    const seen = new Set<string>();
-    const n = decideCheckpointNotification("st1", seen, run("paused"), "checkout-flow");
+  it("fires for a decision park, with workspace and task", () => {
+    const n = decideCheckpointNotification("decision", run("paused"), "checkout-flow");
     expect(n?.title).toBe("The crew needs you");
     expect(n?.body).toContain("checkout-flow");
     expect(n?.body).toContain("Add CSV export");
   });
 
-  it("dedupes a re-emitted checkpoint for the same stage", () => {
-    const seen = new Set(["st1"]);
-    expect(decideCheckpointNotification("st1", seen, run("paused"), "ws")).toBeNull();
+  it("the director's own requested pause is NOT news", () => {
+    expect(decideCheckpointNotification("director", run("paused"), "ws")).toBeNull();
+  });
+
+  it("a legacy event without a reason still pings (fail toward the gate)", () => {
+    expect(decideCheckpointNotification(undefined, run("paused"), "ws")).not.toBeNull();
   });
 
   it("stays silent when the run row isn't hydrated yet — silent beats wrong", () => {
-    expect(decideCheckpointNotification("st1", new Set(), undefined, null)).toBeNull();
+    expect(decideCheckpointNotification("decision", undefined, null)).toBeNull();
   });
 });
 

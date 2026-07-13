@@ -22,8 +22,6 @@ import { useNotifyPrefs } from "../stores/notifyPrefsStore";
  *  ping is informative, not actionable, so it stays quiet while focused. */
 
 const lastStatus = new Map<string, string>();
-/** Checkpoint dedupe — one ping per parked stage, not per re-emit. */
-const notifiedStages = new Set<string>();
 
 export interface CrewNotification {
   title: string;
@@ -58,14 +56,17 @@ export function decideCompletionNotification(
   };
 }
 
-/** Pure: the NEEDS-YOU decision from a checkpoint event. Exported for tests. */
+/** Pure: the NEEDS-YOU decision from a checkpoint event. No dedupe by
+ *  design: the orchestrator never re-emits a checkpoint for a still-parked
+ *  stage, so every emit IS a fresh park — and a loop-back re-parking the
+ *  SAME stage row genuinely needs a fresh ping (a dedupe here silenced
+ *  exactly the gate the feature exists to announce). Exported for tests. */
 export function decideCheckpointNotification(
-  stageId: string,
-  alreadyNotified: ReadonlySet<string>,
+  reason: string | undefined,
   run: Run | undefined,
   workspaceName: string | null,
 ): CrewNotification | null {
-  if (alreadyNotified.has(stageId)) return null;
+  if (reason === "director") return null; // the user's own pause — not news
   if (!run) return null; // row not hydrated yet — better silent than wrong
   return {
     title: "The crew needs you",
@@ -104,18 +105,19 @@ export function initCrewNotifications(): void {
   if (initialized) return;
   initialized = true;
 
-  void listen<{ runId: string; stageId: string }>(RUN_EVENTS.checkpoint, (ev) => {
-    if (!useNotifyPrefs.getState().crewNotifications) return;
-    const n = decideCheckpointNotification(
-      ev.payload.stageId,
-      notifiedStages,
-      findRun(ev.payload.runId),
-      wsName(findRun(ev.payload.runId)?.workspaceId ?? ""),
-    );
-    notifiedStages.add(ev.payload.stageId);
-    if (notifiedStages.size > 500) notifiedStages.clear(); // bounded, session-local
-    if (n) fire(n); // ALWAYS — a silent gate costs hours (see focus policy)
-  });
+  void listen<{ runId: string; stageId: string; reason?: string }>(
+    RUN_EVENTS.checkpoint,
+    (ev) => {
+      if (!useNotifyPrefs.getState().crewNotifications) return;
+      const run = findRun(ev.payload.runId);
+      const n = decideCheckpointNotification(
+        ev.payload.reason,
+        run,
+        run ? wsName(run.workspaceId) : null,
+      );
+      if (n) fire(n); // ALWAYS — a silent gate costs hours (see focus policy)
+    },
+  );
 
   void listen<{ runId: string; run: Run }>(RUN_EVENTS.stageUpdate, (ev) => {
     const run = ev.payload.run;
@@ -132,6 +134,5 @@ export function initCrewNotifications(): void {
 /** Test hook — reset module state between cases. */
 export function __resetCrewNotificationsForTests(): void {
   lastStatus.clear();
-  notifiedStages.clear();
   initialized = false;
 }
