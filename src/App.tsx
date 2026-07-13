@@ -46,6 +46,7 @@ import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
 import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
+import { initCrewNotifications } from "./lib/crewNotifications";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -136,6 +137,9 @@ function App() {
     // One-shot first-run invite eligibility (all-time backend count; the
     // persisted dismissed flag short-circuits inside the store).
     void useFirstRunStore.getState().checkEligibility();
+    // Crew notifications — a native ping when a crew gates/finishes while
+    // the window is unfocused (the fleet's unattended-operation contract).
+    initCrewNotifications();
   }, [loadActiveRuns]);
 
   // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
