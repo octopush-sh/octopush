@@ -384,6 +384,10 @@ pub fn run() {
                     std::sync::Arc::clone(&st.db),
                     sink,
                 ));
+                // Detached bridge: re-emits worker-driven runs' persisted
+                // progress as live run://* events, repairs runs whose worker
+                // died, and adopts leases from a previous app session.
+                std::sync::Arc::clone(&orch).spawn_detached_bridge();
                 app.manage(orch);
             }
 

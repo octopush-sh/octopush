@@ -4095,6 +4095,133 @@ mod orchestrator_tests {
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
     }
 
+    /// The detached-run exception: startup recovery must NEVER repair a run
+    /// whose worker lease heartbeat is fresh — a live `octopush-run-worker`
+    /// owns it, and "repairing" would mark its in-flight stage failed and
+    /// fight the worker's writes (the #1 collision the lease exists to solve).
+    #[tokio::test]
+    async fn startup_recovery_skips_run_with_fresh_worker_lease() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PL1", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        db.lock().set_run_status(&run_id, "running", false).unwrap();
+        // A live worker: reserved by the app, confirmed + beating.
+        assert!(db.lock().reserve_worker_lease(&run_id, "nonce-1").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "nonce-1", 4242).unwrap());
+
+        assert_eq!(db.lock().recover_interrupted_runs().unwrap(), 0);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "running", "the live worker's stage is untouched");
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "running");
+
+        // The worker dies (heartbeat goes stale) → NOW recovery repairs it.
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, run_id])
+            .unwrap();
+        assert_eq!(db.lock().recover_interrupted_runs().unwrap(), 1);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "failed");
+        assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+        assert!(!db.lock().worker_lease_fresh(&run_id).unwrap(), "stale lease cleared by repair");
+    }
+
+    /// The lease lifecycle: reserve is a double-spawn guard while fresh,
+    /// confirm/beat/clear are nonce-guarded so a superseded straggler can
+    /// neither resurrect nor release a successor's claim.
+    #[tokio::test]
+    async fn worker_lease_lifecycle_is_nonce_guarded() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PL2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        assert!(db.lock().reserve_worker_lease(&run_id, "a").unwrap());
+        assert!(db.lock().worker_lease_fresh(&run_id).unwrap());
+        // Second reserve while fresh: refused — the double-spawn guard.
+        assert!(!db.lock().reserve_worker_lease(&run_id, "b").unwrap());
+        // Confirm with the wrong nonce: refused; right nonce: accepted.
+        assert!(!db.lock().confirm_worker_lease(&run_id, "b", 1).unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "a", 1).unwrap());
+        // Beats: only the owner's land.
+        assert!(!db.lock().beat_worker_lease(&run_id, "b").unwrap());
+        assert!(db.lock().beat_worker_lease(&run_id, "a").unwrap());
+        // Clear with the wrong nonce leaves the lease; the owner's clear frees it.
+        db.lock().clear_worker_lease(&run_id, "b").unwrap();
+        assert!(db.lock().worker_lease_fresh(&run_id).unwrap());
+        db.lock().clear_worker_lease(&run_id, "a").unwrap();
+        assert!(!db.lock().worker_lease_fresh(&run_id).unwrap());
+        // Freed: the next segment's reserve succeeds.
+        assert!(db.lock().reserve_worker_lease(&run_id, "b").unwrap());
+        // The run is permanently marked detached for the UI.
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().detached);
+    }
+
+    /// Mid-session worker death: the bridge reconciler repairs ONLY stale
+    /// leases (into the standard interrupted/Resume shape) and reports which,
+    /// leaving live workers alone.
+    #[tokio::test]
+    async fn reconcile_repairs_only_stale_leases() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PL3", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mk = |task: &str| {
+            let id = db.lock().create_run(&ws, &pid, task, None, None, &[]).unwrap();
+            let sid = db.lock().list_run_stages(&id).unwrap()[0].id.clone();
+            db.lock().set_run_stage_status(&sid, "running").unwrap();
+            db.lock().set_run_status(&id, "running", false).unwrap();
+            id
+        };
+        let live = mk("live");
+        let dead = mk("dead");
+        assert!(db.lock().reserve_worker_lease(&live, "n-live").unwrap());
+        assert!(db.lock().reserve_worker_lease(&dead, "n-dead").unwrap());
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, dead])
+            .unwrap();
+
+        let repaired = db.lock().reconcile_stale_leases().unwrap();
+        assert_eq!(repaired, vec![dead.clone()]);
+        assert_eq!(db.lock().get_run(&dead).unwrap().unwrap().status, "paused");
+        assert_eq!(db.lock().list_run_stages(&dead).unwrap()[0].status, "failed");
+        assert_eq!(db.lock().get_run(&live).unwrap().unwrap().status, "running");
+        assert_eq!(db.lock().list_run_stages(&live).unwrap()[0].status, "running");
+    }
+
+    /// The cross-process control flags: set → visible in the worker's poll,
+    /// and a fresh reserve resets them so a new segment never inherits a
+    /// stale stop/pause.
+    #[tokio::test]
+    async fn worker_control_flags_roundtrip_and_reset_on_reserve() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PL4", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        db.lock().set_stop_requested(&run_id, true).unwrap();
+        db.lock().set_pause_requested(&run_id, true).unwrap();
+        let (status, stop, pause) = db.lock().read_worker_controls(&run_id).unwrap().unwrap();
+        assert_eq!(status, "draft");
+        assert!(stop && pause);
+        db.lock().set_stop_requested(&run_id, false).unwrap();
+        let (_, stop, _) = db.lock().read_worker_controls(&run_id).unwrap().unwrap();
+        assert!(!stop);
+
+        // A new segment's reserve wipes both flags.
+        db.lock().set_stop_requested(&run_id, true).unwrap();
+        assert!(db.lock().reserve_worker_lease(&run_id, "n").unwrap());
+        let (_, stop, pause) = db.lock().read_worker_controls(&run_id).unwrap().unwrap();
+        assert!(!stop && !pause);
+        // A vanished run reads as None (workspace deleted under the worker).
+        assert!(db.lock().read_worker_controls("no-such-run").unwrap().is_none());
+    }
+
     /// Accept & continue on a halted stage salvages the journal narration into
     /// the synthesized artifact — the next stage inherits the partial work,
     /// not an empty stub. Only the CURRENT attempt (after the last reset).

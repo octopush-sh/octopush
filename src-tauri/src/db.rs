@@ -44,6 +44,20 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> AppResult<Self> {
+        let db = Self::open_raw(path)?;
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Open WITHOUT running migrations — for the detached run worker, which is
+    /// only ever spawned by an app of the same binary version that migrated at
+    /// its own startup. Skipping `migrate()` keeps the one legacy table-rebuild
+    /// migration from ever racing across processes on a cold install.
+    pub fn open_without_migrations(path: &Path) -> AppResult<Self> {
+        Self::open_raw(path)
+    }
+
+    fn open_raw(path: &Path) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -57,9 +71,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Db { conn };
-        db.migrate()?;
-        Ok(db)
+        Ok(Db { conn })
     }
 
     /// Returns a reference to the underlying connection. Tests only — the
@@ -395,6 +407,19 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN retired_output_tokens INTEGER NOT NULL DEFAULT 0")?;
         // Optional per-run spend cap; NULL = no budget.
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN budget_usd REAL")?;
+
+        // ── Detached runs (segment workers) — the worker lease + control flags ──
+        // A run being driven by an out-of-process `octopush-run-worker` carries a
+        // lease: nonce (claim identity), pid (diagnostics), heartbeat (liveness —
+        // the ONLY signal recovery trusts; PIDs get reused). The two request
+        // flags are the cross-process replacements for the orchestrator's
+        // in-memory cancel/pause state; `detached` marks the run for the UI.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN worker_pid INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN worker_nonce TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN heartbeat_at TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN detached INTEGER NOT NULL DEFAULT 0")?;
 
         // ── v6 Direct iteration history: persisted live journals ──
         // One row per `run://log` entry (including `{"kind":"reset"}` markers),
@@ -2345,7 +2370,7 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                        reference_model, linked_issue_key, created_at, finished_at, budget_usd
+                        reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -2357,7 +2382,7 @@ impl Db {
     pub fn list_runs(&self, workspace_id: &str) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -2370,7 +2395,7 @@ impl Db {
     pub fn list_active_runs(&self) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
              FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -2437,7 +2462,7 @@ impl Db {
     pub fn list_terminal_runs(&self, limit: u32) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
              FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -2815,28 +2840,63 @@ impl Db {
     /// always has a blocked stage the checkpoint UI can act on — a paused run
     /// with NO blocked stage has no affordance at all and permanently blocks
     /// its workspace. Returns the count of stages stamped.
+    /// **Detached-run exception:** a run whose worker lease has a FRESH
+    /// heartbeat is not an orphan — an `octopush-run-worker` is driving it
+    /// right now in another process, and "repairing" it would mark a live
+    /// stage failed and fight the worker's own writes. Those runs are
+    /// skipped here; the bridge reconciler repairs them if the worker dies.
     pub fn recover_interrupted_runs(&self) -> AppResult<usize> {
-        let now = Utc::now().to_rfc3339();
-        let mut n = self.conn.execute(
-            "UPDATE run_stages SET status = 'failed', error = ?1, finished_at = ?2
-             WHERE status = 'running'",
-            params![Self::INTERRUPTED_STAGE_ERROR, now],
-        )?;
-
+        // Candidates: any run that says `running`, plus any run owning a
+        // `running` stage (belt and braces — the two should agree).
         let run_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM runs WHERE status = 'running'")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM runs WHERE status = 'running'
+                 UNION SELECT DISTINCT run_id FROM run_stages WHERE status = 'running'",
+            )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let mut n = 0;
         for run_id in run_ids {
-            let stages = self.list_run_stages(&run_id)?;
+            if self.worker_lease_fresh(&run_id)? {
+                continue; // a live detached worker owns this run
+            }
+            n += self.repair_interrupted_run(&run_id)?;
+        }
+        Ok(n)
+    }
+
+    /// Repair ONE orphaned run whose owning process is gone: its `running`
+    /// stages are stamped failed (interrupted), the run status is settled by
+    /// what its stages say (all done → completed; else paused with a blocked
+    /// stage the checkpoint UI can act on), and any stale worker lease is
+    /// cleared. Returns the number of stages stamped.
+    pub fn repair_interrupted_run(&self, run_id: &str) -> AppResult<usize> {
+        let now = Utc::now().to_rfc3339();
+        let mut n = self.conn.execute(
+            "UPDATE run_stages SET status = 'failed', error = ?1, finished_at = ?2
+             WHERE run_id = ?3 AND status = 'running'",
+            params![Self::INTERRUPTED_STAGE_ERROR, now, run_id],
+        )?;
+        // A stale lease and its request flags are meaningless once repaired.
+        self.conn.execute(
+            "UPDATE runs SET worker_pid = NULL, worker_nonce = NULL, heartbeat_at = NULL,
+                    stop_requested = 0, pause_requested = 0 WHERE id = ?1",
+            params![run_id],
+        )?;
+        let status: Option<String> = self
+            .conn
+            .query_row("SELECT status FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?;
+        // Only a run stuck on `running` needs its status settled; a paused run
+        // with a freshly-failed stage is already the normal recovery shape.
+        if status.as_deref() == Some("running") {
+            let stages = self.list_run_stages(run_id)?;
             if !stages.is_empty() && stages.iter().all(|s| s.status == "done") {
                 // Died after the last stage finished but before the run was
                 // stamped — it IS complete.
-                self.set_run_status(&run_id, "completed", true)?;
-                continue;
+                self.set_run_status(run_id, "completed", true)?;
+                return Ok(n);
             }
             let blocked = stages
                 .iter()
@@ -2847,9 +2907,158 @@ impl Db {
                     n += 1;
                 }
             }
-            self.set_run_status(&run_id, "paused", false)?;
+            self.set_run_status(run_id, "paused", false)?;
         }
         Ok(n)
+    }
+
+    // ── Detached-run worker leases (segment workers) ─────────────────────────
+    //
+    // A detached run is driven one segment at a time by an out-of-process
+    // `octopush-run-worker`. The lease is the cross-process claim: the app
+    // RESERVES it (nonce + heartbeat) before spawning, the worker CONFIRMS it
+    // (nonce-guarded, records its pid), BEATS it while driving, and CLEARS it
+    // on exit. Heartbeat freshness is the only liveness signal recovery
+    // trusts — PIDs get reused, nonces don't.
+
+    /// Seconds a lease heartbeat stays *fresh*. Workers beat every ~2s, so a
+    /// lease older than this belongs to a dead worker (crash, SIGKILL, power
+    /// loss) and its run is safe to repair. Startup recovery and the bridge
+    /// reconciler share this one rule.
+    pub const WORKER_LEASE_FRESH_SECS: i64 = 45;
+
+    fn lease_stale_before() -> String {
+        (Utc::now() - chrono::Duration::seconds(Self::WORKER_LEASE_FRESH_SECS)).to_rfc3339()
+    }
+
+    /// App side, before spawning a worker: claim the run for `nonce`. Refuses
+    /// (returns `false`) while another FRESH lease exists — the double-spawn
+    /// guard. Also stamps `detached` and resets the request flags so a new
+    /// segment never inherits a stale stop/pause.
+    pub fn reserve_worker_lease(&self, run_id: &str, nonce: &str) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET worker_nonce = ?2, worker_pid = NULL, heartbeat_at = ?3,
+                    stop_requested = 0, pause_requested = 0, detached = 1
+             WHERE id = ?1 AND (worker_nonce IS NULL OR heartbeat_at IS NULL OR heartbeat_at < ?4)",
+            params![run_id, nonce, Utc::now().to_rfc3339(), Self::lease_stale_before()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Worker start: prove the claim and record the worker's pid. Zero rows
+    /// affected ⇒ this nonce was superseded (another reserve replaced it) ⇒
+    /// the worker must exit without touching the run.
+    pub fn confirm_worker_lease(&self, run_id: &str, nonce: &str, pid: i64) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET worker_pid = ?3, heartbeat_at = ?4
+             WHERE id = ?1 AND worker_nonce = ?2",
+            params![run_id, nonce, pid, Utc::now().to_rfc3339()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Worker heartbeat. Nonce-guarded so a superseded worker's beats can't
+    /// resurrect a lease it no longer owns; `false` tells the worker it lost
+    /// the claim and must stop driving.
+    pub fn beat_worker_lease(&self, run_id: &str, nonce: &str) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET heartbeat_at = ?3 WHERE id = ?1 AND worker_nonce = ?2",
+            params![run_id, nonce, Utc::now().to_rfc3339()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Worker exit (or app-side spawn failure): release the claim. Nonce-guarded —
+    /// a successor's fresh lease is never cleared by a straggler.
+    pub fn clear_worker_lease(&self, run_id: &str, nonce: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET worker_pid = NULL, worker_nonce = NULL, heartbeat_at = NULL,
+                    stop_requested = 0, pause_requested = 0
+             WHERE id = ?1 AND worker_nonce = ?2",
+            params![run_id, nonce],
+        )?;
+        Ok(())
+    }
+
+    /// `true` while a worker lease exists with a fresh heartbeat — the signal
+    /// that an out-of-process worker owns this run RIGHT NOW.
+    pub fn worker_lease_fresh(&self, run_id: &str) -> AppResult<bool> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT worker_nonce, heartbeat_at FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(matches!(row, Some((Some(_), Some(hb))) if hb >= Self::lease_stale_before()))
+    }
+
+    /// Every run currently carrying a worker lease (fresh or stale) — the
+    /// bridge's watch list.
+    pub fn list_leased_run_ids(&self) -> AppResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM runs WHERE worker_nonce IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Repair every stale-leased run (its worker died mid-segment) and return
+    /// the repaired ids so the bridge can emit their updated state. Fresh
+    /// leases are untouched.
+    pub fn reconcile_stale_leases(&self) -> AppResult<Vec<String>> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM runs WHERE worker_nonce IS NOT NULL
+                 AND (heartbeat_at IS NULL OR heartbeat_at < ?1)",
+            )?;
+            let rows = stmt.query_map(params![Self::lease_stale_before()], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            self.repair_interrupted_run(id)?;
+        }
+        Ok(ids)
+    }
+
+    /// Cross-process "stop the in-flight stage" request (the DB replacement
+    /// for the orchestrator's in-memory cancel flag). The worker polls it.
+    pub fn set_stop_requested(&self, run_id: &str, on: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET stop_requested = ?2 WHERE id = ?1",
+            params![run_id, on as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Cross-process "pause at the next stage boundary" request (the DB
+    /// replacement for the in-memory pause set). The worker polls it.
+    pub fn set_pause_requested(&self, run_id: &str, on: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET pause_requested = ?2 WHERE id = ?1",
+            params![run_id, on as i64],
+        )?;
+        Ok(())
+    }
+
+    /// One worker control poll: `(status, stop_requested, pause_requested)`.
+    /// `None` = the run vanished (workspace deleted under the worker).
+    pub fn read_worker_controls(&self, run_id: &str) -> AppResult<Option<(String, bool, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT status, stop_requested, pause_requested FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
@@ -3235,6 +3444,37 @@ impl Db {
             .prepare("SELECT entry FROM stage_log WHERE stage_id = ?1 ORDER BY id")?;
         let rows = stmt.query_map(params![stage_id], |r| r.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Journal entries for a whole RUN after a rowid cursor, oldest first:
+    /// `(rowid, stage_id, entry_json)`. The detached bridge tails this to
+    /// replay a worker's persisted journal as live `run://log` events.
+    pub fn list_run_log_after(
+        &self,
+        run_id: &str,
+        after_id: i64,
+    ) -> AppResult<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stage_id, entry FROM stage_log
+             WHERE run_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![run_id, after_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The current end of a run's journal — the cursor a bridge tail starts
+    /// from when it begins watching an already-running detached run (history
+    /// before the app opened is hydrated from `stage_log` by the UI, not
+    /// replayed as live events).
+    pub fn last_run_log_id(&self, run_id: &str) -> AppResult<i64> {
+        let id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(id) FROM stage_log WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )?;
+        Ok(id.unwrap_or(0))
     }
 
     /// Snapshot a stage attempt into `stage_iterations` before it gets reset.
@@ -3631,6 +3871,9 @@ pub struct RunRow {
     /// Optional spend cap — the orchestrator pauses before any stage that
     /// would start at/over it. `None` = no budget.
     pub budget_usd: Option<f64>,
+    /// `true` when this run was handed to a detached segment worker — it
+    /// survives the app quitting. Set at spawn, permanent for the run.
+    pub detached: bool,
 }
 
 fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
@@ -3647,6 +3890,7 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         created_at: r.get(9)?,
         finished_at: r.get(10)?,
         budget_usd: r.get(11)?,
+        detached: r.get::<_, i64>(12)? != 0,
     })
 }
 

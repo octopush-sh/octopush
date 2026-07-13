@@ -43,6 +43,7 @@ const mkRun = (id: string, status: RunStatus, over: Partial<Run> = {}): Run => (
   createdAt: "2026-07-09T00:00:00Z",
   finishedAt: null,
   budgetUsd: null,
+  detached: false,
   ...over,
 });
 

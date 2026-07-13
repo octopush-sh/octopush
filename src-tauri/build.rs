@@ -21,7 +21,7 @@ fn main() {
 
     if !target_triple.is_empty() && manifest_dir.exists() {
         // Every binary listed in tauri.conf.json's `externalBin` must be staged.
-        for bin in ["octopush-pty-server", "octopush-mcp"] {
+        for bin in ["octopush-pty-server", "octopush-mcp", "octopush-run-worker"] {
             stage_external_bin(bin, &target_triple, &manifest_dir, &out_dir);
         }
     }

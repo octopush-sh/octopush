@@ -2,6 +2,7 @@
 //! checkpoint-driven run state machine.
 
 pub mod agentic;
+pub mod bridge;
 pub mod cli_runner;
 pub mod cost;
 pub mod events;
@@ -11,6 +12,7 @@ pub mod persist;
 pub mod roles;
 pub mod runner;
 pub mod types;
+pub mod worker;
 
 pub use types::*;
 
@@ -133,11 +135,38 @@ pub struct Orchestrator {
     /// the next pending stage is parked (awaiting_checkpoint) exactly like the
     /// budget gate, so the existing approve-a-parked-stage path resumes it.
     pause_requests: Mutex<std::collections::HashSet<String>>,
+    /// UNWRAPPED live sink (no `PersistingSink`): the detached bridge re-emits
+    /// `run://log` entries it just read FROM `stage_log` through this — routing
+    /// them through the persisting wrapper would write every entry twice.
+    raw_events: Arc<dyn EventSink>,
+    /// Worker mode: this orchestrator drives inside `octopush-run-worker`.
+    /// History sync stays off — it needs the keychain, which a headless
+    /// sidecar must never touch (macOS would prompt); the app's bridge syncs
+    /// on the worker's behalf when it observes the run finish.
+    headless: bool,
+    /// Detached runs whose next park was requested by the director from THIS
+    /// app process — the bridge emits those checkpoints with reason
+    /// "director" so crew notifications stay silent for the user's own hand.
+    director_pauses: Mutex<std::collections::HashSet<String>>,
+    /// The bridge's watch table for leased (worker-driven) runs: journal
+    /// cursor + last-emitted snapshot per run id (see `bridge`).
+    bridge_watch: Mutex<std::collections::HashMap<String, crate::orchestrator::bridge::Watch>>,
 }
 
 impl Orchestrator {
     pub fn new(db: Arc<Mutex<Db>>, events: Arc<dyn EventSink>) -> Self {
+        Self::build(db, events, false)
+    }
+
+    /// The worker-process constructor: same engine, but history sync stays
+    /// off (see the `headless` field — the keychain is app-only).
+    pub fn new_headless(db: Arc<Mutex<Db>>, events: Arc<dyn EventSink>) -> Self {
+        Self::build(db, events, true)
+    }
+
+    fn build(db: Arc<Mutex<Db>>, events: Arc<dyn EventSink>, headless: bool) -> Self {
         // Mirror run://log entries into stage_log so journals survive reloads.
+        let raw_events = Arc::clone(&events);
         let events: Arc<dyn EventSink> = Arc::new(
             crate::orchestrator::persist::PersistingSink::new(events, Arc::clone(&db)),
         );
@@ -149,6 +178,10 @@ impl Orchestrator {
             active: Mutex::new(std::collections::HashSet::new()),
             cancels: Mutex::new(std::collections::HashMap::new()),
             pause_requests: Mutex::new(std::collections::HashSet::new()),
+            raw_events,
+            headless,
+            director_pauses: Mutex::new(std::collections::HashSet::new()),
+            bridge_watch: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -160,12 +193,16 @@ impl Orchestrator {
     ) -> Self {
         Self {
             db,
-            events,
+            events: Arc::clone(&events),
             test_runner: Some(runner),
             client: crate::chat_engine::shared_http_client().clone(),
             active: Mutex::new(std::collections::HashSet::new()),
             cancels: Mutex::new(std::collections::HashMap::new()),
             pause_requests: Mutex::new(std::collections::HashSet::new()),
+            raw_events: events,
+            headless: false,
+            director_pauses: Mutex::new(std::collections::HashSet::new()),
+            bridge_watch: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -215,6 +252,12 @@ impl Orchestrator {
     /// an abort still feels instant. The server upserts by run id, so a re-fire on
     /// an already-terminal run (e.g. abort of an aborted run) is a harmless no-op.
     fn sync_run_history(&self, run_id: &str) {
+        // Worker mode: entitlement lookup reads the keychain, which a headless
+        // sidecar must never touch (macOS prompts for a foreign binary). The
+        // app's bridge fires this when it observes the detached run finish.
+        if self.headless {
+            return;
+        }
         if !crate::entitlement::Entitlement::current()
             .has_feature(crate::entitlement::feature::HISTORY_SYNC)
         {
@@ -809,6 +852,14 @@ impl Orchestrator {
         self.run_to_pause_with(run_id, false).await
     }
 
+    /// Drive ONE segment — public entry point for `octopush-run-worker`. Same
+    /// claim + drive as `run_to_pause`, with the budget-override knob the
+    /// checkpoint-approval path needs (a detached resolve passes it through
+    /// the worker's CLI instead of a function argument).
+    pub async fn drive_segment(&self, run_id: &str, skip_budget_once: bool) -> AppResult<RunStatus> {
+        self.run_to_pause_with(run_id, skip_budget_once).await
+    }
+
     /// `skip_budget_once` lets the FIRST pending stage of this drive start past
     /// the budget gate — set only when the user just approved a budget pause
     /// (conscious override). The gate re-arms for every following stage.
@@ -1016,6 +1067,36 @@ impl Orchestrator {
         action: CheckpointAction,
     ) -> AppResult<RunStatus> {
         let _guard = self.claim_active(run_id, "run is already executing")?;
+        match self.apply_checkpoint_action(run_id, action)? {
+            // NOT `run_to_pause_with` — `_guard` above already holds this
+            // run's `active` claim; claiming again would reject.
+            Some(budget_override) => self.drive_inner(run_id, budget_override).await,
+            None => Ok(RunStatus::Aborted),
+        }
+    }
+
+    /// Detached variant: apply the decision's mutations under the in-process
+    /// claim and return the re-drive parameters WITHOUT driving — the caller
+    /// spawns the next segment's worker instead. `Some(budget_override)` =
+    /// the run wants driving again; `None` = aborted, nothing left to drive.
+    pub fn resolve_checkpoint_apply_only(
+        &self,
+        run_id: &str,
+        action: CheckpointAction,
+    ) -> AppResult<Option<bool>> {
+        let _guard = self.claim_active(run_id, "run is already executing")?;
+        self.apply_checkpoint_action(run_id, action)
+    }
+
+    /// The shared mutation section of a checkpoint resolution (in-process and
+    /// detached paths). The caller MUST hold this run's `active` claim.
+    /// Returns `Some(budget_override)` when the run should be driven again,
+    /// `None` when the action aborted the run.
+    fn apply_checkpoint_action(
+        &self,
+        run_id: &str,
+        action: CheckpointAction,
+    ) -> AppResult<Option<bool>> {
         let stages = self.db.lock().list_run_stages(run_id)?;
         let blocked = stages
             .iter()
@@ -1031,7 +1112,7 @@ impl Orchestrator {
                 self.db.lock().set_run_status(run_id, "aborted", true)?;
                 self.emit_run_update(run_id);
                 self.sync_run_history(run_id);
-                return Ok(RunStatus::Aborted);
+                return Ok(None);
             }
             CheckpointAction::Approve | CheckpointAction::Edit => {
                 if let Some(s) = &blocked {
@@ -1206,10 +1287,7 @@ impl Orchestrator {
             }
         }
 
-        // NOT `run_to_pause_with` — `_guard` above already holds this run's
-        // `active` claim for the whole function; claiming again would reject
-        // with "run is already executing".
-        self.drive_inner(run_id, budget_override).await
+        Ok(Some(budget_override))
     }
 
     /// Validate + perform the synchronous reset for a director-initiated
@@ -1354,6 +1432,20 @@ impl Orchestrator {
         });
     }
 
+    /// Release this run's in-process `active` claim — used when a detached
+    /// worker takes over the drive after an app-side preparation (re-run)
+    /// that deliberately kept the claim.
+    pub fn release_active(&self, run_id: &str) {
+        self.active.lock().remove(run_id);
+    }
+
+    /// Remember that the next park of this (detached) run was the director's
+    /// own pause request — the bridge reads this to emit the checkpoint with
+    /// reason "director" (never ping the user for their own hand).
+    pub fn note_director_pause(&self, run_id: &str) {
+        self.director_pauses.lock().insert(run_id.to_string());
+    }
+
     /// Signal the run's in-flight stage (if any) to stop. The substrate halts
     /// at its next cancel check; the stage lands as failed in the existing
     /// halt-recovery flow. No-op when nothing is in flight.
@@ -1393,8 +1485,15 @@ impl Orchestrator {
 
     /// Spawn the drive as a background task (production entry point).
     pub fn start_run(self: Arc<Self>, run_id: String) {
+        self.spawn_drive(run_id, false);
+    }
+
+    /// Spawn an in-process drive segment in the background. `skip_budget_once`
+    /// mirrors `run_to_pause_with` — the fallback path for a detached resolve
+    /// whose worker failed to spawn still honors the budget override.
+    pub fn spawn_drive(self: Arc<Self>, run_id: String, skip_budget_once: bool) {
         tokio::spawn(async move {
-            if let Err(e) = self.run_to_pause(&run_id).await {
+            if let Err(e) = self.run_to_pause_with(&run_id, skip_budget_once).await {
                 tracing::error!(run_id = %run_id, error = %e, "run drive failed");
                 self.events.emit(
                     "run://error",

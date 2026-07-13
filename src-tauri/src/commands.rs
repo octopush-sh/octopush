@@ -1261,12 +1261,21 @@ pub async fn start_run(
             "another run in this workspace is already executing".into(),
         ));
     }
+    // A live detached worker already owns this run — the in-process `active`
+    // set can't see across processes, so the lease is the guard here.
+    if state.db.lock().worker_lease_fresh(&run_id)? {
+        return Err(AppError::Other(
+            "this run is already executing in the background".into(),
+        ));
+    }
     // Entitlement gates (live). Pro is uncapped and may run many workspaces
     // concurrently; Free / signed-out is capped at FREE_DIRECT_RUNS_PER_MONTH and
     // may run only one at a time. (Same-workspace concurrency is blocked for
     // everyone above — git-worktree safety.) Both surface as UpgradeRequired.
+    let detached_entitled;
     {
         let ent = crate::entitlement::Entitlement::current();
+        detached_entitled = ent.has_feature(crate::entitlement::feature::RUNS_DETACHED);
         // Monthly Direct-run cap.
         let used = state.db.lock().count_started_runs_this_month()?;
         if let Err(denied) = ent.check_direct_run_quota(used) {
@@ -1298,6 +1307,17 @@ pub async fn start_run(
     // Durable first-run marker (survives workspace-delete cascades) — the
     // one-shot invite must never re-appear for a user who has run a crew.
     let _ = state.db.lock().mark_ever_ran();
+    // Pro: hand the segment to a detached worker so the crew survives the app
+    // quitting. Any spawn failure (missing sidecar in dev, exec error) falls
+    // back to the in-process drive — detachment must never cost a run.
+    if detached_entitled {
+        match orch.spawn_detached_segment(&run_id, false) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
+            }
+        }
+    }
     Arc::clone(&*orch).start_run(run_id);
     Ok(())
 }
@@ -1674,6 +1694,21 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
+    // Pro (`runs.detached`): apply the decision's mutations here — they're
+    // synchronous and cheap — then hand the re-drive to a detached worker.
+    // Guard rejections ("run is already executing") surface immediately
+    // instead of via run://error, which is strictly better feedback.
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::RUNS_DETACHED)
+    {
+        if let Some(budget_override) = orch.resolve_checkpoint_apply_only(&run_id, action)? {
+            if let Err(e) = orch.spawn_detached_segment(&run_id, budget_override) {
+                tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
+                Arc::clone(&*orch).spawn_drive(run_id, budget_override);
+            }
+        }
+        return Ok(());
+    }
     // Drive in the background; the frontend reacts to run:// events.
     Arc::clone(&*orch).spawn_resolve_checkpoint(run_id, action);
     Ok(())
@@ -1691,10 +1726,18 @@ pub async fn abort_run(
 /// and lands in the normal failed/decision-strip recovery flow.
 #[tauri::command]
 pub async fn stop_stage(
+    state: State<'_, AppState>,
     orch: State<'_, Arc<Orchestrator>>,
     run_id: String,
 ) -> AppResult<()> {
-    orch.stop_current_stage(&run_id)
+    // In-process flag first (harmless no-op for a detached run), then the
+    // cross-process request — the worker's control poll picks it up within
+    // ~1s and flips its own cancel flag.
+    orch.stop_current_stage(&run_id)?;
+    if state.db.lock().worker_lease_fresh(&run_id)? {
+        state.db.lock().set_stop_requested(&run_id, true)?;
+    }
+    Ok(())
 }
 
 /// Ask a running run to pause at its next stage boundary. The next pending stage
@@ -1702,10 +1745,18 @@ pub async fn stop_stage(
 /// the run isn't currently driving.
 #[tauri::command]
 pub async fn request_run_pause(
+    state: State<'_, AppState>,
     orch: State<'_, Arc<Orchestrator>>,
     run_id: String,
 ) -> AppResult<()> {
     orch.request_pause(&run_id);
+    // Detached: mirror the request cross-process, and remember it was the
+    // director's own hand so the bridge's checkpoint stays silent (reason
+    // "director", exactly like the in-process pause_for_director).
+    if state.db.lock().worker_lease_fresh(&run_id)? {
+        state.db.lock().set_pause_requested(&run_id, true)?;
+        orch.note_director_pause(&run_id);
+    }
     Ok(())
 }
 
@@ -1767,6 +1818,19 @@ pub async fn rerun_from_stage(
         loop_mode,
     };
     orch.prepare_rerun(&run_id, &stage_id, Some(&patch))?;
+    // Pro (`runs.detached`): the reset is done — hand the resumed drive to a
+    // detached worker. The in-process claim `prepare_rerun` kept is released
+    // first; the worker's lease takes over as the cross-process claim.
+    if crate::entitlement::Entitlement::current()
+        .has_feature(crate::entitlement::feature::RUNS_DETACHED)
+    {
+        orch.release_active(&run_id);
+        if let Err(e) = orch.spawn_detached_segment(&run_id, false) {
+            tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
+            Arc::clone(&*orch).spawn_drive(run_id, false);
+        }
+        return Ok(());
+    }
     Arc::clone(&*orch).resume_claimed_drive(run_id);
     Ok(())
 }

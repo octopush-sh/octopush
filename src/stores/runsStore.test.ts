@@ -30,6 +30,7 @@ const RUN: Run = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
   costUsd: 0.05, baselineUsd: 0.2, referenceModel: "m", linkedIssueKey: null,
   createdAt: "t", finishedAt: null, budgetUsd: null,
+  detached: false,
 };
 const STAGE: RunStage = {
   id: "st1", runId: "r1", position: 0, role: "plan", agentModel: "m", substrate: "api",
@@ -201,7 +202,7 @@ describe("runsStore", () => {
 
   it("hasExecutingRun is true only when a run in the workspace is running or paused", () => {
     const mk = (id: string, status: import("../lib/ipc").RunStatus) => ({ id, workspaceId: "w1", pipelineId: "p", task: "t",
-      status, costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null });
+      status, costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, detached: false });
     useRunsStore.setState({ runsByWs: { w1: [mk("r1", "completed")] } });
     expect(useRunsStore.getState().hasExecutingRun("w1")).toBe(false); // terminal → false
     useRunsStore.setState({ runsByWs: { w1: [mk("r1", "draft")] } });
@@ -217,7 +218,7 @@ describe("runsStore", () => {
     (ipc.startRun as any).mockResolvedValue(undefined);
     (ipc.listRuns as any).mockResolvedValue([
       { id: "rNew", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
-        costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null },
+        costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, detached: false },
     ]);
     await useRunsStore.getState().begin("w1", "p", "t", []);
     expect(useRunsStore.getState().getViewedRunId("w1")).toBe("rNew");

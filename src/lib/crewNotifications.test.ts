@@ -9,7 +9,7 @@ import type { Run } from "./ipc";
 const run = (status: Run["status"], over: Partial<Run> = {}): Run => ({
   id: "r1", workspaceId: "w1", pipelineId: "p", task: "Add CSV export to the reports module",
   status, costUsd: 0.42, baselineUsd: 1, referenceModel: null, linkedIssueKey: null,
-  createdAt: "t", finishedAt: null, budgetUsd: null, ...over,
+  createdAt: "t", finishedAt: null, budgetUsd: null, detached: false, ...over,
 });
 
 describe("decideCheckpointNotification (needs you)", () => {
