@@ -3022,6 +3022,17 @@ impl Db {
         Ok(ids)
     }
 
+    /// Mark whether the run's CURRENT segment is worker-driven. Set by
+    /// `reserve_worker_lease`; cleared by the in-process drive, so the UI's
+    /// "survives quitting" indicator never lies after a fallback.
+    pub fn set_run_detached(&self, run_id: &str, on: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET detached = ?2 WHERE id = ?1",
+            params![run_id, on as i64],
+        )?;
+        Ok(())
+    }
+
     /// Cross-process "stop the in-flight stage" request (the DB replacement
     /// for the orchestrator's in-memory cancel flag). The worker polls it.
     pub fn set_stop_requested(&self, run_id: &str, on: bool) -> AppResult<()> {

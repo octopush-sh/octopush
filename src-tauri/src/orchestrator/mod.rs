@@ -927,6 +927,13 @@ impl Orchestrator {
             _ => {}
         }
         self.db.lock().set_run_status(run_id, "running", false)?;
+        // `detached` reflects the CURRENT segment: an in-process drive (Free,
+        // or a Pro fallback after a failed worker spawn) clears it so the
+        // "survives quitting" indicator never lies. The worker's own drive is
+        // headless and leaves the flag exactly as its lease reserve set it.
+        if !self.headless {
+            self.db.lock().set_run_detached(run_id, false)?;
+        }
         self.emit_run_update(run_id);
 
         // Resolve + persist the reference model once per run (avoids a per-stage disk
