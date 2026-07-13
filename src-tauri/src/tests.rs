@@ -4324,6 +4324,170 @@ mod orchestrator_tests {
         assert_eq!(db.lock().list_run_stages(&live).unwrap()[0].status, "running");
     }
 
+    // ── Routines (scheduled crews) ──────────────────────────────────────────
+
+    fn routine_input(pipeline_id: &str, kind: &str, spec: &str) -> crate::db::RoutineInput {
+        crate::db::RoutineInput {
+            name: "Nightly ship".into(),
+            project_id: "p1".into(),
+            pipeline_id: pipeline_id.into(),
+            task: "keep the deps fresh".into(),
+            reference_model: None,
+            stage_overrides: None,
+            budget_usd: Some(2.0),
+            schedule_kind: kind.into(),
+            schedule_spec: spec.into(),
+            workspace_mode: "fixed".into(),
+            fixed_workspace_id: Some("w1".into()),
+            base_branch: None,
+            branch_prefix: None,
+        }
+    }
+
+    /// The pure schedule computation: interval adds seconds; daily lands on the
+    /// next HH:MM (today if not passed, else tomorrow); junk specs are `None`.
+    #[test]
+    fn routine_next_due_interval_and_daily() {
+        use crate::routines::{next_due, KIND_DAILY, KIND_INTERVAL};
+        use chrono::{DateTime, Local, TimeZone, Timelike, Utc};
+
+        let after = Local.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).single().unwrap();
+        // interval: exactly +N seconds.
+        let n = next_due(KIND_INTERVAL, "3600", after).unwrap();
+        let dt = DateTime::parse_from_rfc3339(&n).unwrap().with_timezone(&Utc);
+        assert_eq!((dt - after.with_timezone(&Utc)).num_seconds(), 3600);
+
+        // daily, later today: same day, at HH:MM local.
+        let n = next_due(KIND_DAILY, "09:30", after).unwrap();
+        let local = DateTime::parse_from_rfc3339(&n).unwrap().with_timezone(&Local);
+        assert!(local > after);
+        assert_eq!((local.hour(), local.minute()), (9, 30));
+
+        // daily, already passed today: rolls to tomorrow.
+        let late = Local.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).single().unwrap();
+        let n = next_due(KIND_DAILY, "09:30", late).unwrap();
+        let local = DateTime::parse_from_rfc3339(&n).unwrap().with_timezone(&Local);
+        assert_eq!(local.date_naive(), late.date_naive() + chrono::Duration::days(1));
+
+        assert!(next_due(KIND_INTERVAL, "not-a-number", after).is_none());
+        assert!(next_due(KIND_DAILY, "25:61", after).is_none());
+        assert!(next_due("weekly", "mon", after).is_none());
+    }
+
+    #[test]
+    fn routine_validate_schedule_bounds() {
+        use crate::routines::validate_schedule;
+        assert!(validate_schedule("interval", "3600").is_ok());
+        assert!(validate_schedule("interval", "59").is_err()); // sub-minute floor
+        assert!(validate_schedule("interval", "x").is_err());
+        assert!(validate_schedule("daily", "00:00").is_ok());
+        assert!(validate_schedule("daily", "9:5").is_ok());
+        assert!(validate_schedule("daily", "24:00").is_err());
+        assert!(validate_schedule("cron", "* * * * *").is_err());
+    }
+
+    /// Phase-1 cross-field rule: a fresh-workspace routine must be daily (no
+    /// auto-reaper yet — a sub-daily fresh cadence would spawn worktrees
+    /// without bound). Fixed mode is unconstrained.
+    #[test]
+    fn routine_validate_fresh_requires_daily() {
+        use crate::routines::validate_routine;
+        assert!(validate_routine("fresh", "daily").is_ok());
+        assert!(validate_routine("fresh", "interval").is_err());
+        assert!(validate_routine("fixed", "interval").is_ok());
+        assert!(validate_routine("fixed", "daily").is_ok());
+    }
+
+    /// CRUD roundtrip + the due filter: a routine is `due` only when enabled and
+    /// its `next_due_at` is in the past.
+    #[test]
+    fn routine_crud_and_due_filter() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RP", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+
+        let past = "2000-01-01T00:00:00+00:00";
+        let future = "2999-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-due", &routine_input(&pid, "interval", "3600"), Some(past)).unwrap();
+        db.lock().insert_routine("r-future", &routine_input(&pid, "daily", "09:00"), Some(future)).unwrap();
+
+        assert_eq!(db.lock().list_routines().unwrap().len(), 2);
+        let got = db.lock().get_routine("r-due").unwrap().unwrap();
+        assert!(got.enabled && got.budget_usd == Some(2.0) && got.workspace_mode == "fixed");
+
+        // Only the past-due, enabled one is selected.
+        let now = chrono::Utc::now().to_rfc3339();
+        let due: Vec<String> = db.lock().list_due_routines(&now).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(due, vec!["r-due".to_string()]);
+
+        // Disabling removes it from the due set even though its window is past.
+        db.lock().set_routine_enabled("r-due", false, Some(past)).unwrap();
+        assert!(db.lock().list_due_routines(&now).unwrap().is_empty());
+
+        // mark_routine_fired advances the window and records the run.
+        db.lock().set_routine_enabled("r-due", true, Some(past)).unwrap();
+        db.lock().mark_routine_fired("r-due", "run-xyz", &now, Some(future)).unwrap();
+        let fired = db.lock().get_routine("r-due").unwrap().unwrap();
+        assert_eq!(fired.last_run_id.as_deref(), Some("run-xyz"));
+        assert_eq!(fired.next_due_at.as_deref(), Some(future));
+        assert!(db.lock().list_due_routines(&now).unwrap().is_empty(), "window advanced past now");
+
+        db.lock().delete_routine("r-due").unwrap();
+        db.lock().delete_routine("r-future").unwrap();
+        assert!(db.lock().list_routines().unwrap().is_empty());
+    }
+
+    /// A fixed routine whose target workspace was deleted auto-disables (rather
+    /// than skipping every window forever with no signal), and reports Skipped.
+    #[tokio::test]
+    async fn routine_with_deleted_fixed_workspace_auto_disables() {
+        use crate::routines::FireOutcome;
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RPG", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "daily", "09:00");
+        input.fixed_workspace_id = Some("ghost-ws".into()); // never existed
+        db.lock().insert_routine("r-ghost", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = orch.run_routine_now("r-ghost").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped);
+        assert!(
+            !db.lock().get_routine("r-ghost").unwrap().unwrap().enabled,
+            "a routine pointing at a deleted workspace disables itself"
+        );
+    }
+
+    /// The fixed-mode overlap guard reads active runs in the target workspace.
+    #[test]
+    fn workspace_has_active_run_reflects_running_peers() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RP2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        assert!(!db.lock().workspace_has_active_run(&ws).unwrap());
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().set_run_status(&run, "running", false).unwrap();
+        assert!(db.lock().workspace_has_active_run(&ws).unwrap());
+        db.lock().set_run_status(&run, "completed", true).unwrap();
+        assert!(!db.lock().workspace_has_active_run(&ws).unwrap());
+    }
+
+    /// Deleting a routine's project cascades the routine away (FK ON DELETE
+    /// CASCADE) — no orphan rows the scheduler would trip on.
+    #[test]
+    fn routine_cascades_with_its_project() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RP3", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_routine("r-cascade", &routine_input(&pid, "interval", "3600"), Some("2000-01-01T00:00:00+00:00")).unwrap();
+        db.lock().conn_ref().execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
+        assert!(db.lock().get_routine("r-cascade").unwrap().is_none());
+    }
+
     /// The cross-process control flags: set → visible in the worker's poll,
     /// and a fresh reserve resets them so a new segment never inherits a
     /// stale stop/pause.

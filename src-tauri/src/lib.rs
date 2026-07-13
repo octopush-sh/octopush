@@ -35,6 +35,7 @@ pub mod perf;
 pub mod issue_tracker;
 pub mod github;
 pub mod orchestrator;
+pub mod routines;
 pub mod git_lock;
 pub mod mcp_setup;
 
@@ -342,6 +343,13 @@ pub fn run() {
             commands::get_entitlement,
             commands::direct_run_usage,
             commands::has_ever_started_run,
+            // Routines (scheduled crews — Pro)
+            commands::list_routines,
+            commands::create_routine,
+            commands::update_routine,
+            commands::delete_routine,
+            commands::set_routine_enabled,
+            commands::run_routine_now,
             // Cross-machine run history (Pro-real Part B / B1)
             commands::history_list,
             commands::history_sync_pull,
@@ -388,6 +396,9 @@ pub fn run() {
                 // progress as live run://* events, repairs runs whose worker
                 // died, and adopts leases from a previous app session.
                 std::sync::Arc::clone(&orch).spawn_detached_bridge();
+                // Routine scheduler: fires due scheduled crews (Pro) through
+                // the same guarded launch path as a user's Begin.
+                std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
             }
 

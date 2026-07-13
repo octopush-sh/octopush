@@ -5,6 +5,7 @@ export type SettingsTab =
   | "general"
   | "editor"
   | "models"
+  | "routines"
   | "appearance"
   | "usage"
   | "shortcuts"
@@ -17,6 +18,7 @@ export const SETTINGS_TABS: SettingsTab[] = [
   "general",
   "editor",
   "models",
+  "routines",
   "appearance",
   "usage",
   "shortcuts",
@@ -30,6 +32,7 @@ export const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   general: "General",
   editor: "Editor",
   models: "Models",
+  routines: "Routines",
   appearance: "Appearance",
   usage: "Usage",
   shortcuts: "Shortcuts",
@@ -49,6 +52,7 @@ export interface SettingsGroup {
 export const SETTINGS_GROUPS: SettingsGroup[] = [
   { label: "Setup", tabs: ["general", "editor"] },
   { label: "Intelligence", tabs: ["models", "usage"] },
+  { label: "Automation", tabs: ["routines"] },
   { label: "Connections", tabs: ["integrations"] },
   { label: "App", tabs: ["account", "appearance", "shortcuts", "privacy", "about"] },
 ];
