@@ -590,6 +590,35 @@ impl Db {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_synced_runs_created ON synced_runs(created_at DESC);
+
+            -- Routines (Pro): a saved pipeline that fires on a schedule. The
+            -- last_fired_at / next_due_at / last_run_id triple is the durable
+            -- window guard — written before a fire's side effects so a crash
+            -- or double tick can't double-fire.
+            CREATE TABLE IF NOT EXISTS routines (
+                id                 TEXT PRIMARY KEY,
+                name               TEXT NOT NULL,
+                project_id         TEXT NOT NULL,
+                pipeline_id        TEXT NOT NULL,
+                task               TEXT NOT NULL DEFAULT '',
+                reference_model    TEXT,
+                stage_overrides    TEXT,
+                budget_usd         REAL,
+                schedule_kind      TEXT NOT NULL,
+                schedule_spec      TEXT NOT NULL,
+                workspace_mode     TEXT NOT NULL DEFAULT 'fixed',
+                fixed_workspace_id TEXT,
+                base_branch        TEXT,
+                branch_prefix      TEXT,
+                enabled            INTEGER NOT NULL DEFAULT 1,
+                last_fired_at      TEXT,
+                next_due_at        TEXT,
+                last_run_id        TEXT,
+                created_at         TEXT NOT NULL,
+                FOREIGN KEY(project_id)  REFERENCES projects(id)  ON DELETE CASCADE,
+                FOREIGN KEY(pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_due_at);
             "#,
         )?;
 
@@ -3153,6 +3182,148 @@ impl Db {
             .map_err(Into::into)
     }
 
+    // ── Routines (scheduled crews) ───────────────────────────────────────────
+
+    /// Insert a routine. `next_due_at` is computed by the caller (from the
+    /// schedule + the clock) so `Db` stays clock-free.
+    pub fn insert_routine(
+        &self,
+        id: &str,
+        input: &RoutineInput,
+        next_due_at: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO routines
+                (id, name, project_id, pipeline_id, task, reference_model, stage_overrides,
+                 budget_usd, schedule_kind, schedule_spec, workspace_mode, fixed_workspace_id,
+                 base_branch, branch_prefix, enabled, next_due_at, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,?15,?16)",
+            params![
+                id, input.name, input.project_id, input.pipeline_id, input.task,
+                input.reference_model, input.stage_overrides, input.budget_usd,
+                input.schedule_kind, input.schedule_spec, input.workspace_mode,
+                input.fixed_workspace_id, input.base_branch, input.branch_prefix,
+                next_due_at, Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a routine's mutable fields + recompute its `next_due_at`. Leaves
+    /// `enabled`, `last_fired_at`, and `last_run_id` untouched.
+    pub fn update_routine(
+        &self,
+        id: &str,
+        input: &RoutineInput,
+        next_due_at: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET
+                name = ?2, project_id = ?3, pipeline_id = ?4, task = ?5, reference_model = ?6,
+                stage_overrides = ?7, budget_usd = ?8, schedule_kind = ?9, schedule_spec = ?10,
+                workspace_mode = ?11, fixed_workspace_id = ?12, base_branch = ?13,
+                branch_prefix = ?14, next_due_at = ?15
+             WHERE id = ?1",
+            params![
+                id, input.name, input.project_id, input.pipeline_id, input.task,
+                input.reference_model, input.stage_overrides, input.budget_usd,
+                input.schedule_kind, input.schedule_spec, input.workspace_mode,
+                input.fixed_workspace_id, input.base_branch, input.branch_prefix, next_due_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_routine(&self, id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM routines WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Enable/disable a routine. Enabling re-seats `next_due_at` (the schedule
+    /// resumes from now); disabling leaves the row but the scheduler skips it.
+    pub fn set_routine_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        next_due_at: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET enabled = ?2, next_due_at = ?3 WHERE id = ?1",
+            params![id, enabled as i64, next_due_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_routines(&self) -> AppResult<Vec<RoutineRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ROUTINE_COLS} FROM routines ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], row_to_routine)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_routine(&self, id: &str) -> AppResult<Option<RoutineRow>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ROUTINE_COLS} FROM routines WHERE id = ?1"),
+                params![id],
+                row_to_routine,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Enabled routines whose next fire is due (`next_due_at <= now`). `now`
+    /// is a UTC RFC3339 string; all `next_due_at` are stored UTC so the string
+    /// comparison is a valid time comparison.
+    pub fn list_due_routines(&self, now_utc_rfc3339: &str) -> AppResult<Vec<RoutineRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ROUTINE_COLS} FROM routines
+             WHERE enabled = 1 AND next_due_at IS NOT NULL AND next_due_at <= ?1
+             ORDER BY next_due_at"
+        ))?;
+        let rows = stmt.query_map(params![now_utc_rfc3339], row_to_routine)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Record a fire: stamp `last_fired_at`/`last_run_id` and advance
+    /// `next_due_at` in ONE write, so a crash between them can't double-fire.
+    pub fn mark_routine_fired(
+        &self,
+        id: &str,
+        run_id: &str,
+        fired_at: &str,
+        next_due_at: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET last_fired_at = ?2, last_run_id = ?3, next_due_at = ?4 WHERE id = ?1",
+            params![id, fired_at, run_id, next_due_at],
+        )?;
+        Ok(())
+    }
+
+    /// Advance `next_due_at` WITHOUT recording a fire — used when a due window
+    /// is skipped (workspace busy / previous fresh run still active), so the
+    /// scheduler doesn't retry every tick.
+    pub fn set_routine_next_due(&self, id: &str, next_due_at: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET next_due_at = ?2 WHERE id = ?1",
+            params![id, next_due_at],
+        )?;
+        Ok(())
+    }
+
+    /// `true` if the workspace has a `running`/`paused` run — the fixed-mode
+    /// overlap guard (a fresh fire would be refused by `has_concurrent_run`).
+    pub fn workspace_has_active_run(&self, workspace_id: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE workspace_id = ?1 AND status IN ('running','paused')",
+            params![workspace_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         // Stamp started_at the first time it goes running.
@@ -3672,6 +3843,58 @@ pub struct WorkspaceRow {
     pub from_branch: Option<String>,
 }
 
+/// A scheduled routine (Pro): a saved pipeline that fires on a schedule.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineRow {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub pipeline_id: String,
+    pub task: String,
+    pub reference_model: Option<String>,
+    pub stage_overrides: Option<String>,
+    pub budget_usd: Option<f64>,
+    pub schedule_kind: String,
+    pub schedule_spec: String,
+    pub workspace_mode: String,
+    pub fixed_workspace_id: Option<String>,
+    pub base_branch: Option<String>,
+    pub branch_prefix: Option<String>,
+    pub enabled: bool,
+    pub last_fired_at: Option<String>,
+    pub next_due_at: Option<String>,
+    pub last_run_id: Option<String>,
+    pub created_at: String,
+}
+
+/// The mutable fields of a routine (create + update share this shape). The
+/// caller computes `next_due_at` from `schedule_kind`/`schedule_spec` and the
+/// clock, so `Db` stays clock-free and unit-testable.
+#[derive(serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineInput {
+    pub name: String,
+    pub project_id: String,
+    pub pipeline_id: String,
+    #[serde(default)]
+    pub task: String,
+    pub reference_model: Option<String>,
+    pub stage_overrides: Option<String>,
+    pub budget_usd: Option<f64>,
+    pub schedule_kind: String,
+    pub schedule_spec: String,
+    #[serde(default = "default_workspace_mode")]
+    pub workspace_mode: String,
+    pub fixed_workspace_id: Option<String>,
+    pub base_branch: Option<String>,
+    pub branch_prefix: Option<String>,
+}
+
+fn default_workspace_mode() -> String {
+    "fixed".to_string()
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEditRow {
@@ -3966,6 +4189,36 @@ pub struct RunRow {
     /// `true` when this run was handed to a detached segment worker — it
     /// survives the app quitting. Set at spawn, permanent for the run.
     pub detached: bool,
+}
+
+/// The routines column list, in the order `row_to_routine` reads them.
+const ROUTINE_COLS: &str = "id, name, project_id, pipeline_id, task, reference_model, \
+    stage_overrides, budget_usd, schedule_kind, schedule_spec, workspace_mode, \
+    fixed_workspace_id, base_branch, branch_prefix, enabled, last_fired_at, next_due_at, \
+    last_run_id, created_at";
+
+fn row_to_routine(r: &rusqlite::Row) -> rusqlite::Result<RoutineRow> {
+    Ok(RoutineRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        project_id: r.get(2)?,
+        pipeline_id: r.get(3)?,
+        task: r.get(4)?,
+        reference_model: r.get(5)?,
+        stage_overrides: r.get(6)?,
+        budget_usd: r.get(7)?,
+        schedule_kind: r.get(8)?,
+        schedule_spec: r.get(9)?,
+        workspace_mode: r.get(10)?,
+        fixed_workspace_id: r.get(11)?,
+        base_branch: r.get(12)?,
+        branch_prefix: r.get(13)?,
+        enabled: r.get::<_, i64>(14)? != 0,
+        last_fired_at: r.get(15)?,
+        next_due_at: r.get(16)?,
+        last_run_id: r.get(17)?,
+        created_at: r.get(18)?,
+    })
 }
 
 fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {

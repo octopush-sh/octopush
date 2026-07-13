@@ -44,6 +44,48 @@ export interface PipelineWithStages {
   pipeline: Pipeline;
   stages: PipelineStage[];
 }
+
+/** A scheduled routine (Pro): a saved pipeline that fires on a schedule. */
+export interface Routine {
+  id: string;
+  name: string;
+  projectId: string;
+  pipelineId: string;
+  task: string;
+  referenceModel: string | null;
+  stageOverrides: string | null;
+  budgetUsd: number | null;
+  scheduleKind: "interval" | "daily";
+  /** Interval: whole seconds. Daily: "HH:MM" (24-hour, machine-local). */
+  scheduleSpec: string;
+  workspaceMode: "fixed" | "fresh";
+  fixedWorkspaceId: string | null;
+  baseBranch: string | null;
+  branchPrefix: string | null;
+  enabled: boolean;
+  lastFiredAt: string | null;
+  /** Next fire, RFC3339 UTC. Null = never (invalid spec). */
+  nextDueAt: string | null;
+  lastRunId: string | null;
+  createdAt: string;
+}
+
+/** The mutable fields sent on create/update (camelCase → serde). */
+export interface RoutineInput {
+  name: string;
+  projectId: string;
+  pipelineId: string;
+  task: string;
+  referenceModel?: string | null;
+  stageOverrides?: string | null;
+  budgetUsd?: number | null;
+  scheduleKind: "interval" | "daily";
+  scheduleSpec: string;
+  workspaceMode: "fixed" | "fresh";
+  fixedWorkspaceId?: string | null;
+  baseBranch?: string | null;
+  branchPrefix?: string | null;
+}
 /** A builder-authored stage (position = array index, after topological sort). */
 export interface StageDraft {
   role: string;
@@ -877,6 +919,16 @@ export const ipc = {
 
   deletePipeline: (pipelineId: string) =>
     invoke<void>("delete_pipeline", { pipelineId }),
+
+  // ─── Routines (scheduled crews — Pro) ─────────────────────────────
+  listRoutines: () => invoke<Routine[]>("list_routines"),
+  createRoutine: (input: RoutineInput) => invoke<string>("create_routine", { input }),
+  updateRoutine: (routineId: string, input: RoutineInput) =>
+    invoke<void>("update_routine", { routineId, input }),
+  deleteRoutine: (routineId: string) => invoke<void>("delete_routine", { routineId }),
+  setRoutineEnabled: (routineId: string, enabled: boolean) =>
+    invoke<void>("set_routine_enabled", { routineId, enabled }),
+  runRoutineNow: (routineId: string) => invoke<void>("run_routine_now", { routineId }),
 
   createRun: (
     workspaceId: string,

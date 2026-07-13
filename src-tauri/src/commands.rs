@@ -1256,72 +1256,9 @@ pub async fn start_run(
     run_id: String,
     budget_usd: Option<f64>,
 ) -> AppResult<()> {
-    if orch.has_concurrent_run(&run_id).await? {
-        return Err(AppError::Other(
-            "another run in this workspace is already executing".into(),
-        ));
-    }
-    // A live detached worker already owns this run — the in-process `active`
-    // set can't see across processes, so the lease is the guard here.
-    if state.db.lock().worker_lease_fresh(&run_id)? {
-        return Err(AppError::Other(
-            "this run is already executing in the background".into(),
-        ));
-    }
-    // Entitlement gates (live). Pro is uncapped and may run many workspaces
-    // concurrently; Free / signed-out is capped at FREE_DIRECT_RUNS_PER_MONTH and
-    // may run only one at a time. (Same-workspace concurrency is blocked for
-    // everyone above — git-worktree safety.) Both surface as UpgradeRequired.
-    let detached_entitled;
-    {
-        let ent = crate::entitlement::Entitlement::current();
-        detached_entitled = ent.has_feature(crate::entitlement::feature::RUNS_DETACHED);
-        // Monthly Direct-run cap.
-        let used = state.db.lock().count_started_runs_this_month()?;
-        if let Err(denied) = ent.check_direct_run_quota(used) {
-            return Err(AppError::UpgradeRequired {
-                feature: denied.feature.to_string(),
-                used: denied.used,
-                limit: denied.limit,
-            });
-        }
-        // Concurrency: Free runs one at a time; Pro (RUNS_PARALLEL) runs many.
-        if !ent.has_feature(crate::entitlement::feature::RUNS_PARALLEL) {
-            let active = state.db.lock().count_active_runs_excluding(&run_id)?;
-            if active >= 1 {
-                return Err(AppError::UpgradeRequired {
-                    feature: crate::entitlement::feature::RUNS_PARALLEL.to_string(),
-                    used: active,
-                    limit: 1,
-                });
-            }
-        }
-    }
-    // Persist the optional spend cap before the drive starts. Only a finite
-    // positive budget is meaningful; anything else stays NULL (no budget).
-    if let Some(b) = budget_usd {
-        if b.is_finite() && b > 0.0 {
-            state.db.lock().set_run_budget(&run_id, Some(b))?;
-        }
-    }
-    // Durable first-run marker (survives workspace-delete cascades) — the
-    // one-shot invite must never re-appear for a user who has run a crew.
-    let _ = state.db.lock().mark_ever_ran();
-    // Pro: hand the segment to a detached worker so the crew survives the app
-    // quitting. Any spawn failure (missing sidecar in dev, exec error) falls
-    // back to the in-process drive — detachment must never cost a run.
-    if detached_entitled {
-        match orch.spawn_detached_segment(&run_id, false) {
-            // Spawned OR AlreadyRunning: a worker owns the drive — never fall
-            // back to in-process (that would double-drive one worktree).
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
-            }
-        }
-    }
-    Arc::clone(&*orch).start_run(run_id);
-    Ok(())
+    // All start-time guards + the detached-spawn/fallback discipline live in
+    // one shared path so the routines scheduler applies exactly the same gates.
+    crate::orchestrator::launch::launch_run(&orch, &state.db, &run_id, budget_usd).await
 }
 
 #[tauri::command]
@@ -1379,6 +1316,97 @@ pub async fn direct_run_usage(
 #[tauri::command]
 pub async fn has_ever_started_run(state: State<'_, AppState>) -> AppResult<bool> {
     state.db.lock().has_ever_started_run()
+}
+
+// ─── Routines (scheduled crews — Pro `routines.scheduled`) ─────────────────
+
+/// Compute a routine's next fire from its schedule + the clock, validating the
+/// spec. Shared by create/update/enable so the stored `next_due_at` is always
+/// consistent with the schedule.
+fn routine_next_due(kind: &str, spec: &str) -> AppResult<Option<String>> {
+    crate::routines::validate_schedule(kind, spec).map_err(AppError::Other)?;
+    Ok(crate::routines::next_due(kind, spec, chrono::Local::now()))
+}
+
+#[tauri::command]
+pub async fn list_routines(state: State<'_, AppState>) -> AppResult<Vec<crate::db::RoutineRow>> {
+    state.db.lock().list_routines()
+}
+
+#[tauri::command]
+pub async fn create_routine(
+    state: State<'_, AppState>,
+    input: crate::db::RoutineInput,
+) -> AppResult<String> {
+    require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
+    let next_due = routine_next_due(&input.schedule_kind, &input.schedule_spec)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    state.db.lock().insert_routine(&id, &input, next_due.as_deref())?;
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn update_routine(
+    state: State<'_, AppState>,
+    routine_id: String,
+    input: crate::db::RoutineInput,
+) -> AppResult<()> {
+    require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
+    let next_due = routine_next_due(&input.schedule_kind, &input.schedule_spec)?;
+    state.db.lock().update_routine(&routine_id, &input, next_due.as_deref())
+}
+
+#[tauri::command]
+pub async fn delete_routine(state: State<'_, AppState>, routine_id: String) -> AppResult<()> {
+    // Deletion is ungated — a downgraded user must always be able to remove a
+    // routine they can no longer run.
+    state.db.lock().delete_routine(&routine_id)
+}
+
+#[tauri::command]
+pub async fn set_routine_enabled(
+    state: State<'_, AppState>,
+    routine_id: String,
+    enabled: bool,
+) -> AppResult<()> {
+    // Enabling requires entitlement; disabling never does.
+    if enabled {
+        require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
+    }
+    // Enabling re-seats the schedule from now; disabling leaves next_due as-is.
+    let next_due = if enabled {
+        let r = state
+            .db
+            .lock()
+            .get_routine(&routine_id)?
+            .ok_or_else(|| AppError::Other("routine not found".into()))?;
+        routine_next_due(&r.schedule_kind, &r.schedule_spec)?
+    } else {
+        None
+    };
+    if enabled {
+        state.db.lock().set_routine_enabled(&routine_id, true, next_due.as_deref())
+    } else {
+        // Preserve next_due on disable so re-enabling from the UI is instant;
+        // the scheduler ignores disabled rows regardless.
+        state.db.lock().set_routine_enabled(&routine_id, false, {
+            let existing = state.db.lock().get_routine(&routine_id)?;
+            existing.and_then(|r| r.next_due_at)
+        }.as_deref())
+    }
+}
+
+/// Fire a routine immediately (the "run now" test affordance), independent of
+/// its schedule and its enabled state. Reuses the exact scheduled fire path —
+/// same workspace resolution, same guarded launch — so nothing is bypassed but
+/// the schedule itself.
+#[tauri::command]
+pub async fn run_routine_now(
+    orch: State<'_, Arc<Orchestrator>>,
+    routine_id: String,
+) -> AppResult<()> {
+    require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
+    Arc::clone(&*orch).run_routine_now(&routine_id).await
 }
 
 // ─── Cross-machine run history (Pro-real Part B / B1) ──────────────

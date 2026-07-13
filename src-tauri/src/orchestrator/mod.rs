@@ -6,6 +6,7 @@ pub mod bridge;
 pub mod cli_runner;
 pub mod cost;
 pub mod events;
+pub mod launch;
 pub mod git_baseline;
 pub mod live;
 pub mod persist;
@@ -1455,6 +1456,12 @@ impl Orchestrator {
     /// that deliberately kept the claim.
     pub fn release_active(&self, run_id: &str) {
         self.active.lock().remove(run_id);
+    }
+
+    /// The shared DB handle — for the routine scheduler (`crate::routines`),
+    /// which is a sibling module and can't reach the private field.
+    pub(crate) fn db(&self) -> &Arc<Mutex<Db>> {
+        &self.db
     }
 
     /// Remember that the next park of this (detached) run was the director's

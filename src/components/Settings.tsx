@@ -10,6 +10,7 @@ import { OctoMark } from "./icons/OctoMark";
 import { GeneralPane } from "./settings/GeneralPane";
 import { EditorPane } from "./settings/EditorPane";
 import { ModelsPane } from "./settings/ModelsPane";
+import { RoutinesPane } from "./settings/RoutinesPane";
 import { AppearancePane } from "./settings/AppearancePane";
 import { UsagePane } from "./settings/UsagePane";
 import { ShortcutsPane } from "./settings/ShortcutsPane";
@@ -76,6 +77,7 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
           {tab === "general" && <GeneralPane />}
           {tab === "editor" && <EditorPane />}
           {tab === "models" && <ModelsPane />}
+          {tab === "routines" && <RoutinesPane />}
           {tab === "appearance" && <AppearancePane />}
           {tab === "usage" && <UsagePane />}
           {tab === "shortcuts" && <ShortcutsPane />}
