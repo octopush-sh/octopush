@@ -3,6 +3,10 @@
 // ─── Direct mode (orchestration) — types ──────────────────────────────────
 
 export type AgentSubstrate = "api" | "cli";
+/** Per-stage reasoning effort — the cost/quality lever. `null`/absent = off
+ *  (no thinking). The model-capability mapping (effort models vs the Haiku /
+ *  Sonnet-4.5 thinking-budget path) is handled backend-side. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 export type RunStatus =
   | "draft" | "running" | "paused" | "completed" | "aborted" | "failed";
 export type RunStageStatus =
@@ -14,6 +18,8 @@ export interface PipelineStage {
   position: number;
   role: string;
   agentModel: string;
+  /** Per-stage reasoning effort; null/absent = off (no thinking). */
+  effort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
   loopTargetPosition: number | null;
@@ -90,6 +96,8 @@ export interface RoutineInput {
 export interface StageDraft {
   role: string;
   agentModel: string;
+  /** Per-stage reasoning effort; null/absent = off (no thinking). */
+  effort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
   loopTargetPosition: number | null;
@@ -140,6 +148,8 @@ export interface RunStage {
   position: number;
   role: string;
   agentModel: string;
+  /** Per-stage reasoning effort; null/absent = off (no thinking). */
+  effort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
   status: RunStageStatus;

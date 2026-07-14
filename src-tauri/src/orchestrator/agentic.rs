@@ -6,8 +6,8 @@ use crate::chat_engine::{build_llm_tools, execute_tool};
 use crate::error::{AppResult, ProviderErrorKind};
 use crate::orchestrator::types::ToolCallLog;
 use crate::providers::{
-    complete_with_retry, interruptible_sleep, LlmContent, LlmMessage, LlmProvider, LlmRequest,
-    LlmResponse, LlmRole, LlmStopReason, LlmToolResult, DEFAULT_MAX_RETRIES,
+    complete_with_retry, interruptible_sleep, Effort, LlmContent, LlmMessage, LlmProvider,
+    LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +19,18 @@ const MAX_THROTTLE_SECS: u64 = 65;
 /// Cap (bytes) on a tool result fed back to the model. A single huge read can
 /// otherwise inflate every later turn's input tokens for the rest of the stage.
 const TOOL_RESULT_CAP_BYTES: usize = 24_000;
+
+/// The `max_tokens` floor for a stage given its effort. High-effort thinking
+/// spends its own tokens before the answer, so the output cap must clear that
+/// or a deep-thinking stage truncates mid-answer. (The `output-128k` beta is
+/// already sent, so 64k is safe.) `None`/low/medium keep the historical 32768.
+pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
+    match effort {
+        None | Some(Effort::Low) | Some(Effort::Medium) => 32768,
+        Some(Effort::High) => 48000,
+        Some(Effort::Xhigh) | Some(Effort::Max) => 64000,
+    }
+}
 
 /// Decide how long, if at all, to pause before the NEXT model call given the
 /// rate-limit headroom the provider just reported. Returns `Some(secs)` only
@@ -100,6 +112,10 @@ pub async fn run_agentic_loop(
     // `Some(list)` restricts the agent to exactly those tools (a review stage
     // runs read-only, an implementer gets write/run, etc.).
     allowed_tools: Option<&[String]>,
+    // How hard the model thinks per turn. `None` ⇒ no thinking (today's
+    // behavior). Also raises the `max_tokens` floor so deep thinking doesn't
+    // truncate the answer.
+    effort: Option<Effort>,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -137,11 +153,12 @@ pub async fn run_agentic_loop(
 
         let req = LlmRequest {
             model: model.to_string(),
-            max_tokens: 32768,
+            max_tokens: max_tokens_for(effort),
             system: system.to_string(),
             messages: messages.clone(),
             tools: tools.clone(),
             tool_choice: None,
+            effort,
         };
         // Transient failures (rate limit, overload, 5xx, dropped connection) are
         // retried in place with backoff — the accumulated message history is
@@ -179,6 +196,7 @@ pub async fn run_agentic_loop(
             messages.push(LlmMessage {
                 role: LlmRole::Assistant,
                 content: LlmContent::AssistantWithTools {
+                    raw: resp.raw_content.clone(),
                     text: resp.text.clone(),
                     tool_uses: resp.tool_uses.clone(),
                 },
@@ -209,10 +227,13 @@ pub async fn run_agentic_loop(
         // Emit narration text before processing tool calls.
         emitter.text(&resp.text);
 
-        // Record the assistant tool-use turn.
+        // Record the assistant tool-use turn — the full content array verbatim,
+        // so the next turn's replay preserves signed thinking and the exact
+        // block order (required when thinking is on).
         messages.push(LlmMessage {
             role: LlmRole::Assistant,
             content: LlmContent::AssistantWithTools {
+                raw: resp.raw_content.clone(),
                 text: resp.text.clone(),
                 tool_uses: resp.tool_uses.clone(),
             },

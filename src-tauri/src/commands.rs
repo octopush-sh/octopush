@@ -4373,6 +4373,8 @@ pub fn build_ai_request(
         messages: vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(prompt) }],
         tools,
         tool_choice,
+        // AI-command calls (structured/prose one-shots) don't request thinking.
+        effort: None,
     }
 }
 
@@ -4879,6 +4881,7 @@ mod ai_complete_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             rate_limit: None,
+            raw_content: vec![],
         };
         let text = super::ai_response_text(structured);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -4893,6 +4896,7 @@ mod ai_complete_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             rate_limit: None,
+            raw_content: vec![],
         };
         assert_eq!(super::ai_response_text(prose), "plain answer");
     }

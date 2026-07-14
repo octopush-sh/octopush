@@ -7,7 +7,49 @@
 //! provider-specific code leaks into the engine.
 
 use crate::error::AppResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+// ─── Reasoning effort ─────────────────────────────────────────────────────────
+
+/// Per-request reasoning-effort knob — the author-facing "how hard the model
+/// thinks" lever. Provider-portable: Anthropic maps it to `output_config.effort`
+/// (or a `budget_tokens` thinking budget on the models that predate effort),
+/// OpenAI-compat maps it to `reasoning_effort`. `None` (represented as "off" in
+/// the UI) means no thinking params at all.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// Canonical lowercase token — the DB storage form and the API level string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+    /// Parse the DB/token form back into an `Effort`. `None` for an unknown or
+    /// absent value (so a NULL column round-trips to "off").
+    pub fn from_str(s: &str) -> Option<Effort> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "xhigh" => Some(Effort::Xhigh),
+            "max" => Some(Effort::Max),
+            _ => None,
+        }
+    }
+}
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
@@ -21,6 +63,10 @@ pub struct LlmRequest {
     /// Force the model to call this named tool (guaranteed-shape structured
     /// output — the schema-call primitive). `None` leaves tool use optional.
     pub tool_choice: Option<String>,
+    /// How hard the model should think for this request. `None` ⇒ no thinking
+    /// params (the provider omits them). The provider maps it per the
+    /// model-capability matrix (see `anthropic::thinking_json`).
+    pub effort: Option<Effort>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -45,6 +91,15 @@ pub enum LlmContent {
     /// Assistant turn that called one or more tools.
     /// Also carries any text the assistant emitted alongside the tool calls.
     AssistantWithTools {
+        /// The assistant turn's FULL content-block array, VERBATIM and in the
+        /// original order (thinking, redacted_thinking, text, tool_use — however
+        /// they were interleaved). When thinking is on, the API requires each
+        /// block replayed unchanged and in order (a signed thinking block can't
+        /// be dropped, and reordering interleaved thinking/tool_use 400s the next
+        /// request). Empty for providers that don't emit raw blocks (OpenAI) and
+        /// for turns built without a captured response (TALK, the truncation
+        /// path) — the serializer then rebuilds from `text` + `tool_uses`.
+        raw: Vec<serde_json::Value>,
         text: String,
         tool_uses: Vec<LlmToolUse>,
     },
@@ -103,6 +158,12 @@ pub struct LlmResponse {
     /// the agentic loop pace itself under the org's per-minute budget instead of
     /// charging into a 429. `None` when the provider reports nothing.
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// The response's FULL content-block array, kept VERBATIM and in order
+    /// (thinking/redacted_thinking with `signature`/`data`, text, tool_use).
+    /// Replayed unchanged as the next assistant turn so signed thinking survives
+    /// and interleaved thinking/tool_use ordering is preserved (reordering 400s).
+    /// Empty for OpenAI-compat (no such blocks).
+    pub raw_content: Vec<serde_json::Value>,
 }
 
 /// A provider's reported rate-limit headroom, normalized across providers.

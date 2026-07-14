@@ -229,6 +229,9 @@ pub struct StageSpec {
     pub position: i64,
     pub role: String,
     pub agent_model: String,
+    /// Per-stage reasoning effort, resolved from the stage row. `None` ⇒ no
+    /// thinking (today's behavior). Threaded into the agentic loop's request.
+    pub effort: Option<crate::providers::Effort>,
     pub substrate: AgentSubstrate,
     pub checkpoint: bool,
     /// Optional human feedback from a prior rejection of this stage.

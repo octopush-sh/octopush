@@ -27,6 +27,7 @@ fn sample_request() -> LlmRequest {
             },
         ],
         tool_choice: None,
+        effort: None,
     }
 }
 
@@ -145,6 +146,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
         messages: vec![LlmMessage {
             role: LlmRole::Assistant,
             content: LlmContent::AssistantWithTools {
+                raw: vec![],
                 text: "let me read it".into(),
                 tool_uses: vec![LlmToolUse {
                     id: "call_1".into(),
@@ -155,6 +157,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
         }],
         tools: vec![],
         tool_choice: None,
+        effort: None,
     };
     let body = openai_compat::build_request(&req);
     let m = &body["messages"][0];
@@ -184,6 +187,7 @@ fn openai_tool_results_become_role_tool_messages() {
         }],
         tools: vec![],
         tool_choice: None,
+        effort: None,
     };
     let body = openai_compat::build_request(&req);
     let msgs = body["messages"].as_array().unwrap();
@@ -281,6 +285,239 @@ fn openai_build_request_forces_named_function() {
     assert_eq!(body["tool_choice"]["function"]["name"], "emit_result");
 }
 
+// ─── reasoning effort (per-stage thinking) ──────────────────────────────
+
+mod effort {
+    use super::super::anthropic::{
+        build_request, effective_effort_level, model_supports_effort, parse_response, thinking_json,
+    };
+    use super::super::openai_compat;
+    use super::super::{Effort, LlmContent, LlmMessage, LlmRole, LlmToolUse};
+    use super::sample_request;
+    use crate::orchestrator::agentic::max_tokens_for;
+    use serde_json::json;
+
+    #[test]
+    fn model_supports_effort_matrix() {
+        // Effort-capable (GA output_config.effort path).
+        for m in [
+            "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+            "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "some-unknown-model",
+        ] {
+            assert!(model_supports_effort(m), "{m} should take the effort path");
+        }
+        // Budget-only (legacy thinking budget_tokens path).
+        for m in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0"] {
+            assert!(!model_supports_effort(m), "{m} should take the budget path");
+        }
+    }
+
+    #[test]
+    fn thinking_json_opus_uses_adaptive_and_effort() {
+        let (thinking, output_config) = thinking_json("claude-opus-4-8", Some(Effort::High), 32768);
+        assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }));
+        assert_eq!(output_config.unwrap(), json!({ "effort": "high" }));
+    }
+
+    #[test]
+    fn thinking_json_xhigh_level_passes_through_on_capable_model() {
+        let (_t, output_config) = thinking_json("claude-opus-4-8", Some(Effort::Xhigh), 64000);
+        assert_eq!(output_config.unwrap(), json!({ "effort": "xhigh" }));
+    }
+
+    #[test]
+    fn effective_effort_level_clamps_per_model() {
+        // xhigh-capable: as-is.
+        assert_eq!(effective_effort_level("claude-opus-4-8", Effort::Xhigh), "xhigh");
+        assert_eq!(effective_effort_level("claude-opus-4-8", Effort::Max), "max");
+        // Sonnet 4.6 / Opus 4.6: no xhigh (folds to high), but max is kept.
+        assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::Xhigh), "high");
+        assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::Max), "max");
+        assert_eq!(effective_effort_level("claude-opus-4-6", Effort::Xhigh), "high");
+        // Opus 4.5 / unknown effort-path: cap at high (xhigh AND max fold down).
+        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Max), "high");
+        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Xhigh), "high");
+        assert_eq!(effective_effort_level("some-unknown-model", Effort::Max), "high");
+        // Lower levels are never touched, on any model.
+        assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::High), "high");
+        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Low), "low");
+    }
+
+    #[test]
+    fn build_request_clamps_effort_level_for_the_default_model() {
+        // Sonnet 4.6 is the DEFAULT model and rejects xhigh — it must fold to high.
+        let mut req = sample_request();
+        req.model = "claude-sonnet-4-6".into();
+        req.effort = Some(Effort::Xhigh);
+        let body = build_request(&req);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn thinking_json_haiku_uses_budget_under_max_and_no_output_config() {
+        let (thinking, output_config) = thinking_json("claude-haiku-4-5", Some(Effort::High), 32768);
+        let thinking = thinking.unwrap();
+        assert_eq!(thinking["type"], "enabled");
+        let budget = thinking["budget_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 16384, "high → 16384 on the budget path");
+        assert!(budget < 32768, "budget must clear max_tokens");
+        assert!(output_config.is_none(), "budget path must NOT send output_config");
+    }
+
+    #[test]
+    fn thinking_json_haiku_clamps_budget_below_small_max_tokens() {
+        // A tiny max_tokens forces the budget below it (and never under 1024).
+        let (thinking, _) = thinking_json("claude-haiku-4-5", Some(Effort::Max), 2000);
+        let budget = thinking.unwrap()["budget_tokens"].as_u64().unwrap();
+        assert!(budget < 2000 && budget >= 1024, "clamped budget = {budget}");
+    }
+
+    #[test]
+    fn thinking_json_none_effort_is_empty() {
+        let (thinking, output_config) = thinking_json("claude-opus-4-8", None, 32768);
+        assert!(thinking.is_none() && output_config.is_none());
+    }
+
+    #[test]
+    fn build_request_effort_high_on_opus_emits_config_and_never_temperature() {
+        let mut req = sample_request();
+        req.model = "claude-opus-4-8".into();
+        req.effort = Some(Effort::High);
+        let body = build_request(&req);
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"]["effort"], "high");
+        // temperature must stay ABSENT — current models 400 on it with thinking.
+        assert!(body.get("temperature").is_none(), "temperature must never be sent");
+    }
+
+    #[test]
+    fn build_request_effort_on_haiku_emits_budget_tokens() {
+        let mut req = sample_request();
+        req.model = "claude-haiku-4-5".into();
+        req.max_tokens = 32768;
+        req.effort = Some(Effort::Medium);
+        let body = build_request(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_request_effort_none_emits_neither() {
+        let body = build_request(&sample_request());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn parse_response_keeps_raw_content_verbatim_and_in_order() {
+        let resp = parse_response(json!({
+            "content": [
+                { "type": "thinking", "thinking": "let me reason", "signature": "sig-abc" },
+                { "type": "redacted_thinking", "data": "enc-xyz" },
+                { "type": "text", "text": "the answer" },
+                { "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.ts" } }
+            ],
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 5, "output_tokens": 3 }
+        }));
+        assert_eq!(resp.text, "the answer");
+        assert_eq!(resp.tool_uses.len(), 1);
+        // The FULL content array is kept verbatim, in original order.
+        assert_eq!(resp.raw_content.len(), 4);
+        assert_eq!(resp.raw_content[0]["type"], "thinking");
+        assert_eq!(resp.raw_content[0]["signature"], "sig-abc");
+        assert_eq!(resp.raw_content[1]["type"], "redacted_thinking");
+        assert_eq!(resp.raw_content[1]["data"], "enc-xyz");
+        assert_eq!(resp.raw_content[2]["type"], "text");
+        assert_eq!(resp.raw_content[3]["type"], "tool_use");
+    }
+
+    #[test]
+    fn message_to_anthropic_replays_raw_content_verbatim_in_order() {
+        // Interleaved thinking/tool_use MUST replay in the SAME order — grouping
+        // thinking-then-tool_use would reorder [think,tool,think,tool] and 400.
+        let raw = vec![
+            json!({ "type": "thinking", "thinking": "step 1", "signature": "s1" }),
+            json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a" } }),
+            json!({ "type": "thinking", "thinking": "step 2", "signature": "s2" }),
+            json!({ "type": "tool_use", "id": "tu_2", "name": "read_file", "input": { "path": "b" } }),
+        ];
+        let mut req = sample_request();
+        req.messages = vec![LlmMessage {
+            role: LlmRole::Assistant,
+            content: LlmContent::AssistantWithTools {
+                raw: raw.clone(),
+                text: "ignored when raw is present".into(),
+                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({}) }],
+            },
+        }];
+        let body = build_request(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        // Byte-for-byte the same array, same order.
+        assert_eq!(content, &raw);
+    }
+
+    #[test]
+    fn message_to_anthropic_rebuilds_from_text_and_tools_when_raw_empty() {
+        // No captured raw (TALK / truncation / OpenAI-origin) → build from parts.
+        let mut req = sample_request();
+        req.messages = vec![LlmMessage {
+            role: LlmRole::Assistant,
+            content: LlmContent::AssistantWithTools {
+                raw: vec![],
+                text: "reading".into(),
+                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a" }) }],
+            },
+        }];
+        let body = build_request(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    // ─── OpenAI-compat effort gating + max_tokens clamp ─────────────────
+
+    #[test]
+    fn openai_reasoning_effort_only_on_reasoning_models() {
+        // Reasoning models get reasoning_effort…
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini"] {
+            let mut req = sample_request();
+            req.model = m.into();
+            req.effort = Some(Effort::High);
+            let body = openai_compat::build_request(&req);
+            assert_eq!(body["reasoning_effort"], "high", "{m} should carry reasoning_effort");
+        }
+        // …a chat model like gpt-4o does NOT (it would no-op / 400).
+        let mut req = sample_request();
+        req.model = "gpt-4o".into();
+        req.effort = Some(Effort::High);
+        let body = openai_compat::build_request(&req);
+        assert!(body.get("reasoning_effort").is_none(), "gpt-4o must omit reasoning_effort");
+    }
+
+    #[test]
+    fn openai_clamps_max_tokens_to_32768() {
+        let mut req = sample_request();
+        req.model = "gpt-4o".into();
+        req.max_tokens = 64000; // the xhigh/max bump
+        let body = openai_compat::build_request(&req);
+        assert_eq!(body["max_tokens"], 32768, "OpenAI-compat caps the effort bump");
+    }
+
+    #[test]
+    fn max_tokens_for_floors_by_effort() {
+        assert_eq!(max_tokens_for(None), 32768);
+        assert_eq!(max_tokens_for(Some(Effort::Low)), 32768);
+        assert_eq!(max_tokens_for(Some(Effort::Medium)), 32768);
+        assert_eq!(max_tokens_for(Some(Effort::High)), 48000);
+        assert_eq!(max_tokens_for(Some(Effort::Xhigh)), 64000);
+        assert_eq!(max_tokens_for(Some(Effort::Max)), 64000);
+    }
+}
+
 // ─── complete_with_retry: transient-failure resilience ──────────────────────────
 
 mod retry {
@@ -318,6 +555,7 @@ mod retry {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             rate_limit: None,
+            raw_content: vec![],
         }
     }
 

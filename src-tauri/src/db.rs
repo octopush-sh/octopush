@@ -245,6 +245,7 @@ impl Db {
                 position      INTEGER NOT NULL,
                 role          TEXT NOT NULL,
                 agent_model   TEXT NOT NULL,
+                effort        TEXT,
                 substrate     TEXT NOT NULL,
                 checkpoint    INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
@@ -275,6 +276,7 @@ impl Db {
                 position      INTEGER NOT NULL,
                 role          TEXT NOT NULL,
                 agent_model   TEXT NOT NULL,
+                effort        TEXT,
                 substrate     TEXT NOT NULL,
                 checkpoint    INTEGER NOT NULL DEFAULT 0,
                 status        TEXT NOT NULL DEFAULT 'pending',
@@ -656,6 +658,13 @@ impl Db {
         // old as its creation).
         add_column_if_missing(&self.conn, "ALTER TABLE pipelines ADD COLUMN updated_at TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE roles ADD COLUMN updated_at TEXT")?;
+
+        // ── Per-stage reasoning effort (DIRECT operating-model, slice 1) ────
+        // The "how hard the model thinks" knob, stored as the Effort enum's
+        // lowercase token. Nullable: NULL ⇒ "off" (no thinking params), which
+        // is exactly today's behavior for every pre-existing row.
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN effort TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN effort TEXT")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -2097,7 +2106,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                    pos_x, pos_y, parents, tools, custom_name, instructions
+                    pos_x, pos_y, parents, tools, custom_name, instructions, effort
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -2119,6 +2128,7 @@ impl Db {
                 tools: parse_tools(r.get(14)?),
                 custom_name: r.get(15)?,
                 instructions: r.get(16)?,
+                effort: r.get::<_, Option<String>>(17)?.as_deref().and_then(crate::providers::Effort::from_str),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2328,13 +2338,14 @@ impl Db {
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     pos_x, pos_y, parents, tools, custom_name, instructions)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     pos_x, pos_y, parents, tools, custom_name, instructions, effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
-                        s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions],
+                        s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions,
+                        s.effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         tx.commit()?;
@@ -2406,12 +2417,13 @@ impl Db {
                 "INSERT INTO run_stages
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     parents, tools, custom_name, instructions)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15)",
+                     parents, tools, custom_name, instructions, effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
-                        parents_json, tools_json, s.custom_name, s.instructions],
+                        parents_json, tools_json, s.custom_name, s.instructions,
+                        s.effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         Ok(id)
@@ -2612,7 +2624,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT role, agent_model, substrate, checkpoint, loop_target_position,
                     loop_max_iterations, loop_mode, max_iterations, pos_x, pos_y,
-                    parents, tools, custom_name, instructions
+                    parents, tools, custom_name, instructions, effort
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -2635,6 +2647,7 @@ impl Db {
                 tools: tools_json.and_then(|j| serde_json::from_str(&j).ok()),
                 custom_name: r.get(12)?,
                 instructions: r.get(13)?,
+                effort: r.get::<_, Option<String>>(14)?.as_deref().and_then(crate::providers::Effort::from_str),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2691,13 +2704,14 @@ impl Db {
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     pos_x, pos_y, parents, tools, custom_name, instructions)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     pos_x, pos_y, parents, tools, custom_name, instructions, effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![Uuid::new_v4().to_string(), sp.id, i as i64, st.role, st.agent_model,
                         st.substrate, st.checkpoint as i64,
                         st.loop_target_position, st.loop_max_iterations, st.loop_mode,
                         st.max_iterations, st.pos_x, st.pos_y, parents_json, tools_json,
-                        st.custom_name, st.instructions],
+                        st.custom_name, st.instructions,
+                        st.effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         tx.commit()?;
@@ -2779,7 +2793,7 @@ impl Db {
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
-                    session_id, resume_pending, baseline_commit
+                    session_id, resume_pending, baseline_commit, effort
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -2789,6 +2803,7 @@ impl Db {
                 position: r.get(2)?,
                 role: r.get(3)?,
                 agent_model: r.get(4)?,
+                effort: r.get::<_, Option<String>>(29)?.as_deref().and_then(crate::providers::Effort::from_str),
                 substrate: r.get(5)?,
                 checkpoint: r.get::<_, i64>(6)? != 0,
                 status: r.get(7)?,
@@ -3567,6 +3582,7 @@ impl Db {
     /// Apply a stage patch with NO state guards — callers are responsible for
     /// having validated the run/stage state (`update_run_stage`) or for having
     /// just reset the stage to pending (the rerun path).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_run_stage_patch(
         &self,
         stage_id: &str,
@@ -4015,6 +4031,10 @@ pub struct StageDraft {
     /// Free-form additions appended to the archetype's system prompt.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Per-stage reasoning effort. `None` ⇒ "off" (no thinking). Validated by
+    /// the enum's deserializer; omitted by legacy payloads ⇒ None.
+    #[serde(default)]
+    pub effort: Option<crate::providers::Effort>,
 }
 
 fn default_max_iterations() -> i64 {
@@ -4187,6 +4207,8 @@ pub struct PipelineStageRow {
     pub custom_name: Option<String>,
     /// Free-form additions appended to the archetype's system prompt.
     pub instructions: Option<String>,
+    /// Per-stage reasoning effort; `None` ⇒ off (no thinking).
+    pub effort: Option<crate::providers::Effort>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -4267,6 +4289,8 @@ pub struct RunStageRow {
     pub position: i64,
     pub role: String,
     pub agent_model: String,
+    /// Per-stage reasoning effort; `None` ⇒ off (no thinking).
+    pub effort: Option<crate::providers::Effort>,
     pub substrate: String,
     pub checkpoint: bool,
     pub status: String,

@@ -427,7 +427,7 @@ mod workspace_tests {
         use crate::db::RunStageRow;
         let stage = RunStageRow {
             id: "s1".into(), run_id: "r1".into(), position: 0, role: "plan".into(),
-            agent_model: "m".into(), substrate: "api".into(), checkpoint: false,
+            agent_model: "m".into(), effort: None, substrate: "api".into(), checkpoint: false,
             status: "done".into(), input_tokens: 0, output_tokens: 0, cost_usd: 0.0,
             artifact: None, feedback: None, error: None, started_at: None, finished_at: None,
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
@@ -457,7 +457,7 @@ mod workspace_tests {
         use crate::db::RunStageRow;
         let mk = |pos: i64| RunStageRow {
             id: format!("s{pos}"), run_id: "r1".into(), position: pos, role: "implement".into(),
-            agent_model: "m".into(), substrate: "api".into(), checkpoint: false,
+            agent_model: "m".into(), effort: None, substrate: "api".into(), checkpoint: false,
             status: "done".into(), input_tokens: 0, output_tokens: 0, cost_usd: 0.0,
             artifact: None, feedback: None, error: None, started_at: None, finished_at: None,
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
@@ -553,6 +553,7 @@ mod workspace_tests {
             loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
             parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
             custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
+            effort: None,
         };
         let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
         let synced = a.list_custom_pipelines_for_sync().unwrap();
@@ -582,6 +583,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None,
         };
         let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
         // A pulled copy stamped in the past must be skipped…
@@ -644,6 +646,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None,
         };
         let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
         let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
@@ -2509,6 +2512,7 @@ mod agentic_loop_tests {
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     rate_limit: None,
+                    raw_content: vec![],
                 },
                 LlmResponse {
                     text: "All done.".into(),
@@ -2519,6 +2523,7 @@ mod agentic_loop_tests {
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     rate_limit: None,
+                    raw_content: vec![],
                 },
             ]),
         };
@@ -2537,6 +2542,7 @@ mod agentic_loop_tests {
             25,
             &std::sync::atomic::AtomicBool::new(false),
             &emitter,
+            None,
             None,
         )
         .await
@@ -2911,7 +2917,7 @@ mod pipeline_crud_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25,
             pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
-            custom_name: None, instructions: None,
+            custom_name: None, instructions: None, effort: None,
         }
     }
 
@@ -3129,7 +3135,7 @@ mod pipeline_crud_tests {
             role: role.into(), agent_model: "m".into(), substrate: "api".into(),
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
-            custom_name: None, instructions: None,
+            custom_name: None, instructions: None, effort: None,
         };
         assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
         assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
@@ -5999,7 +6005,7 @@ mod live_tests {
     fn resp(text: &str, tools: Vec<LlmToolUse>, stop: LlmStopReason) -> LlmResponse {
         LlmResponse { text: text.into(), tool_uses: tools, stop_reason: stop,
             input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0,
-            rate_limit: None }
+            rate_limit: None, raw_content: vec![] }
     }
 
     #[tokio::test]
@@ -6020,7 +6026,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -6050,7 +6056,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 2,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
 
         assert!(!out.finished, "iteration exhaustion must not read as success");
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
@@ -6076,7 +6082,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &cancel, &em, None).await.unwrap();
+                                   "sys", "do it", dir.path(), 10, &cancel, &em, None, None).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -6909,6 +6915,7 @@ mod ai_token_event_tests {
             cache_read_tokens: 5000,
             cache_creation_tokens: 700,
             rate_limit: None,
+            raw_content: vec![],
         }
     }
 
@@ -7066,6 +7073,7 @@ mod ancestry_tests {
             position,
             role: "plan".into(),
             agent_model: "m".into(),
+            effort: None,
             substrate: "api".into(),
             checkpoint: false,
             status: "pending".into(),

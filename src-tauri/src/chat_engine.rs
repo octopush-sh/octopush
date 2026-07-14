@@ -1307,6 +1307,8 @@ impl ChatEngine {
                 messages: messages.clone(),
                 tools: tools.clone(),
                 tool_choice: None,
+                // TALK doesn't drive per-request reasoning effort — behavior unchanged.
+                effort: None,
             };
 
             let response = match provider
@@ -1388,6 +1390,7 @@ impl ChatEngine {
                 messages.push(LlmMessage {
                     role: LlmRole::Assistant,
                     content: LlmContent::AssistantWithTools {
+                        raw: vec![],
                         text: response.text.clone(),
                         tool_uses: response.tool_uses.clone(),
                     },
@@ -1476,6 +1479,7 @@ impl ChatEngine {
             messages.push(LlmMessage {
                 role: LlmRole::Assistant,
                 content: LlmContent::AssistantWithTools {
+                    raw: vec![],
                     text: response.text.clone(),
                     tool_uses: response.tool_uses.clone(),
                 },

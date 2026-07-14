@@ -18,6 +18,16 @@ const MODE_OPTIONS = [
   { value: "gated" as const, label: "Gated" },
   { value: "auto" as const, label: "Auto" },
 ];
+/** Reasoning-effort segments. `off` is the null state (no thinking). Labels are
+ *  compact so all six fit the inspector's full-width track. */
+const EFFORT_OPTIONS = [
+  { value: "off" as const, label: "Off", title: "No extra thinking (fastest, cheapest)" },
+  { value: "low" as const, label: "Low", title: "A little reasoning before answering" },
+  { value: "medium" as const, label: "Med", title: "Moderate reasoning" },
+  { value: "high" as const, label: "High", title: "Deep reasoning (slower, pricier)" },
+  { value: "xhigh" as const, label: "XHi", title: "Very deep reasoning" },
+  { value: "max" as const, label: "Max", title: "Maximum reasoning depth" },
+];
 
 export interface LoopState {
   target: string | null;
@@ -133,6 +143,26 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           onSelectModel={(m) => onPatch({ agentModel: m })}
           allowedProviders={isCli ? ["anthropic"] : undefined}
         />
+      </div>
+
+      {/* Reasoning effort — how hard the model thinks per turn. Off = no thinking.
+          API substrate only: the CLI agent manages its own reasoning. */}
+      <div className="flex flex-col gap-1">
+        <span
+          className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute"
+          title="How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking. Applies to API stages only."
+        >
+          Reasoning
+        </span>
+        <SegmentedControl
+          fill
+          disabled={isCli}
+          options={EFFORT_OPTIONS}
+          value={data.effort ?? "off"}
+          onChange={(v) => onPatch({ effort: v === "off" ? null : v })}
+          ariaLabel="Reasoning effort"
+        />
+        {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
       </div>
 
       {/* Substrate + gate */}

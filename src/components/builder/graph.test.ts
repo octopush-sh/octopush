@@ -191,6 +191,17 @@ describe("graphToStageDrafts", () => {
     expect(d.customName).toBe("Scout");
     expect(d.instructions).toBeNull();
   });
+
+  it("carries per-stage reasoning effort (default off = null)", () => {
+    const nodes = [node("a", "plan"), node("b", "implement")];
+    // A fresh node has no effort; an author sets High on the implement stage.
+    nodes[1].data.effort = "high";
+    const drafts = graphToStageDrafts(nodes, []);
+    const plan = drafts.find((d) => d.role === "plan")!;
+    const impl = drafts.find((d) => d.role === "implement")!;
+    expect(plan.effort ?? null).toBeNull();
+    expect(impl.effort).toBe("high");
+  });
 });
 
 describe("draftToGraph", () => {
@@ -200,6 +211,7 @@ describe("draftToGraph", () => {
     position: over.position ?? 0,
     role: over.role ?? "plan",
     agentModel: "claude-sonnet-4-6",
+    effort: over.effort ?? null,
     substrate: "api",
     checkpoint: false,
     loopTargetPosition: over.loopTargetPosition ?? null,
@@ -247,6 +259,19 @@ describe("draftToGraph", () => {
     // compiling it back preserves the loop target
     const drafts = graphToStageDrafts(nodes, edges);
     expect(drafts[1].loopTargetPosition).toBe(0);
+  });
+
+  it("round-trips per-stage reasoning effort edit→save", () => {
+    const pipeline: PipelineWithStages = {
+      pipeline: { id: "p", name: "Effort", description: "", isBuiltin: false, createdAt: "" },
+      stages: [baseStage({ position: 0, role: "implement", effort: "xhigh" })],
+    };
+    const { nodes, edges } = draftToGraph(pipeline);
+    // The saved effort reopens on the canvas node…
+    expect(nodes[0].data.effort).toBe("xhigh");
+    // …and survives recompilation back to a draft.
+    const drafts = graphToStageDrafts(nodes, edges);
+    expect(drafts[0].effort).toBe("xhigh");
   });
 });
 

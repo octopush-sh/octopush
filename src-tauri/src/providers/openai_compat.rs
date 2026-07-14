@@ -5,7 +5,7 @@
 //! (vllm, llama.cpp server, LMStudio, LocalAI, etc.).
 
 use super::{
-    network_error, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
+    network_error, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
     LlmStopReason, LlmToolUse,
 };
 use crate::error::{AppError, AppResult, ProviderErrorKind};
@@ -63,6 +63,14 @@ impl LlmProvider for OpenAICompatibleProvider {
     }
 }
 
+/// Whether an OpenAI-family model actually honors `reasoning_effort`. Only the
+/// reasoning models do (o1/o3/o4 series, GPT-5); on a chat model like gpt-4o
+/// the field is at best a no-op and at worst a 400, so we omit it there.
+fn openai_supports_reasoning(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") || id.contains("gpt-5")
+}
+
 pub fn build_request(req: &LlmRequest) -> Value {
     // OpenAI puts system prompt as the first message with role="system" rather
     // than a top-level field.
@@ -90,13 +98,29 @@ pub fn build_request(req: &LlmRequest) -> Value {
     let mut body = json!({
         "model": req.model,
         "messages": messages,
-        "max_tokens": req.max_tokens,
+        // Clamp the ceiling: the effort-based bump (48k/64k) can exceed a small
+        // OpenAI/local model's output limit and 400. Anthropic keeps the bump
+        // (safe under its output-128k beta); OpenAI-compat stays at ≤32768.
+        "max_tokens": req.max_tokens.min(32768),
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
     if let Some(name) = &req.tool_choice {
         body["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
+    }
+    // Reasoning effort → OpenAI's `reasoning_effort`, but ONLY on models that
+    // honor it (o1/o3/o4, GPT-5). OpenAI exposes only low/medium/high, so the
+    // finer Anthropic levels (xhigh/max) fold to "high".
+    if let Some(effort) = req.effort {
+        if openai_supports_reasoning(&req.model) {
+            let level = match effort {
+                Effort::Low => "low",
+                Effort::Medium => "medium",
+                Effort::High | Effort::Xhigh | Effort::Max => "high",
+            };
+            body["reasoning_effort"] = json!(level);
+        }
     }
     body
 }
@@ -127,7 +151,8 @@ fn message_to_openai(msg: &LlmMessage) -> Vec<Value> {
             "role": "assistant",
             "content": t,
         })],
-        (LlmRole::Assistant, LlmContent::AssistantWithTools { text, tool_uses }) => {
+        // OpenAI has no verbatim content-block replay, so `raw` is ignored.
+        (LlmRole::Assistant, LlmContent::AssistantWithTools { text, tool_uses, .. }) => {
             // Single assistant message with tool_calls array.
             let tool_calls: Vec<Value> = tool_uses.iter().map(|u| json!({
                 "id": u.id,
@@ -228,5 +253,7 @@ pub fn parse_response(response: Value) -> LlmResponse {
         cache_creation_tokens: 0,
         // Header-based rate-limit hints are Anthropic-specific; none here.
         rate_limit: None,
+        // OpenAI-compat returns no verbatim content-block array to replay.
+        raw_content: vec![],
     }
 }

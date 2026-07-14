@@ -198,10 +198,15 @@ function StageCard({
             {live.node}
           </span>
 
-          {/* Meta — discreet position · model · substrate pill. */}
+          {/* Meta — discreet position · model · effort · substrate pill. */}
           <span className="flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
             <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
+            {s.effort && !cliManaged && (
+              <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
+                {s.effort}
+              </span>
+            )}
             <span
               className={`shrink-0 rounded-sm px-1.5 py-0.5 text-[8px] uppercase tracking-[0.18em] ${
                 cliManaged
