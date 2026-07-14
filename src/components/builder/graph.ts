@@ -15,7 +15,7 @@
 // instructions to the author.
 
 import type { Node, Edge } from "@xyflow/react";
-import type { AgentSubstrate, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
+import type { AgentSubstrate, Effort, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
 
 // ─── Tools ────────────────────────────────────────────────────────────────
 // Keep in sync with KNOWN_TOOLS in src-tauri/src/db.rs and tool_definitions().
@@ -114,6 +114,8 @@ export interface StageNodeData {
   role: string;
   customName: string | null;
   agentModel: string;
+  /** Per-stage reasoning effort; null = off (no thinking). */
+  effort: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
   maxIterations: number;
@@ -156,6 +158,7 @@ export function newStageData(role: string): StageNodeData {
     role,
     customName: null,
     agentModel: DEFAULT_MODEL,
+    effort: null,
     substrate: "api",
     checkpoint: false,
     maxIterations: DEFAULT_MAX_TURNS,
@@ -177,6 +180,7 @@ function dataFromStage(s: PipelineStage): StageNodeData {
     role: s.role,
     customName: s.customName ?? null,
     agentModel: s.agentModel,
+    effort: s.effort ?? null,
     substrate: s.substrate,
     checkpoint: s.checkpoint,
     maxIterations: s.maxIterations ?? DEFAULT_MAX_TURNS,
@@ -267,6 +271,7 @@ export function graphToStageDrafts(nodes: StageNode[], edges: StageEdge[]): Stag
     return {
       role: d.role,
       agentModel: d.agentModel,
+      effort: d.effort ?? null,
       substrate: d.substrate,
       checkpoint: d.checkpoint,
       loopTargetPosition: hasLoop ? loopTargetPosition : null,

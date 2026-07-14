@@ -58,6 +58,7 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
           </p>
           <p className="mt-0.5 truncate font-mono text-[10px] text-octo-mute">
             {a.label.toLowerCase()} · {shortModel(data.agentModel)}
+            {data.effort && !cliManaged && <span className="text-octo-brass"> · {data.effort}</span>}
           </p>
         </div>
         {canRemove && (

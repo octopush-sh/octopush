@@ -537,6 +537,7 @@ impl Orchestrator {
             position: stage.position,
             role: stage.role.clone(),
             agent_model: stage.agent_model.clone(),
+            effort: stage.effort,
             substrate,
             checkpoint: stage.checkpoint,
             feedback: stage.feedback.clone(),

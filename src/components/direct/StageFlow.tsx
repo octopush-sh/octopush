@@ -57,6 +57,11 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
                     · {override}
                   </span>
                 )}
+                {s.effort && s.substrate !== "cli" && (
+                  <span className="ml-1.5 font-mono text-[10px] text-octo-brass" title="Reasoning effort for this stage">
+                    · {s.effort}
+                  </span>
+                )}
                 {looping && (
                   <span
                     className="ml-1.5 font-mono text-[10px] text-octo-brass"
@@ -151,6 +156,14 @@ function CrewCard({
         >
           {stage.substrate}
         </span>
+        {stage.effort && !cliManaged && (
+          <span
+            className="rounded-sm bg-[var(--brass-ghost)] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass"
+            title="Reasoning effort for this stage"
+          >
+            {stage.effort}
+          </span>
+        )}
         <span
           className="flex items-center gap-1"
           title={cliManaged ? "Managed by the CLI agent" : `Tools: ${TOOLS.filter((t) => granted(t.id)).map((t) => t.label).join(" · ") || "none"}`}

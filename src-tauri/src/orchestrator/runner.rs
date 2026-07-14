@@ -214,6 +214,7 @@ impl AgentRunner for ApiRunner {
             ctx.cancel.as_ref(),
             &emitter,
             stage.tools.as_deref(),
+            stage.effort,
         )
         .await;
 
