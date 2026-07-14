@@ -103,22 +103,24 @@ fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
 }
 
 /// Whether a model takes the GA `output_config.effort` + `thinking:{adaptive}`
-/// path (true) or the legacy `thinking:{enabled, budget_tokens}` path (false).
-///
-/// Effort is the default: every *current* model supports it, so an unknown id
-/// takes the safe majority. The exceptions are the thinking-but-not-effort
-/// models, which 400 on `output_config.effort` and must use a token budget:
-/// Haiku (any `haiku` id, e.g. haiku-4-5) and Sonnet 4.5 / 4.0
-/// (`sonnet-4-5` / `sonnet-4-0`). Note `sonnet-4-6` and `sonnet-5` are NOT in
-/// that set — they take the effort path.
-pub fn model_supports_effort(model_id: &str) -> bool {
-    let id = model_id.to_ascii_lowercase();
-    let budget_only = id.contains("haiku")
-        || id.contains("sonnet-4-5")
-        || id.contains("sonnet-4.5")
-        || id.contains("sonnet-4-0")
-        || id.contains("sonnet-4.0");
-    !budget_only
+/// path. This is an ALLOWLIST, not "anything that isn't budget-only": a legacy
+/// id (`claude-3-5-sonnet`) or an unknown id must NOT get thinking params (it
+/// would 400) — it gets no thinking at all (see `thinking_json`).
+fn is_effort_model(id: &str) -> bool {
+    [
+        "opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8",
+        "sonnet-4-6", "sonnet-5", "fable-5", "mythos-5",
+    ]
+    .iter()
+    .any(|m| id.contains(m))
+}
+
+/// Whether a model takes the legacy `thinking:{enabled, budget_tokens}` path —
+/// the thinking-but-not-effort models, which 400 on `output_config.effort`.
+fn is_budget_model(id: &str) -> bool {
+    ["haiku-4-5", "sonnet-4-5", "sonnet-4-0"]
+        .iter()
+        .any(|m| id.contains(m))
 }
 
 /// Whether a model accepts the top `xhigh` effort level. Only the newest
@@ -160,7 +162,7 @@ pub fn effective_effort_level(model_id: &str, effort: Effort) -> &'static str {
 }
 
 /// Thinking token budget for the legacy `budget_tokens` path (Haiku / Sonnet
-/// 4.5). Only consulted for models where `model_supports_effort` is false.
+/// 4.5). Only consulted for `is_budget_model` models.
 fn budget_for_effort(effort: Effort) -> u32 {
     match effort {
         Effort::Low => 4096,
@@ -171,14 +173,17 @@ fn budget_for_effort(effort: Effort) -> u32 {
 }
 
 /// Resolve `(thinking, output_config)` JSON for a request, per the
-/// model-capability matrix. Pure + unit-tested.
+/// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
-/// - Effort-capable model ⇒ `thinking:{type:"adaptive"}` +
-///   `output_config:{effort:"<level>"}`.
-/// - Budget-only model (Haiku / Sonnet 4.5) ⇒
+/// - Effort model (Opus 4.5–4.8, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
+///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
+///   level clamped per model (`effective_effort_level`).
+/// - Budget model (Haiku 4.5, Sonnet 4.5/4.0) ⇒
 ///   `thinking:{type:"enabled", budget_tokens:N}` with N clamped to
 ///   `[1024, max_tokens-1]`, and no `output_config` (it would 400).
+/// - Otherwise (legacy `claude-3-5-*`, unknown id) ⇒ `(None, None)`: effort is
+///   silently ignored rather than 400ing on a model that can't think.
 pub fn thinking_json(
     model_id: &str,
     effort: Option<Effort>,
@@ -187,13 +192,14 @@ pub fn thinking_json(
     let Some(effort) = effort else {
         return (None, None);
     };
-    if model_supports_effort(model_id) {
+    let id = model_id.to_ascii_lowercase();
+    if is_effort_model(&id) {
         (
             Some(json!({ "type": "adaptive" })),
-            // Clamp the LEVEL to what this specific effort-path model accepts.
+            // Clamp the LEVEL to what this specific effort model accepts.
             Some(json!({ "effort": effective_effort_level(model_id, effort) })),
         )
-    } else {
+    } else if is_budget_model(&id) {
         // budget_tokens must be < max_tokens and >= the 1024 API floor.
         let ceiling = max_tokens.saturating_sub(1).max(1024);
         let budget = budget_for_effort(effort).clamp(1024, ceiling);
@@ -201,6 +207,9 @@ pub fn thinking_json(
             Some(json!({ "type": "enabled", "budget_tokens": budget })),
             None,
         )
+    } else {
+        // Legacy / unknown model: can't take either thinking form — omit both.
+        (None, None)
     }
 }
 

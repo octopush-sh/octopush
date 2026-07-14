@@ -95,14 +95,22 @@ pub fn build_request(req: &LlmRequest) -> Value {
         },
     })).collect();
 
+    let reasoning = openai_supports_reasoning(&req.model);
+
     let mut body = json!({
         "model": req.model,
         "messages": messages,
-        // Clamp the ceiling: the effort-based bump (48k/64k) can exceed a small
-        // OpenAI/local model's output limit and 400. Anthropic keeps the bump
-        // (safe under its output-128k beta); OpenAI-compat stays at ≤32768.
-        "max_tokens": req.max_tokens.min(32768),
     });
+    // Token cap key differs by model class: reasoning models (o1/o3/o4, GPT-5)
+    // reject `max_tokens` with a 400 and want `max_completion_tokens`; chat
+    // models want `max_tokens`. Either way the budget passes through UNCLAMPED —
+    // TALK "deep" legitimately sends 64000, and the effort bump wants the larger
+    // ceiling (a small-context model would already 400 on its own bump).
+    if reasoning {
+        body["max_completion_tokens"] = json!(req.max_tokens);
+    } else {
+        body["max_tokens"] = json!(req.max_tokens);
+    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
@@ -113,7 +121,7 @@ pub fn build_request(req: &LlmRequest) -> Value {
     // honor it (o1/o3/o4, GPT-5). OpenAI exposes only low/medium/high, so the
     // finer Anthropic levels (xhigh/max) fold to "high".
     if let Some(effort) = req.effort {
-        if openai_supports_reasoning(&req.model) {
+        if reasoning {
             let level = match effort {
                 Effort::Low => "low",
                 Effort::Medium => "medium",

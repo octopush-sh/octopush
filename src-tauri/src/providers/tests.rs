@@ -289,7 +289,7 @@ fn openai_build_request_forces_named_function() {
 
 mod effort {
     use super::super::anthropic::{
-        build_request, effective_effort_level, model_supports_effort, parse_response, thinking_json,
+        build_request, effective_effort_level, parse_response, thinking_json,
     };
     use super::super::openai_compat;
     use super::super::{Effort, LlmContent, LlmMessage, LlmRole, LlmToolUse};
@@ -297,18 +297,31 @@ mod effort {
     use crate::orchestrator::agentic::max_tokens_for;
     use serde_json::json;
 
+    /// Convenience: which branch of `thinking_json` a model+effort lands in.
+    fn plan(model: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+        thinking_json(model, Some(Effort::High), 32768)
+    }
+
     #[test]
-    fn model_supports_effort_matrix() {
-        // Effort-capable (GA output_config.effort path).
+    fn thinking_json_classifies_three_ways() {
+        // Effort models → adaptive + output_config.
         for m in [
             "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
-            "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "some-unknown-model",
+            "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "claude-mythos-5",
         ] {
-            assert!(model_supports_effort(m), "{m} should take the effort path");
+            let (thinking, oc) = plan(m);
+            assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }), "{m} = effort model");
+            assert!(oc.is_some(), "{m} must carry output_config");
         }
-        // Budget-only (legacy thinking budget_tokens path).
+        // Budget models → budget_tokens, no output_config.
         for m in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0"] {
-            assert!(!model_supports_effort(m), "{m} should take the budget path");
+            let (thinking, oc) = plan(m);
+            assert_eq!(thinking.unwrap()["type"], "enabled", "{m} = budget model");
+            assert!(oc.is_none(), "{m} must NOT carry output_config");
+        }
+        // Legacy / unknown → NO thinking params at all (never 400 a non-thinker).
+        for m in ["claude-3-5-sonnet", "claude-3-opus", "foo-model"] {
+            assert_eq!(plan(m), (None, None), "{m} = legacy/unknown → no thinking");
         }
     }
 
@@ -478,7 +491,7 @@ mod effort {
         assert_eq!(content[1]["type"], "tool_use");
     }
 
-    // ─── OpenAI-compat effort gating + max_tokens clamp ─────────────────
+    // ─── OpenAI-compat effort gating + token-cap key ────────────────────
 
     #[test]
     fn openai_reasoning_effort_only_on_reasoning_models() {
@@ -499,12 +512,28 @@ mod effort {
     }
 
     #[test]
-    fn openai_clamps_max_tokens_to_32768() {
+    fn openai_passes_max_tokens_through_unclamped_on_chat_models() {
+        // A chat model uses `max_tokens`, UNCLAMPED (TALK "deep" sends 64000).
         let mut req = sample_request();
         req.model = "gpt-4o".into();
-        req.max_tokens = 64000; // the xhigh/max bump
+        req.max_tokens = 64000;
         let body = openai_compat::build_request(&req);
-        assert_eq!(body["max_tokens"], 32768, "OpenAI-compat caps the effort bump");
+        assert_eq!(body["max_tokens"], 64000, "no clamp on chat models");
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_models_use_max_completion_tokens() {
+        // Reasoning models reject `max_tokens` (400) — they want
+        // `max_completion_tokens`, also unclamped.
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5"] {
+            let mut req = sample_request();
+            req.model = m.into();
+            req.max_tokens = 48000;
+            let body = openai_compat::build_request(&req);
+            assert_eq!(body["max_completion_tokens"], 48000, "{m} uses max_completion_tokens");
+            assert!(body.get("max_tokens").is_none(), "{m} must NOT send max_tokens");
+        }
     }
 
     #[test]

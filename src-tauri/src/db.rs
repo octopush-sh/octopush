@@ -3582,7 +3582,6 @@ impl Db {
     /// Apply a stage patch with NO state guards — callers are responsible for
     /// having validated the run/stage state (`update_run_stage`) or for having
     /// just reset the stage to pending (the rerun path).
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_run_stage_patch(
         &self,
         stage_id: &str,

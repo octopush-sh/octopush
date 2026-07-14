@@ -193,10 +193,14 @@ pub async fn run_agentic_loop(
 
         // Truncation during tool use: feed back errors and retry (mirrors send_agentic).
         if matches!(resp.stop_reason, LlmStopReason::MaxTokens) && !resp.tool_uses.is_empty() {
+            // Truncation path: do NOT replay raw_content verbatim. A turn cut off
+            // at max_tokens can carry an unsigned/partial trailing thinking block,
+            // and replaying it 400s the next request. Empty raw makes the
+            // serializer rebuild from text + tool_uses instead (per the design).
             messages.push(LlmMessage {
                 role: LlmRole::Assistant,
                 content: LlmContent::AssistantWithTools {
-                    raw: resp.raw_content.clone(),
+                    raw: vec![],
                     text: resp.text.clone(),
                     tool_uses: resp.tool_uses.clone(),
                 },
