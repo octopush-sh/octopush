@@ -47,6 +47,10 @@ pub enum SkipReason {
     ConditionError(String),
     /// The workspace couldn't be resolved (deleted / off-disk / unconfigured).
     WorkspaceUnavailable,
+    /// The guarded launch refused the run (monthly quota, budget, parallel-runs
+    /// gate, lease) — carries the refusal's first line so the toast/`last_outcome`
+    /// name the real reason instead of a misleading "workspace busy".
+    LaunchRefused(String),
 }
 
 impl SkipReason {
@@ -57,6 +61,7 @@ impl SkipReason {
             SkipReason::ConditionNotMet => "condition not met".to_string(),
             SkipReason::ConditionError(msg) => format!("condition error: {msg}"),
             SkipReason::WorkspaceUnavailable => "workspace unavailable".to_string(),
+            SkipReason::LaunchRefused(msg) => msg.clone(),
         }
     }
 }
@@ -312,11 +317,25 @@ impl Orchestrator {
 
     /// Fire a specific routine now (the "run now" affordance), regardless of
     /// schedule or enabled state — but through the identical guarded fire path.
+    ///
+    /// Schedule handling is asymmetric on purpose: if the routine's window is
+    /// already OVERDUE (`next_due <= now`), consume it (advance to the next slot
+    /// after now) so the next scheduler tick won't re-fire the SAME window — a
+    /// manual fire on a due window must not become a double run/spend. A FUTURE
+    /// window is left untouched (a manual test must not reschedule it).
     pub async fn run_routine_now(self: Arc<Self>, routine_id: &str) -> crate::error::AppResult<FireOutcome> {
         let routine = self.db()
             .lock()
             .get_routine(routine_id)?
             .ok_or_else(|| crate::error::AppError::Other("routine not found".into()))?;
+        if let Some(due) = routine.next_due_at.as_deref() {
+            if let Ok(due_dt) = DateTime::parse_from_rfc3339(due) {
+                if due_dt.with_timezone(&Utc) <= Utc::now() {
+                    let next = next_due_for(&routine, Local::now());
+                    self.db().lock().set_routine_next_due(&routine.id, next.as_deref())?;
+                }
+            }
+        }
         self.fire_routine(&routine).await
     }
 
@@ -409,9 +428,10 @@ impl Orchestrator {
         // Condition gate — cwd = the resolved worktree (a healthy dir; the
         // resolver already skipped a deleted/off-disk one). A workspace with no
         // worktree path can't host a condition ⇒ fail-safe ConditionError.
-        if let Some(command) = normalize_condition(r.fire_condition.as_deref()) {
+        // `fire_condition` is already trimmed/None (the DB normalizes on write).
+        if let Some(command) = r.fire_condition.as_deref() {
             let eval = match &worktree {
-                Some(path) => evaluate_condition(&command, Path::new(path), CONDITION_TIMEOUT).await,
+                Some(path) => evaluate_condition(command, Path::new(path), CONDITION_TIMEOUT).await,
                 None => ConditionEval::Error("routine's fixed workspace has no worktree".into()),
             };
             if let Some(skip) = self.condition_skip(r, eval) {
@@ -437,24 +457,27 @@ impl Orchestrator {
             }
         }
 
-        // Condition gate — cwd = the project root.
-        if let Some(command) = normalize_condition(r.fire_condition.as_deref()) {
-            let root = self
-                .db()
-                .lock()
-                .get_project_by_id(&r.project_id)?
-                .map(|(_, _, path)| path);
-            let eval = match root {
-                Some(path) => evaluate_condition(&command, Path::new(&path), CONDITION_TIMEOUT).await,
-                None => ConditionEval::Error("routine's project not found".into()),
-            };
+        // Resolve the project ONCE — reused for the condition cwd AND the fresh
+        // worktree (one SELECT per fire). A missing project is a hard error
+        // (stamped + surfaced), consistent with a fixed routine's missing workspace.
+        let project_path = self
+            .db()
+            .lock()
+            .get_project_by_id(&r.project_id)?
+            .ok_or_else(|| crate::error::AppError::Other("routine's project not found".into()))?
+            .2;
+
+        // Condition gate — cwd = the project root (the fresh worktree doesn't
+        // exist yet). `fire_condition` is already trimmed/None (DB-normalized).
+        if let Some(command) = r.fire_condition.as_deref() {
+            let eval = evaluate_condition(command, Path::new(&project_path), CONDITION_TIMEOUT).await;
             if let Some(skip) = self.condition_skip(r, eval) {
                 return Ok(FireOutcome::Skipped(skip));
             }
         }
 
         // Create the fresh worktree only now (a skipped condition created none).
-        let workspace_id = self.create_fresh_routine_workspace(r).await?;
+        let workspace_id = self.create_fresh_routine_workspace(r, &project_path).await?;
         self.dispatch_run(r, &workspace_id).await
     }
 
@@ -494,7 +517,11 @@ impl Orchestrator {
             // Delete the never-started draft (NOT abort — an aborted run counts
             // in the monthly meter and shows as a settled card; this one never ran).
             let _ = self.db().lock().delete_run(&run_id);
-            return Ok(FireOutcome::Skipped(SkipReason::Busy));
+            // Carry the refusal's real reason (quota / budget / parallel-runs /
+            // lease) — NOT a misleading "workspace busy" on an idle workspace.
+            let reason = e.to_string();
+            let first_line = reason.lines().next().unwrap_or("launch refused").trim().to_string();
+            return Ok(FireOutcome::Skipped(SkipReason::LaunchRefused(first_line)));
         }
         Ok(FireOutcome::Dispatched)
     }
@@ -548,13 +575,8 @@ impl Orchestrator {
     /// idempotency-on-branch yields a genuinely clean tree each time. The git
     /// checkout runs on a blocking thread so a large-repo fire can't stall the
     /// async runtime (the DB mutex is not held across it).
-    async fn create_fresh_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<String> {
-        // (id, name, path)
-        let project = self.db()
-            .lock()
-            .get_project_by_id(&r.project_id)?
-            .ok_or_else(|| crate::error::AppError::Other("routine's project not found".into()))?;
-        let project_path = project.2;
+    async fn create_fresh_routine_workspace(&self, r: &RoutineRow, project_path: &str) -> crate::error::AppResult<String> {
+        let project_path = project_path.to_string();
         let stamp = Local::now().format("%Y%m%d-%H%M%S");
         let short = uuid::Uuid::new_v4().to_string();
         let short = short[..6].to_string();
@@ -588,15 +610,6 @@ impl Orchestrator {
         .map_err(|e| crate::error::AppError::Other(format!("worktree task panicked: {e}")))?;
         ws.map(|w| w.id)
     }
-}
-
-/// Trim a stored `fire_condition`, treating a blank one as absent (always fire).
-/// Defensive — the DB layer already normalizes on write, but a NULL vs empty
-/// string must both read as "no condition".
-fn normalize_condition(raw: Option<&str>) -> Option<String> {
-    raw.map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(str::to_string)
 }
 
 /// Parse the stored `[[position, model], …]` JSON overrides into the shape

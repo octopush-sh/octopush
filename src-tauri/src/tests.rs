@@ -5121,9 +5121,10 @@ mod orchestrator_tests {
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "a skipped condition creates no run");
 
         let r = db.lock().get_routine("r-cond").unwrap().unwrap();
-        // Run-now is a manual test: it must NOT advance the schedule (only the
-        // scheduled tick does). The window is untouched.
-        assert_eq!(r.next_due_at.as_deref(), Some(past), "run_now must not touch next_due");
+        // This routine was OVERDUE, so run-now consumes its window (advances
+        // next_due) to keep the next tick from double-firing it — the full rule
+        // is covered by run_now_advances_next_due_only_when_overdue.
+        assert_ne!(r.next_due_at.as_deref(), Some(past), "an overdue window is consumed by run-now");
         assert_eq!(r.last_outcome.as_deref(), Some("condition not met"), "the skip is legible");
         assert!(r.last_checked_at.is_some(), "checked_at stamped on a skip");
         assert!(r.last_run_id.is_none(), "no run stamped on a skip");
@@ -5200,6 +5201,58 @@ mod orchestrator_tests {
             ConditionEval::Error(msg) => assert!(msg.contains("timed out"), "{msg}"),
             other => panic!("expected a timeout Error, got {other:?}"),
         }
+    }
+
+    /// A launch refusal (quota / budget / parallel-runs / lease) is NOT
+    /// mislabelled "workspace busy" — it carries the refusal's real first line.
+    #[test]
+    fn skip_reason_launch_refused_carries_the_real_reason() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let reason = SkipReason::LaunchRefused("monthly quota reached".into());
+        assert_eq!(reason.label(), "monthly quota reached");
+        assert_ne!(reason.label(), SkipReason::Busy.label(), "not mislabelled busy");
+        let view = FireOutcome::Skipped(reason).view();
+        assert_eq!(view.outcome, "skipped");
+        assert_eq!(view.reason.as_deref(), Some("monthly quota reached"));
+    }
+
+    /// `run_routine_now` consumes an OVERDUE window (advances next_due to a future
+    /// slot so the next tick won't double-fire it) but leaves a FUTURE window
+    /// untouched (a manual test must not reschedule the pending window).
+    #[tokio::test]
+    async fn run_now_advances_next_due_only_when_overdue() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RNA", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+
+        // Overdue routine — a condition that skips (no dispatch), so the outcome
+        // is irrelevant; we assert the OVERDUE window was consumed.
+        let mut overdue = routine_input(&pid, "interval", "3600");
+        overdue.fire_condition = Some("false".into());
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-overdue", &overdue, Some(past)).unwrap();
+        Arc::clone(&orch).run_routine_now("r-overdue").await.unwrap();
+        let after = db.lock().get_routine("r-overdue").unwrap().unwrap().next_due_at.unwrap();
+        assert_ne!(after, past, "an overdue window is consumed by run-now");
+        let after_dt = chrono::DateTime::parse_from_rfc3339(&after).unwrap().with_timezone(&chrono::Utc);
+        assert!(after_dt > chrono::Utc::now(), "advanced to a FUTURE slot so the tick won't double-fire");
+
+        // Future routine — next_due must be left exactly as-is.
+        let mut future = routine_input(&pid, "interval", "3600");
+        future.fire_condition = Some("false".into());
+        let far = "2999-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-future", &future, Some(far)).unwrap();
+        Arc::clone(&orch).run_routine_now("r-future").await.unwrap();
+        assert_eq!(
+            db.lock().get_routine("r-future").unwrap().unwrap().next_due_at.as_deref(),
+            Some(far),
+            "a future window must not be rescheduled by a manual run-now",
+        );
     }
 
     /// A condition that exits 0 fires normally (a run is created and dispatched),

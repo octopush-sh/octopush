@@ -10,6 +10,9 @@ interface RoutinesState {
   routines: Routine[];
   loaded: boolean;
   loading: boolean;
+  /** Routine ids with an in-flight `runNow` — the button disables + spins while
+   *  a fire is running (its condition eval can take up to 30s). */
+  runningNow: string[];
   load: () => Promise<void>;
   create: (input: RoutineInput) => Promise<boolean>;
   update: (id: string, input: RoutineInput) => Promise<boolean>;
@@ -34,6 +37,7 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
   routines: [],
   loaded: false,
   loading: false,
+  runningNow: [],
 
   load: async () => {
     set({ loading: true });
@@ -91,13 +95,17 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
   },
 
   runNow: async (id) => {
+    // Ignore a re-click while this routine's fire is already in flight (its
+    // condition eval can take up to 30s) — no duplicate concurrent fires.
+    if (get().runningNow.includes(id)) return;
+    set({ runningNow: [...get().runningNow, id] });
     try {
       const outcome = await ipc.runRoutineNow(id);
       if (outcome.outcome === "dispatched") {
         pushToast({ level: "success", title: "Routine dispatched", body: "The crew is on it — follow along in Mission Control." });
       } else {
         // Honest skip: show exactly why (condition not met/error, workspace
-        // busy/unavailable) so "Run now" is a real test of the gated fire.
+        // busy/unavailable, launch refused) so "Run now" is a real test.
         pushToast({
           level: "info",
           title: "Nothing to run",
@@ -109,6 +117,8 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
       await get().load();
     } catch (e) {
       handleError(e, "Couldn't run the routine");
+    } finally {
+      set({ runningNow: get().runningNow.filter((x) => x !== id) });
     }
   },
 }));

@@ -2,7 +2,7 @@
 // schedule and drives itself via the detached worker: "every morning there's a
 // finished PR waiting." CRUD only; live status lives in Mission Control.
 import { useEffect, useMemo, useState } from "react";
-import { CalendarClock, Pencil, Play, Plus, Power, Trash2 } from "lucide-react";
+import { CalendarClock, Loader2, Pencil, Play, Plus, Power, Trash2 } from "lucide-react";
 import { PaneHeader, SectionLabel } from "./shared";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
@@ -46,6 +46,7 @@ export function RoutinesPane() {
   const setEnabled = useRoutinesStore((s) => s.setEnabled);
   const remove = useRoutinesStore((s) => s.remove);
   const runNow = useRoutinesStore((s) => s.runNow);
+  const runningNow = useRoutinesStore((s) => s.runningNow);
   const [editing, setEditing] = useState<Routine | "new" | null>(null);
 
   const recent = useProjectStore((s) => s.recent);
@@ -157,8 +158,16 @@ export function RoutinesPane() {
                           are always available so a downgraded user can clean up. */}
                       {entitled && (
                         <>
-                          <IconButton title="Run now" onClick={() => void runNow(r.id)}>
-                            <Play size={13} />
+                          <IconButton
+                            title={runningNow.includes(r.id) ? "Running…" : "Run now"}
+                            onClick={() => void runNow(r.id)}
+                            disabled={runningNow.includes(r.id)}
+                          >
+                            {runningNow.includes(r.id) ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <Play size={13} />
+                            )}
                           </IconButton>
                           <IconButton
                             title={r.enabled ? "Pause this routine" : "Resume this routine"}
@@ -207,12 +216,14 @@ function IconButton({
   children,
   active,
   danger,
+  disabled,
 }: {
   title: string;
   onClick: () => void;
   children: React.ReactNode;
   active?: boolean;
   danger?: boolean;
+  disabled?: boolean;
 }) {
   const tone = danger
     ? "text-octo-mute hover:text-octo-rouge"
@@ -225,7 +236,8 @@ function IconButton({
       title={title}
       aria-label={title}
       onClick={onClick}
-      className={`rounded p-1.5 transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] ${tone}`}
+      disabled={disabled}
+      className={`rounded p-1.5 transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent ${tone}`}
     >
       {children}
     </button>
