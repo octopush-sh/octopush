@@ -5,6 +5,7 @@ import type { Session, SessionStatus } from "../lib/types";
 import { useTokenStore } from "../stores/tokenStore";
 import { useEffect } from "react";
 import { OctoMark } from "./icons/OctoMark";
+import { shortModel } from "../lib/modelLabel";
 
 interface Props {
   onNewSession: () => void;
@@ -226,13 +227,6 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
-}
-
-function shortModel(model: string): string {
-  return model
-    .replace("claude-", "")
-    .replace("gpt-", "GPT ")
-    .replace(/-\d{8}$/, "");
 }
 
 function timeAgo(iso: string): string {

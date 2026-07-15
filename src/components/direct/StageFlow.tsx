@@ -3,6 +3,7 @@ import { Pencil } from "lucide-react";
 import type { PipelineStage } from "../../lib/ipc";
 import { TOOLS } from "../builder/graph";
 import { iconForRole } from "../../lib/roleIcons";
+import { shortModel } from "../../lib/modelLabel";
 import { stageTitle } from "../../lib/stageMeta";
 import { ModelPicker } from "../ModelPicker";
 import { Reveal } from "../primitives/Reveal";
@@ -13,6 +14,14 @@ interface Props {
   /** position → overridden model id (the crew override map). */
   overrides: Record<number, string>;
   onOverride: (position: number, model: string) => void;
+}
+
+/** The escalation-policy label for a stage: the escalate model (short), or the
+ *  escalate effort when only that is set (API only). null = no policy. */
+function escalationLabel(s: PipelineStage): string | null {
+  if (s.escalateModel) return shortModel(s.escalateModel);
+  if (s.escalateEffort && s.substrate !== "cli") return s.escalateEffort;
+  return null;
 }
 
 /** The selected ensemble's crew at two altitudes. At rest: ONE quiet line —
@@ -60,6 +69,14 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
                 {s.effort && s.substrate !== "cli" && (
                   <span className="ml-1.5 font-mono text-[10px] text-octo-brass" title="Reasoning effort for this stage">
                     · {s.effort}
+                  </span>
+                )}
+                {escalationLabel(s) && (
+                  <span
+                    className="ml-1.5 font-mono text-[10px] text-octo-brass"
+                    title={`Escalates to ${s.escalateModel ?? "higher effort"} if this stage fails`}
+                  >
+                    · ↑ {escalationLabel(s)}
                   </span>
                 )}
                 {looping && (
@@ -162,6 +179,14 @@ function CrewCard({
             title="Reasoning effort for this stage"
           >
             {stage.effort}
+          </span>
+        )}
+        {escalationLabel(stage) && (
+          <span
+            className="rounded-sm bg-[var(--brass-ghost)] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass"
+            title={`Escalates to ${stage.escalateModel ?? "higher effort"} if this stage fails`}
+          >
+            ↑ {escalationLabel(stage)}
           </span>
         )}
         <span

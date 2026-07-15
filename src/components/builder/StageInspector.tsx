@@ -165,6 +165,47 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
         {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
       </div>
 
+      {/* Escalate on failure — retry ONCE at a stronger tier before halting.
+          The model swap applies to both substrates (the CLI runner reads the
+          model too); the effort bump is API-only, like the base effort. */}
+      <div className="flex flex-col gap-2">
+        <span
+          className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute"
+          title="If this stage fails, retry once with this model/effort before halting."
+        >
+          Escalate on failure
+        </span>
+        <div className="flex items-center gap-2">
+          <ModelPicker
+            activeModel={data.escalateModel ?? ""}
+            onSelectModel={(m) => onPatch({ escalateModel: m })}
+            allowedProviders={isCli ? ["anthropic"] : undefined}
+          />
+          {data.escalateModel ? (
+            <button
+              type="button"
+              aria-label="Clear escalation model"
+              title="No escalation model"
+              onClick={() => onPatch({ escalateModel: null })}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-ivory"
+            >
+              <X size={12} />
+            </button>
+          ) : (
+            <span className="font-mono text-[9px] text-octo-mute">— none —</span>
+          )}
+        </div>
+        <SegmentedControl
+          fill
+          disabled={isCli}
+          options={EFFORT_OPTIONS}
+          value={data.escalateEffort ?? "off"}
+          onChange={(v) => onPatch({ escalateEffort: v === "off" ? null : v })}
+          ariaLabel="Escalation effort"
+        />
+        {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
+      </div>
+
       {/* Substrate + gate */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex flex-col gap-1">

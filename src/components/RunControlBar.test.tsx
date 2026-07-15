@@ -16,7 +16,7 @@ const stage = (over: Partial<RunStage>): RunStage => ({
   artifact: null, feedback: null, error: null, startedAt: "t", finishedAt: null,
   loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, loopIterations: 0,
   diffSnapshot: null, maxIterations: 25, parents: [], tools: null, customName: null, instructions: null,
-  sessionId: null, baselineCommit: null,
+  sessionId: null, baselineCommit: null, escalated: false,
   ...over,
 });
 

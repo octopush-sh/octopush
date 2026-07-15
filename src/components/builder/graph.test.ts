@@ -202,6 +202,20 @@ describe("graphToStageDrafts", () => {
     expect(plan.effort ?? null).toBeNull();
     expect(impl.effort).toBe("high");
   });
+
+  it("carries the escalation policy (default = null / no policy)", () => {
+    const nodes = [node("a", "plan"), node("b", "implement")];
+    // A fresh node has no policy; an author sets an escalate model + effort.
+    nodes[1].data.escalateModel = "claude-opus-4-6";
+    nodes[1].data.escalateEffort = "high";
+    const drafts = graphToStageDrafts(nodes, []);
+    const plan = drafts.find((d) => d.role === "plan")!;
+    const impl = drafts.find((d) => d.role === "implement")!;
+    expect(plan.escalateModel ?? null).toBeNull();
+    expect(plan.escalateEffort ?? null).toBeNull();
+    expect(impl.escalateModel).toBe("claude-opus-4-6");
+    expect(impl.escalateEffort).toBe("high");
+  });
 });
 
 describe("draftToGraph", () => {
@@ -212,6 +226,8 @@ describe("draftToGraph", () => {
     role: over.role ?? "plan",
     agentModel: "claude-sonnet-4-6",
     effort: over.effort ?? null,
+    escalateModel: over.escalateModel ?? null,
+    escalateEffort: over.escalateEffort ?? null,
     substrate: "api",
     checkpoint: false,
     loopTargetPosition: over.loopTargetPosition ?? null,
@@ -272,6 +288,21 @@ describe("draftToGraph", () => {
     // …and survives recompilation back to a draft.
     const drafts = graphToStageDrafts(nodes, edges);
     expect(drafts[0].effort).toBe("xhigh");
+  });
+
+  it("round-trips the escalation policy edit→save", () => {
+    const pipeline: PipelineWithStages = {
+      pipeline: { id: "p", name: "Escalate", description: "", isBuiltin: false, createdAt: "" },
+      stages: [baseStage({ position: 0, role: "implement", escalateModel: "claude-opus-4-6", escalateEffort: "max" })],
+    };
+    const { nodes, edges } = draftToGraph(pipeline);
+    // The saved policy reopens on the canvas node…
+    expect(nodes[0].data.escalateModel).toBe("claude-opus-4-6");
+    expect(nodes[0].data.escalateEffort).toBe("max");
+    // …and survives recompilation back to a draft.
+    const drafts = graphToStageDrafts(nodes, edges);
+    expect(drafts[0].escalateModel).toBe("claude-opus-4-6");
+    expect(drafts[0].escalateEffort).toBe("max");
   });
 });
 

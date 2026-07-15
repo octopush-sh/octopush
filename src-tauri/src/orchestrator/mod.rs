@@ -538,6 +538,70 @@ impl Orchestrator {
         );
     }
 
+    /// Automatic model escalation: if the just-FAILED `stage` has an escalation
+    /// policy it hasn't used yet, retry it ONCE at the strong tier before
+    /// halting. Returns `true` when it escalated (the drive loop re-runs the
+    /// now-pending stage, which resolves to the escalate model/effort); `false`
+    /// to halt as usual. Bounded to exactly one escalation by the sticky
+    /// `escalated` flag. Only ever called from the `Failed` arm — a blocked
+    /// stage (`AwaitingCheckpoint`) and an aborted run never reach here.
+    pub(crate) fn try_escalate(&self, run_id: &str, stage: &RunStageRow) -> AppResult<bool> {
+        // Already used its one escalation ⇒ halt (a second failure at the
+        // strong tier is a real halt, not another escalation).
+        if stage.escalated {
+            return Ok(false);
+        }
+        // Escalate only if the tier would ACTUALLY change — otherwise the retry
+        // re-runs identically and burns spend for nothing. `escalate_model`
+        // must differ from the base; `escalate_effort` counts only on the API
+        // substrate (a CLI agent ignores effort, so an effort-only policy there
+        // is inert). No real change ⇒ halt exactly as before.
+        let model_changes = stage
+            .escalate_model
+            .as_deref()
+            .is_some_and(|m| m != stage.agent_model);
+        let effort_changes = matches!(
+            AgentSubstrate::from_db(&stage.substrate),
+            Some(AgentSubstrate::Api)
+        ) && stage.escalate_effort.is_some()
+            && stage.escalate_effort != stage.effort;
+        if !(model_changes || effort_changes) {
+            return Ok(false);
+        }
+        // Mirror the re-run reset sequence the reject / loop_back paths use:
+        // ARCHIVE the failed base-tier attempt (its error/artifact/diff land in
+        // `stage_iterations` for attempt-history drill-in), RETIRE its spend so
+        // the cost meter keeps counting the erased work (and the budget gate
+        // doesn't overspend), and RESET to pending PRESERVING the existing
+        // feedback — a reviewer's change-requests must reach the strong-tier
+        // retry. `archive_and_reset_stage` resets with model_override `None`, so
+        // the sticky `escalated` flag set below survives, and `recompute_run_cost`
+        // folds the retired spend back into the run total.
+        self.archive_and_reset_stage(run_id, stage, None, stage.feedback.as_deref())?;
+        self.db.lock().set_run_stage_escalated(&stage.id, true)?;
+        self.recompute_run_cost(run_id)?;
+        // Narrate it in the stage journal (persisted + live), like `record_halt`.
+        // Name the model only when the swap is the real change; an effort-only
+        // bump reads as "higher effort".
+        let target = stage
+            .escalate_model
+            .clone()
+            .filter(|m| m != &stage.agent_model)
+            .unwrap_or_else(|| "higher effort".to_string());
+        let entry = serde_json::json!({
+            "kind": "notice",
+            "text": format!("↑ Escalating to {target} after a failed attempt"),
+        });
+        if let Err(e) = self.db.lock().append_stage_log(run_id, &stage.id, &entry.to_string()) {
+            tracing::warn!(stage_id = %stage.id, "escalation journal write failed: {e}");
+        }
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run_id, "stageId": stage.id, "entry": entry }),
+        );
+        Ok(true)
+    }
+
     /// Execute one stage and persist its outcome + cost/baseline.
     async fn run_stage_once(
         &self,
@@ -573,8 +637,17 @@ impl Orchestrator {
         let spec = StageSpec {
             position: stage.position,
             role: stage.role.clone(),
-            agent_model: stage.agent_model.clone(),
-            effort: stage.effort,
+            // Escalation resolves at spec-build time: once this stage has
+            // escalated (sticky flag), it runs at the strong tier — the
+            // escalate model (falling back to the base if only effort was
+            // bumped) and the escalate effort (falling back to the base
+            // effort). The base fields are preserved on the row for history.
+            agent_model: if stage.escalated {
+                stage.escalate_model.clone().unwrap_or_else(|| stage.agent_model.clone())
+            } else {
+                stage.agent_model.clone()
+            },
+            effort: if stage.escalated { stage.escalate_effort.or(stage.effort) } else { stage.effort },
             substrate,
             checkpoint: stage.checkpoint,
             feedback: stage.feedback.clone(),
@@ -1069,6 +1142,16 @@ impl Orchestrator {
 
             match status {
                 StageStatus::Failed => {
+                    // Automatic escalation: a stage with an escalation policy
+                    // retries ONCE at the strong tier before halting. When it
+                    // escalates, the stage is reset to pending and the drive
+                    // loop re-runs it (now with `escalated` set). Only a hard
+                    // failure reaches here — a block (AwaitingCheckpoint) and
+                    // an aborted run never escalate.
+                    if self.try_escalate(run_id, &stage)? {
+                        self.emit_run_update(run_id);
+                        continue;
+                    }
                     self.db.lock().set_run_status(run_id, "paused", false)?;
                     self.emit_checkpoint(run_id, &stage.id, "decision");
                     return Ok(RunStatus::Paused);

@@ -434,6 +434,7 @@ mod workspace_tests {
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
             resume_pending: false, baseline_commit: None, blocked_questions: None,
+            escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
             r#"{{"kind":"text","text":"HEAD{}TAIL"}}"#,
@@ -464,6 +465,7 @@ mod workspace_tests {
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
             session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None,
+            escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
         let stages: Vec<_> = (0..16).map(|p| crate::sync::build_stage_detail(&mk(p), vec![])).collect();
@@ -553,7 +555,7 @@ mod workspace_tests {
             loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
             parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
             custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
-            effort: None,
+            effort: None, escalate_model: None, escalate_effort: None,
         };
         let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
         let synced = a.list_custom_pipelines_for_sync().unwrap();
@@ -583,7 +585,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None,
+            effort: None, escalate_model: None, escalate_effort: None,
         };
         let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
         // A pulled copy stamped in the past must be skipped…
@@ -646,7 +648,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None,
+            effort: None, escalate_model: None, escalate_effort: None,
         };
         let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
         let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
@@ -2925,7 +2927,26 @@ mod pipeline_crud_tests {
             max_iterations: 25,
             pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
         }
+    }
+
+    #[test]
+    fn save_pipeline_round_trips_the_escalation_policy() {
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        let mut s = draft("implement");
+        s.escalate_model = Some("claude-opus-4-6".into());
+        s.escalate_effort = Some(crate::providers::Effort::High);
+        let pid = db.save_pipeline(None, "Escalating", "d", &[s]).unwrap();
+        let stages = db.get_pipeline_stages(&pid).unwrap();
+        assert_eq!(stages[0].escalate_model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(stages[0].escalate_effort, Some(crate::providers::Effort::High));
+        // A stage with no policy stays null (no accidental escalation).
+        let plain = db.save_pipeline(None, "Plain", "d", &[draft("plan")]).unwrap();
+        let plain_stages = db.get_pipeline_stages(&plain).unwrap();
+        assert!(plain_stages[0].escalate_model.is_none());
+        assert!(plain_stages[0].escalate_effort.is_none());
     }
 
     #[test]
@@ -3143,6 +3164,7 @@ mod pipeline_crud_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
             custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
         };
         assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
         assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
@@ -3200,6 +3222,44 @@ mod run_crud_tests {
 
         let runs = db.list_runs(&ws).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn create_run_copies_escalation_policy_and_defaults_escalated_false() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("Esc", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "base-m", "api", false, None, 0, None, 25).unwrap();
+        // Author an escalation policy on the template stage.
+        db.conn_ref()
+            .execute(
+                "UPDATE pipeline_stages SET escalate_model = 'strong-m', escalate_effort = 'high' WHERE pipeline_id = ?1",
+                [&pid],
+            )
+            .unwrap();
+        // The policy reads back on the template…
+        let tmpl = db.get_pipeline_stages(&pid).unwrap();
+        assert_eq!(tmpl[0].escalate_model.as_deref(), Some("strong-m"));
+        assert_eq!(tmpl[0].escalate_effort, Some(crate::providers::Effort::High));
+        // …and copies into run_stages, with `escalated` defaulting false.
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stages = db.list_run_stages(&run).unwrap();
+        assert_eq!(stages[0].escalate_model.as_deref(), Some("strong-m"));
+        assert_eq!(stages[0].escalate_effort, Some(crate::providers::Effort::High));
+        assert!(!stages[0].escalated, "a fresh run-stage has not escalated");
+    }
+
+    #[test]
+    fn set_run_stage_escalated_flips_the_sticky_flag() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("Esc", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "base-m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let id = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(!db.list_run_stages(&run).unwrap()[0].escalated);
+        db.set_run_stage_escalated(&id, true).unwrap();
+        assert!(db.list_run_stages(&run).unwrap()[0].escalated);
     }
 
     #[test]
@@ -3642,6 +3702,29 @@ mod orchestrator_tests {
         }
     }
 
+    /// Always FAILS, recording the (model, effort) of each attempt's resolved
+    /// StageSpec — so a test can prove escalation swaps the spec on the retry.
+    struct SpecRecordingRunner {
+        seen: Arc<Mutex<Vec<(String, Option<crate::providers::Effort>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for SpecRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push((stage.agent_model.clone(), stage.effort));
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Diff, text: "x".into(), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                status: StageStatus::Failed,
+                tool_calls: vec![], error: Some("boom".into()), verdict: None, session_id: None, blocked: None,
+            })
+        }
+    }
+
     /// Captures the stage's cancel flag, then waits (bounded) for it to be set —
     /// mirroring a real substrate that gets interrupted mid-flight. When set, it
     /// returns the same failed outcome the substrates produce on a director stop.
@@ -3805,6 +3888,220 @@ mod orchestrator_tests {
         let orch = Orchestrator::new_with_runner(Arc::clone(db), sink, runner);
         orch.run_to_pause(&run_id).await.unwrap();
         run_id
+    }
+
+    // ── Automatic model escalation ──────────────────────────────────────────
+
+    /// A single-stage run whose `implement` stage carries the given base effort
+    /// and escalation policy (set directly on the template, then copied to the
+    /// run) on the given substrate. Base model is always "base-m". Returns (db, run_id).
+    fn esc_run_sub(
+        substrate: &str,
+        base_effort: Option<&str>,
+        escalate_model: Option<&str>,
+        escalate_effort: Option<&str>,
+    ) -> (Arc<Mutex<Db>>, String) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Esc", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "base-m", substrate, false, None, 0, None, 25).unwrap();
+        db.lock().conn_ref().execute(
+            "UPDATE pipeline_stages SET effort = ?1, escalate_model = ?2, escalate_effort = ?3 WHERE pipeline_id = ?4",
+            rusqlite::params![base_effort, escalate_model, escalate_effort, pid],
+        ).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        (db, run)
+    }
+
+    /// `esc_run_sub` on the API substrate (the common case).
+    fn esc_run(
+        base_effort: Option<&str>,
+        escalate_model: Option<&str>,
+        escalate_effort: Option<&str>,
+    ) -> (Arc<Mutex<Db>>, String) {
+        esc_run_sub("api", base_effort, escalate_model, escalate_effort)
+    }
+
+    fn orch_for(db: &Arc<Mutex<Db>>) -> Orchestrator {
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        Orchestrator::new_with_runner(Arc::clone(db), sink, Box::new(MockRunner))
+    }
+
+    #[test]
+    fn try_escalate_retries_a_failed_stage_with_a_model_policy() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        db.lock().fail_run_stage(&stage.id, "boom").unwrap();
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "a failed stage with a policy escalates");
+        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(reloaded.escalated, "the sticky flag is set");
+        assert_eq!(reloaded.status, "pending", "the stage is reset to pending for the retry");
+        assert!(reloaded.error.is_none(), "the prior failure is cleared");
+    }
+
+    #[test]
+    fn try_escalate_refuses_a_stage_that_already_escalated() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let id = db.lock().list_run_stages(&run).unwrap().remove(0).id;
+        db.lock().set_run_stage_escalated(&id, true).unwrap();
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "one escalation only — a second failure halts");
+    }
+
+    #[test]
+    fn try_escalate_refuses_a_stage_with_no_policy() {
+        let (db, run) = esc_run(None, None, None);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "no policy ⇒ halt as before, zero behavior change");
+        assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn try_escalate_accepts_an_effort_only_policy() {
+        let (db, run) = esc_run(Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "an effort-only policy still escalates");
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn try_escalate_refuses_effort_only_policy_on_cli() {
+        // effort is inert on CLI — an effort-only policy there must NOT burn a
+        // pointless same-tier retry (the retry would run identically).
+        let (db, run) = esc_run_sub("cli", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "CLI ignores effort — no tier change, no retry");
+        assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn try_escalate_refuses_when_escalate_model_equals_base() {
+        // escalate_model identical to the base ⇒ the retry would be identical.
+        let (db, run) = esc_run(None, Some("base-m"), None);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "same model ⇒ no wasted retry");
+    }
+
+    #[test]
+    fn try_escalate_retires_the_failed_attempt_cost_and_archives_it() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
+        // A base-tier attempt that spent $0.05 and then failed.
+        db.lock()
+            .complete_run_stage(&stage_id, "failed", 100, 50, 0.05, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
+            .unwrap();
+        db.lock().fail_run_stage(&stage_id, "boom").unwrap();
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(orch.try_escalate(&run, &stage).unwrap());
+        // Archived in stage_iterations (attempt-history drill-in), not wiped.
+        assert_eq!(db.lock().list_stage_iterations(&stage_id).unwrap().len(), 1, "the base attempt is archived");
+        // Its spend is retired (kept on the run); the live row resets to 0.
+        let (retired, _in, _out) = db.lock().get_retired_cost(&run).unwrap();
+        assert!((retired - 0.05).abs() < 1e-9, "retired = {retired}");
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[0].cost_usd, 0.0);
+        // The run total still includes the retired spend — nothing dropped.
+        let run_row = db.lock().get_run(&run).unwrap().unwrap();
+        assert!((run_row.cost_usd - 0.05).abs() < 1e-9, "run cost keeps the retired attempt: {}", run_row.cost_usd);
+    }
+
+    #[test]
+    fn try_escalate_preserves_existing_feedback_onto_the_retry() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
+        // A reviewer's change-request feedback is on the row when it fails.
+        db.lock().reset_run_stage(&stage_id, None, Some("fix the null check")).unwrap();
+        db.lock().fail_run_stage(&stage_id, "boom").unwrap();
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.feedback.as_deref(), Some("fix the null check"));
+        let orch = orch_for(&db);
+        assert!(orch.try_escalate(&run, &stage).unwrap());
+        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(
+            reloaded.feedback.as_deref(),
+            Some("fix the null check"),
+            "reviewer feedback survives onto the strong-tier retry — it must not run blind",
+        );
+    }
+
+    #[test]
+    fn reset_run_stage_model_override_clears_escalated_none_preserves() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
+        db.lock().set_run_stage_escalated(&id, true).unwrap();
+        // A `None` model override (the auto loop-back / escalation reset path) keeps the flag.
+        db.lock().reset_run_stage(&id, None, None).unwrap();
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated, "None override stays at the strong tier");
+        // An explicit model override (the reject path) clears it.
+        db.lock().reset_run_stage(&id, Some("sonnet-override"), None).unwrap();
+        let s = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!s.escalated, "a manual model override clears the sticky flag");
+        assert_eq!(s.agent_model, "sonnet-override");
+    }
+
+    #[tokio::test]
+    async fn a_manual_model_override_reruns_at_the_chosen_model_not_the_strong_tier() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SpecRecordingRunner { seen: Arc::clone(&seen) }));
+        // First drive: base-m fails → escalate to strong-m → strong-m fails → halt.
+        orch.run_to_pause(&run).await.unwrap();
+        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated, "the stage escalated");
+        seen.lock().clear();
+        // The director re-runs the stage with an explicit model override.
+        let patch = crate::orchestrator::types::StageRerunPatch {
+            agent_model: Some("sonnet-override".into()),
+            ..Default::default()
+        };
+        orch.rerun_from_stage(&run, &stage_id, Some(&patch)).await.unwrap();
+        // The override cleared the sticky flag, so the FIRST re-driven attempt
+        // runs at the director's model — not the escalate tier.
+        assert_eq!(seen.lock()[0].0, "sonnet-override", "the director's model wins over the strong tier");
+    }
+
+    #[tokio::test]
+    async fn escalation_runs_the_retry_at_the_strong_tier_then_halts() {
+        let (db, run) = esc_run(Some("low"), Some("strong-m"), Some("high"));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SpecRecordingRunner { seen: Arc::clone(&seen) }));
+        let status = orch.run_to_pause(&run).await.unwrap();
+        // Exactly two attempts: base tier fails → escalate → strong tier fails → halt.
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2, "bounded to one escalation (one retry)");
+        assert_eq!(seen[0], ("base-m".to_string(), Some(crate::providers::Effort::Low)), "first attempt at the base tier");
+        assert_eq!(seen[1], ("strong-m".to_string(), Some(crate::providers::Effort::High)), "retry at the strong tier");
+        assert_eq!(status, RunStatus::Paused, "the second failure halts the run");
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(stage.escalated);
+        assert_eq!(stage.status, "failed");
+        // The base fields are PRESERVED on the row (resolution happens at spec-build).
+        assert_eq!(stage.agent_model, "base-m", "the base model is kept for history");
+        assert_eq!(stage.effort, Some(crate::providers::Effort::Low));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_stage_never_escalates_even_with_a_policy() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink,
+            Box::new(BlockOnceRunner { asked: std::sync::atomic::AtomicBool::new(false) }));
+        let status = orch.run_to_pause(&run).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "awaiting_checkpoint", "the stage blocked — it did not fail");
+        assert!(!stage.escalated, "a block is not a failure — it never escalates");
     }
 
     #[tokio::test]
@@ -7501,6 +7798,9 @@ mod ancestry_tests {
             role: "plan".into(),
             agent_model: "m".into(),
             effort: None,
+            escalate_model: None,
+            escalate_effort: None,
+            escalated: false,
             substrate: "api".into(),
             checkpoint: false,
             status: "pending".into(),
