@@ -22,9 +22,10 @@ pub fn tool_definitions() -> Value {
             "describe_pipeline_schema",
             "Authoring guide for DIRECT-mode pipelines: the valid stage roles, \
              the workspace tools a stage may use, the api/cli substrates, the \
-             loop & checkpoint rules the validator enforces, recommended model \
-             ids, and a fully annotated example. CALL THIS FIRST before \
-             create_pipeline or update_pipeline.",
+             loop & checkpoint rules the validator enforces, per-stage reasoning \
+             effort and model-escalation policy, the runtime escape valve, \
+             recommended model ids, and a fully annotated example. CALL THIS \
+             FIRST before create_pipeline or update_pipeline.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         ),
         def(
@@ -46,10 +47,12 @@ pub fn tool_definitions() -> Value {
         def(
             "create_pipeline",
             "Create a NEW custom pipeline template from a name, description, and \
-             an ordered list of stages. Stages are validated (roles, substrates, \
-             tool allowlists, loop/checkpoint rules) before saving; invalid \
-             drafts are rejected with a reason. Returns the new pipeline id. \
-             Does not run anything.",
+             an ordered list of stages. Each stage may set per-stage reasoning \
+             `effort` and a model-escalation policy (`escalateModel` / \
+             `escalateEffort`) — see describe_pipeline_schema. Stages are \
+             validated (roles, substrates, tool allowlists, loop/checkpoint \
+             rules) before saving; invalid drafts are rejected with a reason. \
+             Returns the new pipeline id. Does not run anything.",
             json!({
                 "type": "object",
                 "properties": {
@@ -243,7 +246,10 @@ fn STAGE_ARRAY_SCHEMA() -> Value {
                 "instructions": { "type": ["string", "null"], "description": "Optional free-form additions to the role's prompt (max 8000 chars)." },
                 "loopTargetPosition": { "type": ["integer", "null"], "description": "Review roles only: earlier stage to loop back to on rejection. Null = no loop." },
                 "loopMaxIterations": { "type": "integer", "description": "Max loop-backs (>=1 when looping, else 0). Default 0." },
-                "loopMode": { "type": ["string", "null"], "enum": ["gated", "auto", null], "description": "'gated' (human-approved) or 'auto'. Required when looping." }
+                "loopMode": { "type": ["string", "null"], "enum": ["gated", "auto", null], "description": "'gated' (human-approved) or 'auto'. Required when looping." },
+                "effort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Per-stage reasoning effort. API substrate only (ignored on cli). Takes effect only on models that support reasoning: the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and the budget-path models (Haiku 4.5, Sonnet 4.5) — on those, higher levels auto-clamp to the model's max (e.g. Sonnet 4.6 caps xhigh→high). On any OTHER model id (legacy claude-3-5-*, unknown/non-Claude) effort is silently IGNORED — no thinking at all, not clamped. Use a current Claude model to get effect. Omit/null = off (no extended thinking)." },
+                "escalateModel": { "type": ["string", "null"], "description": "On this stage FAILING (loop exhausts its tool-turn budget unfinished, or errors), retry it ONCE with this stronger model before halting. Applies to api and cli. The retry fires ONLY if it raises the tier — set a genuinely different, stronger model than agentModel; if escalateModel equals agentModel the escalation no-ops and the stage just halts on failure. Omit = no escalation." },
+                "escalateEffort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Optionally also raise reasoning effort on the escalated retry (api only). On its own (no escalateModel) it triggers a retry only if it is higher than the stage's base effort; an equal effort no-ops and the stage halts." }
             },
             "required": ["role", "agentModel"],
             "additionalProperties": false
@@ -342,6 +348,13 @@ fn save_pipeline(db: &Db, args: &Value, edit: Option<()>) -> Result<Value, Strin
     let mut stages: Vec<StageDraft> = Vec::with_capacity(raw_stages.len());
     for (i, raw) in raw_stages.iter().enumerate() {
         let normalized = normalize_stage(raw);
+        // An invalid `effort`/`escalateEffort` (a string outside the enum, or an
+        // empty "") surfaces here as a clean serde error — never a panic — because
+        // both deserialize through `Option<Effort>`; we wrap it with the stage
+        // number so the author knows which stage to fix. A whitespace-only
+        // `escalateModel` is trimmed to "no escalation" downstream by
+        // `db.save_pipeline` (the single source of truth), which the re-read
+        // before returning reflects.
         let stage: StageDraft = serde_json::from_value(normalized)
             .map_err(|e| format!("stage {} is malformed: {e}", i + 1))?;
         stages.push(stage);
@@ -589,7 +602,10 @@ fn describe_pipeline_schema() -> Value {
             "instructions": "optional free-form prompt additions (<= 8000 chars).",
             "loopTargetPosition": "review roles only — an EARLIER stage to loop back to on rejection; null = no loop.",
             "loopMaxIterations": ">= 1 when looping, otherwise 0.",
-            "loopMode": "'gated' (human approves each loop) or 'auto'; required when looping."
+            "loopMode": "'gated' (human approves each loop) or 'auto'; required when looping.",
+            "effort": "optional per-stage reasoning effort: low | medium | high | xhigh | max. API substrate only (ignored on cli). Takes effect only on models that support reasoning — the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and budget-path models (Haiku 4.5, Sonnet 4.5), where higher levels auto-clamp to the model's max; on any other id (legacy claude-3-5-*, unknown/non-Claude) it is silently ignored (no thinking at all, not clamped). Use a current Claude model to get effect. Omit/null = off (no extended thinking).",
+            "escalateModel": "optional — a stronger model to retry this stage with ONCE if it fails (loop exhausts its tool-turn budget unfinished, or errors) before halting. Applies to api and cli. Only fires if it raises the tier: pick a genuinely different/stronger model than agentModel; if it equals agentModel the retry no-ops and the stage halts. Omit = no escalation.",
+            "escalateEffort": "optional — also raise the reasoning effort on the escalated retry (api only): low | medium | high | xhigh | max. On its own (no escalateModel) it triggers a retry only when higher than the base effort; equal effort no-ops."
         },
         "rules": [
             "At least one stage.",
@@ -597,25 +613,144 @@ fn describe_pipeline_schema() -> Value {
             "Only review roles (plan_review, code_review, critique, verify) may carry a loop.",
             "A loop's target must be an earlier stage; in an authored graph it must lie on the review's own ancestry path.",
             "When loopTargetPosition is null, loopMaxIterations must be 0 and loopMode must be null.",
-            "substrate must be 'api' or 'cli'; agentModel must be non-empty; maxIterations in 1..100."
+            "substrate must be 'api' or 'cli'; agentModel must be non-empty; maxIterations in 1..100.",
+            "effort is API-substrate only (ignored on cli) and takes effect only on reasoning-capable models — the current Claude families and budget-path models auto-clamp higher levels to the model's max (e.g. Sonnet 4.6 caps xhigh→high); on legacy claude-3-5-* or unknown/non-Claude models it is silently ignored (no thinking), not clamped. omit/null = off.",
+            "A stage with an escalateModel (and/or escalateEffort) retries ONCE at the stronger tier when it fails before halting — but ONLY if that raises the tier: if escalateModel equals agentModel (or escalateEffort equals the base effort with no model change) the escalation no-ops and the stage just halts. escalateModel applies to api and cli, escalateEffort is api-only."
         ],
         "recommendedModels": {
-            "claude-opus-4-8": "Most capable — heavy implement/plan stages.",
+            "claude-opus-4-8": "Most capable — heavy implement/plan stages, and a good escalateModel target.",
             "claude-sonnet-4-6": "Balanced — implement, fix, refine, plan.",
             "claude-haiku-4-5": "Fast & cheap — plan, reviews, tests.",
             "note": "Any model id your configured providers support is accepted; these are the defaults the built-in pipelines use."
         },
+        "runtimeBehaviors": {
+            "__note__": "Two mechanics run at execution time (in the app), not things you enumerate in the stage list — design your pipeline around them.",
+            "escapeValve": "An API-substrate stage may PAUSE and ask the director a question (with a recommended default) when it is genuinely blocked — the run parks like a checkpoint until you answer, then resumes. Nothing to author or configure. IMPORTANT: this is API-only — a `cli` stage keeps a strict never-ask contract and has NO ask-director tool, so it never self-blocks. For a cli stage that might need a human, use a `checkpoint` (pause before it) or an `escalateModel` (retry stronger on failure) instead.",
+            "autoEscalation": "Set `escalateModel` (optionally `escalateEffort`) on your expensive or critical stages so that a FAILURE retries ONCE at a stronger tier instead of halting the whole run. It fires ONLY when it actually raises the tier — set escalateModel to a genuinely stronger model than the stage's agentModel (and/or escalateEffort higher than the base effort); if the escalated tier equals the base, no retry happens and the stage halts. Reach for it on the stages you most want to finish unattended."
+        },
         "annotatedExample": {
             "name": "Feature Factory (custom)",
-            "description": "Plan → review the plan → implement → review code (loops back to implement) → test.",
+            "description": "Plan (medium effort) → review the plan → implement (high effort, escalates to Opus on failure) → review code (loops back to implement) → test.",
             "stages": [
-                { "role": "plan",        "agentModel": "claude-haiku-4-5",  "substrate": "api" },
+                { "role": "plan",        "agentModel": "claude-haiku-4-5",  "substrate": "api", "effort": "medium" },
                 { "role": "plan_review", "agentModel": "claude-haiku-4-5",  "substrate": "api" },
-                { "role": "implement",   "agentModel": "claude-sonnet-4-6", "substrate": "api", "checkpoint": true },
+                { "role": "implement",   "agentModel": "claude-sonnet-4-6", "substrate": "api", "checkpoint": true,
+                  "effort": "high", "escalateModel": "claude-opus-4-8" },
                 { "role": "code_review", "agentModel": "claude-haiku-4-5",  "substrate": "api", "checkpoint": true,
                   "loopTargetPosition": 2, "loopMaxIterations": 2, "loopMode": "gated" },
                 { "role": "test",        "agentModel": "claude-haiku-4-5",  "substrate": "api", "checkpoint": true }
             ]
         }
     })
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octopush_lib::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        // `Db::open` runs migrations, which seed the built-in roles the pipeline
+        // validator needs. No pipeline seeding required for authoring a fresh one.
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    /// The per-stage input schema advertises effort + escalation so a client
+    /// won't reject them (it carries `additionalProperties: false`).
+    #[test]
+    fn stage_schema_advertises_effort_and_escalation() {
+        let schema = STAGE_ARRAY_SCHEMA();
+        let props = &schema["items"]["properties"];
+        for key in ["effort", "escalateModel", "escalateEffort"] {
+            assert!(props.get(key).is_some(), "stage schema is missing '{key}'");
+        }
+        // effort/escalateEffort constrain to the five levels (plus null).
+        let enum_vals = props["effort"]["enum"].as_array().unwrap();
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(enum_vals.iter().any(|v| v == level), "effort enum missing '{level}'");
+        }
+    }
+
+    /// The authoring guide documents the three fields, the runtime mechanics,
+    /// and the escalation/effort rules.
+    #[test]
+    fn describe_schema_documents_effort_and_escalation() {
+        let schema = describe_pipeline_schema();
+        let fields = &schema["stageFields"];
+        for key in ["effort", "escalateModel", "escalateEffort"] {
+            assert!(fields.get(key).is_some(), "stageFields missing '{key}'");
+        }
+        // Runtime behaviors an author designs around.
+        assert!(schema["runtimeBehaviors"]["escapeValve"].is_string());
+        assert!(schema["runtimeBehaviors"]["autoEscalation"].is_string());
+        // The annotated example demonstrates both knobs.
+        let stages = schema["annotatedExample"]["stages"].as_array().unwrap();
+        assert_eq!(stages[0]["effort"], "medium");
+        assert_eq!(stages[2]["effort"], "high");
+        assert_eq!(stages[2]["escalateModel"], "claude-opus-4-8");
+    }
+
+    /// A stage carrying effort + escalateModel + escalateEffort is accepted by
+    /// create_pipeline and round-trips through the same persistence the app uses.
+    #[test]
+    fn create_pipeline_round_trips_effort_and_escalation() {
+        let db = test_db();
+        let args = json!({
+            "name": "Effort Pipe",
+            "description": "one heavy stage",
+            "stages": [
+                {
+                    "role": "implement",
+                    "agentModel": "claude-sonnet-4-6",
+                    "effort": "high",
+                    "escalateModel": "claude-opus-4-8",
+                    "escalateEffort": "max"
+                }
+            ]
+        });
+        let payload = save_pipeline(&db, &args, None).expect("create_pipeline should accept the stage");
+        let stage = &payload["stages"][0];
+        assert_eq!(stage["effort"], "high");
+        assert_eq!(stage["escalateModel"], "claude-opus-4-8");
+        assert_eq!(stage["escalateEffort"], "max");
+
+        // And it truly persisted: re-read straight from the store.
+        let pid = payload["pipelineId"].as_str().unwrap();
+        let stages = db.get_pipeline_stages(pid).unwrap();
+        assert_eq!(stages[0].effort, Some(octopush_lib::providers::Effort::High));
+        assert_eq!(stages[0].escalate_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(stages[0].escalate_effort, Some(octopush_lib::providers::Effort::Max));
+    }
+
+    /// A whitespace-only escalateModel means "no escalation" (matches
+    /// save_pipeline's persistence), not a stored phantom empty model id.
+    #[test]
+    fn empty_escalate_model_normalizes_to_none() {
+        let db = test_db();
+        let args = json!({
+            "name": "No Escalation",
+            "description": "blank escalateModel",
+            "stages": [ { "role": "implement", "agentModel": "claude-sonnet-4-6", "escalateModel": "   " } ]
+        });
+        let payload = save_pipeline(&db, &args, None).expect("blank escalateModel is dropped, not an error");
+        assert!(payload["stages"][0]["escalateModel"].is_null());
+    }
+
+    /// An effort value outside the enum surfaces as a clean tool error naming
+    /// the stage — never a serde panic.
+    #[test]
+    fn invalid_effort_is_a_clean_tool_error() {
+        let db = test_db();
+        let args = json!({
+            "name": "Bad Effort",
+            "description": "unknown effort level",
+            "stages": [ { "role": "implement", "agentModel": "claude-sonnet-4-6", "effort": "ultra" } ]
+        });
+        let err = save_pipeline(&db, &args, None).expect_err("an invalid effort must be rejected");
+        assert!(err.contains("stage 1"), "error should name the stage: {err}");
+    }
 }
