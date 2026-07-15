@@ -81,6 +81,12 @@ export interface Routine {
   nextDueAt: string | null;
   lastRunId: string | null;
   createdAt: string;
+  /** Optional pre-fire shell command (exit 0 ⇒ fire). Null = always fire. */
+  fireCondition?: string | null;
+  /** When the fire condition/fire was last evaluated (RFC3339 UTC). */
+  lastCheckedAt?: string | null;
+  /** The last evaluation's outcome ("dispatched" / "condition not met" / …). */
+  lastOutcome?: string | null;
 }
 
 /** The mutable fields sent on create/update (camelCase → serde). */
@@ -98,6 +104,15 @@ export interface RoutineInput {
   fixedWorkspaceId?: string | null;
   baseBranch?: string | null;
   branchPrefix?: string | null;
+  /** Optional pre-fire shell command; trimmed, empty → omitted (always fire). */
+  fireCondition?: string | null;
+}
+
+/** The outcome of a routine fire (from `runRoutineNow`): dispatched, or a skip
+ *  with a human reason ("condition not met", "condition error: …"). */
+export interface FireOutcomeView {
+  outcome: "dispatched" | "skipped";
+  reason?: string;
 }
 /** A builder-authored stage (position = array index, after topological sort). */
 export interface StageDraft {
@@ -979,7 +994,7 @@ export const ipc = {
   setRoutineEnabled: (routineId: string, enabled: boolean) =>
     invoke<void>("set_routine_enabled", { routineId, enabled }),
   runRoutineNow: (routineId: string) =>
-    invoke<"dispatched" | "skipped">("run_routine_now", { routineId }),
+    invoke<FireOutcomeView>("run_routine_now", { routineId }),
 
   createRun: (
     workspaceId: string,

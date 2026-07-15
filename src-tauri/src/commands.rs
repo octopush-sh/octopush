@@ -1408,9 +1408,13 @@ pub async fn set_routine_enabled(
 pub async fn run_routine_now(
     orch: State<'_, Arc<Orchestrator>>,
     routine_id: String,
-) -> AppResult<crate::routines::FireOutcome> {
+) -> AppResult<crate::routines::FireOutcomeView> {
     require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
-    Arc::clone(&*orch).run_routine_now(&routine_id).await
+    // Run the identical guarded fire path (condition gate included), then hand
+    // the frontend the flattened `{ outcome, reason? }` so "Run now" reports
+    // exactly what a scheduled fire would do.
+    let outcome = Arc::clone(&*orch).run_routine_now(&routine_id).await?;
+    Ok(outcome.view())
 }
 
 // ─── Cross-machine run history (Pro-real Part B / B1) ──────────────

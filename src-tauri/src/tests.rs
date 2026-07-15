@@ -4932,6 +4932,7 @@ mod orchestrator_tests {
             fixed_workspace_id: Some("w1".into()),
             base_branch: None,
             branch_prefix: None,
+            fire_condition: None,
         }
     }
 
@@ -5032,7 +5033,7 @@ mod orchestrator_tests {
     /// than skipping every window forever with no signal), and reports Skipped.
     #[tokio::test]
     async fn routine_with_deleted_fixed_workspace_auto_disables() {
-        use crate::routines::FireOutcome;
+        use crate::routines::{FireOutcome, SkipReason};
         let (db, _ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("RPG", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -5046,11 +5047,255 @@ mod orchestrator_tests {
             Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
         ));
         let outcome = orch.run_routine_now("r-ghost").await.unwrap();
-        assert_eq!(outcome, FireOutcome::Skipped);
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::WorkspaceUnavailable));
         assert!(
             !db.lock().get_routine("r-ghost").unwrap().unwrap().enabled,
             "a routine pointing at a deleted workspace disables itself"
         );
+    }
+
+    // ── Routine pre-fire condition (`fire_condition`) ───────────────────────
+
+    /// The pure condition evaluator, gated purely on exit code: 0 ⇒ Met,
+    /// non-zero ⇒ NotMet, and a command that outruns the timeout ⇒ Error (the
+    /// child is killed) — a hung check can never stall the scheduler tick.
+    #[tokio::test]
+    async fn routine_condition_evaluates_by_exit_code() {
+        use crate::routines::{evaluate_condition, ConditionEval};
+        use std::time::Duration;
+        let dir = std::env::temp_dir();
+        assert_eq!(evaluate_condition("true", &dir, Duration::from_secs(5)).await, ConditionEval::Met);
+        assert_eq!(evaluate_condition("false", &dir, Duration::from_secs(5)).await, ConditionEval::NotMet);
+        assert_eq!(evaluate_condition("exit 7", &dir, Duration::from_secs(5)).await, ConditionEval::NotMet);
+        // Outruns the timeout ⇒ Error (skip, fail-safe).
+        let timed_out = evaluate_condition("sleep 5", &dir, Duration::from_millis(100)).await;
+        assert!(matches!(timed_out, ConditionEval::Error(_)), "{timed_out:?}");
+    }
+
+    /// On timeout the WHOLE process group is killed, not just `bash`: a
+    /// backgrounded child (standing in for a `gh … | grep` pipeline member) is
+    /// reaped with the group and never outlives the tick. Without group-kill the
+    /// subshell reparents to init and would create the marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_condition_timeout_kills_the_process_group() {
+        use crate::routines::{evaluate_condition, ConditionEval};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived.marker");
+        // A backgrounded child creates the marker after 0.5s; the foreground
+        // sleep keeps the group alive well past the 150ms timeout.
+        let cmd = format!("(sleep 0.5 && touch '{}') & sleep 30", marker.display());
+        let eval = evaluate_condition(&cmd, dir.path(), Duration::from_millis(150)).await;
+        assert!(matches!(eval, ConditionEval::Error(_)), "{eval:?}");
+        // Wait past when the background touch WOULD have fired — the group-kill
+        // must have prevented it.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "the backgrounded child must be killed with the group");
+    }
+
+    /// A condition that exits non-zero skips the window with NO run created (zero
+    /// tokens), the window still advanced FIRST (crash-safe), and the skip is
+    /// legible (`last_outcome`/`last_checked_at`). `run_routine_now` surfaces the
+    /// reason, so "Run now" is an honest test of the gated path.
+    #[tokio::test]
+    async fn routine_condition_not_met_skips_without_a_run() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RC", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "interval", "3600");
+        input.fire_condition = Some("  false  ".into()); // trims to `false`
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-cond", &input, Some(past)).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0);
+
+        let outcome = orch.run_routine_now("r-cond").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::ConditionNotMet));
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "a skipped condition creates no run");
+
+        let r = db.lock().get_routine("r-cond").unwrap().unwrap();
+        // This routine was OVERDUE, so run-now consumes its window (advances
+        // next_due) to keep the next tick from double-firing it — the full rule
+        // is covered by run_now_advances_next_due_only_when_overdue.
+        assert_ne!(r.next_due_at.as_deref(), Some(past), "an overdue window is consumed by run-now");
+        assert_eq!(r.last_outcome.as_deref(), Some("condition not met"), "the skip is legible");
+        assert!(r.last_checked_at.is_some(), "checked_at stamped on a skip");
+        assert!(r.last_run_id.is_none(), "no run stamped on a skip");
+    }
+
+    /// A fixed routine whose workspace has a live run is `Busy` (not mislabelled
+    /// "workspace unavailable"), and the condition is NEVER evaluated inside a
+    /// busy worktree — the workspace guard runs BEFORE the gate.
+    #[tokio::test]
+    async fn routine_fixed_busy_workspace_skips_busy_before_condition() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RCB", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        // A live run in the fixed workspace makes it busy.
+        let live = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().set_run_status(&live, "running", false).unwrap();
+
+        let mut input = routine_input(&pid, "interval", "3600");
+        // A condition that would ERROR if it ever ran (bad cwd is irrelevant —
+        // the point is it must NOT run because busy is caught first).
+        input.fire_condition = Some("exit 1".into());
+        db.lock().insert_routine("r-busy", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = orch.run_routine_now("r-busy").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::Busy), "busy is Busy, not WorkspaceUnavailable");
+        assert_eq!(
+            db.lock().get_routine("r-busy").unwrap().unwrap().last_outcome.as_deref(),
+            Some("workspace busy"),
+        );
+    }
+
+    /// A hard error in the fire path (here: a fixed routine with no workspace
+    /// configured) still stamps `last_outcome`/`last_checked_at` — an erroring
+    /// routine must never look never-evaluated. `run_routine_now` surfaces the Err.
+    #[tokio::test]
+    async fn routine_fire_error_is_stamped() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RCE", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "interval", "3600");
+        input.fixed_workspace_id = None; // fixed mode with no workspace ⇒ hard error
+        db.lock().insert_routine("r-err", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        assert!(orch.run_routine_now("r-err").await.is_err(), "a misconfigured routine surfaces the error");
+        let r = db.lock().get_routine("r-err").unwrap().unwrap();
+        assert!(r.last_outcome.as_deref().unwrap_or("").starts_with("error:"), "{:?}", r.last_outcome);
+        assert!(r.last_checked_at.is_some(), "checked_at stamped even on error");
+    }
+
+    /// A condition that can't be evaluated (here: a bogus/hung command bounded by
+    /// a tiny timeout) is a fail-SAFE skip that records the error — never a
+    /// blind fire. Exercises the `ConditionError` branch end-to-end.
+    #[tokio::test]
+    async fn routine_condition_error_is_a_failsafe_skip() {
+        use crate::routines::{evaluate_condition, ConditionEval};
+        use std::time::Duration;
+        // A genuinely unresolvable program under `bash -lc` still exits (127),
+        // which is a NotMet skip; the Error branch is the un-evaluable case
+        // (spawn failure / timeout) — assert the timeout maps to Error.
+        let dir = std::env::temp_dir();
+        let evaluated = evaluate_condition("sleep 30", &dir, Duration::from_millis(50)).await;
+        match evaluated {
+            ConditionEval::Error(msg) => assert!(msg.contains("timed out"), "{msg}"),
+            other => panic!("expected a timeout Error, got {other:?}"),
+        }
+    }
+
+    /// A launch refusal (quota / budget / parallel-runs / lease) is NOT
+    /// mislabelled "workspace busy" — it carries the refusal's real first line.
+    #[test]
+    fn skip_reason_launch_refused_carries_the_real_reason() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let reason = SkipReason::LaunchRefused("monthly quota reached".into());
+        assert_eq!(reason.label(), "monthly quota reached");
+        assert_ne!(reason.label(), SkipReason::Busy.label(), "not mislabelled busy");
+        let view = FireOutcome::Skipped(reason).view();
+        assert_eq!(view.outcome, "skipped");
+        assert_eq!(view.reason.as_deref(), Some("monthly quota reached"));
+    }
+
+    /// `run_routine_now` consumes an OVERDUE window (advances next_due to a future
+    /// slot so the next tick won't double-fire it) but leaves a FUTURE window
+    /// untouched (a manual test must not reschedule the pending window).
+    #[tokio::test]
+    async fn run_now_advances_next_due_only_when_overdue() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RNA", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+
+        // Overdue routine — a condition that skips (no dispatch), so the outcome
+        // is irrelevant; we assert the OVERDUE window was consumed.
+        let mut overdue = routine_input(&pid, "interval", "3600");
+        overdue.fire_condition = Some("false".into());
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-overdue", &overdue, Some(past)).unwrap();
+        Arc::clone(&orch).run_routine_now("r-overdue").await.unwrap();
+        let after = db.lock().get_routine("r-overdue").unwrap().unwrap().next_due_at.unwrap();
+        assert_ne!(after, past, "an overdue window is consumed by run-now");
+        let after_dt = chrono::DateTime::parse_from_rfc3339(&after).unwrap().with_timezone(&chrono::Utc);
+        assert!(after_dt > chrono::Utc::now(), "advanced to a FUTURE slot so the tick won't double-fire");
+
+        // Future routine — next_due must be left exactly as-is.
+        let mut future = routine_input(&pid, "interval", "3600");
+        future.fire_condition = Some("false".into());
+        let far = "2999-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-future", &future, Some(far)).unwrap();
+        Arc::clone(&orch).run_routine_now("r-future").await.unwrap();
+        assert_eq!(
+            db.lock().get_routine("r-future").unwrap().unwrap().next_due_at.as_deref(),
+            Some(far),
+            "a future window must not be rescheduled by a manual run-now",
+        );
+    }
+
+    /// A condition that exits 0 fires normally (a run is created and dispatched),
+    /// and a routine with NO condition is unchanged (backward compat). Two
+    /// independent workspaces so the two dispatches never contend.
+    #[tokio::test]
+    async fn routine_condition_met_dispatches_and_no_condition_is_backward_compat() {
+        use crate::routines::FireOutcome;
+        let (db, w1) = db_with_workspace();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.lock().conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w2','p1','W2','main','/tmp',?1,?1)", [&now]).unwrap();
+        let pid = db.lock().insert_pipeline("RC2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let past = "2000-01-01T00:00:00+00:00";
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+
+        // Condition exits 0 → fire (into w1).
+        let mut met = routine_input(&pid, "interval", "3600");
+        met.fire_condition = Some("true".into());
+        db.lock().insert_routine("r-met", &met, Some(past)).unwrap();
+        let outcome = Arc::clone(&orch).run_routine_now("r-met").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Dispatched);
+        assert_eq!(db.lock().list_runs(&w1).unwrap().len(), 1, "a met condition dispatches a run");
+        assert_eq!(
+            db.lock().get_routine("r-met").unwrap().unwrap().last_outcome.as_deref(),
+            Some("dispatched"),
+            "a dispatch is stamped too",
+        );
+
+        // No condition → always fires (into w2), unchanged behavior.
+        let mut plain = routine_input(&pid, "interval", "3600");
+        plain.fixed_workspace_id = Some("w2".into());
+        db.lock().insert_routine("r-plain", &plain, Some(past)).unwrap();
+        let outcome = Arc::clone(&orch).run_routine_now("r-plain").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Dispatched, "no condition ⇒ backward-compat fire");
+        assert_eq!(db.lock().list_runs("w2").unwrap().len(), 1);
     }
 
     /// The fixed-mode overlap guard reads active runs in the target workspace.

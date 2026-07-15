@@ -22,6 +22,7 @@ const baseDraft: RoutineDraft = {
   fixedWorkspaceId: "w1",
   baseBranch: "",
   branchPrefix: "routine",
+  fireCondition: "",
 };
 
 describe("scheduleSummary", () => {
@@ -95,6 +96,16 @@ describe("draftToInput validation", () => {
     const noBudget = draftToInput({ ...baseDraft, budgetUsd: "  " });
     expect(typeof noBudget === "object" && noBudget.budgetUsd).toBeNull();
   });
+
+  it("trims the fire condition and omits an empty one", () => {
+    const withCond = draftToInput({ ...baseDraft, fireCondition: "  gh pr view | grep -q .  " });
+    expect(typeof withCond === "object" && withCond.fireCondition).toBe("gh pr view | grep -q .");
+    // Empty / whitespace-only ⇒ undefined (omitted ⇒ always fire).
+    const blank = draftToInput({ ...baseDraft, fireCondition: "   " });
+    expect(typeof blank === "object" && blank.fireCondition).toBeUndefined();
+    const none = draftToInput({ ...baseDraft, fireCondition: "" });
+    expect(typeof none === "object" && none.fireCondition).toBeUndefined();
+  });
 });
 
 describe("draftFromRoutine round-trip", () => {
@@ -104,6 +115,8 @@ describe("draftFromRoutine round-trip", () => {
     scheduleSpec: "21600", workspaceMode: "fresh", fixedWorkspaceId: null,
     baseBranch: "main", branchPrefix: "nightly", enabled: true, lastFiredAt: null,
     nextDueAt: null, lastRunId: null, createdAt: "t",
+    fireCondition: "gh pr view | grep -q .", lastCheckedAt: "2026-07-15T09:00:00Z",
+    lastOutcome: "condition not met",
   };
   it("recovers hours from a whole-hour interval and preserves fresh fields", () => {
     const d = draftFromRoutine(routine, "p0");
@@ -113,10 +126,19 @@ describe("draftFromRoutine round-trip", () => {
     expect(d.baseBranch).toBe("main");
     expect(d.budgetUsd).toBe("3");
   });
-  it("defaults sensibly for a new routine", () => {
+  it("round-trips the fire condition into the draft and back", () => {
+    const d = draftFromRoutine(routine, "p0");
+    expect(d.fireCondition).toBe("gh pr view | grep -q .");
+    // Back to the wire (via a valid fixed+daily combo — the fresh fixture is
+    // interval, which draftToInput rejects; the condition is what we assert).
+    const back = draftToInput({ ...d, workspaceMode: "fixed", fixedWorkspaceId: "w1", scheduleKind: "daily" });
+    expect(typeof back === "object" && back.fireCondition).toBe("gh pr view | grep -q .");
+  });
+  it("defaults the fire condition to empty for a new routine", () => {
     const d = draftFromRoutine(null, "p9");
     expect(d.projectId).toBe("p9");
     expect(d.scheduleKind).toBe("daily");
     expect(d.workspaceMode).toBe("fixed");
+    expect(d.fireCondition).toBe("");
   });
 });

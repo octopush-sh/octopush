@@ -2,7 +2,7 @@
 // schedule and drives itself via the detached worker: "every morning there's a
 // finished PR waiting." CRUD only; live status lives in Mission Control.
 import { useEffect, useMemo, useState } from "react";
-import { CalendarClock, Pencil, Play, Plus, Power, Trash2 } from "lucide-react";
+import { CalendarClock, Loader2, Pencil, Play, Plus, Power, Trash2 } from "lucide-react";
 import { PaneHeader, SectionLabel } from "./shared";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
@@ -13,6 +13,7 @@ import { useEntitlementStore } from "../../stores/entitlementStore";
 import { ipc, type Routine } from "../../lib/ipc";
 import type { Workspace } from "../../lib/types";
 import { pushToast } from "../Toasts";
+import { formatRelTime } from "../../lib/relTime";
 import {
   draftFromRoutine,
   draftToInput,
@@ -28,6 +29,15 @@ const ROUTINES_FEATURE = "routines.scheduled";
 const FIELD_SURFACE =
   "border border-octo-hairline bg-octo-bg text-octo-ivory hover:border-[var(--brass-dim)] focus:border-octo-brass";
 
+/** The last evaluation, legible in the list row ("dispatched · 5m ago" /
+ *  "condition not met · 2m ago") so a routine that keeps skipping doesn't look
+ *  dead. Null when the routine has never been evaluated. */
+function lastCheckLabel(r: Routine): string | null {
+  if (!r.lastCheckedAt || !r.lastOutcome) return null;
+  const rel = formatRelTime(new Date(r.lastCheckedAt).getTime());
+  return `${r.lastOutcome} · ${rel}`;
+}
+
 export function RoutinesPane() {
   const hasFeature = useEntitlementStore((s) => s.hasFeature);
   const entitled = hasFeature(ROUTINES_FEATURE);
@@ -36,6 +46,7 @@ export function RoutinesPane() {
   const setEnabled = useRoutinesStore((s) => s.setEnabled);
   const remove = useRoutinesStore((s) => s.remove);
   const runNow = useRoutinesStore((s) => s.runNow);
+  const runningNow = useRoutinesStore((s) => s.runningNow);
   const [editing, setEditing] = useState<Routine | "new" | null>(null);
 
   const recent = useProjectStore((s) => s.recent);
@@ -135,16 +146,28 @@ export function RoutinesPane() {
                         <span className="text-octo-brass">{scheduleSummary(r.scheduleKind, r.scheduleSpec)}</span>
                         <span>· {projectName(r.projectId)}</span>
                         <span>· {r.workspaceMode === "fresh" ? "fresh workspace" : "fixed workspace"}</span>
+                        {r.fireCondition && <span title="This routine fires only when its condition command exits 0.">· conditional</span>}
                         {r.enabled && entitled && <span>· next {untilLabel(r.nextDueAt)}</span>}
                       </div>
+                      {lastCheckLabel(r) && (
+                        <div className="mt-0.5 font-mono text-[10px] text-octo-mute">{lastCheckLabel(r)}</div>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
                       {/* Run-now and enable need entitlement; pause and delete
                           are always available so a downgraded user can clean up. */}
                       {entitled && (
                         <>
-                          <IconButton title="Run now" onClick={() => void runNow(r.id)}>
-                            <Play size={13} />
+                          <IconButton
+                            title={runningNow.includes(r.id) ? "Running…" : "Run now"}
+                            onClick={() => void runNow(r.id)}
+                            disabled={runningNow.includes(r.id)}
+                          >
+                            {runningNow.includes(r.id) ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <Play size={13} />
+                            )}
                           </IconButton>
                           <IconButton
                             title={r.enabled ? "Pause this routine" : "Resume this routine"}
@@ -193,12 +216,14 @@ function IconButton({
   children,
   active,
   danger,
+  disabled,
 }: {
   title: string;
   onClick: () => void;
   children: React.ReactNode;
   active?: boolean;
   danger?: boolean;
+  disabled?: boolean;
 }) {
   const tone = danger
     ? "text-octo-mute hover:text-octo-rouge"
@@ -211,7 +236,8 @@ function IconButton({
       title={title}
       aria-label={title}
       onClick={onClick}
-      className={`rounded p-1.5 transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] ${tone}`}
+      disabled={disabled}
+      className={`rounded p-1.5 transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent ${tone}`}
     >
       {children}
     </button>
@@ -422,6 +448,18 @@ function RoutineEditor({
             />
           </Field>
 
+          <Field label="Fire only if… (optional)">
+            <TextInput
+              value={draft.fireCondition}
+              onChange={(v) => set("fireCondition", v)}
+              placeholder="gh pr view --json reviewThreads -q '…' | grep -q ."
+              mono
+            />
+            <p className="mt-1 text-[11px] leading-snug text-octo-mute">
+              Runs before each fire in the routine&rsquo;s workspace; the routine fires only if this command exits 0. Leave empty to always fire.
+            </p>
+          </Field>
+
           <Field label="Budget per run (optional)">
             <div className="flex items-center gap-2">
               <span className="font-mono text-[12px] text-octo-mute">$</span>
@@ -468,11 +506,13 @@ function TextInput({
   onChange,
   placeholder,
   autoFocus,
+  mono,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   autoFocus?: boolean;
+  mono?: boolean;
 }) {
   return (
     <input
@@ -481,7 +521,10 @@ function TextInput({
       autoFocus={autoFocus}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-[13px] text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute"
+      spellCheck={mono ? false : undefined}
+      className={`w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute ${
+        mono ? "font-mono text-[12px]" : "text-[13px]"
+      }`}
     />
   );
 }
