@@ -93,10 +93,18 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
   runNow: async (id) => {
     try {
       const outcome = await ipc.runRoutineNow(id);
-      if (outcome === "dispatched") {
+      if (outcome.outcome === "dispatched") {
         pushToast({ level: "success", title: "Routine dispatched", body: "The crew is on it — follow along in Mission Control." });
       } else {
-        pushToast({ level: "info", title: "Nothing to run", body: "The window was skipped — its workspace is busy, or a previous run is still going." });
+        // Honest skip: show exactly why (condition not met/error, workspace
+        // busy/unavailable) so "Run now" is a real test of the gated fire.
+        pushToast({
+          level: "info",
+          title: "Nothing to run",
+          body: outcome.reason
+            ? `The window was skipped — ${outcome.reason}.`
+            : "The window was skipped — its workspace is busy, or a previous run is still going.",
+        });
       }
       await get().load();
     } catch (e) {

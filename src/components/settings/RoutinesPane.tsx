@@ -13,6 +13,7 @@ import { useEntitlementStore } from "../../stores/entitlementStore";
 import { ipc, type Routine } from "../../lib/ipc";
 import type { Workspace } from "../../lib/types";
 import { pushToast } from "../Toasts";
+import { formatRelTime } from "../../lib/relTime";
 import {
   draftFromRoutine,
   draftToInput,
@@ -27,6 +28,15 @@ const ROUTINES_FEATURE = "routines.scheduled";
 // (same border/bg/focus tokens) so the pickers read as siblings, in both themes.
 const FIELD_SURFACE =
   "border border-octo-hairline bg-octo-bg text-octo-ivory hover:border-[var(--brass-dim)] focus:border-octo-brass";
+
+/** The last evaluation, legible in the list row ("dispatched · 5m ago" /
+ *  "condition not met · 2m ago") so a routine that keeps skipping doesn't look
+ *  dead. Null when the routine has never been evaluated. */
+function lastCheckLabel(r: Routine): string | null {
+  if (!r.lastCheckedAt || !r.lastOutcome) return null;
+  const rel = formatRelTime(new Date(r.lastCheckedAt).getTime());
+  return `${r.lastOutcome} · ${rel}`;
+}
 
 export function RoutinesPane() {
   const hasFeature = useEntitlementStore((s) => s.hasFeature);
@@ -135,8 +145,12 @@ export function RoutinesPane() {
                         <span className="text-octo-brass">{scheduleSummary(r.scheduleKind, r.scheduleSpec)}</span>
                         <span>· {projectName(r.projectId)}</span>
                         <span>· {r.workspaceMode === "fresh" ? "fresh workspace" : "fixed workspace"}</span>
+                        {r.fireCondition && <span title="This routine fires only when its condition command exits 0.">· conditional</span>}
                         {r.enabled && entitled && <span>· next {untilLabel(r.nextDueAt)}</span>}
                       </div>
+                      {lastCheckLabel(r) && (
+                        <div className="mt-0.5 font-mono text-[10px] text-octo-mute">{lastCheckLabel(r)}</div>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
                       {/* Run-now and enable need entitlement; pause and delete
@@ -422,6 +436,18 @@ function RoutineEditor({
             />
           </Field>
 
+          <Field label="Fire only if… (optional)">
+            <TextInput
+              value={draft.fireCondition}
+              onChange={(v) => set("fireCondition", v)}
+              placeholder="gh pr view --json reviewThreads -q '…' | grep -q ."
+              mono
+            />
+            <p className="mt-1 text-[11px] leading-snug text-octo-mute">
+              Runs before each fire in the routine&rsquo;s workspace; the routine fires only if this command exits 0. Leave empty to always fire.
+            </p>
+          </Field>
+
           <Field label="Budget per run (optional)">
             <div className="flex items-center gap-2">
               <span className="font-mono text-[12px] text-octo-mute">$</span>
@@ -468,11 +494,13 @@ function TextInput({
   onChange,
   placeholder,
   autoFocus,
+  mono,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   autoFocus?: boolean;
+  mono?: boolean;
 }) {
   return (
     <input
@@ -481,7 +509,10 @@ function TextInput({
       autoFocus={autoFocus}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-[13px] text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute"
+      spellCheck={mono ? false : undefined}
+      className={`w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute ${
+        mono ? "font-mono text-[12px]" : "text-[13px]"
+      }`}
     />
   );
 }

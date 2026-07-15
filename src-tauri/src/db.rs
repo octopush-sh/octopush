@@ -41,6 +41,15 @@ fn add_column_if_missing(conn: &rusqlite::Connection, alter_sql: &str) -> rusqli
     }
 }
 
+/// Trim an optional text field, treating a blank string as absent — so an empty
+/// input is stored as NULL rather than an empty string that would read as "set".
+fn normalize_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse a stage's `parents` JSON column (a list of upstream positions) into a
 /// vec. A NULL or malformed value reads as "no recorded parents" — the caller
 /// then treats the stage as part of a legacy linear chain.
@@ -622,6 +631,9 @@ impl Db {
                 last_fired_at      TEXT,
                 next_due_at        TEXT,
                 last_run_id        TEXT,
+                fire_condition     TEXT,
+                last_checked_at    TEXT,
+                last_outcome       TEXT,
                 created_at         TEXT NOT NULL,
                 FOREIGN KEY(project_id)  REFERENCES projects(id)  ON DELETE CASCADE,
                 FOREIGN KEY(pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
@@ -689,6 +701,16 @@ impl Db {
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
         )?;
+
+        // ── Routine pre-fire condition (Routines, `fire_condition` gate) ────
+        // An optional shell command evaluated before each fire (exit 0 ⇒ fire,
+        // non-zero ⇒ skip the window with no run/tokens). `last_checked_at` /
+        // `last_outcome` are written on EVERY evaluation so a routine that keeps
+        // skipping stays legible instead of looking dead. All three NULL for
+        // pre-existing rows ⇒ unchanged behavior (always fire).
+        add_column_if_missing(&self.conn, "ALTER TABLE routines ADD COLUMN fire_condition TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE routines ADD COLUMN last_checked_at TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE routines ADD COLUMN last_outcome TEXT")?;
 
         self.backfill_default_threads()?;
 
@@ -3250,18 +3272,20 @@ impl Db {
         input: &RoutineInput,
         next_due_at: Option<&str>,
     ) -> AppResult<()> {
+        // Trim the optional fire condition, empty → NULL (always fire).
+        let fire_condition = normalize_optional(input.fire_condition.as_deref());
         self.conn.execute(
             "INSERT INTO routines
                 (id, name, project_id, pipeline_id, task, reference_model, stage_overrides,
                  budget_usd, schedule_kind, schedule_spec, workspace_mode, fixed_workspace_id,
-                 base_branch, branch_prefix, enabled, next_due_at, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,?15,?16)",
+                 base_branch, branch_prefix, fire_condition, enabled, next_due_at, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,1,?16,?17)",
             params![
                 id, input.name, input.project_id, input.pipeline_id, input.task,
                 input.reference_model, input.stage_overrides, input.budget_usd,
                 input.schedule_kind, input.schedule_spec, input.workspace_mode,
                 input.fixed_workspace_id, input.base_branch, input.branch_prefix,
-                next_due_at, Utc::now().to_rfc3339(),
+                fire_condition, next_due_at, Utc::now().to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -3275,18 +3299,20 @@ impl Db {
         input: &RoutineInput,
         next_due_at: Option<&str>,
     ) -> AppResult<()> {
+        let fire_condition = normalize_optional(input.fire_condition.as_deref());
         self.conn.execute(
             "UPDATE routines SET
                 name = ?2, project_id = ?3, pipeline_id = ?4, task = ?5, reference_model = ?6,
                 stage_overrides = ?7, budget_usd = ?8, schedule_kind = ?9, schedule_spec = ?10,
                 workspace_mode = ?11, fixed_workspace_id = ?12, base_branch = ?13,
-                branch_prefix = ?14, next_due_at = ?15
+                branch_prefix = ?14, fire_condition = ?15, next_due_at = ?16
              WHERE id = ?1",
             params![
                 id, input.name, input.project_id, input.pipeline_id, input.task,
                 input.reference_model, input.stage_overrides, input.budget_usd,
                 input.schedule_kind, input.schedule_spec, input.workspace_mode,
-                input.fixed_workspace_id, input.base_branch, input.branch_prefix, next_due_at,
+                input.fixed_workspace_id, input.base_branch, input.branch_prefix,
+                fire_condition, next_due_at,
             ],
         )?;
         Ok(())
@@ -3377,6 +3403,19 @@ impl Db {
         self.conn.execute(
             "UPDATE routines SET last_fired_at = ?2, last_run_id = ?3 WHERE id = ?1",
             params![id, fired_at, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the outcome of a fire evaluation (dispatched, or a skip reason)
+    /// on EVERY tick — `last_checked_at`/`last_outcome`. Independent of
+    /// `stamp_routine_run` (which records the dispatched run itself); this keeps
+    /// a routine that keeps skipping legible ("checked 2m ago · condition not
+    /// met") instead of looking dead.
+    pub fn set_routine_fire_result(&self, id: &str, checked_at: &str, outcome: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE routines SET last_checked_at = ?2, last_outcome = ?3 WHERE id = ?1",
+            params![id, checked_at, outcome],
         )?;
         Ok(())
     }
@@ -3982,6 +4021,13 @@ pub struct RoutineRow {
     pub next_due_at: Option<String>,
     pub last_run_id: Option<String>,
     pub created_at: String,
+    /// Optional pre-fire shell command (exit 0 ⇒ fire, non-zero ⇒ skip). NULL =
+    /// always fire.
+    pub fire_condition: Option<String>,
+    /// When the fire condition (or fire) was last evaluated — set on every tick.
+    pub last_checked_at: Option<String>,
+    /// The last evaluation's outcome ("dispatched" / "condition not met" / …).
+    pub last_outcome: Option<String>,
 }
 
 /// The mutable fields of a routine (create + update share this shape). The
@@ -4005,6 +4051,9 @@ pub struct RoutineInput {
     pub fixed_workspace_id: Option<String>,
     pub base_branch: Option<String>,
     pub branch_prefix: Option<String>,
+    /// Optional pre-fire shell command; trimmed, empty → NULL on write.
+    #[serde(default)]
+    pub fire_condition: Option<String>,
 }
 
 fn default_workspace_mode() -> String {
@@ -4330,7 +4379,7 @@ pub struct RunRow {
 const ROUTINE_COLS: &str = "id, name, project_id, pipeline_id, task, reference_model, \
     stage_overrides, budget_usd, schedule_kind, schedule_spec, workspace_mode, \
     fixed_workspace_id, base_branch, branch_prefix, enabled, last_fired_at, next_due_at, \
-    last_run_id, created_at";
+    last_run_id, created_at, fire_condition, last_checked_at, last_outcome";
 
 fn row_to_routine(r: &rusqlite::Row) -> rusqlite::Result<RoutineRow> {
     Ok(RoutineRow {
@@ -4353,6 +4402,9 @@ fn row_to_routine(r: &rusqlite::Row) -> rusqlite::Result<RoutineRow> {
         next_due_at: r.get(16)?,
         last_run_id: r.get(17)?,
         created_at: r.get(18)?,
+        fire_condition: r.get(19)?,
+        last_checked_at: r.get(20)?,
+        last_outcome: r.get(21)?,
     })
 }
 

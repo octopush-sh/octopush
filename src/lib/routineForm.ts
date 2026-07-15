@@ -17,6 +17,7 @@ export interface RoutineDraft {
   fixedWorkspaceId: string;
   baseBranch: string;
   branchPrefix: string;
+  fireCondition: string;
 }
 
 /** Human summary of a schedule, e.g. "Every 6 hours" / "Daily at 09:00". */
@@ -61,6 +62,7 @@ export function draftFromRoutine(r: Routine | null, defaultProject: string): Rou
       fixedWorkspaceId: "",
       baseBranch: "",
       branchPrefix: "routine",
+      fireCondition: "",
     };
   }
   const secs = Number(r.scheduleSpec);
@@ -79,6 +81,7 @@ export function draftFromRoutine(r: Routine | null, defaultProject: string): Rou
     fixedWorkspaceId: r.fixedWorkspaceId ?? "",
     baseBranch: r.baseBranch ?? "",
     branchPrefix: r.branchPrefix ?? "routine",
+    fireCondition: r.fireCondition ?? "",
   };
 }
 
@@ -130,5 +133,7 @@ export function draftToInput(d: RoutineDraft): RoutineInput | string {
     fixedWorkspaceId: d.workspaceMode === "fixed" ? d.fixedWorkspaceId : null,
     baseBranch: d.workspaceMode === "fresh" ? d.baseBranch.trim() || null : null,
     branchPrefix: d.workspaceMode === "fresh" ? d.branchPrefix.trim() || null : null,
+    // Optional pre-fire gate — trim, empty → undefined (omitted ⇒ always fire).
+    fireCondition: d.fireCondition.trim() || undefined,
   };
 }
