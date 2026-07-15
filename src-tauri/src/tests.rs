@@ -3989,45 +3989,45 @@ mod orchestrator_tests {
     }
 
     #[test]
-    fn try_escalate_retires_the_failed_attempt_cost_and_archives_it() {
+    fn try_escalate_retires_cost_archives_and_preserves_feedback_from_the_fresh_row() {
+        // Exercises the PRODUCTION path: the drive loop's Failed arm passes a
+        // clone captured BEFORE the stage ran (cost 0, no artifact/error/feedback).
+        // `try_escalate` must re-read the fresh row — reading spend/error/feedback
+        // off the stale clone would archive nothing, drop the base-tier cost, and
+        // run the retry blind. This test FAILS on the stale-clone version.
         let (db, run) = esc_run(None, Some("strong-m"), None);
-        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
-        // A base-tier attempt that spent $0.05 and then failed.
+        let stale = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stale.cost_usd, 0.0);
+        assert!(
+            stale.artifact.is_none() && stale.error.is_none() && stale.feedback.is_none(),
+            "the drive loop's clone is pre-run state",
+        );
+        // The DB row then records the REAL base-tier attempt: a reviewer's
+        // feedback (from a prior loop-back), $0.05 spent, and a hard failure.
+        db.lock().reset_run_stage(&stale.id, None, Some("fix the null check")).unwrap();
         db.lock()
-            .complete_run_stage(&stage_id, "failed", 100, 50, 0.05, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
+            .complete_run_stage(&stale.id, "failed", 100, 50, 0.05, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
             .unwrap();
-        db.lock().fail_run_stage(&stage_id, "boom").unwrap();
-        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        db.lock().fail_run_stage(&stale.id, "boom").unwrap();
+        // Escalate using the STALE clone (as the drive loop does).
         let orch = orch_for(&db);
-        assert!(orch.try_escalate(&run, &stage).unwrap());
-        // Archived in stage_iterations (attempt-history drill-in), not wiped.
-        assert_eq!(db.lock().list_stage_iterations(&stage_id).unwrap().len(), 1, "the base attempt is archived");
-        // Its spend is retired (kept on the run); the live row resets to 0.
+        assert!(orch.try_escalate(&run, &stale).unwrap());
+        // (b) The base attempt is archived in stage_iterations, not wiped.
+        assert_eq!(db.lock().list_stage_iterations(&stale.id).unwrap().len(), 1, "the base attempt is archived");
+        // (a) Its spend is retired and still counts toward the run; live row resets to 0.
         let (retired, _in, _out) = db.lock().get_retired_cost(&run).unwrap();
         assert!((retired - 0.05).abs() < 1e-9, "retired = {retired}");
-        assert_eq!(db.lock().list_run_stages(&run).unwrap()[0].cost_usd, 0.0);
-        // The run total still includes the retired spend — nothing dropped.
+        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(reloaded.cost_usd, 0.0, "the reset live row starts fresh");
         let run_row = db.lock().get_run(&run).unwrap().unwrap();
         assert!((run_row.cost_usd - 0.05).abs() < 1e-9, "run cost keeps the retired attempt: {}", run_row.cost_usd);
-    }
-
-    #[test]
-    fn try_escalate_preserves_existing_feedback_onto_the_retry() {
-        let (db, run) = esc_run(None, Some("strong-m"), None);
-        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
-        // A reviewer's change-request feedback is on the row when it fails.
-        db.lock().reset_run_stage(&stage_id, None, Some("fix the null check")).unwrap();
-        db.lock().fail_run_stage(&stage_id, "boom").unwrap();
-        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
-        assert_eq!(stage.feedback.as_deref(), Some("fix the null check"));
-        let orch = orch_for(&db);
-        assert!(orch.try_escalate(&run, &stage).unwrap());
-        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        // (c) The reviewer's feedback survives onto the strong-tier retry.
         assert_eq!(
             reloaded.feedback.as_deref(),
             Some("fix the null check"),
-            "reviewer feedback survives onto the strong-tier retry — it must not run blind",
+            "reviewer feedback survives — the retry must not run blind",
         );
+        assert!(reloaded.escalated);
     }
 
     #[test]

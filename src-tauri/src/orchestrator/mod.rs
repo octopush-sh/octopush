@@ -546,9 +546,24 @@ impl Orchestrator {
     /// `escalated` flag. Only ever called from the `Failed` arm — a blocked
     /// stage (`AwaitingCheckpoint`) and an aborted run never reach here.
     pub(crate) fn try_escalate(&self, run_id: &str, stage: &RunStageRow) -> AppResult<bool> {
+        // The drive loop's Failed arm hands us a clone captured BEFORE the stage
+        // ran (pre-run state: cost 0, tokens 0, no artifact/error). Re-read the
+        // FRESH row so the archive records the REAL failure (error/artifact/diff)
+        // and the retire keeps the REAL spend — reading spend/error off the stale
+        // clone would archive nothing and drop the base-tier cost.
+        let fresh = match self
+            .db
+            .lock()
+            .list_run_stages(run_id)?
+            .into_iter()
+            .find(|s| s.id == stage.id)
+        {
+            Some(s) => s,
+            None => return Ok(false),
+        };
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
-        if stage.escalated {
+        if fresh.escalated {
             return Ok(false);
         }
         // Escalate only if the tier would ACTUALLY change — otherwise the retry
@@ -556,15 +571,15 @@ impl Orchestrator {
         // must differ from the base; `escalate_effort` counts only on the API
         // substrate (a CLI agent ignores effort, so an effort-only policy there
         // is inert). No real change ⇒ halt exactly as before.
-        let model_changes = stage
+        let model_changes = fresh
             .escalate_model
             .as_deref()
-            .is_some_and(|m| m != stage.agent_model);
+            .is_some_and(|m| m != fresh.agent_model);
         let effort_changes = matches!(
-            AgentSubstrate::from_db(&stage.substrate),
+            AgentSubstrate::from_db(&fresh.substrate),
             Some(AgentSubstrate::Api)
-        ) && stage.escalate_effort.is_some()
-            && stage.escalate_effort != stage.effort;
+        ) && fresh.escalate_effort.is_some()
+            && fresh.escalate_effort != fresh.effort;
         if !(model_changes || effort_changes) {
             return Ok(false);
         }
@@ -577,27 +592,27 @@ impl Orchestrator {
         // retry. `archive_and_reset_stage` resets with model_override `None`, so
         // the sticky `escalated` flag set below survives, and `recompute_run_cost`
         // folds the retired spend back into the run total.
-        self.archive_and_reset_stage(run_id, stage, None, stage.feedback.as_deref())?;
-        self.db.lock().set_run_stage_escalated(&stage.id, true)?;
+        self.archive_and_reset_stage(run_id, &fresh, None, fresh.feedback.as_deref())?;
+        self.db.lock().set_run_stage_escalated(&fresh.id, true)?;
         self.recompute_run_cost(run_id)?;
         // Narrate it in the stage journal (persisted + live), like `record_halt`.
         // Name the model only when the swap is the real change; an effort-only
         // bump reads as "higher effort".
-        let target = stage
+        let target = fresh
             .escalate_model
             .clone()
-            .filter(|m| m != &stage.agent_model)
+            .filter(|m| m != &fresh.agent_model)
             .unwrap_or_else(|| "higher effort".to_string());
         let entry = serde_json::json!({
             "kind": "notice",
             "text": format!("↑ Escalating to {target} after a failed attempt"),
         });
-        if let Err(e) = self.db.lock().append_stage_log(run_id, &stage.id, &entry.to_string()) {
-            tracing::warn!(stage_id = %stage.id, "escalation journal write failed: {e}");
+        if let Err(e) = self.db.lock().append_stage_log(run_id, &fresh.id, &entry.to_string()) {
+            tracing::warn!(stage_id = %fresh.id, "escalation journal write failed: {e}");
         }
         self.events.emit(
             crate::orchestrator::live::RUN_LOG_EVENT,
-            serde_json::json!({ "runId": run_id, "stageId": stage.id, "entry": entry }),
+            serde_json::json!({ "runId": run_id, "stageId": fresh.id, "entry": entry }),
         );
         Ok(true)
     }
