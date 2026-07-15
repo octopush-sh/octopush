@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import type { McpStatus } from "../../lib/ipc";
 import { pushToast } from "../Toasts";
+import { copyToClipboard } from "../../lib/clipboard";
 import { PaneHeader, SectionLabel } from "./shared";
 import { IssueTrackingSection } from "./IssueTrackingSection";
 import { McpServersSection } from "./McpServersSection";
@@ -71,11 +72,14 @@ function ClaudeCodeCard() {
     }
   }
 
-  function copyCommand() {
+  async function copyCommand() {
     if (!status) return;
-    void navigator.clipboard.writeText(status.manualCommand);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
+    // Native clipboard (via copyToClipboard) — the pane has its own inline
+    // "copied" feedback, so success stays silent; only flip the label on success.
+    if (await copyToClipboard(status.manualCommand)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    }
   }
 
   const registered = status?.registered ?? false;
@@ -140,7 +144,7 @@ function ClaudeCodeCard() {
             />
             <button
               type="button"
-              onClick={copyCommand}
+              onClick={() => void copyCommand()}
               className="min-w-[80px] rounded-md px-3 py-2 text-center font-serif text-[12px] text-octo-brass transition-colors"
               style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
             >
