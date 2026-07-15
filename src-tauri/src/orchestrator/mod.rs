@@ -1143,8 +1143,23 @@ impl Orchestrator {
         run_id: &str,
         action: CheckpointAction,
     ) -> AppResult<RunStatus> {
+        // The plain checkpoint path carries no specific target — it resolves the
+        // run's single parked/failed stage. The escape-valve answer path threads
+        // its validated id via `resolve_checkpoint_scoped`.
+        self.resolve_checkpoint_scoped(run_id, None, action).await
+    }
+
+    /// Like [`resolve_checkpoint`], but resolves the parked/failed stage that
+    /// matches `stage_id` (the caller's validated target); falls back to the
+    /// single-parked-stage rule when `stage_id` is `None` or matches nothing.
+    pub async fn resolve_checkpoint_scoped(
+        &self,
+        run_id: &str,
+        stage_id: Option<&str>,
+        action: CheckpointAction,
+    ) -> AppResult<RunStatus> {
         let _guard = self.claim_active(run_id, "run is already executing")?;
-        match self.apply_checkpoint_action(run_id, action)? {
+        match self.apply_checkpoint_action(run_id, stage_id, action)? {
             // NOT `run_to_pause_with` — `_guard` above already holds this
             // run's `active` claim; claiming again would reject.
             Some(budget_override) => self.drive_inner(run_id, budget_override).await,
@@ -1156,13 +1171,15 @@ impl Orchestrator {
     /// claim and return the re-drive parameters WITHOUT driving — the caller
     /// spawns the next segment's worker instead. `Some(budget_override)` =
     /// the run wants driving again; `None` = aborted, nothing left to drive.
+    /// `stage_id` scopes the target exactly like [`resolve_checkpoint_scoped`].
     pub fn resolve_checkpoint_apply_only(
         &self,
         run_id: &str,
+        stage_id: Option<&str>,
         action: CheckpointAction,
     ) -> AppResult<Option<bool>> {
         let _guard = self.claim_active(run_id, "run is already executing")?;
-        self.apply_checkpoint_action(run_id, action)
+        self.apply_checkpoint_action(run_id, stage_id, action)
     }
 
     /// The shared mutation section of a checkpoint resolution (in-process and
@@ -1172,12 +1189,20 @@ impl Orchestrator {
     fn apply_checkpoint_action(
         &self,
         run_id: &str,
+        stage_id: Option<&str>,
         action: CheckpointAction,
     ) -> AppResult<Option<bool>> {
         let stages = self.db.lock().list_run_stages(run_id)?;
-        let blocked = stages
-            .iter()
-            .find(|s| s.status == "awaiting_checkpoint" || s.status == "failed")
+        let is_resolvable =
+            |s: &crate::db::RunStageRow| s.status == "awaiting_checkpoint" || s.status == "failed";
+        // Prefer the caller's VALIDATED stage_id (e.g. `answer_blocker` checked
+        // exactly this stage): resolve THAT parked/failed stage. Only when no
+        // resolvable stage matches the id (stale/absent) do we fall back to the
+        // single-parked-stage `.find` — so nothing regresses for callers that
+        // pass no id (the plain `resolve_checkpoint`).
+        let blocked = stage_id
+            .and_then(|id| stages.iter().find(|s| s.id == id && is_resolvable(s)))
+            .or_else(|| stages.iter().find(|s| is_resolvable(s)))
             .cloned();
 
         // Escape-valve guard: a stage parked via `ask_director` (awaiting a
@@ -1646,10 +1671,20 @@ impl Orchestrator {
         });
     }
 
-    /// Spawn a checkpoint resolution in the background, emitting run://error on failure.
-    pub fn spawn_resolve_checkpoint(self: Arc<Self>, run_id: String, action: CheckpointAction) {
+    /// Spawn a checkpoint resolution in the background, emitting run://error on
+    /// failure. `stage_id` scopes the target (the escape-valve answer path passes
+    /// its validated id; the plain checkpoint path passes `None`).
+    pub fn spawn_resolve_checkpoint(
+        self: Arc<Self>,
+        run_id: String,
+        stage_id: Option<String>,
+        action: CheckpointAction,
+    ) {
         tokio::spawn(async move {
-            if let Err(e) = self.resolve_checkpoint(&run_id, action).await {
+            if let Err(e) = self
+                .resolve_checkpoint_scoped(&run_id, stage_id.as_deref(), action)
+                .await
+            {
                 tracing::error!(run_id = %run_id, error = %e, "resolve_checkpoint failed");
                 self.events.emit(
                     "run://error",

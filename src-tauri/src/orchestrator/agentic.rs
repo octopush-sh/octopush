@@ -136,16 +136,64 @@ fn ask_director_tool() -> LlmTool {
     }
 }
 
+/// The last-resort question text when a block carries no usable summary either.
+const BLOCK_FALLBACK_QUESTION: &str = "The stage needs a decision to proceed.";
+
+/// Normalize a parsed/salvaged [`BlockedAsk`] so the director ALWAYS sees usable
+/// context — never a blank question label. For each question: an empty/whitespace
+/// `question` is backfilled (from its `why_blocked`, else the ask's `summary`,
+/// else the fallback); a question with NO text at all (no question/why/default)
+/// is dropped. If that leaves no questions, one is synthesized from the summary.
+/// The summary itself is backfilled to the fallback when blank so the UI header
+/// is never empty either.
+fn normalize_blocked_ask(ask: BlockedAsk) -> BlockedAsk {
+    let summary_text = |s: &str| -> String {
+        if s.trim().is_empty() {
+            BLOCK_FALLBACK_QUESTION.to_string()
+        } else {
+            s.trim().to_string()
+        }
+    };
+    let mut out: Vec<BlockedQuestion> = Vec::new();
+    for mut q in ask.questions {
+        let has_q = !q.question.trim().is_empty();
+        let has_why = !q.why_blocked.trim().is_empty();
+        let has_def = !q.recommended_default.trim().is_empty();
+        if !has_q && !has_why && !has_def {
+            continue; // entirely empty — nothing to show; drop it.
+        }
+        if !has_q {
+            q.question = if has_why {
+                q.why_blocked.trim().to_string()
+            } else {
+                summary_text(&ask.summary)
+            };
+        }
+        out.push(q);
+    }
+    if out.is_empty() {
+        out.push(BlockedQuestion {
+            question: summary_text(&ask.summary),
+            why_blocked: String::new(),
+            recommended_default: String::new(),
+        });
+    }
+    BlockedAsk { summary: summary_text(&ask.summary), questions: out }
+}
+
 /// Parse an `ask_director` tool call's input into a [`BlockedAsk`]. With
 /// [`BlockedAsk`]/[`BlockedQuestion`] tolerant of missing/aliased fields, the
-/// strict parse now succeeds for ANY array-of-objects payload — so a well-formed
-/// multi-question ask keeps every question. The degrade branch is reserved for
-/// genuinely non-object/garbage input; even then it maps over ALL elements (not
-/// just the first) so nothing is silently lost, and it NEVER crashes the stage.
-fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
+/// strict parse succeeds for ANY array-of-objects payload — so a well-formed
+/// multi-question ask keeps every question. The result is [`normalize_blocked_ask`]d
+/// so no question ever renders blank; a strict parse is accepted only if that
+/// leaves at least one question with real text, otherwise (or on a hard parse
+/// failure) we salvage from the raw JSON — mapping over ALL elements (bare-string
+/// or object, either field casing), then normalizing the same way. Never crashes.
+pub(crate) fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
     if let Ok(ask) = serde_json::from_value::<BlockedAsk>(u.input.clone()) {
-        if !ask.questions.is_empty() {
-            return ask;
+        let normalized = normalize_blocked_ask(ask);
+        if normalized.questions.iter().any(|q| !q.question.trim().is_empty()) {
+            return normalized;
         }
     }
     // Salvage path: pull whatever is present out of the raw JSON, tolerating a
@@ -155,8 +203,7 @@ fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
         .get("summary")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "The crew needs a decision to proceed.".to_string());
+        .unwrap_or_default();
     let field = |q: &serde_json::Value, camel: &str, snake: &str| -> String {
         q.get(camel)
             .or_else(|| q.get(snake))
@@ -164,7 +211,7 @@ fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
             .map(str::to_string)
             .unwrap_or_default()
     };
-    let mut questions: Vec<BlockedQuestion> = u
+    let questions: Vec<BlockedQuestion> = u
         .input
         .get("questions")
         .and_then(|q| q.as_array())
@@ -190,15 +237,9 @@ fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
                 .collect()
         })
         .unwrap_or_default();
-    if questions.is_empty() {
-        // Nothing structured at all — surface the summary as the one question.
-        questions.push(BlockedQuestion {
-            question: summary.clone(),
-            why_blocked: String::new(),
-            recommended_default: String::new(),
-        });
-    }
-    BlockedAsk { summary, questions }
+    // Normalization backfills blank question text and synthesizes one from the
+    // summary when the array yields nothing usable — so both paths guarantee it.
+    normalize_blocked_ask(BlockedAsk { summary, questions })
 }
 
 /// Run the tool-use loop against `provider` until it returns a final answer

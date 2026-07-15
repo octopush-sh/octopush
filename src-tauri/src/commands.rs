@@ -1728,15 +1728,18 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
-    dispatch_checkpoint(&orch, run_id, action)
+    dispatch_checkpoint(&orch, run_id, None, action)
 }
 
 /// Resolve a checkpoint decision and resume the drive, choosing the detached
 /// (Pro) or in-process path. Shared by `resolve_checkpoint` and
 /// `answer_blocker` so the escape valve reuses the exact resume substrate.
+/// `stage_id` scopes which parked/failed stage the action targets — the escape
+/// valve passes its validated id; the plain checkpoint path passes `None`.
 fn dispatch_checkpoint(
     orch: &Arc<Orchestrator>,
     run_id: String,
+    stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
     // Pro (`runs.detached`): apply the decision's mutations here — they're
@@ -1746,7 +1749,9 @@ fn dispatch_checkpoint(
     if crate::entitlement::Entitlement::current()
         .has_feature(crate::entitlement::feature::RUNS_DETACHED)
     {
-        if let Some(budget_override) = orch.resolve_checkpoint_apply_only(&run_id, action)? {
+        if let Some(budget_override) =
+            orch.resolve_checkpoint_apply_only(&run_id, stage_id.as_deref(), action)?
+        {
             if let Err(e) = orch.spawn_detached_segment(&run_id, budget_override) {
                 tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
                 Arc::clone(orch).spawn_drive(run_id, budget_override);
@@ -1755,7 +1760,7 @@ fn dispatch_checkpoint(
         return Ok(());
     }
     // Drive in the background; the frontend reacts to run:// events.
-    Arc::clone(orch).spawn_resolve_checkpoint(run_id, action);
+    Arc::clone(orch).spawn_resolve_checkpoint(run_id, stage_id, action);
     Ok(())
 }
 
@@ -1785,7 +1790,9 @@ pub async fn answer_blocker(
             "this stage is not awaiting a director decision".into(),
         ));
     }
-    dispatch_checkpoint(&orch, run_id, CheckpointAction::AnswerBlocker { answers })
+    // Thread the validated `stage_id` through so the resolution acts on exactly
+    // the stage we just checked, not merely "the parked stage".
+    dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers })
 }
 
 #[tauri::command]

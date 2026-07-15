@@ -4081,6 +4081,41 @@ mod orchestrator_tests {
         assert!(err.to_string().contains("not awaiting a director decision"), "{err}");
     }
 
+    #[tokio::test]
+    async fn resolve_checkpoint_scoped_targets_the_passed_stage_id() {
+        // Two stages parked at a gate at once (constructed by hand). `.find`
+        // alone resolves the FIRST; the caller's validated `stage_id` must
+        // select the intended one, and a stale/absent id falls back to `.find`.
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let ids: Vec<String> = db.lock().list_run_stages(&run_id).unwrap().iter().map(|s| s.id.clone()).collect();
+        let art = |t: &str| serde_json::to_string(&StageArtifact {
+            kind: ArtifactKind::Note, text: t.into(), payload: None, refs_worktree: false,
+        }).unwrap();
+        // Park BOTH at a gate: ran (started_at stamped) → artifact set → awaiting_checkpoint.
+        for (i, id) in ids.iter().enumerate() {
+            db.lock().set_run_stage_status(id, "running").unwrap();
+            db.lock().complete_run_stage(id, "awaiting_checkpoint", 0, 0, 0.0, Some(&art(&format!("s{i}")))).unwrap();
+        }
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        // Passing stage 1's id resolves STAGE 1, not the `.find` default (stage 0).
+        orch.resolve_checkpoint_apply_only(&run_id, Some(&ids[1]), CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].status, "done", "the passed stage_id was the one resolved");
+        assert_eq!(stages[0].status, "awaiting_checkpoint", "the unselected stage is untouched");
+
+        // A stale/absent id falls back to `.find` (the remaining parked stage 0).
+        orch.resolve_checkpoint_apply_only(&run_id, Some("nonexistent"), CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done", "a stale id falls back to the single parked stage");
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";
@@ -6449,6 +6484,42 @@ mod live_tests {
         assert_eq!(ask.questions[1].recommended_default, "OAuth");
         assert_eq!(ask.questions[2].question, "Region?");
         assert_eq!(ask.questions[2].recommended_default, "", "an omitted default parses to empty, not a failure");
+    }
+
+    #[test]
+    fn parse_ask_director_backfills_a_blank_question_from_why_blocked() {
+        use crate::orchestrator::agentic::parse_ask_director;
+        // `question` omitted (defaults to "") but whyBlocked/recommendedDefault
+        // present — the blank question must be backfilled, never render empty.
+        let u = LlmToolUse { id: "a".into(), name: "ask_director".into(),
+            input: json!({"summary":"which datastore?","questions":[
+                {"whyBlocked":"schema differs","recommendedDefault":"Postgres"}
+            ]}) };
+        let ask = parse_ask_director(&u);
+        assert_eq!(ask.questions.len(), 1);
+        assert!(!ask.questions[0].question.trim().is_empty(), "no blank <label>");
+        assert_eq!(ask.questions[0].question, "schema differs");
+        assert_eq!(ask.questions[0].recommended_default, "Postgres");
+    }
+
+    #[test]
+    fn parse_ask_director_drops_a_fully_empty_question_and_synthesizes_from_summary() {
+        use crate::orchestrator::agentic::parse_ask_director;
+        let u = LlmToolUse { id: "a".into(), name: "ask_director".into(),
+            input: json!({"summary":"pick a database","questions":[{}]}) };
+        let ask = parse_ask_director(&u);
+        assert_eq!(ask.questions.len(), 1, "the empty question is dropped, one synthesized from summary");
+        assert_eq!(ask.questions[0].question, "pick a database");
+    }
+
+    #[test]
+    fn parse_ask_director_all_empty_input_yields_one_fallback_question() {
+        use crate::orchestrator::agentic::parse_ask_director;
+        let u = LlmToolUse { id: "a".into(), name: "ask_director".into(), input: json!({}) };
+        let ask = parse_ask_director(&u);
+        assert_eq!(ask.questions.len(), 1);
+        assert!(!ask.questions[0].question.trim().is_empty());
+        assert_eq!(ask.summary, "The stage needs a decision to proceed.");
     }
 
     struct Recorder { events: Mutex<Vec<(String, Value)>> }
