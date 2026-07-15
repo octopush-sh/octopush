@@ -5072,6 +5072,28 @@ mod orchestrator_tests {
         assert!(matches!(timed_out, ConditionEval::Error(_)), "{timed_out:?}");
     }
 
+    /// On timeout the WHOLE process group is killed, not just `bash`: a
+    /// backgrounded child (standing in for a `gh … | grep` pipeline member) is
+    /// reaped with the group and never outlives the tick. Without group-kill the
+    /// subshell reparents to init and would create the marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_condition_timeout_kills_the_process_group() {
+        use crate::routines::{evaluate_condition, ConditionEval};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived.marker");
+        // A backgrounded child creates the marker after 0.5s; the foreground
+        // sleep keeps the group alive well past the 150ms timeout.
+        let cmd = format!("(sleep 0.5 && touch '{}') & sleep 30", marker.display());
+        let eval = evaluate_condition(&cmd, dir.path(), Duration::from_millis(150)).await;
+        assert!(matches!(eval, ConditionEval::Error(_)), "{eval:?}");
+        // Wait past when the background touch WOULD have fired — the group-kill
+        // must have prevented it.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "the backgrounded child must be killed with the group");
+    }
+
     /// A condition that exits non-zero skips the window with NO run created (zero
     /// tokens), the window still advanced FIRST (crash-safe), and the skip is
     /// legible (`last_outcome`/`last_checked_at`). `run_routine_now` surfaces the
@@ -5099,10 +5121,67 @@ mod orchestrator_tests {
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "a skipped condition creates no run");
 
         let r = db.lock().get_routine("r-cond").unwrap().unwrap();
-        assert_ne!(r.next_due_at.as_deref(), Some(past), "next_due advanced BEFORE the gate");
+        // Run-now is a manual test: it must NOT advance the schedule (only the
+        // scheduled tick does). The window is untouched.
+        assert_eq!(r.next_due_at.as_deref(), Some(past), "run_now must not touch next_due");
         assert_eq!(r.last_outcome.as_deref(), Some("condition not met"), "the skip is legible");
         assert!(r.last_checked_at.is_some(), "checked_at stamped on a skip");
         assert!(r.last_run_id.is_none(), "no run stamped on a skip");
+    }
+
+    /// A fixed routine whose workspace has a live run is `Busy` (not mislabelled
+    /// "workspace unavailable"), and the condition is NEVER evaluated inside a
+    /// busy worktree — the workspace guard runs BEFORE the gate.
+    #[tokio::test]
+    async fn routine_fixed_busy_workspace_skips_busy_before_condition() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RCB", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        // A live run in the fixed workspace makes it busy.
+        let live = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().set_run_status(&live, "running", false).unwrap();
+
+        let mut input = routine_input(&pid, "interval", "3600");
+        // A condition that would ERROR if it ever ran (bad cwd is irrelevant —
+        // the point is it must NOT run because busy is caught first).
+        input.fire_condition = Some("exit 1".into());
+        db.lock().insert_routine("r-busy", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = orch.run_routine_now("r-busy").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::Busy), "busy is Busy, not WorkspaceUnavailable");
+        assert_eq!(
+            db.lock().get_routine("r-busy").unwrap().unwrap().last_outcome.as_deref(),
+            Some("workspace busy"),
+        );
+    }
+
+    /// A hard error in the fire path (here: a fixed routine with no workspace
+    /// configured) still stamps `last_outcome`/`last_checked_at` — an erroring
+    /// routine must never look never-evaluated. `run_routine_now` surfaces the Err.
+    #[tokio::test]
+    async fn routine_fire_error_is_stamped() {
+        let (db, _ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RCE", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "interval", "3600");
+        input.fixed_workspace_id = None; // fixed mode with no workspace ⇒ hard error
+        db.lock().insert_routine("r-err", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        assert!(orch.run_routine_now("r-err").await.is_err(), "a misconfigured routine surfaces the error");
+        let r = db.lock().get_routine("r-err").unwrap().unwrap();
+        assert!(r.last_outcome.as_deref().unwrap_or("").starts_with("error:"), "{:?}", r.last_outcome);
+        assert!(r.last_checked_at.is_some(), "checked_at stamped even on error");
     }
 
     /// A condition that can't be evaluated (here: a bogus/hung command bounded by

@@ -10,7 +10,7 @@
 //! to the next future slot). See the design record:
 //! `docs/superpowers/plans/2026-07-13-routines-phase1-design.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,6 +107,13 @@ pub struct FireOutcomeView {
     pub reason: Option<String>,
 }
 
+/// The outcome of resolving + guarding a fixed routine's workspace: ready to
+/// fire (with its id + worktree path), or a reason to skip this window.
+enum FixedResolve {
+    Ready { id: String, worktree: Option<String> },
+    Skip(SkipReason),
+}
+
 /// The result of evaluating a routine's `fire_condition` command.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConditionEval {
@@ -121,19 +128,33 @@ pub enum ConditionEval {
 /// Run a routine's `fire_condition` shell command in `cwd`, bounded by `timeout`.
 /// A login shell (`bash -lc`) so the user's PATH + `gh` auth are present — the
 /// SAME trust model as a run's `run_command` (their command, their machine).
-/// exit 0 ⇒ `Met`; non-zero ⇒ `NotMet`; spawn failure / timeout ⇒ `Error`
-/// (the child is killed on timeout so it can't linger past the tick).
+/// exit 0 ⇒ `Met`; non-zero ⇒ `NotMet`; spawn failure / timeout ⇒ `Error`.
+///
+/// The child is launched as its OWN process-group/session leader (`setsid`), so
+/// on timeout the WHOLE group is killed — a pipeline like `gh … | grep -q .`
+/// leaves no orphaned `gh` reparented past the tick. `kill_on_drop` is the
+/// backstop.
 pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) -> ConditionEval {
-    let mut child = match tokio::process::Command::new("bash")
-        .arg("-lc")
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-lc")
         .arg(command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    // Own session/process group so a timeout can kill the whole pipeline, not
+    // just `bash` (mirrors how the detached worker isolates its group).
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: `setsid()` is async-signal-safe and is the only call made in
+        // the forked child before exec.
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return ConditionEval::Error(format!("could not launch condition: {e}")),
     };
@@ -147,11 +168,30 @@ pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) ->
         }
         Ok(Err(e)) => ConditionEval::Error(format!("condition wait failed: {e}")),
         Err(_) => {
-            // Timed out — kill the child so a hung command can't outlive the tick.
-            let _ = child.start_kill();
+            // Timed out — kill the whole process group (not just `bash`), then
+            // reap so no zombie lingers.
+            kill_process_group(&mut child);
+            let _ = child.wait().await;
             ConditionEval::Error(format!("condition timed out after {}s", timeout.as_secs()))
         }
     }
+}
+
+/// SIGKILL the child's entire process group. The child is a session leader
+/// (`setsid` in `evaluate_condition`), so `-pid` addresses its group and reaps
+/// any pipeline members with it. Falls back to killing just the child when the
+/// group can't be addressed (no pid / non-Unix).
+fn kill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(-pid, SIGKILL) signals the group `setsid` created for this
+        // child; `pid` comes from the live child handle.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        return;
+    }
+    let _ = child.start_kill();
 }
 
 /// Compute a routine's next fire as a UTC RFC3339 string, from its schedule and
@@ -297,12 +337,25 @@ impl Orchestrator {
             }
         };
         for routine in due {
-            if let Err(e) = self.fire_routine(&routine).await {
-                tracing::warn!(routine = %routine.id, error = %e, "routine fire failed");
-                // A per-routine failure must never kill the loop — advance its
-                // window so a persistently-broken routine doesn't spin.
-                let _ = self.advance_routine_window(&routine);
+            // Advance the window FIRST, synchronously (the crash-safe invariant:
+            // a window fires at most once, even if the fire below crashes or the
+            // next tick races — next_due is already past `now`, so it won't be
+            // re-selected). Only the SCHEDULED path advances; `run_routine_now`
+            // deliberately does NOT (a manual test must not touch the schedule).
+            if let Err(e) = self.advance_routine_window(&routine) {
+                tracing::warn!(routine = %routine.id, error = %e, "routine scheduler: advance failed — skipping this tick");
+                continue;
             }
+            // Fire DETACHED: a condition may take up to CONDITION_TIMEOUT, and
+            // awaiting each fire here would serialize the tick and delay every
+            // other due routine (and the next tick). The outcome is stamped for
+            // legibility inside `fire_routine`.
+            let orch = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = orch.fire_routine(&routine).await {
+                    tracing::warn!(routine = %routine.id, error = %e, "routine fire failed");
+                }
+            });
         }
     }
 
@@ -312,74 +365,119 @@ impl Orchestrator {
         self.db().lock().set_routine_next_due(&r.id, next.as_deref())
     }
 
-    /// Fire one due routine, then record the evaluation outcome for legibility.
-    /// Every tick (dispatch OR skip) stamps `last_checked_at`/`last_outcome` so a
-    /// routine that keeps skipping shows it's alive ("checked 2m ago · condition
-    /// not met") instead of looking dead.
+    /// Fire one routine, then record the evaluation outcome for legibility on
+    /// EVERY path — dispatch, skip, OR a hard error — so a routine that keeps
+    /// skipping (or erroring) shows it's alive ("condition not met · 2m ago")
+    /// instead of looking never-evaluated. Both the scheduled tick and
+    /// `run_routine_now` go through this wrapper, so both stamp.
     async fn fire_routine(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
-        let outcome = self.fire_routine_inner(r).await?;
-        // Best-effort — a legibility write must never fail an otherwise-good fire.
-        let _ = self.db().lock().set_routine_fire_result(
-            &r.id,
-            &Utc::now().to_rfc3339(),
-            &outcome.last_outcome_label(),
-        );
-        Ok(outcome)
+        let result = self.fire_routine_inner(r).await;
+        let label = match &result {
+            Ok(outcome) => outcome.last_outcome_label(),
+            Err(e) => format!("error: {e}"),
+        };
+        // Best-effort — a legibility write must never mask the fire's own result.
+        let _ = self
+            .db()
+            .lock()
+            .set_routine_fire_result(&r.id, &Utc::now().to_rfc3339(), &label);
+        result
     }
 
-    /// The fire itself: advance the window first (so a crash mid-fire can never
-    /// re-fire it), gate on the optional `fire_condition`, then resolve/create
-    /// the workspace, create the run, stamp it, and launch through the shared
-    /// guarded path. Returns whether a run was dispatched or the window skipped.
+    /// The fire itself, branched by workspace mode. `next_due` is NOT advanced
+    /// here (the scheduled tick advances up front; `run_routine_now` must not
+    /// touch the schedule). Returns whether a run was dispatched or the window
+    /// skipped (with the reason).
     async fn fire_routine_inner(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
-        // Advance the schedule window BEFORE any side effect (worktree, run):
-        // a window must fire at most once, even if the work below crashes or a
-        // second tick races. A skip below just consumes this window cleanly.
-        let next = next_due_for(r, Local::now());
-        self.db().lock().set_routine_next_due(&r.id, next.as_deref())?;
-
-        // Runaway guard (fresh mode): don't stack a new worktree while this
-        // routine's previous crew is still active — skip this (already-advanced)
-        // window.
         if r.workspace_mode == "fresh" {
-            if let Some(prev) = &r.last_run_id {
-                if let Some(run) = self.db().lock().get_run(prev)? {
-                    if run.status == "running" || run.status == "paused" {
-                        return Ok(FireOutcome::Skipped(SkipReason::Busy));
-                    }
-                }
-            }
+            self.fire_fresh(r).await
+        } else {
+            self.fire_fixed(r).await
         }
+    }
 
-        // Pre-fire condition gate — AFTER the busy check, BEFORE resolving the
-        // workspace, so a skip never materialises a fresh worktree and spends
-        // zero tokens. exit 0 ⇒ fire; non-zero ⇒ skip; can't evaluate ⇒ skip
-        // (fail-safe, surfaced via last_outcome).
-        if let Some(command) = normalize_condition(r.fire_condition.as_deref()) {
-            let cwd = self.resolve_condition_cwd(r)?;
-            let eval = match cwd {
-                Some(dir) => evaluate_condition(&command, &dir, CONDITION_TIMEOUT).await,
-                None => ConditionEval::Error("could not resolve the routine's workspace".into()),
-            };
-            match eval {
-                ConditionEval::Met => {}
-                ConditionEval::NotMet => return Ok(FireOutcome::Skipped(SkipReason::ConditionNotMet)),
-                ConditionEval::Error(msg) => {
-                    tracing::warn!(routine = %r.id, error = %msg, "routine fire condition could not be evaluated — skipping");
-                    return Ok(FireOutcome::Skipped(SkipReason::ConditionError(msg)));
-                }
-            }
-        }
-
-        let workspace_id = match self.resolve_routine_workspace(r).await? {
-            Some(id) => id,
-            // A busy fixed workspace (or a missing/off-disk target) — skip.
-            None => return Ok(FireOutcome::Skipped(SkipReason::WorkspaceUnavailable)),
+    /// Fixed mode: resolve + guard the chosen workspace FIRST (so a deleted
+    /// workspace still auto-disables and a busy one is labelled `Busy`, not run
+    /// into), THEN evaluate the condition inside that healthy, idle worktree,
+    /// THEN dispatch.
+    async fn fire_fixed(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
+        let (workspace_id, worktree) = match self.resolve_fixed_workspace(r)? {
+            FixedResolve::Ready { id, worktree } => (id, worktree),
+            FixedResolve::Skip(reason) => return Ok(FireOutcome::Skipped(reason)),
         };
 
+        // Condition gate — cwd = the resolved worktree (a healthy dir; the
+        // resolver already skipped a deleted/off-disk one). A workspace with no
+        // worktree path can't host a condition ⇒ fail-safe ConditionError.
+        if let Some(command) = normalize_condition(r.fire_condition.as_deref()) {
+            let eval = match &worktree {
+                Some(path) => evaluate_condition(&command, Path::new(path), CONDITION_TIMEOUT).await,
+                None => ConditionEval::Error("routine's fixed workspace has no worktree".into()),
+            };
+            if let Some(skip) = self.condition_skip(r, eval) {
+                return Ok(FireOutcome::Skipped(skip));
+            }
+        }
+
+        self.dispatch_run(r, &workspace_id).await
+    }
+
+    /// Fresh mode: guard against stacking a worktree on the previous crew, THEN
+    /// evaluate the condition at the project root (the fresh worktree doesn't
+    /// exist yet), THEN create the worktree (only now — a skip creates none) and
+    /// dispatch.
+    async fn fire_fresh(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
+        // Runaway guard: don't stack a new worktree while this routine's previous
+        // crew is still active.
+        if let Some(prev) = &r.last_run_id {
+            if let Some(run) = self.db().lock().get_run(prev)? {
+                if run.status == "running" || run.status == "paused" {
+                    return Ok(FireOutcome::Skipped(SkipReason::Busy));
+                }
+            }
+        }
+
+        // Condition gate — cwd = the project root.
+        if let Some(command) = normalize_condition(r.fire_condition.as_deref()) {
+            let root = self
+                .db()
+                .lock()
+                .get_project_by_id(&r.project_id)?
+                .map(|(_, _, path)| path);
+            let eval = match root {
+                Some(path) => evaluate_condition(&command, Path::new(&path), CONDITION_TIMEOUT).await,
+                None => ConditionEval::Error("routine's project not found".into()),
+            };
+            if let Some(skip) = self.condition_skip(r, eval) {
+                return Ok(FireOutcome::Skipped(skip));
+            }
+        }
+
+        // Create the fresh worktree only now (a skipped condition created none).
+        let workspace_id = self.create_fresh_routine_workspace(r).await?;
+        self.dispatch_run(r, &workspace_id).await
+    }
+
+    /// Map a condition evaluation to an optional skip reason (`None` ⇒ Met, fire
+    /// on). Logs the fail-safe error path.
+    fn condition_skip(&self, r: &RoutineRow, eval: ConditionEval) -> Option<SkipReason> {
+        match eval {
+            ConditionEval::Met => None,
+            ConditionEval::NotMet => Some(SkipReason::ConditionNotMet),
+            ConditionEval::Error(msg) => {
+                tracing::warn!(routine = %r.id, error = %msg, "routine fire condition could not be evaluated — skipping");
+                Some(SkipReason::ConditionError(msg))
+            }
+        }
+    }
+
+    /// Create the draft run, stamp it on the routine, and launch through the one
+    /// shared guarded path (quota / parallel / lease / detached). A launch
+    /// refusal deletes the never-started draft and skips.
+    async fn dispatch_run(self: &Arc<Self>, r: &RoutineRow, workspace_id: &str) -> crate::error::AppResult<FireOutcome> {
         let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
         let run_id = self.db().lock().create_run(
-            &workspace_id,
+            workspace_id,
             &r.pipeline_id,
             &r.task,
             r.reference_model.as_deref(),
@@ -387,12 +485,10 @@ impl Orchestrator {
             &overrides,
         )?;
 
-        // Stamp the run onto the routine (the window was already advanced above).
         self.db()
             .lock()
             .stamp_routine_run(&r.id, &run_id, &Utc::now().to_rfc3339())?;
 
-        // The single shared guarded launch (quota / parallel / lease / detached).
         if let Err(e) = launch::launch_run(self, self.db(), &run_id, r.budget_usd).await {
             tracing::warn!(routine = %r.id, run = %run_id, error = %e, "routine run refused at launch");
             // Delete the never-started draft (NOT abort — an aborted run counts
@@ -403,34 +499,11 @@ impl Orchestrator {
         Ok(FireOutcome::Dispatched)
     }
 
-    /// The directory a routine's `fire_condition` runs in: the fixed workspace's
-    /// worktree, or the project root for fresh mode (the fresh worktree doesn't
-    /// exist yet at gate time). `None` when a fixed workspace can't be resolved
-    /// (deleted / no path) — the caller treats that as a `ConditionError`.
-    fn resolve_condition_cwd(&self, r: &RoutineRow) -> crate::error::AppResult<Option<PathBuf>> {
-        if r.workspace_mode == "fresh" {
-            let project = self.db().lock().get_project_by_id(&r.project_id)?;
-            return Ok(project.map(|(_, _, path)| PathBuf::from(path)));
-        }
-        // Fixed mode — the chosen workspace's worktree path.
-        let Some(ws_id) = r.fixed_workspace_id.clone() else {
-            return Ok(None);
-        };
-        let path = self
-            .db()
-            .lock()
-            .get_workspace(&ws_id)?
-            .and_then(|w| w.worktree_path);
-        Ok(path.map(PathBuf::from))
-    }
-
-    /// Resolve the workspace to run in. `Some(id)` to proceed, `None` to skip
-    /// this window (fixed workspace missing/off-disk or busy).
-    async fn resolve_routine_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<Option<String>> {
-        if r.workspace_mode == "fresh" {
-            return self.create_fresh_routine_workspace(r).await.map(Some);
-        }
-        // Fixed mode.
+    /// Resolve + guard a fixed routine's workspace: auto-disable on a deleted
+    /// workspace, skip on busy / off-disk, else return the id + worktree path.
+    /// Runs BEFORE the condition gate so the command never executes inside a
+    /// deleted/busy worktree.
+    fn resolve_fixed_workspace(&self, r: &RoutineRow) -> crate::error::AppResult<FixedResolve> {
         let Some(ws_id) = r.fixed_workspace_id.clone() else {
             return Err(crate::error::AppError::Other(
                 "routine has no fixed workspace configured".into(),
@@ -453,21 +526,21 @@ impl Orchestrator {
             self.db()
                 .lock()
                 .set_routine_enabled(&r.id, false, r.next_due_at.as_deref())?;
-            return Ok(None);
+            return Ok(FixedResolve::Skip(SkipReason::WorkspaceUnavailable));
         }
         // Busy is transient (a previous run is still going) — just skip.
         if busy {
-            return Ok(None);
+            return Ok(FixedResolve::Skip(SkipReason::Busy));
         }
         // Worktree deleted off disk but the row survives — skip (firing into a
         // missing directory would hard-fail); don't disable, it may be restored.
-        match worktree {
-            Some(path) if !std::path::Path::new(&path).is_dir() => {
+        if let Some(path) = &worktree {
+            if !std::path::Path::new(path).is_dir() {
                 tracing::warn!(routine = %r.id, workspace = %ws_id, "routine's fixed worktree is missing on disk — skipping");
-                Ok(None)
+                return Ok(FixedResolve::Skip(SkipReason::WorkspaceUnavailable));
             }
-            _ => Ok(Some(ws_id)),
         }
+        Ok(FixedResolve::Ready { id: ws_id, worktree })
     }
 
     /// Create a fresh worktree for this fire, on a UNIQUE branch (the routine's
