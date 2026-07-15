@@ -315,9 +315,8 @@ function RoutineEditor({
                 ariaLabel="Project"
                 className="w-full"
                 triggerClassName={FIELD_SURFACE}
-                placeholder="Choose…"
-                value={draft.projectId || null}
-                options={projects.map((p) => ({ value: p.id, label: p.name }))}
+                value={draft.projectId}
+                options={[{ value: "", label: "Choose…" }, ...projects.map((p) => ({ value: p.id, label: p.name }))]}
                 onChange={onProjectChange}
               />
             </Field>
@@ -326,9 +325,8 @@ function RoutineEditor({
                 ariaLabel="Pipeline"
                 className="w-full"
                 triggerClassName={FIELD_SURFACE}
-                placeholder="Choose…"
-                value={draft.pipelineId || null}
-                options={pipelines.map((p) => ({ value: p.id, label: p.name }))}
+                value={draft.pipelineId}
+                options={[{ value: "", label: "Choose…" }, ...pipelines.map((p) => ({ value: p.id, label: p.name }))]}
                 onChange={(v) => set("pipelineId", v)}
               />
             </Field>
@@ -395,9 +393,8 @@ function RoutineEditor({
                   ariaLabel="Workspace"
                   className="w-full"
                   triggerClassName={FIELD_SURFACE}
-                  placeholder="Choose a workspace…"
-                  value={draft.fixedWorkspaceId || null}
-                  options={workspaces.map((w) => ({ value: w.id, label: w.name }))}
+                  value={draft.fixedWorkspaceId}
+                  options={[{ value: "", label: "Choose a workspace…" }, ...workspaces.map((w) => ({ value: w.id, label: w.name }))]}
                   onChange={(v) => set("fixedWorkspaceId", v)}
                 />
                 <p className="mt-1 text-[11px] leading-snug text-octo-mute">
