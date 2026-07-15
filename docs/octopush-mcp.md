@@ -40,7 +40,7 @@ SQLite store the desktop app uses.
 
 | Tool | Kind | What it does |
 |------|------|--------------|
-| `describe_pipeline_schema` | reference | Roles, tools, substrates, loop/checkpoint rules, recommended models, annotated example. **Call first when authoring.** |
+| `describe_pipeline_schema` | reference | Roles, tools, substrates, loop/checkpoint rules, per-stage reasoning **effort** + model-**escalation** policy, runtime behaviors (escape valve + auto-escalation), recommended models, annotated example. **Call first when authoring.** |
 | `list_pipelines` | read | Every pipeline (built-in + custom) with stages. |
 | `get_pipeline` | read | One pipeline + stages by id. |
 | `create_pipeline` | author | Create a new custom pipeline (validated before save). |
@@ -71,6 +71,18 @@ A pipeline is a DAG of role-specialized agent stages. Only `role` and
 - `substrate` is `api` (in-process LLM) or `cli` (external agent CLI).
 - `tools`, when set, is a non-empty subset of `read_file, list_files,
   write_file, run_command`.
+- `effort` (`low|medium|high|xhigh|max`; null/omit = off) is optional per-stage
+  reasoning effort — **API substrate only**, and auto-clamps to the model's max
+  level at run time.
+- `escalateModel` (and optional `escalateEffort`, api-only) sets an escalation
+  policy: if the stage **fails** (its tool-turn budget is exhausted unfinished,
+  or it errors) it retries **once** at the stronger tier before halting.
+  `escalateModel` applies to `api` and `cli`.
+
+Two **runtime** behaviors need no authoring: any stage may pause to **ask the
+director** (`ask_director`) when genuinely blocked (the run parks like a
+checkpoint until answered), and a stage with an escalation policy auto-retries
+once at the stronger tier on failure.
 
 ## Build
 
