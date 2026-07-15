@@ -1,6 +1,6 @@
 // Add a provider — a two-step ModalShell wizard (1 · 2). Step 1 is identity
-// (name, protocol, local); step 2 is the endpoint. Replaces the inline form and
-// its native <select>/<checkbox> with Atelier controls.
+// (name, protocol, local); step 2 is the endpoint. Replaces the inline form's
+// native dropdown/checkbox with Atelier controls (Listbox + TogglePill).
 import { useState } from "react";
 import type { ProviderConfig } from "../../lib/types";
 import { ModalShell } from "../ModalShell";

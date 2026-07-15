@@ -326,7 +326,7 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 
 **Provider dot tokens** — `--provider-anthropic / -openai / -deepseek / -ollama` exist for the decorative identity dots in the ModelPicker (and Direct surfaces that embed it). Decorative only; never for text or borders.
 
-**Atelier form controls** (`src/components/controls/`) — `SegmentedControl`, `TogglePill`, `Stepper`, `Listbox` (portal + fixed positioning), `IconButton`. Direct surfaces never use native `<select>`, checkboxes, or number spinners; new form UI should reach for these first.
+**Atelier form controls** (`src/components/controls/`) — `SegmentedControl`, `TogglePill`, `Stepper`, `Listbox` (portal + fixed positioning; **keyboard-navigable — a full native-`<select>` replacement**: type-ahead, arrow/Home/End roving highlight via `aria-activedescendant`, Enter/Space select, Escape/Tab close, `triggerClassName` to match a form's sibling inputs), `IconButton`. **No production surface uses a native `<select>`, checkbox, or number spinner** — `grep -rn "<select" src --include='*.tsx' | grep -v .test.` returns nothing; new form UI must reach for these controls first.
 
 **Run track (`RunFlow`)** — the horizontal stage list across the canvas top, governed by Law 1 (depth of field) and Law 2 (single beacon).
 
