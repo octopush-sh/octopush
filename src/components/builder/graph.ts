@@ -116,6 +116,11 @@ export interface StageNodeData {
   agentModel: string;
   /** Per-stage reasoning effort; null = off (no thinking). */
   effort: Effort | null;
+  /** Escalation policy — the stronger model to retry with on failure; null =
+   *  no model swap. Either escalate field set = the stage escalates. */
+  escalateModel: string | null;
+  /** Escalation policy — the effort to bump to on the failed-retry (API only). */
+  escalateEffort: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
   maxIterations: number;
@@ -159,6 +164,8 @@ export function newStageData(role: string): StageNodeData {
     customName: null,
     agentModel: DEFAULT_MODEL,
     effort: null,
+    escalateModel: null,
+    escalateEffort: null,
     substrate: "api",
     checkpoint: false,
     maxIterations: DEFAULT_MAX_TURNS,
@@ -181,6 +188,8 @@ function dataFromStage(s: PipelineStage): StageNodeData {
     customName: s.customName ?? null,
     agentModel: s.agentModel,
     effort: s.effort ?? null,
+    escalateModel: s.escalateModel ?? null,
+    escalateEffort: s.escalateEffort ?? null,
     substrate: s.substrate,
     checkpoint: s.checkpoint,
     maxIterations: s.maxIterations ?? DEFAULT_MAX_TURNS,
@@ -272,6 +281,8 @@ export function graphToStageDrafts(nodes: StageNode[], edges: StageEdge[]): Stag
       role: d.role,
       agentModel: d.agentModel,
       effort: d.effort ?? null,
+      escalateModel: d.escalateModel ?? null,
+      escalateEffort: d.escalateEffort ?? null,
       substrate: d.substrate,
       checkpoint: d.checkpoint,
       loopTargetPosition: hasLoop ? loopTargetPosition : null,

@@ -246,6 +246,8 @@ impl Db {
                 role          TEXT NOT NULL,
                 agent_model   TEXT NOT NULL,
                 effort        TEXT,
+                escalate_model  TEXT,
+                escalate_effort TEXT,
                 substrate     TEXT NOT NULL,
                 checkpoint    INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
@@ -277,6 +279,9 @@ impl Db {
                 role          TEXT NOT NULL,
                 agent_model   TEXT NOT NULL,
                 effort        TEXT,
+                escalate_model  TEXT,
+                escalate_effort TEXT,
+                escalated     INTEGER NOT NULL DEFAULT 0,
                 substrate     TEXT NOT NULL,
                 checkpoint    INTEGER NOT NULL DEFAULT 0,
                 status        TEXT NOT NULL DEFAULT 'pending',
@@ -666,6 +671,17 @@ impl Db {
         // is exactly today's behavior for every pre-existing row.
         add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN effort TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN effort TEXT")?;
+        // ── Automatic model escalation (DIRECT operating-model, slice 3) ────
+        // A stage's escalation POLICY (opt-in, either field ⇒ policy present):
+        // on a FAILED attempt, retry once with `escalate_model` and/or bump to
+        // `escalate_effort` before halting. `escalated` is sticky run-state on
+        // run_stages: set true the first time the stage escalates. NULL/0 for
+        // every pre-existing row ⇒ zero behavior change without a policy.
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN escalate_model TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN escalate_effort TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_model TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_effort TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0")?;
         // The escape valve: a parked stage's `ask_director` questions (JSON
         // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
@@ -2110,7 +2126,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                    pos_x, pos_y, parents, tools, custom_name, instructions, effort
+                    pos_x, pos_y, parents, tools, custom_name, instructions, effort,
+                    escalate_model, escalate_effort
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -2133,6 +2150,8 @@ impl Db {
                 custom_name: r.get(15)?,
                 instructions: r.get(16)?,
                 effort: r.get::<_, Option<String>>(17)?.as_deref().and_then(crate::providers::Effort::from_str),
+                escalate_model: r.get(18)?,
+                escalate_effort: r.get::<_, Option<String>>(19)?.as_deref().and_then(crate::providers::Effort::from_str),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2342,14 +2361,17 @@ impl Db {
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     pos_x, pos_y, parents, tools, custom_name, instructions, effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                     pos_x, pos_y, parents, tools, custom_name, instructions, effort,
+                     escalate_model, escalate_effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
                         s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions,
-                        s.effort.as_ref().map(|e| e.as_str())],
+                        s.effort.as_ref().map(|e| e.as_str()),
+                        s.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+                        s.escalate_effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         tx.commit()?;
@@ -2421,13 +2443,16 @@ impl Db {
                 "INSERT INTO run_stages
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     parents, tools, custom_name, instructions, effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                     parents, tools, custom_name, instructions, effort,
+                     escalate_model, escalate_effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
                         parents_json, tools_json, s.custom_name, s.instructions,
-                        s.effort.as_ref().map(|e| e.as_str())],
+                        s.effort.as_ref().map(|e| e.as_str()),
+                        s.escalate_model.as_deref(),
+                        s.escalate_effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         Ok(id)
@@ -2628,7 +2653,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT role, agent_model, substrate, checkpoint, loop_target_position,
                     loop_max_iterations, loop_mode, max_iterations, pos_x, pos_y,
-                    parents, tools, custom_name, instructions, effort
+                    parents, tools, custom_name, instructions, effort,
+                    escalate_model, escalate_effort
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
@@ -2652,6 +2678,8 @@ impl Db {
                 custom_name: r.get(12)?,
                 instructions: r.get(13)?,
                 effort: r.get::<_, Option<String>>(14)?.as_deref().and_then(crate::providers::Effort::from_str),
+                escalate_model: r.get(15)?,
+                escalate_effort: r.get::<_, Option<String>>(16)?.as_deref().and_then(crate::providers::Effort::from_str),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2708,14 +2736,20 @@ impl Db {
                 "INSERT INTO pipeline_stages
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
-                     pos_x, pos_y, parents, tools, custom_name, instructions, effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                     pos_x, pos_y, parents, tools, custom_name, instructions, effort,
+                     escalate_model, escalate_effort)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
                 params![Uuid::new_v4().to_string(), sp.id, i as i64, st.role, st.agent_model,
                         st.substrate, st.checkpoint as i64,
                         st.loop_target_position, st.loop_max_iterations, st.loop_mode,
                         st.max_iterations, st.pos_x, st.pos_y, parents_json, tools_json,
                         st.custom_name, st.instructions,
-                        st.effort.as_ref().map(|e| e.as_str())],
+                        st.effort.as_ref().map(|e| e.as_str()),
+                        // Normalize empty → NULL (mirrors `save_pipeline`), so a
+                        // synced `escalate_model = ""` isn't treated as a real
+                        // policy that escalates to an empty model id.
+                        st.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+                        st.escalate_effort.as_ref().map(|e| e.as_str())],
             )?;
         }
         tx.commit()?;
@@ -2797,7 +2831,8 @@ impl Db {
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
-                    session_id, resume_pending, baseline_commit, effort, blocked_questions
+                    session_id, resume_pending, baseline_commit, effort, blocked_questions,
+                    escalate_model, escalate_effort, escalated
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -2808,6 +2843,9 @@ impl Db {
                 role: r.get(3)?,
                 agent_model: r.get(4)?,
                 effort: r.get::<_, Option<String>>(29)?.as_deref().and_then(crate::providers::Effort::from_str),
+                escalate_model: r.get(31)?,
+                escalate_effort: r.get::<_, Option<String>>(32)?.as_deref().and_then(crate::providers::Effort::from_str),
+                escalated: r.get::<_, i64>(33)? != 0,
                 substrate: r.get(5)?,
                 checkpoint: r.get::<_, i64>(6)? != 0,
                 status: r.get(7)?,
@@ -3375,6 +3413,17 @@ impl Db {
         Ok(())
     }
 
+    /// Mark a run-stage as having escalated (sticky). Set true the first time
+    /// the stage retries at its escalation tier; never cleared for the rest of
+    /// the run, so any later re-run (loop-back / reject) keeps the strong tier.
+    pub fn set_run_stage_escalated(&self, stage_id: &str, escalated: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET escalated = ?2 WHERE id = ?1",
+            params![stage_id, escalated as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         // Stamp started_at the first time it goes running.
@@ -3432,8 +3481,13 @@ impl Db {
         feedback: Option<&str>,
     ) -> AppResult<()> {
         if let Some(model) = model_override {
+            // A manual model override is the director's explicit choice — clear
+            // the sticky escalation flag so the re-run honors THIS model instead
+            // of `run_stage_once` forcing the escalate tier. The auto loop-back
+            // and escalation reset paths pass `None` here, so they stay sticky
+            // (a post-escalation loop-back keeps the strong tier by design).
             self.conn.execute(
-                "UPDATE run_stages SET agent_model = ?2 WHERE id = ?1",
+                "UPDATE run_stages SET agent_model = ?2, escalated = 0 WHERE id = ?1",
                 params![stage_id, model],
             )?;
         }
@@ -3629,8 +3683,12 @@ impl Db {
             )?;
         }
         if let Some(model) = agent_model {
+            // A manual model override (StageRerunPatch) clears the sticky
+            // escalation flag so the director's explicit model wins over the
+            // escalate tier. See `reset_run_stage` for the same rule on the
+            // reject path.
             self.conn.execute(
-                "UPDATE run_stages SET agent_model = ?2 WHERE id = ?1",
+                "UPDATE run_stages SET agent_model = ?2, escalated = 0 WHERE id = ?1",
                 params![stage_id, model],
             )?;
         }
@@ -4057,6 +4115,15 @@ pub struct StageDraft {
     /// the enum's deserializer; omitted by legacy payloads ⇒ None.
     #[serde(default)]
     pub effort: Option<crate::providers::Effort>,
+    /// Escalation policy: the stronger model to retry with when this stage
+    /// fails. `None` ⇒ no model swap on the retry. Either escalate field set
+    /// ⇒ the stage has an escalation policy.
+    #[serde(default)]
+    pub escalate_model: Option<String>,
+    /// Escalation policy: the effort to bump to on the failed-retry (API only,
+    /// like `effort`). `None` ⇒ keep the base effort on the retry.
+    #[serde(default)]
+    pub escalate_effort: Option<crate::providers::Effort>,
 }
 
 fn default_max_iterations() -> i64 {
@@ -4231,6 +4298,10 @@ pub struct PipelineStageRow {
     pub instructions: Option<String>,
     /// Per-stage reasoning effort; `None` ⇒ off (no thinking).
     pub effort: Option<crate::providers::Effort>,
+    /// Escalation policy — the stronger model to retry with on failure.
+    pub escalate_model: Option<String>,
+    /// Escalation policy — the effort to bump to on the failed-retry (API only).
+    pub escalate_effort: Option<crate::providers::Effort>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -4313,6 +4384,14 @@ pub struct RunStageRow {
     pub agent_model: String,
     /// Per-stage reasoning effort; `None` ⇒ off (no thinking).
     pub effort: Option<crate::providers::Effort>,
+    /// Escalation policy (copied from the template) — the stronger model to
+    /// retry with on failure. `None` ⇒ no model swap on the retry.
+    pub escalate_model: Option<String>,
+    /// Escalation policy (copied) — the effort to bump to on the retry (API only).
+    pub escalate_effort: Option<crate::providers::Effort>,
+    /// Sticky run-state: true once this stage has escalated (its one retry at
+    /// the strong tier). Drives the escalated model/effort resolution and the badge.
+    pub escalated: bool,
     pub substrate: String,
     pub checkpoint: bool,
     pub status: String,

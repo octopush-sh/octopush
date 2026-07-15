@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Zap, ChevronDown, Check } from "lucide-react";
 import { ipc } from "../lib/ipc";
+import { shortModel } from "../lib/modelLabel";
 import { useSessionStore } from "../stores/sessionStore";
 import { pushToast } from "./Toasts";
 import type { ModelWithProvider } from "../lib/types";
@@ -170,11 +171,4 @@ export function ModelSwitcherButton({
       <ChevronDown size={12} />
     </button>
   );
-}
-
-function shortModel(model: string): string {
-  return model
-    .replace("claude-", "")
-    .replace("gpt-", "GPT ")
-    .replace(/-\d{8}$/, "");
 }

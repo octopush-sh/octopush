@@ -4,6 +4,7 @@ import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runSt
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
+import { shortModel } from "../lib/modelLabel";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
@@ -205,6 +206,14 @@ function StageCard({
             {s.effort && !cliManaged && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}
+              </span>
+            )}
+            {s.escalated && (
+              <span
+                className="shrink-0 text-octo-brass"
+                title={`Escalated${s.escalateModel ? ` to ${s.escalateModel}` : ""} after a failed attempt`}
+              >
+                ↑ {s.escalateModel ? shortModel(s.escalateModel) : "retry"}
               </span>
             )}
             <span

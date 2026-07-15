@@ -72,4 +72,21 @@ describe("RunFlow — depth of field & the single beacon", () => {
     // the gate mark lives on the gated card, not the connector
     expect(container.textContent).toContain("⟜");
   });
+
+  it("shows the escalated badge on a stage that escalated (and only then)", () => {
+    const escalated = mk({
+      id: "e", position: 0, status: "failed",
+      escalated: true, escalateModel: "claude-opus-4-6",
+    });
+    const plain = mk({ id: "p", position: 1, status: "running", startedAt: 1 });
+    const { container } = render(
+      <RunFlow stages={[escalated, plain]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    // Brass ↑ escalated badge names the strong model (short form).
+    expect(container.textContent).toContain("↑ opus-4-6");
+    // A non-escalated stage carries no badge.
+    expect(container.querySelector('[title*="Escalated"]')).toBeTruthy();
+    const titles = Array.from(container.querySelectorAll('[title*="Escalated"]'));
+    expect(titles).toHaveLength(1);
+  });
 });

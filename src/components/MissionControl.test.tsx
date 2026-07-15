@@ -53,6 +53,7 @@ const mkStage = (id: string, runId: string, position: number, status: RunStage["
   position,
   role: "implement",
   agentModel: "m",
+  escalated: false,
   substrate: "api",
   checkpoint: false,
   status,
