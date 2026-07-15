@@ -43,25 +43,46 @@ pub const PREAMBLE_ACTION: &str = "You are one stage in an automated, headless b
     instructs — that is your job. Complete the action autonomously, then end with a brief summary \
     of exactly what you did (branch, PR URL, version, etc.) and anything still outstanding.";
 
+/// The escape-valve carve-out — appended to the preamble ONLY for API-substrate
+/// stages, which have the `ask_director` tool. It is deliberately kept out of the
+/// preamble constants so a CLI-substrate stage (which has no such tool) keeps the
+/// strict "never ask / never wait for input" guard intact. The leading space
+/// lets it append cleanly after the preamble's closing sentence.
+pub const ASK_DIRECTOR_CLAUSE: &str = " The one exception: if you hit a decision only the director \
+    can make — a genuine ambiguity, a missing spec or credential, or contradictory requirements — \
+    and guessing wrong would waste real work, call the `ask_director` tool ONCE with specific \
+    questions and your recommended default for each, then stop; prefer to ask BEFORE making \
+    expensive or irreversible changes. For anything you can reasonably decide yourself, choose a \
+    sensible default and note it — do not ask.";
+
 /// Appended to a stage prompt when the stage is in auto-loop mode (verbatim copy
 /// of the historical VERDICT_INSTRUCTION).
 pub const VERDICT_INSTRUCTION: &str = "\n\nThis is an automated review. After your findings, end your \
     response with EXACTLY ONE line, on its own line: `VERDICT: PASS` if the changes are acceptable, \
     or `VERDICT: CHANGES_REQUESTED` if they must be revised. Emit nothing after that line.";
 
-/// Compose the full system prompt: environment preamble + role body + author
-/// instructions + (auto-loop only) the verdict line.
+/// Compose the full system prompt: environment preamble + (API only) the
+/// `ask_director` carve-out + role body + author instructions + (auto-loop only)
+/// the verdict line. `can_ask_director` gates the escape-valve clause: API stages
+/// pass `true` (they have the tool); CLI stages pass `false` (they don't, and
+/// keep the strict never-ask preamble).
 pub fn compose_system_prompt(
     prompt_body: &str,
     environment: RoleEnvironment,
     loop_mode: Option<LoopMode>,
     instructions: Option<&str>,
+    can_ask_director: bool,
 ) -> String {
     let preamble = match environment {
         RoleEnvironment::Worktree => PREAMBLE_WORKTREE,
         RoleEnvironment::Action => PREAMBLE_ACTION,
     };
-    let mut s = format!("{preamble}\n\n{prompt_body}");
+    let mut s = String::from(preamble);
+    if can_ask_director {
+        s.push_str(ASK_DIRECTOR_CLAUSE);
+    }
+    s.push_str("\n\n");
+    s.push_str(prompt_body);
     if let Some(instr) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
         s.push_str("\n\nAdditional instructions for this stage, from the pipeline author:\n");
         s.push_str(instr);

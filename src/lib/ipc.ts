@@ -142,6 +142,23 @@ export interface Run {
    *  crew keeps working even if the app quits. */
   detached: boolean;
 }
+/** One question a blocked stage asks the director via `ask_director` — paired
+ *  with the agent's own best guess so the director can accept it in one click.
+ *  Mirrors the Rust `BlockedQuestion`. */
+export interface BlockedQuestion {
+  question: string;
+  whyBlocked: string;
+  recommendedDefault: string;
+}
+
+/** The structured payload of an `ask_director` call: a one-line summary plus
+ *  the specific decisions the stage needs. Surfaced to the answer form while a
+ *  stage is parked awaiting the director. Mirrors the Rust `BlockedAsk`. */
+export interface BlockedAsk {
+  summary: string;
+  questions: BlockedQuestion[];
+}
+
 export interface RunStage {
   id: string;
   runId: string;
@@ -181,6 +198,11 @@ export interface RunStage {
   sessionId: string | null;
   /** Git commit SHA captured before the stage ran (enables Discard). Null when capture failed or non-repo. */
   baselineCommit: string | null;
+  /** Escape valve: the stage's `ask_director` questions while it is parked
+   *  awaiting the director; null/absent otherwise. Its presence marks an
+   *  awaiting_checkpoint stage as a question-block (answer form) rather than a
+   *  normal gate (Approve/Reject). */
+  blockedQuestions?: BlockedAsk | null;
 }
 export interface RunDetail {
   run: Run | null;
@@ -983,6 +1005,13 @@ export const ipc = {
       modelOverride: modelOverride ?? null,
       maxTurnsOverride: maxTurnsOverride ?? null,
     }),
+
+  /** Answer a stage that parked itself via the `ask_director` escape valve.
+   *  `answers` is positional — one per question the stage asked; a missing or
+   *  empty entry falls back to that question's recommended default. The
+   *  decisions become the stage's re-run feedback and the stage re-runs. */
+  answerBlocker: (runId: string, stageId: string, answers: string[]) =>
+    invoke<void>("answer_blocker", { runId, stageId, answers }),
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),

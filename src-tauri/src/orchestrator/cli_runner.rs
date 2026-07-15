@@ -198,6 +198,8 @@ pub fn parse_cli_result(
             error: Some(error),
             verdict: None,
             session_id: parsed.session_id.clone(),
+            // `ask_director` is an API-substrate tool only; a CLI stage never blocks.
+            blocked: None,
         });
     }
 
@@ -218,6 +220,7 @@ pub fn parse_cli_result(
         error: None,
         verdict: parse_verdict(&parsed.result),
         session_id: parsed.session_id.clone(),
+        blocked: None,
     })
 }
 
@@ -285,7 +288,9 @@ impl AgentRunner for CliRunner {
         // The CLI substrate (Claude Code) owns its own tool surface, so the
         // per-stage tool allowlist does not apply here; the author's free-form
         // instructions still shape the stage via the system prompt.
-        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref());
+        // CLI substrate has no `ask_director` tool — keep the strict never-ask
+        // preamble by NOT appending the carve-out (`can_ask_director = false`).
+        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), false);
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
                 build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
@@ -515,5 +520,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         error: Some(msg.to_string()),
         verdict: None,
         session_id: None,
+        blocked: None,
     }
 }

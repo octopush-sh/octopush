@@ -33,6 +33,8 @@ interface Props {
   onResume: (maxTurns?: number) => void;
   onDiscard: () => void;
   onSendBack: (feedback: string) => void;
+  /** Answer a stage parked via the `ask_director` escape valve (positional). */
+  onAnswerBlocker: (answers: string[]) => void;
   onRunAgain: () => void;
 }
 
@@ -87,6 +89,18 @@ export function RunControlBar(props: Props) {
     return <DraftBar onStart={props.onStart} onDiscard={props.onAbort} beacon={props.beacon ?? false} />;
   }
   if (blockedStage) {
+    // The escape valve: a stage that parked itself asking the director gets the
+    // answer form, not the Approve/Reject decision. Both are awaiting_checkpoint;
+    // `blockedQuestions` is what distinguishes a question-block from a gate.
+    if (blockedStage.blockedQuestions) {
+      return (
+        <BlockedAskBar
+          blockedStage={blockedStage}
+          beacon={props.beacon ?? false}
+          onAnswer={props.onAnswerBlocker}
+        />
+      );
+    }
     return <DecisionBar {...props} blockedStage={blockedStage} />;
   }
   // While the run simply runs, the bar yields: pause / stop / abort live in
@@ -134,6 +148,90 @@ function TerminalBar({ run, onRunAgain }: { run: Run; onRunAgain: () => void }) 
         <RotateCcw size={13} strokeWidth={1.75} />
         Run it again
       </button>
+    </div>
+  );
+}
+
+/**
+ * The escape-valve answer form. When a stage stops to ask the director
+ * (`ask_director`), this replaces the Approve/Reject decision: each question is
+ * shown with its rationale and an input pre-filled with the crew's recommended
+ * default. "Send answers" submits the edited answers; "Accept all defaults" is
+ * the one-click fast path (submit every default unchanged). The stage re-runs
+ * with the decisions injected as feedback.
+ */
+function BlockedAskBar({
+  blockedStage,
+  beacon,
+  onAnswer,
+}: {
+  blockedStage: RunStage;
+  beacon: boolean;
+  onAnswer: (answers: string[]) => void;
+}) {
+  const ask = blockedStage.blockedQuestions;
+  const questions = ask?.questions ?? [];
+  const [answers, setAnswers] = useState<string[]>(() => questions.map((q) => q.recommendedDefault));
+
+  // Re-seed the editor whenever a new block arrives (the bar stays mounted).
+  useEffect(() => {
+    setAnswers(questions.map((q) => q.recommendedDefault));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- questions derives from blockedStage.id
+  }, [blockedStage.id]);
+
+  if (!ask) return null;
+
+  const setAnswer = (i: number, v: string) =>
+    setAnswers((prev) => prev.map((a, idx) => (idx === i ? v : a)));
+
+  return (
+    <div className="octo-fade-in border-t border-[var(--brass-dim)] bg-[var(--brass-faint)] px-4 py-3">
+      <div className="mb-2.5 flex items-center gap-2">
+        <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+          ⟜ the crew asked you
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={ask.summary}>
+          {ask.summary}
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        {questions.map((q, i) => (
+          <div key={i} className="flex flex-col gap-1">
+            <label htmlFor={`blocker-q-${i}`} className="font-sans text-[13px] text-octo-ivory">
+              {q.question}
+            </label>
+            {q.whyBlocked.trim() !== "" && (
+              <p className="font-mono text-[11px] leading-relaxed text-octo-mute">{q.whyBlocked}</p>
+            )}
+            <input
+              id={`blocker-q-${i}`}
+              type="text"
+              value={answers[i] ?? ""}
+              onChange={(e) => setAnswer(i, e.target.value)}
+              placeholder={q.recommendedDefault || "Your decision…"}
+              className="rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
+            />
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 flex gap-2">
+        <button
+          type="button"
+          onClick={() => onAnswer(answers)}
+          className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}
+        >
+          Send answers
+        </button>
+        <button
+          type="button"
+          onClick={() => onAnswer(questions.map((q) => q.recommendedDefault))}
+          className="rounded-md border border-[var(--brass-dim)] px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
+        >
+          Accept all defaults
+        </button>
+      </div>
     </div>
   );
 }

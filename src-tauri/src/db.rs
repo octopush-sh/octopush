@@ -288,6 +288,7 @@ impl Db {
                 error         TEXT,
                 started_at    TEXT,
                 finished_at   TEXT,
+                blocked_questions TEXT,
                 FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_run_stages_run
@@ -665,6 +666,9 @@ impl Db {
         // is exactly today's behavior for every pre-existing row.
         add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN effort TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN effort TEXT")?;
+        // The escape valve: a parked stage's `ask_director` questions (JSON
+        // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -2793,7 +2797,7 @@ impl Db {
                     input_tokens, output_tokens, cost_usd, artifact, feedback, error, started_at, finished_at,
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
-                    session_id, resume_pending, baseline_commit, effort
+                    session_id, resume_pending, baseline_commit, effort, blocked_questions
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -2828,6 +2832,7 @@ impl Db {
                 session_id: r.get(26)?,
                 resume_pending: r.get::<_, i64>(27)? != 0,
                 baseline_commit: r.get(28)?,
+                blocked_questions: r.get(30)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3359,6 +3364,17 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Persist (or clear, with `None`) a parked stage's `ask_director`
+    /// questions — the JSON `BlockedAsk` the answer form reads. Set when a stage
+    /// blocks; cleared when the director answers (or, defensively, on any reset).
+    pub fn set_run_stage_blocked(&self, stage_id: &str, questions_json: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET blocked_questions = ?2 WHERE id = ?1",
+            params![stage_id, questions_json],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         // Stamp started_at the first time it goes running.
@@ -3402,7 +3418,9 @@ impl Db {
     }
 
     /// Reset a stage to pending (for re-run), optionally overriding its model and
-    /// recording reviewer feedback. Clears the prior artifact/error/finish time.
+    /// recording reviewer feedback. Clears the prior artifact/error/finish time,
+    /// and any `blocked_questions` — a re-run never carries a stale escape-valve
+    /// block, whatever path (reject / answer / loop-back / re-run) triggered it.
     /// NOTE: `session_id`, `resume_pending`, and `baseline_commit` are intentionally
     /// preserved — the UPDATE below does not list them. `resume_pending` is cleared
     /// separately by the Resume action handler after it sets it, and `session_id` /
@@ -3423,6 +3441,7 @@ impl Db {
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
+                 blocked_questions = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],
@@ -3513,13 +3532,17 @@ impl Db {
 
         // Two editable moments: a pending stage the run hasn't reached, and a
         // stage parked BEFORE it began — a budget park or a director pause,
-        // which hold the NEXT stage with no work done. "No artifact yet" is
-        // the no-work-done signal: those pre-work parks produce nothing (and
-        // never stamp started_at), while a checkpoint-GATE park holds a
-        // FINISHED stage's hand-off, artifact and all — that one is past
-        // editing and is redirected via the decision bar or a re-run.
+        // which hold the NEXT stage with no work done. The discriminator is
+        // `started_at IS NULL` (never ran): those pre-work parks produce nothing
+        // and never stamp `started_at`, while a checkpoint-GATE park holds a
+        // FINISHED stage's hand-off (artifact present) and an `ask_director`
+        // BLOCK holds a stage that DID run (started_at stamped, artifact null) —
+        // both are past editing, redirected via the decision bar / answer form
+        // or a re-run. Requiring `started_at.is_none()` (not just "no artifact")
+        // is what keeps a block out of this branch.
         let pending_unstarted = status == "pending" && started_at.is_none();
-        let parked_unbegun = status == "awaiting_checkpoint" && artifact.is_none();
+        let parked_unbegun =
+            status == "awaiting_checkpoint" && artifact.is_none() && started_at.is_none();
         if !pending_unstarted && !parked_unbegun {
             return Err(AppError::Other(format!(
                 "{} has already started — only stages that haven't begun can be edited",
@@ -4326,6 +4349,28 @@ pub struct RunStageRow {
     pub resume_pending: bool,
     /// Dangling commit SHA snapshotting the worktree at this stage's start.
     pub baseline_commit: Option<String>,
+    /// Escape valve: the stage's `ask_director` questions (JSON `BlockedAsk`)
+    /// while it is parked awaiting the director; NULL otherwise. Serialized to
+    /// the frontend as the PARSED object (or null) — the answer form wants
+    /// structured questions, not a JSON string to re-parse.
+    #[serde(serialize_with = "serialize_blocked_questions")]
+    pub blocked_questions: Option<String>,
+}
+
+/// Serialize a stored JSON string as its parsed value (or `null`) so a
+/// `RunStageRow`'s `blocked_questions` reaches the frontend as a `BlockedAsk`
+/// object rather than an opaque string. Unparseable/absent ⇒ `null`.
+fn serialize_blocked_questions<S>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match v
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+    {
+        Some(val) => serde::Serialize::serialize(&val, s),
+        None => s.serialize_none(),
+    }
 }
 
 /// One archived stage attempt (a snapshot taken just before a loop-back /

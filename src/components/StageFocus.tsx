@@ -183,17 +183,21 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // The gate toggle needs a stage the run hasn't reached. A stage parked
   // BEFORE it began — a budget park or a director pause, which hold the
   // next stage with no work done — still takes field edits; the park itself
-  // is released via approve/reject, not a toggle. "No artifact yet" is the
-  // no-work-done signal: pre-work parks produce nothing, while a checkpoint
-  // GATE park holds a FINISHED stage's hand-off (artifact present) and is
-  // redirected via the decision bar or a re-run instead. The backend
-  // enforces the same rule.
+  // is released via approve/reject, not a toggle. The no-work-done signal is
+  // `startedAt === null` (never ran): pre-work parks produce nothing and never
+  // stamp it, while a checkpoint GATE park holds a FINISHED stage's hand-off
+  // (artifact present) and an `ask_director` BLOCK holds a stage that DID run
+  // (startedAt stamped, artifact null) — both are redirected via the decision
+  // bar / answer form or a re-run instead. The backend enforces the same rule.
   const controllable = !!stage && !!run && !TERMINAL_RUN_STATUSES.has(run.status);
   const gateTogglable =
     controllable && stage.status === "pending" && stage.startedAt === null;
   const fieldsEditable =
     gateTogglable ||
-    (controllable && stage.status === "awaiting_checkpoint" && stage.artifact === null);
+    (controllable &&
+      stage.status === "awaiting_checkpoint" &&
+      stage.artifact === null &&
+      stage.startedAt === null);
   // NOTE: not `controllable` — a COMPLETED run can't take edits but its
   // stages can be re-run ("completed" is in the rerunnable set).
   const rerunnable =

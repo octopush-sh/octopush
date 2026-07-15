@@ -33,6 +33,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const begin = useRunsStore((s) => s.begin);
   const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
+  const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
   const pauseRun = useRunsStore((s) => s.pauseRun);
@@ -220,6 +221,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns)}
           onDiscard={() => void resolve(run.id, "discard")}
           onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
+          onAnswerBlocker={(answers) => {
+            if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);
+          }}
           onRunAgain={onRunAgain}
         />
         {briefOpen && (

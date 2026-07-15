@@ -104,6 +104,11 @@ interface RunsState {
     modelOverride?: string,
     maxTurnsOverride?: number,
   ) => Promise<void>;
+  /** Answer a stage parked via the `ask_director` escape valve. `answers` is
+   *  positional (one per question); the stage re-runs with the decisions
+   *  injected as feedback. Refreshes the detail so the form gives way to the
+   *  re-running stage. */
+  answerBlocker: (runId: string, stageId: string, answers: string[]) => Promise<void>;
   abort: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
@@ -363,6 +368,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
     await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride);
+    await get().refreshDetail(runId);
+  },
+
+  answerBlocker: async (runId, stageId, answers) => {
+    await ipc.answerBlocker(runId, stageId, answers);
     await get().refreshDetail(runId);
   },
 

@@ -81,6 +81,38 @@ pub enum ReviewVerdict {
     ChangesRequested,
 }
 
+/// One question a blocked stage asks the director via the `ask_director` escape
+/// valve — the thing it cannot proceed without, paired with the agent's own best
+/// guess so the director can accept it in one click.
+///
+/// Deserialization is deliberately tolerant so a well-formed multi-question ask
+/// never collapses to one: EVERY field defaults (a missing one is empty, never a
+/// hard parse error), and the underscore fields accept BOTH the schema's
+/// camelCase (`whyBlocked`/`recommendedDefault`) and any snake_case drift the
+/// model emits (`why_blocked`/`recommended_default`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedQuestion {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default, alias = "why_blocked")]
+    pub why_blocked: String,
+    #[serde(default, alias = "recommended_default")]
+    pub recommended_default: String,
+}
+
+/// The structured payload of an `ask_director` tool call: a one-line summary of
+/// what the stage is blocked on plus the specific questions (each with a
+/// recommended default). Persisted as JSON in `run_stages.blocked_questions`
+/// while the stage is parked, and surfaced to the director's answer form.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedAsk {
+    #[serde(default)]
+    pub summary: String,
+    pub questions: Vec<BlockedQuestion>,
+}
+
 /// How a review stage's loop-back behaves. Persisted as text in
 /// `*_stages.loop_mode`; absent/unknown ⇒ no loop (linear).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -278,7 +310,8 @@ pub struct StageOutcome {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
-    /// Either `Done` or `Failed`.
+    /// `Done` or `Failed` in the common case; `AwaitingCheckpoint` when the
+    /// stage blocked on `ask_director` (see the `blocked` field below).
     pub status: StageStatus,
     pub tool_calls: Vec<ToolCallLog>,
     /// Present when `status == Failed`.
@@ -288,6 +321,10 @@ pub struct StageOutcome {
     /// The CLI session ID from the `type:"result"` event, when the CLI substrate
     /// was used. `None` for API-substrate stages.
     pub session_id: Option<String>,
+    /// Set when the stage called the `ask_director` escape valve: it stopped to
+    /// ask the director a blocking question. Neither `Done` nor `Failed` — the
+    /// drive parks it as an `awaiting_checkpoint` decision (see `run_stage_once`).
+    pub blocked: Option<BlockedAsk>,
 }
 
 /// What the user chose at a checkpoint.
@@ -315,5 +352,12 @@ pub enum CheckpointAction {
     Discard,
     /// Artifact was edited out-of-band; continue.
     Edit,
+    /// Answer a stage that parked itself via the `ask_director` escape valve:
+    /// the director's decisions (one per question, in order) become the stage's
+    /// re-run feedback and the stage resets to pending. Reuses the reject-resume
+    /// path — a blocked stage is just another `awaiting_checkpoint` pause.
+    AnswerBlocker {
+        answers: Vec<String>,
+    },
     Abort,
 }

@@ -1728,6 +1728,20 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
+    dispatch_checkpoint(&orch, run_id, None, action)
+}
+
+/// Resolve a checkpoint decision and resume the drive, choosing the detached
+/// (Pro) or in-process path. Shared by `resolve_checkpoint` and
+/// `answer_blocker` so the escape valve reuses the exact resume substrate.
+/// `stage_id` scopes which parked/failed stage the action targets — the escape
+/// valve passes its validated id; the plain checkpoint path passes `None`.
+fn dispatch_checkpoint(
+    orch: &Arc<Orchestrator>,
+    run_id: String,
+    stage_id: Option<String>,
+    action: CheckpointAction,
+) -> AppResult<()> {
     // Pro (`runs.detached`): apply the decision's mutations here — they're
     // synchronous and cheap — then hand the re-drive to a detached worker.
     // Guard rejections ("run is already executing") surface immediately
@@ -1735,17 +1749,50 @@ pub async fn resolve_checkpoint(
     if crate::entitlement::Entitlement::current()
         .has_feature(crate::entitlement::feature::RUNS_DETACHED)
     {
-        if let Some(budget_override) = orch.resolve_checkpoint_apply_only(&run_id, action)? {
+        if let Some(budget_override) =
+            orch.resolve_checkpoint_apply_only(&run_id, stage_id.as_deref(), action)?
+        {
             if let Err(e) = orch.spawn_detached_segment(&run_id, budget_override) {
                 tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
-                Arc::clone(&*orch).spawn_drive(run_id, budget_override);
+                Arc::clone(orch).spawn_drive(run_id, budget_override);
             }
         }
         return Ok(());
     }
     // Drive in the background; the frontend reacts to run:// events.
-    Arc::clone(&*orch).spawn_resolve_checkpoint(run_id, action);
+    Arc::clone(orch).spawn_resolve_checkpoint(run_id, stage_id, action);
     Ok(())
+}
+
+/// Answer a stage that parked itself via the `ask_director` escape valve. The
+/// `answers` are positional — one per question the stage asked (a missing or
+/// empty entry falls back to that question's recommended default; extras are
+/// ignored, so the frontend's "Accept all defaults" just sends the defaults).
+/// The decisions become the stage's re-run feedback and the stage re-runs with
+/// them injected — reusing the checkpoint resume substrate wholesale.
+#[tauri::command]
+pub async fn answer_blocker(
+    state: State<'_, AppState>,
+    orch: State<'_, Arc<Orchestrator>>,
+    run_id: String,
+    stage_id: String,
+    answers: Vec<String>,
+) -> AppResult<()> {
+    // `stage_id` scopes the answer to the intended block (defensive: only one
+    // stage is ever awaiting a decision at a time, but the frontend passes it
+    // and a stale click must not answer a different stage). Reject clearly if
+    // the stage is not actually blocked awaiting the director.
+    let is_blocked = state.db.lock().list_run_stages(&run_id)?.into_iter().any(|s| {
+        s.id == stage_id && s.status == "awaiting_checkpoint" && s.blocked_questions.is_some()
+    });
+    if !is_blocked {
+        return Err(crate::error::AppError::Other(
+            "this stage is not awaiting a director decision".into(),
+        ));
+    }
+    // Thread the validated `stage_id` through so the resolution acts on exactly
+    // the stage we just checked, not merely "the parked stage".
+    dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers })
 }
 
 #[tauri::command]

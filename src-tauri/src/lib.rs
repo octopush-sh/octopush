@@ -214,6 +214,7 @@ pub fn run() {
             commands::list_runs,
             commands::list_active_runs,
             commands::resolve_checkpoint,
+            commands::answer_blocker,
             commands::abort_run,
             commands::stop_stage,
             commands::request_run_pause,

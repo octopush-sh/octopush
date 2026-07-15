@@ -22,7 +22,8 @@ const stage = (over: Partial<RunStage>): RunStage => ({
 
 const handlers = () => ({
   onStart: vi.fn(), onPause: vi.fn(), onStopStage: vi.fn(), onAbort: vi.fn(), onApprove: vi.fn(),
-  onReject: vi.fn(), onResume: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onRunAgain: vi.fn(),
+  onReject: vi.fn(), onResume: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onAnswerBlocker: vi.fn(),
+  onRunAgain: vi.fn(),
 });
 
 describe("RunControlBar", () => {
@@ -134,5 +135,54 @@ describe("RunControlBar", () => {
     expect(screen.getByText(/awaiting retry/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Resume the stage/i }));
     expect(h.onResume).toHaveBeenCalled();
+  });
+
+  it("escape valve: renders the questions pre-filled with defaults and sends edited answers", () => {
+    const h = handlers();
+    const blocked = stage({
+      blockedQuestions: {
+        summary: "which datastore?",
+        questions: [
+          { question: "Postgres or SQLite?", whyBlocked: "the schema differs", recommendedDefault: "Postgres" },
+          { question: "Which auth?", whyBlocked: "", recommendedDefault: "OAuth" },
+        ],
+      },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={blocked} loopTargetRole={null} loopState={null} {...h} />);
+    // The answer form replaces the Approve/Reject decision.
+    expect(screen.getByText(/the crew asked you/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve & continue/i })).not.toBeInTheDocument();
+    expect(screen.getByText("Postgres or SQLite?")).toBeInTheDocument();
+    expect(screen.getByText("the schema differs")).toBeInTheDocument();
+
+    const inputs = screen.getAllByRole("textbox") as HTMLInputElement[];
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0].value).toBe("Postgres"); // pre-filled with the recommended default
+    expect(inputs[1].value).toBe("OAuth");
+
+    fireEvent.change(inputs[0], { target: { value: "SQLite" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send answers/i }));
+    expect(h.onAnswerBlocker).toHaveBeenCalledWith(["SQLite", "OAuth"]);
+  });
+
+  it("escape valve: Accept all defaults sends the recommended defaults, ignoring edits", () => {
+    const h = handlers();
+    const blocked = stage({
+      blockedQuestions: {
+        summary: "s",
+        questions: [{ question: "q?", whyBlocked: "", recommendedDefault: "the default" }],
+      },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={blocked} loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "edited" } });
+    fireEvent.click(screen.getByRole("button", { name: /Accept all defaults/i }));
+    expect(h.onAnswerBlocker).toHaveBeenCalledWith(["the default"]);
+  });
+
+  it("normal gate: a stage without blockedQuestions keeps Approve/Reject, not the answer form", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByRole("button", { name: /Approve & continue/i })).toBeInTheDocument();
+    expect(screen.queryByText(/the crew asked you/i)).not.toBeInTheDocument();
   });
 });

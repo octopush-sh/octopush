@@ -194,6 +194,28 @@ describe("MissionControl", () => {
     expect(screen.getByText(/holds the gate/)).toBeTruthy();
   });
 
+  it("a question-block reads distinctly from an approval gate (asked you, not the gate)", () => {
+    // The escape valve: a stage parked via ask_director shows an answer-form
+    // indicator, NOT the approval-gate wording — the director must see one is waiting.
+    const run = mkRun("a", "paused");
+    const blocked: RunStage = {
+      ...mkStage("s2", "a", 1, "awaiting_checkpoint"),
+      startedAt: "t",
+      blockedQuestions: {
+        summary: "which datastore?",
+        questions: [{ question: "Postgres or SQLite?", whyBlocked: "schema differs", recommendedDefault: "Postgres" }],
+      },
+    };
+    const stages = [mkStage("s1", "a", 0, "done"), blocked];
+    useRunsStore.setState({
+      runsByWs: { "ws-a": [run] },
+      detailByRun: { a: { run, stages } },
+    });
+    renderRoom();
+    expect(screen.getByText(/asked you · waiting on your answer/)).toBeTruthy();
+    expect(screen.queryByText(/holds the gate/)).toBeNull();
+  });
+
   it("empty board offers the dispatch CTA (header icon + ceremonial CTA)", () => {
     const onDispatch = vi.fn();
     renderRoom({ onDispatch });

@@ -193,7 +193,9 @@ impl AgentRunner for ApiRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
-        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref());
+        // API substrate: the `ask_director` escape valve is available, so the
+        // carve-out is included (`can_ask_director = true`).
+        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
@@ -227,6 +229,29 @@ impl AgentRunner for ApiRunner {
                     r.cache_read_tokens,
                     r.cache_creation_tokens,
                 );
+                // Escape valve: the stage called `ask_director`. This is neither
+                // a success nor a failure — it's a block. Carry the questions up
+                // so the drive parks the stage as an `awaiting_checkpoint`
+                // decision; the spend it burned asking is preserved for the meter.
+                if let Some(ask) = r.blocked.clone() {
+                    return Ok(StageOutcome {
+                        artifact: StageArtifact {
+                            kind: ArtifactKind::Note,
+                            text: String::new(),
+                            payload: None,
+                            refs_worktree: false,
+                        },
+                        input_tokens: r.input_tokens,
+                        output_tokens: r.output_tokens,
+                        cost_usd: cost,
+                        status: StageStatus::AwaitingCheckpoint,
+                        tool_calls: r.tool_calls,
+                        error: None,
+                        verdict: None,
+                        session_id: None,
+                        blocked: Some(ask),
+                    });
+                }
                 // An unfinished loop is a failure, not a thin success: the
                 // stage never produced a final answer, so don't hand its
                 // placeholder text to the next stage. Usage is preserved for
@@ -249,6 +274,7 @@ impl AgentRunner for ApiRunner {
                         error: Some(unfinished_stage_error(cancelled, max_iterations)),
                         verdict: None,
                         session_id: None,
+                        blocked: None,
                     });
                 }
                 let kind = stage.artifact_kind.clone();
@@ -275,6 +301,7 @@ impl AgentRunner for ApiRunner {
                     error: None,
                     verdict,
                     session_id: None,
+                    blocked: None,
                 })
             }
             Err(e) => Ok(StageOutcome {
@@ -292,6 +319,7 @@ impl AgentRunner for ApiRunner {
                 error: Some(e.to_string()),
                 verdict: None,
                 session_id: None,
+                blocked: None,
             }),
         }
     }
