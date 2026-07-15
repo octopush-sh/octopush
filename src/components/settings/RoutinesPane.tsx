@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { CalendarClock, Pencil, Play, Plus, Power, Trash2 } from "lucide-react";
 import { PaneHeader, SectionLabel } from "./shared";
 import { ModalShell } from "../ModalShell";
+import { Listbox } from "../controls/Listbox";
 import { useRoutinesStore } from "../../stores/routinesStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { usePipelineStore } from "../../stores/pipelineStore";
@@ -21,6 +22,11 @@ import {
 } from "../../lib/routineForm";
 
 const ROUTINES_FEATURE = "routines.scheduled";
+
+// Listbox trigger surface that matches this form's TextInput/time/number fields
+// (same border/bg/focus tokens) so the pickers read as siblings, in both themes.
+const FIELD_SURFACE =
+  "border border-octo-hairline bg-octo-bg text-octo-ivory hover:border-[var(--brass-dim)] focus:border-octo-brass";
 
 export function RoutinesPane() {
   const hasFeature = useEntitlementStore((s) => s.hasFeature);
@@ -305,20 +311,26 @@ function RoutineEditor({
 
           <div className="grid grid-cols-2 gap-4">
             <Field label="Project">
-              <Select value={draft.projectId} onChange={onProjectChange}>
-                <option value="">Choose…</option>
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </Select>
+              <Listbox
+                ariaLabel="Project"
+                className="w-full"
+                triggerClassName={FIELD_SURFACE}
+                placeholder="Choose…"
+                value={draft.projectId || null}
+                options={projects.map((p) => ({ value: p.id, label: p.name }))}
+                onChange={onProjectChange}
+              />
             </Field>
             <Field label="Pipeline">
-              <Select value={draft.pipelineId} onChange={(v) => set("pipelineId", v)}>
-                <option value="">Choose…</option>
-                {pipelines.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </Select>
+              <Listbox
+                ariaLabel="Pipeline"
+                className="w-full"
+                triggerClassName={FIELD_SURFACE}
+                placeholder="Choose…"
+                value={draft.pipelineId || null}
+                options={pipelines.map((p) => ({ value: p.id, label: p.name }))}
+                onChange={(v) => set("pipelineId", v)}
+              />
             </Field>
           </div>
 
@@ -379,12 +391,15 @@ function RoutineEditor({
             />
             {draft.workspaceMode === "fixed" ? (
               <div className="mt-2">
-                <Select value={draft.fixedWorkspaceId} onChange={(v) => set("fixedWorkspaceId", v)}>
-                  <option value="">Choose a workspace…</option>
-                  {workspaces.map((w) => (
-                    <option key={w.id} value={w.id}>{w.name}</option>
-                  ))}
-                </Select>
+                <Listbox
+                  ariaLabel="Workspace"
+                  className="w-full"
+                  triggerClassName={FIELD_SURFACE}
+                  placeholder="Choose a workspace…"
+                  value={draft.fixedWorkspaceId || null}
+                  options={workspaces.map((w) => ({ value: w.id, label: w.name }))}
+                  onChange={(v) => set("fixedWorkspaceId", v)}
+                />
                 <p className="mt-1 text-[11px] leading-snug text-octo-mute">
                   Each fire runs in this workspace. A fire is skipped while a previous run is still going.
                 </p>
@@ -471,26 +486,6 @@ function TextInput({
       placeholder={placeholder}
       className="w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-[13px] text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute"
     />
-  );
-}
-
-function Select({
-  value,
-  onChange,
-  children,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full rounded-md border border-octo-hairline bg-octo-bg px-2.5 py-1.5 text-[13px] text-octo-ivory outline-none focus:border-octo-brass"
-    >
-      {children}
-    </select>
   );
 }
 

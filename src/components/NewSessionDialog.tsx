@@ -3,6 +3,7 @@ import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
 import type { ModelWithProvider, SessionTemplate } from "../lib/types";
 import { ModalShell } from "./ModalShell";
+import { Listbox } from "./controls/Listbox";
 
 interface Props {
   open: boolean;
@@ -182,18 +183,20 @@ export function NewSessionDialog({ open, onClose }: Props) {
                 (sets OCTOPUSH_MODEL env var in terminal)
               </span>
             </span>
-            <select
+            <Listbox
+              ariaLabel="Model"
+              className="w-full"
+              triggerClassName="border border-octo-border bg-octo-bg text-octo-ivory hover:border-octo-accent/50 focus:border-octo-accent"
               value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className="w-full rounded-md border border-octo-border bg-octo-bg px-3 py-2 text-sm outline-none focus:border-octo-accent"
-            >
-              <option value="">Default (agent decides)</option>
-              {models.map((m) => (
-                <option key={m.model.id} value={m.model.id}>
-                  {m.model.displayName} — {m.provider} (${m.model.inputCostPerM}/M in)
-                </option>
-              ))}
-            </select>
+              onChange={setSelectedModel}
+              options={[
+                { value: "", label: "Default (agent decides)" },
+                ...models.map((m) => ({
+                  value: m.model.id,
+                  label: `${m.model.displayName} — ${m.provider} ($${m.model.inputCostPerM}/M in)`,
+                })),
+              ]}
+            />
           </label>
         )}
 
