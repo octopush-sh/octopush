@@ -4,10 +4,11 @@
 
 use crate::chat_engine::{build_llm_tools, execute_tool};
 use crate::error::{AppResult, ProviderErrorKind};
-use crate::orchestrator::types::ToolCallLog;
+use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
     complete_with_retry, interruptible_sleep, Effort, LlmContent, LlmMessage, LlmProvider,
-    LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmToolResult, DEFAULT_MAX_RETRIES,
+    LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult, LlmToolUse,
+    DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +88,117 @@ pub struct AgenticResult {
     /// False when the loop exhausted `max_iterations` without a final answer.
     /// Callers must not treat an unfinished result as a successful stage.
     pub finished: bool,
+    /// Set when the loop stopped because the model called `ask_director`: the
+    /// stage is blocked on a director decision. The caller parks it as a
+    /// checkpoint and re-runs it once answered. `finished` stays false.
+    pub blocked: Option<BlockedAsk>,
+}
+
+/// The DIRECT-only escape-valve tool. Appended to every DIRECT stage's toolset
+/// AFTER the per-stage allowlist filter — so it survives a review stage's
+/// read-only allowlist — and never added to TALK (which shares
+/// `build_llm_tools` but has a human present, making the tool meaningless).
+pub const ASK_DIRECTOR_TOOL: &str = "ask_director";
+
+fn ask_director_tool() -> LlmTool {
+    LlmTool {
+        name: ASK_DIRECTOR_TOOL.to_string(),
+        description: "Stop and ask the director a blocking question ONLY when you cannot proceed \
+            without a decision that only they can make — a genuine ambiguity, a missing spec or \
+            credential, or contradictory requirements. Give your recommended default for each \
+            question so they can accept quickly. Do NOT use it for choices you can reasonably make \
+            yourself. Calling this ends your work on this stage until the director answers; prefer \
+            to ask before making expensive or irreversible changes."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "One sentence: what you are blocked on."
+                },
+                "questions": {
+                    "type": "array",
+                    "description": "The specific decisions you need from the director.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "The decision you need." },
+                            "whyBlocked": { "type": "string", "description": "Why you cannot proceed without it." },
+                            "recommendedDefault": { "type": "string", "description": "Your best answer if the director does not specify." }
+                        },
+                        "required": ["question", "recommendedDefault"]
+                    }
+                }
+            },
+            "required": ["summary", "questions"]
+        }),
+    }
+}
+
+/// Parse an `ask_director` tool call's input into a [`BlockedAsk`]. With
+/// [`BlockedAsk`]/[`BlockedQuestion`] tolerant of missing/aliased fields, the
+/// strict parse now succeeds for ANY array-of-objects payload — so a well-formed
+/// multi-question ask keeps every question. The degrade branch is reserved for
+/// genuinely non-object/garbage input; even then it maps over ALL elements (not
+/// just the first) so nothing is silently lost, and it NEVER crashes the stage.
+fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
+    if let Ok(ask) = serde_json::from_value::<BlockedAsk>(u.input.clone()) {
+        if !ask.questions.is_empty() {
+            return ask;
+        }
+    }
+    // Salvage path: pull whatever is present out of the raw JSON, tolerating a
+    // bare-string question, either field casing, and any number of questions.
+    let summary = u
+        .input
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "The crew needs a decision to proceed.".to_string());
+    let field = |q: &serde_json::Value, camel: &str, snake: &str| -> String {
+        q.get(camel)
+            .or_else(|| q.get(snake))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let mut questions: Vec<BlockedQuestion> = u
+        .input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| {
+                    if let Some(s) = q.as_str() {
+                        return Some(BlockedQuestion {
+                            question: s.to_string(),
+                            why_blocked: String::new(),
+                            recommended_default: String::new(),
+                        });
+                    }
+                    if q.is_object() {
+                        return Some(BlockedQuestion {
+                            question: field(q, "question", "question"),
+                            why_blocked: field(q, "whyBlocked", "why_blocked"),
+                            recommended_default: field(q, "recommendedDefault", "recommended_default"),
+                        });
+                    }
+                    None
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if questions.is_empty() {
+        // Nothing structured at all — surface the summary as the one question.
+        questions.push(BlockedQuestion {
+            question: summary.clone(),
+            why_blocked: String::new(),
+            recommended_default: String::new(),
+        });
+    }
+    BlockedAsk { summary, questions }
 }
 
 /// Run the tool-use loop against `provider` until it returns a final answer
@@ -121,6 +233,11 @@ pub async fn run_agentic_loop(
     if let Some(allowed) = allowed_tools {
         tools.retain(|t| allowed.iter().any(|a| a == &t.name));
     }
+    // The escape valve is appended AFTER the allowlist filter so it is always
+    // available to a DIRECT stage — even a review stage whose allowlist is
+    // read-only. It is deliberately NOT part of `build_llm_tools` (shared with
+    // TALK), which has a human present and no use for a director-ask tool.
+    tools.push(ask_director_tool());
     let mut messages: Vec<LlmMessage> = vec![LlmMessage {
         role: LlmRole::User,
         content: LlmContent::Text(initial_user.to_string()),
@@ -187,6 +304,19 @@ pub async fn run_agentic_loop(
         out.cache_creation_tokens += resp.cache_creation_tokens;
         // Pace the next call if this response says the window is nearly spent.
         pending_throttle = compute_throttle(&resp);
+
+        // Escape valve: if the model called `ask_director`, asking supersedes
+        // acting. Stop the loop immediately — do NOT execute this turn's tools
+        // (including any other tool_uses, which are discarded), do NOT push more
+        // messages, and do NOT continue. The result is unfinished (it's a block,
+        // not a completed answer); the caller parks the stage and re-runs it
+        // once the director answers.
+        if let Some(u) = resp.tool_uses.iter().find(|u| u.name == ASK_DIRECTOR_TOOL) {
+            let ask = parse_ask_director(u);
+            emitter.notice(&format!("paused to ask the director: {}", ask.summary));
+            out.blocked = Some(ask);
+            return Ok(out);
+        }
 
         let is_final =
             resp.stop_reason != LlmStopReason::ToolUse || resp.tool_uses.is_empty();

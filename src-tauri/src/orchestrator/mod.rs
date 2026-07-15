@@ -93,6 +93,43 @@ pub(crate) fn downstream_of(
         .collect()
 }
 
+/// Format the director's answers to a blocked stage's `ask_director` questions
+/// into the feedback block that `user_input_for` injects on the re-run. Answers
+/// are positional; a missing or empty answer falls back to that question's
+/// recommended default (the per-item "accept default" outcome), and any extra
+/// answers are ignored. `ask` is `None` only for a corrupt/absent block, in
+/// which case the raw answers are still surfaced so the re-run isn't blind.
+pub(crate) fn format_blocker_feedback(
+    ask: Option<&crate::orchestrator::types::BlockedAsk>,
+    answers: &[String],
+) -> String {
+    let mut s = String::from(
+        "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n",
+    );
+    let questions = ask.map(|a| a.questions.as_slice()).unwrap_or(&[]);
+    if questions.is_empty() {
+        for (i, a) in answers.iter().enumerate() {
+            s.push_str(&format!("{}. Director: {}\n", i + 1, a.trim()));
+        }
+        return s;
+    }
+    for (i, q) in questions.iter().enumerate() {
+        let answer = answers
+            .get(i)
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| q.recommended_default.trim());
+        s.push_str(&format!(
+            "{}. {}  (you recommended: {})\n   Director: {}\n",
+            i + 1,
+            q.question.trim(),
+            q.recommended_default.trim(),
+            answer,
+        ));
+    }
+    s
+}
+
 /// RAII claim on a run's `active` slot (see [`Orchestrator::claim_active`]).
 /// Dropping releases the claim — including on an early `?` return — so a
 /// rejected guard check or a mid-work error can never leave a run stuck as
@@ -623,6 +660,28 @@ impl Orchestrator {
             }
         };
 
+        // Escape valve: the stage called `ask_director`. Persist its questions
+        // and the spend it burned asking, then park it as `awaiting_checkpoint`
+        // — the drive pauses the run and fires the SAME "decision" checkpoint a
+        // gate uses, so the crew "needs you" notification and the beacon fire
+        // for free. Handled before the Done/Failed match: a block is neither.
+        if let Some(ask) = &outcome.blocked {
+            let json = serde_json::to_string(ask)?;
+            // Preserve the asking spend on the row so the meter stays truthful;
+            // `answer_blocker` retires it before the re-run.
+            self.db.lock().complete_run_stage(
+                &stage.id,
+                "awaiting_checkpoint",
+                outcome.input_tokens as i64,
+                outcome.output_tokens as i64,
+                outcome.cost_usd,
+                None,
+            )?;
+            self.db.lock().set_run_stage_blocked(&stage.id, Some(&json))?;
+            self.recompute_run_cost(&run.id)?;
+            return Ok((StageStatus::AwaitingCheckpoint, None));
+        }
+
         match outcome.status {
             StageStatus::Done => {
                 // Always persist on Done: Some updates to the new session, None
@@ -1014,6 +1073,15 @@ impl Orchestrator {
                     self.emit_checkpoint(run_id, &stage.id, "decision");
                     return Ok(RunStatus::Paused);
                 }
+                StageStatus::AwaitingCheckpoint => {
+                    // Escape valve: the stage parked itself asking the director.
+                    // `run_stage_once` already persisted the questions + the
+                    // awaiting_checkpoint status; pause the run and fire the same
+                    // "decision" checkpoint a gate uses (needs-you + beacon).
+                    self.db.lock().set_run_status(run_id, "paused", false)?;
+                    self.emit_checkpoint(run_id, &stage.id, "decision");
+                    return Ok(RunStatus::Paused);
+                }
                 StageStatus::Done => {
                     // Auto-loop verdict decision runs BEFORE gated/checkpoint pause.
                     if Self::stage_has_auto_loop(&stage) {
@@ -1112,6 +1180,32 @@ impl Orchestrator {
             .find(|s| s.status == "awaiting_checkpoint" || s.status == "failed")
             .cloned();
 
+        // Escape-valve guard: a stage parked via `ask_director` (awaiting a
+        // checkpoint WITH questions) can ONLY be resolved by AnswerBlocker (or
+        // Abort, which tears the whole run down). A stale click or racing caller
+        // that Approves/Rejects/SendBacks a block would mark it done with an
+        // empty hand-off — refuse it with a clear message. Conversely,
+        // AnswerBlocker only makes sense on an actual block.
+        let is_answer = matches!(action, CheckpointAction::AnswerBlocker { .. });
+        let is_abort = matches!(action, CheckpointAction::Abort);
+        if let Some(s) = &blocked {
+            let is_block = s.status == "awaiting_checkpoint" && s.blocked_questions.is_some();
+            if is_block && !is_answer && !is_abort {
+                return Err(AppError::Other(
+                    "this stage is waiting for an answer to its question, not an approval — answer it (or abort) to continue".into(),
+                ));
+            }
+            if is_answer && !is_block {
+                return Err(AppError::Other(
+                    "this stage is not awaiting a director decision".into(),
+                ));
+            }
+        } else if is_answer {
+            return Err(AppError::Other(
+                "no stage is awaiting a director decision".into(),
+            ));
+        }
+
         // Approving a budget-parked stage (it never ran) is a conscious
         // override: the re-drive lets that stage start past the budget gate.
         let mut budget_override = false;
@@ -1122,6 +1216,29 @@ impl Orchestrator {
                 self.emit_run_update(run_id);
                 self.sync_run_history(run_id);
                 return Ok(None);
+            }
+            CheckpointAction::AnswerBlocker { answers } => {
+                // The director answered a stage that parked itself via
+                // `ask_director`. Only a stage actually blocked (awaiting a
+                // checkpoint WITH questions) can be answered — a normal gate is
+                // resolved by Approve/Reject/SendBack, never here. Format the
+                // decisions into re-run feedback, retire the asking spend, and
+                // reset the stage to pending; the drive re-runs it with the
+                // answers injected as feedback (`user_input_for`). `reset_run_stage`
+                // clears `blocked_questions`, so the re-run never re-blocks stale.
+                if let Some(s) = &blocked {
+                    if s.status == "awaiting_checkpoint" {
+                        if let Some(json) = s.blocked_questions.as_deref() {
+                            let ask = serde_json::from_str::<
+                                crate::orchestrator::types::BlockedAsk,
+                            >(json)
+                            .ok();
+                            let feedback = format_blocker_feedback(ask.as_ref(), &answers);
+                            self.archive_and_reset_stage(run_id, s, None, Some(&feedback))?;
+                            self.recompute_run_cost(run_id)?;
+                        }
+                    }
+                }
             }
             CheckpointAction::Approve | CheckpointAction::Edit => {
                 if let Some(s) = &blocked {

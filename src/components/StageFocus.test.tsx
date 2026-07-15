@@ -537,6 +537,17 @@ describe("StageFocus director controls", () => {
     expect(screen.queryByRole("button", { name: /Edit/ })).not.toBeInTheDocument();
   });
 
+  it("a stage parked on an ask_director BLOCK (ran, artifact null) is not field-editable", () => {
+    // A block has a null artifact but DID run (startedAt stamped) — the null
+    // artifact must NOT make it read as an editable un-begun park.
+    const blocked = {
+      ...baseStage, status: "awaiting_checkpoint", startedAt: "t", artifact: null,
+      blockedQuestions: { summary: "which db?", questions: [{ question: "PG?", whyBlocked: "", recommendedDefault: "PG" }] },
+    };
+    render(<StageFocus stage={blocked} workspacePath="/tmp" run={runningRun} onUpdateStage={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Edit/ })).not.toBeInTheDocument();
+  });
+
   it("edit on a finished stage becomes Edit & re-run: saving routes the patch through onRerunFromStage", async () => {
     const onRerunFromStage = vi.fn().mockResolvedValue(undefined);
     const onUpdateStage = vi.fn();

@@ -433,7 +433,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None,
         };
         let huge = format!(
             r#"{{"kind":"text","text":"HEAD{}TAIL"}}"#,
@@ -463,7 +463,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
         let stages: Vec<_> = (0..16).map(|p| crate::sync::build_stage_detail(&mk(p), vec![])).collect();
@@ -2623,7 +2623,7 @@ mod runner_helpers_tests {
         let roles = builtin_roles();
         let prompt_for = |key: &str| {
             let r = roles.iter().find(|r| r.key == key).unwrap();
-            compose_system_prompt(&r.prompt_body, r.environment, None, None)
+            compose_system_prompt(&r.prompt_body, r.environment, None, None, true)
         };
         assert!(prompt_for("plan").to_lowercase().contains("plan"));
         assert!(prompt_for("implement").to_lowercase().contains("implement"));
@@ -2634,13 +2634,20 @@ mod runner_helpers_tests {
         use crate::orchestrator::roles::{builtin_roles, compose_system_prompt};
         use crate::orchestrator::types::RoleEnvironment;
         let roles = builtin_roles();
-        // Every stage, regardless of role, gets the autonomous/no-questions framing.
+        // Every stage keeps the strict autonomous framing. The `ask_director`
+        // carve-out is API-ONLY: an API stage has the tool and is told about it;
+        // a CLI stage has no such tool and must keep the pure never-ask guard.
         for key in ["plan", "implement", "code_review", "test"] {
             let r = roles.iter().find(|r| r.key == key).unwrap();
-            let p = compose_system_prompt(&r.prompt_body, r.environment, None, None).to_lowercase();
-            assert!(p.contains("never ask"), "role {key} missing no-questions directive");
-            assert!(p.contains("pipeline"), "role {key} missing pipeline framing");
-            assert!(p.contains("git"), "role {key} missing git-ownership note");
+            let api = compose_system_prompt(&r.prompt_body, r.environment, None, None, true).to_lowercase();
+            assert!(api.contains("never ask"), "role {key} missing no-questions directive");
+            assert!(api.contains("ask_director"), "role {key} missing the API escape-valve carve-out");
+            assert!(api.contains("pipeline"), "role {key} missing pipeline framing");
+            assert!(api.contains("git"), "role {key} missing git-ownership note");
+
+            let cli = compose_system_prompt(&r.prompt_body, r.environment, None, None, false).to_lowercase();
+            assert!(cli.contains("never ask"), "CLI role {key} must keep the strict never-ask guard");
+            assert!(!cli.contains("ask_director"), "CLI role {key} must NOT mention ask_director (no such tool)");
         }
     }
 
@@ -2663,12 +2670,12 @@ mod runner_helpers_tests {
         use crate::orchestrator::types::LoopMode;
         let roles = builtin_roles();
         let cr = roles.iter().find(|r| r.key == "code_review").unwrap();
-        let auto = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None);
+        let auto = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None, true);
         assert!(auto.contains("VERDICT:"));
-        let gated = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Gated), None);
+        let gated = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Gated), None, true);
         assert!(!gated.contains("VERDICT:"));
         let impl_r = roles.iter().find(|r| r.key == "implement").unwrap();
-        let plain = compose_system_prompt(&impl_r.prompt_body, impl_r.environment, None, None);
+        let plain = compose_system_prompt(&impl_r.prompt_body, impl_r.environment, None, None, true);
         assert!(!plain.contains("VERDICT:"));
     }
 
@@ -3527,6 +3534,50 @@ mod orchestrator_tests {
         }
     }
 
+    /// Escape-valve runner: blocks via `ask_director` on the FIRST attempt,
+    /// then on the re-run succeeds with an artifact echoing the feedback it
+    /// received — so a test can prove the director's answer reached the re-run.
+    struct BlockOnceRunner {
+        asked: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for BlockOnceRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first = !self.asked.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                return Ok(StageOutcome {
+                    artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+                    input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    status: StageStatus::AwaitingCheckpoint,
+                    tool_calls: vec![], error: None, verdict: None, session_id: None,
+                    blocked: Some(BlockedAsk {
+                        summary: "which datastore?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "Postgres or SQLite?".into(),
+                            why_blocked: "the schema differs".into(),
+                            recommended_default: "Postgres".into(),
+                        }],
+                    }),
+                });
+            }
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Plan,
+                    text: format!("resolved <<{}>>", stage.feedback.as_deref().unwrap_or("(no feedback)")),
+                    payload: None, refs_worktree: false,
+                },
+                input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                status: StageStatus::Done,
+                tool_calls: vec![], error: None, verdict: None, session_id: None, blocked: None,
+            })
+        }
+    }
+
     /// A runner that always succeeds with a canned artifact.
     struct MockRunner;
     #[async_trait::async_trait]
@@ -3552,6 +3603,7 @@ mod orchestrator_tests {
                 error: None,
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -3585,6 +3637,7 @@ mod orchestrator_tests {
                 error: if self.fail { Some("ran out of iterations".into()) } else { None },
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -3625,6 +3678,7 @@ mod orchestrator_tests {
                 error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -3829,6 +3883,204 @@ mod orchestrator_tests {
         assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "completed");
     }
 
+    #[tokio::test]
+    async fn ask_director_parks_the_stage_then_answer_reruns_with_the_decision() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(BlockOnceRunner { asked: Default::default() }),
+        );
+
+        // Drive: the stage calls ask_director → parks as awaiting_checkpoint
+        // (NOT failed) with the questions persisted, run paused.
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "awaiting_checkpoint");
+        assert!(stages[0].error.is_none(), "a block is not a failure");
+        let bq = stages[0].blocked_questions.as_deref().expect("questions persisted");
+        let ask: BlockedAsk = serde_json::from_str(bq).unwrap();
+        assert_eq!(ask.summary, "which datastore?");
+        assert_eq!(ask.questions[0].recommended_default, "Postgres");
+        // The asking spend is on the meter (truthful cost).
+        assert!((db.lock().get_run(&run_id).unwrap().unwrap().cost_usd - 0.02).abs() < 1e-6);
+        // The SAME decision checkpoint a gate uses fired (needs-you + beacon).
+        assert!(sink.events.lock().iter().any(|e| e == "run://checkpoint"));
+
+        // Answer it → the stage resets to pending with the decision as feedback,
+        // re-runs, and the run completes. blocked_questions is cleared.
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["Use SQLite".into()] })
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done");
+        assert!(stages[0].blocked_questions.is_none(), "cleared after answering");
+        let artifact = stages[0].artifact.as_deref().unwrap();
+        assert!(artifact.contains("Use SQLite"), "the director's answer reached the re-run: {artifact}");
+        assert!(artifact.contains("you recommended: Postgres"), "the default is shown for context: {artifact}");
+        // Spend is retained across the re-run (0.02 asking retired + 0.02 re-run).
+        assert!((db.lock().get_run(&run_id).unwrap().unwrap().cost_usd - 0.04).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn answer_blocker_accept_defaults_uses_recommended_defaults() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(BlockOnceRunner { asked: Default::default() }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+        // "Accept all defaults" sends each recommended_default verbatim.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["Postgres".into()] })
+            .await
+            .unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        let artifact = stages[0].artifact.as_deref().unwrap();
+        assert!(artifact.contains("Director: Postgres"), "the default became the decision: {artifact}");
+    }
+
+    #[test]
+    fn blocked_ask_serde_round_trips_camel_case() {
+        let ask = BlockedAsk {
+            summary: "s".into(),
+            questions: vec![BlockedQuestion {
+                question: "q?".into(),
+                why_blocked: "because".into(),
+                recommended_default: "d".into(),
+            }],
+        };
+        let json = serde_json::to_string(&ask).unwrap();
+        // camelCase on the wire — matches the frontend BlockedAsk type.
+        assert!(json.contains("\"whyBlocked\""), "camelCase: {json}");
+        assert!(json.contains("\"recommendedDefault\""), "camelCase: {json}");
+        let back: BlockedAsk = serde_json::from_str(&json).unwrap();
+        assert_eq!(ask, back);
+    }
+
+    #[test]
+    fn format_blocker_feedback_pairs_answers_and_falls_back_to_defaults() {
+        let ask = BlockedAsk {
+            summary: "s".into(),
+            questions: vec![
+                BlockedQuestion { question: "DB?".into(), why_blocked: String::new(), recommended_default: "Postgres".into() },
+                BlockedQuestion { question: "Auth?".into(), why_blocked: String::new(), recommended_default: "OAuth".into() },
+            ],
+        };
+        // First answered explicitly; second is empty → uses the recommended default.
+        let fb = crate::orchestrator::format_blocker_feedback(Some(&ask), &["SQLite".into(), "   ".into()]);
+        assert!(fb.contains("1. DB?  (you recommended: Postgres)"), "{fb}");
+        assert!(fb.contains("Director: SQLite"), "{fb}");
+        assert!(fb.contains("2. Auth?  (you recommended: OAuth)"), "{fb}");
+        assert!(fb.contains("Director: OAuth"), "empty answer falls back to the default: {fb}");
+        assert!(fb.contains("do not ask again unless a NEW blocking ambiguity"), "{fb}");
+    }
+
+    #[test]
+    fn blocked_questions_column_write_read_and_clear() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sid = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+
+        // Absent by default.
+        assert!(db.lock().list_run_stages(&run_id).unwrap()[0].blocked_questions.is_none());
+        // Write + read back verbatim.
+        let json = r#"{"summary":"q","questions":[]}"#;
+        db.lock().set_run_stage_blocked(&sid, Some(json)).unwrap();
+        assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[0].blocked_questions.as_deref(), Some(json));
+        // reset_run_stage clears it (no re-run carries a stale block).
+        db.lock().reset_run_stage(&sid, None, None).unwrap();
+        assert!(db.lock().list_run_stages(&run_id).unwrap()[0].blocked_questions.is_none());
+        // Explicit clear via None also works.
+        db.lock().set_run_stage_blocked(&sid, Some(json)).unwrap();
+        db.lock().set_run_stage_blocked(&sid, None).unwrap();
+        assert!(db.lock().list_run_stages(&run_id).unwrap()[0].blocked_questions.is_none());
+    }
+
+    #[test]
+    fn update_run_stage_refuses_a_blocked_stage() {
+        // A block RAN (started_at stamped) — it is NOT an editable un-begun park
+        // (budget/director-pause). Editing model/instructions must be refused, or
+        // an already-executed stage would silently take field edits.
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sid = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+
+        // Simulate "ran, then blocked": running stamps started_at, then it parks
+        // awaiting_checkpoint (artifact still null) with its questions.
+        db.lock().set_run_stage_status(&sid, "running").unwrap();
+        db.lock().set_run_stage_status(&sid, "awaiting_checkpoint").unwrap();
+        db.lock().set_run_stage_blocked(&sid, Some(r#"{"summary":"q","questions":[]}"#)).unwrap();
+        assert!(db.lock().list_run_stages(&run_id).unwrap()[0].started_at.is_some());
+
+        let err = db
+            .lock()
+            .update_run_stage(&run_id, &sid, None, Some("new instructions"), None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("already started"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn approving_a_block_is_refused_answer_it_instead() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(BlockOnceRunner { asked: Default::default() }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+        // A stale Approve on a block would mark it done with an empty hand-off — refuse it.
+        let err = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap_err();
+        assert!(err.to_string().contains("waiting for an answer"), "{err}");
+        // The block is untouched — still parked with its questions.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "awaiting_checkpoint");
+        assert!(stages[0].blocked_questions.is_some());
+        // Abort, by contrast, IS allowed on a block (tear the whole run down).
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Abort).await.unwrap();
+        assert_eq!(status, RunStatus::Aborted);
+    }
+
+    #[tokio::test]
+    async fn answer_blocker_on_a_normal_gate_is_refused() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        // checkpoint=true → a normal approval GATE (no questions).
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", true, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        orch.run_to_pause(&run_id).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "awaiting_checkpoint");
+        assert!(stages[0].blocked_questions.is_none(), "a normal gate has no questions");
+        // Answering a stage that never asked is nonsense — refuse it.
+        let err = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec![] })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not awaiting a director decision"), "{err}");
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";
@@ -3963,6 +4215,7 @@ mod orchestrator_tests {
                 error: None,
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -4905,6 +5158,7 @@ mod orchestrator_tests {
                 error: None,
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -5012,6 +5266,7 @@ mod orchestrator_tests {
                 error: None,
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -5158,6 +5413,7 @@ mod orchestrator_tests {
                 error: None,
                 verdict: None,
                 session_id: None,
+                blocked: None,
             })
         }
     }
@@ -6093,6 +6349,106 @@ mod live_tests {
         let last = &events.last().expect("cancel must close the journal").1["entry"];
         assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
         assert_eq!(last["text"], "stopped by the director");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_ask_director_blocks_and_supersedes_acting() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        // One turn requests ask_director AND a normal read_file. Asking
+        // supersedes acting: the read must NOT run, and the loop must STOP —
+        // a second turn would panic (empty queue), proving it stopped.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("I cannot proceed",
+                 vec![
+                    LlmToolUse { id: "ask".into(), name: "ask_director".into(),
+                        input: json!({"summary":"which datastore?","questions":[
+                            {"question":"Postgres or SQLite?","whyBlocked":"schema differs","recommendedDefault":"Postgres"},
+                            {"question":"Which auth?","whyBlocked":"affects the schema","recommendedDefault":"OAuth"}
+                        ]}) },
+                    LlmToolUse { id: "r".into(), name: "read_file".into(),
+                        input: json!({"path":"a.rs"}) },
+                 ],
+                 LlmStopReason::ToolUse),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 10,
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+
+        assert!(!out.finished, "a block is not a finished answer");
+        let ask = out.blocked.expect("ask_director must populate blocked");
+        assert_eq!(ask.summary, "which datastore?");
+        // Strict parse (not the degraded fallback) preserves BOTH questions and
+        // their camelCase fields — a collapse to one would mean the parse failed.
+        assert_eq!(ask.questions.len(), 2);
+        assert_eq!(ask.questions[0].recommended_default, "Postgres");
+        assert_eq!(ask.questions[0].why_blocked, "schema differs");
+        assert_eq!(ask.questions[1].recommended_default, "OAuth");
+        assert!(out.tool_calls.is_empty(), "no tool runs on a blocking turn");
+        // The journal ends with the pause notice.
+        let events = rec.events.lock();
+        let last = &events.last().unwrap().1["entry"];
+        assert_eq!(last["kind"], "notice");
+        assert!(last["text"].as_str().unwrap().contains("paused to ask the director"));
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_malformed_ask_director_degrades_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        // 'questions' missing entirely → strict parse fails; we must still yield
+        // a block (a single synthesized question) rather than crash the stage.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("blocked",
+                 vec![LlmToolUse { id: "ask".into(), name: "ask_director".into(),
+                       input: json!({"summary":"need a decision"}) }],
+                 LlmStopReason::ToolUse),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 10,
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+
+        let ask = out.blocked.expect("malformed input still yields a block");
+        assert_eq!(ask.summary, "need a decision");
+        assert_eq!(ask.questions.len(), 1, "degrades to a single synthesized question");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_multi_question_snake_case_keeps_every_question() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three questions, snake_case `recommended_default`/`why_blocked` (model
+        // drift from the camelCase schema), and the THIRD omits its default
+        // entirely. The tolerant struct must parse all three — a collapse to one
+        // (the old strict-then-salvage-first bug) would silently lose questions.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("blocked on three things",
+                 vec![LlmToolUse { id: "ask".into(), name: "ask_director".into(),
+                       input: json!({"summary":"three decisions","questions":[
+                           {"question":"DB?","why_blocked":"schema differs","recommended_default":"Postgres"},
+                           {"question":"Auth?","why_blocked":"affects schema","recommended_default":"OAuth"},
+                           {"question":"Region?"}
+                       ]}) }],
+                 LlmStopReason::ToolUse),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 10,
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+
+        let ask = out.blocked.expect("block");
+        assert_eq!(ask.questions.len(), 3, "all three questions must survive, none lost");
+        assert_eq!(ask.questions[0].recommended_default, "Postgres");
+        assert_eq!(ask.questions[0].why_blocked, "schema differs");
+        assert_eq!(ask.questions[1].recommended_default, "OAuth");
+        assert_eq!(ask.questions[2].question, "Region?");
+        assert_eq!(ask.questions[2].recommended_default, "", "an omitted default parses to empty, not a failure");
     }
 
     struct Recorder { events: Mutex<Vec<(String, Value)>> }
@@ -7098,6 +7454,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
+            blocked_questions: None,
         }
     }
 
@@ -7415,7 +7772,7 @@ mod roles_tests {
         let by = |k: &str| builtin_roles().into_iter().find(|r| r.key == k).unwrap();
         // plan body, worktree preamble, no instructions, no verdict
         let plan = by("plan");
-        let got = compose_system_prompt(&plan.prompt_body, plan.environment, None, None);
+        let got = compose_system_prompt(&plan.prompt_body, plan.environment, None, None, true);
         assert!(got.contains("You are one stage in an automated, headless build pipeline."));
         assert!(got.contains("Do not commit, push, or otherwise manage git"));
         assert!(got.contains("produce a concrete implementation plan"));
@@ -7428,7 +7785,7 @@ mod roles_tests {
         // an action role uses the action preamble
         let rel = by("release");
         assert_eq!(rel.environment, RoleEnvironment::Action);
-        let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None);
+        let rp = compose_system_prompt(&rel.prompt_body, rel.environment, None, None, true);
         assert!(rp.contains("may commit, push"));
         assert!(!rp.contains("Do not commit, push"));
     }
@@ -7493,7 +7850,7 @@ mod roles_tests {
         // compose still works for an arbitrary body+env (no role lookup needed here)
         use crate::orchestrator::roles::compose_system_prompt;
         use crate::orchestrator::types::RoleEnvironment;
-        let s = compose_system_prompt("Body.", RoleEnvironment::Worktree, None, None);
+        let s = compose_system_prompt("Body.", RoleEnvironment::Worktree, None, None, false);
         assert!(s.ends_with("Body."));
     }
 

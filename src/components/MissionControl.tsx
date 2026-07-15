@@ -223,6 +223,10 @@ function CrewCard({
 
   // What the paused run is actually waiting on — enriches glyph/word/ticker.
   const gateStage = stages.find((s) => s.status === "awaiting_checkpoint");
+  // A stage parked via `ask_director` is a QUESTION-block, not an approval gate:
+  // an answer form is waiting, not an approve/reject. Distinguish it so the
+  // director can tell the two apart at a glance on the fleet board.
+  const askedStage = gateStage?.blockedQuestions ? gateStage : undefined;
   const failedStage = stages.find((s) => s.status === "failed");
   const stalled = !!failedStage && isTransientHalt(failedStage.error);
   const runningStage = stages.find((s) => s.status === "running");
@@ -232,9 +236,11 @@ function CrewCard({
       ? { label: "⟳", cls: "text-octo-warning", word: "stalled" }
       : band === "needs-you" && failedStage
         ? { label: "✕", cls: "text-octo-rouge", word: "halted" }
-        : band === "needs-you" && gateStage
-          ? { label: "⟜", cls: "text-octo-brass", word: "at the gate" }
-          : { label: meta.glyph, cls: meta.className, word: meta.word };
+        : band === "needs-you" && askedStage
+          ? { label: "?", cls: "text-octo-brass", word: "asked you" }
+          : band === "needs-you" && gateStage
+            ? { label: "⟜", cls: "text-octo-brass", word: "at the gate" }
+            : { label: meta.glyph, cls: meta.className, word: meta.word };
 
   // Needs-you cards carry the brass border; everything else stays hairline
   // (position in the band is the salience). Law 2 fleet scope: exactly one
@@ -377,6 +383,10 @@ function LiveSlot({
     } else if (failed) {
       text = failed.error?.split("\n")[0] ?? "stage halted";
       cls = "text-octo-rouge";
+    } else if (gate && gate.blockedQuestions) {
+      // The escape valve: an answer form is waiting, not an approval.
+      text = `${stageTitle(gate)} asked you · waiting on your answer`;
+      cls = "text-octo-brass";
     } else if (gate) {
       const loop = gate.loopTargetPosition !== null ? ` · loop ${gate.loopIterations}/${gate.loopMaxIterations}` : "";
       text = `${stageTitle(gate)} holds the gate${loop}`;
