@@ -57,6 +57,11 @@ SQLite store the desktop app uses.
 | `create_run` | author | Stage a run in `draft` from a pipeline + task (does **not** start it). |
 | `list_runs` | read | Runs of a workspace, newest first. |
 | `get_run` | read | One run + per-stage detail (status, tokens, cost, artifacts). |
+| `list_routines` | read | Every routine (scheduled crew): schedule, workspace mode, enabled, next due, last outcome. |
+| `create_routine` | author | Create a routine (a pipeline that fires on a schedule). Created **disabled** unless `enabled:true`. Validates project/pipeline/workspace exist. |
+| `update_routine` | author | Update a routine's fields by id + recompute next due (leaves `enabled` untouched). |
+| `delete_routine` | author | Delete a routine by id (ungated). |
+| `set_routine_enabled` | author | Enable (starts firing on schedule) or disable a routine. |
 
 ### Pipeline authoring contract
 
@@ -122,6 +127,33 @@ are required; every other field defaults (see `describe_pipeline_schema` →
 - **Library sync caveat:** like `delete_pipeline`, a role authored/deleted over
   MCP is **not** pushed to the Pro cloud library from the MCP process — edit it
   once in-app to sync it across machines.
+
+### Routine authoring contract
+
+A **routine** is a pipeline that fires on a schedule in a workspace (a Pro
+feature; `create_routine`/`update_routine` share one validated payload). It stays
+**author-only** and **safe by default**:
+
+- **Created DISABLED unless `enabled:true`.** Authoring never silently schedules
+  token spend — the agent stages the routine; you enable it in Settings →
+  Routines or via `set_routine_enabled`. An enabled routine fires **only while the
+  Octopush app runs** and **your plan includes routines** (re-checked at fire
+  time). There is deliberately **no `run_routine_now`** over MCP — firing a crew
+  *now* is execution, which stays in the app.
+- **Required:** `name`, `projectId`, `pipelineId`, `scheduleKind`,
+  `scheduleSpec`. All ids are **validated to exist** (a dangling routine would
+  fail silently at fire time).
+- **Schedule:** `scheduleKind` `interval` (`scheduleSpec` = whole **seconds** as a
+  string, ≥ 60 — `"3600"` = hourly) or `daily` (`scheduleSpec` = `"HH:MM"` 24h).
+- **Workspace mode:** `fixed` (default — needs `fixedWorkspaceId`, which must
+  exist and belong to `projectId`; a fire is skipped while that workspace has a
+  live run) or `fresh` (a new worktree per fire — **requires `daily`**; takes
+  `baseBranch`/`branchPrefix`).
+- **Optional:** `task`, `referenceModel`, `budgetUsd`, `stageModelOverrides`
+  (`[position, model]` pairs, like `create_run`), and `fireCondition` — a pre-fire
+  shell command run in the workspace; the routine fires only if it **exits 0**
+  (non-zero ⇒ skip with zero tokens, no run). `update_routine` leaves `enabled`
+  unchanged.
 
 ## Build
 

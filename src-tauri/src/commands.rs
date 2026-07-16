@@ -1349,7 +1349,9 @@ pub async fn create_routine(
     require_feature_gate(crate::entitlement::feature::ROUTINES_SCHEDULED)?;
     let next_due = validate_routine_input(&input)?;
     let id = uuid::Uuid::new_v4().to_string();
-    state.db.lock().insert_routine(&id, &input, next_due.as_deref())?;
+    // The app creates routines ENABLED (the command is Pro-gated above); the
+    // enabled flag is written in the same insert so there's no toggle window.
+    state.db.lock().insert_routine(&id, &input, next_due.as_deref(), true)?;
     Ok(id)
 }
 

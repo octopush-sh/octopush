@@ -3271,21 +3271,25 @@ impl Db {
         id: &str,
         input: &RoutineInput,
         next_due_at: Option<&str>,
+        enabled: bool,
     ) -> AppResult<()> {
         // Trim the optional fire condition, empty → NULL (always fire).
         let fire_condition = normalize_optional(input.fire_condition.as_deref());
+        // `enabled` is written in the SAME insert (not a create-then-toggle) so a
+        // caller wanting a DISABLED routine can never be left with an enabled one
+        // by a failed second statement (e.g. SQLITE_BUSY on the shared WAL).
         self.conn.execute(
             "INSERT INTO routines
                 (id, name, project_id, pipeline_id, task, reference_model, stage_overrides,
                  budget_usd, schedule_kind, schedule_spec, workspace_mode, fixed_workspace_id,
                  base_branch, branch_prefix, fire_condition, enabled, next_due_at, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,1,?16,?17)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 id, input.name, input.project_id, input.pipeline_id, input.task,
                 input.reference_model, input.stage_overrides, input.budget_usd,
                 input.schedule_kind, input.schedule_spec, input.workspace_mode,
                 input.fixed_workspace_id, input.base_branch, input.branch_prefix,
-                fire_condition, next_due_at, Utc::now().to_rfc3339(),
+                fire_condition, enabled as i64, next_due_at, Utc::now().to_rfc3339(),
             ],
         )?;
         Ok(())
