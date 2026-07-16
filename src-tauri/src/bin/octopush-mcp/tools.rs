@@ -118,7 +118,7 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "label": { "type": "string", "description": "Display name, e.g. \"Security Auditor\"." },
                     "promptBody": { "type": "string", "description": "The role's system-prompt body — the instructions that define what this agent does. Composed with the environment preamble at run time. Required, non-empty." },
-                    "key": { "type": ["string", "null"], "description": "Optional stable id a pipeline stage references (role: \"<key>\"). Omit to derive it from the label (lowercased, each run of non-alphanumerics → '_', trimmed). An existing CUSTOM key updates that role in place; a built-in key is rejected." },
+                    "key": { "type": ["string", "null"], "description": "Optional stable id a pipeline stage references (role: \"<key>\"). Omit (or pass blank/whitespace) to derive it from the label (lowercased, each run of non-alphanumerics → '_', trimmed). An existing CUSTOM key updates that role in place; a built-in key is rejected." },
                     "description": { "type": ["string", "null"], "description": "Short human description. Default empty." },
                     "artifactKind": { "type": ["string", "null"], "enum": ["plan", "review", "tests", "diff", "note", null], "description": "What this role produces. Default 'note'." },
                     "environment": { "type": ["string", "null"], "enum": ["worktree", "action", null], "description": "'worktree' (default) never touches git and leaves changes uncommitted for the next stage; 'action' may commit/push/PR/merge/release (its job IS a side effect)." },
@@ -457,11 +457,14 @@ fn list_roles(db: &Db) -> Result<Value, String> {
     Ok(json!({ "roles": roles }))
 }
 
-/// Derive a stable role key from a display name — byte-for-byte the app's
-/// `deriveRoleKey` (RoleEditor.tsx): lowercase, every run of non-alphanumerics
-/// collapses to a single '_', then trim leading/trailing '_'. Non-ASCII chars
-/// are non-alphanumeric here (matching the JS `[^a-z0-9]` after `toLowerCase`),
-/// so they too become '_'.
+/// Derive a stable role key from a display name — mirrors the app's
+/// `deriveRoleKey` (RoleEditor.tsx): lowercase, every run of non-`[a-z0-9]`
+/// collapses to a single '_', then trim leading/trailing '_'. Matches the JS
+/// for ASCII and the common non-ASCII case (accented Latin, Greek, CJK all fold
+/// to '_' in both). A rare class of codepoints whose Unicode lowercase folds
+/// INTO ASCII (e.g. U+212A KELVIN SIGN → 'k') would survive in the JS but become
+/// '_' here; no realistic role label hits this, and the derived key is returned
+/// to the caller so it stays internally consistent regardless.
 fn derive_role_key(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut prev_underscore = false;
@@ -505,7 +508,9 @@ fn save_role(db: &Db, args: &Value) -> Result<Value, String> {
 
     // Build a RoleDef JSON with the app's defaults for omitted fields, then
     // deserialize through the typed struct so an out-of-enum artifactKind /
-    // environment / substrate surfaces as a clean tool error, never a panic.
+    // environment surfaces as a clean tool error, never a panic. (defaultTools
+    // and defaultSubstrate are plain fields on RoleDef, not enums, so they are
+    // validated explicitly below.)
     let obj = args.as_object().cloned().unwrap_or_default();
     let field = |k: &str| obj.get(k).filter(|v| !v.is_null()).cloned();
     let role_json = json!({
@@ -527,8 +532,11 @@ fn save_role(db: &Db, args: &Value) -> Result<Value, String> {
         serde_json::from_value(role_json).map_err(|e| format!("role is malformed: {e}"))?;
     role.is_builtin = false; // user-saved roles are never built-in (matches save_role)
 
-    // Validate the tool allowlist here (RoleDef itself doesn't) so an unknown
-    // tool is a clear authoring error, not a stage failure later.
+    // Validate the plain-String fields RoleDef doesn't type-check (default_tools
+    // and default_substrate are `Vec<String>`/`String`, not enums) so an unknown
+    // value is a clear authoring error here, not a stage failure later or a
+    // nonsense value echoed back by list_roles. Matches the tool/substrate enums
+    // the inputSchema advertises.
     for t in &role.default_tools {
         if !ROLE_TOOLS.contains(&t.as_str()) {
             return Err(format!(
@@ -536,6 +544,12 @@ fn save_role(db: &Db, args: &Value) -> Result<Value, String> {
                 ROLE_TOOLS.join(", ")
             ));
         }
+    }
+    if role.default_substrate != "api" && role.default_substrate != "cli" {
+        return Err(format!(
+            "unknown defaultSubstrate '{}'; must be 'api' or 'cli'",
+            role.default_substrate
+        ));
     }
 
     // Never overwrite a built-in role key — mirror the command guard so the MCP
@@ -1055,11 +1069,103 @@ mod tests {
         assert!(err.contains("deploy_prod"), "error should name the bad tool: {err}");
     }
 
-    /// An empty/whitespace promptBody is rejected.
+    /// Every explicitly-supplied optional field is persisted and returned — a
+    /// guard against a mis-keyed `field("...")` lookup silently dropping an
+    /// override (which would otherwise pass every default-only test). Covers the
+    /// behavior-carrying fields especially (`environment:"action"`, tools).
+    #[test]
+    fn save_role_round_trips_all_overrides() {
+        let db = test_db();
+        let payload = save_role(
+            &db,
+            &json!({
+                "key": "deployer",
+                "label": "Deployer",
+                "promptBody": "ship it",
+                "description": "an action role",
+                "artifactKind": "diff",
+                "environment": "action",
+                "canLoop": true,
+                "defaultTools": ["read_file", "write_file", "run_command"],
+                "defaultSubstrate": "cli",
+                "defaultCheckpoint": true,
+                "tokenEstIn": 12345,
+                "tokenEstOut": 678
+            }),
+        )
+        .expect("a fully-specified role should save");
+        let role = &payload["role"];
+        assert_eq!(role["description"], "an action role");
+        assert_eq!(role["artifactKind"], "diff");
+        assert_eq!(role["environment"], "action");
+        assert_eq!(role["canLoop"], true);
+        assert_eq!(role["defaultTools"], json!(["read_file", "write_file", "run_command"]));
+        assert_eq!(role["defaultSubstrate"], "cli");
+        assert_eq!(role["defaultCheckpoint"], true);
+        assert_eq!(role["tokenEstIn"], 12345);
+        assert_eq!(role["tokenEstOut"], 678);
+        // And it truly persisted (not just an echo of the input).
+        let stored = db.get_role("deployer").unwrap().unwrap();
+        assert_eq!(stored.environment, octopush_lib::orchestrator::types::RoleEnvironment::Action);
+        assert!(stored.default_checkpoint);
+        assert_eq!(stored.default_substrate, "cli");
+    }
+
+    /// An out-of-enum defaultSubstrate is rejected (RoleDef stores it as a plain
+    /// String, so the handler must validate it to honor the advertised enum).
+    #[test]
+    fn save_role_rejects_invalid_substrate() {
+        let db = test_db();
+        let err = save_role(
+            &db,
+            &json!({ "label": "Bad Sub", "promptBody": "x", "defaultSubstrate": "openai" }),
+        )
+        .expect_err("an unknown defaultSubstrate must be rejected");
+        assert!(err.contains("defaultSubstrate"), "error should name the field: {err}");
+    }
+
+    /// A blank/whitespace explicit key falls back to deriving from the label.
+    #[test]
+    fn save_role_blank_key_falls_back_to_derived() {
+        let db = test_db();
+        let payload = save_role(
+            &db,
+            &json!({ "key": "   ", "label": "Fallback Role", "promptBody": "x" }),
+        )
+        .expect("a blank key derives from the label");
+        assert_eq!(payload["key"], "fallback_role");
+    }
+
+    /// A derived key that collides with a built-in is rejected (not only the
+    /// explicit-key collision path).
+    #[test]
+    fn save_role_derived_key_colliding_with_builtin_is_rejected() {
+        let db = test_db();
+        // No key → derives "code_review", which is a built-in.
+        let err = save_role(
+            &db,
+            &json!({ "label": "Code Review", "promptBody": "nope" }),
+        )
+        .expect_err("a derived built-in key must be rejected");
+        assert!(err.contains("built-in"), "error should mention built-in: {err}");
+    }
+
+    /// An empty/whitespace promptBody is rejected with a promptBody-specific error.
     #[test]
     fn save_role_rejects_empty_prompt() {
         let db = test_db();
-        assert!(save_role(&db, &json!({ "label": "L", "promptBody": "   " })).is_err());
+        let err = save_role(&db, &json!({ "label": "L", "promptBody": "   " }))
+            .expect_err("a blank promptBody must be rejected");
+        assert!(err.contains("promptBody"), "error should name promptBody: {err}");
+    }
+
+    /// Deleting a key that doesn't exist is a clean error, not a false success.
+    #[test]
+    fn delete_role_rejects_unknown_key() {
+        let db = test_db();
+        let err = delete_role(&db, &json!({ "key": "no_such_role" }))
+            .expect_err("deleting an unknown role must error");
+        assert!(err.contains("no role"), "error should say no such role: {err}");
     }
 
     /// delete_role refuses a built-in role.
