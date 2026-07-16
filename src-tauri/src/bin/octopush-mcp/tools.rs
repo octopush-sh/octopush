@@ -331,10 +331,10 @@ fn ROUTINE_INPUT_SCHEMA(edit: bool) -> Value {
         "name": { "type": "string", "description": "Display name for the routine." },
         "projectId": { "type": "string", "description": "The project (git repo) to run in (see list_projects). Must exist." },
         "pipelineId": { "type": "string", "description": "The pipeline to fire (see list_pipelines). Must exist." },
-        "task": { "type": ["string", "null"], "description": "The task each fired run should accomplish. Default empty." },
+        "task": { "type": "string", "description": "The task each fired run should accomplish. Omit for empty (do not pass null)." },
         "scheduleKind": { "type": "string", "enum": ["interval", "daily"], "description": "'interval' fires every N seconds; 'daily' fires at a wall-clock time." },
         "scheduleSpec": { "type": "string", "description": "For 'interval': a whole number of SECONDS as a string, minimum 60 (e.g. \"3600\" = hourly). For 'daily': \"HH:MM\" 24-hour local time (e.g. \"09:00\")." },
-        "workspaceMode": { "type": ["string", "null"], "enum": ["fixed", "fresh", null], "description": "'fixed' (default) fires in one existing workspace (requires fixedWorkspaceId; a fire is skipped while that workspace has a live run); 'fresh' creates a NEW worktree each fire (requires scheduleKind 'daily' — a fresh worktree per run needs a daily cadence)." },
+        "workspaceMode": { "type": "string", "enum": ["fixed", "fresh"], "description": "'fixed' (default when omitted) fires in one existing workspace (requires fixedWorkspaceId; a fire is skipped while that workspace has a live run); 'fresh' creates a NEW worktree each fire (requires scheduleKind 'daily' — a fresh worktree per run needs a daily cadence). Omit for the default (do not pass null)." },
         "fixedWorkspaceId": { "type": ["string", "null"], "description": "For 'fixed' mode: the workspace to run in (see list_workspaces). Must exist and belong to projectId. Ignored for 'fresh'." },
         "baseBranch": { "type": ["string", "null"], "description": "For 'fresh' mode: base branch each new worktree branches from. Defaults to the repo default branch." },
         "branchPrefix": { "type": ["string", "null"], "description": "For 'fresh' mode: prefix for the auto-generated branch name per fire." },
@@ -885,11 +885,21 @@ fn build_routine_input(
             obj.insert("stageOverrides".to_string(), json!(encoded));
         }
     }
-    let input: octopush_lib::db::RoutineInput = serde_json::from_value(Value::Object(obj))
+    let mut input: octopush_lib::db::RoutineInput = serde_json::from_value(Value::Object(obj))
         .map_err(|e| format!("routine is malformed: {e}"))?;
 
     if input.name.trim().is_empty() {
         return Err("routine name cannot be empty".into());
+    }
+    // Null the fields the chosen mode doesn't use, mirroring the app's
+    // `draftToInput` — so a stale fixedWorkspaceId (fresh) or baseBranch/
+    // branchPrefix (fixed) can't be stored and mislead `list_routines`.
+    match input.workspace_mode.as_str() {
+        "fresh" => input.fixed_workspace_id = None,
+        _ => {
+            input.base_branch = None;
+            input.branch_prefix = None;
+        }
     }
     if db
         .get_project_by_id(&input.project_id)
@@ -945,20 +955,18 @@ fn build_routine_input(
     Ok((input, next_due))
 }
 
-/// Create a routine. Author-first: `insert_routine` creates it ENABLED, so we
-/// disable it unless `enabled:true` was explicitly requested — an enabled
-/// routine's scheduler spends tokens on schedule, so authoring it must not be a
-/// silent commitment (consistent with `create_run` staging a draft).
+/// Create a routine. Author-first: created DISABLED unless `enabled:true` was
+/// explicitly requested — an enabled routine's scheduler spends tokens on
+/// schedule, so authoring it must not be a silent commitment (consistent with
+/// `create_run` staging a draft). The enabled flag is written in the SAME insert
+/// (atomic) so a failure can never strand an enabled routine the caller wanted
+/// disabled.
 fn create_routine(db: &Db, args: &Value) -> Result<Value, String> {
     let (input, next_due) = build_routine_input(db, args)?;
     let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(false);
     let id = uuid::Uuid::new_v4().to_string();
-    db.insert_routine(&id, &input, next_due.as_deref())
+    db.insert_routine(&id, &input, next_due.as_deref(), enabled)
         .map_err(|e| e.to_string())?;
-    if !enabled {
-        db.set_routine_enabled(&id, false, next_due.as_deref())
-            .map_err(|e| e.to_string())?;
-    }
     let routine = db
         .get_routine(&id)
         .map_err(|e| e.to_string())?
@@ -1014,6 +1022,10 @@ fn set_routine_enabled(db: &Db, args: &Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no routine with id '{id}'"))?;
     let next_due = if enabled {
+        // Validate the stored schedule before re-seating (exact parity with the
+        // app's routine_next_due) — a corrupt spec is refused, not enabled with a
+        // NULL next_due that would never fire.
+        octopush_lib::routines::validate_schedule(&routine.schedule_kind, &routine.schedule_spec)?;
         octopush_lib::routines::next_due(
             &routine.schedule_kind,
             &routine.schedule_spec,
@@ -1538,8 +1550,11 @@ mod tests {
         args["enabled"] = json!(true);
         let payload = create_routine(&db, &args).expect("valid enabled routine");
         assert_eq!(payload["enabled"], true);
+        assert!(payload["routine"]["nextDueAt"].is_string(), "enabled create seeds next_due");
         let id = payload["routineId"].as_str().unwrap();
-        assert!(db.get_routine(id).unwrap().unwrap().enabled);
+        let stored = db.get_routine(id).unwrap().unwrap();
+        assert!(stored.enabled);
+        assert!(stored.next_due_at.is_some());
     }
 
     /// Referential integrity: unknown project / pipeline / fixed workspace, and a
@@ -1620,20 +1635,106 @@ mod tests {
         assert_eq!(parsed, vec![(0, "claude-opus-4-8".to_string())]);
     }
 
-    /// set_routine_enabled toggles; enabling re-seats next_due, disabling keeps it.
+    /// set_routine_enabled toggles; enabling re-seats next_due (from now, into the
+    /// future), disabling PRESERVES the exact stored value.
     #[test]
-    fn set_routine_enabled_toggles() {
+    fn set_routine_enabled_reseats_on_enable_preserves_on_disable() {
         let (db, proj, pipe, ws) = seeded_routine_db();
         let id = create_routine(&db, &fixed_routine_args(&proj, &pipe, &ws)).unwrap()["routineId"]
             .as_str()
             .unwrap()
             .to_string();
+
         set_routine_enabled(&db, &json!({ "routineId": id, "enabled": true })).unwrap();
-        assert!(db.get_routine(&id).unwrap().unwrap().enabled);
+        let enabled_row = db.get_routine(&id).unwrap().unwrap();
+        assert!(enabled_row.enabled);
+        let seated = enabled_row.next_due_at.expect("enable re-seats next_due");
+        // Re-seated from now → strictly in the future (interval 3600s).
+        let due = chrono::DateTime::parse_from_rfc3339(&seated).unwrap();
+        assert!(due > chrono::Utc::now(), "re-seated next_due should be in the future");
+
         set_routine_enabled(&db, &json!({ "routineId": id, "enabled": false })).unwrap();
-        let r = db.get_routine(&id).unwrap().unwrap();
-        assert!(!r.enabled);
-        assert!(r.next_due_at.is_some(), "disable preserves next_due");
+        let disabled_row = db.get_routine(&id).unwrap().unwrap();
+        assert!(!disabled_row.enabled);
+        assert_eq!(
+            disabled_row.next_due_at.as_deref(),
+            Some(seated.as_str()),
+            "disable must preserve the exact next_due, not recompute or clear it"
+        );
+    }
+
+    /// fireCondition round-trips into the stored column, and empty normalizes to
+    /// None — the highest-stakes passthrough (a silent drop means the routine
+    /// fires unconditionally and spends tokens).
+    #[test]
+    fn create_routine_fire_condition_round_trip() {
+        let (db, proj, pipe, ws) = seeded_routine_db();
+        let mut a = fixed_routine_args(&proj, &pipe, &ws);
+        a["fireCondition"] = json!("gh pr view --json reviewThreads -q '.x' | grep -q .");
+        let id = create_routine(&db, &a).unwrap()["routineId"].as_str().unwrap().to_string();
+        let stored = db.get_routine(&id).unwrap().unwrap();
+        assert_eq!(
+            stored.fire_condition.as_deref(),
+            Some("gh pr view --json reviewThreads -q '.x' | grep -q ."),
+            "fireCondition must persist verbatim"
+        );
+
+        // Empty/whitespace normalizes to None (always fire).
+        let mut b = fixed_routine_args(&proj, &pipe, &ws);
+        b["fireCondition"] = json!("   ");
+        let id2 = create_routine(&db, &b).unwrap()["routineId"].as_str().unwrap().to_string();
+        assert!(db.get_routine(&id2).unwrap().unwrap().fire_condition.is_none());
+    }
+
+    /// The one valid fresh combo (fresh + daily, no fixed workspace) SUCCEEDS,
+    /// and mode-irrelevant fields are nulled (a stale fixedWorkspaceId is dropped;
+    /// baseBranch/branchPrefix persist for fresh).
+    #[test]
+    fn create_routine_fresh_daily_succeeds_and_normalizes_fields() {
+        let (db, proj, pipe, ws) = seeded_routine_db();
+        let a = json!({
+            "name": "Morning PR", "projectId": proj, "pipelineId": pipe,
+            "scheduleKind": "daily", "scheduleSpec": "09:00",
+            "workspaceMode": "fresh",
+            "fixedWorkspaceId": ws, // stale — must be dropped for fresh mode
+            "baseBranch": "main", "branchPrefix": "routine/"
+        });
+        let payload = create_routine(&db, &a).expect("fresh+daily is the one valid fresh combo");
+        let id = payload["routineId"].as_str().unwrap();
+        let stored = db.get_routine(id).unwrap().unwrap();
+        assert_eq!(stored.workspace_mode, "fresh");
+        assert!(stored.fixed_workspace_id.is_none(), "fresh must not keep a fixedWorkspaceId");
+        assert_eq!(stored.base_branch.as_deref(), Some("main"));
+        assert_eq!(stored.branch_prefix.as_deref(), Some("routine/"));
+    }
+
+    /// A fixed-mode routine drops any baseBranch/branchPrefix it was given.
+    #[test]
+    fn create_routine_fixed_drops_fresh_only_fields() {
+        let (db, proj, pipe, ws) = seeded_routine_db();
+        let mut a = fixed_routine_args(&proj, &pipe, &ws);
+        a["baseBranch"] = json!("main");
+        a["branchPrefix"] = json!("routine/");
+        let id = create_routine(&db, &a).unwrap()["routineId"].as_str().unwrap().to_string();
+        let stored = db.get_routine(&id).unwrap().unwrap();
+        assert!(stored.base_branch.is_none() && stored.branch_prefix.is_none());
+        assert_eq!(stored.fixed_workspace_id.as_deref(), Some(ws.as_str()));
+    }
+
+    /// The list_routines MCP handler returns the camelCase RoutineRow shape an
+    /// agent needs.
+    #[test]
+    fn list_routines_returns_camelcase_rows() {
+        let (db, proj, pipe, ws) = seeded_routine_db();
+        create_routine(&db, &fixed_routine_args(&proj, &pipe, &ws)).unwrap();
+        let payload = list_routines(&db).unwrap();
+        let rows = payload["routines"].as_array().expect("routines array");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["scheduleKind"], "interval");
+        assert_eq!(r["workspaceMode"], "fixed");
+        assert!(r["nextDueAt"].is_string());
+        assert_eq!(r["enabled"], false);
     }
 
     /// update_routine changes fields, recomputes next_due, and leaves enabled alone.

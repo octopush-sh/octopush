@@ -5000,8 +5000,8 @@ mod orchestrator_tests {
 
         let past = "2000-01-01T00:00:00+00:00";
         let future = "2999-01-01T00:00:00+00:00";
-        db.lock().insert_routine("r-due", &routine_input(&pid, "interval", "3600"), Some(past)).unwrap();
-        db.lock().insert_routine("r-future", &routine_input(&pid, "daily", "09:00"), Some(future)).unwrap();
+        db.lock().insert_routine("r-due", &routine_input(&pid, "interval", "3600"), Some(past), true).unwrap();
+        db.lock().insert_routine("r-future", &routine_input(&pid, "daily", "09:00"), Some(future), true).unwrap();
 
         assert_eq!(db.lock().list_routines().unwrap().len(), 2);
         let got = db.lock().get_routine("r-due").unwrap().unwrap();
@@ -5039,7 +5039,7 @@ mod orchestrator_tests {
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
         let mut input = routine_input(&pid, "daily", "09:00");
         input.fixed_workspace_id = Some("ghost-ws".into()); // never existed
-        db.lock().insert_routine("r-ghost", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+        db.lock().insert_routine("r-ghost", &input, Some("2000-01-01T00:00:00+00:00"), true).unwrap();
 
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
@@ -5107,7 +5107,7 @@ mod orchestrator_tests {
         let mut input = routine_input(&pid, "interval", "3600");
         input.fire_condition = Some("  false  ".into()); // trims to `false`
         let past = "2000-01-01T00:00:00+00:00";
-        db.lock().insert_routine("r-cond", &input, Some(past)).unwrap();
+        db.lock().insert_routine("r-cond", &input, Some(past), true).unwrap();
 
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
@@ -5147,7 +5147,7 @@ mod orchestrator_tests {
         // A condition that would ERROR if it ever ran (bad cwd is irrelevant —
         // the point is it must NOT run because busy is caught first).
         input.fire_condition = Some("exit 1".into());
-        db.lock().insert_routine("r-busy", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+        db.lock().insert_routine("r-busy", &input, Some("2000-01-01T00:00:00+00:00"), true).unwrap();
 
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
@@ -5172,7 +5172,7 @@ mod orchestrator_tests {
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
         let mut input = routine_input(&pid, "interval", "3600");
         input.fixed_workspace_id = None; // fixed mode with no workspace ⇒ hard error
-        db.lock().insert_routine("r-err", &input, Some("2000-01-01T00:00:00+00:00")).unwrap();
+        db.lock().insert_routine("r-err", &input, Some("2000-01-01T00:00:00+00:00"), true).unwrap();
 
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
@@ -5235,7 +5235,7 @@ mod orchestrator_tests {
         let mut overdue = routine_input(&pid, "interval", "3600");
         overdue.fire_condition = Some("false".into());
         let past = "2000-01-01T00:00:00+00:00";
-        db.lock().insert_routine("r-overdue", &overdue, Some(past)).unwrap();
+        db.lock().insert_routine("r-overdue", &overdue, Some(past), true).unwrap();
         Arc::clone(&orch).run_routine_now("r-overdue").await.unwrap();
         let after = db.lock().get_routine("r-overdue").unwrap().unwrap().next_due_at.unwrap();
         assert_ne!(after, past, "an overdue window is consumed by run-now");
@@ -5246,7 +5246,7 @@ mod orchestrator_tests {
         let mut future = routine_input(&pid, "interval", "3600");
         future.fire_condition = Some("false".into());
         let far = "2999-01-01T00:00:00+00:00";
-        db.lock().insert_routine("r-future", &future, Some(far)).unwrap();
+        db.lock().insert_routine("r-future", &future, Some(far), true).unwrap();
         Arc::clone(&orch).run_routine_now("r-future").await.unwrap();
         assert_eq!(
             db.lock().get_routine("r-future").unwrap().unwrap().next_due_at.as_deref(),
@@ -5279,7 +5279,7 @@ mod orchestrator_tests {
         // Condition exits 0 → fire (into w1).
         let mut met = routine_input(&pid, "interval", "3600");
         met.fire_condition = Some("true".into());
-        db.lock().insert_routine("r-met", &met, Some(past)).unwrap();
+        db.lock().insert_routine("r-met", &met, Some(past), true).unwrap();
         let outcome = Arc::clone(&orch).run_routine_now("r-met").await.unwrap();
         assert_eq!(outcome, FireOutcome::Dispatched);
         assert_eq!(db.lock().list_runs(&w1).unwrap().len(), 1, "a met condition dispatches a run");
@@ -5292,7 +5292,7 @@ mod orchestrator_tests {
         // No condition → always fires (into w2), unchanged behavior.
         let mut plain = routine_input(&pid, "interval", "3600");
         plain.fixed_workspace_id = Some("w2".into());
-        db.lock().insert_routine("r-plain", &plain, Some(past)).unwrap();
+        db.lock().insert_routine("r-plain", &plain, Some(past), true).unwrap();
         let outcome = Arc::clone(&orch).run_routine_now("r-plain").await.unwrap();
         assert_eq!(outcome, FireOutcome::Dispatched, "no condition ⇒ backward-compat fire");
         assert_eq!(db.lock().list_runs("w2").unwrap().len(), 1);
@@ -5319,7 +5319,7 @@ mod orchestrator_tests {
         let (db, _ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("RP3", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
-        db.lock().insert_routine("r-cascade", &routine_input(&pid, "interval", "3600"), Some("2000-01-01T00:00:00+00:00")).unwrap();
+        db.lock().insert_routine("r-cascade", &routine_input(&pid, "interval", "3600"), Some("2000-01-01T00:00:00+00:00"), true).unwrap();
         db.lock().conn_ref().execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
         assert!(db.lock().get_routine("r-cascade").unwrap().is_none());
     }
