@@ -94,6 +94,58 @@ pub fn tool_definitions() -> Value {
             }),
         ),
         def(
+            "list_roles",
+            "List every DIRECT-mode role (built-in and custom), each with its full \
+             config: prompt body, artifact kind, environment (worktree/action), \
+             default tools & substrate, loop capability, and token estimates. A \
+             pipeline stage's `role` is a role's `key` — call this to learn the \
+             vocabulary before authoring a pipeline or a new role.",
+            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        ),
+        def(
+            "save_role",
+            "Create or update a CUSTOM role — the reusable, role-specialized agent \
+             persona a pipeline stage runs as. Supply just `label` + `promptBody` \
+             for a basic role; every other field takes a sensible default. The \
+             `key` (the stable id a stage references via `role`) is derived from \
+             the label when omitted, and is always returned so you can wire it \
+             into stages. Built-in roles are protected: a key that maps to a \
+             built-in is rejected (never overwritten). See \
+             describe_pipeline_schema → customRoles for the full field contract. \
+             Does not run anything.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "description": "Display name, e.g. \"Security Auditor\"." },
+                    "promptBody": { "type": "string", "description": "The role's system-prompt body — the instructions that define what this agent does. Composed with the environment preamble at run time. Required, non-empty." },
+                    "key": { "type": ["string", "null"], "description": "Optional stable id a pipeline stage references (role: \"<key>\"). Omit to derive it from the label (lowercased, each run of non-alphanumerics → '_', trimmed). An existing CUSTOM key updates that role in place; a built-in key is rejected." },
+                    "description": { "type": ["string", "null"], "description": "Short human description. Default empty." },
+                    "artifactKind": { "type": ["string", "null"], "enum": ["plan", "review", "tests", "diff", "note", null], "description": "What this role produces. Default 'note'." },
+                    "environment": { "type": ["string", "null"], "enum": ["worktree", "action", null], "description": "'worktree' (default) never touches git and leaves changes uncommitted for the next stage; 'action' may commit/push/PR/merge/release (its job IS a side effect)." },
+                    "canLoop": { "type": ["boolean", "null"], "description": "Whether a stage with this role can act as a review gate that loops back on rejection. Default false." },
+                    "defaultTools": { "type": ["array", "null"], "items": { "type": "string", "enum": ["read_file", "list_files", "write_file", "run_command"] }, "description": "Default workspace-tool allowlist for stages using this role. Default [\"read_file\", \"list_files\"]." },
+                    "defaultSubstrate": { "type": ["string", "null"], "enum": ["api", "cli", null], "description": "'api' (default, in-process LLM) or 'cli' (external agent CLI)." },
+                    "defaultCheckpoint": { "type": ["boolean", "null"], "description": "Whether stages using this role default to pausing for human approval. Default false." },
+                    "tokenEstIn": { "type": ["integer", "null"], "description": "Rough input-token estimate for the cost preview. Default 4000." },
+                    "tokenEstOut": { "type": ["integer", "null"], "description": "Rough output-token estimate for the cost preview. Default 1000." }
+                },
+                "required": ["label", "promptBody"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
+            "delete_role",
+            "Delete a CUSTOM role by key. Built-in roles cannot be deleted, and a \
+             role currently used by any pipeline or run stage is protected \
+             (re-point or remove those stages first).",
+            json!({
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "The role key to delete (see list_roles)." } },
+                "required": ["key"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
             "list_projects",
             "List the user's open Octopush projects (each is a git repository).",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -275,6 +327,9 @@ pub fn call_tool(db: &Mutex<Db>, name: &str, args: &Value) -> Value {
             "create_pipeline" => save_pipeline(&db, args, None),
             "update_pipeline" => save_pipeline(&db, args, Some(())),
             "delete_pipeline" => delete_pipeline(&db, args),
+            "list_roles" => list_roles(&db),
+            "save_role" => save_role(&db, args),
+            "delete_role" => delete_role(&db, args),
             "list_projects" => list_projects(&db),
             "list_workspaces" => list_workspaces(&db, args),
             "get_workspace" => get_workspace(&db, args),
@@ -389,6 +444,134 @@ fn delete_pipeline(db: &Db, args: &Value) -> Result<Value, String> {
     let id = req_str(args, "pipelineId")?;
     db.delete_pipeline(&id).map_err(|e| e.to_string())?;
     Ok(json!({ "deleted": id }))
+}
+
+// ── role handlers ─────────────────────────────────────────────────────────
+
+/// The four workspace tools a role's `defaultTools` may name — the same
+/// allowlist the pipeline stage validator enforces.
+const ROLE_TOOLS: [&str; 4] = ["read_file", "list_files", "write_file", "run_command"];
+
+fn list_roles(db: &Db) -> Result<Value, String> {
+    let roles = db.list_roles().map_err(|e| e.to_string())?;
+    Ok(json!({ "roles": roles }))
+}
+
+/// Derive a stable role key from a display name — byte-for-byte the app's
+/// `deriveRoleKey` (RoleEditor.tsx): lowercase, every run of non-alphanumerics
+/// collapses to a single '_', then trim leading/trailing '_'. Non-ASCII chars
+/// are non-alphanumeric here (matching the JS `[^a-z0-9]` after `toLowerCase`),
+/// so they too become '_'.
+fn derive_role_key(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// Create or update a CUSTOM role. Routes through the SAME `db.upsert_role` the
+/// app's `save_role` command uses (built-in protection, in-place update), with
+/// the app's new-role defaults filled for omitted fields so the caller supplies
+/// only `label` + `promptBody` for a basic role.
+fn save_role(db: &Db, args: &Value) -> Result<Value, String> {
+    let label = req_str(args, "label")?;
+    let prompt_body = req_str(args, "promptBody")?;
+    if label.trim().is_empty() {
+        return Err("role label cannot be empty".into());
+    }
+    if prompt_body.trim().is_empty() {
+        return Err("role promptBody cannot be empty".into());
+    }
+    // Key: an explicit (trimmed) key, else derived from the label with the exact
+    // app algorithm. A label of only punctuation derives to "" — ask for a key.
+    let key = opt_str(args, "key")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| derive_role_key(&label));
+    if key.is_empty() {
+        return Err(
+            "could not derive a role key from the label — pass an explicit 'key' (letters/digits)"
+                .into(),
+        );
+    }
+
+    // Build a RoleDef JSON with the app's defaults for omitted fields, then
+    // deserialize through the typed struct so an out-of-enum artifactKind /
+    // environment / substrate surfaces as a clean tool error, never a panic.
+    let obj = args.as_object().cloned().unwrap_or_default();
+    let field = |k: &str| obj.get(k).filter(|v| !v.is_null()).cloned();
+    let role_json = json!({
+        "key": key,
+        "label": label,
+        "description": field("description").unwrap_or_else(|| json!("")),
+        "promptBody": prompt_body,
+        "artifactKind": field("artifactKind").unwrap_or_else(|| json!("note")),
+        "environment": field("environment").unwrap_or_else(|| json!("worktree")),
+        "canLoop": field("canLoop").unwrap_or_else(|| json!(false)),
+        "defaultTools": field("defaultTools").unwrap_or_else(|| json!(["read_file", "list_files"])),
+        "defaultSubstrate": field("defaultSubstrate").unwrap_or_else(|| json!("api")),
+        "defaultCheckpoint": field("defaultCheckpoint").unwrap_or_else(|| json!(false)),
+        "tokenEstIn": field("tokenEstIn").unwrap_or_else(|| json!(4000)),
+        "tokenEstOut": field("tokenEstOut").unwrap_or_else(|| json!(1000)),
+        "isBuiltin": false,
+    });
+    let mut role: octopush_lib::orchestrator::roles::RoleDef =
+        serde_json::from_value(role_json).map_err(|e| format!("role is malformed: {e}"))?;
+    role.is_builtin = false; // user-saved roles are never built-in (matches save_role)
+
+    // Validate the tool allowlist here (RoleDef itself doesn't) so an unknown
+    // tool is a clear authoring error, not a stage failure later.
+    for t in &role.default_tools {
+        if !ROLE_TOOLS.contains(&t.as_str()) {
+            return Err(format!(
+                "unknown tool '{t}' in defaultTools; valid tools are {}",
+                ROLE_TOOLS.join(", ")
+            ));
+        }
+    }
+
+    // Never overwrite a built-in role key — mirror the command guard so the MCP
+    // caller gets the same clear error, not a silent no-op from upsert_role.
+    if let Some(existing) = db.get_role(&role.key).map_err(|e| e.to_string())? {
+        if existing.is_builtin {
+            return Err(format!(
+                "'{}' maps to the built-in role key '{}' — choose a different label or key",
+                role.label, role.key
+            ));
+        }
+    }
+    db.upsert_role(&role).map_err(|e| e.to_string())?;
+    let saved = db
+        .get_role(&role.key)
+        .map_err(|e| e.to_string())?
+        .ok_or("role saved but could not be reloaded")?;
+    Ok(json!({ "role": saved, "key": saved.key }))
+}
+
+fn delete_role(db: &Db, args: &Value) -> Result<Value, String> {
+    let key = req_str(args, "key")?;
+    match db.get_role(&key).map_err(|e| e.to_string())? {
+        None => return Err(format!("no role with key '{key}'")),
+        Some(existing) if existing.is_builtin => {
+            return Err(format!("cannot delete the built-in role '{key}'"));
+        }
+        Some(_) => {}
+    }
+    if db.role_in_use(&key).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "role '{key}' is used by a pipeline or run stage — re-point or remove those stages first"
+        ));
+    }
+    db.delete_role(&key).map_err(|e| e.to_string())?;
+    Ok(json!({ "deleted": key }))
 }
 
 // ── project / workspace handlers ──────────────────────────────────────────
@@ -623,6 +806,29 @@ fn describe_pipeline_schema() -> Value {
             "claude-haiku-4-5": "Fast & cheap — plan, reviews, tests.",
             "note": "Any model id your configured providers support is accepted; these are the defaults the built-in pipelines use."
         },
+        "customRoles": {
+            "__note__": "Beyond the built-in roles above you can AUTHOR your own with save_role, then reference one from a stage's `role` (by the role's key). list_roles returns the full current set (built-in + custom).",
+            "requiredFields": {
+                "label": "Display name (required).",
+                "promptBody": "The role's system-prompt body — what this agent does (required, non-empty). Composed with the environment preamble at run time."
+            },
+            "optionalFields": {
+                "key": "Stable id a stage references (role: \"<key>\"). Derived from the label when omitted (lowercase, each run of non-alphanumerics → '_', trimmed); always returned by save_role.",
+                "description": "short human description — default \"\".",
+                "artifactKind": "plan | review | tests | diff | note — default note.",
+                "environment": "worktree (default; never touches git, leaves changes uncommitted for the next stage) | action (may commit/push/PR/merge/release).",
+                "canLoop": "default false — set true for a review-style role that can loop back on rejection.",
+                "defaultTools": "subset of [read_file, list_files, write_file, run_command] — default [read_file, list_files].",
+                "defaultSubstrate": "api (default) | cli.",
+                "defaultCheckpoint": "default false.",
+                "tokenEstIn": "cost-preview input estimate — default 4000.",
+                "tokenEstOut": "cost-preview output estimate — default 1000."
+            },
+            "rules": [
+                "Built-in role keys are protected: save_role rejects a key that maps to a built-in; delete_role refuses built-ins.",
+                "A role in use by any pipeline or run stage cannot be deleted — re-point or remove those stages first."
+            ]
+        },
         "runtimeBehaviors": {
             "__note__": "Two mechanics run at execution time (in the app), not things you enumerate in the stage list — design your pipeline around them.",
             "escapeValve": "An API-substrate stage may PAUSE and ask the director a question (with a recommended default) when it is genuinely blocked — the run parks like a checkpoint until you answer, then resumes. Nothing to author or configure. IMPORTANT: this is API-only — a `cli` stage keeps a strict never-ask contract and has NO ask-director tool, so it never self-blocks. For a cli stage that might need a human, use a `checkpoint` (pause before it) or an `escalateModel` (retry stronger on failure) instead.",
@@ -752,5 +958,161 @@ mod tests {
         });
         let err = save_pipeline(&db, &args, None).expect_err("an invalid effort must be rejected");
         assert!(err.contains("stage 1"), "error should name the stage: {err}");
+    }
+
+    // ── role authoring ────────────────────────────────────────────────────
+
+    /// The key derivation is byte-for-byte the app's `deriveRoleKey`.
+    #[test]
+    fn derive_role_key_matches_app_algorithm() {
+        assert_eq!(derive_role_key("Security Auditor"), "security_auditor");
+        assert_eq!(derive_role_key("  Plan!!  "), "plan");
+        assert_eq!(derive_role_key("API/CLI reviewer"), "api_cli_reviewer");
+        assert_eq!(derive_role_key("multi   space"), "multi_space");
+        assert_eq!(derive_role_key("!!!"), ""); // pure punctuation → empty
+    }
+
+    /// save_role with only label + promptBody derives the key and applies the
+    /// app's new-role defaults, and truly persists (re-read from the store).
+    #[test]
+    fn save_role_applies_defaults_and_derives_key() {
+        let db = test_db();
+        let payload = save_role(
+            &db,
+            &json!({ "label": "Security Auditor", "promptBody": "Audit the diff for vulnerabilities." }),
+        )
+        .expect("a minimal role should save");
+        assert_eq!(payload["key"], "security_auditor");
+        let role = &payload["role"];
+        assert_eq!(role["artifactKind"], "note");
+        assert_eq!(role["environment"], "worktree");
+        assert_eq!(role["canLoop"], false);
+        assert_eq!(role["defaultSubstrate"], "api");
+        assert_eq!(role["defaultTools"], json!(["read_file", "list_files"]));
+        assert_eq!(role["tokenEstIn"], 4000);
+        assert_eq!(role["isBuiltin"], false);
+
+        // Persisted and re-readable by key.
+        let stored = db.get_role("security_auditor").unwrap().expect("role in store");
+        assert_eq!(stored.label, "Security Auditor");
+        assert!(!stored.is_builtin);
+    }
+
+    /// An explicit key is preserved (not re-derived), and updating it edits in place.
+    #[test]
+    fn save_role_preserves_explicit_key_and_updates_in_place() {
+        let db = test_db();
+        save_role(
+            &db,
+            &json!({ "key": "my_reviewer", "label": "Reviewer", "promptBody": "v1" }),
+        )
+        .unwrap();
+        save_role(
+            &db,
+            &json!({ "key": "my_reviewer", "label": "Reviewer", "promptBody": "v2 updated" }),
+        )
+        .unwrap();
+        let stored = db.get_role("my_reviewer").unwrap().unwrap();
+        assert_eq!(stored.prompt_body, "v2 updated");
+        // Exactly one custom role — the update didn't create a second row.
+        let customs = db.list_roles().unwrap().into_iter().filter(|r| !r.is_builtin).count();
+        assert_eq!(customs, 1);
+    }
+
+    /// A key that maps to a BUILT-IN role is rejected — never silently overwritten.
+    #[test]
+    fn save_role_rejects_builtin_key() {
+        let db = test_db();
+        let err = save_role(
+            &db,
+            &json!({ "key": "code_review", "label": "Hijack", "promptBody": "nope" }),
+        )
+        .expect_err("a built-in key must be rejected");
+        assert!(err.contains("built-in"), "error should mention built-in: {err}");
+    }
+
+    /// An out-of-enum artifactKind is a clean tool error, never a panic.
+    #[test]
+    fn save_role_rejects_invalid_artifact_kind() {
+        let db = test_db();
+        let err = save_role(
+            &db,
+            &json!({ "label": "Bad", "promptBody": "x", "artifactKind": "blueprint" }),
+        )
+        .expect_err("an unknown artifactKind must be rejected");
+        assert!(err.contains("malformed"), "error should be a clean parse error: {err}");
+    }
+
+    /// An unknown tool in defaultTools is rejected at authoring time.
+    #[test]
+    fn save_role_rejects_unknown_tool() {
+        let db = test_db();
+        let err = save_role(
+            &db,
+            &json!({ "label": "Bad Tools", "promptBody": "x", "defaultTools": ["read_file", "deploy_prod"] }),
+        )
+        .expect_err("an unknown tool must be rejected");
+        assert!(err.contains("deploy_prod"), "error should name the bad tool: {err}");
+    }
+
+    /// An empty/whitespace promptBody is rejected.
+    #[test]
+    fn save_role_rejects_empty_prompt() {
+        let db = test_db();
+        assert!(save_role(&db, &json!({ "label": "L", "promptBody": "   " })).is_err());
+    }
+
+    /// delete_role refuses a built-in role.
+    #[test]
+    fn delete_role_refuses_builtin() {
+        let db = test_db();
+        let err = delete_role(&db, &json!({ "key": "code_review" }))
+            .expect_err("built-in roles are protected");
+        assert!(err.contains("built-in"), "error should mention built-in: {err}");
+    }
+
+    /// delete_role refuses a custom role that a pipeline stage still uses.
+    #[test]
+    fn delete_role_refuses_in_use() {
+        let db = test_db();
+        save_role(&db, &json!({ "key": "my_reviewer", "label": "Reviewer", "promptBody": "review" }))
+            .unwrap();
+        save_pipeline(
+            &db,
+            &json!({
+                "name": "Uses Custom",
+                "description": "a pipeline referencing the custom role",
+                "stages": [ { "role": "my_reviewer", "agentModel": "claude-haiku-4-5" } ]
+            }),
+            None,
+        )
+        .expect("pipeline with a valid custom role should save");
+        let err = delete_role(&db, &json!({ "key": "my_reviewer" }))
+            .expect_err("an in-use role must be protected");
+        assert!(err.contains("used by"), "error should explain it's in use: {err}");
+    }
+
+    /// delete_role removes an unused custom role.
+    #[test]
+    fn delete_role_removes_unused_custom() {
+        let db = test_db();
+        save_role(&db, &json!({ "key": "temp_role", "label": "Temp", "promptBody": "x" })).unwrap();
+        let out = delete_role(&db, &json!({ "key": "temp_role" })).expect("unused custom deletes");
+        assert_eq!(out["deleted"], "temp_role");
+        assert!(db.get_role("temp_role").unwrap().is_none());
+    }
+
+    /// The authoring guide documents custom-role authoring.
+    #[test]
+    fn describe_schema_documents_custom_roles() {
+        let schema = describe_pipeline_schema();
+        let cr = &schema["customRoles"];
+        assert!(cr["requiredFields"]["label"].is_string());
+        assert!(cr["requiredFields"]["promptBody"].is_string());
+        assert!(cr["optionalFields"]["artifactKind"].is_string());
+        assert!(cr["rules"].as_array().unwrap().iter().any(|r| r
+            .as_str()
+            .unwrap_or("")
+            .contains("built-in")));
     }
 }
