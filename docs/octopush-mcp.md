@@ -46,6 +46,9 @@ SQLite store the desktop app uses.
 | `create_pipeline` | author | Create a new custom pipeline (validated before save). |
 | `update_pipeline` | author | Update a custom pipeline; **forks** a built-in into a new copy. |
 | `delete_pipeline` | author | Delete a custom pipeline (built-ins protected). |
+| `list_roles` | read | Every role (built-in + custom) with its full config — the vocabulary a stage's `role` draws from. |
+| `save_role` | author | Create/update a **custom** role (the agent persona a stage runs as). Only `label` + `promptBody` required; `key` derived from the label if omitted. Built-in keys protected. |
+| `delete_role` | author | Delete a custom role by key (built-ins protected; a role used by any pipeline/run stage is protected). |
 | `list_projects` | read | Open projects (git repos). |
 | `list_workspaces` | read | Workspaces (worktrees) of a project. |
 | `get_workspace` | read | One workspace: branch, path, status, linked issue. |
@@ -95,6 +98,30 @@ self-blocks — for a cli stage that might need a human, use a `checkpoint` or a
 `escalateModel` instead. **Auto-escalation:** a stage with an escalation policy
 that raises the tier auto-retries once at the stronger tier on failure (see
 above).
+
+### Role authoring contract
+
+A stage's `role` is a role's `key`. Beyond the built-ins you can author your own
+with `save_role`, then reference them from a stage. Only `label` + `promptBody`
+are required; every other field defaults (see `describe_pipeline_schema` →
+`customRoles` for the exhaustive field list). Key rules:
+
+- `key` is the stable id a stage references. Omit it to derive one from the label
+  (lowercase, each run of non-alphanumerics → `_`, trimmed) — it's always
+  returned by `save_role`. An existing **custom** key updates in place; a
+  **built-in** key is rejected (never overwritten).
+- `artifactKind` ∈ `plan|review|tests|diff|note` (default `note`);
+  `environment` is `worktree` (default — never touches git, leaves changes for the
+  next stage) or `action` (may commit/push/PR/merge/release);
+  `defaultTools` ⊆ `read_file, list_files, write_file, run_command`
+  (default `[read_file, list_files]`); `defaultSubstrate` `api`|`cli`;
+  `canLoop`/`defaultCheckpoint` default false; `tokenEstIn`/`tokenEstOut` feed the
+  cost preview (defaults 4000/1000).
+- `delete_role` refuses a built-in and refuses a role still used by any
+  pipeline/run stage (re-point or remove those stages first).
+- **Library sync caveat:** like `delete_pipeline`, a role authored/deleted over
+  MCP is **not** pushed to the Pro cloud library from the MCP process — edit it
+  once in-app to sync it across machines.
 
 ## Build
 
