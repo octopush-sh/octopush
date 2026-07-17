@@ -1,5 +1,6 @@
 import { useEffect } from "react";
-import { Copy } from "lucide-react";
+import { Copy, Hammer, Wrench, Eye, FlaskConical, PenTool, Gauge, Cog } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
@@ -7,6 +8,18 @@ import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { copyToClipboard } from "../lib/clipboard";
+
+/** Mission-intent glyphs. build/fix ship in M1; the rest arrive with later
+ *  movements but map now so the header never falls back to a generic icon. */
+const INTENT_ICON: Record<string, LucideIcon> = {
+  build: Hammer,
+  fix: Wrench,
+  review: Eye,
+  probe: FlaskConical,
+  design: PenTool,
+  perf: Gauge,
+  ops: Cog,
+};
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -61,6 +74,9 @@ interface Props {
    *  match this prefix to surface a ticket (C5); a manual link still wins
    *  regardless. */
   jiraProjectKey?: string | null;
+  /** The active mission's intent (build/fix/…). Renders a small mute glyph +
+   *  label eyebrow above the workspace name; null falls back to "Workspace". */
+  missionIntent?: string | null;
 }
 
 export function ContextHeader({
@@ -72,6 +88,7 @@ export function ContextHeader({
   workspace = null,
   issueTrackerConfigured = false,
   jiraProjectKey = null,
+  missionIntent = null,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
@@ -153,9 +170,29 @@ export function ContextHeader({
         </div>
       ) : (
         <div className="flex min-w-0 flex-col gap-0.5">
-          <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-            Workspace
-          </div>
+          {/* Intent eyebrow. The slot height is reserved in BOTH states so
+              nothing shifts while missions load, and the chip reveals with
+              `.octo-pop-in` once resolved — no brass→mute flip. Every code
+              workspace has a mission, so the empty state is a sub-second load
+              artifact, never a resting state. */}
+          {missionIntent ? (
+            (() => {
+              const Icon = INTENT_ICON[missionIntent] ?? Hammer;
+              return (
+                <div
+                  className="octo-pop-in flex h-[14px] items-center gap-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute"
+                  title="Mission intent"
+                >
+                  <Icon size={10} aria-hidden />
+                  <span>{missionIntent}</span>
+                </div>
+              );
+            })()
+          ) : (
+            <div className="flex h-[14px] items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+              Workspace
+            </div>
+          )}
           <div
             key={workspaceName}
             className="animate-name-in font-serif text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"

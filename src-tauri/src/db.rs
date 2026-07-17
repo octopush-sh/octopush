@@ -712,6 +712,84 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE routines ADD COLUMN last_checked_at TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE routines ADD COLUMN last_outcome TEXT")?;
 
+        // ── Missions (the first-level unit of intent) ──────────────────────
+        // A mission is a thread of intent (build/fix/review/probe/design/perf/
+        // ops) with agents, terminals and artifacts inside. The worktree stops
+        // being the unit and becomes a *property* a mission chooses along two
+        // axes: git-state (worktree/readonly/ephemeral/pr) and execution
+        // (none/sandbox/container/cloud). `workspace_id` is NULLABLE so
+        // design/probe missions can live without a worktree. The partial UNIQUE
+        // index enforces the core invariant: never two *active* missions writing
+        // the same checkout (readonly missions may share freely). See
+        // docs/superpowers/plans/2026-07-17-missions-reframe-master-plan.md.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS missions (
+                id               TEXT PRIMARY KEY,
+                workspace_id     TEXT,
+                project_id       TEXT NOT NULL,
+                intent           TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'active',
+                linked_issue_key TEXT,
+                git_isolation    TEXT NOT NULL DEFAULT 'worktree',
+                exec_isolation   TEXT NOT NULL DEFAULT 'none',
+                payload          TEXT NOT NULL DEFAULT '{}',
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                archived_at      TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_missions_project ON missions(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_missions_workspace ON missions(workspace_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_missions_writer
+                ON missions(workspace_id)
+                WHERE status = 'active' AND workspace_id IS NOT NULL
+                  AND git_isolation IN ('worktree','pr','ephemeral');
+            "#,
+        )?;
+        // Nullable back-references: which mission a run / conversation / terminal
+        // belongs to. Adding a column at the END is safe — no read SELECTs *, all
+        // list their columns explicitly, so existing positional maps are unmoved.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN mission_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mission_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE terminals ADD COLUMN mission_id TEXT")?;
+        // One-shot re-parenting: every existing workspace becomes a 'build'
+        // mission owning its worktree; its runs/threads/terminals inherit the id.
+        // Gated by app_meta so it runs exactly once; the WHERE NOT EXISTS keeps a
+        // torn/retried migration idempotent even before the flag is set.
+        if self.meta_get("missions_backfill_v1")?.is_none() {
+            self.conn.execute_batch(
+                r#"
+                INSERT INTO missions (id, workspace_id, project_id, intent, title, status,
+                                      linked_issue_key, git_isolation, exec_isolation, payload,
+                                      created_at, updated_at, archived_at)
+                SELECT lower(hex(randomblob(16))), w.id, w.project_id, 'build',
+                       CASE WHEN w.task <> '' THEN w.task ELSE w.name END,
+                       CASE WHEN w.status = 'archived' THEN 'archived' ELSE 'active' END,
+                       w.linked_issue_key, 'worktree', 'none', '{}',
+                       w.created_at, w.last_active,
+                       CASE WHEN w.status = 'archived' THEN w.last_active ELSE NULL END
+                FROM workspaces w
+                WHERE NOT EXISTS (SELECT 1 FROM missions m WHERE m.workspace_id = w.id)
+                  -- Skip any workspace whose project row is missing: with
+                  -- foreign_keys=ON the FK insert would otherwise abort the whole
+                  -- backfill and wedge startup on every launch (flag never set).
+                  AND EXISTS (SELECT 1 FROM projects p WHERE p.id = w.project_id);
+                UPDATE runs SET mission_id =
+                  (SELECT m.id FROM missions m WHERE m.workspace_id = runs.workspace_id)
+                  WHERE mission_id IS NULL;
+                UPDATE chat_threads SET mission_id =
+                  (SELECT m.id FROM missions m WHERE m.workspace_id = chat_threads.workspace_id)
+                  WHERE mission_id IS NULL;
+                UPDATE terminals SET mission_id =
+                  (SELECT m.id FROM missions m WHERE m.workspace_id = terminals.workspace_id)
+                  WHERE mission_id IS NULL;
+                "#,
+            )?;
+            self.meta_set("missions_backfill_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1418,6 +1496,131 @@ impl Db {
         Ok(row)
     }
 
+    // ── Missions ────────────────────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_mission(
+        &self,
+        id: &str,
+        workspace_id: Option<&str>,
+        project_id: &str,
+        intent: &str,
+        title: &str,
+        status: &str,
+        linked_issue_key: Option<&str>,
+        git_isolation: &str,
+        exec_isolation: &str,
+        payload: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO missions (id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+                params![id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, now],
+            )
+            .map_err(|e| {
+                let s = e.to_string();
+                // Only the writer-uniqueness violation (partial index on
+                // `workspace_id`) maps to this message; SQLite names the column,
+                // not the index. A PK (`missions.id`) collision or any other
+                // UNIQUE must propagate untouched, not be mislabeled.
+                if s.contains("missions.workspace_id") {
+                    crate::error::AppError::Other(
+                        "another active mission is already writing this workspace".into(),
+                    )
+                } else {
+                    e.into()
+                }
+            })?;
+        Ok(())
+    }
+
+    pub fn list_missions(&self, project_id: &str) -> AppResult<Vec<MissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+             FROM missions WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| row_to_mission(r))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_mission(&self, mission_id: &str) -> AppResult<Option<MissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+             FROM missions WHERE id = ?1",
+        )?;
+        stmt.query_row(params![mission_id], |r| row_to_mission(r))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The active mission that owns a workspace (the 1:1 pairing for code
+    /// missions). Prefers an active row when an archived one also exists.
+    pub fn mission_for_workspace(&self, workspace_id: &str) -> AppResult<Option<MissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+             FROM missions WHERE workspace_id = ?1
+             ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
+        )?;
+        stmt.query_row(params![workspace_id], |r| row_to_mission(r))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The *active* mission owning a workspace, if any. Distinct from
+    /// `mission_for_workspace` (which prefers-but-falls-back-to archived) — the
+    /// pairing path needs "is there a live mission?" so it never re-adopts an
+    /// archived row.
+    pub fn active_mission_for_workspace(&self, workspace_id: &str) -> AppResult<Option<MissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+             FROM missions WHERE workspace_id = ?1 AND status = 'active'
+             ORDER BY created_at ASC LIMIT 1",
+        )?;
+        stmt.query_row(params![workspace_id], |r| row_to_mission(r))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Partial update. `None` leaves a column unchanged (COALESCE); this cannot
+    /// clear `linked_issue_key` to NULL — a later slice adds explicit-clear if
+    /// the workspace-link mirroring needs it.
+    pub fn update_mission(
+        &self,
+        mission_id: &str,
+        title: Option<&str>,
+        status: Option<&str>,
+        linked_issue_key: Option<&str>,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE missions SET
+                title = COALESCE(?2, title),
+                status = COALESCE(?3, status),
+                archived_at = CASE
+                    WHEN ?3 = 'archived' THEN COALESCE(archived_at, ?5)
+                    WHEN ?3 IS NOT NULL THEN NULL
+                    ELSE archived_at END,
+                linked_issue_key = COALESCE(?4, linked_issue_key),
+                updated_at = ?5
+             WHERE id = ?1",
+            params![mission_id, title, status, linked_issue_key, now],
+        )?;
+        Ok(())
+    }
+
+    /// Archive a mission (status + `archived_at`). Callers archive the underlying
+    /// workspace through the existing guarded path (`archive_workspace`) separately.
+    pub fn archive_mission(&self, mission_id: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE missions SET status = 'archived', archived_at = ?2, updated_at = ?2 WHERE id = ?1",
+            params![mission_id, now],
+        )?;
+        Ok(())
+    }
+
     /// Find a workspace by `(project_id, branch)` regardless of status. There
     /// is at most one meaningful workspace per branch (git can't check a branch
     /// out twice); when both an active and an archived row somehow exist we
@@ -1529,6 +1732,11 @@ impl Db {
     }
 
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
+        // Cascade to missions in lockstep. `missions` has no FK on workspace_id
+        // (it is nullable for design/probe missions), so a deleted workspace's
+        // missions must be removed explicitly or they linger as active orphans.
+        self.conn
+            .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -1536,18 +1744,42 @@ impl Db {
     /// Mark a workspace archived (worktree removed, branch kept). The row
     /// survives but is hidden from the rail.
     pub fn archive_workspace(&self, id: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
             params![id],
+        )?;
+        // Keep the paired mission in lockstep: archive its active mission(s) so
+        // the writer slot frees and it stops surfacing as an active mission.
+        self.conn.execute(
+            "UPDATE missions SET status = 'archived', archived_at = ?2, updated_at = ?2
+             WHERE workspace_id = ?1 AND status = 'active'",
+            params![id, now],
         )?;
         Ok(())
     }
 
     /// Un-archive a workspace (status back to active).
     pub fn restore_workspace(&self, id: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "UPDATE workspaces SET status = 'active' WHERE id = ?1",
             params![id],
+        )?;
+        // Re-pair: reactivate the most-recent archived mission when the workspace
+        // has no active one, restoring the 1:1 code-mission invariant without
+        // ever minting a duplicate (the NOT EXISTS guard keeps the writer slot
+        // occupied by exactly one active mission).
+        self.conn.execute(
+            "UPDATE missions SET status = 'active', archived_at = NULL, updated_at = ?2
+             WHERE id = (
+                 SELECT id FROM missions WHERE workspace_id = ?1 AND status = 'archived'
+                 ORDER BY created_at DESC LIMIT 1
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM missions m2 WHERE m2.workspace_id = ?1 AND m2.status = 'active'
+             )",
+            params![id, now],
         )?;
         Ok(())
     }
@@ -2600,6 +2832,13 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Remove a meta key if present. No-op when absent. Used to re-arm a
+    /// one-shot migration (e.g. tests simulating an upgrade from an older DB).
+    pub fn meta_delete(&self, key: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM app_meta WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -4002,6 +4241,28 @@ pub struct WorkspaceRow {
     pub from_branch: Option<String>,
 }
 
+/// A mission — the first-level unit of intent (build/fix/review/probe/design/
+/// perf/ops). The worktree is a property it chooses along two isolation axes
+/// (`git_isolation` × `exec_isolation`). `workspace_id` is None for missions
+/// with no worktree (design/probe).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionRow {
+    pub id: String,
+    pub workspace_id: Option<String>,
+    pub project_id: String,
+    pub intent: String,
+    pub title: String,
+    pub status: String,
+    pub linked_issue_key: Option<String>,
+    pub git_isolation: String,
+    pub exec_isolation: String,
+    pub payload: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived_at: Option<String>,
+}
+
 /// A scheduled routine (Pro): a saved pipeline that fires on a schedule.
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -4409,6 +4670,24 @@ fn row_to_routine(r: &rusqlite::Row) -> rusqlite::Result<RoutineRow> {
         fire_condition: r.get(19)?,
         last_checked_at: r.get(20)?,
         last_outcome: r.get(21)?,
+    })
+}
+
+fn row_to_mission(r: &rusqlite::Row) -> rusqlite::Result<MissionRow> {
+    Ok(MissionRow {
+        id: r.get(0)?,
+        workspace_id: r.get(1)?,
+        project_id: r.get(2)?,
+        intent: r.get(3)?,
+        title: r.get(4)?,
+        status: r.get(5)?,
+        linked_issue_key: r.get(6)?,
+        git_isolation: r.get(7)?,
+        exec_isolation: r.get(8)?,
+        payload: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+        archived_at: r.get(12)?,
     })
 }
 

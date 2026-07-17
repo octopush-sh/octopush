@@ -510,6 +510,11 @@ fn ensure_main_workspace(
     // name = branch name so the rail shows "main" / "master" / whatever the
     // user's default branch is.
     db.insert_workspace(&id, project_id, &branch, "", &branch, Some(project_path), "", None)?;
+    // Every workspace is born with a mission — the main workspace becomes a
+    // 'build' mission owning the project root.
+    if let Some(ws) = db.get_workspace(&id)? {
+        crate::mission::ensure_for_workspace(db, &ws, "build")?;
+    }
     Ok(())
 }
 
@@ -561,7 +566,83 @@ pub async fn create_workspace(
         &from_branch,
         &setup_script,
     )?;
+    // Pair the workspace with its mission (idempotent — a reused/adopted row
+    // keeps its existing mission). Guarantees "no workspace without a mission".
+    {
+        let db = state.db.lock();
+        crate::mission::ensure_for_workspace(&db, &ws, "build")?;
+    }
     Ok(ws)
+}
+
+// ─── Mission commands ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_missions(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Vec<crate::db::MissionRow>> {
+    state.db.lock().list_missions(&project_id)
+}
+
+#[tauri::command]
+pub async fn get_mission(
+    state: State<'_, AppState>,
+    mission_id: String,
+) -> AppResult<Option<crate::db::MissionRow>> {
+    state.db.lock().get_mission(&mission_id)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_mission(
+    state: State<'_, AppState>,
+    project_id: String,
+    intent: String,
+    title: String,
+    git_isolation: String,
+    exec_isolation: String,
+    workspace_id: Option<String>,
+    linked_issue_key: Option<String>,
+) -> AppResult<crate::db::MissionRow> {
+    let db = state.db.lock();
+    crate::mission::create(
+        &db,
+        &project_id,
+        &intent,
+        &title,
+        &git_isolation,
+        &exec_isolation,
+        workspace_id.as_deref(),
+        linked_issue_key.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn update_mission(
+    state: State<'_, AppState>,
+    mission_id: String,
+    title: Option<String>,
+    status: Option<String>,
+    linked_issue_key: Option<String>,
+) -> AppResult<crate::db::MissionRow> {
+    if let Some(s) = status.as_deref() {
+        crate::mission::validate_status(s)?;
+    }
+    let db = state.db.lock();
+    db.update_mission(
+        &mission_id,
+        title.as_deref(),
+        status.as_deref(),
+        linked_issue_key.as_deref(),
+    )?;
+    db.get_mission(&mission_id)?
+        .ok_or_else(|| crate::error::AppError::Other("mission not found".into()))
+}
+
+#[tauri::command]
+pub async fn archive_mission(state: State<'_, AppState>, mission_id: String) -> AppResult<()> {
+    state.db.lock().archive_mission(&mission_id)
 }
 
 /// Local + remote-tracking branches for the workspace creator's base picker.

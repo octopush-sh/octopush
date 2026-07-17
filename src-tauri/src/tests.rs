@@ -8543,3 +8543,210 @@ mod roles_tests {
         assert!(after.is_builtin, "is_builtin flag must still be 1");
     }
 }
+
+#[cfg(test)]
+mod mission_tests {
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project_ws(db: &Db, project_id: &str, ws_id: &str, task: &str) {
+        db.insert_project(project_id, "P", &format!("/tmp/{project_id}")).unwrap();
+        db.insert_workspace(ws_id, project_id, "ws", task, ws_id, Some("/tmp/wt"), "", None)
+            .unwrap();
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_missions_usable() {
+        let tmp = NamedTempFile::new().unwrap();
+        // Opening twice must not error — migrate() runs top-to-bottom every launch.
+        let _ = Db::open(tmp.path()).unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        let m = crate::mission::create(&db, "p1", "build", "Do a thing", "worktree", "none", None, None)
+            .unwrap();
+        assert_eq!(m.intent, "build");
+        assert_eq!(m.status, "active");
+        assert_eq!(m.git_isolation, "worktree");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_for_workspace_pairs_exactly_once() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "Fix the header");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let b = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_eq!(a.id, b.id, "pairing must be idempotent");
+        assert_eq!(a.title, "Fix the header", "title uses the task when present");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+        assert_eq!(db.mission_for_workspace("w1").unwrap().unwrap().id, a.id);
+    }
+
+    #[test]
+    fn ensure_for_workspace_title_falls_back_to_name_when_task_empty() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "main", "", "main", Some("/tmp/p1"), "", None)
+            .unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_eq!(m.title, "main");
+    }
+
+    #[test]
+    fn writer_uniqueness_blocks_a_second_active_writer() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        crate::mission::create(&db, "p1", "build", "first", "worktree", "none", Some("w1"), None)
+            .unwrap();
+        let second =
+            crate::mission::create(&db, "p1", "build", "second", "worktree", "none", Some("w1"), None);
+        assert!(
+            second.is_err(),
+            "a second active worktree mission on the same workspace must be rejected"
+        );
+    }
+
+    #[test]
+    fn readonly_missions_may_share_a_workspace() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        // The writer index only constrains worktree/pr/ephemeral — readonly is free.
+        crate::mission::create(&db, "p1", "review", "r1", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        crate::mission::create(&db, "p1", "probe", "r2", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn archiving_frees_the_writer_slot() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let m = crate::mission::create(&db, "p1", "build", "first", "worktree", "none", Some("w1"), None)
+            .unwrap();
+        db.archive_mission(&m.id).unwrap();
+        // Archived rows leave the partial index, so a fresh active writer is allowed.
+        crate::mission::create(&db, "p1", "build", "second", "worktree", "none", Some("w1"), None)
+            .unwrap();
+        let active = db.list_missions("p1").unwrap();
+        assert_eq!(active.len(), 1, "archived mission is excluded from list_missions");
+        assert_eq!(active[0].title, "second");
+    }
+
+    #[test]
+    fn invalid_axes_are_rejected() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        assert!(crate::mission::create(&db, "p1", "nope", "t", "worktree", "none", None, None).is_err());
+        assert!(crate::mission::create(&db, "p1", "build", "t", "bogus", "none", None, None).is_err());
+        assert!(crate::mission::create(&db, "p1", "build", "t", "worktree", "bogus", None, None).is_err());
+    }
+
+    #[test]
+    fn backfill_reparents_existing_workspaces_on_upgrade() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            db.insert_project("p1", "P", "/tmp/p1").unwrap();
+            db.insert_workspace("w1", "p1", "ws-a", "Task A", "branch-a", Some("/tmp/wa"), "", None)
+                .unwrap();
+            db.insert_workspace("w2", "p1", "ws-b", "", "branch-b", Some("/tmp/wb"), "", None)
+                .unwrap();
+            // Re-arm the one-shot backfill to simulate upgrading a pre-missions DB.
+            db.meta_delete("missions_backfill_v1").unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        let missions = db.list_missions("p1").unwrap();
+        assert_eq!(missions.len(), 2, "one build mission per existing workspace");
+        assert!(missions.iter().all(|m| m.intent == "build" && m.git_isolation == "worktree"));
+        assert_eq!(db.mission_for_workspace("w1").unwrap().unwrap().title, "Task A");
+        // Title falls back to the workspace name when its task was empty.
+        assert_eq!(db.mission_for_workspace("w2").unwrap().unwrap().title, "ws-b");
+    }
+
+    #[test]
+    fn deleting_a_workspace_deletes_its_missions() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(
+            db.list_missions("p1").unwrap().len(),
+            0,
+            "a deleted workspace must not leave an orphan mission",
+        );
+        assert!(db.mission_for_workspace("w1").unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_then_restore_workspace_keeps_the_mission_in_lockstep() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+
+        db.archive_workspace("w1").unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 0, "archived ws hides its mission");
+        let archived = db.get_mission(&m.id).unwrap().unwrap();
+        assert_eq!(archived.status, "archived");
+        assert!(archived.archived_at.is_some(), "archiving stamps archived_at");
+
+        db.restore_workspace("w1").unwrap();
+        let active = db.list_missions("p1").unwrap();
+        assert_eq!(active.len(), 1, "restore reactivates exactly one mission");
+        assert_eq!(active[0].id, m.id, "restore reactivates the SAME mission — no duplicate");
+        assert!(active[0].archived_at.is_none());
+    }
+
+    #[test]
+    fn ensure_after_a_direct_archive_is_not_stuck() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m1 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        db.archive_mission(&m1.id).unwrap();
+        // ensure must NOT re-adopt the archived mission — it mints a fresh active
+        // one, so the workspace never ends up with zero active missions.
+        let m2 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_ne!(m2.id, m1.id);
+        assert_eq!(m2.status, "active");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn primary_key_collision_is_not_reported_as_a_writer_conflict() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        // workspace_id = None keeps both out of the writer index, so the only
+        // possible violation is the primary key on `missions.id`.
+        db.insert_mission("dup", None, "p1", "build", "a", "active", None, "readonly", "none", "{}")
+            .unwrap();
+        let err = db
+            .insert_mission("dup", None, "p1", "build", "b", "active", None, "readonly", "none", "{}")
+            .unwrap_err();
+        assert!(
+            !format!("{err}").contains("already writing"),
+            "a PK collision must not be mislabeled as a writer conflict",
+        );
+    }
+
+    #[test]
+    fn update_mission_to_archived_stamps_archived_at() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        let m = crate::mission::create(&db, "p1", "build", "t", "readonly", "none", None, None).unwrap();
+        db.update_mission(&m.id, None, Some("archived"), None).unwrap();
+        let after = db.get_mission(&m.id).unwrap().unwrap();
+        assert_eq!(after.status, "archived");
+        assert!(after.archived_at.is_some(), "archiving via update must stamp archived_at");
+    }
+}

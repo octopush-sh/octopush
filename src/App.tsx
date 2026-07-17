@@ -53,6 +53,7 @@ import { UpdateNotifier } from "./components/UpdateNotifier";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
+import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
@@ -114,6 +115,11 @@ function App() {
   const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
   const prByWs = useWorkspaceStore((s) => s.prByWs);
   const loadProjectPrs = useWorkspaceStore((s) => s.loadProjectPrs);
+  // The active mission's intent, derived from the active workspace (missions are
+  // 1:1 with code workspaces). Drives the ContextHeader intent chip.
+  const activeMissionIntent = useMissionsStore((s) =>
+    activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.intent ?? null : null,
+  );
 
   // Per-workspace "actively processing" signal for the rail's marching bar.
   // Each selector derives the SET of workspaces with live activity and is
@@ -558,6 +564,7 @@ function App() {
 
     const ids = Array.from(projectIds);
     loadAllWorkspaces(ids);
+    void useMissionsStore.getState().loadAll(ids);
     const pathById = new Map<string, string>();
     recentProjects.forEach((p) => pathById.set(p.id, p.path));
     if (project) pathById.set(project.id, project.path);
@@ -582,6 +589,7 @@ function App() {
       if (project) byId.set(project.id, project.path);
       recentProjects.forEach((p) => byId.set(p.id, p.path));
       void loadAllWorkspaces([...byId.keys()]);
+      void useMissionsStore.getState().loadAll([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
@@ -1717,6 +1725,7 @@ function App() {
             workspace={activeWorkspace}
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}
+            missionIntent={activeMissionIntent}
           />
         )}
 

@@ -146,6 +146,32 @@ export interface Workspace {
   fromBranch: string | null;
 }
 
+// ─── Missions ─────────────────────────────────────────────────────
+
+/** A mission — the first-level unit of intent. The worktree is a property it
+ *  chooses along two isolation axes; a code mission (build/fix) owns exactly one
+ *  workspace, while design/probe missions may have none. */
+export interface Mission {
+  id: string;
+  /** Null for missions with no worktree (design/probe). */
+  workspaceId: string | null;
+  projectId: string;
+  /** build | fix | review | probe | design | perf | ops */
+  intent: string;
+  title: string;
+  /** active | done | archived */
+  status: string;
+  linkedIssueKey: string | null;
+  /** worktree | readonly | ephemeral | pr */
+  gitIsolation: string;
+  /** none | sandbox | container | cloud */
+  execIsolation: string;
+  payload: string;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null;
+}
+
 // ─── File edits ───────────────────────────────────────────────────
 
 export interface FileEdit {
