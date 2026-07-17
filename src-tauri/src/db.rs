@@ -171,6 +171,62 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_token_events_session
                 ON token_events(session_id, timestamp DESC);
 
+            -- Canonical spend ledger (token-accounting rebuild, Phase 2). Unlike
+            -- token_events (whose overloaded `session_id` conflates workspace /
+            -- CLI-session / terminal ids), spend rows carry an explicit `surface`
+            -- plus denormalized project/workspace attribution (project_id survives
+            -- a workspace deletion) and an `idempotency_key` for dedupe. Phase 2
+            -- Slice 1 populates only the `direct` surface (the orchestrator never
+            -- wrote a ledger row before, so DIRECT spend was invisible to Usage
+            -- and budgets); TALK/RUN/REVIEW still flow through token_events and are
+            -- unioned below. Later slices migrate those surfaces here too.
+            CREATE TABLE IF NOT EXISTS spend_events (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc                TEXT NOT NULL,
+                surface               TEXT NOT NULL,
+                project_id            TEXT,
+                workspace_id          TEXT,
+                source_id             TEXT,
+                attempt               INTEGER NOT NULL DEFAULT 1,
+                model_raw             TEXT NOT NULL,
+                model                 TEXT NOT NULL,
+                input_tokens          INTEGER NOT NULL DEFAULT 0,
+                output_tokens         INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                provider_cost_usd     REAL,
+                computed_cost_usd     REAL,
+                cost_usd              REAL NOT NULL DEFAULT 0,
+                cost_basis            TEXT NOT NULL DEFAULT 'computed',
+                idempotency_key       TEXT UNIQUE,
+                CHECK (input_tokens >= 0 AND output_tokens >= 0
+                       AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0),
+                CHECK (surface IN ('talk','run','direct','review','adhoc')),
+                CHECK (cost_basis IN ('provider','computed','subscription','unpriced','estimated'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_spend_ts ON spend_events(ts_utc);
+            CREATE INDEX IF NOT EXISTS idx_spend_ws ON spend_events(workspace_id, ts_utc);
+            CREATE INDEX IF NOT EXISTS idx_spend_project ON spend_events(project_id, ts_utc);
+            CREATE INDEX IF NOT EXISTS idx_spend_source ON spend_events(source_id);
+
+            -- Unified read surface: legacy token_events + the DIRECT rows from
+            -- spend_events, projected into the token_events column shape (DIRECT's
+            -- workspace_id masquerades as session_id, which is exactly what the
+            -- workspace/project scope filters already key on). Every Usage/budget
+            -- reader selects FROM all_spend so DIRECT spend finally shows up.
+            CREATE VIEW IF NOT EXISTS all_spend AS
+                SELECT session_id, timestamp, input_tokens, output_tokens,
+                       cache_read, cache_create, model, cost_usd
+                FROM token_events
+                UNION ALL
+                SELECT workspace_id AS session_id, ts_utc AS timestamp,
+                       input_tokens, output_tokens,
+                       cache_read_tokens AS cache_read,
+                       cache_creation_tokens AS cache_create,
+                       model, cost_usd
+                FROM spend_events
+                WHERE surface = 'direct';
+
             CREATE TABLE IF NOT EXISTS projects (
                 id              TEXT PRIMARY KEY,
                 name            TEXT NOT NULL,
@@ -790,6 +846,35 @@ impl Db {
             self.meta_set("missions_backfill_v1", "done")?;
         }
 
+        // Backfill DIRECT spend history into the canonical ledger so past runs
+        // show up in Usage the moment this ships. One row per current run_stage
+        // that burned spend, attributed to its run's workspace/project. INSERT OR
+        // IGNORE + a deterministic key make it idempotent even before the flag is
+        // set. (Retired/archived attempts in stage_iterations are not backfilled;
+        // the live path captures each attempt going forward — a later slice can
+        // retro-fill them for exact parity with the retire-inclusive run meter.)
+        if self.meta_get("spend_events_direct_backfill_v1")?.is_none() {
+            self.conn.execute_batch(
+                r#"
+                INSERT OR IGNORE INTO spend_events
+                    (ts_utc, surface, project_id, workspace_id, source_id, attempt,
+                     model_raw, model, input_tokens, output_tokens,
+                     cache_read_tokens, cache_creation_tokens,
+                     provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key)
+                SELECT COALESCE(s.finished_at, r.created_at),
+                       'direct', w.project_id, r.workspace_id, s.id, 1,
+                       s.agent_model, s.agent_model, s.input_tokens, s.output_tokens,
+                       0, 0, NULL, s.cost_usd, s.cost_usd, 'computed',
+                       'direct-backfill:' || s.id
+                FROM run_stages s
+                JOIN runs r ON r.id = s.run_id
+                LEFT JOIN workspaces w ON w.id = r.workspace_id
+                WHERE (s.cost_usd > 0 OR s.input_tokens > 0 OR s.output_tokens > 0);
+                "#,
+            )?;
+            self.meta_set("spend_events_direct_backfill_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1094,6 +1179,42 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    // ─── Spend ledger (canonical, Phase 2) ────────────────────────
+
+    /// Insert a canonical spend event. `INSERT OR IGNORE` so a non-null
+    /// `idempotency_key` dedupes replays/retries (a NULL key always inserts —
+    /// SQLite treats NULLs as distinct under a UNIQUE constraint).
+    pub fn insert_spend_event(&self, ev: &SpendEvent) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO spend_events
+                (ts_utc, surface, project_id, workspace_id, source_id, attempt,
+                 model_raw, model, input_tokens, output_tokens,
+                 cache_read_tokens, cache_creation_tokens,
+                 provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![
+                ev.ts_utc,
+                ev.surface,
+                ev.project_id,
+                ev.workspace_id,
+                ev.source_id,
+                ev.attempt,
+                ev.model_raw,
+                ev.model,
+                ev.input_tokens,
+                ev.output_tokens,
+                ev.cache_read_tokens,
+                ev.cache_creation_tokens,
+                ev.provider_cost_usd,
+                ev.computed_cost_usd,
+                ev.cost_usd,
+                ev.cost_basis,
+                ev.idempotency_key,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn token_report(&self, session_id: Option<&str>) -> AppResult<TokenReport> {
         let (where_clause, filter_val) = match session_id {
             Some(id) => ("WHERE session_id = ?1", id.to_string()),
@@ -1104,8 +1225,8 @@ impl Db {
         let (total_input, total_output, total_cached, total_cost): (i64, i64, i64, f64) = {
             let sql = format!(
                 "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(cache_read),0), COALESCE(SUM(cost_usd),0)
-                 FROM token_events {where_clause}"
+                        COALESCE(SUM(cache_read + cache_create),0), COALESCE(SUM(cost_usd),0)
+                 FROM all_spend {where_clause}"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             if session_id.is_some() {
@@ -1123,7 +1244,7 @@ impl Db {
         let cost_by_session = {
             let sql = format!(
                 "SELECT s.name, COALESCE(SUM(e.cost_usd),0), COALESCE(SUM(e.input_tokens+e.output_tokens),0)
-                 FROM token_events e JOIN sessions s ON s.id = e.session_id
+                 FROM all_spend e JOIN sessions s ON s.id = e.session_id
                  {where_clause} GROUP BY e.session_id ORDER BY 2 DESC LIMIT 20"
             );
             let cost_entry_mapper = |r: &rusqlite::Row| -> rusqlite::Result<CostEntry> {
@@ -1147,7 +1268,7 @@ impl Db {
         let cost_by_model = {
             let sql = format!(
                 "SELECT model, COALESCE(SUM(cost_usd),0), COALESCE(SUM(input_tokens+output_tokens),0)
-                 FROM token_events {where_clause} GROUP BY model ORDER BY 2 DESC LIMIT 20"
+                 FROM all_spend {where_clause} GROUP BY model ORDER BY 2 DESC LIMIT 20"
             );
             let cost_entry_mapper = |r: &rusqlite::Row| -> rusqlite::Result<CostEntry> {
                 Ok(CostEntry {
@@ -1176,7 +1297,7 @@ impl Db {
             let sql = format!(
                 "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS hour,
                         SUM(input_tokens+output_tokens), SUM(cost_usd)
-                 FROM token_events
+                 FROM all_spend
                  WHERE timestamp >= ?1
                  {extra_and}
                  GROUP BY hour ORDER BY hour",
@@ -1222,7 +1343,7 @@ impl Db {
         let projected = {
             let sql = format!(
                 "SELECT COALESCE(SUM(cost_usd),0)
-                 FROM token_events
+                 FROM all_spend
                  WHERE timestamp >= ?1
                  {extra_and}",
                 extra_and = if session_id.is_some() {
@@ -2113,7 +2234,7 @@ impl Db {
             "workspace" => {
                 let sql = format!(
                     "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
-                     FROM token_events
+                     FROM all_spend
                      WHERE session_id = ?1 AND timestamp >= {since}"
                 );
                 let mut stmt = self.conn.prepare(&sql)?;
@@ -2124,7 +2245,7 @@ impl Db {
             "project" => {
                 let sql = format!(
                     "SELECT COALESCE(SUM(e.cost_usd), 0.0), COALESCE(SUM(e.input_tokens + e.output_tokens), 0)
-                     FROM token_events e
+                     FROM all_spend e
                      JOIN workspaces w ON w.id = e.session_id
                      WHERE w.project_id = ?1 AND e.timestamp >= {since}"
                 );
@@ -2137,7 +2258,7 @@ impl Db {
                 // global
                 let sql = format!(
                     "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
-                     FROM token_events
+                     FROM all_spend
                      WHERE timestamp >= {since}"
                 );
                 let mut stmt = self.conn.prepare(&sql)?;
@@ -2171,7 +2292,7 @@ impl Db {
             "SELECT model,
                     COALESCE(SUM(cost_usd), 0),
                     COALESCE(SUM(input_tokens + output_tokens), 0)
-             FROM token_events
+             FROM all_spend
              WHERE timestamp >= ?1 AND timestamp <= ?2
              GROUP BY model",
         )?;
@@ -2222,7 +2343,7 @@ impl Db {
     ) -> AppResult<String> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, session_id, model, input_tokens, output_tokens, cost_usd
-             FROM token_events
+             FROM all_spend
              WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp",
         )?;
@@ -3745,7 +3866,66 @@ impl Db {
              WHERE id = ?1",
             params![stage_id, status, input_tokens, output_tokens, cost_usd, artifact_json, now],
         )?;
+        // Mirror the burned spend into the canonical ledger so DIRECT shows up in
+        // Settings→Usage and counts against USD budgets (Phase 2). This is the
+        // single choke point for every stage completion (done / failed-with-usage
+        // / accept-partial), so all DIRECT spend flows through here exactly once
+        // per completion. A re-run is a fresh completion with a new `now`, hence a
+        // new idempotency key — every burned attempt stays counted (matching the
+        // retire-inclusive run meter). Best-effort: a ledger hiccup must not fail
+        // the run itself, and the authoritative run figure is still runs.cost_usd.
+        if cost_usd > 0.0 || input_tokens > 0 || output_tokens > 0 {
+            if let Err(e) = self.record_direct_spend(stage_id, &now, input_tokens, output_tokens, cost_usd) {
+                tracing::warn!(stage_id, error = %e, "failed to mirror DIRECT stage spend to the ledger");
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve a stage's workspace/project/model and append a `direct` spend
+    /// event. `finished_at`-derived idempotency key = one row per completion.
+    fn record_direct_spend(
+        &self,
+        stage_id: &str,
+        ts_utc: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cost_usd: f64,
+    ) -> AppResult<()> {
+        let attr: Option<(String, Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT r.workspace_id, w.project_id, s.agent_model
+                 FROM run_stages s
+                 JOIN runs r ON r.id = s.run_id
+                 LEFT JOIN workspaces w ON w.id = r.workspace_id
+                 WHERE s.id = ?1",
+                params![stage_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((workspace_id, project_id, model)) = attr else {
+            return Ok(()); // stage vanished — nothing to attribute
+        };
+        self.insert_spend_event(&SpendEvent {
+            ts_utc: ts_utc.to_string(),
+            surface: "direct".into(),
+            project_id,
+            workspace_id: Some(workspace_id),
+            source_id: Some(stage_id.to_string()),
+            attempt: 1,
+            model_raw: model.clone(),
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(cost_usd),
+            cost_usd,
+            cost_basis: "computed".into(),
+            idempotency_key: Some(format!("direct:{stage_id}:{ts_utc}")),
+        })
     }
 
     pub fn fail_run_stage(&self, stage_id: &str, error: &str) -> AppResult<()> {
@@ -4625,6 +4805,30 @@ pub struct PipelineStageRow {
     pub escalate_model: Option<String>,
     /// Escalation policy — the effort to bump to on the failed-retry (API only).
     pub escalate_effort: Option<crate::providers::Effort>,
+}
+
+/// A row for the canonical `spend_events` ledger.
+#[derive(Clone, Debug)]
+pub struct SpendEvent {
+    pub ts_utc: String,
+    /// 'talk' | 'run' | 'direct' | 'review' | 'adhoc'
+    pub surface: String,
+    pub project_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub source_id: Option<String>,
+    pub attempt: i64,
+    pub model_raw: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub provider_cost_usd: Option<f64>,
+    pub computed_cost_usd: Option<f64>,
+    pub cost_usd: f64,
+    /// 'provider' | 'computed' | 'subscription' | 'unpriced' | 'estimated'
+    pub cost_basis: String,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

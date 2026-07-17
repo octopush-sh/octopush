@@ -203,6 +203,38 @@ mod db_tests {
     }
 
     #[test]
+    fn spend_event_idempotency_key_dedupes() {
+        // The canonical ledger dedupes on idempotency_key (INSERT OR IGNORE), so
+        // a replayed/retried write can't double-count. A distinct key inserts.
+        let db = test_db();
+        let mk = |key: &str| crate::db::SpendEvent {
+            ts_utc: "2026-07-17T10:00:00+00:00".into(),
+            surface: "direct".into(),
+            project_id: None,
+            workspace_id: Some("ws1".into()),
+            source_id: Some("s1".into()),
+            attempt: 1,
+            model_raw: "claude-opus-4-8".into(),
+            model: "claude-opus-4-8".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(0.1),
+            cost_usd: 0.1,
+            cost_basis: "computed".into(),
+            idempotency_key: Some(key.into()),
+        };
+        db.insert_spend_event(&mk("k1")).unwrap();
+        db.insert_spend_event(&mk("k1")).unwrap(); // dup key → ignored
+        db.insert_spend_event(&mk("k2")).unwrap(); // new key → inserted
+        let rep = db.token_report(None).unwrap();
+        assert!((rep.total_cost_usd - 0.2).abs() < 1e-9, "k1 counted once + k2");
+        assert_eq!(rep.total_input, 200);
+    }
+
+    #[test]
     fn pty_scan_clamps_absurd_token_counts() {
         use crate::token_engine::scan_pty_output;
         // Regression (F18): a garbled "Total cost:" line with an absurd K value
@@ -3484,6 +3516,39 @@ mod run_crud_tests {
         assert!((cost - 0.75).abs() < 1e-9);
         assert_eq!(inp, 150);
         assert_eq!(out, 50);
+    }
+
+    #[test]
+    fn direct_spend_surfaces_in_usage_and_budgets() {
+        // Phase 2 headline (F1): completing a DIRECT stage mirrors its spend into
+        // the canonical ledger, so it appears in Settings→Usage AND counts against
+        // USD budgets — previously the orchestrator wrote no ledger row at all.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "api", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+
+        // Nothing recorded yet.
+        assert_eq!(db.token_report(None).unwrap().total_cost_usd, 0.0);
+
+        db.complete_run_stage(&stage, "done", 1000, 500, 0.42, None).unwrap();
+
+        // Usage now includes the DIRECT stage.
+        let rep = db.token_report(None).unwrap();
+        assert!((rep.total_cost_usd - 0.42).abs() < 1e-9);
+        assert_eq!(rep.total_input, 1000);
+        assert_eq!(rep.total_output, 500);
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-opus-4-8"));
+
+        // Budgets: workspace + global period spend see it (project too, via the join).
+        let (ws_cost, ws_tokens) = db.period_spend("workspace", &ws, "daily").unwrap();
+        assert!((ws_cost - 0.42).abs() < 1e-9);
+        assert_eq!(ws_tokens, 1500);
+        let (global_cost, _) = db.period_spend("global", "", "daily").unwrap();
+        assert!((global_cost - 0.42).abs() < 1e-9);
     }
 
     #[test]
