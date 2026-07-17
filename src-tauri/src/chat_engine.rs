@@ -743,7 +743,7 @@ impl ChatEngine {
         total_input: u64,
         total_output: u64,
     ) -> AppResult<()> {
-        let cost = token_engine::compute_cost(model, total_input, total_output, 0, 0);
+        let cost = token_engine::cost_for(model, total_input, total_output, 0, 0);
         self.insert_and_emit_message(
             app,
             workspace_id,
@@ -1413,7 +1413,7 @@ impl ChatEngine {
                 // this event must arrive before the done event so the frontend has the
                 // final message before it clears the streaming bubble.
                 if !final_text.is_empty() {
-                    let cost = token_engine::compute_cost(&request.model, total_input, total_output, 0, 0);
+                    let cost = token_engine::cost_for(&request.model, total_input, total_output, 0, 0);
                     self.insert_and_emit_message(
                         &app,
                         &request.workspace_id,

@@ -171,6 +171,38 @@ mod db_tests {
     }
 
     #[test]
+    fn model_prices_cost_is_cache_aware() {
+        use crate::token_engine::ModelPrices;
+        // Opus 4.8 per-M: in $5, out $25, cache-read $0.50, cache-write $6.25.
+        let p = ModelPrices {
+            input_per_m: 5.0,
+            output_per_m: 25.0,
+            cache_read_per_m: 0.5,
+            cache_creation_per_m: 6.25,
+        };
+        let c = p.cost(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((c - (5.0 + 25.0 + 0.5 + 6.25)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_authority_unknown_is_none() {
+        use crate::token_engine::{cost_for, prices_for};
+        // Genuinely-unknown model → None (so callers can flag unpriced), and
+        // cost_for yields 0 rather than a fabricated price.
+        assert!(prices_for("totally-unknown-model-xyz").is_none());
+        assert_eq!(cost_for("totally-unknown-model-xyz", 1000, 1000, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn cost_for_prices_current_and_dated_models() {
+        use crate::token_engine::cost_for;
+        // Catalog-or-hardcoded, a current model must price > 0 (regression F2),
+        // and a dated snapshot normalizes to its base and prices too (F20).
+        assert!(cost_for("claude-opus-4-8", 1_000_000, 0, 0, 0) > 0.0);
+        assert!(cost_for("claude-opus-4-8-20260601", 1_000_000, 0, 0, 0) > 0.0);
+    }
+
+    #[test]
     fn pty_scan_clamps_absurd_token_counts() {
         use crate::token_engine::scan_pty_output;
         // Regression (F18): a garbled "Total cost:" line with an absurd K value

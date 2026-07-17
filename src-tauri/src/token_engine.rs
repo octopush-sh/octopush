@@ -210,6 +210,84 @@ pub fn compute_cost_with_prices(
         / 1_000_000.0
 }
 
+// ─── Pricing authority ────────────────────────────────────────────────
+//
+// One resolver every cost path funnels through, so the ledger, the DIRECT
+// run meter, one-shot AI calls, and the PTY scanner can never disagree on a
+// model's price. Resolution is catalog-first (the user-editable, cache-aware
+// ProviderRouter), then the builtin hardcoded table as a legacy fallback,
+// then `None` — a genuinely unknown model so the caller can flag the spend as
+// unpriced instead of silently charging $0.
+
+/// Per-million-token prices for one model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelPrices {
+    pub input_per_m: f64,
+    pub output_per_m: f64,
+    pub cache_read_per_m: f64,
+    pub cache_creation_per_m: f64,
+}
+
+impl ModelPrices {
+    pub fn cost(&self, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+        compute_cost_with_prices(
+            self.input_per_m,
+            self.output_per_m,
+            self.cache_read_per_m,
+            self.cache_creation_per_m,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        )
+    }
+}
+
+/// Resolve a model's prices, catalog-first. `None` means the model is unknown
+/// to both the ProviderRouter catalog and the builtin table (so its spend is
+/// genuinely unpriced — distinct from a known local model priced at $0, which
+/// the catalog returns as `Some(zeros)`).
+pub fn prices_for(model: &str) -> Option<ModelPrices> {
+    if let Ok(router) = crate::provider_router::ProviderRouter::load() {
+        if let Some((_, mi)) = router.find_model(model) {
+            return Some(ModelPrices {
+                input_per_m: mi.input_cost_per_m,
+                output_per_m: mi.output_cost_per_m,
+                cache_read_per_m: mi.cache_read_cost_per_m,
+                cache_creation_per_m: mi.cache_creation_cost_per_m,
+            });
+        }
+    }
+    // Hardcoded fallback: a positive input price is the "known" discriminator
+    // (every builtin entry is nonzero; unknown/local ids fall through to $0).
+    let norm = normalize_model_id(model);
+    let input_per_m = cost_per_token(&norm, TokenType::Input) * 1_000_000.0;
+    if input_per_m > 0.0 {
+        return Some(ModelPrices {
+            input_per_m,
+            output_per_m: cost_per_token(&norm, TokenType::Output) * 1_000_000.0,
+            cache_read_per_m: cost_per_token(&norm, TokenType::CacheRead) * 1_000_000.0,
+            cache_creation_per_m: cost_per_token(&norm, TokenType::CacheCreation) * 1_000_000.0,
+        });
+    }
+    None
+}
+
+/// Canonical cost for a usage tuple, via [`prices_for`]. An unpriced model
+/// yields `0.0` — callers that care about the distinction should consult
+/// [`prices_for`] directly.
+pub fn cost_for(
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+) -> f64 {
+    prices_for(model)
+        .map(|p| p.cost(input, output, cache_read, cache_creation))
+        .unwrap_or(0.0)
+}
+
 // ─── Engine ───────────────────────────────────────────────────────────
 
 pub struct TokenEngine {
@@ -225,38 +303,14 @@ impl TokenEngine {
     /// the session's aggregate counters.
     pub fn record(&self, mut event: TokenEvent) -> AppResult<()> {
         if event.cost_usd == 0.0 {
-            // Try to look up per-model prices from ProviderRouter so that
-            // cache pricing is accurate for Anthropic models.
-            event.cost_usd = if let Ok(router) = crate::provider_router::ProviderRouter::load() {
-                if let Some((_, model_info)) = router.find_model(&event.model) {
-                    compute_cost_with_prices(
-                        model_info.input_cost_per_m,
-                        model_info.output_cost_per_m,
-                        model_info.cache_read_cost_per_m,
-                        model_info.cache_creation_cost_per_m,
-                        event.input_tokens,
-                        event.output_tokens,
-                        event.cache_read_tokens,
-                        event.cache_creation_tokens,
-                    )
-                } else {
-                    compute_cost(
-                        &event.model,
-                        event.input_tokens,
-                        event.output_tokens,
-                        event.cache_read_tokens,
-                        event.cache_creation_tokens,
-                    )
-                }
-            } else {
-                compute_cost(
-                    &event.model,
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.cache_read_tokens,
-                    event.cache_creation_tokens,
-                )
-            };
+            // Single pricing authority (catalog-first, cache-aware).
+            event.cost_usd = cost_for(
+                &event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_creation_tokens,
+            );
         }
         if event.timestamp.is_empty() {
             event.timestamp = Utc::now().to_rfc3339();
@@ -399,7 +453,9 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_create,
         model: model.clone(),
-        cost_usd: compute_cost(&model, input, output, cache_read, cache_create),
+        // Price via the single authority (catalog-first) rather than the raw
+        // hardcoded table, matching every other ledger path.
+        cost_usd: cost_for(&model, input, output, cache_read, cache_create),
     })
 }
 

@@ -4080,7 +4080,9 @@ pub async fn ai_complete(
     let client = crate::chat_engine::shared_http_client();
     let resp = provider.complete(&api_base, api_key.as_deref(), &req, client).await?;
     ensure_not_truncated(&resp.stop_reason)?;
-    let cost = crate::token_engine::compute_cost(
+    // Same pricing authority `record` uses, so the cost we return to the UI is
+    // exactly the one persisted to the ledger (no hardcoded-vs-router drift).
+    let cost = crate::token_engine::cost_for(
         &model,
         resp.input_tokens,
         resp.output_tokens,
