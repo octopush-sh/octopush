@@ -88,7 +88,9 @@ pub enum SpawnMode {
 // ---------------------------------------------------------------------------
 
 /// Optional callback invoked on each PTY read chunk (for token scanning).
-pub type OutputHook = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
+/// Args: `(session_id, seq, bytes)`. `seq` is the daemon's monotonic sequence
+/// number for the chunk — the scanner uses it to skip replayed scrollback.
+pub type OutputHook = Box<dyn Fn(&str, u64, &[u8]) + Send + 'static>;
 
 // ---------------------------------------------------------------------------
 // SpawnOptions (public API unchanged)
@@ -274,7 +276,7 @@ fn start_reader_thread(
 
             loop {
                 match rx.recv() {
-                    Ok(TermEvent::Data { bytes, .. }) => {
+                    Ok(TermEvent::Data { seq, bytes }) => {
                         let _ = app.emit(
                             "pty://data",
                             PtyDataEvent {
@@ -283,7 +285,7 @@ fn start_reader_thread(
                             },
                         );
                         if let Some(ref hook) = on_output {
-                            hook(&id, &bytes);
+                            hook(&id, seq, &bytes);
                         }
                     }
                     Ok(TermEvent::Exit { code }) => {

@@ -69,7 +69,7 @@ mod db_tests {
     #[test]
     fn agent_config_defaults() {
         let cfg = AgentConfig::default();
-        assert_eq!(cfg.model, "claude-opus-4-6");
+        assert_eq!(cfg.model, "claude-opus-4-8");
         assert_eq!(cfg.temperature, 1.0);
         assert_eq!(cfg.max_tokens, 8192);
     }
@@ -130,6 +130,84 @@ mod db_tests {
 
         let free = compute_cost("llama-3-local", 1_000_000, 1_000_000, 0, 0);
         assert_eq!(free, 0.0);
+    }
+
+    #[test]
+    fn pricing_current_models_nonzero() {
+        // Regression (F2): the current lineup must all price above zero —
+        // three of the four (opus-4-8 / sonnet-5 / fable-5) used to fall through
+        // to the $0 wildcard.
+        for model in [
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                compute_cost(model, 1_000_000, 1_000_000, 0, 0) > 0.0,
+                "{model} priced to $0"
+            );
+        }
+        // Fable 5: $10 in + $50 out; Opus 4.8: $5 in + $25 out.
+        assert!((compute_cost("claude-fable-5", 1_000_000, 1_000_000, 0, 0) - 60.0).abs() < 0.01);
+        assert!((compute_cost("claude-opus-4-8", 1_000_000, 1_000_000, 0, 0) - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn model_id_normalization() {
+        use crate::token_engine::normalize_model_id;
+        assert_eq!(normalize_model_id("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(normalize_model_id("claude-sonnet-5-20260203"), "claude-sonnet-5");
+        assert_eq!(
+            normalize_model_id("us.anthropic.claude-opus-4-8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(normalize_model_id("claude-opus-4-8[1m]"), "claude-opus-4-8");
+        assert_eq!(normalize_model_id("claude-opus-4-5@20251101"), "claude-opus-4-5");
+        // Haiku's real `-5` suffix must NOT be mistaken for a dated snapshot.
+        assert_eq!(normalize_model_id("claude-haiku-4-5"), "claude-haiku-4-5");
+        // A dated variant of a current model prices like its base (not $0).
+        assert!(compute_cost("claude-opus-4-8-20260601", 1_000_000, 0, 0, 0) > 0.0);
+    }
+
+    #[test]
+    fn pty_scan_clamps_absurd_token_counts() {
+        use crate::token_engine::scan_pty_output;
+        // Regression (F18): a garbled "Total cost:" line with an absurd K value
+        // must not overflow into a NEGATIVE row after the u64 → i64 DB cast.
+        let line = "Total cost: $1.00 | Input: 999999999999999999K | Output: 5K";
+        if let Some(ev) = scan_pty_output("sess", line.as_bytes()) {
+            assert!(ev.input_tokens <= 1_000_000_000_000);
+            assert!((ev.input_tokens as i64) >= 0);
+        }
+    }
+
+    #[test]
+    fn pty_scan_seq_gating_skips_replay() {
+        // Regression (F3): a daemon reattach replays scrollback from seq 0
+        // through the scanner hook. Chunks at or below the last-recorded seq are
+        // already-counted history and must be skipped, or every restart
+        // re-records the whole session with fresh timestamps.
+        let db = Arc::new(Mutex::new(test_db()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let s = test_session("gate-sess");
+        db.lock().upsert_session(&s).unwrap();
+
+        let payload =
+            r#"{"model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":500}}"#;
+
+        // First live chunk at seq 10 records one event.
+        engine.scan_and_record(&s.id, 10, payload.as_bytes());
+        assert_eq!(db.lock().list_token_events(&s.id).unwrap().len(), 1);
+
+        // Replay of the same chunk (seq 10) and an older chunk (seq 3) are skipped.
+        engine.scan_and_record(&s.id, 10, payload.as_bytes());
+        engine.scan_and_record(&s.id, 3, payload.as_bytes());
+        assert_eq!(db.lock().list_token_events(&s.id).unwrap().len(), 1);
+
+        // A genuinely newer chunk (seq 11) records again.
+        engine.scan_and_record(&s.id, 11, payload.as_bytes());
+        assert_eq!(db.lock().list_token_events(&s.id).unwrap().len(), 2);
     }
 
     #[test]

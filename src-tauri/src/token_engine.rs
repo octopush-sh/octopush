@@ -86,24 +86,75 @@ pub enum TokenType {
     CacheCreation,
 }
 
+/// Normalize a raw model id to its base catalog id for pricing lookups:
+/// strips provider prefixes (Bedrock/Vertex `us.anthropic.…` / `anthropic.…`),
+/// a bracketed capability suffix (`claude-opus-4-8[1m]`), a Vertex `@`-version
+/// separator, and a trailing dated snapshot (`-YYYYMMDD`). Exact-match pricing
+/// tables would otherwise silently price these variants at $0.
+pub fn normalize_model_id(model: &str) -> String {
+    let mut m = model.trim();
+    for prefix in ["us.anthropic.", "eu.anthropic.", "apac.anthropic.", "anthropic."] {
+        if let Some(rest) = m.strip_prefix(prefix) {
+            m = rest;
+            break;
+        }
+    }
+    if let Some(idx) = m.find('[') {
+        m = &m[..idx];
+    }
+    if let Some(idx) = m.find('@') {
+        m = &m[..idx];
+    }
+    // Trailing `-YYYYMMDD` (dash + exactly 8 digits at the very end).
+    if m.len() > 9 {
+        let tail = &m[m.len() - 9..];
+        if tail.starts_with('-') && tail[1..].bytes().all(|c| c.is_ascii_digit()) {
+            m = &m[..m.len() - 9];
+        }
+    }
+    m.to_string()
+}
+
 /// Per-million-token pricing. Returns $/token (i.e. already divided by 1M).
+///
+/// Interim catalog (Phase 0): kept in sync with the ProviderRouter builtin
+/// catalog so both pricing paths agree until Phase 1 unifies them. Cache prices
+/// follow Anthropic's standard economics — cache-read ≈ 0.1× input, cache-write
+/// (5-minute TTL) ≈ 1.25× input. Older ids are retained so historical events
+/// still re-price correctly.
 pub fn cost_per_token(model: &str, tt: TokenType) -> f64 {
-    let per_m = match (model, tt) {
-        // Claude Opus 4.6
+    let model = normalize_model_id(model);
+    let per_m = match (model.as_str(), tt) {
+        // Claude Fable 5
+        ("claude-fable-5", TokenType::Input) => 10.0,
+        ("claude-fable-5", TokenType::Output) => 50.0,
+        ("claude-fable-5", TokenType::CacheRead) => 1.0,
+        ("claude-fable-5", TokenType::CacheCreation) => 12.5,
+        // Claude Opus 4.8 / 4.7 (same price tier)
+        ("claude-opus-4-8", TokenType::Input) | ("claude-opus-4-7", TokenType::Input) => 5.0,
+        ("claude-opus-4-8", TokenType::Output) | ("claude-opus-4-7", TokenType::Output) => 25.0,
+        ("claude-opus-4-8", TokenType::CacheRead) | ("claude-opus-4-7", TokenType::CacheRead) => 0.5,
+        ("claude-opus-4-8", TokenType::CacheCreation) | ("claude-opus-4-7", TokenType::CacheCreation) => 6.25,
+        // Claude Opus 4.6 (legacy)
         ("claude-opus-4-6", TokenType::Input) => 15.0,
         ("claude-opus-4-6", TokenType::Output) => 75.0,
         ("claude-opus-4-6", TokenType::CacheRead) => 1.5,
         ("claude-opus-4-6", TokenType::CacheCreation) => 18.75,
-        // Claude Sonnet 4.6
+        // Claude Sonnet 5 (standard sticker; intro discount not modeled)
+        ("claude-sonnet-5", TokenType::Input) => 3.0,
+        ("claude-sonnet-5", TokenType::Output) => 15.0,
+        ("claude-sonnet-5", TokenType::CacheRead) => 0.3,
+        ("claude-sonnet-5", TokenType::CacheCreation) => 3.75,
+        // Claude Sonnet 4.6 (legacy)
         ("claude-sonnet-4-6", TokenType::Input) => 3.0,
         ("claude-sonnet-4-6", TokenType::Output) => 15.0,
         ("claude-sonnet-4-6", TokenType::CacheRead) => 0.3,
         ("claude-sonnet-4-6", TokenType::CacheCreation) => 3.75,
         // Claude Haiku 4.5
-        ("claude-haiku-4-5", TokenType::Input) => 0.80,
-        ("claude-haiku-4-5", TokenType::Output) => 4.0,
-        ("claude-haiku-4-5", TokenType::CacheRead) => 0.08,
-        ("claude-haiku-4-5", TokenType::CacheCreation) => 1.0,
+        ("claude-haiku-4-5", TokenType::Input) => 1.0,
+        ("claude-haiku-4-5", TokenType::Output) => 5.0,
+        ("claude-haiku-4-5", TokenType::CacheRead) => 0.10,
+        ("claude-haiku-4-5", TokenType::CacheCreation) => 1.25,
         // GPT-4o
         ("gpt-4o", TokenType::Input) => 2.50,
         ("gpt-4o", TokenType::Output) => 10.0,
@@ -218,6 +269,41 @@ impl TokenEngine {
             event.output_tokens,
         )?;
         Ok(())
+    }
+
+    /// Scan a PTY output chunk for a token-usage pattern and record it, gated by
+    /// a persisted per-session high-water sequence number so replayed scrollback
+    /// is never double-counted.
+    ///
+    /// A daemon reattach (pane reopen or app restart) replays the whole
+    /// scrollback from seq 0, feeding every historical chunk back through this
+    /// hook. The `octopush-pty-server` daemon outlives the app and its `seq` is
+    /// monotonic across restarts, so a chunk whose `seq` is at or below the last
+    /// seq we recorded a usage event for is guaranteed to be already-counted
+    /// history — skip it. We advance the high-water mark only when a chunk
+    /// actually yields an event, which both prevents duplicate recording and
+    /// keeps DB writes rare (a match is uncommon; a plain re-scan of an
+    /// unmatched replayed chunk is a cheap string search with no side effect).
+    pub fn scan_and_record(&self, session_id: &str, seq: u64, buf: &[u8]) {
+        let key = format!("pty_scan_seq:{session_id}");
+        let last = self
+            .db
+            .lock()
+            .meta_get(&key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if seq <= last {
+            return;
+        }
+        if let Some(ev) = scan_pty_output(session_id, buf) {
+            if let Err(e) = self.record(ev) {
+                tracing::warn!(session_id = %session_id, error = %e, "token scan record failed");
+                return;
+            }
+            let _ = self.db.lock().meta_set(&key, &seq.to_string());
+        }
     }
 
     /// Build an aggregate report, optionally filtered to a single session.
@@ -378,13 +464,24 @@ fn extract_json_object(s: &str) -> Option<&str> {
     None
 }
 
+/// Upper bounds guarding against garbled/hostile PTY text. A single event
+/// cannot realistically exceed these; without the caps a huge parsed value
+/// saturates on the `as u64` cast and then wraps NEGATIVE on the later
+/// `as i64` DB insert, poisoning aggregates.
+const MAX_EVENT_TOKENS: u64 = 1_000_000_000_000; // 1e12
+const MAX_EVENT_COST_USD: f64 = 1_000_000.0;
+
 fn parse_dollar_amount(s: &str) -> Option<f64> {
     let dollar = s.find('$')?;
     let rest = &s[dollar + 1..];
     let end = rest
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    let v: f64 = rest[..end].parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    Some(v.min(MAX_EVENT_COST_USD))
 }
 
 fn parse_k_value(s: &str, prefix: &str) -> Option<u64> {
@@ -394,10 +491,14 @@ fn parse_k_value(s: &str, prefix: &str) -> Option<u64> {
         .find(|c: char| !c.is_ascii_digit() && c != '.' && c != 'K' && c != 'k')
         .unwrap_or(rest.len());
     let raw = &rest[..end];
-    if raw.ends_with('K') || raw.ends_with('k') {
+    let value = if raw.ends_with('K') || raw.ends_with('k') {
         let num: f64 = raw[..raw.len() - 1].parse().ok()?;
-        Some((num * 1000.0) as u64)
+        if !num.is_finite() || num < 0.0 {
+            return None;
+        }
+        (num * 1000.0) as u64
     } else {
-        raw.parse().ok()
-    }
+        raw.parse().ok()?
+    };
+    Some(value.min(MAX_EVENT_TOKENS))
 }

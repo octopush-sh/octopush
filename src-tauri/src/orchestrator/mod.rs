@@ -1077,6 +1077,18 @@ impl Orchestrator {
                     if s.artifact.is_some() || s.error.is_some() {
                         self.db.lock().archive_stage_attempt(s, feedback.as_deref())?;
                     }
+                    // Retire the rejected attempt's spend onto the run BEFORE the
+                    // reset zeroes the row — the tokens were really burned. Without
+                    // this, `recompute_run_cost` (retired + live-stage sum) silently
+                    // drops them from `runs.cost_usd` and the savings baseline, and
+                    // repeated rejects can keep a run under its budget cap while
+                    // real money is spent. Mirrors the Resume / loop_back / rerun arms.
+                    self.db.lock().retire_stage_cost(
+                        run_id,
+                        s.cost_usd,
+                        s.input_tokens,
+                        s.output_tokens,
+                    )?;
                     if let Some(mt) = max_turns_override {
                         self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                     }
