@@ -184,6 +184,23 @@ impl ProviderRouter {
                 }
             }
 
+            // Migration: backfill missing BUILTIN models into an existing
+            // provider. The whole-provider append below only fires when the
+            // provider is absent, so a pre-existing "anthropic" block would
+            // never receive newly-shipped model ids (e.g. Opus 4.8, Sonnet 5,
+            // Fable 5) — leaving them unpriced ($0) on upgraded installs. Append
+            // any builtin model whose id isn't already present; on-disk prices
+            // for models the user already has are left untouched (respecting
+            // manual edits).
+            for p in &mut list {
+                let Some(def) = defaults.get(&p.name) else { continue };
+                for def_model in &def.models {
+                    if !p.models.iter().any(|m| m.id == def_model.id) {
+                        p.models.push(def_model.clone());
+                    }
+                }
+            }
+
             for (name, def) in &defaults {
                 if !list.iter().any(|p| p.name == *name) {
                     list.push(def.clone());
@@ -234,10 +251,23 @@ impl ProviderRouter {
     }
 
     pub fn find_model(&self, model_id: &str) -> Option<(&ProviderConfig, &ModelInfo)> {
+        // Exact match first; then retry against the normalized id so a dated
+        // snapshot / Bedrock-prefixed / bracket-suffixed variant still resolves
+        // to its base catalog entry instead of falling through to $0 pricing.
         for p in self.providers.values() {
             for m in &p.models {
                 if m.id == model_id {
                     return Some((p, m));
+                }
+            }
+        }
+        let normalized = crate::token_engine::normalize_model_id(model_id);
+        if normalized != model_id {
+            for p in self.providers.values() {
+                for m in &p.models {
+                    if m.id == normalized {
+                        return Some((p, m));
+                    }
                 }
             }
         }
@@ -341,6 +371,55 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_key_env: "ANTHROPIC_API_KEY".into(),
             models: vec![
                 ModelInfo {
+                    id: "claude-fable-5".into(),
+                    display_name: "Claude Fable 5".into(),
+                    input_cost_per_m: 10.0,
+                    output_cost_per_m: 50.0,
+                    cache_read_cost_per_m: 10.0 * 0.10,    // $1.00 / M
+                    cache_creation_cost_per_m: 10.0 * 1.25, // $12.50 / M
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["most capable".into(), "largest ctx".into()],
+                },
+                ModelInfo {
+                    id: "claude-opus-4-8".into(),
+                    display_name: "Claude Opus 4.8".into(),
+                    input_cost_per_m: 5.0,
+                    output_cost_per_m: 25.0,
+                    cache_read_cost_per_m: 5.0 * 0.10,    // $0.50 / M
+                    cache_creation_cost_per_m: 5.0 * 1.25, // $6.25 / M
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["best reasoning".into(), "largest ctx".into()],
+                },
+                ModelInfo {
+                    id: "claude-sonnet-5".into(),
+                    display_name: "Claude Sonnet 5".into(),
+                    input_cost_per_m: 3.0,
+                    output_cost_per_m: 15.0,
+                    cache_read_cost_per_m: 3.0 * 0.10,    // $0.30 / M
+                    cache_creation_cost_per_m: 3.0 * 1.25, // $3.75 / M
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["balanced".into(), "coding".into()],
+                },
+                ModelInfo {
+                    id: "claude-haiku-4-5".into(),
+                    display_name: "Claude Haiku 4.5".into(),
+                    input_cost_per_m: 1.0,
+                    output_cost_per_m: 5.0,
+                    cache_read_cost_per_m: 1.0 * 0.10,    // $0.10 / M
+                    cache_creation_cost_per_m: 1.0 * 1.25, // $1.25 / M
+                    max_context: 200_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["fast".into(), "cheap".into()],
+                },
+                // ── Legacy ids retained so historical runs still price correctly ──
+                ModelInfo {
                     id: "claude-opus-4-6".into(),
                     display_name: "Claude Opus 4.6".into(),
                     input_cost_per_m: 15.0,
@@ -350,7 +429,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,
-                    tags: vec!["largest ctx".into(), "best reasoning".into()],
+                    tags: vec![],
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
@@ -362,19 +441,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     max_context: 200_000,
                     supports_vision: true,
                     supports_tools: true,
-                    tags: vec!["balanced".into(), "coding".into()],
-                },
-                ModelInfo {
-                    id: "claude-haiku-4-5".into(),
-                    display_name: "Claude Haiku 4.5".into(),
-                    input_cost_per_m: 0.80,
-                    output_cost_per_m: 4.0,
-                    cache_read_cost_per_m: 0.80 * 0.10,    // $0.08 / M
-                    cache_creation_cost_per_m: 0.80 * 1.25, // $1.00 / M
-                    max_context: 200_000,
-                    supports_vision: true,
-                    supports_tools: true,
-                    tags: vec!["fast".into(), "cheap".into()],
+                    tags: vec![],
                 },
             ],
             rate_limits: RateLimits {
@@ -529,8 +596,13 @@ mod tests {
         assert!(providers.contains_key("anthropic"));
         assert!(providers.contains_key("openai"));
         let anthropic = &providers["anthropic"];
-        assert_eq!(anthropic.models.len(), 3);
+        // 4 current (fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy (opus-4-6, sonnet-4-6).
+        assert_eq!(anthropic.models.len(), 6);
         assert!(anthropic.enabled);
+        // Current-generation ids must be present and priced (regression F2).
+        for id in ["claude-opus-4-8", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5"] {
+            assert!(anthropic.models.iter().any(|m| m.id == id), "missing {id}");
+        }
     }
 
     #[test]

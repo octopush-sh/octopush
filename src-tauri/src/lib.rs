@@ -439,12 +439,10 @@ fn restore_active_sessions(app: tauri::AppHandle, state: &AppState) {
         guard.apply_env(&mut env);
 
         let db_for_hook = std::sync::Arc::clone(&state.db);
-        let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, bytes| {
-            if let Some(ev) = crate::token_engine::scan_pty_output(sid, bytes) {
-                let engine =
-                    crate::token_engine::TokenEngine::new(std::sync::Arc::clone(&db_for_hook));
-                let _ = engine.record(ev);
-            }
+        let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
+            let engine =
+                crate::token_engine::TokenEngine::new(std::sync::Arc::clone(&db_for_hook));
+            engine.scan_and_record(sid, seq, bytes);
         });
 
         if let Err(e) = state.pty.lock().spawn(

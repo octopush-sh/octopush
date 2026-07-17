@@ -80,7 +80,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             provider: Provider::Anthropic,
-            model: "claude-opus-4-6".to_string(),
+            model: "claude-opus-4-8".to_string(),
             temperature: 1.0,
             max_tokens: 8192,
             system_prompt_override: None,

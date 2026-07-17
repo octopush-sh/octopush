@@ -966,28 +966,28 @@ impl Orchestrator {
             .reference_model
             .clone()
             .or_else(crate::orchestrator::cost::pick_reference_model);
+        // Resolve the reference model's prices ONCE (a single ProviderRouter load)
+        // and price every stage's baseline arithmetically — the previous per-stage
+        // `baseline_cost` call would now trigger a router load (and providers.json
+        // write-back) on every iteration.
+        let ref_prices = reference
+            .as_deref()
+            .and_then(crate::token_engine::prices_for);
         let (retired_cost, retired_in, retired_out) = self.db.lock().get_retired_cost(run_id)?;
         let mut cost = retired_cost;
         let mut baseline = 0.0;
-        if let Some(ref_model) = &reference {
-            baseline += crate::orchestrator::cost::baseline_cost(
-                ref_model,
-                retired_in as u64,
-                retired_out as u64,
-            );
+        if let Some(p) = &ref_prices {
+            baseline += p.cost(retired_in as u64, retired_out as u64, 0, 0);
         }
         for s in &stages {
             cost += s.cost_usd;
-            if let Some(ref_model) = &reference {
-                baseline += crate::orchestrator::cost::baseline_cost(
-                    ref_model,
-                    s.input_tokens as u64,
-                    s.output_tokens as u64,
-                );
+            if let Some(p) = &ref_prices {
+                baseline += p.cost(s.input_tokens as u64, s.output_tokens as u64, 0, 0);
             }
         }
-        // If no premium reference exists, baseline = cost (savings $0, shown honestly).
-        if reference.is_none() || baseline < cost {
+        // If the reference model is unknown/unpriced, baseline = cost (savings $0,
+        // shown honestly rather than inventing a discount).
+        if ref_prices.is_none() || baseline < cost {
             baseline = cost;
         }
         self.db.lock().set_run_cost(run_id, cost, baseline)?;
@@ -1429,6 +1429,18 @@ impl Orchestrator {
                     if s.artifact.is_some() || s.error.is_some() {
                         self.db.lock().archive_stage_attempt(s, feedback.as_deref())?;
                     }
+                    // Retire the rejected attempt's spend onto the run BEFORE the
+                    // reset zeroes the row — the tokens were really burned. Without
+                    // this, `recompute_run_cost` (retired + live-stage sum) silently
+                    // drops them from `runs.cost_usd` and the savings baseline, and
+                    // repeated rejects can keep a run under its budget cap while
+                    // real money is spent. Mirrors the Resume / loop_back / rerun arms.
+                    self.db.lock().retire_stage_cost(
+                        run_id,
+                        s.cost_usd,
+                        s.input_tokens,
+                        s.output_tokens,
+                    )?;
                     if let Some(mt) = max_turns_override {
                         self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                     }

@@ -241,7 +241,7 @@ pub fn parse_response(response: Value) -> LlmResponse {
         }
     };
 
-    let input_tokens = response.get("usage")
+    let prompt_tokens = response.get("usage")
         .and_then(|u| u.get("prompt_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
@@ -249,6 +249,19 @@ pub fn parse_response(response: Value) -> LlmResponse {
         .and_then(|u| u.get("completion_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    // OpenAI-compatible providers report cached prompt tokens under
+    // `usage.prompt_tokens_details.cached_tokens` (DeepSeek uses the same key).
+    // Crucially, `prompt_tokens` is the FULL prompt count and already INCLUDES
+    // the cached ones, so we subtract to get the billable (fresh) input and
+    // surface the cached slice separately — otherwise cached input is priced at
+    // the full input rate. Providers that omit the field report 0 (no change).
+    let cache_read_tokens = response.get("usage")
+        .and_then(|u| u.get("prompt_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(prompt_tokens);
+    let input_tokens = prompt_tokens - cache_read_tokens;
 
     LlmResponse {
         text,
@@ -256,8 +269,8 @@ pub fn parse_response(response: Value) -> LlmResponse {
         stop_reason,
         input_tokens,
         output_tokens,
-        // OpenAI / DeepSeek / Ollama don't expose Anthropic-style cache fields.
-        cache_read_tokens: 0,
+        cache_read_tokens,
+        // OpenAI-style caching has no separate cache-write line — only reads.
         cache_creation_tokens: 0,
         // Header-based rate-limit hints are Anthropic-specific; none here.
         rate_limit: None,

@@ -1166,17 +1166,22 @@ impl Db {
             }
         };
 
-        // Hourly trend (last 24h)
+        // Hourly trend (last 24h). The cutoff is computed in Rust as an RFC3339
+        // UTC string so it string-compares correctly against the stored
+        // `to_rfc3339()` timestamps. (SQLite's `datetime('now', …)` renders a
+        // space-separated naive form whose lexical order diverges from the
+        // stored `T…+00:00` form — that bug widened the window to the whole day.)
+        let trend_cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let hourly_trend = {
             let sql = format!(
                 "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS hour,
                         SUM(input_tokens+output_tokens), SUM(cost_usd)
                  FROM token_events
-                 WHERE timestamp >= datetime('now', '-24 hours')
+                 WHERE timestamp >= ?1
                  {extra_and}
                  GROUP BY hour ORDER BY hour",
                 extra_and = if session_id.is_some() {
-                    "AND session_id = ?1"
+                    "AND session_id = ?2"
                 } else {
                     ""
                 }
@@ -1190,10 +1195,10 @@ impl Db {
             };
             let mut stmt = self.conn.prepare(&sql)?;
             if session_id.is_some() {
-                stmt.query_map(params![filter_val], trend_mapper)?
+                stmt.query_map(params![trend_cutoff, filter_val], trend_mapper)?
                     .collect::<Result<Vec<_>, _>>()?
             } else {
-                stmt.query_map([], trend_mapper)?
+                stmt.query_map(params![trend_cutoff], trend_mapper)?
                     .collect::<Result<Vec<_>, _>>()?
             }
         };
@@ -1209,24 +1214,28 @@ impl Db {
             None
         };
 
-        // Projected daily cost: extrapolate from last hour of activity.
+        // Projected daily cost: extrapolate from the last hour of activity.
+        // Same RFC3339 cutoff fix as the trend above — the previous
+        // `datetime('now', '-1 hour')` string-compared as the whole current
+        // day, inflating the projection by up to ~24×.
+        let proj_cutoff = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let projected = {
             let sql = format!(
                 "SELECT COALESCE(SUM(cost_usd),0)
                  FROM token_events
-                 WHERE timestamp >= datetime('now', '-1 hour')
+                 WHERE timestamp >= ?1
                  {extra_and}",
                 extra_and = if session_id.is_some() {
-                    "AND session_id = ?1"
+                    "AND session_id = ?2"
                 } else {
                     ""
                 }
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let last_hour: f64 = if session_id.is_some() {
-                stmt.query_row(params![filter_val], |r| r.get(0))?
+                stmt.query_row(params![proj_cutoff, filter_val], |r| r.get(0))?
             } else {
-                stmt.query_row([], |r| r.get(0))?
+                stmt.query_row(params![proj_cutoff], |r| r.get(0))?
             };
             last_hour * 24.0
         };

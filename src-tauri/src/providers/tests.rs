@@ -117,6 +117,36 @@ fn anthropic_parse_response_tool_use() {
 }
 
 #[test]
+fn openai_parse_response_splits_cached_input() {
+    // Regression (F11): OpenAI-style `prompt_tokens` INCLUDES cached tokens.
+    // We must surface the cached slice as cache_read and bill only the fresh
+    // remainder as input, or cached input is charged at the full input rate.
+    let resp = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_tokens_details": { "cached_tokens": 400 }
+        }
+    }));
+    assert_eq!(resp.input_tokens, 600, "billable input = prompt - cached");
+    assert_eq!(resp.cache_read_tokens, 400);
+    assert_eq!(resp.cache_creation_tokens, 0);
+    assert_eq!(resp.output_tokens, 200);
+}
+
+#[test]
+fn openai_parse_response_no_cache_field() {
+    // Providers that omit the details block report 0 cached (no change).
+    let resp = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 1000, "completion_tokens": 200 }
+    }));
+    assert_eq!(resp.input_tokens, 1000);
+    assert_eq!(resp.cache_read_tokens, 0);
+}
+
+#[test]
 fn openai_build_request_puts_system_in_messages() {
     let body = openai_compat::build_request(&sample_request());
     assert_eq!(body["model"], "test-model");
