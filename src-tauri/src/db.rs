@@ -771,7 +771,11 @@ impl Db {
                        w.created_at, w.last_active,
                        CASE WHEN w.status = 'archived' THEN w.last_active ELSE NULL END
                 FROM workspaces w
-                WHERE NOT EXISTS (SELECT 1 FROM missions m WHERE m.workspace_id = w.id);
+                WHERE NOT EXISTS (SELECT 1 FROM missions m WHERE m.workspace_id = w.id)
+                  -- Skip any workspace whose project row is missing: with
+                  -- foreign_keys=ON the FK insert would otherwise abort the whole
+                  -- backfill and wedge startup on every launch (flag never set).
+                  AND EXISTS (SELECT 1 FROM projects p WHERE p.id = w.project_id);
                 UPDATE runs SET mission_id =
                   (SELECT m.id FROM missions m WHERE m.workspace_id = runs.workspace_id)
                   WHERE mission_id IS NULL;
@@ -1517,7 +1521,11 @@ impl Db {
             )
             .map_err(|e| {
                 let s = e.to_string();
-                if s.contains("idx_missions_writer") || s.contains("UNIQUE") {
+                // Only the writer-uniqueness violation (partial index on
+                // `workspace_id`) maps to this message; SQLite names the column,
+                // not the index. A PK (`missions.id`) collision or any other
+                // UNIQUE must propagate untouched, not be mislabeled.
+                if s.contains("missions.workspace_id") {
                     crate::error::AppError::Other(
                         "another active mission is already writing this workspace".into(),
                     )
@@ -1560,6 +1568,21 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// The *active* mission owning a workspace, if any. Distinct from
+    /// `mission_for_workspace` (which prefers-but-falls-back-to archived) — the
+    /// pairing path needs "is there a live mission?" so it never re-adopts an
+    /// archived row.
+    pub fn active_mission_for_workspace(&self, workspace_id: &str) -> AppResult<Option<MissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+             FROM missions WHERE workspace_id = ?1 AND status = 'active'
+             ORDER BY created_at ASC LIMIT 1",
+        )?;
+        stmt.query_row(params![workspace_id], |r| row_to_mission(r))
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Partial update. `None` leaves a column unchanged (COALESCE); this cannot
     /// clear `linked_issue_key` to NULL — a later slice adds explicit-clear if
     /// the workspace-link mirroring needs it.
@@ -1575,6 +1598,10 @@ impl Db {
             "UPDATE missions SET
                 title = COALESCE(?2, title),
                 status = COALESCE(?3, status),
+                archived_at = CASE
+                    WHEN ?3 = 'archived' THEN COALESCE(archived_at, ?5)
+                    WHEN ?3 IS NOT NULL THEN NULL
+                    ELSE archived_at END,
                 linked_issue_key = COALESCE(?4, linked_issue_key),
                 updated_at = ?5
              WHERE id = ?1",
@@ -1705,6 +1732,11 @@ impl Db {
     }
 
     pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
+        // Cascade to missions in lockstep. `missions` has no FK on workspace_id
+        // (it is nullable for design/probe missions), so a deleted workspace's
+        // missions must be removed explicitly or they linger as active orphans.
+        self.conn
+            .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -1712,18 +1744,42 @@ impl Db {
     /// Mark a workspace archived (worktree removed, branch kept). The row
     /// survives but is hidden from the rail.
     pub fn archive_workspace(&self, id: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
             params![id],
+        )?;
+        // Keep the paired mission in lockstep: archive its active mission(s) so
+        // the writer slot frees and it stops surfacing as an active mission.
+        self.conn.execute(
+            "UPDATE missions SET status = 'archived', archived_at = ?2, updated_at = ?2
+             WHERE workspace_id = ?1 AND status = 'active'",
+            params![id, now],
         )?;
         Ok(())
     }
 
     /// Un-archive a workspace (status back to active).
     pub fn restore_workspace(&self, id: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "UPDATE workspaces SET status = 'active' WHERE id = ?1",
             params![id],
+        )?;
+        // Re-pair: reactivate the most-recent archived mission when the workspace
+        // has no active one, restoring the 1:1 code-mission invariant without
+        // ever minting a duplicate (the NOT EXISTS guard keeps the writer slot
+        // occupied by exactly one active mission).
+        self.conn.execute(
+            "UPDATE missions SET status = 'active', archived_at = NULL, updated_at = ?2
+             WHERE id = (
+                 SELECT id FROM missions WHERE workspace_id = ?1 AND status = 'archived'
+                 ORDER BY created_at DESC LIMIT 1
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM missions m2 WHERE m2.workspace_id = ?1 AND m2.status = 'active'
+             )",
+            params![id, now],
         )?;
         Ok(())
     }

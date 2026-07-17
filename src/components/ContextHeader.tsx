@@ -170,12 +170,17 @@ export function ContextHeader({
         </div>
       ) : (
         <div className="flex min-w-0 flex-col gap-0.5">
+          {/* Intent eyebrow. The slot height is reserved in BOTH states so
+              nothing shifts while missions load, and the chip reveals with
+              `.octo-pop-in` once resolved — no brass→mute flip. Every code
+              workspace has a mission, so the empty state is a sub-second load
+              artifact, never a resting state. */}
           {missionIntent ? (
             (() => {
               const Icon = INTENT_ICON[missionIntent] ?? Hammer;
               return (
                 <div
-                  className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute"
+                  className="octo-pop-in flex h-[14px] items-center gap-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute"
                   title="Mission intent"
                 >
                   <Icon size={10} aria-hidden />
@@ -184,7 +189,7 @@ export function ContextHeader({
               );
             })()
           ) : (
-            <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
+            <div className="flex h-[14px] items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
               Workspace
             </div>
           )}

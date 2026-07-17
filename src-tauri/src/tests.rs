@@ -8670,4 +8670,83 @@ mod mission_tests {
         // Title falls back to the workspace name when its task was empty.
         assert_eq!(db.mission_for_workspace("w2").unwrap().unwrap().title, "ws-b");
     }
+
+    #[test]
+    fn deleting_a_workspace_deletes_its_missions() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(
+            db.list_missions("p1").unwrap().len(),
+            0,
+            "a deleted workspace must not leave an orphan mission",
+        );
+        assert!(db.mission_for_workspace("w1").unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_then_restore_workspace_keeps_the_mission_in_lockstep() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+
+        db.archive_workspace("w1").unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 0, "archived ws hides its mission");
+        let archived = db.get_mission(&m.id).unwrap().unwrap();
+        assert_eq!(archived.status, "archived");
+        assert!(archived.archived_at.is_some(), "archiving stamps archived_at");
+
+        db.restore_workspace("w1").unwrap();
+        let active = db.list_missions("p1").unwrap();
+        assert_eq!(active.len(), 1, "restore reactivates exactly one mission");
+        assert_eq!(active[0].id, m.id, "restore reactivates the SAME mission — no duplicate");
+        assert!(active[0].archived_at.is_none());
+    }
+
+    #[test]
+    fn ensure_after_a_direct_archive_is_not_stuck() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m1 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        db.archive_mission(&m1.id).unwrap();
+        // ensure must NOT re-adopt the archived mission — it mints a fresh active
+        // one, so the workspace never ends up with zero active missions.
+        let m2 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        assert_ne!(m2.id, m1.id);
+        assert_eq!(m2.status, "active");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn primary_key_collision_is_not_reported_as_a_writer_conflict() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        // workspace_id = None keeps both out of the writer index, so the only
+        // possible violation is the primary key on `missions.id`.
+        db.insert_mission("dup", None, "p1", "build", "a", "active", None, "readonly", "none", "{}")
+            .unwrap();
+        let err = db
+            .insert_mission("dup", None, "p1", "build", "b", "active", None, "readonly", "none", "{}")
+            .unwrap_err();
+        assert!(
+            !format!("{err}").contains("already writing"),
+            "a PK collision must not be mislabeled as a writer conflict",
+        );
+    }
+
+    #[test]
+    fn update_mission_to_archived_stamps_archived_at() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        let m = crate::mission::create(&db, "p1", "build", "t", "readonly", "none", None, None).unwrap();
+        db.update_mission(&m.id, None, Some("archived"), None).unwrap();
+        let after = db.get_mission(&m.id).unwrap().unwrap();
+        assert_eq!(after.status, "archived");
+        assert!(after.archived_at.is_some(), "archiving via update must stamp archived_at");
+    }
 }

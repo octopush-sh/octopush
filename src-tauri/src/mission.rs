@@ -15,6 +15,18 @@ pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "per
 pub const GIT_ISOLATIONS: &[&str] = &["worktree", "readonly", "ephemeral", "pr"];
 /// The execution isolation axis (`cloud` reserved until M5).
 pub const EXEC_ISOLATIONS: &[&str] = &["none", "sandbox", "container", "cloud"];
+/// The mission status vocabulary.
+pub const STATUSES: &[&str] = &["active", "done", "archived"];
+
+/// Validate a caller-supplied mission status (the `update_mission` command uses
+/// this before persisting, so a bad string can't slip a mission out of the
+/// active set without the archived-at bookkeeping the archive path maintains).
+pub fn validate_status(status: &str) -> AppResult<()> {
+    if !STATUSES.contains(&status) {
+        return Err(AppError::Other(format!("unknown mission status '{status}'")));
+    }
+    Ok(())
+}
 
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
@@ -68,7 +80,7 @@ pub fn create(
 /// idempotent on `(project_id, branch)` upstream, so callers may call this on
 /// every outcome).
 pub fn ensure_for_workspace(db: &Db, ws: &WorkspaceRow, intent: &str) -> AppResult<MissionRow> {
-    if let Some(existing) = db.mission_for_workspace(&ws.id)? {
+    if let Some(existing) = db.active_mission_for_workspace(&ws.id)? {
         return Ok(existing);
     }
     let title = if ws.task.trim().is_empty() { ws.name.as_str() } else { ws.task.as_str() };

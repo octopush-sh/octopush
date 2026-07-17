@@ -626,6 +626,9 @@ pub async fn update_mission(
     status: Option<String>,
     linked_issue_key: Option<String>,
 ) -> AppResult<crate::db::MissionRow> {
+    if let Some(s) = status.as_deref() {
+        crate::mission::validate_status(s)?;
+    }
     let db = state.db.lock();
     db.update_mission(
         &mission_id,
