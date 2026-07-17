@@ -369,6 +369,7 @@ import type {
   GitStatus,
   Issue,
   IssueTrackerConfig,
+  Mission,
   ModelSuggestion,
   ModelWithProvider,
   GhIssue,
@@ -580,6 +581,22 @@ export const ipc = {
                     branch: string, fromBranch: string, setupScript: string) =>
     invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
+
+  // ─── Missions ───────────────────────────────────────────────────
+  listMissions: (projectId: string) => invoke<Mission[]>("list_missions", { projectId }),
+  getMission: (missionId: string) => invoke<Mission | null>("get_mission", { missionId }),
+  createMission: (
+    projectId: string, intent: string, title: string,
+    gitIsolation: string, execIsolation: string,
+    workspaceId: string | null, linkedIssueKey: string | null,
+  ) =>
+    invoke<Mission>("create_mission", {
+      projectId, intent, title, gitIsolation, execIsolation, workspaceId, linkedIssueKey,
+    }),
+  updateMission: (
+    missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
+  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey }),
+  archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),

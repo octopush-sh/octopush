@@ -28,6 +28,7 @@ mod state;
 pub mod sync;
 pub mod talk_shell;
 pub mod workspace;
+pub mod mission;
 pub mod template;
 pub mod theme;
 pub mod token_engine;
@@ -177,6 +178,12 @@ pub fn run() {
             commands::rename_workspace,
             commands::update_workspace_link,
             commands::update_project_jira_key,
+            // Missions
+            commands::create_mission,
+            commands::list_missions,
+            commands::get_mission,
+            commands::update_mission,
+            commands::archive_mission,
             commands::get_git_status,
             commands::list_branches,
             commands::workspaces_git_summary,

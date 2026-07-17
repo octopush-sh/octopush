@@ -1,0 +1,85 @@
+//! Mission lifecycle — the single shared code path for creating and pairing
+//! missions, used by both the Tauri command layer and the `octopush-mcp` binary
+//! (mirrors the role of [`crate::workspace`]). A mission is a thread of intent;
+//! isolation is a property it chooses on two axes (git-state × execution). The
+//! worktree stops being the unit and becomes one value of the git-state axis.
+
+use crate::db::{Db, MissionRow, WorkspaceRow};
+use crate::error::{AppError, AppResult};
+
+/// The intent taxonomy. `build`/`fix` are code missions (worktree default);
+/// `review`/`probe`/`design`/`perf`/`ops` arrive with later movements but the
+/// enum is validated from day one so the data model never holds a stray value.
+pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "perf", "ops"];
+/// The git-state isolation axis.
+pub const GIT_ISOLATIONS: &[&str] = &["worktree", "readonly", "ephemeral", "pr"];
+/// The execution isolation axis (`cloud` reserved until M5).
+pub const EXEC_ISOLATIONS: &[&str] = &["none", "sandbox", "container", "cloud"];
+
+fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
+    if !INTENTS.contains(&intent) {
+        return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
+    }
+    if !GIT_ISOLATIONS.contains(&git_isolation) {
+        return Err(AppError::Other(format!("unknown git isolation '{git_isolation}'")));
+    }
+    if !EXEC_ISOLATIONS.contains(&exec_isolation) {
+        return Err(AppError::Other(format!("unknown exec isolation '{exec_isolation}'")));
+    }
+    Ok(())
+}
+
+/// Create a mission. Validates the two isolation axes; the writer-uniqueness
+/// invariant (never two active missions writing one checkout) is enforced by the
+/// partial unique index and surfaced as a legible error from `insert_mission`.
+#[allow(clippy::too_many_arguments)]
+pub fn create(
+    db: &Db,
+    project_id: &str,
+    intent: &str,
+    title: &str,
+    git_isolation: &str,
+    exec_isolation: &str,
+    workspace_id: Option<&str>,
+    linked_issue_key: Option<&str>,
+) -> AppResult<MissionRow> {
+    validate(intent, git_isolation, exec_isolation)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    db.insert_mission(
+        &id,
+        workspace_id,
+        project_id,
+        intent,
+        title,
+        "active",
+        linked_issue_key,
+        git_isolation,
+        exec_isolation,
+        "{}",
+    )?;
+    db.get_mission(&id)?
+        .ok_or_else(|| AppError::Other("mission vanished right after insert".into()))
+}
+
+/// Idempotent pairing for a code workspace: return the existing active mission
+/// if one already owns the workspace, else create a `worktree` mission for it.
+/// Guarantees the invariant "no workspace without a mission" from day one, and
+/// stays a no-op when a workspace is reused/restored/adopted (create is
+/// idempotent on `(project_id, branch)` upstream, so callers may call this on
+/// every outcome).
+pub fn ensure_for_workspace(db: &Db, ws: &WorkspaceRow, intent: &str) -> AppResult<MissionRow> {
+    if let Some(existing) = db.mission_for_workspace(&ws.id)? {
+        return Ok(existing);
+    }
+    let title = if ws.task.trim().is_empty() { ws.name.as_str() } else { ws.task.as_str() };
+    create(
+        db,
+        &ws.project_id,
+        intent,
+        title,
+        "worktree",
+        "none",
+        Some(&ws.id),
+        ws.linked_issue_key.as_deref(),
+    )
+}
