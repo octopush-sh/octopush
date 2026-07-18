@@ -106,6 +106,33 @@ fn render_profile(subpaths: &[String], literals: &[String]) -> String {
     p
 }
 
+/// Resolve the effective sandbox write-roots for a mission's execution, unifying
+/// the two isolation axes into one confinement decision:
+///
+/// - **`git_isolation = "readonly"`** (review/probe missions) is *read-only by
+///   construction*: the sandbox is forced ON with **no workspace in the write
+///   roots** (temp-only writes), so the agent can read the checkout but never
+///   modify it — regardless of the mission's own `exec_isolation`.
+/// - else **`exec_isolation = "sandbox"`** → confine writes to the workspace.
+/// - else → `None` (unconfined; a `none`/unimplemented tier is handled by the
+///   caller / `cli_runner`'s fail-closed match).
+///
+/// `Some(vec![])` means "sandboxed, temp-only"; `Some(vec![ws])` means
+/// "sandboxed, workspace-writable"; `None` means "not sandboxed". Pure.
+pub fn sandbox_write_roots(
+    git_isolation: &str,
+    exec_isolation: &str,
+    workspace_path: &str,
+) -> Option<Vec<String>> {
+    if git_isolation == "readonly" {
+        Some(Vec::new())
+    } else if exec_isolation == "sandbox" {
+        Some(vec![workspace_path.to_string()])
+    } else {
+        None
+    }
+}
+
 /// Build the seatbelt profile text for a mission's write roots, resolving the
 /// system dirs from the environment.
 pub fn build_seatbelt_profile(mission_write_roots: &[String]) -> String {
@@ -251,6 +278,18 @@ mod tests {
     fn system_write_files_covers_the_claude_state_file() {
         assert_eq!(system_write_files(Some("/home/u")), vec!["/home/u/.claude.json".to_string()]);
         assert!(system_write_files(None).is_empty());
+    }
+
+    #[test]
+    fn sandbox_write_roots_makes_readonly_temp_only_and_sandbox_workspace_writable() {
+        // readonly forces the sandbox on with NO workspace root (temp-only), even
+        // if the mission's exec_isolation says "none".
+        assert_eq!(sandbox_write_roots("readonly", "none", "/ws"), Some(vec![]));
+        assert_eq!(sandbox_write_roots("readonly", "sandbox", "/ws"), Some(vec![]));
+        // a normal sandboxed mission may write its workspace.
+        assert_eq!(sandbox_write_roots("worktree", "sandbox", "/ws"), Some(vec!["/ws".to_string()]));
+        // an unsandboxed writer mission is not confined.
+        assert_eq!(sandbox_write_roots("worktree", "none", "/ws"), None);
     }
 
     #[test]

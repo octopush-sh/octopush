@@ -17,6 +17,7 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
   const showUpgrade = useUpgradeStore((s) => s.show);
   const missionId = useMissionsStore((s) => s.missionByWorkspaceId[workspaceId]?.id ?? null);
   const execIso = useMissionsStore((s) => s.missionByWorkspaceId[workspaceId]?.execIsolation ?? null);
+  const gitIso = useMissionsStore((s) => s.missionByWorkspaceId[workspaceId]?.gitIsolation ?? null);
   const setExecIsolation = useMissionsStore((s) => s.setExecIsolation);
   const [enabling, setEnabling] = useState(false);
 
@@ -61,7 +62,15 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
         <Moon size={11} aria-hidden />
         Runs unattended
       </span>
-      {sandboxed ? (
+      {gitIso === "readonly" ? (
+        <span
+          className="flex items-center gap-1 text-octo-verdigris"
+          title="Read-only — this mission's agents read the checkout but can't modify it"
+        >
+          <Shield size={11} aria-hidden />
+          read-only
+        </span>
+      ) : sandboxed ? (
         <span
           className="flex items-center gap-1 text-octo-verdigris"
           title="Sandboxed — the agent's writes are confined to the workspace"

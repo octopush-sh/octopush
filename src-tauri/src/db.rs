@@ -1891,6 +1891,27 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// The `git_isolation` of an active mission on this workspace that DIFFERS
+    /// from `git_isolation`, if any. Keeps one checkout to a single isolation
+    /// mode — the invariant the `active_mission_for_workspace`-based confinement
+    /// resolution relies on (a readonly + writer mix on one checkout would be
+    /// unsafe). `None` = no conflict.
+    pub fn conflicting_active_isolation(
+        &self,
+        workspace_id: &str,
+        git_isolation: &str,
+    ) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT git_isolation FROM missions
+                 WHERE workspace_id = ?1 AND status = 'active' AND git_isolation != ?2 LIMIT 1",
+                params![workspace_id, git_isolation],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Partial update. `None` leaves a column unchanged (COALESCE); this cannot
     /// clear `linked_issue_key` to NULL — a later slice adds explicit-clear if
     /// the workspace-link mirroring needs it.
