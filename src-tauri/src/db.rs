@@ -927,6 +927,28 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
         )?;
         if self.meta_get("spend_events_mission_backfill_v1")?.is_none() {
+            // Pass 1: attribute each spend to the mission whose lifetime
+            // [created_at, archived_at) actually brackets its ts_utc — so an
+            // archived→recreated mission on the same workspace keeps its own
+            // historical cost instead of donating it to the survivor. The ts_utc
+            // correlation lives in the WHERE only: SQLite does not resolve an
+            // outer-table reference inside a subquery's ORDER BY (it does in the
+            // WHERE, which is why workspace_id correlation works).
+            self.conn.execute(
+                "UPDATE spend_events SET mission_id = (
+                     SELECT m.id FROM missions m
+                     WHERE m.workspace_id = spend_events.workspace_id
+                       AND m.created_at <= spend_events.ts_utc
+                       AND (m.archived_at IS NULL OR m.archived_at > spend_events.ts_utc)
+                     ORDER BY m.created_at DESC LIMIT 1
+                 )
+                 WHERE mission_id IS NULL AND workspace_id IS NOT NULL",
+                [],
+            )?;
+            // Pass 2: rows no mission bracketed (the common case — the M1 backfill
+            // stamped every mission with a recent created_at, so pre-mission spend
+            // predates them all) fall back to the earliest non-archived mission,
+            // preserving the original single-mission behaviour.
             self.conn.execute(
                 "UPDATE spend_events SET mission_id = (
                      SELECT m.id FROM missions m
@@ -1959,14 +1981,17 @@ impl Db {
         let Some(project_id) = project_id else { return Ok(()) }; // workspace gone
         let mission_id = self.active_mission_for_workspace(workspace_id)?.map(|m| m.id);
         // All work_spans timestamps come from Utc::now().to_rfc3339() (same
-        // format + offset), so a string `>` on ended_at is chronological.
+        // format + offset), so a string `>` on ended_at is chronological. Match
+        // on mission_id too (`IS` so NULL==NULL): if the workspace's active
+        // mission changed mid-window we must open a fresh span, not extend the
+        // old mission's — otherwise worked time is attributed to the wrong one.
         let recent: Option<String> = self
             .conn
             .query_row(
                 "SELECT id FROM work_spans
-                 WHERE workspace_id = ?1 AND surface = ?2 AND ended_at > ?3
+                 WHERE workspace_id = ?1 AND surface = ?2 AND ended_at > ?3 AND mission_id IS ?4
                  ORDER BY ended_at DESC LIMIT 1",
-                params![workspace_id, surface, cutoff],
+                params![workspace_id, surface, cutoff, mission_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -3218,10 +3243,17 @@ impl Db {
         }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+        // Stamp the run's mission at birth so DIRECT spend/savings/run-count roll
+        // up in the Logbook. `record_direct_spend` and `mission_run_stats` both
+        // read `runs.mission_id`; without this they'd stay NULL forever (only the
+        // one-shot backfill ever wrote the column otherwise).
+        let mission_id = self
+            .active_mission_for_workspace(workspace_id)?
+            .map(|m| m.id);
         self.conn.execute(
-            "INSERT INTO runs (id, workspace_id, pipeline_id, task, status, reference_model, linked_issue_key, created_at)
-             VALUES (?1,?2,?3,?4,'draft',?5,?6,?7)",
-            params![id, workspace_id, pipeline_id, task, reference_model, linked_issue_key, now],
+            "INSERT INTO runs (id, workspace_id, pipeline_id, task, status, reference_model, linked_issue_key, created_at, mission_id)
+             VALUES (?1,?2,?3,?4,'draft',?5,?6,?7,?8)",
+            params![id, workspace_id, pipeline_id, task, reference_model, linked_issue_key, now, mission_id],
         )?;
         for s in &stages {
             let model = stage_model_overrides

@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { Reveal } from "./primitives/Reveal";
 import { ipc } from "../lib/ipc";
 import { useMissionsStore } from "../stores/missionsStore";
+import { useChatStore } from "../stores/chatStore";
+import { useRunsStore } from "../stores/runsStore";
 import type { LogbookMissionRow } from "../lib/types";
 
 /** Compact worked-time formatting: `45s` · `12m` · `3h 20m`. */
@@ -23,34 +25,49 @@ function fmtHours(secs: number): string {
  */
 export function LogbookCard({ workspaceId }: { workspaceId: string }) {
   const missionId = useMissionsStore((s) => s.missionByWorkspaceId[workspaceId]?.id ?? null);
+  // Refresh signals: a TALK turn completing (streaming true→false) and a DIRECT
+  // run changing status both land new spend/hours we should re-read. Keyed on
+  // status only (not cost) so live per-tick cost updates don't cause a fetch
+  // storm — a run settling is the meaningful edge.
+  const streaming = useChatStore((s) => s.streamingByWs[workspaceId] ?? false);
+  const runsSig = useRunsStore((s) =>
+    (s.runsByWs[workspaceId] ?? []).map((r) => r.status).join(","),
+  );
   const [open, setOpen] = useState(true);
   const [row, setRow] = useState<LogbookMissionRow | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const seq = useRef(0);
+  const prevMission = useRef<string | null>(null);
 
   useEffect(() => {
     if (!missionId) {
+      seq.current += 1;
+      prevMission.current = null;
       setRow(null);
       setLoaded(false);
       return;
     }
-    let cancelled = false;
-    setLoaded(false);
+    // Clear only when the mission itself changed — a plain refresh updates the
+    // figures in place, so numbers never blink to empty on a background refetch.
+    if (prevMission.current !== missionId) {
+      prevMission.current = missionId;
+      setRow(null);
+      setLoaded(false);
+    }
+    const token = ++seq.current;
     const to = new Date().toISOString();
     const from = "2000-01-01T00:00:00+00:00"; // mission lifetime
     void ipc
       .logbookSummary("mission", missionId, from, to)
       .then((rows) => {
-        if (cancelled) return;
+        if (seq.current !== token) return; // a newer load superseded this one
         setRow(rows[0] ?? null);
         setLoaded(true);
       })
       .catch(() => {
-        if (!cancelled) setLoaded(true);
+        if (seq.current === token) setLoaded(true);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [missionId]);
+  }, [missionId, streaming, runsSig]);
 
   if (!missionId) return null;
 

@@ -9130,4 +9130,51 @@ mod mission_tests {
         assert_eq!(db.logbook_summary("global", None, from, to).unwrap().len(), 1);
         assert!(db.logbook_summary("bogus", None, from, to).is_err());
     }
+
+    #[test]
+    fn create_run_stamps_the_active_mission_so_direct_rolls_up() {
+        // Regression (M2.1 review #1): a run must carry mission_id at birth, else
+        // DIRECT spend / savings / run-count never roll up into the Logbook —
+        // create_run was the only write path and it left the column NULL.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        db.create_run("w1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+
+        let rows = db
+            .logbook_summary("mission", Some(&m.id), "2026-01-01", "2027-01-01")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runs_count, 1, "the run is attributed to its mission");
+    }
+
+    #[test]
+    fn record_activity_splits_the_span_when_the_mission_changes() {
+        // Regression (M2.1 review #3): a mission change inside the idle window must
+        // open a fresh span, not extend the previous mission's — else worked time
+        // is silently attributed to the wrong mission.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1);
+
+        // Retire mission A and pair a fresh writer on the same workspace.
+        db.archive_mission(&a.id).unwrap();
+        crate::mission::create(&db, "p1", "build", "second", "worktree", "none", Some("w1"), None)
+            .unwrap();
+
+        // Same surface, still within the idle window, but a DIFFERENT active
+        // mission → a new span, not an extend of A's.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2, "mission change opens a fresh span");
+    }
 }
