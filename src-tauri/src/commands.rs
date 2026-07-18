@@ -2358,10 +2358,26 @@ pub async fn spawn_or_attach_terminal(
     use crate::pty_manager::{SpawnMode, SpawnOptions};
 
     let db_for_hook = std::sync::Arc::clone(&state.db);
+    // Logbook: resolve the terminal's workspace once, then beat coalesced PTY
+    // activity from the output hook — throttled to ≤1 write/min per terminal
+    // (record_activity coalesces into one span, so a beat a minute keeps a live
+    // terminal's span growing while output flows, with negligible cost during
+    // heavy output; the span closes on its own after the idle window).
+    let ws_for_activity = state.db.lock().workspace_for_terminal(&id).ok().flatten();
+    let db_for_activity = std::sync::Arc::clone(&state.db);
+    let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
         let engine =
             crate::token_engine::TokenEngine::new(std::sync::Arc::clone(&db_for_hook));
         engine.scan_and_record(sid, seq, bytes);
+        if let Some(ws) = &ws_for_activity {
+            let now = chrono::Utc::now().timestamp();
+            let prev = last_beat.load(std::sync::atomic::Ordering::Relaxed);
+            if now - prev >= 60 {
+                last_beat.store(now, std::sync::atomic::Ordering::Relaxed);
+                let _ = db_for_activity.lock().record_activity(ws, "terminal", "pty");
+            }
+        }
     });
 
     let mode = state.pty.lock().spawn_or_attach(
@@ -4676,6 +4692,10 @@ pub async fn ai_complete(
         // Best-effort: a recording failure must not fail the AI call itself.
         if let Err(e) = state.tokens.record(ai_token_event(workspace_id.as_deref(), &model, &resp, cost), surface) {
             tracing::warn!(error = %e, "failed to record ai_complete token event");
+        }
+        // Logbook: AI review on a workspace is review work on its mission.
+        if let Some(ws) = workspace_id.as_deref() {
+            let _ = state.db.lock().record_activity(ws, "review", "ai");
         }
     }
     let (input_tokens, output_tokens) = (resp.input_tokens, resp.output_tokens);

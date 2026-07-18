@@ -2531,6 +2531,19 @@ impl Db {
 
     // ─── Terminals ────────────────────────────────────────────────
 
+    /// The workspace a terminal belongs to — resolved once at spawn so the
+    /// Logbook can attribute PTY activity without a lookup per output chunk.
+    pub fn workspace_for_terminal(&self, terminal_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT workspace_id FROM terminals WHERE id = ?1",
+                params![terminal_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_terminals(&self, workspace_id: &str) -> AppResult<Vec<TerminalRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, label, position, created_at
