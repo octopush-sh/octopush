@@ -2,7 +2,27 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { WorkspaceRail, type ProjectGroup } from "./WorkspaceRail";
 import { useAttentionStore } from "../stores/attentionStore";
-import type { Workspace } from "../lib/types";
+import { useMissionsStore } from "../stores/missionsStore";
+import type { Workspace, Mission } from "../lib/types";
+
+function makeMission(overrides: Partial<Mission> = {}): Mission {
+  return {
+    id: "m-1",
+    workspaceId: "ws-1",
+    projectId: "proj-1",
+    intent: "build",
+    title: "t",
+    status: "active",
+    linkedIssueKey: null,
+    gitIsolation: "worktree",
+    execIsolation: "none",
+    payload: "{}",
+    createdAt: "2026-05-16T00:00:00Z",
+    updatedAt: "2026-05-16T00:00:00Z",
+    archivedAt: null,
+    ...overrides,
+  };
+}
 
 function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
   return {
@@ -345,7 +365,7 @@ describe("WorkspaceRail", () => {
     // Open PR chip carries an accessible title
     expect(screen.getByTitle(/open pull request/i)).toBeInTheDocument();
     // Dirty chip on a non-active workspace (row chip uses the exact phrase;
-    // the header aggregate differs — "N workspace(s) with uncommitted changes").
+    // the header aggregate differs — "N mission(s) with uncommitted changes").
     expect(screen.getByTitle("Uncommitted changes")).toBeInTheDocument();
   });
 
@@ -367,7 +387,7 @@ describe("WorkspaceRail", () => {
       />,
     );
     // 2 workspaces dirty, 1 open PR → header aggregate chips with those titles.
-    expect(screen.getByTitle(/2 workspaces with uncommitted changes/i)).toBeInTheDocument();
+    expect(screen.getByTitle(/2 missions with uncommitted changes/i)).toBeInTheDocument();
     expect(screen.getByTitle(/1 open pr/i)).toBeInTheDocument();
   });
 
@@ -490,5 +510,41 @@ describe("WorkspaceRail", () => {
     expect(container.querySelector(".animate-attention-pulse")).not.toBeNull();
 
     useAttentionStore.setState({ flagsByWs: {} });
+  });
+
+  it("renders the mission-intent glyph for a workspace's active mission", () => {
+    useMissionsStore.setState({
+      missionsByProjectId: {},
+      missionByWorkspaceId: { "ws-1": makeMission({ workspaceId: "ws-1", intent: "fix" }) },
+    });
+    const projects: ProjectGroup[] = [
+      { id: "proj-1", name: "Project", workspaces: [makeWorkspace({ id: "ws-1", name: "Alpha" })] },
+    ];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="ws-1"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+      />,
+    );
+    // The reserved intent slot carries a "{intent} mission" title.
+    expect(screen.getByTitle("fix mission")).toBeInTheDocument();
+    useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
+  });
+
+  it("shows the 'No missions yet' empty state for a project with no rows", () => {
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces: [] }];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId={null}
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("No missions yet")).toBeInTheDocument();
   });
 });

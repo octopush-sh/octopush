@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  ChevronDown, GripVertical, Plus,
+  ChevronDown, GripVertical, Plus, Hammer,
   GitCommitHorizontal, GitPullRequest, ArrowUp, ArrowDown,
 } from "lucide-react";
 import {
@@ -23,6 +23,8 @@ import { resolveMonogram, TINTS } from "../lib/monogram";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { useMissionsStore } from "../stores/missionsStore";
+import { INTENT_ICON } from "../lib/missionIntent";
 import { ProjectMark } from "./icons/ProjectMark";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
 
@@ -133,7 +135,7 @@ export function WorkspaceRail({
       className={`flex h-full flex-col items-center border-r border-octo-hairline bg-octo-panel pb-3 pt-9 transition-all duration-[220ms] ${
         isCollapsed ? "w-[50px] gap-1" : "w-[280px] gap-2"
       }`}
-      aria-label="Workspaces"
+      aria-label="Missions"
     >
       <div className={`flex-1 flex flex-col w-full overflow-y-auto ${isCollapsed ? "gap-0.5" : "gap-2"}`}>
         {!isCollapsed && (
@@ -141,7 +143,7 @@ export function WorkspaceRail({
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Escape") setFilter(""); }}
-            placeholder="Filter projects & workspaces"
+            placeholder="Filter projects & missions"
             spellCheck={false}
             aria-label="Filter the rail"
             className="mx-3 mb-1 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
@@ -296,7 +298,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
           ))}
           {!isCollapsed && visibleWs.length === 0 && (
             <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
-              No workspaces yet
+              No missions yet
             </div>
           )}
         </div>
@@ -352,7 +354,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                     icon={<GitCommitHorizontal size={11} />}
                     label={String(dirtyCount)}
                     tone="sage"
-                    title={`${dirtyCount} workspace${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
+                    title={`${dirtyCount} mission${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
                   />
                 )}
                 {openPrCount > 0 && (
@@ -380,8 +382,8 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                   <button
                     type="button"
                     onClick={() => onNewWorkspaceForProject(project.id)}
-                    title={`New workspace in ${project.name}`}
-                    aria-label={`New workspace in ${project.name}`}
+                    title={`New mission in ${project.name}`}
+                    aria-label={`New mission in ${project.name}`}
                     className="flex h-5 w-5 items-center justify-center text-octo-mute opacity-0 transition-opacity hover:text-octo-brass group-hover:opacity-100 focus-visible:opacity-100"
                   >
                     <Plus size={12} aria-hidden="true" />
@@ -449,6 +451,11 @@ function WorkspaceRow({
   // Hooks must run unconditionally — before any early return (C4).
   const attentionFlag = useAttentionStore(
     (s) => s.flagsByWs?.[workspace?.id ?? ""],
+  );
+  // The row's mission intent (missions are 1:1 with code workspaces). Read here
+  // — like attentionFlag — rather than threaded through every prop layer.
+  const missionIntent = useMissionsStore(
+    (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.intent ?? null,
   );
 
   if (!workspace) return null;
@@ -562,6 +569,21 @@ function WorkspaceRow({
       >
         {mono?.glyph || "?"}
       </button>
+
+      {/* Mission-intent glyph — reserved slot so the row never shifts as
+          missions load; every code workspace has a mission, so it fills fast. */}
+      <span
+        className="flex h-4 w-3 flex-shrink-0 items-center justify-center"
+        role={missionIntent ? "img" : undefined}
+        aria-label={missionIntent ? `${missionIntent} mission` : undefined}
+        title={missionIntent ? `${missionIntent} mission` : undefined}
+      >
+        {missionIntent &&
+          (() => {
+            const Icon = INTENT_ICON[missionIntent] ?? Hammer;
+            return <Icon size={11} aria-hidden className="octo-pop-in text-octo-mute" />;
+          })()}
+      </span>
 
       {/* Workspace name — a real button (keyboard-operable) that truncates with
           the full name as its tooltip. No aria-label: its accessible name is the
