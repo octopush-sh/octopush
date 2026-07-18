@@ -224,6 +224,11 @@ impl AgentRunner for ApiRunner {
             &emitter,
             stage.tools.as_deref(),
             stage.effort,
+            if ctx.exec_isolation == "sandbox" {
+                Some(ctx.allowed_write_roots.as_slice())
+            } else {
+                None
+            },
         )
         .await;
 

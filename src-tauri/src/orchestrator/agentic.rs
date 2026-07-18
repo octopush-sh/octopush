@@ -269,6 +269,9 @@ pub async fn run_agentic_loop(
     // behavior). Also raises the `max_tokens` floor so deep thinking doesn't
     // truncate the answer.
     effort: Option<Effort>,
+    // Sandbox write roots when the mission is sandboxed (`Some` ⇒ in-process
+    // `run_command` runs under seatbelt and `write_file` is confined).
+    sandbox_roots: Option<&[String]>,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -421,7 +424,7 @@ pub async fn run_agentic_loop(
             // The chat engine consumes execute_tool's structural `ok`; the
             // orchestrator keeps its own text-based classifier for journal
             // continuity, so it deliberately ignores the bool here.
-            let (result, _) = execute_tool(workspace_path, &u.name, &u.input);
+            let (result, _) = execute_tool(workspace_path, &u.name, &u.input, sandbox_roots);
             emitter.tool_result(!crate::orchestrator::live::looks_like_error(&result), &crate::orchestrator::live::summarize(&result));
             // The journal keeps the FULL result as evidence; only the copy fed
             // back to the model is capped, to bound input-token growth.

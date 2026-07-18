@@ -318,8 +318,6 @@ impl AgentRunner for CliRunner {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
                     match crate::orchestrator::sandbox::prepare(
-                        &ctx.run_id,
-                        &ctx.stage_id,
                         &ctx.allowed_write_roots,
                         &real_program,
                         &args,

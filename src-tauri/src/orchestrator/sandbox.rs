@@ -15,7 +15,7 @@
 
 use crate::error::{AppError, AppResult};
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The system seatbelt driver. Absolute so it resolves regardless of the child's
 /// PATH; it is a stable macOS system binary.
@@ -148,16 +148,11 @@ pub struct Prepared {
     pub guard: ProfileGuard,
 }
 
-/// Prepare a sandboxed launch: verify the platform + driver, write a per-stage
+/// Prepare a sandboxed launch: verify the platform + driver, write a fresh
 /// seatbelt profile, and return the wrapped argv. Errors (no silent fallback) if
-/// sandboxing is unavailable or the profile can't be written.
-pub fn prepare(
-    run_id: &str,
-    stage_id: &str,
-    write_roots: &[String],
-    program: &OsStr,
-    args: &[String],
-) -> AppResult<Prepared> {
+/// sandboxing is unavailable or the profile can't be written. Shared by the CLI
+/// substrate (wrapping `claude`) and in-process `run_command` (wrapping `bash`).
+pub fn prepare(write_roots: &[String], program: &OsStr, args: &[String]) -> AppResult<Prepared> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::Other(
             "sandboxed execution is only available on macOS".into(),
@@ -169,7 +164,7 @@ pub fn prepare(
         )));
     }
     let profile = build_seatbelt_profile(write_roots);
-    let path = std::env::temp_dir().join(format!("octopush-sandbox-{run_id}-{stage_id}.sb"));
+    let path = std::env::temp_dir().join(format!("octopush-sandbox-{}.sb", uuid::Uuid::new_v4()));
     std::fs::write(&path, profile)
         .map_err(|e| AppError::Other(format!("could not write the sandbox profile: {e}")))?;
     let (prog, wrapped) = sandbox_argv(program, args, &path);
@@ -177,6 +172,35 @@ pub fn prepare(
         program: prog,
         args: wrapped,
         guard: ProfileGuard { path },
+    })
+}
+
+/// Collapse `.`/`..` components lexically (no filesystem access, so it works for
+/// paths that don't exist yet — e.g. a `write_file` target). Absolute inputs
+/// stay absolute; `..` can't climb above root.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether an in-process `write_file` target is permitted for a sandboxed
+/// mission: the lexically-normalized absolute path must sit under one of the
+/// mission's write roots. Catches absolute-path and `..` escapes; a symlink
+/// escape would first need `run_command`, which is itself sandboxed.
+pub fn is_write_allowed(target: &Path, write_roots: &[String]) -> bool {
+    let normalized = normalize_lexical(target);
+    write_roots.iter().any(|r| {
+        let root = normalize_lexical(Path::new(r));
+        normalized.starts_with(&root)
     })
 }
 
@@ -227,6 +251,19 @@ mod tests {
     fn system_write_files_covers_the_claude_state_file() {
         assert_eq!(system_write_files(Some("/home/u")), vec!["/home/u/.claude.json".to_string()]);
         assert!(system_write_files(None).is_empty());
+    }
+
+    #[test]
+    fn is_write_allowed_confines_to_roots_and_blocks_escapes() {
+        let roots = vec!["/ws".to_string(), "/private/tmp".to_string()];
+        assert!(is_write_allowed(Path::new("/ws/src/main.rs"), &roots));
+        assert!(is_write_allowed(Path::new("/private/tmp/x"), &roots));
+        // Absolute escape (Path::join discards the base for an absolute arg).
+        assert!(!is_write_allowed(Path::new("/etc/passwd"), &roots));
+        // `..` escape out of the workspace.
+        assert!(!is_write_allowed(Path::new("/ws/../etc/passwd"), &roots));
+        // A sibling dir that merely shares a prefix is NOT under the root.
+        assert!(!is_write_allowed(Path::new("/ws-other/x"), &roots));
     }
 
     #[test]
