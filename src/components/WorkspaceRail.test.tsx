@@ -365,7 +365,7 @@ describe("WorkspaceRail", () => {
     // Open PR chip carries an accessible title
     expect(screen.getByTitle(/open pull request/i)).toBeInTheDocument();
     // Dirty chip on a non-active workspace (row chip uses the exact phrase;
-    // the header aggregate differs — "N workspace(s) with uncommitted changes").
+    // the header aggregate differs — "N mission(s) with uncommitted changes").
     expect(screen.getByTitle("Uncommitted changes")).toBeInTheDocument();
   });
 
@@ -387,7 +387,7 @@ describe("WorkspaceRail", () => {
       />,
     );
     // 2 workspaces dirty, 1 open PR → header aggregate chips with those titles.
-    expect(screen.getByTitle(/2 workspaces with uncommitted changes/i)).toBeInTheDocument();
+    expect(screen.getByTitle(/2 missions with uncommitted changes/i)).toBeInTheDocument();
     expect(screen.getByTitle(/1 open pr/i)).toBeInTheDocument();
   });
 

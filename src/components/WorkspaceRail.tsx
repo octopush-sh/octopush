@@ -143,7 +143,7 @@ export function WorkspaceRail({
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Escape") setFilter(""); }}
-            placeholder="Filter projects & workspaces"
+            placeholder="Filter projects & missions"
             spellCheck={false}
             aria-label="Filter the rail"
             className="mx-3 mb-1 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
@@ -354,7 +354,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                     icon={<GitCommitHorizontal size={11} />}
                     label={String(dirtyCount)}
                     tone="sage"
-                    title={`${dirtyCount} workspace${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
+                    title={`${dirtyCount} mission${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
                   />
                 )}
                 {openPrCount > 0 && (
@@ -574,6 +574,8 @@ function WorkspaceRow({
           missions load; every code workspace has a mission, so it fills fast. */}
       <span
         className="flex h-4 w-3 flex-shrink-0 items-center justify-center"
+        role={missionIntent ? "img" : undefined}
+        aria-label={missionIntent ? `${missionIntent} mission` : undefined}
         title={missionIntent ? `${missionIntent} mission` : undefined}
       >
         {missionIntent &&
