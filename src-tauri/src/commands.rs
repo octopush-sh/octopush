@@ -3117,10 +3117,18 @@ pub async fn save_git_credentials(host: String, username: String, token: String)
 
 /// Persist the full provider catalog to ~/.octopush/providers.json.
 #[tauri::command]
-pub async fn save_providers(providers: Vec<crate::provider_router::ProviderConfig>) -> AppResult<()> {
+pub async fn save_providers(
+    state: State<'_, AppState>,
+    providers: Vec<crate::provider_router::ProviderConfig>,
+) -> AppResult<()> {
     crate::provider_router::validate_providers(&providers)
         .map_err(crate::error::AppError::Other)?;
     crate::provider_router::write_providers(&providers)?;
+    // Reload the in-memory router so `list_providers`/`list_models` reflect the
+    // write immediately (else a just-enabled provider stays invisible until an
+    // app restart — which strands genesis's inline-key readiness check).
+    let updated = crate::provider_router::ProviderRouter::load()?;
+    *state.router.lock() = updated;
     Ok(())
 }
 

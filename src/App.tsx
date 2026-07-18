@@ -1473,7 +1473,7 @@ function App() {
   // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
   // "it's mine, on my disk" is the whole point.
   const genesisInFlight = useRef(false);
-  const handleGenesis = useCallback(async (promptText: string, name: string, location = "~/Octopush") => {
+  const handleGenesis = useCallback(async (promptText: string, name: string, location = "~/Octopush", model: string | null = null) => {
     // Reentrancy guard: a second submit (double Enter, key-repeat) mid-genesis
     // must not spawn a duplicate project or let one call's error suppress the
     // other's crew staging (they share projectStore.error).
@@ -1504,10 +1504,15 @@ function App() {
       pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
       pipelines.find((p) => p.pipeline.isBuiltin);
     if (flagship) {
+      // A chosen model overrides every api stage of the staged pipeline (the
+      // launcher keys overrides by stage position; cli stages keep their own).
+      const overrides: [number, string][] = model
+        ? flagship.stages.filter((s) => s.substrate === "api").map((s) => [s.position, model])
+        : [];
       useRunsStore.getState().setLauncherPrefill({
         task: promptText,
         pipelineId: flagship.pipeline.id,
-        overrides: [],
+        overrides,
         workspaceId: main.id,
       });
     }
@@ -1698,7 +1703,10 @@ function App() {
     }
     return (
       <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-        <WelcomeScreen onNewProject={() => setAppView("new-project")} onGenesis={handleGenesis} />
+        <WelcomeScreen
+          onNewProject={() => setAppView("new-project")}
+          onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
+        />
         <ToastContainer />
       </div>
     );
