@@ -1540,22 +1540,38 @@ function App() {
   const sketchInFlight = useRef(false);
   const handleSketch = useCallback(async (promptText: string) => {
     if (sketchInFlight.current) return;
+    // A sketch is a real BYOK Talk turn. If there's no key, keep the user on the
+    // Welcome with their prompt still in the textarea (never lost) and point them
+    // to Settings — mirrors genesis's keyless path.
+    if (!(await crewProviderReady())) {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "Thinking it through is a Talk turn on Claude — one key in Settings · Models.",
+      });
+      return;
+    }
     sketchInFlight.current = true;
+    useProjectStore.setState({ loading: true }); // disables the genesis block meanwhile
     try {
       const sketchbook = await ipc.ensureSketchbook();
-      useProjectStore.setState({ current: sketchbook });
+      useProjectStore.setState({ current: sketchbook, loading: false });
       const wss = await ipc.listWorkspaces(sketchbook.id);
       const main = wss[0];
       if (!main) return;
+      const wsPath = main.worktreePath || sketchbook.path;
+      // Create the fresh thread BEFORE mounting the Talk canvas: ChatCanvas's
+      // mount-time loadHistory keeps a valid prior active thread, so it preserves
+      // this one instead of racing to pick threads[0] (which would strand it).
+      await useChatStore.getState().newThread(main.id);
       selectWorkspace(main.id);
       setModePerWorkspace((p) => ({ ...p, [main.id]: "talk" }));
-      // A fresh thread per sketch, then send the prompt as its first turn.
-      await useChatStore.getState().newThread(main.id);
-      const wsPath = main.worktreePath || sketchbook.path;
       await useChatStore.getState().send(main.id, wsPath, promptText);
     } catch (e) {
       pushToast({ level: "error", title: "Couldn't open the Sketchbook", body: String(e).split("\n")[0] });
     } finally {
+      useProjectStore.setState({ loading: false });
       sketchInFlight.current = false;
     }
   }, [selectWorkspace]);
