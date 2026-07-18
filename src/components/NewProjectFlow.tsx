@@ -12,7 +12,7 @@ interface Props {
   onBack: () => void;
   /** Prompt genesis from the wizard: describe → a project is born + a crew is
    *  staged. Location comes from the wizard's own field. */
-  onGenesis: (prompt: string, name: string, location: string) => void;
+  onGenesis: (prompt: string, name: string, location: string, model: string | null) => void;
 }
 
 type ProjectType = "empty" | "clone" | "genesis" | "open";
@@ -694,8 +694,8 @@ export function NewProjectFlow({ onBack, onGenesis }: Props) {
             <div className="mt-8 max-w-[520px] space-y-5">
               <GenesisPrompt
                 loading={createLoading}
-                onSubmit={(prompt, name) =>
-                  onGenesis(prompt, name, genesisLocation.trim() || "~/Octopush")
+                onSubmit={(prompt, name, model) =>
+                  onGenesis(prompt, name, genesisLocation.trim() || "~/Octopush", model)
                 }
               />
               <Field label="LOCATION">

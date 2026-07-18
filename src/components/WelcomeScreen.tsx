@@ -8,7 +8,7 @@ interface Props {
   onNewProject: () => void;
   /** Prompt genesis: describe what to build → a project is born + a crew is
    *  staged. `name` is the (editable) derived slug. */
-  onGenesis: (prompt: string, name: string) => void;
+  onGenesis: (prompt: string, name: string, model: string | null) => void;
 }
 
 export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
@@ -98,7 +98,7 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
       {/* ⊕ Genesis — describe what you want to build; a crew scaffolds it.
           The project is born from the prompt (intent before the repo). */}
       <div className="mt-8 w-full max-w-[560px]">
-        <GenesisPrompt loading={loading} onSubmit={onGenesis} />
+        <GenesisPrompt loading={loading} onSubmit={(p, n, model) => onGenesis(p, n, model)} />
       </div>
 
       {/* Or — start from a repo instead (project-first, unchanged). */}
