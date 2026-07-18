@@ -551,7 +551,8 @@ export const ipc = {
   // ─── Projects ───────────────────────────────────────────────────
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
   listRecentProjects: () => invoke<ProjectInfo[]>("list_recent_projects"),
-  createProject: (path: string, name: string) => invoke<ProjectInfo>("create_project", { path, name }),
+  createProject: (path: string, name: string, task?: string | null) =>
+    invoke<ProjectInfo>("create_project", { path, name, task: task ?? null }),
   cloneProject: (args: {
     path: string;
     url: string;

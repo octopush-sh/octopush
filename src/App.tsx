@@ -1468,6 +1468,61 @@ function App() {
     setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
   }, [activeWorkspaceId, workspaces]);
 
+  // Prompt genesis: a prompt becomes a project + a staged crew (intent before
+  // the repo). Composes create_project (born in <1s, local) with the same crew
+  // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
+  // "it's mine, on my disk" is the whole point.
+  const genesisInFlight = useRef(false);
+  const handleGenesis = useCallback(async (promptText: string, name: string) => {
+    // Reentrancy guard: a second submit (double Enter, key-repeat) mid-genesis
+    // must not spawn a duplicate project or let one call's error suppress the
+    // other's crew staging (they share projectStore.error).
+    if (genesisInFlight.current) return;
+    genesisInFlight.current = true;
+    try {
+    await useProjectStore.getState().create("~/Octopush", name, promptText);
+    const proj = useProjectStore.getState().current;
+    if (!proj || useProjectStore.getState().error) return; // Welcome shows the error; no navigation.
+    // Read workspaces fresh — the project effect also loads them, but the direct
+    // read avoids racing the store (same pattern as handleSendFirstCrew).
+    const wss = await ipc.listWorkspaces(proj.id);
+    const main = wss[0];
+    if (!main) return;
+    // Builtins exist regardless of any provider key, so resolve the flagship
+    // either way and stage it — the prompt is the brief, and the workspace-scoped
+    // prefill survives even the detour to Settings when no key is configured.
+    let pipelines = usePipelineStore.getState().pipelines;
+    if (pipelines.length === 0) {
+      await usePipelineStore.getState().load();
+      pipelines = usePipelineStore.getState().pipelines;
+    }
+    const flagship =
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
+      pipelines.find((p) => p.pipeline.isBuiltin);
+    if (flagship) {
+      useRunsStore.getState().setLauncherPrefill({
+        task: promptText,
+        pipelineId: flagship.pipeline.id,
+        overrides: [],
+        workspaceId: main.id,
+      });
+    }
+    setModePerWorkspace((p) => ({ ...p, [main.id]: "direct" }));
+    if (await crewProviderReady()) {
+      useFirstRunStore.getState().markUsed();
+    } else {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "Your crew is staged and waiting — one key in Settings · Models.",
+      });
+    }
+    } finally {
+      genesisInFlight.current = false;
+    }
+  }, []);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1639,7 +1694,7 @@ function App() {
     }
     return (
       <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-        <WelcomeScreen onNewProject={() => setAppView("new-project")} />
+        <WelcomeScreen onNewProject={() => setAppView("new-project")} onGenesis={handleGenesis} />
         <ToastContainer />
       </div>
     );
