@@ -1532,6 +1532,50 @@ function App() {
     }
   }, []);
 
+  // Genesis "think it through first": open the Sketchbook (a real scratch git
+  // project, auto-provisioned) and start a fresh Talk thread with the prompt as
+  // the first message — no build, no repo of your own yet. This is the path that
+  // subsumes "design missions": you think in a scratch project's Talk, and
+  // promote to a real project when ready (both genesis doors stay available).
+  const sketchInFlight = useRef(false);
+  const handleSketch = useCallback(async (promptText: string) => {
+    if (sketchInFlight.current) return;
+    // A sketch is a real BYOK Talk turn. If there's no key, keep the user on the
+    // Welcome with their prompt still in the textarea (never lost) and point them
+    // to Settings — mirrors genesis's keyless path.
+    if (!(await crewProviderReady())) {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "Thinking it through is a Talk turn on Claude — one key in Settings · Models.",
+      });
+      return;
+    }
+    sketchInFlight.current = true;
+    useProjectStore.setState({ loading: true }); // disables the genesis block meanwhile
+    try {
+      const sketchbook = await ipc.ensureSketchbook();
+      useProjectStore.setState({ current: sketchbook, loading: false });
+      const wss = await ipc.listWorkspaces(sketchbook.id);
+      const main = wss[0];
+      if (!main) return;
+      const wsPath = main.worktreePath || sketchbook.path;
+      // Create the fresh thread BEFORE mounting the Talk canvas: ChatCanvas's
+      // mount-time loadHistory keeps a valid prior active thread, so it preserves
+      // this one instead of racing to pick threads[0] (which would strand it).
+      await useChatStore.getState().newThread(main.id);
+      selectWorkspace(main.id);
+      setModePerWorkspace((p) => ({ ...p, [main.id]: "talk" }));
+      await useChatStore.getState().send(main.id, wsPath, promptText);
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't open the Sketchbook", body: String(e).split("\n")[0] });
+    } finally {
+      useProjectStore.setState({ loading: false });
+      sketchInFlight.current = false;
+    }
+  }, [selectWorkspace]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1706,6 +1750,7 @@ function App() {
         <WelcomeScreen
           onNewProject={() => setAppView("new-project")}
           onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
+          onSketch={handleSketch}
         />
         <ToastContainer />
       </div>

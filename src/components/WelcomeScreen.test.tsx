@@ -19,7 +19,7 @@ beforeEach(() => {
 describe("WelcomeScreen — prompt genesis", () => {
   it("falls back to the derived slug when the name field is cleared (never empty)", () => {
     const onGenesis = vi.fn();
-    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={onGenesis} />);
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={onGenesis} onSketch={vi.fn()} />);
     fireEvent.change(screen.getByPlaceholderText(PROMPT), {
       target: { value: "Build me an iOS app to track my daily tasks" },
     });
@@ -35,7 +35,7 @@ describe("WelcomeScreen — prompt genesis", () => {
 
   it("Enter submits a non-empty prompt; a blank prompt is a no-op", () => {
     const onGenesis = vi.fn();
-    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={onGenesis} />);
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={onGenesis} onSketch={vi.fn()} />);
     const textarea = screen.getByPlaceholderText(PROMPT);
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onGenesis).not.toHaveBeenCalled();
@@ -46,14 +46,22 @@ describe("WelcomeScreen — prompt genesis", () => {
 
   it("disables the prompt while a project is being created", () => {
     useProjectStore.setState({ loading: true });
-    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} />);
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} onSketch={vi.fn()} />);
     expect(screen.getByPlaceholderText(PROMPT)).toBeDisabled();
   });
 
   it("still offers the project-first route (Begin a new study)", () => {
     const onNewProject = vi.fn();
-    render(<WelcomeScreen onNewProject={onNewProject} onGenesis={vi.fn()} />);
+    render(<WelcomeScreen onNewProject={onNewProject} onGenesis={vi.fn()} onSketch={vi.fn()} />);
     fireEvent.click(screen.getByText("Begin a new study"));
     expect(onNewProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("'think it through first' opens the Sketchbook with the typed prompt", () => {
+    const onSketch = vi.fn();
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} onSketch={onSketch} />);
+    fireEvent.change(screen.getByPlaceholderText(PROMPT), { target: { value: "a habit tracker idea" } });
+    fireEvent.click(screen.getByText(/think it through first/i));
+    expect(onSketch).toHaveBeenCalledWith("a habit tracker idea");
   });
 });

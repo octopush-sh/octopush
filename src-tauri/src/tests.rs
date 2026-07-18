@@ -9277,6 +9277,21 @@ mod mission_tests {
     }
 
     #[test]
+    fn sketchbook_project_is_find_or_create_idempotent() {
+        // The Sketchbook (genesis G5) is a canonical singleton project — inserting
+        // it twice reuses the same row (find-or-create by path), never duplicates.
+        let db = test_db();
+        let path = "/tmp/octopush-test-sketchbook";
+        assert!(db.get_project_by_path(path).unwrap().is_none());
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&id, "Sketchbook", path).unwrap();
+        // A second "ensure" resolves the existing row rather than making a new one.
+        let found = db.get_project_by_path(path).unwrap();
+        assert_eq!(found.map(|(i, _, _)| i).as_deref(), Some(id.as_str()));
+        assert_eq!(db.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
     fn greenfield_pipeline_is_seeded_gated_and_idempotent() {
         // The Greenfield crew (genesis G3): plan-with-stack-choice → gate →
         // scaffold → first increment → honest verify, ending at a local repo.

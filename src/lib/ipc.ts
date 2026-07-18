@@ -553,6 +553,7 @@ export const ipc = {
   listRecentProjects: () => invoke<ProjectInfo[]>("list_recent_projects"),
   createProject: (path: string, name: string, task?: string | null) =>
     invoke<ProjectInfo>("create_project", { path, name, task: task ?? null }),
+  ensureSketchbook: () => invoke<ProjectInfo>("ensure_sketchbook"),
   cloneProject: (args: {
     path: string;
     url: string;
