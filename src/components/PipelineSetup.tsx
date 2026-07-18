@@ -11,6 +11,7 @@ import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
 import { Github } from "lucide-react";
+import { UnattendedReadiness } from "./UnattendedReadiness";
 
 interface Props {
   /** The workspace whose launcher this is — guards prefill consumption. */
@@ -354,6 +355,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                   />
                 </div>
               </div>
+
+              {workspaceId && <UnattendedReadiness workspaceId={workspaceId} />}
 
               <div className="ml-auto flex flex-col items-end gap-1.5">
                 <button

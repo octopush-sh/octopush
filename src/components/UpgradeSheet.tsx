@@ -48,6 +48,18 @@ export function UpgradeSheet() {
               </>
             ),
           }
+        : info.feature === "runs.detached"
+        ? {
+            eyebrow: "Direct · unattended crews",
+            title: "Let your crews run while you're away.",
+            body: (
+              <>
+                Free runs your crew only while Octopush is open. Upgrade to Pro to run them{" "}
+                <span className="text-octo-ivory">unattended — detached, surviving app quit</span>,
+                with a native ping when a crew needs you or finishes.
+              </>
+            ),
+          }
         : info.feature === "logbook.reports"
         ? {
             eyebrow: "Logbook · reports",
