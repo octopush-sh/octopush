@@ -1392,6 +1392,17 @@ function App() {
     [handleSelectWorkspace],
   );
 
+  // Mission Control attention items → the mission's Talk (chat) / Run (terminal)
+  // surface. Focusing the matching workspace+mode clears the attention flag.
+  const handleJumpToAttention = useCallback(
+    (workspaceId: string, kind: "chat" | "terminal") => {
+      setMissionControlOpen(false);
+      handleSelectWorkspace(workspaceId);
+      setModePerWorkspace((p) => ({ ...p, [workspaceId]: kind === "chat" ? "talk" : "run" }));
+    },
+    [handleSelectWorkspace],
+  );
+
   // "Send out a crew" — close the room and land on the current workspace's
   // Direct surface (its launcher when no run is executing).
   const handleDispatchCrew = useCallback(() => {
@@ -2471,6 +2482,7 @@ function App() {
           open
           onClose={() => setMissionControlOpen(false)}
           onJumpToRun={handleJumpToRun}
+          onJumpToAttention={handleJumpToAttention}
           onDispatch={handleDispatchCrew}
         />
       )}

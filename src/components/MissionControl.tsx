@@ -8,11 +8,14 @@
 // canvas instead), no launching, no history (HistorySheet owns the past).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { Moon, Plus, Square, X } from "lucide-react";
+import { Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
-import { runStatusMeta, isTransientHalt, needsYou } from "../lib/runStatus";
+import { useAttentionStore } from "../stores/attentionStore";
+import { useMissionsStore } from "../stores/missionsStore";
+import { INTENT_ICON } from "../lib/missionIntent";
+import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
 import { stageTitle } from "../lib/stageMeta";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
@@ -23,6 +26,8 @@ interface Props {
   onClose: () => void;
   /** Jump to a run's workspace + Direct surface (App closes the room first). */
   onJumpToRun: (workspaceId: string) => void;
+  /** Jump to a mission's Talk (chat) or terminal (run) surface that's waiting. */
+  onJumpToAttention: (workspaceId: string, kind: "chat" | "terminal") => void;
   /** "Send out a crew" — Direct mode in the current workspace. */
   onDispatch: () => void;
 }
@@ -31,34 +36,66 @@ interface Props {
  *  (gate / halted stage / budget park / director pause) — that IS "needs you". */
 type Band = "needs-you" | "in-flight" | "settled";
 
+/** A non-run mission surface waiting on the director: a Talk conversation that
+ *  finished streaming, or a terminal that rang its bell. Always "needs you". */
+type AttentionItem = {
+  kind: "attention";
+  workspaceId: string;
+  missionTitle: string | null;
+  flag: "chat" | "terminal";
+  at: number;
+};
+/** The board renders a discriminated union so runs and attention surfaces share
+ *  one FIFO-sorted needs-you band under the single-beacon law. */
+type BoardItem = { kind: "run"; run: Run } | AttentionItem;
+
 const EMPTY_STAGES: RunStage[] = [];
 
-export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props) {
+export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, onDispatch }: Props) {
   const runsByWs = useRunsStore((s) => s.runsByWs);
   const settledAt = useRunsStore((s) => s.settledAt);
   const statusSince = useRunsStore((s) => s.statusSince);
   const refreshDetail = useRunsStore((s) => s.refreshDetail);
+  const flagsByWs = useAttentionStore((s) => s.flagsByWs);
+  const missionByWorkspaceId = useMissionsStore((s) => s.missionByWorkspaceId);
 
-  // The board: active runs everywhere + this session's settled (undismissed).
+  // The board: paused runs + attention (chats/terminals waiting on you) in
+  // "needs you", running runs in flight, and this session's settled
+  // (undismissed). Attention items are always needs-you — a human is waiting.
   const board = useMemo(() => {
     const all = Object.values(runsByWs).flat();
-    const active = all.filter((r) => r.status === "running" || r.status === "paused");
+    const paused = all.filter((r) => r.status === "paused");
+    const running = all.filter((r) => r.status === "running");
     const settled = all.filter((r) => r.id in settledAt);
-    const since = (r: Run) => {
+    const runSince = (r: Run) => {
       if (statusSince[r.id] !== undefined) return statusSince[r.id];
       const t = Date.parse(r.createdAt);
       return Number.isNaN(t) ? 0 : t;
     };
-    const fifo = (a: Run, b: Run) => since(a) - since(b);
+    const attention: AttentionItem[] = Object.entries(flagsByWs).map(([workspaceId, flag]) => ({
+      kind: "attention" as const,
+      workspaceId,
+      missionTitle: missionByWorkspaceId[workspaceId]?.title ?? null,
+      flag: flag.kind,
+      at: flag.at,
+    }));
+    const itemSince = (it: BoardItem) => (it.kind === "run" ? runSince(it.run) : it.at);
+    const needsYou: BoardItem[] = [
+      ...paused.map((r) => ({ kind: "run" as const, run: r })),
+      ...attention,
+    ].sort((a, b) => itemSince(a) - itemSince(b));
     return {
-      needsYou: active.filter(needsYou).sort(fifo),
-      inFlight: active.filter((r) => r.status === "running").sort(fifo),
-      settled: settled.sort(fifo),
+      needsYou,
+      inFlight: running.sort((a, b) => runSince(a) - runSince(b)),
+      settled: settled.sort((a, b) => runSince(a) - runSince(b)),
+      paused,
     };
-  }, [runsByWs, settledAt, statusSince]);
+  }, [runsByWs, settledAt, statusSince, flagsByWs, missionByWorkspaceId]);
 
+  // Runs only, for stage hydration + the fleet ledger (attention items carry no
+  // run/cost of their own).
   const boardRuns = useMemo(
-    () => [...board.needsYou, ...board.inFlight, ...board.settled],
+    () => [...board.paused, ...board.inFlight, ...board.settled],
     [board],
   );
 
@@ -83,7 +120,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
   // a live burn-rate figure, never inflated by this session's settled runs
   // (each settled card carries its own cost). Savings-first, per the Direct
   // ledger convention.
-  const activeRuns = [...board.needsYou, ...board.inFlight];
+  const activeRuns = [...board.paused, ...board.inFlight];
   const spent = activeRuns.reduce((sum, r) => sum + r.costUsd, 0);
   const baseline = activeRuns.reduce((sum, r) => sum + r.baselineUsd, 0);
   const saved = Math.max(0, baseline - spent);
@@ -94,6 +131,10 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
     { n: board.inFlight.length, label: "in flight", cls: "text-octo-verdigris" },
     { n: board.settled.length, label: "settled", cls: "text-octo-mute" },
   ];
+
+  // Empty covers runs AND attention — an attention-only board is not "quiet".
+  const isEmpty =
+    board.needsYou.length === 0 && board.inFlight.length === 0 && board.settled.length === 0;
 
   return (
     <OverlayRoom onClose={onClose} ariaLabel="Mission Control">
@@ -141,7 +182,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
         </span>
       </header>
 
-      {boardRuns.length === 0 ? (
+      {isEmpty ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-5 p-8">
           <p className="font-serif text-[22px] tracking-[-0.005em] text-octo-sage">
             The floor is quiet.
@@ -156,9 +197,9 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto px-8 pb-8">
-          <BandSection title="Needs you" runs={board.needsYou} band="needs-you" onJumpToRun={onJumpToRun} />
-          <BandSection title="In flight" runs={board.inFlight} band="in-flight" onJumpToRun={onJumpToRun} />
-          <BandSection title="Settled" runs={board.settled} band="settled" onJumpToRun={onJumpToRun} />
+          <BandSection title="Needs you" items={board.needsYou} band="needs-you" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
+          <BandSection title="In flight" items={board.inFlight.map((r) => ({ kind: "run" as const, run: r }))} band="in-flight" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
+          <BandSection title="Settled" items={board.settled.map((r) => ({ kind: "run" as const, run: r }))} band="settled" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
         </div>
       )}
     </OverlayRoom>
@@ -167,27 +208,102 @@ export function MissionControl({ open, onClose, onJumpToRun, onDispatch }: Props
 
 function BandSection({
   title,
-  runs,
+  items,
   band,
   onJumpToRun,
+  onJumpToAttention,
 }: {
   title: string;
-  runs: Run[];
+  items: BoardItem[];
   band: Band;
   onJumpToRun: (workspaceId: string) => void;
+  onJumpToAttention: (workspaceId: string, kind: "chat" | "terminal") => void;
 }) {
-  if (runs.length === 0) return null;
+  if (items.length === 0) return null;
   return (
     <section>
       <div className="flex h-11 items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         {title}
       </div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(380px,1fr))] gap-4">
-        {runs.map((run, i) => (
-          <CrewCard key={run.id} run={run} band={band} index={i} onJumpToRun={onJumpToRun} />
-        ))}
+        {items.map((item, i) =>
+          item.kind === "run" ? (
+            <CrewCard key={item.run.id} run={item.run} band={band} index={i} onJumpToRun={onJumpToRun} />
+          ) : (
+            <AttentionCard
+              key={`att:${item.workspaceId}:${item.flag}`}
+              item={item}
+              index={i}
+              onJump={onJumpToAttention}
+            />
+          ),
+        )}
       </div>
     </section>
+  );
+}
+
+/** A non-run mission waiting on the director (a finished Talk conversation or a
+ *  terminal bell). Same card geometry family as CrewCard, minus the run-only
+ *  rows. Lives only in the needs-you band, so it carries the brass border and
+ *  joins the single-beacon law (index 0 of the band pulses). */
+function AttentionCard({
+  item,
+  index,
+  onJump,
+}: {
+  item: AttentionItem;
+  index: number;
+  onJump: (workspaceId: string, kind: "chat" | "terminal") => void;
+}) {
+  const wsName = useWorkspaceName(item.workspaceId);
+  const inState = useTimeInState(new Date(item.at).toISOString());
+  const title = item.missionTitle || wsName || "mission";
+  const Icon = item.flag === "chat" ? MessageSquare : Terminal;
+  const word = item.flag === "chat" ? "waiting in Talk" : "terminal bell";
+  const brief =
+    item.flag === "chat" ? "A conversation finished — your move." : "A terminal is asking for input.";
+  const isLongestWaiting = index === 0;
+  const jump = () => onJump(item.workspaceId, item.flag);
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={jump}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          jump();
+        }
+      }}
+      aria-label={`Open ${title} — ${word}`}
+      style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
+      className={`octo-rise-in group relative flex cursor-pointer flex-col gap-1.5 rounded-lg border border-octo-brass bg-octo-panel px-4 py-3 text-left transition duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${isLongestWaiting ? "octo-stage-pulse" : ""}`}
+    >
+      {/* Row 1 — glyph · word · time waiting. */}
+      <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
+        <Icon size={11} aria-hidden className="text-octo-brass" />
+        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{word}</span>
+        <span
+          className="octo-tabular ml-auto w-[7ch] shrink-0 text-right text-octo-mute"
+          title="Time waiting"
+        >
+          {inState}
+        </span>
+      </span>
+
+      {/* Row 2 — mission. */}
+      <span className="flex h-5 items-baseline gap-2">
+        <span className="min-w-0 truncate font-serif text-[15px] text-octo-ivory" title={title}>
+          {title}
+        </span>
+      </span>
+
+      {/* Row 3 — the brief. */}
+      <span className="block h-4 truncate text-[12px] leading-4 text-octo-sage">{brief}</span>
+    </div>
   );
 }
 
@@ -205,6 +321,9 @@ function CrewCard({
   const stages = useRunsStore((s) => s.detailByRun[run.id]?.stages ?? EMPTY_STAGES);
   const statusSinceMs = useRunsStore((s) => s.statusSince[run.id]);
   const wsName = useWorkspaceName(run.workspaceId);
+  const missionIntent = useMissionsStore(
+    (s) => s.missionByWorkspaceId[run.workspaceId]?.intent ?? null,
+  );
   // A run whose workspace isn't loaded (project closed/removed) still shows —
   // and can be aborted — but jump-to is disabled: we can't navigate to an
   // unloaded workspace. (Same guard the old tray popover carried.)
@@ -310,8 +429,13 @@ function CrewCard({
         </span>
       </span>
 
-      {/* Row 2 — workspace. */}
-      <span className="flex h-5 items-baseline gap-2">
+      {/* Row 2 — mission: intent glyph + workspace name. */}
+      <span className="flex h-5 items-center gap-1.5">
+        {missionIntent &&
+          (() => {
+            const Icon = INTENT_ICON[missionIntent] ?? Hammer;
+            return <Icon size={11} aria-hidden className="shrink-0 text-octo-mute" />;
+          })()}
         <span className="min-w-0 truncate font-serif text-[15px] text-octo-ivory" title={wsName ?? undefined}>
           {wsName ?? "workspace"}
         </span>
