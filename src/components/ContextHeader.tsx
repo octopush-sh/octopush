@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { Copy, Hammer, Wrench, Eye, FlaskConical, PenTool, Gauge, Cog } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
+import { Copy, Hammer } from "lucide-react";
+import { INTENT_ICON } from "../lib/missionIntent";
 import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
@@ -8,18 +8,6 @@ import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { copyToClipboard } from "../lib/clipboard";
-
-/** Mission-intent glyphs. build/fix ship in M1; the rest arrive with later
- *  movements but map now so the header never falls back to a generic icon. */
-const INTENT_ICON: Record<string, LucideIcon> = {
-  build: Hammer,
-  fix: Wrench,
-  review: Eye,
-  probe: FlaskConical,
-  design: PenTool,
-  perf: Gauge,
-  ops: Cog,
-};
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
