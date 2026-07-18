@@ -8870,4 +8870,28 @@ mod mission_tests {
         assert_eq!(m.intent, "fix");
         assert_eq!(m.git_isolation, "ephemeral");
     }
+
+    #[test]
+    fn ensure_for_workspace_updates_axes_on_reuse() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        // Re-running the wizard for the same (reused) branch with a different
+        // intent/isolation updates the mission in place — the picked values are
+        // never silently discarded, and no duplicate mission is minted.
+        let b = crate::mission::ensure_for_workspace(&db, &ws, "fix", "ephemeral").unwrap();
+        assert_eq!(a.id, b.id, "same mission updated in place, not a duplicate");
+        assert_eq!(b.intent, "fix");
+        assert_eq!(b.git_isolation, "ephemeral");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_axes_rejects_out_of_enum_values() {
+        assert!(crate::mission::validate_axes("nope", "worktree").is_err());
+        assert!(crate::mission::validate_axes("build", "bogus").is_err());
+        assert!(crate::mission::validate_axes("build", "worktree").is_ok());
+        assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
+    }
 }

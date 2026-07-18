@@ -28,6 +28,14 @@ pub fn validate_status(status: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Validate the intent + git-isolation axes a caller may pass (execution
+/// isolation is always `none` at creation time). `create_workspace` calls this
+/// BEFORE creating any workspace/worktree, so a bad axis can't strand an
+/// orphaned workspace with no mission.
+pub fn validate_axes(intent: &str, git_isolation: &str) -> AppResult<()> {
+    validate(intent, git_isolation, "none")
+}
+
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
         return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
@@ -87,6 +95,14 @@ pub fn ensure_for_workspace(
     git_isolation: &str,
 ) -> AppResult<MissionRow> {
     if let Some(existing) = db.active_mission_for_workspace(&ws.id)? {
+        // Honor the wizard's latest choice on reuse: re-running the wizard for
+        // an existing branch (a collision the UI surfaces) with a different
+        // intent/isolation updates the mission in place, so the picked values
+        // are never silently discarded. Idempotent when nothing changed.
+        if existing.intent != intent || existing.git_isolation != git_isolation {
+            db.update_mission_axes(&existing.id, intent, git_isolation)?;
+            return Ok(db.get_mission(&existing.id)?.unwrap_or(existing));
+        }
         return Ok(existing);
     }
     let title = if ws.task.trim().is_empty() { ws.name.as_str() } else { ws.task.as_str() };

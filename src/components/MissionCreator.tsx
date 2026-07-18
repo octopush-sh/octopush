@@ -554,7 +554,7 @@ function IntentCard({
       type="button"
       onClick={onSelect}
       aria-pressed={selected}
-      style={{ animationDelay: `${index * 45}ms` }}
+      style={{ animationDelay: `calc(${index} * var(--stagger-step))` }}
       className={`octo-rise-in flex flex-col items-start gap-2 rounded-lg border p-4 text-left transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
         selected
           ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)]"

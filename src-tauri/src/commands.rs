@@ -548,6 +548,15 @@ pub async fn create_workspace(
     intent: Option<String>,
     git_isolation: Option<String>,
 ) -> AppResult<crate::db::WorkspaceRow> {
+    // Validate the axes BEFORE anything is created on disk. workspace::create
+    // commits a DB row + a git worktree; a bad intent/isolation caught only at
+    // pairing time (after that) would strand an orphaned workspace with no
+    // mission. The wizard's TS unions can't send a bad value, but any other
+    // caller of this public command could.
+    let intent = intent.as_deref().unwrap_or("build");
+    let git_isolation = git_isolation.as_deref().unwrap_or("worktree");
+    crate::mission::validate_axes(intent, git_isolation)?;
+
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
 
@@ -570,11 +579,6 @@ pub async fn create_workspace(
     // keeps its existing mission). Guarantees "no workspace without a mission".
     {
         let db = state.db.lock();
-        // The wizard passes the Step-1 intent (build/fix) and the git-isolation
-        // choice (worktree/ephemeral/pr); both default to a plain worktree build
-        // mission for callers that don't (e.g. the auto-created main workspace).
-        let intent = intent.as_deref().unwrap_or("build");
-        let git_isolation = git_isolation.as_deref().unwrap_or("worktree");
         crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
     }
     Ok(ws)
@@ -634,20 +638,69 @@ pub async fn update_mission(
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
     }
-    let db = state.db.lock();
-    db.update_mission(
-        &mission_id,
-        title.as_deref(),
-        status.as_deref(),
-        linked_issue_key.as_deref(),
-    )?;
-    db.get_mission(&mission_id)?
-        .ok_or_else(|| crate::error::AppError::Other("mission not found".into()))
+    // Scope the DB lock so it's released before the (self-locking) ephemeral
+    // auto-archive below — parking_lot's Mutex is not reentrant.
+    let updated = {
+        let db = state.db.lock();
+        db.update_mission(
+            &mission_id,
+            title.as_deref(),
+            status.as_deref(),
+            linked_issue_key.as_deref(),
+        )?;
+        db.get_mission(&mission_id)?
+            .ok_or_else(|| crate::error::AppError::Other("mission not found".into()))?
+    };
+    // An ephemeral mission reaching a terminal state (done/archived) takes its
+    // throwaway worktree with it — "archived when the mission is done".
+    if matches!(status.as_deref(), Some("done") | Some("archived"))
+        && updated.git_isolation == "ephemeral"
+    {
+        if let Some(ws_id) = updated.workspace_id.as_deref() {
+            archive_workspace_internal(&state, ws_id)?;
+        }
+    }
+    Ok(updated)
+}
+
+/// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,
+/// resolving the project path from the workspace's project. Shared by the
+/// ephemeral-mission auto-archive; mirrors the guarded removal the
+/// `archive_workspace` command performs. Best-effort on the filesystem.
+fn archive_workspace_internal(state: &AppState, workspace_id: &str) -> AppResult<()> {
+    let ws = { state.db.lock().get_workspace(workspace_id)? };
+    let Some(ws) = ws else { return Ok(()) };
+    let project_path = { state.db.lock().get_project(&ws.project_id)?.map(|p| p.path) };
+    let Some(project_path) = project_path else { return Ok(()) };
+    if owns_worktree_on_disk(&state.db, workspace_id, &project_path, ws.worktree_path.as_deref()) {
+        if let Some(wt) = &ws.worktree_path {
+            let _ = crate::git_ops::delete_worktree(
+                std::path::Path::new(&project_path),
+                std::path::Path::new(wt),
+            );
+            let wt_path = std::path::Path::new(wt);
+            if wt_path.exists() {
+                let _ = std::fs::remove_dir_all(wt_path);
+            }
+        }
+    }
+    state.db.lock().archive_workspace(workspace_id)?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn archive_mission(state: State<'_, AppState>, mission_id: String) -> AppResult<()> {
-    state.db.lock().archive_mission(&mission_id)
+    let mission = { state.db.lock().get_mission(&mission_id)? };
+    state.db.lock().archive_mission(&mission_id)?;
+    // An ephemeral mission takes its throwaway worktree with it when archived.
+    if let Some(m) = mission {
+        if m.git_isolation == "ephemeral" {
+            if let Some(ws_id) = m.workspace_id.as_deref() {
+                archive_workspace_internal(&state, ws_id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Local + remote-tracking branches for the workspace creator's base picker.
