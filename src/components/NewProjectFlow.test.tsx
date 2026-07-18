@@ -72,8 +72,9 @@ const { NewProjectFlow } = await import("./NewProjectFlow");
 
 function render_flow() {
   const onBack = vi.fn();
-  const utils = render(<NewProjectFlow onBack={onBack} />);
-  return { ...utils, onBack };
+  const onGenesis = vi.fn();
+  const utils = render(<NewProjectFlow onBack={onBack} onGenesis={onGenesis} />);
+  return { ...utils, onBack, onGenesis };
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -94,7 +95,7 @@ describe("NewProjectFlow — Step I (type selection)", () => {
     expect(screen.getByText("Empty")).toBeInTheDocument();
     expect(screen.getByText("Clone")).toBeInTheDocument();
     expect(screen.getByText("Open")).toBeInTheDocument();
-    expect(screen.getByText("Template")).toBeInTheDocument();
+    expect(screen.getByText("From a prompt")).toBeInTheDocument();
   });
 
   it("Open card is enabled (not disabled)", () => {
@@ -109,11 +110,31 @@ describe("NewProjectFlow — Step I (type selection)", () => {
     expect(cloneCard).not.toBeDisabled();
   });
 
-  it("Template card is disabled", () => {
+  it("the 'From a prompt' card is selectable and opens the genesis step", async () => {
     render_flow();
-    // The Template button is disabled
-    const templateCard = screen.getByRole("button", { name: /template/i });
-    expect(templateCard).toBeDisabled();
+    const genesisCard = screen.getByRole("button", { name: /from a prompt/i });
+    expect(genesisCard).not.toBeDisabled();
+    fireEvent.click(genesisCard);
+    await waitFor(() => {
+      expect(screen.getByText("What do you want to build?")).toBeInTheDocument();
+      expect(screen.getByPlaceholderText(/Describe what you want to build/i)).toBeInTheDocument();
+    });
+  });
+
+  it("the wizard genesis CTA calls onGenesis with prompt/name/location; a cleared location falls back", async () => {
+    const { onGenesis } = render_flow();
+    fireEvent.click(screen.getByRole("button", { name: /from a prompt/i }));
+    const textarea = await screen.findByPlaceholderText(/Describe what you want to build/i);
+    fireEvent.change(textarea, { target: { value: "a todo cli in rust" } });
+    // Clear the Location field — an empty location must never reach onGenesis
+    // (it would make the backend scaffold at a relative/cwd path).
+    fireEvent.change(screen.getByDisplayValue("~/Octopush"), { target: { value: "" } });
+    fireEvent.click(screen.getByText("Set a crew on it"));
+    expect(onGenesis).toHaveBeenCalledTimes(1);
+    const [prompt, name, location] = onGenesis.mock.calls[0];
+    expect(prompt).toBe("a todo cli in rust");
+    expect(name).toBe("todo-cli-rust");
+    expect(location).toBe("~/Octopush");
   });
 
   it("clicking Clone advances to Step II with URL field", async () => {

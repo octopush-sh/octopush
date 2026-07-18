@@ -1473,14 +1473,14 @@ function App() {
   // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
   // "it's mine, on my disk" is the whole point.
   const genesisInFlight = useRef(false);
-  const handleGenesis = useCallback(async (promptText: string, name: string) => {
+  const handleGenesis = useCallback(async (promptText: string, name: string, location = "~/Octopush") => {
     // Reentrancy guard: a second submit (double Enter, key-repeat) mid-genesis
     // must not spawn a duplicate project or let one call's error suppress the
     // other's crew staging (they share projectStore.error).
     if (genesisInFlight.current) return;
     genesisInFlight.current = true;
     try {
-    await useProjectStore.getState().create("~/Octopush", name, promptText);
+    await useProjectStore.getState().create(location, name, promptText);
     const proj = useProjectStore.getState().current;
     if (!proj || useProjectStore.getState().error) return; // Welcome shows the error; no navigation.
     // Read workspaces fresh — the project effect also loads them, but the direct
@@ -1687,7 +1687,7 @@ function App() {
     if (appView === "new-project") {
       return (
         <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-          <NewProjectFlow onBack={() => setAppView("project")} />
+          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} />
           <ToastContainer />
         </div>
       );
@@ -2422,6 +2422,7 @@ function App() {
         <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
           <NewProjectFlow
             onBack={() => setShowAddProject(false)}
+            onGenesis={handleGenesis}
           />
         </div>
       )}
