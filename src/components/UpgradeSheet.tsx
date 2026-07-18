@@ -48,6 +48,18 @@ export function UpgradeSheet() {
               </>
             ),
           }
+        : info.feature === "logbook.reports"
+        ? {
+            eyebrow: "Logbook · reports",
+            title: "Every mission's hours and dollars, in one view.",
+            body: (
+              <>
+                Free shows each mission's own totals. Upgrade to Pro for the{" "}
+                <span className="text-octo-ivory">cross-mission Logbook</span> — worked time,
+                spend, and savings across a whole project or your entire studio, with export.
+              </>
+            ),
+          }
         : {
             eyebrow: "Direct · monthly limit",
             title: "You've hit your monthly Direct-run limit.",

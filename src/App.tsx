@@ -44,6 +44,7 @@ import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
+import { LogbookRoom } from "./components/LogbookRoom";
 import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
@@ -329,6 +330,7 @@ function App() {
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [missionControlOpen, setMissionControlOpen] = useState(false);
+  const [logbookOpen, setLogbookOpen] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
@@ -896,6 +898,13 @@ function App() {
       if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
         e.preventDefault();
         setMissionControlOpen((v) => !v);
+        return;
+      }
+
+      // ⌘⇧L → Logbook Room (cross-mission rollup)
+      if (mod && e.shiftKey && (e.key === "L" || e.key === "l")) {
+        e.preventDefault();
+        setLogbookOpen((v) => !v);
         return;
       }
 
@@ -2004,6 +2013,7 @@ function App() {
             onJumpToFile={handleJumpToFile}
             collapsed={isCompanionCollapsed}
             onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
+            onOpenLogbook={() => setLogbookOpen(true)}
           />
         </div>
         </div>
@@ -2485,6 +2495,9 @@ function App() {
           onJumpToAttention={handleJumpToAttention}
           onDispatch={handleDispatchCrew}
         />
+      )}
+      {logbookOpen && (
+        <LogbookRoom open onClose={() => setLogbookOpen(false)} project={project} />
       )}
     </div>
   );

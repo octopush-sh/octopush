@@ -1,21 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Maximize2 } from "lucide-react";
 import { Reveal } from "./primitives/Reveal";
 import { ipc } from "../lib/ipc";
 import { useMissionsStore } from "../stores/missionsStore";
 import { useChatStore } from "../stores/chatStore";
 import { useRunsStore } from "../stores/runsStore";
+import { fmtHours } from "../lib/logbook";
 import type { LogbookMissionRow } from "../lib/types";
-
-/** Compact worked-time formatting: `45s` · `12m` · `3h 20m`. */
-function fmtHours(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m`;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
-}
 
 /**
  * The Logbook card — the free per-mission slice of the Logbook. Shows worked
@@ -23,7 +14,14 @@ function fmtHours(secs: number): string {
  * cross-mission Logbook Room is Pro). Loads on mission change; geometry is
  * reserved so nothing shifts while it resolves.
  */
-export function LogbookCard({ workspaceId }: { workspaceId: string }) {
+export function LogbookCard({
+  workspaceId,
+  onOpenRoom,
+}: {
+  workspaceId: string;
+  /** Opens the full Logbook Room (⌘⇧L) — the free card is its teaser. */
+  onOpenRoom?: () => void;
+}) {
   const missionId = useMissionsStore((s) => s.missionByWorkspaceId[workspaceId]?.id ?? null);
   // Refresh signals: a TALK turn completing (streaming true→false) and a DIRECT
   // run changing status both land new spend/hours we should re-read. Keyed on
@@ -75,20 +73,33 @@ export function LogbookCard({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div className="border-t border-octo-hairline px-3 py-2.5">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        title="This mission's worked time and spend"
-        className="flex w-full items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-      >
-        <ChevronRight
-          size={11}
-          aria-hidden
-          className={`transition-transform duration-[220ms] ${open ? "rotate-90" : ""}`}
-        />
-        Logbook
-      </button>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          title="This mission's worked time and spend"
+          className="flex flex-1 items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          <ChevronRight
+            size={11}
+            aria-hidden
+            className={`transition-transform duration-[220ms] ${open ? "rotate-90" : ""}`}
+          />
+          Logbook
+        </button>
+        {onOpenRoom && (
+          <button
+            type="button"
+            onClick={onOpenRoom}
+            title="Open the Logbook"
+            aria-label="Open the Logbook"
+            className="shrink-0 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            <Maximize2 size={11} aria-hidden />
+          </button>
+        )}
+      </div>
       <Reveal open={open} className="mt-2">
         {/* Reserved-height row so the figures fading in never shift layout. */}
         <div className="flex h-4 items-baseline gap-4 font-mono text-[11px]">

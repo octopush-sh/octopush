@@ -18,6 +18,7 @@ export function ShortcutsPane() {
           <Shortcut keys="⌘⇧3" desc="Review mode" />
           <Shortcut keys="⌘⇧D" desc="Direct mode" />
           <Shortcut keys="⌘⇧M" desc="Mission Control" />
+          <Shortcut keys="⌘⇧L" desc="Logbook Room" />
           <Shortcut keys="⌘\\" desc="Toggle companion" />
         </ShortcutGroup>
 
