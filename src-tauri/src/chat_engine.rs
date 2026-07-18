@@ -2069,6 +2069,25 @@ mod tests {
     }
 
     #[test]
+    fn readonly_mission_empty_roots_refuses_every_write_platform_independently() {
+        // A readonly mission (review/probe) resolves to Some(vec![]) write roots.
+        // The lexical pre-check must then refuse EVERY write_file — even one
+        // inside the workspace — before any macOS-only kernel path, so read-only
+        // holds regardless of platform.
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let empty: Vec<String> = vec![];
+        let (msg, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": "in_workspace.txt", "content": "x"}),
+            Some(&empty),
+        );
+        assert!(!ok, "a readonly mission refuses even an in-workspace write: {msg}");
+        assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
+    }
+
+    #[test]
     fn dangerous_command_flags_destructive_and_passes_safe() {
         // Destructive → flagged.
         assert!(dangerous_command("rm -rf build").is_some());

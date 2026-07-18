@@ -74,6 +74,20 @@ pub fn create(
     linked_issue_key: Option<&str>,
 ) -> AppResult<MissionRow> {
     validate(intent, git_isolation, exec_isolation)?;
+    // One workspace, one isolation mode. A workspace may host several active
+    // missions (readonly review/probe share a checkout), but they must ALL agree
+    // on git_isolation — because execution confinement is resolved from
+    // `active_mission_for_workspace` (any active mission), so a mix of readonly +
+    // writer missions on one checkout could let a readonly agent resolve as a
+    // writer and modify the checkout. Reject the mix at the source.
+    if let Some(ws) = workspace_id {
+        if let Some(other) = db.conflicting_active_isolation(ws, git_isolation)? {
+            return Err(AppError::Other(format!(
+                "this workspace already has an active '{other}' mission — a checkout can't mix \
+                 '{other}' and '{git_isolation}' isolation (start '{intent}' in its own workspace)"
+            )));
+        }
+    }
     let id = uuid::Uuid::new_v4().to_string();
     db.insert_mission(
         &id,

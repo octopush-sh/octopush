@@ -9244,4 +9244,26 @@ mod mission_tests {
         assert!(crate::mission::validate_exec("sandbox").is_ok());
         assert!(crate::mission::validate_exec("bogus").is_err());
     }
+
+    #[test]
+    fn a_workspace_cannot_mix_isolation_modes() {
+        // One checkout, one isolation mode — else a readonly agent could resolve
+        // (via active_mission_for_workspace) as a writer and modify the checkout.
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        crate::mission::create(&db, "p1", "build", "b", "worktree", "none", Some("w1"), None)
+            .unwrap();
+        // A readonly mission on the SAME workspace (different isolation) is rejected.
+        let mixed =
+            crate::mission::create(&db, "p1", "review", "r", "readonly", "none", Some("w1"), None);
+        assert!(mixed.is_err(), "readonly can't share a checkout with a writer mission");
+        // Same isolation is fine — two readonly missions may share a checkout.
+        let build_id = db.list_missions("p1").unwrap()[0].id.clone();
+        db.archive_mission(&build_id).unwrap();
+        crate::mission::create(&db, "p1", "review", "r1", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        crate::mission::create(&db, "p1", "probe", "r2", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 2, "two readonly missions share fine");
+    }
 }
