@@ -1496,7 +1496,11 @@ function App() {
       await usePipelineStore.getState().load();
       pipelines = usePipelineStore.getState().pipelines;
     }
+    // Genesis stages the Greenfield crew — it knows how to be BORN into an empty
+    // repo (choose the stack → gate → scaffold → first increment → honest verify),
+    // unlike Feature Factory which assumes an existing codebase.
     const flagship =
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Greenfield") ??
       pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
       pipelines.find((p) => p.pipeline.isBuiltin);
     if (flagship) {

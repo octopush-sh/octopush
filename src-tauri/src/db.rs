@@ -3135,6 +3135,12 @@ impl Db {
             }
         }
 
+        // The Greenfield crew (prompt genesis, G3): plan-with-stack-choice →
+        // gate → scaffold → first working increment → honest verification. It
+        // carries per-stage instructions the simple `defs` shape can't express,
+        // so it seeds separately (still idempotent on the builtin name).
+        self.seed_greenfield_pipeline()?;
+
         // Backfill: existing installs seeded the builtins before loop config existed.
         // Set the gated default on builtin review stages that are still linear. The
         // `loop_mode IS NULL` guard makes this idempotent and never overrides a config.
@@ -3157,6 +3163,81 @@ impl Db {
             [],
         )?;
 
+        Ok(())
+    }
+
+    /// Seed the "Greenfield" builtin — the crew that turns a prompt into a first
+    /// working slice of a brand-new project. Idempotent (keyed on the name). The
+    /// director chose (G3): the crew CHOOSES the stack, gated by a checkpoint the
+    /// director approves before any scaffolding; it ends at a LOCAL repo (no
+    /// push/PR). Honesty is mechanical — the final stage writes a verification
+    /// README declaring what it could and could NOT verify.
+    fn seed_greenfield_pipeline(&self) -> AppResult<()> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pipelines WHERE name = ?1 AND is_builtin = 1",
+            params!["Greenfield"],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Ok(());
+        }
+        let pid = self.insert_pipeline(
+            "Greenfield",
+            "From a prompt to a first working slice of a brand-new project.",
+            true,
+        )?;
+        // (role, custom_name, model, checkpoint, loop_target, loop_max, loop_mode, instructions)
+        let stages: &[(&str, &str, &str, bool, Option<i64>, i64, Option<&str>, &str)] = &[
+            (
+                "plan", "Choose the stack", "claude-sonnet-4-6", true, None, 0, None,
+                "This is a GREENFIELD project — the repository is empty. Read the brief and choose the \
+                 SIMPLEST language, framework, and structure that genuinely satisfies it (bias to what \
+                 can be verified locally with common toolchains). Propose the directory structure and a \
+                 FIRST working increment — the smallest slice that actually runs. Explicitly declare what \
+                 you will NOT attempt in this first slice. Do NOT write any code yet; this is the plan the \
+                 director approves before the build begins.",
+            ),
+            (
+                "implement", "Scaffold", "claude-sonnet-4-6", false, None, 0, None,
+                "Scaffold ONLY the structure the approved plan chose: directories, dependency manifests, \
+                 config, and a sensible .gitignore. Do not implement features yet — create the skeleton \
+                 that installs/builds cleanly. Prefer standard, well-known project layouts for the chosen \
+                 stack.",
+            ),
+            (
+                "implement", "First increment", "claude-sonnet-4-6", true, None, 0, None,
+                "Implement the FIRST working increment from the plan — the smallest slice that actually \
+                 runs: a passing test, a server that responds, a CLI that does one thing, or a view that \
+                 compiles. Keep it minimal and real. This is a starting point a developer can build on, \
+                 not a finished product.",
+            ),
+            (
+                "code_review", "Review the increment", "claude-haiku-4-5", true, Some(2), 2, Some("gated"),
+                "Review the increment for correctness and obvious issues. Keep the bar at 'a competent \
+                 first slice', not 'production-ready' — this is a greenfield starting point.",
+            ),
+            (
+                "test", "Verify honestly", "claude-sonnet-4-6", true, None, 0, None,
+                "Run whatever can be run to verify the increment. Then write a README.md that is HONEST: \
+                 how to run it, what you actually verified (e.g. 'tests pass', 'the server responds on \
+                 :3000'), and what you could NOT verify in this environment (e.g. 'no iOS simulator \
+                 available to launch the app'). Never claim more than you verified. Do not push anywhere \
+                 or open a pull request — the work stays in this local repository.",
+            ),
+        ];
+        for (i, (role, custom_name, model, checkpoint, lt, lm, lmode, instructions)) in
+            stages.iter().enumerate()
+        {
+            let id = Uuid::new_v4().to_string();
+            self.conn.execute(
+                "INSERT INTO pipeline_stages
+                    (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                     custom_name, instructions)
+                 VALUES (?1,?2,?3,?4,?5,'api',?6,?7,?8,?9,25,?10,?11)",
+                params![id, pid, i as i64, role, model, *checkpoint as i64, lt, lm, lmode, custom_name, instructions],
+            )?;
+        }
         Ok(())
     }
 
