@@ -4316,6 +4316,8 @@ impl Db {
         let Some((workspace_id, project_id, model, mission_id)) = attr else {
             return Ok(()); // stage vanished — nothing to attribute
         };
+        // Logbook: a stage that burned spend is active DIRECT work on the mission.
+        let _ = self.record_activity(&workspace_id, "direct", "stage");
         self.insert_spend_event(&SpendEvent {
             ts_utc: ts_utc.to_string(),
             surface: "direct".into(),

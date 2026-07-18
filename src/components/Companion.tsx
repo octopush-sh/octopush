@@ -8,6 +8,7 @@ import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionRuns } from "./CompanionRuns";
+import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
@@ -228,6 +229,7 @@ export function Companion({
             <CompanionHistory {...historyProps} />
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
             {workspaceId && <SavingsLedger workspaceId={workspaceId} />}
+            {workspaceId && <LogbookCard workspaceId={workspaceId} />}
           </div>
         )}
         {mode === "run" && workspaceId && (
@@ -243,7 +245,10 @@ export function Companion({
           />
         )}
         {mode === "direct" && workspaceId && (
-          <CompanionRuns workspaceId={workspaceId} />
+          <div className="flex min-h-0 flex-1 flex-col">
+            <CompanionRuns workspaceId={workspaceId} />
+            <LogbookCard workspaceId={workspaceId} />
+          </div>
         )}
       </FadeSwap>
 

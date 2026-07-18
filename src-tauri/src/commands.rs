@@ -704,6 +704,26 @@ pub async fn archive_mission(state: State<'_, AppState>, mission_id: String) -> 
     Ok(())
 }
 
+/// The Logbook rollup for a scope + period. Per-mission (the Companion card) is
+/// FREE; cross-mission rollups (project / global — the Logbook Room) are Pro
+/// (`logbook.reports`).
+#[tauri::command]
+pub async fn logbook_summary(
+    state: State<'_, AppState>,
+    scope_type: String,
+    scope_id: Option<String>,
+    from: String,
+    to: String,
+) -> AppResult<Vec<crate::db::LogbookMissionRow>> {
+    if scope_type != "mission" {
+        require_logbook_reports()?;
+    }
+    state
+        .db
+        .lock()
+        .logbook_summary(&scope_type, scope_id.as_deref(), &from, &to)
+}
+
 /// Local + remote-tracking branches for the workspace creator's base picker.
 /// Locals keep their "default first" ordering; remotes come fully qualified
 /// (`origin/dev`) so the picker can pass them straight back as a base.
@@ -1573,6 +1593,11 @@ fn require_feature_gate(feature: &str) -> AppResult<()> {
 
 fn require_history_sync() -> AppResult<()> {
     require_feature_gate(crate::entitlement::feature::HISTORY_SYNC)
+}
+
+/// Cross-mission Logbook rollups + export are Pro; per-mission is free.
+fn require_logbook_reports() -> AppResult<()> {
+    require_feature_gate(crate::entitlement::feature::LOGBOOK_REPORTS)
 }
 
 /// The local read-only history mirror (instant, no network). The History view

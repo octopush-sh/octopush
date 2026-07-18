@@ -370,6 +370,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
   GhIssue,
@@ -598,6 +599,11 @@ export const ipc = {
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
   ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
+
+  // ─── Logbook ────────────────────────────────────────────────────
+  /** Per-mission scope is free; project/global (the Logbook Room) is Pro. */
+  logbookSummary: (scopeType: string, scopeId: string | null, from: string, to: string) =>
+    invoke<LogbookMissionRow[]>("logbook_summary", { scopeType, scopeId, from, to }),
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),

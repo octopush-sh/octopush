@@ -26,6 +26,9 @@ pub mod feature {
     pub const RUNS_DETACHED: &str = "runs.detached";
     /// Saved pipelines fire on a schedule (recurring crews).
     pub const ROUTINES_SCHEDULED: &str = "routines.scheduled";
+    /// Logbook rollups across missions/projects + export + digest. (Per-mission
+    /// Logbook — the Companion card — is free; only the cross-mission Room is gated.)
+    pub const LOGBOOK_REPORTS: &str = "logbook.reports";
 }
 
 /// The Free monthly Direct-run cap (live). Shared by the meter, the restricted
@@ -93,6 +96,7 @@ impl Entitlement {
                 feature::LIBRARY_SYNC.into(),
                 feature::RUNS_DETACHED.into(),
                 feature::ROUTINES_SCHEDULED.into(),
+                feature::LOGBOOK_REPORTS.into(),
             ],
             direct_runs_per_month: None,
         }

@@ -1355,6 +1355,8 @@ impl ChatEngine {
                     tracing::warn!(error = %e, "failed to record chat token event");
                 }
             }
+            // Logbook: a completed chat turn is active TALK work on the mission.
+            let _ = self.db.lock().record_activity(&request.workspace_id, "talk", "chat");
 
             tracing::info!(
                 iteration = iteration,
