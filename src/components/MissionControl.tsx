@@ -225,7 +225,7 @@ function BandSection({
       <div className="flex h-11 items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         {title}
       </div>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(380px,1fr))] gap-4">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(380px,1fr))] items-start gap-4">
         {items.map((item, i) =>
           item.kind === "run" ? (
             <CrewCard key={item.run.id} run={item.run} band={band} index={i} onJumpToRun={onJumpToRun} />
@@ -264,23 +264,31 @@ function AttentionCard({
   const brief =
     item.flag === "chat" ? "A conversation finished — your move." : "A terminal is asking for input.";
   const isLongestWaiting = index === 0;
+  // Mirror CrewCard's guard: a workspace whose project is closed still shows,
+  // but jump-to is disabled — we can't navigate to an unloaded workspace.
+  const canJump = wsName !== null;
   const jump = () => onJump(item.workspaceId, item.flag);
+  const jumpProps = canJump
+    ? {
+        role: "button" as const,
+        tabIndex: 0,
+        onClick: jump,
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.target !== e.currentTarget) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            jump();
+          }
+        },
+        "aria-label": `Open ${title} — ${word}`,
+      }
+    : { title: "Open this mission's project to view it" };
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      onClick={jump}
-      onKeyDown={(e) => {
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          jump();
-        }
-      }}
-      aria-label={`Open ${title} — ${word}`}
+      {...jumpProps}
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
-      className={`octo-rise-in group relative flex cursor-pointer flex-col gap-1.5 rounded-lg border border-octo-brass bg-octo-panel px-4 py-3 text-left transition duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${isLongestWaiting ? "octo-stage-pulse" : ""}`}
+      className={`octo-rise-in group relative flex flex-col gap-1.5 rounded-lg border border-octo-brass bg-octo-panel px-4 py-3 text-left transition duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${canJump ? "cursor-pointer" : ""} ${isLongestWaiting ? "octo-stage-pulse" : ""}`}
     >
       {/* Row 1 — glyph · word · time waiting. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
@@ -434,7 +442,11 @@ function CrewCard({
         {missionIntent &&
           (() => {
             const Icon = INTENT_ICON[missionIntent] ?? Hammer;
-            return <Icon size={11} aria-hidden className="shrink-0 text-octo-mute" />;
+            return (
+              <span title={`${missionIntent} mission`} className="flex shrink-0 items-center">
+                <Icon size={11} aria-hidden className="text-octo-mute" />
+              </span>
+            );
           })()}
         <span className="min-w-0 truncate font-serif text-[15px] text-octo-ivory" title={wsName ?? undefined}>
           {wsName ?? "workspace"}

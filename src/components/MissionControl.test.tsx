@@ -253,13 +253,24 @@ describe("MissionControl", () => {
     expect(screen.getByText("terminal bell")).toBeInTheDocument();
   });
 
-  it("clicking an attention card jumps to that mission's Talk surface", () => {
+  it("clicking an attention card (loaded workspace) jumps to that mission's Talk surface", () => {
     useAttentionStore.setState({ flagsByWs: { "ws-x": { kind: "chat", at: 1_000 } } });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-x", name: "Alpha" }] },
+    } as any);
     const onJumpToAttention = vi.fn();
     renderRoom({ onJumpToAttention });
-    const card = screen.getByText("waiting in Talk").closest('[role="button"]');
-    fireEvent.click(card as HTMLElement);
+    fireEvent.click(screen.getByRole("button", { name: /waiting in Talk/ }));
     expect(onJumpToAttention).toHaveBeenCalledWith("ws-x", "chat");
+  });
+
+  it("an attention card for an unloaded workspace renders inert (no jump)", () => {
+    useAttentionStore.setState({ flagsByWs: { "ws-gone": { kind: "chat", at: 1_000 } } });
+    const onJumpToAttention = vi.fn();
+    renderRoom({ onJumpToAttention });
+    // Can't navigate to an unloaded workspace — no clickable card, explaining title.
+    expect(screen.queryByRole("button", { name: /waiting in Talk/ })).toBeNull();
+    expect(screen.getByTitle("Open this mission's project to view it")).toBeTruthy();
   });
 
   it("runs and attention share the needs-you band, oldest-first (single beacon)", () => {
