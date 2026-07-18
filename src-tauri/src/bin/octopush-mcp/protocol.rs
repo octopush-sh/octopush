@@ -63,8 +63,10 @@ pub fn initialize_result(client_protocol: Option<&str>) -> Value {
 /// Server-level guidance surfaced to the model on connect — sets expectations
 /// about what this server is for and its safety envelope.
 const INSTRUCTIONS: &str = "\
-Octopush MCP — author DIRECT-mode pipelines and inspect Octopush workspaces, \
-projects, and runs over the same local store the desktop app uses.\n\n\
+Octopush MCP — author DIRECT-mode pipelines and inspect Octopush missions, \
+workspaces, projects, and runs over the same local store the desktop app uses. \
+A mission is the first-level unit of intent; every workspace is paired with one \
+(create_workspace does this automatically).\n\n\
 This server is read-and-author only: it never executes runs, spends tokens, or \
 mutates git working trees. Pipelines you create/update are saved as reusable \
 templates; runs you create are staged in 'draft' for the user to launch from \

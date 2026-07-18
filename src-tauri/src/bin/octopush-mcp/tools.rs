@@ -186,7 +186,8 @@ pub fn tool_definitions() -> Value {
              `status` is one of created | adopted | existed | restored. This is \
              the one tool that touches git (it may materialise a worktree). The \
              workspace shows up in Octopush's left rail (refresh the project, or \
-             it appears when the window regains focus).",
+             it appears when the window regains focus). Every workspace is paired \
+             with a mission — pass `intent` ('build' default, or 'fix').",
             json!({
                 "type": "object",
                 "properties": {
@@ -195,9 +196,53 @@ pub fn tool_definitions() -> Value {
                     "branch": { "type": ["string", "null"], "description": "Optional explicit branch name, used VERBATIM (validated as a git ref; case/slashes/dots preserved). An existing branch is reused. Omit to derive a slug from `task`." },
                     "name": { "type": ["string", "null"], "description": "Optional display name for the rail. Defaults to the branch." },
                     "fromBranch": { "type": ["string", "null"], "description": "Optional base to branch from (local like 'dev' or remote-tracking like 'origin/dev'). Defaults to the repo's default branch. Ignored when the branch already exists." },
-                    "setupScript": { "type": ["string", "null"], "description": "Optional shell script to seed the workspace's setup. Default empty." }
+                    "setupScript": { "type": ["string", "null"], "description": "Optional shell script to seed the workspace's setup. Default empty." },
+                    "intent": { "type": ["string", "null"], "description": "Intent for the auto-paired mission: 'build' (default) or 'fix'." }
                 },
                 "required": ["projectId", "task"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
+            "list_missions",
+            "List a project's missions (threads of intent). A mission is the \
+             first-level unit of work; a code mission (build/fix) owns one \
+             workspace. Returns intent, title, status, the two isolation axes, \
+             and the linked workspace/issue.",
+            json!({
+                "type": "object",
+                "properties": { "projectId": { "type": "string" } },
+                "required": ["projectId"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
+            "get_mission",
+            "Fetch one mission by id.",
+            json!({
+                "type": "object",
+                "properties": { "missionId": { "type": "string" } },
+                "required": ["missionId"],
+                "additionalProperties": false
+            }),
+        ),
+        def(
+            "create_mission",
+            "Author a mission (a thread of intent). For code work prefer \
+             create_workspace (it pairs a 'build' mission automatically); use \
+             this for missions with no worktree (design/probe) or to attach a \
+             specific intent/isolation. Authoring only — never executes anything.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string" },
+                    "title": { "type": "string" },
+                    "intent": { "type": ["string", "null"], "description": "build | fix | review | probe | design | perf | ops. Default 'build'." },
+                    "gitIsolation": { "type": ["string", "null"], "description": "worktree (default) | readonly | ephemeral | pr." },
+                    "workspaceId": { "type": ["string", "null"], "description": "Optional workspace this mission owns (code missions). Omit for design/probe." },
+                    "linkedIssueKey": { "type": ["string", "null"], "description": "Optional issue-tracker key." }
+                },
+                "required": ["projectId", "title"],
                 "additionalProperties": false
             }),
         ),
@@ -430,6 +475,9 @@ pub fn call_tool(db: &Mutex<Db>, name: &str, args: &Value) -> Value {
             "list_projects" => list_projects(&db),
             "list_workspaces" => list_workspaces(&db, args),
             "get_workspace" => get_workspace(&db, args),
+            "list_missions" => list_missions(&db, args),
+            "get_mission" => get_mission(&db, args),
+            "create_mission" => create_mission(&db, args),
             "link_workspace_issue" => link_workspace_issue(&db, args),
             "create_run" => create_run(&db, args),
             "list_runs" => list_runs(&db, args),
@@ -759,6 +807,12 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| branch.clone());
     let from_branch = opt_str(args, "fromBranch").unwrap_or_default();
     let setup_script = opt_str(args, "setupScript").unwrap_or_default();
+    // Validate the mission intent BEFORE creating anything on disk (mirrors the
+    // desktop command) so a bad value can't strand an unpaired workspace.
+    let intent = opt_str(args, "intent")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "build".to_string());
+    octopush_lib::mission::validate_axes(&intent, "worktree").map_err(|e| e.to_string())?;
 
     let (ws, outcome) = octopush_lib::workspace::create(
         db,
@@ -771,6 +825,15 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
         &setup_script,
     )
     .map_err(|e| e.to_string())?;
+
+    // Pair the workspace with its mission — the same "no workspace without a
+    // mission" guarantee the desktop app makes, now honored for MCP-created
+    // workspaces. Idempotent: a reused/adopted workspace keeps its mission.
+    {
+        let dbg = db.lock();
+        octopush_lib::mission::ensure_for_workspace(&dbg, &ws, &intent, "worktree")
+            .map_err(|e| e.to_string())?;
+    }
 
     use octopush_lib::workspace::CreateOutcome;
     let (status, note) = match outcome {
@@ -793,6 +856,46 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
     };
 
     Ok(json!({ "workspace": ws, "status": status, "note": note }))
+}
+
+fn list_missions(db: &Db, args: &Value) -> Result<Value, String> {
+    let project_id = req_str(args, "projectId")?;
+    let missions = db.list_missions(&project_id).map_err(|e| e.to_string())?;
+    Ok(json!({ "missions": missions }))
+}
+
+fn get_mission(db: &Db, args: &Value) -> Result<Value, String> {
+    let id = req_str(args, "missionId")?;
+    let m = db
+        .get_mission(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no mission with id '{id}'"))?;
+    Ok(json!({ "mission": m }))
+}
+
+fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
+    let project_id = req_str(args, "projectId")?;
+    let title = req_str(args, "title")?;
+    let intent = opt_str(args, "intent")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "build".to_string());
+    let git_isolation = opt_str(args, "gitIsolation")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "worktree".to_string());
+    let workspace_id = opt_str(args, "workspaceId").filter(|s| !s.trim().is_empty());
+    let linked_issue_key = opt_str(args, "linkedIssueKey").filter(|s| !s.trim().is_empty());
+    let m = octopush_lib::mission::create(
+        db,
+        &project_id,
+        &intent,
+        &title,
+        &git_isolation,
+        "none",
+        workspace_id.as_deref(),
+        linked_issue_key.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({ "mission": m }))
 }
 
 fn link_workspace_issue(db: &Db, args: &Value) -> Result<Value, String> {
@@ -1799,5 +1902,45 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("built-in")));
+    }
+
+    #[test]
+    fn create_mission_tool_authors_lists_and_gets() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        let payload = create_mission(
+            &db,
+            &json!({ "projectId": "p1", "title": "Design the thing", "intent": "design" }),
+        )
+        .expect("create_mission should author a mission");
+        assert_eq!(payload["mission"]["intent"], "design");
+        assert_eq!(payload["mission"]["title"], "Design the thing");
+
+        let listed = list_missions(&db, &json!({ "projectId": "p1" })).unwrap();
+        assert_eq!(listed["missions"].as_array().unwrap().len(), 1);
+
+        let mid = payload["mission"]["id"].as_str().unwrap();
+        let got = get_mission(&db, &json!({ "missionId": mid })).unwrap();
+        assert_eq!(got["mission"]["id"], mid);
+    }
+
+    #[test]
+    fn get_mission_unknown_id_is_a_clean_error() {
+        let db = test_db();
+        let err = get_mission(&db, &json!({ "missionId": "nope" }))
+            .expect_err("unknown mission id must be a clean tool error");
+        assert!(err.contains("no mission"), "err: {err}");
+    }
+
+    #[test]
+    fn create_mission_rejects_a_bad_intent() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        let err = create_mission(
+            &db,
+            &json!({ "projectId": "p1", "title": "t", "intent": "nonsense" }),
+        )
+        .expect_err("an out-of-enum intent must be rejected");
+        assert!(err.contains("unknown mission intent"), "err: {err}");
     }
 }
