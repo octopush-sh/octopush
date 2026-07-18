@@ -694,7 +694,9 @@ export function NewProjectFlow({ onBack, onGenesis }: Props) {
             <div className="mt-8 max-w-[520px] space-y-5">
               <GenesisPrompt
                 loading={createLoading}
-                onSubmit={(prompt, name) => onGenesis(prompt, name, genesisLocation.trim())}
+                onSubmit={(prompt, name) =>
+                  onGenesis(prompt, name, genesisLocation.trim() || "~/Octopush")
+                }
               />
               <Field label="LOCATION">
                 <input

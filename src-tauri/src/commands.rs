@@ -527,6 +527,16 @@ pub async fn create_project(
 ) -> AppResult<ProjectInfo> {
     let path = expand_tilde(&path);
     let base = std::path::Path::new(&path);
+    // The location must be an absolute path. An editable field feeds this, and an
+    // empty/relative base would make `Path::join` yield a RELATIVE project path —
+    // scaffolded against the process cwd and persisted as a relative string that
+    // resolves differently next launch. Reject it at the source (mirrors the
+    // name guard in resolve_free_project_dir).
+    if path.trim().is_empty() || base.is_relative() {
+        return Err(crate::error::AppError::Other(format!(
+            "'{path}' is not a valid project location — an absolute path is required"
+        )));
+    }
     // Never `git init` over someone else's non-empty directory: if the target
     // exists with content, pick a free `<name>-2`, `-3`, … (an empty dir is
     // adopted). Prompt genesis derives the name from a prompt, so collisions are
