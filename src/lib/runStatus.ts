@@ -48,9 +48,10 @@ export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
 
 /** Whether a run needs the director's attention right now. `paused` always
  *  means a human must act in this engine (gate / halted stage / budget park /
- *  director pause) — the one predicate Mission Control's Needs-you band and
- *  the fleet chip (`RunsTray`) both read, so the two surfaces never disagree
- *  on what counts as "needs you". */
+ *  director pause). The fleet chip (`RunsTray`) reads this predicate; Mission
+ *  Control inlines the same `status === "paused"` check on the run side of its
+ *  discriminated-union board (it also folds in non-run attention items), so keep
+ *  the two definitions of "a paused run needs you" in lockstep. */
 export function needsYou(run: Pick<Run, "status">): boolean {
   return run.status === "paused";
 }
