@@ -19,11 +19,13 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
   // Genesis: the prompt, and a derived project name the user may override.
   const [prompt, setPrompt] = useState("");
   const [nameOverride, setNameOverride] = useState<string | null>(null);
-  const effectiveName = nameOverride ?? deriveProjectName(prompt);
+  // A BLANK override never wins — an empty name would make the backend git-init
+  // the ~/Octopush container itself. Clearing the field reverts to the slug.
+  const effectiveName = nameOverride?.trim() ? nameOverride.trim() : deriveProjectName(prompt);
   const canGenesis = prompt.trim().length > 0;
 
   function submitGenesis() {
-    if (!canGenesis) return;
+    if (!canGenesis || loading) return;
     onGenesis(prompt.trim(), effectiveName);
   }
 
@@ -118,8 +120,9 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
             }
           }}
           rows={2}
+          disabled={loading}
           placeholder="Describe what you want to build…"
-          className="w-full resize-none rounded-lg border border-octo-hairline bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
+          className="w-full resize-none rounded-lg border border-octo-hairline bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-60"
         />
         <p className="mt-2 text-[12px] leading-[1.4] text-octo-sage">{GENESIS_PROMISE}</p>
         <div className="mt-3 flex items-center justify-end gap-3">

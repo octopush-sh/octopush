@@ -27,6 +27,13 @@ describe("deriveProjectName", () => {
   it("strips punctuation and non-ascii into a clean slug", () => {
     expect(deriveProjectName("Café ordering system!!!")).toBe("caf-ordering-system");
   });
+
+  it("caps each token so a giant no-whitespace paste can't blow the name limit", () => {
+    const huge = "x".repeat(500);
+    const out = deriveProjectName(`a ${huge} thing`);
+    // Each token ≤ 24 chars.
+    for (const token of out.split("-")) expect(token.length).toBeLessThanOrEqual(24);
+  });
 });
 
 describe("GENESIS_PROMISE", () => {

@@ -552,10 +552,26 @@ pub(crate) fn resolve_free_project_dir(
     base: &std::path::Path,
     name: &str,
 ) -> AppResult<(std::path::PathBuf, String)> {
+    // The name must be ONE safe path component. An editable field feeds this, so
+    // an absolute path, a `..`, a separator, or an empty string would escape the
+    // `~/Octopush` sandbox (`Path::join` replaces the base on an absolute arg and
+    // keeps `..` literally) — or, when empty, git-init the container dir itself.
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(crate::error::AppError::Other(format!(
+            "'{name}' is not a valid project name"
+        )));
+    }
     let is_free = |p: &std::path::Path| -> bool {
         match std::fs::read_dir(p) {
-            Ok(mut entries) => entries.next().is_none(), // exists + empty
-            Err(_) => true,                              // doesn't exist
+            Ok(mut entries) => entries.next().is_none(), // exists + empty → adopt
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // doesn't exist → create
+            Err(_) => false, // exists as a file / unreadable → not usable, suffix past it
         }
     };
     let first = base.join(name);

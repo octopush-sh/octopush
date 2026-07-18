@@ -9265,6 +9265,15 @@ mod mission_tests {
         std::fs::create_dir_all(base.join("empty")).unwrap();
         let (_, n3) = crate::commands::resolve_free_project_dir(base, "empty").unwrap();
         assert_eq!(n3, "empty");
+        // Names that aren't a single safe component are REJECTED (an editable
+        // field feeds this — empty/`..`/separator/absolute would escape the box
+        // or git-init the container itself).
+        for bad in ["", "   ", ".", "..", "a/b", "/etc/evil", "..\\x"] {
+            assert!(
+                crate::commands::resolve_free_project_dir(base, bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
     }
 
     #[test]

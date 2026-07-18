@@ -1472,7 +1472,14 @@ function App() {
   // the repo). Composes create_project (born in <1s, local) with the same crew
   // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
   // "it's mine, on my disk" is the whole point.
+  const genesisInFlight = useRef(false);
   const handleGenesis = useCallback(async (promptText: string, name: string) => {
+    // Reentrancy guard: a second submit (double Enter, key-repeat) mid-genesis
+    // must not spawn a duplicate project or let one call's error suppress the
+    // other's crew staging (they share projectStore.error).
+    if (genesisInFlight.current) return;
+    genesisInFlight.current = true;
+    try {
     await useProjectStore.getState().create("~/Octopush", name, promptText);
     const proj = useProjectStore.getState().current;
     if (!proj || useProjectStore.getState().error) return; // Welcome shows the error; no navigation.
@@ -1510,6 +1517,9 @@ function App() {
         title: "Add your Anthropic key first",
         body: "Your crew is staged and waiting — one key in Settings · Models.",
       });
+    }
+    } finally {
+      genesisInFlight.current = false;
     }
   }, []);
 

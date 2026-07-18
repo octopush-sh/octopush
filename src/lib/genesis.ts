@@ -20,9 +20,13 @@ export const GENESIS_STOPWORDS = new Set([
   "me", "us",
 ]);
 
-/** Keep ASCII word chars only, lowercased. */
+/** Keep ASCII word chars only, lowercased, and bounded so a giant no-whitespace
+ *  paste (URL, hash) can't blow past the filesystem's ~255-byte name limit. */
 function cleanToken(t: string): string {
-  return t.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return t
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 24);
 }
 
 /**
