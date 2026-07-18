@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 import { OctoMark } from "./icons/OctoMark";
-import { deriveProjectName, GENESIS_PROMISE } from "../lib/genesis";
+import { GenesisPrompt } from "./GenesisPrompt";
 
 interface Props {
   onNewProject: () => void;
@@ -16,18 +16,6 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathValue, setPathValue] = useState("");
   const [dragOver, setDragOver] = useState(false);
-  // Genesis: the prompt, and a derived project name the user may override.
-  const [prompt, setPrompt] = useState("");
-  const [nameOverride, setNameOverride] = useState<string | null>(null);
-  // A BLANK override never wins — an empty name would make the backend git-init
-  // the ~/Octopush container itself. Clearing the field reverts to the slug.
-  const effectiveName = nameOverride?.trim() ? nameOverride.trim() : deriveProjectName(prompt);
-  const canGenesis = prompt.trim().length > 0;
-
-  function submitGenesis() {
-    if (!canGenesis || loading) return;
-    onGenesis(prompt.trim(), effectiveName);
-  }
 
   useEffect(() => {
     loadRecent();
@@ -110,45 +98,7 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
       {/* ⊕ Genesis — describe what you want to build; a crew scaffolds it.
           The project is born from the prompt (intent before the repo). */}
       <div className="mt-8 w-full max-w-[560px]">
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              submitGenesis();
-            }
-          }}
-          rows={2}
-          disabled={loading}
-          placeholder="Describe what you want to build…"
-          className="w-full resize-none rounded-lg border border-octo-hairline bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-60"
-        />
-        <p className="mt-2 text-[12px] leading-[1.4] text-octo-sage">{GENESIS_PROMISE}</p>
-        <div className="mt-3 flex items-center justify-end gap-3">
-          {canGenesis && (
-            <div className="octo-fade-in flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">
-                project
-              </span>
-              <input
-                value={effectiveName}
-                onChange={(e) => setNameOverride(e.target.value)}
-                aria-label="Project name"
-                className="min-w-0 flex-1 bg-transparent font-mono text-[11px] text-octo-sage outline-none transition-colors focus:text-octo-ivory"
-              />
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={submitGenesis}
-            disabled={!canGenesis || loading}
-            className="shrink-0 rounded-md px-4 py-2 font-serif text-[14px] text-octo-brass transition disabled:opacity-40"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-          >
-            Set a crew on it
-          </button>
-        </div>
+        <GenesisPrompt loading={loading} onSubmit={onGenesis} />
       </div>
 
       {/* Or — start from a repo instead (project-first, unchanged). */}
