@@ -446,10 +446,64 @@ fn tool_definitions() -> serde_json::Value {
 /// signal — `run_command` reports the process exit status, file ops report
 /// whether the syscall succeeded — never a sniff of the result text. Callers
 /// that only want the text can ignore the bool (`let (result, _) = …`).
+/// Kernel-enforced `write_file` for a sandboxed mission: `mkdir -p` + write run
+/// under a seatbelt-wrapped shell, so the KERNEL resolves symlinks and blocks a
+/// target that escapes the workspace (a lexical check can't see through a
+/// symlink). The target is passed as a positional arg (`$1`), never interpolated
+/// into the script. Fail-closed: if the sandbox can't be set up, nothing is
+/// written. The profile guard lives until the child exits.
+fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> (String, bool) {
+    use std::io::Write;
+    // `$0` is a label; `$1` is the (untrusted) absolute target path.
+    let script = r#"mkdir -p "$(dirname "$1")" && cat > "$1""#;
+    let args = vec![
+        "-c".to_string(),
+        script.to_string(),
+        "octopush-write".to_string(),
+        full.to_string_lossy().into_owned(),
+    ];
+    let prepared =
+        match crate::orchestrator::sandbox::prepare(roots, std::ffi::OsStr::new("bash"), &args) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    format!("Sandbox unavailable — refusing to write unconfined: {e}"),
+                    false,
+                );
+            }
+        };
+    let mut child = match std::process::Command::new(&prepared.program)
+        .args(&prepared.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (format!("Sandboxed write failed to start: {e}"), false),
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(content.as_bytes());
+        // Dropping `si` closes stdin so `cat` sees EOF and finishes.
+    }
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => (format!("Wrote {} bytes to {path}", content.len()), true),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            (
+                format!("Sandboxed: could not write {path} (blocked or failed): {}", err.trim()),
+                false,
+            )
+        }
+        Err(e) => (format!("Sandboxed write failed: {e}"), false),
+    }
+}
+
 /// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
 /// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
-/// — no wrapper, no run) and `write_file` is refused outside the write roots.
-/// Reads stay open (the seatbelt profile allows reads too).
+/// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
+/// kernel enforces the workspace boundary. Reads stay open (the profile allows
+/// reads too).
 pub(crate) fn execute_tool(
     workspace_path: &Path,
     name: &str,
@@ -535,12 +589,17 @@ pub(crate) fn execute_tool(
             let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let full = workspace_path.join(path);
             if let Some(roots) = sandbox_roots {
+                // Fast lexical pre-check rejects obvious absolute/`..` escapes
+                // without spawning; the authoritative guard is the KERNEL-enforced
+                // write below, which resolves symlinks a lexical check can't (a
+                // hostile repo can commit `link -> $HOME`).
                 if !crate::orchestrator::sandbox::is_write_allowed(&full, roots) {
                     return (
                         format!("Sandboxed: refusing to write outside the mission workspace ({path})"),
                         false,
                     );
                 }
+                return sandboxed_write(roots, &full, content, path);
             }
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -1971,6 +2030,35 @@ mod tests {
             Some(&roots),
         );
         assert!(!ok, "a `..` escape is refused");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sandboxed_write_blocks_symlink_traversal_at_the_kernel() {
+        // The exact escape a lexical check can't catch: a pre-existing symlink
+        // inside the workspace pointing at a DENIED location (a hostile repo can
+        // commit `link -> $HOME`). Lexically `link/…` is under the workspace, so
+        // it passes the fast pre-check — the KERNEL-enforced seatbelt write must
+        // still block it. ($HOME root is denied; only ~/.claude/~/.cache are
+        // writable, and a tempdir would be under the allowed $TMPDIR.)
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let roots = vec![wp.to_string_lossy().into_owned()];
+        let home = std::env::var("HOME").unwrap();
+        let marker = format!("octopush-sandbox-escape-{}.txt", std::process::id());
+        std::os::unix::fs::symlink(&home, wp.join("link")).unwrap();
+
+        let (msg, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": format!("link/{marker}"), "content": "x"}),
+            Some(&roots),
+        );
+        let escaped = std::path::Path::new(&home).join(&marker);
+        let existed = escaped.exists();
+        let _ = std::fs::remove_file(&escaped); // best-effort cleanup
+        assert!(!ok, "symlink traversal must be blocked by the kernel: {msg}");
+        assert!(!existed, "nothing may be written outside the workspace ($HOME)");
     }
 
     #[test]
