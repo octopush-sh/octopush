@@ -11,6 +11,7 @@ import {
   PERIODS,
   type PeriodKey,
   periodRange,
+  periodPhrase,
   fmtHours,
   logbookTotals,
   logbookToMarkdown,
@@ -45,7 +46,7 @@ export function LogbookRoom({ open, onClose, project }: Props) {
 
   // With no project open, project scope has nothing to key off — force global.
   const effScope: Scope = project ? scope : "global";
-  const periodLabel = PERIODS.find((p) => p.key === period)?.label ?? "";
+  const scopeWord = effScope === "project" ? "project" : "studio";
   const scopeLabel = effScope === "project" ? (project?.name ?? "Project") : "All missions";
 
   useEffect(() => {
@@ -53,6 +54,10 @@ export function LogbookRoom({ open, onClose, project }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    // Drop the previous scope/period's rows so a switch shows a loading state
+    // rather than silently rendering (and letting Copy export) stale numbers
+    // under the newly-selected label.
+    setRows(null);
     const { from, to } = periodRange(period, new Date());
     const scopeId = effScope === "project" ? (project?.id ?? null) : null;
     void ipc
@@ -84,7 +89,7 @@ export function LogbookRoom({ open, onClose, project }: Props) {
   const onCopy = () => {
     if (!rows || rows.length === 0) return;
     void copyToClipboard(
-      logbookToMarkdown(rows, { scopeLabel, periodLabel: `Last ${periodLabel}` }),
+      logbookToMarkdown(rows, { scopeLabel, periodLabel: periodPhrase(period) }),
       "Logbook copied as Markdown",
     );
   };
@@ -166,8 +171,9 @@ export function LogbookRoom({ open, onClose, project }: Props) {
           <div className="mt-16 flex flex-col items-center gap-2 octo-fade-in">
             <p className="font-serif text-[17px] text-octo-ivory">Nothing logged yet.</p>
             <p className="text-[12px] text-octo-mute">
-              Work in this {effScope === "project" ? "project" : "workspace"} over the last{" "}
-              {periodLabel.toLowerCase()} will collect here.
+              {period === "all"
+                ? `No missions have logged work in this ${scopeWord} yet.`
+                : `No work logged in this ${scopeWord} in the ${periodPhrase(period).toLowerCase()}.`}
             </p>
           </div>
         ) : (

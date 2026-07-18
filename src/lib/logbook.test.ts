@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fmtHours, periodRange, logbookTotals, logbookToMarkdown } from "./logbook";
+import { fmtHours, periodRange, periodPhrase, logbookTotals, logbookToMarkdown } from "./logbook";
 import type { LogbookMissionRow } from "./types";
 
 function row(over: Partial<LogbookMissionRow>): LogbookMissionRow {
@@ -41,6 +41,14 @@ describe("periodRange", () => {
   it("uses the epoch sentinel for all-time", () => {
     expect(periodRange("all", now).from).toBe("2000-01-01T00:00:00+00:00");
     expect(periodRange("all", now).to).toBe("2026-07-18T12:00:00.000Z");
+  });
+});
+
+describe("periodPhrase", () => {
+  it("prefixes 'Last' for windowed periods but not all-time (grammatical export copy)", () => {
+    expect(periodPhrase("7d")).toBe("Last 7 days");
+    expect(periodPhrase("30d")).toBe("Last 30 days");
+    expect(periodPhrase("all")).toBe("All time");
   });
 });
 

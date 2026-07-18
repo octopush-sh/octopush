@@ -30,6 +30,14 @@ export const PERIODS: Period[] = [
  *  mission-lifetime lower bound so both surfaces agree. */
 const EPOCH_START = "2000-01-01T00:00:00+00:00";
 
+/** Grammatical phrase for a period, for prose/export: `Last 7 days` · `Last 30
+ *  days` · `All time` (the all-time case takes no "Last" prefix). */
+export function periodPhrase(key: PeriodKey): string {
+  const p = PERIODS.find((x) => x.key === key);
+  if (!p) return "";
+  return p.days === null ? p.label : `Last ${p.label}`;
+}
+
 /** Resolve a period preset to an ISO `[from, to]` window. Pure — takes `now` so
  *  it stays deterministic and testable. */
 export function periodRange(key: PeriodKey, now: Date): { from: string; to: string } {
