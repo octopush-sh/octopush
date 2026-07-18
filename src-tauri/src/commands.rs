@@ -548,6 +548,7 @@ pub async fn create_workspace(
     setup_script: String,
     intent: Option<String>,
     git_isolation: Option<String>,
+    exec_isolation: Option<String>,
 ) -> AppResult<crate::db::WorkspaceRow> {
     // Validate the axes BEFORE anything is created on disk. workspace::create
     // commits a DB row + a git worktree; a bad intent/isolation caught only at
@@ -556,7 +557,9 @@ pub async fn create_workspace(
     // caller of this public command could.
     let intent = intent.as_deref().unwrap_or("build");
     let git_isolation = git_isolation.as_deref().unwrap_or("worktree");
+    let exec_isolation = exec_isolation.as_deref().unwrap_or("none");
     crate::mission::validate_axes(intent, git_isolation)?;
+    crate::mission::validate_exec(exec_isolation)?;
 
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
@@ -578,9 +581,15 @@ pub async fn create_workspace(
     )?;
     // Pair the workspace with its mission (idempotent — a reused/adopted row
     // keeps its existing mission). Guarantees "no workspace without a mission".
+    // Execution isolation is applied in place afterwards (only when it differs)
+    // so both new and reused missions honor the wizard's Execution choice
+    // without changing the shared pairing signature.
     {
         let db = state.db.lock();
-        crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
+        let mission = crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
+        if mission.exec_isolation != exec_isolation {
+            db.update_mission_exec_isolation(&mission.id, exec_isolation)?;
+        }
     }
     Ok(ws)
 }

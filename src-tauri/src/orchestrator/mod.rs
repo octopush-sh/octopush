@@ -12,6 +12,7 @@ pub mod live;
 pub mod persist;
 pub mod roles;
 pub mod runner;
+pub mod sandbox;
 pub mod types;
 pub mod worker;
 
@@ -719,14 +720,28 @@ impl Orchestrator {
         // stage so the run converges to a clean paused/recoverable state instead of
         // stranding the stage in "running".
         let run_result: AppResult<StageOutcome> = async {
+            let workspace_path = self.workspace_path(run)?;
+            // Re-derive the mission's execution isolation from the DB every stage
+            // (no cached cross-process state — the detached worker gets it too).
+            // Resolved via the workspace's active mission, mirroring how
+            // create_run stamps mission_id.
+            let exec_isolation = self
+                .db
+                .lock()
+                .active_mission_for_workspace(&run.workspace_id)?
+                .map(|m| m.exec_isolation)
+                .unwrap_or_else(|| "none".to_string());
+            let allowed_write_roots = vec![workspace_path.to_string_lossy().into_owned()];
             let ctx = StageContext {
-                workspace_path: self.workspace_path(run)?,
+                workspace_path,
                 task: run.task.clone(),
                 client: self.client.clone(),
                 events: Arc::clone(&self.events),
                 run_id: run.id.clone(),
                 stage_id: stage.id.clone(),
                 cancel,
+                exec_isolation,
+                allowed_write_roots,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

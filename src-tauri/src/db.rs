@@ -1935,6 +1935,18 @@ impl Db {
         Ok(())
     }
 
+    /// Set a mission's execution isolation in place (the wizard's Execution
+    /// choice, applied after `ensure_for_workspace` on both create and reuse so
+    /// the picked value is honored without churning the pairing signature).
+    pub fn update_mission_exec_isolation(&self, mission_id: &str, exec_isolation: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE missions SET exec_isolation = ?2, updated_at = ?3 WHERE id = ?1",
+            params![mission_id, exec_isolation, now],
+        )?;
+        Ok(())
+    }
+
     /// Archive a mission (status + `archived_at`). Callers archive the underlying
     /// workspace through the existing guarded path (`archive_workspace`) separately.
     pub fn archive_mission(&self, mission_id: &str) -> AppResult<()> {

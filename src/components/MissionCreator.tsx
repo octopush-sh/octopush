@@ -29,6 +29,10 @@ type Intent = "build" | "fix";
  *  Listbox option — one state, two entry points. */
 type GitIsolation = "worktree" | "ephemeral";
 
+/** The execution-isolation choices offered in the wizard. `container`/`cloud`
+ *  arrive with later movements — zero dead options until they're real. */
+type ExecIsolation = "none" | "sandbox";
+
 /** Flatten a branch to the single-component directory name the backend uses for
  *  the worktree (mirrors `git_ops::slot_name_for`): keep ASCII word chars, `.`;
  *  turn everything else (slashes, spaces, …) into `-`; collapse; trim. So
@@ -92,6 +96,8 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [prError, setPrError] = useState<string | null>(null);
   /** Manual git-isolation choice (overridden to `pr` when a PR is picked). */
   const [gitIsolation, setGitIsolation] = useState<GitIsolation>("worktree");
+  /** Execution isolation — free security: sandbox confines the agent's writes. */
+  const [execIsolation, setExecIsolation] = useState<ExecIsolation>("none");
   const [showIsolation, setShowIsolation] = useState(false);
   /** Base in effect before a PR retargeted it — restored when the chip clears. */
   const prevBaseRef = useRef<string | null>(null);
@@ -198,6 +204,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         setupScript,
         intent,
         gitIso,
+        execIsolation,
       );
     } catch (e) {
       setError(String(e));
@@ -406,22 +413,44 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                   Isolation
                 </button>
                 <Reveal open={showIsolation} className="mt-3">
-                  {fromPr ? (
-                    <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
-                      Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                        Git state
+                      </div>
+                      {fromPr ? (
+                        <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
+                          Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
+                        </div>
+                      ) : (
+                        <Listbox
+                          ariaLabel="Git isolation"
+                          className="max-w-[420px]"
+                          value={gitIsolation}
+                          onChange={(v) => setGitIsolation(v as GitIsolation)}
+                          options={[
+                            { value: "worktree", label: "Own worktree", description: "The default — a dedicated git worktree for this mission." },
+                            { value: "ephemeral", label: "Ephemeral", description: "A throwaway worktree, archived when the mission is done." },
+                          ]}
+                        />
+                      )}
                     </div>
-                  ) : (
-                    <Listbox
-                      ariaLabel="Git isolation"
-                      className="max-w-[420px]"
-                      value={gitIsolation}
-                      onChange={(v) => setGitIsolation(v as GitIsolation)}
-                      options={[
-                        { value: "worktree", label: "Own worktree", description: "The default — a dedicated git worktree for this mission." },
-                        { value: "ephemeral", label: "Ephemeral", description: "A throwaway worktree, archived when the mission is done." },
-                      ]}
-                    />
-                  )}
+                    <div>
+                      <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                        Execution
+                      </div>
+                      <Listbox
+                        ariaLabel="Execution isolation"
+                        className="max-w-[420px]"
+                        value={execIsolation}
+                        onChange={(v) => setExecIsolation(v as ExecIsolation)}
+                        options={[
+                          { value: "none", label: "None", description: "The default — the agent runs with your normal permissions." },
+                          { value: "sandbox", label: "Local sandbox", description: "Confines the agent's file writes to this mission's workspace — reads and network stay open. Free." },
+                        ]}
+                      />
+                    </div>
+                  </div>
                 </Reveal>
               </div>
             </div>

@@ -84,6 +84,34 @@ describe("ContextHeader", () => {
     expect(screen.getByText("auth-refactor")).toBeInTheDocument();
   });
 
+  it("shows a Shield glyph when the mission's execution is sandboxed", () => {
+    render(
+      <ContextHeader
+        {...baseProps}
+        workspaceName="X"
+        branch="feat/x"
+        gitStatus={null}
+        missionIntent="build"
+        missionExecIsolation="sandbox"
+      />,
+    );
+    expect(screen.getByTitle(/sandboxed execution/i)).toBeInTheDocument();
+  });
+
+  it("omits the sandbox glyph when execution is not sandboxed", () => {
+    render(
+      <ContextHeader
+        {...baseProps}
+        workspaceName="X"
+        branch="feat/x"
+        gitStatus={null}
+        missionIntent="build"
+        missionExecIsolation="none"
+      />,
+    );
+    expect(screen.queryByTitle(/sandboxed execution/i)).not.toBeInTheDocument();
+  });
+
   it("renders the branch", () => {
     render(
       <ContextHeader {...baseProps} workspaceName="X" branch="feat/auth" gitStatus={null} />,

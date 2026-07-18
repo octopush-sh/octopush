@@ -36,6 +36,16 @@ pub fn validate_axes(intent: &str, git_isolation: &str) -> AppResult<()> {
     validate(intent, git_isolation, "none")
 }
 
+/// Validate the execution-isolation axis (the wizard's Execution choice, applied
+/// to the mission after pairing). Kept separate from `validate_axes` so its
+/// callers are unaffected.
+pub fn validate_exec(exec_isolation: &str) -> AppResult<()> {
+    if !EXEC_ISOLATIONS.contains(&exec_isolation) {
+        return Err(AppError::Other(format!("unknown exec isolation '{exec_isolation}'")));
+    }
+    Ok(())
+}
+
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
         return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
