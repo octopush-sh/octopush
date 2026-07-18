@@ -3552,6 +3552,45 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn cost_by_session_reconciles_to_total() {
+        // F9: the per-entity breakdown must include workspace-attributed spend
+        // (TALK/REVIEW/DIRECT), not just RUN sessions — the old INNER JOIN on
+        // `sessions` dropped it, so the breakdown never summed to the total.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        // TALK-style spend: a token_event attributed to the workspace id.
+        db.insert_token_event(&crate::token_engine::TokenEvent {
+            id: None,
+            session_id: ws.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-5".into(),
+            cost_usd: 0.10,
+        })
+        .unwrap();
+        // DIRECT-style spend via a completed stage in the same workspace.
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "api", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0.42, None).unwrap();
+
+        let rep = db.token_report(None).unwrap();
+        assert!((rep.total_cost_usd - 0.52).abs() < 1e-9);
+        // The breakdown includes both and reconciles to the headline total.
+        let breakdown_sum: f64 = rep.cost_by_session.iter().map(|e| e.cost_usd).sum();
+        assert!(
+            (breakdown_sum - rep.total_cost_usd).abs() < 1e-9,
+            "cost_by_session {breakdown_sum} must equal total {}",
+            rep.total_cost_usd
+        );
+    }
+
+    #[test]
     fn builtins_seed_gated_loop_on_review_stages() {
         let db = test_db();
         db.seed_builtin_pipelines().unwrap();
