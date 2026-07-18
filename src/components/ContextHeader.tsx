@@ -179,7 +179,7 @@ export function ContextHeader({
                   <span>{missionIntent}</span>
                   {missionExecIsolation === "sandbox" && (
                     <span
-                      title="Sandboxed execution — the agent's writes are confined to this workspace"
+                      title="Sandboxed execution — this mission's Claude Code (Direct) crew runs write-confined to the workspace"
                       className="flex items-center"
                     >
                       <Shield size={10} aria-hidden />

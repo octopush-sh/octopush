@@ -314,27 +314,37 @@ impl AgentRunner for CliRunner {
         // The profile guard lives to the end of this fn (past `child.wait`).
         let mut _profile_guard: Option<crate::orchestrator::sandbox::ProfileGuard> = None;
         let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
-            if ctx.exec_isolation == "sandbox" {
-                match crate::orchestrator::sandbox::prepare(
-                    &ctx.run_id,
-                    &ctx.stage_id,
-                    &ctx.allowed_write_roots,
-                    &real_program,
-                    &args,
-                ) {
-                    Ok(prepared) => {
-                        _profile_guard = Some(prepared.guard);
-                        (prepared.program, prepared.args)
-                    }
-                    Err(e) => {
-                        return Ok(failed_stage(&format!(
-                            "Sandbox setup failed — refusing to run the stage without the \
-                             requested isolation: {e}"
-                        )));
+            match ctx.exec_isolation.as_str() {
+                "none" => (real_program, args.iter().map(Into::into).collect()),
+                "sandbox" => {
+                    match crate::orchestrator::sandbox::prepare(
+                        &ctx.run_id,
+                        &ctx.stage_id,
+                        &ctx.allowed_write_roots,
+                        &real_program,
+                        &args,
+                    ) {
+                        Ok(prepared) => {
+                            _profile_guard = Some(prepared.guard);
+                            (prepared.program, prepared.args)
+                        }
+                        Err(e) => {
+                            return Ok(failed_stage(&format!(
+                                "Sandbox setup failed — refusing to run the stage without the \
+                                 requested isolation: {e}"
+                            )));
+                        }
                     }
                 }
-            } else {
-                (real_program, args.iter().map(Into::into).collect())
+                // Fail CLOSED on any recognized-but-unimplemented tier (container /
+                // cloud) rather than silently running unconfined — the whole point
+                // of the axis is that isolation never degrades quietly.
+                other => {
+                    return Ok(failed_stage(&format!(
+                        "Execution isolation '{other}' is not available yet — refusing to run \
+                         the stage without the requested isolation."
+                    )));
+                }
             };
 
         let mut command = tokio::process::Command::new(&program);

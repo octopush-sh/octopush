@@ -28,31 +28,36 @@ fn sbpl_string(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Always-writable roots a real CLI process needs regardless of the mission —
-/// the temp dirs, `/dev`, and the Claude CLI's own session/cache dirs. Kept
-/// deliberately narrow: everything else under `$HOME` (`~/.ssh`, `~/.aws`,
-/// documents, other projects) stays read-only. Pure over its inputs for testing.
+/// The writable directory *subtrees* a real CLI process needs regardless of the
+/// mission — the temp dir, `/dev`, and the Claude CLI's own session/cache dirs.
+/// Kept deliberately narrow: `~/.ssh`, `~/.aws`, `~/.config` (credentials),
+/// documents, and every other project stay read-only. Pure over its inputs.
+///
+/// Seatbelt matches the kernel-resolved (realpath) path, so only the `/private`
+/// forms are live rules — `/tmp`→`/private/tmp`, `$TMPDIR`→`/private/var/…`. We
+/// list the real form here; the exact `$TMPDIR` subtree's canonical form is added
+/// by `assemble_write_roots`, so we don't blanket-allow all of `/var/folders`.
 fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
-    let mut v = vec![
-        "/dev".to_string(),
-        // macOS temp: /tmp and $TMPDIR are symlinks into /private; seatbelt
-        // matches the real path, so list both forms.
-        "/tmp".to_string(),
-        "/private/tmp".to_string(),
-        "/var/folders".to_string(),
-        "/private/var/folders".to_string(),
-    ];
+    let mut v = vec!["/dev".to_string(), "/private/tmp".to_string()];
     if let Some(t) = tmpdir {
         v.push(t.to_string());
     }
     if let Some(h) = home {
-        // The CLI's session/config/cache — needed for it to run at all.
+        // The CLI's own session + generic tool caches — needed for it to run.
         v.push(format!("{h}/.claude"));
-        v.push(format!("{h}/.config"));
         v.push(format!("{h}/.cache"));
-        v.push(format!("{h}/Library/Caches"));
     }
     v
+}
+
+/// Writable individual *files* (as opposed to subtrees). Seatbelt's `subpath`
+/// won't cover a bare file sibling of an allowed dir, so the CLI's top-level
+/// `~/.claude.json` state file needs its own `literal` rule.
+fn system_write_files(home: Option<&str>) -> Vec<String> {
+    match home {
+        Some(h) => vec![format!("{h}/.claude.json")],
+        None => Vec::new(),
+    }
 }
 
 /// Merge the mission's write roots with the system defaults, add canonical forms
@@ -78,17 +83,23 @@ fn assemble_write_roots(mission_roots: &[String], home: Option<&str>, tmpdir: Op
 }
 
 /// Render an SBPL profile that allows everything by default, denies all file
-/// writes, then re-allows writes under `write_roots`. `(allow default)` keeps
-/// reads and network working — confinement is on writes only. Pure.
-fn render_profile(write_roots: &[String]) -> String {
+/// writes, then re-allows writes under `subpaths` (directory subtrees) and to
+/// `literals` (individual files). `(allow default)` keeps reads and network
+/// working — confinement is on writes only. Pure.
+fn render_profile(subpaths: &[String], literals: &[String]) -> String {
     let mut p = String::new();
     p.push_str("(version 1)\n");
     p.push_str("(allow default)\n");
     p.push_str("(deny file-write*)\n");
     p.push_str("(allow file-write*\n");
-    for root in write_roots {
+    for root in subpaths {
         p.push_str("  (subpath ");
         p.push_str(&sbpl_string(root));
+        p.push_str(")\n");
+    }
+    for file in literals {
+        p.push_str("  (literal ");
+        p.push_str(&sbpl_string(file));
         p.push_str(")\n");
     }
     p.push_str(")\n");
@@ -100,8 +111,9 @@ fn render_profile(write_roots: &[String]) -> String {
 pub fn build_seatbelt_profile(mission_write_roots: &[String]) -> String {
     let home = std::env::var("HOME").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
-    let roots = assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref());
-    render_profile(&roots)
+    let subpaths = assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref());
+    let literals = system_write_files(home.as_deref());
+    render_profile(&subpaths, &literals)
 }
 
 /// Wrap a program + args as a `sandbox-exec -f <profile> <program> <args…>` argv.
@@ -181,25 +193,40 @@ mod tests {
 
     #[test]
     fn render_profile_confines_writes_but_allows_default() {
-        let p = render_profile(&["/ws".to_string(), "/tmp".to_string()]);
+        let p = render_profile(&["/ws".to_string(), "/tmp".to_string()], &["/home/u/.claude.json".to_string()]);
         assert!(p.contains("(version 1)"));
         assert!(p.contains("(allow default)"));
         assert!(p.contains("(deny file-write*)"));
         assert!(p.contains("(subpath \"/ws\")"));
         assert!(p.contains("(subpath \"/tmp\")"));
+        // Individual files use `literal`, not `subpath`.
+        assert!(p.contains("(literal \"/home/u/.claude.json\")"));
         // The deny must precede the write-allow so the re-allow wins.
         assert!(p.find("(deny file-write*)").unwrap() < p.find("(allow file-write*").unwrap());
     }
 
     #[test]
-    fn assemble_write_roots_includes_mission_temp_and_claude_dirs() {
+    fn assemble_write_roots_is_narrow() {
         let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"));
         assert!(roots.contains(&"/ws".to_string()));
         assert!(roots.contains(&"/home/u/.claude".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
         assert!(roots.contains(&"/dev".to_string()));
-        // Sensitive home dirs are NOT writable.
-        assert!(!roots.iter().any(|r| r == "/home/u/.ssh" || r == "/home/u"));
+        // Sensitive/credential home dirs and the home root itself stay read-only,
+        // and we no longer blanket-allow every app's temp under /var/folders.
+        assert!(!roots.iter().any(|r| {
+            r == "/home/u/.ssh"
+                || r == "/home/u/.config"
+                || r == "/home/u"
+                || r == "/var/folders"
+                || r == "/private/var/folders"
+        }));
+    }
+
+    #[test]
+    fn system_write_files_covers_the_claude_state_file() {
+        assert_eq!(system_write_files(Some("/home/u")), vec!["/home/u/.claude.json".to_string()]);
+        assert!(system_write_files(None).is_empty());
     }
 
     #[test]
