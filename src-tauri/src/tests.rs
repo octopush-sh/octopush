@@ -9071,4 +9071,63 @@ mod mission_tests {
         // An unknown mission has no attributed spend.
         assert_eq!(db.mission_spend("ghost", "2026-01-01", "2027-01-01").unwrap().0, 0.0);
     }
+
+    #[test]
+    fn record_activity_coalesces_within_the_idle_window() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // Two same-surface beats in quick succession extend ONE span.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1, "same surface within window coalesces");
+        // A different surface is its own span.
+        db.record_activity("w1", "terminal", "pty").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2);
+    }
+
+    #[test]
+    fn logbook_summary_unions_overlapping_hours_and_rolls_up_cost() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // OVERLAPPING spans: talk 10:00–10:10, terminal 10:05–10:15 → the union is
+        // 15 min (900s), NOT the 20-min sum. Per-surface keeps the raw 600+600.
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "talk", "2026-07-17T10:00:00+00:00", "2026-07-17T10:10:00+00:00");
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "terminal", "2026-07-17T10:05:00+00:00", "2026-07-17T10:15:00+00:00");
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:03:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.25,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let from = "2026-07-01T00:00:00+00:00";
+        let to = "2026-08-01T00:00:00+00:00";
+        let rows = db.logbook_summary("mission", Some(&m.id), from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.hours_secs, 900, "union of overlapping spans, not the 1200s sum");
+        assert!((row.cost_usd - 0.25).abs() < 1e-9);
+        assert_eq!(row.per_surface.iter().find(|s| s.surface == "talk").unwrap().secs, 600);
+        // Scope filtering.
+        assert_eq!(db.logbook_summary("project", Some("p1"), from, to).unwrap().len(), 1);
+        assert_eq!(db.logbook_summary("global", None, from, to).unwrap().len(), 1);
+        assert!(db.logbook_summary("bogus", None, from, to).is_err());
+    }
 }

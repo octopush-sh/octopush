@@ -939,6 +939,28 @@ impl Db {
             self.meta_set("spend_events_mission_backfill_v1", "done")?;
         }
 
+        // Logbook (M2): work_spans — coalesced activity intervals, the "hours"
+        // half of the Logbook. Worked time per mission = the UNION of its spans'
+        // intervals (a TALK span and a terminal span open at once count once,
+        // merged in Rust), never the sum of per-surface durations.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS work_spans (
+                id           TEXT PRIMARY KEY,
+                mission_id   TEXT,
+                workspace_id TEXT,
+                project_id   TEXT NOT NULL,
+                surface      TEXT NOT NULL,   -- talk | direct | terminal | review
+                source       TEXT NOT NULL,   -- chat | stage | pty | edit
+                started_at   TEXT NOT NULL,
+                ended_at     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_work_spans_mission ON work_spans(mission_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_work_spans_project ON work_spans(project_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_work_spans_coalesce ON work_spans(workspace_id, surface, ended_at);
+            "#,
+        )?;
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1916,6 +1938,212 @@ impl Db {
             |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
         )?;
         Ok(row)
+    }
+
+    /// Record a coalesced activity beat for a workspace (Logbook hours). Extends
+    /// the most recent `(workspace, surface)` span if it's within the 10-minute
+    /// idle window, else opens a fresh one — so ongoing work grows no rows. A
+    /// workspace with no active mission still records a project-scoped span.
+    pub fn record_activity(&self, workspace_id: &str, surface: &str, source: &str) -> AppResult<()> {
+        let now = Utc::now();
+        let now_s = now.to_rfc3339();
+        let cutoff = (now - chrono::Duration::minutes(10)).to_rfc3339();
+        let project_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else { return Ok(()) }; // workspace gone
+        let mission_id = self.active_mission_for_workspace(workspace_id)?.map(|m| m.id);
+        // All work_spans timestamps come from Utc::now().to_rfc3339() (same
+        // format + offset), so a string `>` on ended_at is chronological.
+        let recent: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM work_spans
+                 WHERE workspace_id = ?1 AND surface = ?2 AND ended_at > ?3
+                 ORDER BY ended_at DESC LIMIT 1",
+                params![workspace_id, surface, cutoff],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match recent {
+            Some(id) => {
+                self.conn
+                    .execute("UPDATE work_spans SET ended_at = ?2 WHERE id = ?1", params![id, now_s])?;
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.conn.execute(
+                    "INSERT INTO work_spans
+                        (id, mission_id, workspace_id, project_id, surface, source, started_at, ended_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+                    params![id, mission_id, workspace_id, project_id, surface, source, now_s],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn work_span_count_for_test(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM work_spans", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn insert_work_span_for_test(
+        &self,
+        mission_id: &str,
+        workspace_id: &str,
+        project_id: &str,
+        surface: &str,
+        started_at: &str,
+        ended_at: &str,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO work_spans (id, mission_id, workspace_id, project_id, surface, source, started_at, ended_at)
+                 VALUES (?1,?2,?3,?4,?5,'test',?6,?7)",
+                params![id, mission_id, workspace_id, project_id, surface, started_at, ended_at],
+            )
+            .unwrap();
+    }
+
+    /// Worked seconds for a mission in `[from, to]` = the UNION of its span
+    /// intervals (overlapping surfaces counted once), plus a display-only
+    /// per-surface breakdown (raw, may exceed the union).
+    fn mission_spans_summary(
+        &self,
+        mission_id: &str,
+        from: &str,
+        to: &str,
+    ) -> AppResult<(i64, Vec<LogbookSurfaceSecs>)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface, started_at, ended_at FROM work_spans
+             WHERE mission_id = ?1 AND started_at <= ?3 AND ended_at >= ?2
+             ORDER BY started_at ASC",
+        )?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map(params![mission_id, from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let (from_s, to_s) = (parse_epoch(from), parse_epoch(to));
+        let mut intervals: Vec<(i64, i64)> = Vec::new();
+        let mut per: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (surface, s, e) in &rows {
+            let a = parse_epoch(s).max(from_s);
+            let b = parse_epoch(e).min(to_s);
+            if b <= a {
+                continue;
+            }
+            intervals.push((a, b));
+            *per.entry(surface.clone()).or_insert(0) += b - a;
+        }
+        intervals.sort_by_key(|iv| iv.0);
+        let mut total = 0i64;
+        let mut cur: Option<(i64, i64)> = None;
+        for (a, b) in intervals {
+            match cur {
+                None => cur = Some((a, b)),
+                Some((ca, cb)) if a <= cb => cur = Some((ca, cb.max(b))),
+                Some((ca, cb)) => {
+                    total += cb - ca;
+                    cur = Some((a, b));
+                }
+            }
+        }
+        if let Some((ca, cb)) = cur {
+            total += cb - ca;
+        }
+        let mut per_vec: Vec<LogbookSurfaceSecs> =
+            per.into_iter().map(|(surface, secs)| LogbookSurfaceSecs { surface, secs }).collect();
+        per_vec.sort_by(|a, b| b.secs.cmp(&a.secs));
+        Ok((total, per_vec))
+    }
+
+    /// (savings_usd, runs_count) for a mission's DIRECT runs in `[from, to]`.
+    /// Savings = baseline − actual, DIRECT-only (only runs carry a baseline).
+    fn mission_run_stats(&self, mission_id: &str, from: &str, to: &str) -> AppResult<(f64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(MAX(baseline_usd - cost_usd, 0)), 0.0), COUNT(*)
+                 FROM runs WHERE mission_id = ?1 AND created_at >= ?2 AND created_at <= ?3",
+                params![mission_id, from, to],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(Into::into)
+    }
+
+    fn mission_message_count(&self, mission_id: &str, from: &str, to: &str) -> AppResult<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages cm
+                 JOIN chat_threads ct ON ct.id = cm.thread_id
+                 WHERE ct.mission_id = ?1 AND cm.created_at >= ?2 AND cm.created_at <= ?3",
+                params![mission_id, from, to],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// The Logbook rollup: hours (span union) + cost + savings + counts per
+    /// mission, for a mission / project / global scope over `[from, to]`.
+    pub fn logbook_summary(
+        &self,
+        scope_type: &str,
+        scope_id: Option<&str>,
+        from: &str,
+        to: &str,
+    ) -> AppResult<Vec<LogbookMissionRow>> {
+        let missions: Vec<MissionRow> = match scope_type {
+            "mission" => {
+                let id = scope_id
+                    .ok_or_else(|| crate::error::AppError::Other("mission scope needs an id".into()))?;
+                self.get_mission(id)?.into_iter().collect()
+            }
+            "project" => {
+                let id = scope_id
+                    .ok_or_else(|| crate::error::AppError::Other("project scope needs an id".into()))?;
+                self.list_missions(id)?
+            }
+            "global" => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, workspace_id, project_id, intent, title, status, linked_issue_key, git_isolation, exec_isolation, payload, created_at, updated_at, archived_at
+                     FROM missions WHERE status != 'archived' ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map([], |r| row_to_mission(r))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            other => {
+                return Err(crate::error::AppError::Other(format!("unknown logbook scope '{other}'")))
+            }
+        };
+
+        let mut out = Vec::with_capacity(missions.len());
+        for m in missions {
+            let (cost_usd, _tokens) = self.mission_spend(&m.id, from, to)?;
+            let (hours_secs, per_surface) = self.mission_spans_summary(&m.id, from, to)?;
+            let (savings_usd, runs_count) = self.mission_run_stats(&m.id, from, to)?;
+            let messages_count = self.mission_message_count(&m.id, from, to)?;
+            out.push(LogbookMissionRow {
+                mission_id: m.id,
+                title: m.title,
+                intent: m.intent,
+                status: m.status,
+                hours_secs,
+                cost_usd,
+                savings_usd,
+                runs_count,
+                messages_count,
+                per_surface,
+            });
+        }
+        Ok(out)
     }
 
     /// Find a workspace by `(project_id, branch)` regardless of status. There
@@ -5069,6 +5297,39 @@ fn row_to_routine(r: &rusqlite::Row) -> rusqlite::Result<RoutineRow> {
         last_checked_at: r.get(20)?,
         last_outcome: r.get(21)?,
     })
+}
+
+/// A per-surface worked-time breakdown for the Logbook (display-only; the sum
+/// of these can exceed the union total when surfaces overlap).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LogbookSurfaceSecs {
+    pub surface: String,
+    pub secs: i64,
+}
+
+/// One Logbook row: worked hours (span union) + cost + savings + counts for a
+/// mission over a period.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LogbookMissionRow {
+    pub mission_id: String,
+    pub title: String,
+    pub intent: String,
+    pub status: String,
+    pub hours_secs: i64,
+    pub cost_usd: f64,
+    pub savings_usd: f64,
+    pub runs_count: i64,
+    pub messages_count: i64,
+    pub per_surface: Vec<LogbookSurfaceSecs>,
+}
+
+/// RFC3339 → epoch seconds (0 on parse failure — callers pass Utc timestamps).
+fn parse_epoch(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| d.timestamp())
+        .unwrap_or(0)
 }
 
 fn row_to_mission(r: &rusqlite::Row) -> rusqlite::Result<MissionRow> {
