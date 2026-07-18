@@ -914,6 +914,21 @@ impl Db {
             self.meta_set("spend_events_token_backfill_v1", "done")?;
         }
 
+        // Reconcile each run's retired/looped DIRECT history into the ledger. The
+        // Slice-1 backfill only captured the CURRENT run_stages, so a run that
+        // looped/rejected before that shipped is missing its retired attempts,
+        // making its Usage figure lower than the retire-inclusive `runs.cost_usd`.
+        // We can't backfill stage_iterations naively — attempts archived AFTER the
+        // live capture (complete_run_stage) landed are already in the ledger, so
+        // re-adding them would double-count. Instead insert ONE reconciliation row
+        // per run for the GAP = runs.cost_usd − (DIRECT spend already recorded for
+        // that run's stages). Only positive gaps insert, so already-complete runs
+        // add nothing; the per-run idempotency key makes it safe to re-run.
+        if self.meta_get("spend_events_retired_reconcile_v1")?.is_none() {
+            self.reconcile_retired_direct_spend()?;
+            self.meta_set("spend_events_retired_reconcile_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1254,6 +1269,43 @@ impl Db {
                 ev.cost_basis,
                 ev.idempotency_key,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// One reconciliation row per run for the gap between its retire-inclusive
+    /// meter (`runs.cost_usd`) and the DIRECT spend already in the ledger for its
+    /// stages — i.e. retired/looped attempts that predate the live-capture path.
+    /// Double-count-safe: only positive gaps insert, and a per-run idempotency
+    /// key makes it a no-op to re-run. (Cost-only: token counts stay 0, since the
+    /// captured attempts already carry their tokens.)
+    pub fn reconcile_retired_direct_spend(&self) -> AppResult<()> {
+        self.conn.execute_batch(
+            r#"
+            INSERT OR IGNORE INTO spend_events
+                (ts_utc, surface, project_id, workspace_id, source_id, attempt,
+                 model_raw, model, input_tokens, output_tokens,
+                 cache_read_tokens, cache_creation_tokens,
+                 provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key)
+            SELECT ts, 'direct', project_id, workspace_id, run_id, 1,
+                   'retired-history', 'retired-history', 0, 0, 0, 0,
+                   NULL, gap, gap, 'computed',
+                   'direct-retired-reconcile:' || run_id
+            FROM (
+                SELECT r.id AS run_id, r.workspace_id AS workspace_id,
+                       w.project_id AS project_id,
+                       COALESCE(r.finished_at, r.created_at) AS ts,
+                       r.cost_usd - COALESCE((
+                           SELECT SUM(se.cost_usd)
+                           FROM spend_events se
+                           JOIN run_stages rs ON rs.id = se.source_id
+                           WHERE rs.run_id = r.id AND se.surface = 'direct'
+                       ), 0) AS gap
+                FROM runs r
+                LEFT JOIN workspaces w ON w.id = r.workspace_id
+            )
+            WHERE gap > 0.005;
+            "#,
         )?;
         Ok(())
     }
@@ -2332,60 +2384,106 @@ impl Db {
     }
 
     /// Returns (cost_usd, tokens) for the given scope and period.
-    /// - period = "daily"   → events since start of today UTC
-    /// - period = "monthly" → events since start of this month UTC
+    /// - period = "daily"   → events since start of today (LOCAL time)
+    /// - period = "monthly" → events since start of this month (LOCAL time)
     /// - scope_type = "global"    → all events
     /// - scope_type = "workspace" → events where session_id = scope_id
     /// - scope_type = "project"   → events whose session_id is a workspace belonging to scope_id project
+    ///
+    /// The cutoff is computed in the user's local timezone (F13: daily/monthly
+    /// budgets reset at local midnight, not 00:00 UTC) and bound as an RFC3339
+    /// UTC string that string-compares correctly against the stored timestamps.
     pub fn period_spend(
         &self,
         scope_type: &str,
         scope_id: &str,
         period: &str,
     ) -> AppResult<(f64, i64)> {
-        let since = match period {
-            "monthly" => "datetime('now', 'start of month')",
-            _ => "datetime('now', 'start of day')",
-        };
+        let since = period_since_utc(period);
 
         let (cost, tokens) = match scope_type {
             "workspace" => {
-                let sql = format!(
+                let mut stmt = self.conn.prepare(
                     "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
                      FROM all_spend
-                     WHERE session_id = ?1 AND timestamp >= {since}"
-                );
-                let mut stmt = self.conn.prepare(&sql)?;
-                stmt.query_row(params![scope_id], |r| {
+                     WHERE session_id = ?1 AND timestamp >= ?2",
+                )?;
+                stmt.query_row(params![scope_id, since], |r| {
                     Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
                 })?
             }
             "project" => {
-                let sql = format!(
+                let mut stmt = self.conn.prepare(
                     "SELECT COALESCE(SUM(e.cost_usd), 0.0), COALESCE(SUM(e.input_tokens + e.output_tokens), 0)
                      FROM all_spend e
                      JOIN workspaces w ON w.id = e.session_id
-                     WHERE w.project_id = ?1 AND e.timestamp >= {since}"
-                );
-                let mut stmt = self.conn.prepare(&sql)?;
-                stmt.query_row(params![scope_id], |r| {
+                     WHERE w.project_id = ?1 AND e.timestamp >= ?2",
+                )?;
+                stmt.query_row(params![scope_id, since], |r| {
                     Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
                 })?
             }
             _ => {
                 // global
-                let sql = format!(
+                let mut stmt = self.conn.prepare(
                     "SELECT COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens + output_tokens), 0)
                      FROM all_spend
-                     WHERE timestamp >= {since}"
-                );
-                let mut stmt = self.conn.prepare(&sql)?;
-                stmt.query_row([], |r| {
+                     WHERE timestamp >= ?1",
+                )?;
+                stmt.query_row(params![since], |r| {
                     Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?))
                 })?
             }
         };
         Ok((cost, tokens))
+    }
+
+    /// Backend budget gate: is spending currently over ANY configured budget for
+    /// this workspace (and its project, and global)? Reads the same `budgets`
+    /// rows and `period_spend` figures the UI uses. Returns the first breached
+    /// scope, else `Allow`. A scope with no budget (or limit ≤ 0) never blocks.
+    pub fn check_budget(&self, workspace_id: Option<&str>) -> AppResult<BudgetVerdict> {
+        let project_id: Option<String> = match workspace_id {
+            Some(ws) => self
+                .conn
+                .query_row(
+                    "SELECT project_id FROM workspaces WHERE id = ?1",
+                    params![ws],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        // (scope_type, scope_id) tuples to check, widest first.
+        let mut scopes: Vec<(&str, String)> = vec![("global", String::new())];
+        if let Some(pid) = &project_id {
+            scopes.push(("project", pid.clone()));
+        }
+        if let Some(ws) = workspace_id {
+            scopes.push(("workspace", ws.to_string()));
+        }
+        let budgets = self.list_budgets()?;
+        for (scope_type, scope_id) in &scopes {
+            for period in ["daily", "monthly"] {
+                let Some(b) = budgets.iter().find(|b| {
+                    b.scope_type == *scope_type && b.scope_id == *scope_id && b.period == period
+                }) else {
+                    continue;
+                };
+                if b.limit_usd <= 0.0 {
+                    continue;
+                }
+                let (spent, _) = self.period_spend(scope_type, scope_id, period)?;
+                if spent >= b.limit_usd {
+                    return Ok(BudgetVerdict::Block {
+                        scope: format!("{scope_type} {period}"),
+                        spent,
+                        limit: b.limit_usd,
+                    });
+                }
+            }
+        }
+        Ok(BudgetVerdict::Allow)
     }
 
     /// Return a breakdown of cloud vs local token usage within a time range.
@@ -4701,6 +4799,39 @@ pub struct BudgetRow {
     pub period: String,
     pub limit_usd: f64,
     pub updated_at: String,
+}
+
+/// Result of the backend budget gate ([`Db::check_budget`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BudgetVerdict {
+    Allow,
+    /// A configured budget is at or over its limit. `scope` is a human string
+    /// like "workspace daily"; `spent`/`limit` are USD.
+    Block { scope: String, spent: f64, limit: f64 },
+}
+
+/// Start-of-period cutoff as an RFC3339 UTC string, computed in the user's LOCAL
+/// timezone so "daily"/"monthly" reset at local midnight rather than 00:00 UTC
+/// (F13). The format matches the stored `to_rfc3339()` timestamps so the SQL
+/// `timestamp >= ?` string comparison stays correct.
+fn period_since_utc(period: &str) -> String {
+    use chrono::{Datelike, Local, TimeZone, Utc};
+    let now = Local::now();
+    let start_date = if period == "monthly" {
+        now.date_naive()
+            .with_day(1)
+            .unwrap_or_else(|| now.date_naive())
+    } else {
+        now.date_naive()
+    };
+    let start_naive = start_date.and_hms_opt(0, 0, 0).unwrap_or_else(|| {
+        now.naive_local()
+    });
+    Local
+        .from_local_datetime(&start_naive)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
 }
 
 /// Cloud vs. local usage split for the Usage dashboard.
