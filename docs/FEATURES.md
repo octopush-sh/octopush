@@ -741,7 +741,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 ### Usage analytics & charts (Settings → Usage)
 - **Live polling dashboard** — Polls `getTokenReport` + `getUsageBreakdown` (rolling 30-day) every 10s. _Support:_ `UsagePane.tsx`.
 - **Headline stats** — Cost, Tokens, Projected/day, Cache hit %. **Cloud vs local (30d)** — Cloud spend, Local volume (tokens), Est. savings. _Support:_ `UsagePane.tsx`; `get_usage_breakdown`.
-- **Burn-rate area chart (24h)** / **Cost-by-session bar chart** / **Cost-by-model list** / **Budget gauge** / **Token breakdown** — Recharts via `useChartColors` (live theme colors). _Support:_ `UsagePane.tsx`.
+- **Burn-rate area chart (24h)** / **Cost-by-session bar chart** / **Cost-by-model list** / **Budget gauge** / **Token breakdown** — Recharts via `useChartColors` (live theme colors). The cost-by-session breakdown LEFT-joins sessions **and** workspaces (labeling each entity by session or workspace name), so workspace-attributed TALK/REVIEW/DIRECT spend is included and the breakdown reconciles to the headline total instead of dropping to RUN sessions only. _Support:_ `UsagePane.tsx`; `db.rs::token_report`.
 - **CSV export ("Export ledger")** — Date range → `exportTokenEventsCsv` → save dialog. Header `timestamp,workspace_id,model,input_tokens,output_tokens,cost_usd`. _Support:_ `UsagePane.tsx`; `export_token_events_csv`.
 
 ### Model picker / switcher
@@ -752,7 +752,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **All-premium savings baseline** — Savings computed against the priciest configured model for the tokens actually used; `savingsVsBaseline` floored at $0; `aggregateSavings` across runs. _Support:_ `lib/runStatus.ts`.
 - **TALK SavingsLedger** — "saved vs {model} · $X · N%" over "spent $X". _Support:_ `SavingsLedger.tsx`.
 - **Direct run ledger** — "{pct}% under all-premium"; completion "This run saved $X…". _Support:_ `RunLedger.tsx`.
-- **Local-model savings estimate** — `usage_breakdown` classifies cloud/local and estimates local savings at a blended cheapest-cloud rate (~$0.21/M). _Support:_ `db.rs::usage_breakdown`.
+- **Local-model savings estimate** — `usage_breakdown` classifies cloud/local and estimates local savings at the blended (input+output)/2 rate of the **cheapest enabled non-local model in the catalog** (falls back to ~$0.21/M if none), instead of a stale hardcoded constant. _Support:_ `db.rs::usage_breakdown`.
 - **Tagline** — "The IDE for agentic developers — eight arms, zero wasted tokens." _Support:_ `settings/AboutPane.tsx`.
 
 ### Notable implementation details

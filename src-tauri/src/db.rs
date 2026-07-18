@@ -1240,11 +1240,20 @@ impl Db {
             }
         };
 
-        // Cost by session
+        // Cost by session/workspace. LEFT JOINs (not the old INNER JOIN on
+        // `sessions`) so no rows are silently dropped: the old query kept only
+        // RUN-session-attributed spend and discarded every workspace-attributed
+        // TALK/REVIEW/DIRECT row, so this breakdown never summed to the headline
+        // total (F9). Each entity is labeled by its session name (RUN) or
+        // workspace name (everything keyed by a workspace id), falling back to
+        // the raw id — and the breakdown now reconciles to `total_cost`.
         let cost_by_session = {
             let sql = format!(
-                "SELECT s.name, COALESCE(SUM(e.cost_usd),0), COALESCE(SUM(e.input_tokens+e.output_tokens),0)
-                 FROM all_spend e JOIN sessions s ON s.id = e.session_id
+                "SELECT COALESCE(s.name, w.name, e.session_id, 'unknown'),
+                        COALESCE(SUM(e.cost_usd),0), COALESCE(SUM(e.input_tokens+e.output_tokens),0)
+                 FROM all_spend e
+                 LEFT JOIN sessions s ON s.id = e.session_id
+                 LEFT JOIN workspaces w ON w.id = e.session_id
                  {where_clause} GROUP BY e.session_id ORDER BY 2 DESC LIMIT 20"
             );
             let cost_entry_mapper = |r: &rusqlite::Row| -> rusqlite::Result<CostEntry> {
@@ -2283,9 +2292,23 @@ impl Db {
         start_iso: &str,
         end_iso: &str,
     ) -> AppResult<UsageBreakdown> {
-        // Cheapest cloud equivalent used for local savings estimate.
-        // DeepSeek Chat: $0.14/M input, $0.28/M output → blended ~$0.21/M.
-        const CHEAPEST_CLOUD_PER_M: f64 = 0.21;
+        // Cheapest cloud equivalent for the "we saved X vs running cloud" metric,
+        // derived from the actual enabled catalog (blended (input+output)/2 of the
+        // cheapest enabled non-local model) rather than a stale hardcoded constant
+        // (F19). Falls back to ~$0.21/M (DeepSeek-era blend) if nothing qualifies.
+        let cheapest_cloud_per_m = router
+            .list_providers()
+            .iter()
+            .filter(|p| p.enabled && !p.local)
+            .flat_map(|p| p.models.iter())
+            .map(|m| (m.input_cost_per_m + m.output_cost_per_m) / 2.0)
+            .filter(|&r| r > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let cheapest_cloud_per_m = if cheapest_cloud_per_m.is_finite() {
+            cheapest_cloud_per_m
+        } else {
+            0.21
+        };
 
         // Per-model aggregates within the time range.
         let mut stmt = self.conn.prepare(
@@ -2325,7 +2348,7 @@ impl Db {
         }
 
         let estimated_local_savings_usd =
-            local_tokens as f64 * CHEAPEST_CLOUD_PER_M / 1_000_000.0;
+            local_tokens as f64 * cheapest_cloud_per_m / 1_000_000.0;
 
         Ok(UsageBreakdown {
             cloud_cost_usd,
