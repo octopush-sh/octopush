@@ -1532,6 +1532,34 @@ function App() {
     }
   }, []);
 
+  // Genesis "think it through first": open the Sketchbook (a real scratch git
+  // project, auto-provisioned) and start a fresh Talk thread with the prompt as
+  // the first message — no build, no repo of your own yet. This is the path that
+  // subsumes "design missions": you think in a scratch project's Talk, and
+  // promote to a real project when ready (both genesis doors stay available).
+  const sketchInFlight = useRef(false);
+  const handleSketch = useCallback(async (promptText: string) => {
+    if (sketchInFlight.current) return;
+    sketchInFlight.current = true;
+    try {
+      const sketchbook = await ipc.ensureSketchbook();
+      useProjectStore.setState({ current: sketchbook });
+      const wss = await ipc.listWorkspaces(sketchbook.id);
+      const main = wss[0];
+      if (!main) return;
+      selectWorkspace(main.id);
+      setModePerWorkspace((p) => ({ ...p, [main.id]: "talk" }));
+      // A fresh thread per sketch, then send the prompt as its first turn.
+      await useChatStore.getState().newThread(main.id);
+      const wsPath = main.worktreePath || sketchbook.path;
+      await useChatStore.getState().send(main.id, wsPath, promptText);
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't open the Sketchbook", body: String(e).split("\n")[0] });
+    } finally {
+      sketchInFlight.current = false;
+    }
+  }, [selectWorkspace]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1706,6 +1734,7 @@ function App() {
         <WelcomeScreen
           onNewProject={() => setAppView("new-project")}
           onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
+          onSketch={handleSketch}
         />
         <ToastContainer />
       </div>

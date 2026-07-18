@@ -9,9 +9,12 @@ interface Props {
   /** Prompt genesis: describe what to build → a project is born + a crew is
    *  staged. `name` is the (editable) derived slug. */
   onGenesis: (prompt: string, name: string, model: string | null) => void;
+  /** "Think it through first": open the Sketchbook and start a Talk thread with
+   *  the prompt — no build yet. */
+  onSketch: (prompt: string) => void;
 }
 
-export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
+export function WelcomeScreen({ onNewProject, onGenesis, onSketch }: Props) {
   const { open, loadRecent, recent, loading, error, closed, loadClosed } = useProjectStore();
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathValue, setPathValue] = useState("");
@@ -98,7 +101,11 @@ export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
       {/* ⊕ Genesis — describe what you want to build; a crew scaffolds it.
           The project is born from the prompt (intent before the repo). */}
       <div className="mt-8 w-full max-w-[560px]">
-        <GenesisPrompt loading={loading} onSubmit={(p, n, model) => onGenesis(p, n, model)} />
+        <GenesisPrompt
+          loading={loading}
+          onSubmit={(p, n, model) => onGenesis(p, n, model)}
+          onSketch={onSketch}
+        />
       </div>
 
       {/* Or — start from a repo instead (project-first, unchanged). */}

@@ -452,6 +452,38 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
     }
 }
 
+/// Find-or-create the canonical **Sketchbook** — a real git project at
+/// `~/.octopush/sketchbook` where "think it through first" missions live as TALK
+/// threads (genesis G5). A normal project in every respect (so sketches are
+/// versioned for free and there is NO special "design mission" surface) — it's
+/// just singleton + named, unlike `create_project` which suffixes collisions.
+#[tauri::command]
+pub async fn ensure_sketchbook(state: State<'_, AppState>) -> AppResult<ProjectInfo> {
+    let path = expand_tilde("~/.octopush/sketchbook");
+    let path_buf = std::path::PathBuf::from(&path);
+    if !path_buf.exists() || !crate::git_ops::is_git_repo(&path_buf) {
+        std::fs::create_dir_all(&path_buf)?;
+        crate::git_ops::init_repo(&path_buf)?;
+    }
+    crate::git_ops::ensure_initial_commit(&path_buf)?;
+
+    let db = state.db.lock();
+    if let Some((id, _name, p)) = db.get_project_by_path(&path)? {
+        db.reopen_project(&id)?;
+        ensure_main_workspace(&db, &id, &p, None)?;
+        let existing = db.get_project(&id)?;
+        let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
+        let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
+        let tint = existing.as_ref().and_then(|p| p.tint.clone());
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint })
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&id, "Sketchbook", &path)?;
+        ensure_main_workspace(&db, &id, &path, None)?;
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None })
+    }
+}
+
 #[tauri::command]
 pub async fn list_recent_projects(state: State<'_, AppState>) -> AppResult<Vec<ProjectInfo>> {
     let rows = state.db.lock().list_projects()?;

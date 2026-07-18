@@ -13,6 +13,9 @@ interface Props {
   /** Fires with the prompt, the (editable, never-empty) derived name, and the
    *  chosen model (null = the crew's default). */
   onSubmit: (prompt: string, name: string, model: string | null) => void;
+  /** "Think it through first": open the Sketchbook with this prompt instead of
+   *  building. A secondary action; omit to hide it. */
+  onSketch?: (prompt: string) => void;
 }
 
 /**
@@ -25,7 +28,7 @@ interface Props {
  * runs on) and, for a cold user with no key, an inline Anthropic-key field so
  * the whole gesture completes without a detour to Settings.
  */
-export function GenesisPrompt({ loading = false, onSubmit }: Props) {
+export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
   const [prompt, setPrompt] = useState("");
   const [nameOverride, setNameOverride] = useState<string | null>(null);
   const effectiveName = nameOverride?.trim() ? nameOverride.trim() : deriveProjectName(prompt);
@@ -181,6 +184,20 @@ export function GenesisPrompt({ loading = false, onSubmit }: Props) {
           Set a crew on it
         </button>
       </div>
+
+      {/* Secondary: think it through first (the Sketchbook) — no build yet. */}
+      {onSketch && (
+        <div className="mt-2 text-right">
+          <button
+            type="button"
+            onClick={() => canGenesis && onSketch(prompt.trim())}
+            disabled={!canGenesis}
+            className="font-serif text-[12px] text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage disabled:opacity-40"
+          >
+            or think it through first
+          </button>
+        </div>
+      )}
     </div>
   );
 }

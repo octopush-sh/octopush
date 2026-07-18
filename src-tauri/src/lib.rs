@@ -160,6 +160,7 @@ pub fn run() {
             commands::open_project,
             commands::list_recent_projects,
             commands::create_project,
+            commands::ensure_sketchbook,
             commands::update_project_customization,
             commands::set_project_pinned,
             commands::set_project_order,
