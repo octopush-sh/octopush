@@ -9177,4 +9177,50 @@ mod mission_tests {
         db.record_activity("w1", "talk", "chat").unwrap();
         assert_eq!(db.work_span_count_for_test(), 2, "mission change opens a fresh span");
     }
+
+    #[test]
+    fn workspace_for_terminal_resolves_the_owning_workspace() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        db.create_terminal("t1", "w1", "shell", 0, 0).unwrap();
+        assert_eq!(db.workspace_for_terminal("t1").unwrap().as_deref(), Some("w1"));
+        assert_eq!(db.workspace_for_terminal("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_and_review_surfaces_appear_in_the_logbook_breakdown() {
+        // The M2.1 hooks completed: terminal (PTY) + review (AI) worked time now
+        // rolls up alongside talk + direct, each keeping its own surface. (Spans
+        // are inserted with real duration — a lone instant beat is 0s worked and
+        // correctly contributes nothing; the hooks extend spans over real time.)
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        db.insert_work_span_for_test(
+            &m.id, "w1", "p1", "terminal",
+            "2026-07-18T10:00:00+00:00", "2026-07-18T10:05:00+00:00",
+        );
+        db.insert_work_span_for_test(
+            &m.id, "w1", "p1", "review",
+            "2026-07-18T11:00:00+00:00", "2026-07-18T11:02:00+00:00",
+        );
+        let rows = db
+            .logbook_summary(
+                "mission",
+                Some(&m.id),
+                "2026-07-01T00:00:00+00:00",
+                "2026-08-01T00:00:00+00:00",
+            )
+            .unwrap();
+        let secs = |name: &str| {
+            rows[0].per_surface.iter().find(|s| s.surface == name).map(|s| s.secs)
+        };
+        assert_eq!(secs("terminal"), Some(300));
+        assert_eq!(secs("review"), Some(120));
+        // Disjoint spans → worked hours is the plain sum.
+        assert_eq!(rows[0].hours_secs, 420);
+    }
 }
