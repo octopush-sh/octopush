@@ -3114,7 +3114,7 @@ mod pipeline_crud_tests {
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 5); // incl. "Ship it" (issue → PR)
+        assert_eq!(pipelines.len(), 6); // incl. "Ship it" (issue → PR) + "Greenfield" (genesis)
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();
@@ -9274,6 +9274,38 @@ mod mission_tests {
                 "expected '{bad}' to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn greenfield_pipeline_is_seeded_gated_and_idempotent() {
+        // The Greenfield crew (genesis G3): plan-with-stack-choice → gate →
+        // scaffold → first increment → honest verify, ending at a local repo.
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        // Idempotent: a second migrate/seed must not duplicate it.
+        db.seed_builtin_pipelines().unwrap();
+        let gf: Vec<_> = db
+            .list_pipelines()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.name == "Greenfield" && p.is_builtin)
+            .collect();
+        assert_eq!(gf.len(), 1, "exactly one Greenfield builtin");
+        let stages = db.get_pipeline_stages(&gf[0].id).unwrap();
+        let roles: Vec<&str> = stages.iter().map(|s| s.role.as_str()).collect();
+        assert_eq!(roles, ["plan", "implement", "implement", "code_review", "test"]);
+        // The plan stage is a GATE (the director approves the stack before build).
+        assert!(stages[0].checkpoint, "plan is gated — the stack is the director's call");
+        // Every stage carries authored instructions (steer the greenfield arc).
+        assert!(stages.iter().all(|s| s.instructions.as_deref().is_some_and(|i| !i.is_empty())));
+        // The review loops back to the increment, gated ×2.
+        let review = &stages[3];
+        assert_eq!(review.loop_target_position, Some(2));
+        assert_eq!(review.loop_mode.as_deref(), Some("gated"));
+        // Local-only: no pull_request stage (never pushes/opens a PR).
+        assert!(!roles.contains(&"pull_request"), "greenfield ends at a local repo");
+        // The verify stage's instructions demand honesty (no overclaim).
+        assert!(stages[4].instructions.as_deref().unwrap().to_lowercase().contains("could not verify"));
     }
 
     #[test]
