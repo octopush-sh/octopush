@@ -721,17 +721,24 @@ impl Orchestrator {
         // stranding the stage in "running".
         let run_result: AppResult<StageOutcome> = async {
             let workspace_path = self.workspace_path(run)?;
-            // Re-derive the mission's execution isolation from the DB every stage
-            // (no cached cross-process state — the detached worker gets it too).
-            // Resolved via the workspace's active mission, mirroring how
-            // create_run stamps mission_id.
-            let exec_isolation = self
-                .db
-                .lock()
-                .active_mission_for_workspace(&run.workspace_id)?
+            // Re-derive the mission's isolation from the DB every stage (no cached
+            // cross-process state — the detached worker gets it too). A `readonly`
+            // mission (review/probe) is read-only-by-construction: the sandbox is
+            // forced on with temp-only write roots regardless of its exec choice.
+            let mission = self.db.lock().active_mission_for_workspace(&run.workspace_id)?;
+            let git_isolation = mission
+                .as_ref()
+                .map(|m| m.git_isolation.clone())
+                .unwrap_or_else(|| "worktree".to_string());
+            let exec_choice = mission
                 .map(|m| m.exec_isolation)
                 .unwrap_or_else(|| "none".to_string());
-            let allowed_write_roots = vec![workspace_path.to_string_lossy().into_owned()];
+            let ws_str = workspace_path.to_string_lossy().into_owned();
+            let (exec_isolation, allowed_write_roots) =
+                match crate::orchestrator::sandbox::sandbox_write_roots(&git_isolation, &exec_choice, &ws_str) {
+                    Some(roots) => ("sandbox".to_string(), roots),
+                    None => (exec_choice, vec![ws_str]),
+                };
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),

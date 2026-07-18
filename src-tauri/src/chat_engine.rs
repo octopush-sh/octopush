@@ -1154,17 +1154,24 @@ impl ChatEngine {
         let workspace_path = std::path::PathBuf::from(&request.workspace_path);
 
         // Sandbox scope for this turn's in-process tools: Some(write_roots) when
-        // the mission is sandboxed. When set, run_command routes to the
+        // the mission is confined. When set, run_command routes to the
         // seatbelt-wrapped execute_tool (bypassing the shared shell) and
-        // write_file is confined to the workspace. Resolved once per turn.
+        // write_file is confined. A `readonly` mission (review/probe) is
+        // read-only-by-construction → Some(vec![]) (temp-only, no workspace
+        // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
         let sandbox_roots: Option<Vec<String>> = self
             .db
             .lock()
             .active_mission_for_workspace(&request.workspace_id)
             .ok()
             .flatten()
-            .filter(|m| m.exec_isolation == "sandbox")
-            .map(|_| vec![request.workspace_path.clone()]);
+            .and_then(|m| {
+                crate::orchestrator::sandbox::sandbox_write_roots(
+                    &m.git_isolation,
+                    &m.exec_isolation,
+                    &request.workspace_path,
+                )
+            });
 
         // Register a fresh cancellation flag for this turn, keyed by thread. The
         // guard removes it from the registry on every exit path (Drop).
