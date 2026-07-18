@@ -644,9 +644,13 @@ pub async fn update_mission(
     title: Option<String>,
     status: Option<String>,
     linked_issue_key: Option<String>,
+    exec_isolation: Option<String>,
 ) -> AppResult<crate::db::MissionRow> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
+    }
+    if let Some(e) = exec_isolation.as_deref() {
+        crate::mission::validate_exec(e)?;
     }
     // Scope the DB lock so it's released before the (self-locking) ephemeral
     // auto-archive below — parking_lot's Mutex is not reentrant.
@@ -658,6 +662,11 @@ pub async fn update_mission(
             status.as_deref(),
             linked_issue_key.as_deref(),
         )?;
+        // The Execution axis can now be changed on an existing mission (e.g. the
+        // launcher's "enable sandbox for an unattended run" one-click).
+        if let Some(e) = exec_isolation.as_deref() {
+            db.update_mission_exec_isolation(&mission_id, e)?;
+        }
         db.get_mission(&mission_id)?
             .ok_or_else(|| crate::error::AppError::Other("mission not found".into()))?
     };

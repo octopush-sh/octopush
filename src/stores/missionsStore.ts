@@ -31,6 +31,9 @@ interface MissionsState {
     status: string | null,
     linkedIssueKey: string | null,
   ) => Promise<Mission>;
+  /** Set a mission's execution isolation in place (e.g. the launcher's
+   *  one-click "enable sandbox" for an unattended run). */
+  setExecIsolation: (missionId: string, execIsolation: string) => Promise<Mission>;
   archive: (missionId: string) => Promise<void>;
 }
 
@@ -89,6 +92,12 @@ export const useMissionsStore = create<MissionsState>((set, get) => ({
 
   async update(missionId, title, status, linkedIssueKey) {
     const mission = await ipc.updateMission(missionId, title, status, linkedIssueKey);
+    await get().load(mission.projectId);
+    return mission;
+  },
+
+  async setExecIsolation(missionId, execIsolation) {
+    const mission = await ipc.updateMission(missionId, null, null, null, execIsolation);
     await get().load(mission.projectId);
     return mission;
   },

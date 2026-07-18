@@ -598,7 +598,8 @@ export const ipc = {
     }),
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey }),
+    execIsolation: string | null = null,
+  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────
