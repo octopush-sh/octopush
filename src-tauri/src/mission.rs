@@ -74,12 +74,18 @@ pub fn create(
 }
 
 /// Idempotent pairing for a code workspace: return the existing active mission
-/// if one already owns the workspace, else create a `worktree` mission for it.
+/// if one already owns the workspace, else create one with the given `intent`
+/// and `git_isolation` (the wizard's Step-1 intent + isolation choice).
 /// Guarantees the invariant "no workspace without a mission" from day one, and
 /// stays a no-op when a workspace is reused/restored/adopted (create is
 /// idempotent on `(project_id, branch)` upstream, so callers may call this on
 /// every outcome).
-pub fn ensure_for_workspace(db: &Db, ws: &WorkspaceRow, intent: &str) -> AppResult<MissionRow> {
+pub fn ensure_for_workspace(
+    db: &Db,
+    ws: &WorkspaceRow,
+    intent: &str,
+    git_isolation: &str,
+) -> AppResult<MissionRow> {
     if let Some(existing) = db.active_mission_for_workspace(&ws.id)? {
         return Ok(existing);
     }
@@ -89,7 +95,7 @@ pub fn ensure_for_workspace(db: &Db, ws: &WorkspaceRow, intent: &str) -> AppResu
         &ws.project_id,
         intent,
         title,
-        "worktree",
+        git_isolation,
         "none",
         Some(&ws.id),
         ws.linked_issue_key.as_deref(),

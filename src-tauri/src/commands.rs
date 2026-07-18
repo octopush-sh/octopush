@@ -510,7 +510,7 @@ fn ensure_main_workspace(
     // Every workspace is born with a mission — the main workspace becomes a
     // 'build' mission owning the project root.
     if let Some(ws) = db.get_workspace(&id)? {
-        crate::mission::ensure_for_workspace(db, &ws, "build")?;
+        crate::mission::ensure_for_workspace(db, &ws, "build", "worktree")?;
     }
     Ok(())
 }
@@ -535,6 +535,7 @@ pub async fn create_project(state: State<'_, AppState>, path: String, name: Stri
 // ─── Workspace commands ───────────────────────────────────────────
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
     state: State<'_, AppState>,
     project_id: String,
@@ -544,6 +545,8 @@ pub async fn create_workspace(
     branch: String,
     from_branch: String,
     setup_script: String,
+    intent: Option<String>,
+    git_isolation: Option<String>,
 ) -> AppResult<crate::db::WorkspaceRow> {
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
@@ -567,7 +570,12 @@ pub async fn create_workspace(
     // keeps its existing mission). Guarantees "no workspace without a mission".
     {
         let db = state.db.lock();
-        crate::mission::ensure_for_workspace(&db, &ws, "build")?;
+        // The wizard passes the Step-1 intent (build/fix) and the git-isolation
+        // choice (worktree/ephemeral/pr); both default to a plain worktree build
+        // mission for callers that don't (e.g. the auto-created main workspace).
+        let intent = intent.as_deref().unwrap_or("build");
+        let git_isolation = git_isolation.as_deref().unwrap_or("worktree");
+        crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
     }
     Ok(ws)
 }

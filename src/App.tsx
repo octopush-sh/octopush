@@ -9,7 +9,7 @@ import { usePerfStore } from "./stores/perfStore";
 import { ContextHeader } from "./components/ContextHeader";
 import { Companion } from "./components/Companion";
 import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
-import { WorkspaceCreator } from "./components/WorkspaceCreator";
+import { MissionCreator } from "./components/MissionCreator";
 import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
 import { RenameDialog } from "./components/RenameDialog";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
@@ -1895,7 +1895,7 @@ function App() {
               const targetProject = getProjectById(targetProjectId);
               return targetProject ? (
                 <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
-                  <WorkspaceCreator
+                  <MissionCreator
                     projectId={targetProject.id}
                     projectPath={targetProject.path}
                     onCreated={() => {
@@ -1928,7 +1928,7 @@ function App() {
             {!activeWorkspace && !hasStaleActiveState && (
               <div className="absolute inset-0 z-40 bg-octo-bg octo-fade-in">
                 {showInlineCreator ? (
-                  <WorkspaceCreator
+                  <MissionCreator
                     projectId={project.id}
                     projectPath={project.path}
                     onCreated={() => setShowInlineCreator(false)}
@@ -2446,7 +2446,7 @@ function App() {
              *  opens for a different ticket — `useState(initialTask)` only
              *  reads at mount, so without this prop a back-to-back flow on
              *  two tickets would keep the first ticket's pre-fill. */}
-            <WorkspaceCreator
+            <MissionCreator
               key={creatorForTicket.linkIssueKeyOnCreate}
               projectId={targetProject.id}
               projectPath={targetProject.path}

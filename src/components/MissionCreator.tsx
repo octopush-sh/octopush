@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Hammer, Wrench, X } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
+import { Reveal } from "./primitives/Reveal";
+import { Listbox } from "./controls/Listbox";
 import type { PrInfo } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
@@ -20,12 +23,12 @@ interface Props {
   linkIssueKeyOnCreate?: string | null;
 }
 
-type Step = 1 | 2;
+type Step = 1 | 2 | 3;
+type Intent = "build" | "fix";
+/** The manual git-isolation choices. `pr` is derived (picking a PR), never a
+ *  Listbox option — one state, two entry points. */
+type GitIsolation = "worktree" | "ephemeral";
 
-/** Mirror the backend's worktree path computation: workspaces live as
- *  siblings of the project root, inside a shared `.octopus-worktrees/`
- *  directory. Showing this honestly here means the path the user sees
- *  in the wizard matches what they'd see in Finder. */
 /** Flatten a branch to the single-component directory name the backend uses for
  *  the worktree (mirrors `git_ops::slot_name_for`): keep ASCII word chars, `.`;
  *  turn everything else (slashes, spaces, …) into `-`; collapse; trim. So
@@ -63,10 +66,16 @@ function slugify(text: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
+const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: string }> = {
+  build: { icon: Hammer, title: "Build something new", desc: "A feature, a surface, a capability." },
+  fix: { icon: Wrench, title: "Fix something broken", desc: "A bug, a regression, a rough edge." },
+};
+
+export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
   const [step, setStep] = useState<Step>(1);
+  const [intent, setIntent] = useState<Intent>("build");
   const [task, setTask] = useState(initialTask ?? "");
-  // Step II prefills with the project's last-used setup script (saved back on
+  // Step 3 prefills with the project's last-used setup script (saved back on
   // successful create — a remembered template, not a live binding).
   const [setupScript, setSetupScript] = useState(
     () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
@@ -78,9 +87,12 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
   const [base, setBase] = useState<string | null>(null);
   /** Explicit branch name typed by the user. null = follow the task slug. */
   const [branchOverride, setBranchOverride] = useState<string | null>(null);
-  /** The pull request this workspace starts from, if any (drives the chip). */
+  /** The pull request this mission starts from, if any (drives the chip). */
   const [fromPr, setFromPr] = useState<PrInfo | null>(null);
   const [prError, setPrError] = useState<string | null>(null);
+  /** Manual git-isolation choice (overridden to `pr` when a PR is picked). */
+  const [gitIsolation, setGitIsolation] = useState<GitIsolation>("worktree");
+  const [showIsolation, setShowIsolation] = useState(false);
   /** Base in effect before a PR retargeted it — restored when the chip clears. */
   const prevBaseRef = useRef<string | null>(null);
 
@@ -142,18 +154,51 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [creating, onCancel]);
 
-  const branch = branchOverride ?? (slugify(task) || "new-workspace");
+  // Step-1 (Intent) keyboard: 1/2 choose-and-advance, ←/→ move the highlight,
+  // Enter continues with the current choice. Only active on step 1 so it never
+  // competes with the task input's own Enter handler on step 2.
+  useEffect(() => {
+    if (step !== 1) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "1") { setIntent("build"); setStep(2); }
+      else if (e.key === "2") { setIntent("fix"); setStep(2); }
+      else if (e.key === "ArrowLeft") setIntent("build");
+      else if (e.key === "ArrowRight") setIntent("fix");
+      else if (e.key === "Enter") setStep(2);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [step]);
+
+  const branch = branchOverride ?? (slugify(task) || "new-mission");
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
   const branchCollides = branches.includes(branch);
+
+  function chooseIntent(v: Intent) {
+    setIntent(v);
+    setStep(2);
+  }
 
   async function handleCreate() {
     if (!taskValid) return;
     setCreating(true);
     setError(null);
+    // Picking a PR overrides the manual isolation choice — one effective value.
+    const gitIso: string = fromPr ? "pr" : gitIsolation;
     let newWs;
     try {
-      newWs = await create(projectId, projectPath, workspaceName, task.trim(), branch, base ?? "", setupScript);
+      newWs = await create(
+        projectId,
+        projectPath,
+        workspaceName,
+        task.trim(),
+        branch,
+        base ?? "",
+        setupScript,
+        intent,
+        gitIso,
+      );
     } catch (e) {
       setError(String(e));
       setCreating(false);
@@ -202,17 +247,23 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
       {/* Left index pane */}
       <aside className="w-[220px] shrink-0 border-r border-octo-hairline bg-octo-panel px-6 py-10">
         <div className="font-serif text-[18px] text-octo-ivory">
-          A new workspace
+          A new mission
         </div>
 
         <div className="mt-6 space-y-1">
-          <StepIndex active={step === 1} numeral="1" label="Task & intent" onClick={() => setStep(1)} />
+          <StepIndex active={step === 1} numeral="1" label="Intent" onClick={() => setStep(1)} />
           <StepIndex
             active={step === 2}
             numeral="2"
+            label="Task & branch"
+            onClick={() => setStep(2)}
+          />
+          <StepIndex
+            active={step === 3}
+            numeral="3"
             label="Setup script"
-            onClick={() => taskValid && setStep(2)}
-            disabled={!taskValid && step !== 2}
+            onClick={() => taskValid && setStep(3)}
+            disabled={!taskValid && step !== 3}
           />
         </div>
       </aside>
@@ -223,13 +274,52 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         {step === 1 ? (
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP 1 OF 2
+              STEP 1 OF 3
+            </div>
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+              What is this mission about?
+            </h1>
+            <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
+              A mission is a thread of intent. What you set out to do shapes how it is isolated.
+            </p>
+
+            <div className="mt-8 grid max-w-[560px] grid-cols-2 gap-3">
+              {(Object.keys(INTENT_META) as Intent[]).map((key, i) => (
+                <IntentCard
+                  key={key}
+                  index={i}
+                  meta={INTENT_META[key]}
+                  shortcut={String(i + 1)}
+                  selected={intent === key}
+                  onSelect={() => chooseIntent(key)}
+                />
+              ))}
+            </div>
+
+            <div className="mt-10 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(2)}
+                className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                Continue
+              </button>
+              <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                <kbd className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] tracking-normal text-octo-mute">Enter</kbd>
+                <span className="ml-1">to continue · 1 / 2 to choose</span>
+              </div>
+            </div>
+          </>
+        ) : step === 2 ? (
+          <>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+              STEP 2 OF 3
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               What are you setting out to do?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
-              A workspace is an isolated task environment backed by a git worktree. The task name becomes the branch.
+              The task name becomes the branch. By default the mission gets its own git worktree.
             </p>
 
             <div className="mt-8 max-w-[520px]">
@@ -239,7 +329,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                   value={task}
                   onChange={(e) => setTask(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && taskValid) setStep(2);
+                    if (e.key === "Enter" && taskValid) setStep(3);
                   }}
                   placeholder="e.g. Add dark mode, Fix checkout bug"
                   className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
@@ -299,12 +389,55 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                   Branch exists — the workspace will reuse it
                 </div>
               )}
+
+              {/* Isolation disclosure — collapsed by default; brass stays quiet. */}
+              <div className="mt-6">
+                <button
+                  type="button"
+                  onClick={() => setShowIsolation((v) => !v)}
+                  aria-expanded={showIsolation}
+                  className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                >
+                  <ChevronRight
+                    size={11}
+                    aria-hidden
+                    className={`transition-transform duration-[220ms] ${showIsolation ? "rotate-90" : ""}`}
+                  />
+                  Isolation
+                </button>
+                <Reveal open={showIsolation} className="mt-3">
+                  {fromPr ? (
+                    <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
+                      Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
+                    </div>
+                  ) : (
+                    <Listbox
+                      ariaLabel="Git isolation"
+                      className="max-w-[420px]"
+                      value={gitIsolation}
+                      onChange={(v) => setGitIsolation(v as GitIsolation)}
+                      options={[
+                        { value: "worktree", label: "Own worktree", description: "The default — a dedicated git worktree for this mission." },
+                        { value: "ephemeral", label: "Ephemeral", description: "A throwaway worktree, archived when the mission is done." },
+                      ]}
+                    />
+                  )}
+                </Reveal>
+              </div>
             </div>
 
             <div className="mt-10 flex items-center gap-3">
               <button
                 type="button"
-                onClick={() => setStep(2)}
+                onClick={() => setStep(1)}
+                className="inline-flex items-center gap-1 rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <ChevronLeft size={12} />
+                Back
+              </button>
+              <button
+                type="button"
+                onClick={() => setStep(3)}
                 disabled={!taskValid}
                 className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
@@ -319,13 +452,13 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         ) : (
           <>
             <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-              STEP 2 OF 2
+              STEP 3 OF 3
             </div>
             <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
               How does it start?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
-              These commands run automatically when the workspace is created. Leave empty to skip.
+              These commands run automatically when the mission&apos;s worktree is created. Leave empty to skip.
             </p>
 
             <div className="mt-8 max-w-[640px]">
@@ -379,7 +512,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
             <div className="mt-10 flex items-center gap-3">
               <button
                 type="button"
-                onClick={() => setStep(1)}
+                onClick={() => setStep(2)}
                 className="inline-flex items-center gap-1 rounded-md px-3 py-2 text-[12px] text-octo-mute transition-colors duration-[220ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 <ChevronLeft size={12} />
@@ -391,7 +524,7 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
                 disabled={!taskValid || creating}
                 className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
-                {creating ? "Creating…" : "Begin"}
+                {creating ? "Beginning…" : "Begin the mission"}
               </button>
             </div>
           </>
@@ -399,6 +532,42 @@ export function WorkspaceCreator({ projectId, projectPath, onCreated, onCancel, 
         </FadeSwap>
       </main>
     </div>
+  );
+}
+
+function IntentCard({
+  index,
+  meta,
+  shortcut,
+  selected,
+  onSelect,
+}: {
+  index: number;
+  meta: { icon: LucideIcon; title: string; desc: string };
+  shortcut: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const Icon = meta.icon;
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-pressed={selected}
+      style={{ animationDelay: `${index * 45}ms` }}
+      className={`octo-rise-in flex flex-col items-start gap-2 rounded-lg border p-4 text-left transition-colors duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+        selected
+          ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)]"
+          : "border-octo-hairline bg-octo-panel hover:border-[var(--brass-dim)]"
+      }`}
+    >
+      <div className="flex w-full items-center justify-between">
+        <Icon size={18} aria-hidden className={selected ? "text-octo-brass" : "text-octo-sage"} />
+        <span className="font-mono text-[9px] text-octo-mute">{shortcut}</span>
+      </div>
+      <div className="font-serif text-[15px] leading-tight text-octo-ivory">{meta.title}</div>
+      <div className="text-[12px] leading-[1.5] text-octo-sage">{meta.desc}</div>
+    </button>
   );
 }
 
@@ -420,7 +589,7 @@ function StepIndex({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      title={disabled ? "Complete the task first" : undefined}
+      title={disabled ? "Add a task first" : undefined}
       className="flex w-full items-baseline gap-3 rounded-sm py-1.5 text-left disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
       <span
