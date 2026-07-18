@@ -63,6 +63,41 @@ describe("GenesisPrompt pre-flight", () => {
     );
   });
 
+  it("a cold user who typed a key but pressed the CTA gets it saved BEFORE genesis proceeds", async () => {
+    m.listProviders.mockResolvedValue([anthropic(false)] as never);
+    m.getSettings.mockResolvedValue(settings());
+    const onSubmit = vi.fn();
+    render(<GenesisPrompt onSubmit={onSubmit} />);
+    await screen.findByLabelText("Anthropic API key");
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
+      target: { value: "a todo cli" },
+    });
+    fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-yyy" } });
+    // After the save the re-check should be ready.
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-yyy"));
+    // Press the CTA WITHOUT clicking "Save" — the key must persist first.
+    fireEvent.click(screen.getByText("Set a crew on it"));
+    await waitFor(() => expect(m.saveProviders).toHaveBeenCalled());
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    // Order: key saved, THEN genesis proceeds (no Settings detour).
+    expect(m.saveSettings.mock.calls[0][0].providerKeys.anthropic).toBe("sk-ant-yyy");
+  });
+
+  it("a cold user with NO key still proceeds (the honest Settings fallback path)", async () => {
+    m.listProviders.mockResolvedValue([anthropic(false)] as never);
+    m.getSettings.mockResolvedValue(settings());
+    const onSubmit = vi.fn();
+    render(<GenesisPrompt onSubmit={onSubmit} />);
+    await screen.findByLabelText("Anthropic API key");
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
+      target: { value: "a todo cli" },
+    });
+    fireEvent.click(screen.getByText("Set a crew on it"));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(m.saveProviders).not.toHaveBeenCalled(); // nothing to save
+  });
+
   it("a ready user can pick a model, which is passed to onSubmit", async () => {
     m.listProviders.mockResolvedValue([anthropic(true)] as never);
     m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));

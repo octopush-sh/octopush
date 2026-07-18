@@ -55,25 +55,38 @@ export function GenesisPrompt({ loading = false, onSubmit }: Props) {
     void refreshReady();
   }, []);
 
-  function submit() {
-    if (!canGenesis || loading) return;
-    onSubmit(prompt.trim(), effectiveName, model);
-  }
-
-  async function saveKey() {
+  /** Persist an Anthropic key + re-check readiness. Returns true on success.
+   *  Shared by the explicit Save button and the submit-with-a-typed-key path. */
+  async function saveKey(): Promise<boolean> {
     const trimmed = keyValue.trim();
-    if (!trimmed || savingKey) return;
+    if (!trimmed || savingKey) return false;
     setSavingKey(true);
     try {
       await saveAnthropicKey(trimmed);
       setKeyValue("");
       await refreshReady();
       pushToast({ level: "success", title: "Key saved", body: "Your crew is ready to work." });
+      return true;
     } catch (e) {
       pushToast({ level: "error", title: "Couldn't save the key", body: String(e).split("\n")[0] });
+      return false;
     } finally {
       setSavingKey(false);
     }
+  }
+
+  async function submit() {
+    if (!canGenesis || loading || savingKey) return;
+    // A cold user who typed a key but pressed Enter/the CTA (rather than "Save")
+    // gets it persisted first, so the whole gesture completes without the
+    // Settings·Models detour. A user who typed NO key still proceeds — the crew
+    // is staged and the (honest) Settings fallback fires, since a keyless crew
+    // genuinely can't run.
+    if (ready === false && keyValue.trim()) {
+      const saved = await saveKey();
+      if (!saved) return; // a bad key surfaced a toast — don't launch on a failure
+    }
+    onSubmit(prompt.trim(), effectiveName, model);
   }
 
   return (
@@ -84,7 +97,7 @@ export function GenesisPrompt({ loading = false, onSubmit }: Props) {
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
-            submit();
+            void submit();
           }
         }}
         rows={2}
@@ -160,8 +173,8 @@ export function GenesisPrompt({ loading = false, onSubmit }: Props) {
         )}
         <button
           type="button"
-          onClick={submit}
-          disabled={!canGenesis || loading}
+          onClick={() => void submit()}
+          disabled={!canGenesis || loading || savingKey}
           className="shrink-0 rounded-md px-4 py-2 font-serif text-[14px] text-octo-brass transition disabled:opacity-40"
           style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
         >
