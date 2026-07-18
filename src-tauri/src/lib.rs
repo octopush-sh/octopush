@@ -184,6 +184,7 @@ pub fn run() {
             commands::get_mission,
             commands::update_mission,
             commands::archive_mission,
+            commands::logbook_summary,
             commands::get_git_status,
             commands::list_branches,
             commands::workspaces_git_summary,

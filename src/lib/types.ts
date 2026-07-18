@@ -172,6 +172,28 @@ export interface Mission {
   archivedAt: string | null;
 }
 
+// ─── Logbook ──────────────────────────────────────────────────────
+
+export interface LogbookSurfaceSecs {
+  surface: string;
+  secs: number;
+}
+
+/** One Logbook row: worked hours (activity-span union) + cost + savings +
+ *  counts for a mission over a period. */
+export interface LogbookMissionRow {
+  missionId: string;
+  title: string;
+  intent: string;
+  status: string;
+  hoursSecs: number;
+  costUsd: number;
+  savingsUsd: number;
+  runsCount: number;
+  messagesCount: number;
+  perSurface: LogbookSurfaceSecs[];
+}
+
 // ─── File edits ───────────────────────────────────────────────────
 
 export interface FileEdit {

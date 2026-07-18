@@ -212,6 +212,7 @@ mod db_tests {
             surface: "direct".into(),
             project_id: None,
             workspace_id: Some("ws1".into()),
+            mission_id: None,
             source_id: Some("s1".into()),
             attempt: 1,
             model_raw: "claude-opus-4-8".into(),
@@ -9034,5 +9035,146 @@ mod mission_tests {
         assert!(crate::mission::validate_axes("build", "bogus").is_err());
         assert!(crate::mission::validate_axes("build", "worktree").is_ok());
         assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
+    }
+
+    #[test]
+    fn spend_is_attributed_to_a_mission_and_rolls_up() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // A TALK spend keyed on the workspace id is denormalized onto its mission.
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:00:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.10,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let (cost, tokens) = db.mission_spend(&m.id, "2026-01-01", "2027-01-01").unwrap();
+        assert!((cost - 0.10).abs() < 1e-9, "cost rolls up to the mission: {cost}");
+        assert_eq!(tokens, 150);
+        // A period outside the event excludes it.
+        let (later, _) = db.mission_spend(&m.id, "2026-08-01", "2027-01-01").unwrap();
+        assert_eq!(later, 0.0);
+        // An unknown mission has no attributed spend.
+        assert_eq!(db.mission_spend("ghost", "2026-01-01", "2027-01-01").unwrap().0, 0.0);
+    }
+
+    #[test]
+    fn record_activity_coalesces_within_the_idle_window() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // Two same-surface beats in quick succession extend ONE span.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1, "same surface within window coalesces");
+        // A different surface is its own span.
+        db.record_activity("w1", "terminal", "pty").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2);
+    }
+
+    #[test]
+    fn logbook_summary_unions_overlapping_hours_and_rolls_up_cost() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // OVERLAPPING spans: talk 10:00–10:10, terminal 10:05–10:15 → the union is
+        // 15 min (900s), NOT the 20-min sum. Per-surface keeps the raw 600+600.
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "talk", "2026-07-17T10:00:00+00:00", "2026-07-17T10:10:00+00:00");
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "terminal", "2026-07-17T10:05:00+00:00", "2026-07-17T10:15:00+00:00");
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:03:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.25,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let from = "2026-07-01T00:00:00+00:00";
+        let to = "2026-08-01T00:00:00+00:00";
+        let rows = db.logbook_summary("mission", Some(&m.id), from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.hours_secs, 900, "union of overlapping spans, not the 1200s sum");
+        assert!((row.cost_usd - 0.25).abs() < 1e-9);
+        assert_eq!(row.per_surface.iter().find(|s| s.surface == "talk").unwrap().secs, 600);
+        // Scope filtering.
+        assert_eq!(db.logbook_summary("project", Some("p1"), from, to).unwrap().len(), 1);
+        assert_eq!(db.logbook_summary("global", None, from, to).unwrap().len(), 1);
+        assert!(db.logbook_summary("bogus", None, from, to).is_err());
+    }
+
+    #[test]
+    fn create_run_stamps_the_active_mission_so_direct_rolls_up() {
+        // Regression (M2.1 review #1): a run must carry mission_id at birth, else
+        // DIRECT spend / savings / run-count never roll up into the Logbook —
+        // create_run was the only write path and it left the column NULL.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        db.create_run("w1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+
+        let rows = db
+            .logbook_summary("mission", Some(&m.id), "2026-01-01", "2027-01-01")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runs_count, 1, "the run is attributed to its mission");
+    }
+
+    #[test]
+    fn record_activity_splits_the_span_when_the_mission_changes() {
+        // Regression (M2.1 review #3): a mission change inside the idle window must
+        // open a fresh span, not extend the previous mission's — else worked time
+        // is silently attributed to the wrong mission.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1);
+
+        // Retire mission A and pair a fresh writer on the same workspace.
+        db.archive_mission(&a.id).unwrap();
+        crate::mission::create(&db, "p1", "build", "second", "worktree", "none", Some("w1"), None)
+            .unwrap();
+
+        // Same surface, still within the idle window, but a DIFFERENT active
+        // mission → a new span, not an extend of A's.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2, "mission change opens a fresh span");
     }
 }
