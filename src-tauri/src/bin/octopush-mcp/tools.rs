@@ -809,10 +809,19 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
     let setup_script = opt_str(args, "setupScript").unwrap_or_default();
     // Validate the mission intent BEFORE creating anything on disk (mirrors the
     // desktop command) so a bad value can't strand an unpaired workspace.
+    // create_workspace materializes a worktree, so it only pairs a *code*
+    // mission — build/fix. Non-code intents (review/probe/design/perf/ops) don't
+    // want a fresh worktree; use create_mission for those.
     let intent = opt_str(args, "intent")
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "build".to_string());
-    octopush_lib::mission::validate_axes(&intent, "worktree").map_err(|e| e.to_string())?;
+    if intent != "build" && intent != "fix" {
+        return Err(format!(
+            "create_workspace only pairs a code mission — intent must be 'build' or 'fix' \
+             (got '{intent}'); use create_mission for review/probe/design/perf/ops"
+        ));
+    }
 
     let (ws, outcome) = octopush_lib::workspace::create(
         db,
@@ -877,13 +886,29 @@ fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
     let project_id = req_str(args, "projectId")?;
     let title = req_str(args, "title")?;
     let intent = opt_str(args, "intent")
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "build".to_string());
     let git_isolation = opt_str(args, "gitIsolation")
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "worktree".to_string());
-    let workspace_id = opt_str(args, "workspaceId").filter(|s| !s.trim().is_empty());
-    let linked_issue_key = opt_str(args, "linkedIssueKey").filter(|s| !s.trim().is_empty());
+    let workspace_id = opt_str(args, "workspaceId").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let linked_issue_key = opt_str(args, "linkedIssueKey").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    // A supplied workspace must exist AND belong to this project — MCP hands this
+    // surface to arbitrary tool-calling agents, so guard against orphan /
+    // cross-project mission rows (workspace_id has no FK by design).
+    if let Some(ws_id) = &workspace_id {
+        let ws = db
+            .get_workspace(ws_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no workspace with id '{ws_id}'"))?;
+        if ws.project_id != project_id {
+            return Err(format!(
+                "workspace '{ws_id}' belongs to a different project than '{project_id}'"
+            ));
+        }
+    }
     let m = octopush_lib::mission::create(
         db,
         &project_id,
@@ -1942,5 +1967,70 @@ mod tests {
         )
         .expect_err("an out-of-enum intent must be rejected");
         assert!(err.contains("unknown mission intent"), "err: {err}");
+    }
+
+    #[test]
+    fn create_workspace_tool_pairs_a_code_mission() {
+        use tempfile::TempDir;
+        let repo = TempDir::new().unwrap();
+        let path = repo.path();
+        octopush_lib::git_ops::init_repo(path).unwrap();
+        octopush_lib::git_ops::ensure_initial_commit(path).unwrap();
+        let db = parking_lot::Mutex::new(test_db());
+        db.lock().insert_project("p1", "P", path.to_str().unwrap()).unwrap();
+
+        let payload = create_workspace(
+            &db,
+            &json!({ "projectId": "p1", "task": "Fix the header", "intent": "fix" }),
+        )
+        .expect("create_workspace should succeed and pair a mission");
+        let ws_id = payload["workspace"]["id"].as_str().unwrap();
+
+        // The workspace is paired with a mission carrying the passed intent.
+        let m = db
+            .lock()
+            .mission_for_workspace(ws_id)
+            .unwrap()
+            .expect("a paired mission");
+        assert_eq!(m.intent, "fix");
+        assert_eq!(m.git_isolation, "worktree");
+
+        // …and it's visible through the mission tools.
+        let listed = list_missions(&db.lock(), &json!({ "projectId": "p1" })).unwrap();
+        assert_eq!(listed["missions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_workspace_rejects_a_non_code_intent_before_any_git_work() {
+        let db = parking_lot::Mutex::new(test_db());
+        db.lock().insert_project("p1", "P", "/tmp/p1").unwrap();
+        let err = create_workspace(
+            &db,
+            &json!({ "projectId": "p1", "task": "t", "intent": "design" }),
+        )
+        .expect_err("a non-code intent must be rejected (no worktree created)");
+        assert!(err.contains("must be 'build' or 'fix'"), "err: {err}");
+    }
+
+    #[test]
+    fn create_mission_rejects_a_workspace_from_another_project() {
+        let db = test_db();
+        db.insert_project("p1", "P1", "/tmp/p1").unwrap();
+        db.insert_project("p2", "P2", "/tmp/p2").unwrap();
+        db.insert_workspace("w2", "p2", "ws", "", "b2", Some("/tmp/wt"), "", None).unwrap();
+        // A workspace belonging to p2 can't be attached to a p1 mission.
+        let err = create_mission(
+            &db,
+            &json!({ "projectId": "p1", "title": "t", "workspaceId": "w2" }),
+        )
+        .expect_err("cross-project workspace must be rejected");
+        assert!(err.contains("different project"), "err: {err}");
+        // A non-existent workspace id is a clean error too.
+        let err2 = create_mission(
+            &db,
+            &json!({ "projectId": "p1", "title": "t", "workspaceId": "ghost" }),
+        )
+        .expect_err("unknown workspace must be rejected");
+        assert!(err2.contains("no workspace"), "err: {err2}");
     }
 }
