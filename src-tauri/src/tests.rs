@@ -212,6 +212,7 @@ mod db_tests {
             surface: "direct".into(),
             project_id: None,
             workspace_id: Some("ws1".into()),
+            mission_id: None,
             source_id: Some("s1".into()),
             attempt: 1,
             model_raw: "claude-opus-4-8".into(),
@@ -9034,5 +9035,40 @@ mod mission_tests {
         assert!(crate::mission::validate_axes("build", "bogus").is_err());
         assert!(crate::mission::validate_axes("build", "worktree").is_ok());
         assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
+    }
+
+    #[test]
+    fn spend_is_attributed_to_a_mission_and_rolls_up() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // A TALK spend keyed on the workspace id is denormalized onto its mission.
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:00:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.10,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let (cost, tokens) = db.mission_spend(&m.id, "2026-01-01", "2027-01-01").unwrap();
+        assert!((cost - 0.10).abs() < 1e-9, "cost rolls up to the mission: {cost}");
+        assert_eq!(tokens, 150);
+        // A period outside the event excludes it.
+        let (later, _) = db.mission_spend(&m.id, "2026-08-01", "2027-01-01").unwrap();
+        assert_eq!(later, 0.0);
+        // An unknown mission has no attributed spend.
+        assert_eq!(db.mission_spend("ghost", "2026-01-01", "2027-01-01").unwrap().0, 0.0);
     }
 }

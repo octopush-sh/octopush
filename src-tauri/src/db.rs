@@ -914,6 +914,31 @@ impl Db {
             self.meta_set("spend_events_token_backfill_v1", "done")?;
         }
 
+        // Logbook (M2): denormalize mission_id onto spend_events so cost rolls up
+        // per mission without a workspace_id JOIN (which would mis-attribute
+        // across an archived→recreated mission on the same workspace). Populated
+        // at write time by record_token_spend/record_direct_spend going forward;
+        // backfilled here (after all history-inserting migrations above) from the
+        // workspace→mission pairing — covers talk/review/direct (the surfaces that
+        // carry workspace_id); RUN/adhoc stay NULL until RUN gets workspace
+        // attribution.
+        add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN mission_id TEXT")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
+        )?;
+        if self.meta_get("spend_events_mission_backfill_v1")?.is_none() {
+            self.conn.execute(
+                "UPDATE spend_events SET mission_id = (
+                     SELECT m.id FROM missions m
+                     WHERE m.workspace_id = spend_events.workspace_id
+                     ORDER BY (m.status = 'archived') ASC, m.created_at ASC LIMIT 1
+                 )
+                 WHERE mission_id IS NULL AND workspace_id IS NOT NULL",
+                [],
+            )?;
+            self.meta_set("spend_events_mission_backfill_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1233,8 +1258,9 @@ impl Db {
                 (ts_utc, surface, project_id, workspace_id, source_id, attempt,
                  model_raw, model, input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
-                 provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                 provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key,
+                 mission_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 ev.ts_utc,
                 ev.surface,
@@ -1253,6 +1279,7 @@ impl Db {
                 ev.cost_usd,
                 ev.cost_basis,
                 ev.idempotency_key,
+                ev.mission_id,
             ],
         )?;
         Ok(())
@@ -1284,11 +1311,17 @@ impl Db {
                 .optional()?,
             None => None,
         };
+        // Denormalize the mission for per-mission cost rollups (Logbook).
+        let mission_id: Option<String> = match &workspace_id {
+            Some(ws) => self.active_mission_for_workspace(ws)?.map(|m| m.id),
+            None => None,
+        };
         self.insert_spend_event(&SpendEvent {
             ts_utc: ev.timestamp.clone(),
             surface: surface.to_string(),
             project_id,
             workspace_id,
+            mission_id,
             source_id: Some(ev.session_id.clone()),
             attempt: 1,
             model_raw: ev.model.clone(),
@@ -1867,6 +1900,22 @@ impl Db {
             params![mission_id, now],
         )?;
         Ok(())
+    }
+
+    /// Total (cost_usd, tokens) attributed to a mission in `[from, to]` — the
+    /// cost half of the Logbook. Rolls up `spend_events` by the denormalized
+    /// `mission_id`, so it covers talk/review/direct (the surfaces that resolve
+    /// a workspace); RUN/adhoc spend is unattributed and excluded.
+    pub fn mission_spend(&self, mission_id: &str, from: &str, to: &str) -> AppResult<(f64, i64)> {
+        let row = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM spend_events
+             WHERE mission_id = ?1 AND ts_utc >= ?2 AND ts_utc <= ?3",
+            params![mission_id, from, to],
+            |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(row)
     }
 
     /// Find a workspace by `(project_id, branch)` regardless of status. There
@@ -4024,19 +4073,19 @@ impl Db {
         output_tokens: i64,
         cost_usd: f64,
     ) -> AppResult<()> {
-        let attr: Option<(String, Option<String>, String)> = self
+        let attr: Option<(String, Option<String>, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT r.workspace_id, w.project_id, s.agent_model
+                "SELECT r.workspace_id, w.project_id, s.agent_model, r.mission_id
                  FROM run_stages s
                  JOIN runs r ON r.id = s.run_id
                  LEFT JOIN workspaces w ON w.id = r.workspace_id
                  WHERE s.id = ?1",
                 params![stage_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((workspace_id, project_id, model)) = attr else {
+        let Some((workspace_id, project_id, model, mission_id)) = attr else {
             return Ok(()); // stage vanished — nothing to attribute
         };
         self.insert_spend_event(&SpendEvent {
@@ -4044,6 +4093,7 @@ impl Db {
             surface: "direct".into(),
             project_id,
             workspace_id: Some(workspace_id),
+            mission_id,
             source_id: Some(stage_id.to_string()),
             attempt: 1,
             model_raw: model.clone(),
@@ -4947,6 +4997,9 @@ pub struct SpendEvent {
     pub surface: String,
     pub project_id: Option<String>,
     pub workspace_id: Option<String>,
+    /// The mission this spend belongs to (denormalized, nullable). Populated when
+    /// `workspace_id` resolves to an active mission; NULL for RUN/adhoc.
+    pub mission_id: Option<String>,
     pub source_id: Option<String>,
     pub attempt: i64,
     pub model_raw: String,
