@@ -578,8 +578,9 @@ export const ipc = {
 
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
-                    branch: string, fromBranch: string, setupScript: string) =>
-    invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript }),
+                    branch: string, fromBranch: string, setupScript: string,
+                    intent: string | null, gitIsolation: string | null) =>
+    invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────

@@ -8755,8 +8755,8 @@ mod mission_tests {
         let db = test_db();
         seed_project_ws(&db, "p1", "w1", "Fix the header");
         let ws = db.get_workspace("w1").unwrap().unwrap();
-        let a = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
-        let b = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        let b = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
         assert_eq!(a.id, b.id, "pairing must be idempotent");
         assert_eq!(a.title, "Fix the header", "title uses the task when present");
         assert_eq!(db.list_missions("p1").unwrap().len(), 1);
@@ -8770,7 +8770,7 @@ mod mission_tests {
         db.insert_workspace("w1", "p1", "main", "", "main", Some("/tmp/p1"), "", None)
             .unwrap();
         let ws = db.get_workspace("w1").unwrap().unwrap();
-        let m = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
         assert_eq!(m.title, "main");
     }
 
@@ -8851,7 +8851,7 @@ mod mission_tests {
         let db = test_db();
         seed_project_ws(&db, "p1", "w1", "task");
         let ws = db.get_workspace("w1").unwrap().unwrap();
-        crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
         assert_eq!(db.list_missions("p1").unwrap().len(), 1);
         db.delete_workspace("w1").unwrap();
         assert_eq!(
@@ -8867,7 +8867,7 @@ mod mission_tests {
         let db = test_db();
         seed_project_ws(&db, "p1", "w1", "task");
         let ws = db.get_workspace("w1").unwrap().unwrap();
-        let m = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
 
         db.archive_workspace("w1").unwrap();
         assert_eq!(db.list_missions("p1").unwrap().len(), 0, "archived ws hides its mission");
@@ -8887,11 +8887,11 @@ mod mission_tests {
         let db = test_db();
         seed_project_ws(&db, "p1", "w1", "task");
         let ws = db.get_workspace("w1").unwrap().unwrap();
-        let m1 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let m1 = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
         db.archive_mission(&m1.id).unwrap();
         // ensure must NOT re-adopt the archived mission — it mints a fresh active
         // one, so the workspace never ends up with zero active missions.
-        let m2 = crate::mission::ensure_for_workspace(&db, &ws, "build").unwrap();
+        let m2 = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
         assert_ne!(m2.id, m1.id);
         assert_eq!(m2.status, "active");
         assert_eq!(db.list_missions("p1").unwrap().len(), 1);
@@ -8923,5 +8923,40 @@ mod mission_tests {
         let after = db.get_mission(&m.id).unwrap().unwrap();
         assert_eq!(after.status, "archived");
         assert!(after.archived_at.is_some(), "archiving via update must stamp archived_at");
+    }
+
+    #[test]
+    fn ensure_for_workspace_records_intent_and_git_isolation() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        // The wizard's Step-1 intent + isolation choice are recorded on the mission.
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "fix", "ephemeral").unwrap();
+        assert_eq!(m.intent, "fix");
+        assert_eq!(m.git_isolation, "ephemeral");
+    }
+
+    #[test]
+    fn ensure_for_workspace_updates_axes_on_reuse() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        // Re-running the wizard for the same (reused) branch with a different
+        // intent/isolation updates the mission in place — the picked values are
+        // never silently discarded, and no duplicate mission is minted.
+        let b = crate::mission::ensure_for_workspace(&db, &ws, "fix", "ephemeral").unwrap();
+        assert_eq!(a.id, b.id, "same mission updated in place, not a duplicate");
+        assert_eq!(b.intent, "fix");
+        assert_eq!(b.git_isolation, "ephemeral");
+        assert_eq!(db.list_missions("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_axes_rejects_out_of_enum_values() {
+        assert!(crate::mission::validate_axes("nope", "worktree").is_err());
+        assert!(crate::mission::validate_axes("build", "bogus").is_err());
+        assert!(crate::mission::validate_axes("build", "worktree").is_ok());
+        assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
     }
 }

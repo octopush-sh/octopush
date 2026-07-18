@@ -1740,6 +1740,23 @@ impl Db {
         Ok(())
     }
 
+    /// Update a mission's two axes in place (used when the wizard is re-run for
+    /// an already-paired workspace with a different intent/isolation). Safe re:
+    /// the writer index — it updates one existing row, never adds a second.
+    pub fn update_mission_axes(
+        &self,
+        mission_id: &str,
+        intent: &str,
+        git_isolation: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE missions SET intent = ?2, git_isolation = ?3, updated_at = ?4 WHERE id = ?1",
+            params![mission_id, intent, git_isolation, now],
+        )?;
+        Ok(())
+    }
+
     /// Archive a mission (status + `archived_at`). Callers archive the underlying
     /// workspace through the existing guarded path (`archive_workspace`) separately.
     pub fn archive_mission(&self, mission_id: &str) -> AppResult<()> {
