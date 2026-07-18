@@ -209,23 +209,24 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_spend_project ON spend_events(project_id, ts_utc);
             CREATE INDEX IF NOT EXISTS idx_spend_source ON spend_events(source_id);
 
-            -- Unified read surface: legacy token_events + the DIRECT rows from
-            -- spend_events, projected into the token_events column shape (DIRECT's
-            -- workspace_id masquerades as session_id, which is exactly what the
-            -- workspace/project scope filters already key on). Every Usage/budget
-            -- reader selects FROM all_spend so DIRECT spend finally shows up.
-            CREATE VIEW IF NOT EXISTS all_spend AS
-                SELECT session_id, timestamp, input_tokens, output_tokens,
-                       cache_read, cache_create, model, cost_usd
-                FROM token_events
-                UNION ALL
-                SELECT workspace_id AS session_id, ts_utc AS timestamp,
+            -- Unified read surface over the canonical ledger. Every surface
+            -- (TALK/RUN/REVIEW/DIRECT) now lives in spend_events, so the old
+            -- token_events UNION is gone. `session_id` is projected as
+            -- COALESCE(workspace_id, source_id): workspace-attributed spend
+            -- (talk/review/direct) keys on its workspace id — exactly what the
+            -- workspace/project scope filters expect — while RUN spend keys on
+            -- its CLI-session id (source_id), so per-session recap/scope still
+            -- works. DROP first: `CREATE VIEW IF NOT EXISTS` would otherwise keep
+            -- a stale earlier definition on upgraded installs.
+            DROP VIEW IF EXISTS all_spend;
+            CREATE VIEW all_spend AS
+                SELECT COALESCE(workspace_id, source_id) AS session_id,
+                       ts_utc AS timestamp,
                        input_tokens, output_tokens,
                        cache_read_tokens AS cache_read,
                        cache_creation_tokens AS cache_create,
                        model, cost_usd
-                FROM spend_events
-                WHERE surface = 'direct';
+                FROM spend_events;
 
             CREATE TABLE IF NOT EXISTS projects (
                 id              TEXT PRIMARY KEY,
@@ -875,6 +876,44 @@ impl Db {
             self.meta_set("spend_events_direct_backfill_v1", "done")?;
         }
 
+        // F14: migrate all historical token_events (TALK/RUN/REVIEW/adhoc) into the
+        // canonical ledger, since record() now writes spend_events exclusively and
+        // the all_spend view no longer reads token_events. Surface is classified by
+        // what session_id actually names (a CLI session → 'run', a workspace →
+        // 'talk', the ai-adhoc bucket → 'adhoc'); TALK vs REVIEW can't be told
+        // apart in legacy data, so workspace-attributed rows land as 'talk'.
+        // Attribution: workspace_id/project_id when session_id is a real workspace;
+        // source_id always preserves the original id. Deterministic key + INSERT OR
+        // IGNORE keep it idempotent. token_events itself is left intact (read-only
+        // history / manual-recovery fallback).
+        if self.meta_get("spend_events_token_backfill_v1")?.is_none() {
+            self.conn.execute_batch(
+                r#"
+                INSERT OR IGNORE INTO spend_events
+                    (ts_utc, surface, project_id, workspace_id, source_id, attempt,
+                     model_raw, model, input_tokens, output_tokens,
+                     cache_read_tokens, cache_creation_tokens,
+                     provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key)
+                SELECT te.timestamp,
+                       CASE
+                         WHEN EXISTS (SELECT 1 FROM sessions s WHERE s.id = te.session_id) THEN 'run'
+                         WHEN te.session_id = 'ai-adhoc' THEN 'adhoc'
+                         WHEN EXISTS (SELECT 1 FROM workspaces w WHERE w.id = te.session_id) THEN 'talk'
+                         ELSE 'adhoc'
+                       END,
+                       (SELECT w.project_id FROM workspaces w WHERE w.id = te.session_id),
+                       (SELECT w.id FROM workspaces w WHERE w.id = te.session_id),
+                       te.session_id, 1,
+                       te.model, te.model, te.input_tokens, te.output_tokens,
+                       te.cache_read, te.cache_create,
+                       NULL, te.cost_usd, te.cost_usd, 'computed',
+                       'token-backfill:' || te.id
+                FROM token_events te;
+                "#,
+            )?;
+            self.meta_set("spend_events_token_backfill_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1157,11 +1196,15 @@ impl Db {
         Ok(())
     }
 
+    /// Events for one source id (a RUN CLI-session id, or a workspace id), read
+    /// from the canonical ledger. Used by session export/recap. Reads
+    /// spend_events (not the retired token_events table) so it reflects spend
+    /// recorded after the F14 migration.
     pub fn list_token_events(&self, session_id: &str) -> AppResult<Vec<TokenEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, timestamp, input_tokens, output_tokens,
-                    cache_read, cache_create, model, cost_usd
-             FROM token_events WHERE session_id = ?1 ORDER BY timestamp",
+            "SELECT source_id, ts_utc, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, model, cost_usd
+             FROM spend_events WHERE source_id = ?1 ORDER BY ts_utc",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(TokenEvent {
@@ -1213,6 +1256,55 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record a TALK/RUN/REVIEW/adhoc token event into the canonical ledger.
+    /// Attribution is derived from what `session_id` actually is (a workspace id
+    /// for TALK/REVIEW, a CLI-session id for RUN, or the literal `ai-adhoc`) so
+    /// the ledger never re-overloads a single column: `source_id` always keeps
+    /// the original id (for RUN session recap / scope), while `workspace_id` /
+    /// `project_id` are populated only when `session_id` names a real workspace.
+    pub fn record_token_spend(&self, ev: &TokenEvent, surface: &str) -> AppResult<()> {
+        let workspace_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM workspaces WHERE id = ?1",
+                params![ev.session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let project_id: Option<String> = match &workspace_id {
+            Some(ws) => self
+                .conn
+                .query_row(
+                    "SELECT project_id FROM workspaces WHERE id = ?1",
+                    params![ws],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        self.insert_spend_event(&SpendEvent {
+            ts_utc: ev.timestamp.clone(),
+            surface: surface.to_string(),
+            project_id,
+            workspace_id,
+            source_id: Some(ev.session_id.clone()),
+            attempt: 1,
+            model_raw: ev.model.clone(),
+            model: ev.model.clone(),
+            input_tokens: ev.input_tokens as i64,
+            output_tokens: ev.output_tokens as i64,
+            cache_read_tokens: ev.cache_read_tokens as i64,
+            cache_creation_tokens: ev.cache_creation_tokens as i64,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(ev.cost_usd),
+            cost_usd: ev.cost_usd,
+            cost_basis: "computed".into(),
+            // No idempotency key: these are distinct billed calls (the PTY scanner
+            // already deduped via its seq high-water before we get here).
+            idempotency_key: None,
+        })
     }
 
     pub fn token_report(&self, session_id: Option<&str>) -> AppResult<TokenReport> {
