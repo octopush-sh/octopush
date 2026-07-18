@@ -31,7 +31,8 @@ interface WorkspaceState {
   loadAllWorkspaces: (projectIds: string[]) => Promise<void>;
   create: (projectId: string, projectPath: string, name: string, task: string,
            branch: string, fromBranch: string, setupScript: string,
-           intent?: string | null, gitIsolation?: string | null) => Promise<Workspace>;
+           intent?: string | null, gitIsolation?: string | null,
+           execIsolation?: string | null) => Promise<Workspace>;
   select: (id: string | null) => void;
   /** Self-heal for the currently-open project: call when `activeId` doesn't
    *  resolve to a workspace even though `workspacesByProjectId[projectId]` is
@@ -178,8 +179,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     return true;
   },
 
-  create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript, intent = null, gitIsolation = null) => {
-    const ws = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation);
+  create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript, intent = null, gitIsolation = null, execIsolation = null) => {
+    const ws = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
     // Only the currently-open project owns the flat `workspaces`/`activeId`.
     // Creating for any other project must not steal focus or corrupt that
     // list — it just lands in the per-project map for the rail (C3).

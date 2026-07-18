@@ -27,6 +27,13 @@ pub struct StageContext {
     /// Director stop signal: set by `stop_current_stage`/`abort_run` while the
     /// stage is in flight. Substrates must check it and halt promptly.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The mission's execution isolation (`none` | `sandbox` | …). Re-derived per
+    /// stage from the DB, so the detached worker sees it too. Only the CLI
+    /// substrate acts on it (it wraps the spawn in a sandbox); `ApiRunner`
+    /// ignores it (it never spawns a subprocess).
+    pub exec_isolation: String,
+    /// Directories a sandbox may write to (the workspace worktree at minimum).
+    pub allowed_write_roots: Vec<String>,
 }
 
 /// The error message for a stage whose agentic work ended without a final

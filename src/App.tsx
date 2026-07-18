@@ -121,6 +121,10 @@ function App() {
   const activeMissionIntent = useMissionsStore((s) =>
     activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.intent ?? null : null,
   );
+  // Drives the ContextHeader sandbox (Shield) glyph.
+  const activeMissionExecIsolation = useMissionsStore((s) =>
+    activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.execIsolation ?? null : null,
+  );
 
   // Per-workspace "actively processing" signal for the rail's marching bar.
   // Each selector derives the SET of workspaces with live activity and is
@@ -1746,6 +1750,7 @@ function App() {
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}
             missionIntent={activeMissionIntent}
+            missionExecIsolation={activeMissionExecIsolation}
           />
         )}
 

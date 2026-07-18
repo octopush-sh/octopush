@@ -304,12 +304,52 @@ impl AgentRunner for CliRunner {
         };
 
         let path_env = resolved_cli_path();
-        let program: std::ffi::OsString = resolve_executable("claude", &path_env)
+        let real_program: std::ffi::OsString = resolve_executable("claude", &path_env)
             .map(Into::into)
             .unwrap_or_else(|| "claude".into());
+
+        // Seatbelt sandbox (macOS): when the mission asks for it, wrap the spawn
+        // in `sandbox-exec -f <profile> claude …`. NO silent fallback — if the
+        // sandbox can't be set up the stage fails rather than running unconfined.
+        // The profile guard lives to the end of this fn (past `child.wait`).
+        let mut _profile_guard: Option<crate::orchestrator::sandbox::ProfileGuard> = None;
+        let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
+            match ctx.exec_isolation.as_str() {
+                "none" => (real_program, args.iter().map(Into::into).collect()),
+                "sandbox" => {
+                    match crate::orchestrator::sandbox::prepare(
+                        &ctx.run_id,
+                        &ctx.stage_id,
+                        &ctx.allowed_write_roots,
+                        &real_program,
+                        &args,
+                    ) {
+                        Ok(prepared) => {
+                            _profile_guard = Some(prepared.guard);
+                            (prepared.program, prepared.args)
+                        }
+                        Err(e) => {
+                            return Ok(failed_stage(&format!(
+                                "Sandbox setup failed — refusing to run the stage without the \
+                                 requested isolation: {e}"
+                            )));
+                        }
+                    }
+                }
+                // Fail CLOSED on any recognized-but-unimplemented tier (container /
+                // cloud) rather than silently running unconfined — the whole point
+                // of the axis is that isolation never degrades quietly.
+                other => {
+                    return Ok(failed_stage(&format!(
+                        "Execution isolation '{other}' is not available yet — refusing to run \
+                         the stage without the requested isolation."
+                    )));
+                }
+            };
+
         let mut command = tokio::process::Command::new(&program);
         command
-            .args(&args)
+            .args(&exec_args)
             .current_dir(&ctx.workspace_path);
         for (k, v) in login_shell_env() {
             command.env(k, v);

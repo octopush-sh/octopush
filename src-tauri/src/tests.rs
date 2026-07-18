@@ -9223,4 +9223,24 @@ mod mission_tests {
         // Disjoint spans → worked hours is the plain sum.
         assert_eq!(rows[0].hours_secs, 420);
     }
+
+    #[test]
+    fn update_mission_exec_isolation_sets_the_axis() {
+        // The wizard's Execution choice is applied in place after pairing.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        assert_eq!(m.exec_isolation, "none", "missions default to no sandbox");
+        db.update_mission_exec_isolation(&m.id, "sandbox").unwrap();
+        assert_eq!(db.get_mission(&m.id).unwrap().unwrap().exec_isolation, "sandbox");
+    }
+
+    #[test]
+    fn validate_exec_gates_the_execution_axis() {
+        assert!(crate::mission::validate_exec("none").is_ok());
+        assert!(crate::mission::validate_exec("sandbox").is_ok());
+        assert!(crate::mission::validate_exec("bogus").is_err());
+    }
 }
