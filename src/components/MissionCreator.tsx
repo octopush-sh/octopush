@@ -446,7 +446,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                         onChange={(v) => setExecIsolation(v as ExecIsolation)}
                         options={[
                           { value: "none", label: "None", description: "The default — the agent runs with your normal permissions." },
-                          { value: "sandbox", label: "Local sandbox", description: "Confines the Claude Code (Direct) crew's file writes to this workspace — reads and network stay open. Free." },
+                          { value: "sandbox", label: "Local sandbox", description: "Confines the agent's file writes to this workspace — reads and network stay open. Free." },
                         ]}
                       />
                     </div>
