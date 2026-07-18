@@ -94,7 +94,7 @@ mod db_tests {
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 0.0, // will be computed
         };
-        engine.record(ev).unwrap();
+        engine.record(ev, "run").unwrap();
 
         let report = engine.report(Some(&s.id)).unwrap();
         assert_eq!(report.total_input, 1000);
@@ -1328,7 +1328,7 @@ mod budgets_v2_tests {
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 0.0, // let engine compute
         };
-        engine.record(ev).unwrap();
+        engine.record(ev, "talk").unwrap();
 
         let events = db.lock().list_token_events("ws-cache-test").unwrap();
         assert_eq!(events.len(), 1);
@@ -1460,7 +1460,7 @@ mod budgets_v2_tests {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Cloud model event
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-cloud".to_string(),
             timestamp: now.clone(),
@@ -1470,10 +1470,10 @@ mod budgets_v2_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 2.00,
-        }).unwrap();
+        }, "talk").unwrap();
 
         // Local model event
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-local".to_string(),
             timestamp: now.clone(),
@@ -1483,7 +1483,7 @@ mod budgets_v2_tests {
             cache_creation_tokens: 0,
             model: "llama3.3".to_string(),
             cost_usd: 0.0,
-        }).unwrap();
+        }, "talk").unwrap();
 
         let start = "2020-01-01T00:00:00Z";
         let end = "2099-12-31T23:59:59Z";
@@ -1552,7 +1552,7 @@ mod budget_tests {
 
         // Insert a token event with today's timestamp
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-spend".to_string(),
             timestamp: now.clone(),
@@ -1562,7 +1562,7 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 1.23,
-        }).unwrap();
+        }, "talk").unwrap();
 
         let (cost, tokens) = db.period_spend("global", "", "daily").unwrap();
         assert!((cost - 1.23).abs() < 0.001);
@@ -1576,7 +1576,7 @@ mod budget_tests {
         setup_project_and_workspace(&db, "proj-ws-scope2", "ws-scope-b");
 
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-scope-a".to_string(),
             timestamp: now.clone(),
@@ -1586,8 +1586,8 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 0.50,
-        }).unwrap();
-        db.insert_token_event(&TokenEvent {
+        }, "talk").unwrap();
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-scope-b".to_string(),
             timestamp: now.clone(),
@@ -1597,7 +1597,7 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 1.00,
-        }).unwrap();
+        }, "talk").unwrap();
 
         // ws-scope-a only
         let (cost_a, tokens_a) = db.period_spend("workspace", "ws-scope-a", "daily").unwrap();
@@ -1616,7 +1616,7 @@ mod budget_tests {
         setup_project_and_workspace(&db, "proj-other", "ws-other-proj");
 
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-in-proj".to_string(),
             timestamp: now.clone(),
@@ -1626,8 +1626,8 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 2.00,
-        }).unwrap();
-        db.insert_token_event(&TokenEvent {
+        }, "talk").unwrap();
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-other-proj".to_string(),
             timestamp: now.clone(),
@@ -1637,7 +1637,7 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 0.50,
-        }).unwrap();
+        }, "talk").unwrap();
 
         let (cost, tokens) = db.period_spend("project", "proj-scope", "daily").unwrap();
         assert!((cost - 2.00).abs() < 0.001);
@@ -1650,7 +1650,7 @@ mod budget_tests {
         setup_project_and_workspace(&db, "proj-csv", "ws-csv");
 
         let now = chrono::Utc::now().to_rfc3339();
-        db.insert_token_event(&TokenEvent {
+        db.record_token_spend(&TokenEvent {
             id: None,
             session_id: "ws-csv".to_string(),
             timestamp: now.clone(),
@@ -1660,7 +1660,7 @@ mod budget_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-4-6".to_string(),
             cost_usd: 0.25,
-        }).unwrap();
+        }, "talk").unwrap();
 
         let start = "2020-01-01T00:00:00Z";
         let end = "2099-12-31T23:59:59Z";
@@ -3552,6 +3552,43 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn record_attributes_by_surface_not_overloaded_session_id() {
+        // F14: record() now writes the canonical ledger with an explicit surface
+        // and namespace-derived attribution. TALK spend keyed by a workspace id is
+        // workspace/budget-attributed; RUN spend keyed by a CLI-session id is
+        // session-scoped only (not a workspace) — so the two no longer collide in
+        // one overloaded column.
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let db = Arc::new(Mutex::new(test_db()));
+        let ws = seed_workspace(&db.lock());
+        let engine = crate::token_engine::TokenEngine::new(Arc::clone(&db));
+        let ev = |sid: &str, cost: f64| crate::token_engine::TokenEvent {
+            id: None,
+            session_id: sid.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-5".into(),
+            cost_usd: cost,
+        };
+        engine.record(ev(&ws, 0.10), "talk").unwrap();
+        engine.record(ev("cli-sess-1", 0.20), "run").unwrap();
+
+        // Both land in the global total.
+        assert!((db.lock().token_report(None).unwrap().total_cost_usd - 0.30).abs() < 1e-9);
+        // Only the TALK spend counts toward the workspace budget…
+        let (ws_cost, _) = db.lock().period_spend("workspace", &ws, "daily").unwrap();
+        assert!((ws_cost - 0.10).abs() < 1e-9);
+        // …and the RUN spend is retrievable by its CLI-session id (recap path).
+        let run_events = db.lock().list_token_events("cli-sess-1").unwrap();
+        assert_eq!(run_events.len(), 1);
+        assert!((run_events[0].cost_usd - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
     fn cost_by_session_reconciles_to_total() {
         // F9: the per-entity breakdown must include workspace-attributed spend
         // (TALK/REVIEW/DIRECT), not just RUN sessions — the old INNER JOIN on
@@ -3559,7 +3596,7 @@ mod run_crud_tests {
         let db = test_db();
         let ws = seed_workspace(&db);
         // TALK-style spend: a token_event attributed to the workspace id.
-        db.insert_token_event(&crate::token_engine::TokenEvent {
+        db.record_token_spend(&crate::token_engine::TokenEvent {
             id: None,
             session_id: ws.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3569,7 +3606,7 @@ mod run_crud_tests {
             cache_creation_tokens: 0,
             model: "claude-sonnet-5".into(),
             cost_usd: 0.10,
-        })
+        }, "talk")
         .unwrap();
         // DIRECT-style spend via a completed stage in the same workspace.
         let pid = db.insert_pipeline("P", "d", false).unwrap();
@@ -8130,7 +8167,7 @@ mod ai_token_event_tests {
         let engine = TokenEngine::new(Arc::clone(&db));
 
         let ev = crate::commands::ai_token_event(Some("ws-no-session"), "claude-sonnet-4-6", &response(), 0.5);
-        engine.record(ev).unwrap();
+        engine.record(ev, "review").unwrap();
 
         let rows = db.lock().list_token_events("ws-no-session").unwrap();
         assert_eq!(rows.len(), 1);

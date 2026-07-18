@@ -1351,7 +1351,7 @@ impl ChatEngine {
                     cache_creation_tokens: response.cache_creation_tokens,
                     model: request.model.clone(),
                     cost_usd: 0.0,
-                }) {
+                }, "talk") {
                     tracing::warn!(error = %e, "failed to record chat token event");
                 }
             }

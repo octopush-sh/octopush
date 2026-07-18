@@ -183,7 +183,8 @@ pub async fn record_token_event(
     state: State<'_, AppState>,
     event: TokenEvent,
 ) -> AppResult<()> {
-    state.tokens.record(event)
+    // Frontend-supplied one-off event → the catch-all surface.
+    state.tokens.record(event, "adhoc")
 }
 
 #[tauri::command]
@@ -4644,8 +4645,11 @@ pub async fn ai_complete(
         resp.cache_creation_tokens,
     );
     if resp.input_tokens > 0 || resp.output_tokens > 0 {
+        // AI review / conflict / commit-draft go through this primitive. With a
+        // workspace it's REVIEW-surface spend; without one it's the adhoc bucket.
+        let surface = if workspace_id.is_some() { "review" } else { "adhoc" };
         // Best-effort: a recording failure must not fail the AI call itself.
-        if let Err(e) = state.tokens.record(ai_token_event(workspace_id.as_deref(), &model, &resp, cost)) {
+        if let Err(e) = state.tokens.record(ai_token_event(workspace_id.as_deref(), &model, &resp, cost), surface) {
             tracing::warn!(error = %e, "failed to record ai_complete token event");
         }
     }

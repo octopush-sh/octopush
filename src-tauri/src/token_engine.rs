@@ -299,9 +299,12 @@ impl TokenEngine {
         Self { db }
     }
 
-    /// Record a token usage event, compute cost, persist, and update
-    /// the session's aggregate counters.
-    pub fn record(&self, mut event: TokenEvent) -> AppResult<()> {
+    /// Record a token usage event into the canonical `spend_events` ledger, and
+    /// update the session's aggregate counters. `surface` names the mode that
+    /// produced the spend ('talk' | 'run' | 'review' | 'adhoc') — the ledger
+    /// carries it explicitly instead of overloading `session_id`, and attribution
+    /// (workspace/project) is derived from what `session_id` actually is.
+    pub fn record(&self, mut event: TokenEvent, surface: &str) -> AppResult<()> {
         if event.cost_usd == 0.0 {
             // Single pricing authority (catalog-first, cache-aware).
             event.cost_usd = cost_for(
@@ -316,7 +319,7 @@ impl TokenEngine {
             event.timestamp = Utc::now().to_rfc3339();
         }
         let db = self.db.lock();
-        db.insert_token_event(&event)?;
+        db.record_token_spend(&event, surface)?;
         db.increment_session_tokens(
             &event.session_id,
             event.input_tokens,
@@ -352,7 +355,8 @@ impl TokenEngine {
             return;
         }
         if let Some(ev) = scan_pty_output(session_id, buf) {
-            if let Err(e) = self.record(ev) {
+            // PTY scraping is the RUN-mode (terminal CLI agent) path.
+            if let Err(e) = self.record(ev, "run") {
                 tracing::warn!(session_id = %session_id, error = %e, "token scan record failed");
                 return;
             }
