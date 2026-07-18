@@ -2,16 +2,30 @@ import { useEffect, useState } from "react";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 import { OctoMark } from "./icons/OctoMark";
+import { deriveProjectName, GENESIS_PROMISE } from "../lib/genesis";
 
 interface Props {
   onNewProject: () => void;
+  /** Prompt genesis: describe what to build → a project is born + a crew is
+   *  staged. `name` is the (editable) derived slug. */
+  onGenesis: (prompt: string, name: string) => void;
 }
 
-export function WelcomeScreen({ onNewProject }: Props) {
+export function WelcomeScreen({ onNewProject, onGenesis }: Props) {
   const { open, loadRecent, recent, loading, error, closed, loadClosed } = useProjectStore();
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathValue, setPathValue] = useState("");
   const [dragOver, setDragOver] = useState(false);
+  // Genesis: the prompt, and a derived project name the user may override.
+  const [prompt, setPrompt] = useState("");
+  const [nameOverride, setNameOverride] = useState<string | null>(null);
+  const effectiveName = nameOverride ?? deriveProjectName(prompt);
+  const canGenesis = prompt.trim().length > 0;
+
+  function submitGenesis() {
+    if (!canGenesis) return;
+    onGenesis(prompt.trim(), effectiveName);
+  }
 
   useEffect(() => {
     loadRecent();
@@ -91,25 +105,65 @@ export function WelcomeScreen({ onNewProject }: Props) {
         an atelier for agentic developers
       </div>
 
-      {/* Primary CTA */}
-      <button
-        type="button"
-        onClick={onNewProject}
-        className="mt-6 rounded-md px-5 py-2.5 font-serif text-[14px] text-octo-brass transition"
-        style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-      >
-        Begin a new study
-      </button>
+      {/* ⊕ Genesis — describe what you want to build; a crew scaffolds it.
+          The project is born from the prompt (intent before the repo). */}
+      <div className="mt-8 w-full max-w-[560px]">
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              submitGenesis();
+            }
+          }}
+          rows={2}
+          placeholder="Describe what you want to build…"
+          className="w-full resize-none rounded-lg border border-octo-hairline bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
+        />
+        <p className="mt-2 text-[12px] leading-[1.4] text-octo-sage">{GENESIS_PROMISE}</p>
+        <div className="mt-3 flex items-center justify-end gap-3">
+          {canGenesis && (
+            <div className="octo-fade-in flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute">
+                project
+              </span>
+              <input
+                value={effectiveName}
+                onChange={(e) => setNameOverride(e.target.value)}
+                aria-label="Project name"
+                className="min-w-0 flex-1 bg-transparent font-mono text-[11px] text-octo-sage outline-none transition-colors focus:text-octo-ivory"
+              />
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={submitGenesis}
+            disabled={!canGenesis || loading}
+            className="shrink-0 rounded-md px-4 py-2 font-serif text-[14px] text-octo-brass transition disabled:opacity-40"
+            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+          >
+            Set a crew on it
+          </button>
+        </div>
+      </div>
 
-      {/* Or — open existing */}
-      <div className="mt-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+      {/* Or — start from a repo instead (project-first, unchanged). */}
+      <div className="mt-6 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         or
       </div>
 
-      {/* Drop / open path */}
+      {/* Begin a new study · drop / open path */}
       {!showPathInput ? (
         <div className="mt-3 text-center text-[12px] leading-[1.6] text-octo-sage">
-          <span>Drop a folder, or </span>
+          <button
+            type="button"
+            onClick={onNewProject}
+            className="font-serif text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
+          >
+            Begin a new study
+          </button>
+          <span>, drop a folder, or </span>
           <button
             type="button"
             onClick={handleOpenClick}

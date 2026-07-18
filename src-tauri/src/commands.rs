@@ -432,7 +432,7 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
         db.reopen_project(&id)?;
         // Heal projects opened by older Octopush versions that didn't auto-
         // create a main workspace.
-        ensure_main_workspace(&db, &id, &p)?;
+        ensure_main_workspace(&db, &id, &p, None)?;
         // Carry the saved Jira project key (if any) so the frontend that
         // builds its project map from this return value doesn't silently
         // zero out a previously-configured mapping.
@@ -447,7 +447,7 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
         db.insert_project(&id, &name, &path)?;
-        ensure_main_workspace(&db, &id, &path)?;
+        ensure_main_workspace(&db, &id, &path, None)?;
         Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None })
     }
 }
@@ -495,6 +495,7 @@ fn ensure_main_workspace(
     db: &crate::db::Db,
     project_id: &str,
     project_path: &str,
+    task: Option<&str>,
 ) -> AppResult<()> {
     let existing = db.list_workspaces(project_id)?;
     if !existing.is_empty() {
@@ -506,8 +507,9 @@ fn ensure_main_workspace(
         .unwrap_or_else(|| "main".into());
     let id = uuid::Uuid::new_v4().to_string();
     // name = branch name so the rail shows "main" / "master" / whatever the
-    // user's default branch is.
-    db.insert_workspace(&id, project_id, &branch, "", &branch, Some(project_path), "", None)?;
+    // user's default branch is. `task`, when present (prompt genesis), seeds the
+    // main workspace's task → becomes the paired mission's title (M1 pairing).
+    db.insert_workspace(&id, project_id, &branch, task.unwrap_or(""), &branch, Some(project_path), "", None)?;
     // Every workspace is born with a mission — the main workspace becomes a
     // 'build' mission owning the project root.
     if let Some(ws) = db.get_workspace(&id)? {
@@ -517,9 +519,19 @@ fn ensure_main_workspace(
 }
 
 #[tauri::command]
-pub async fn create_project(state: State<'_, AppState>, path: String, name: String) -> AppResult<ProjectInfo> {
+pub async fn create_project(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    task: Option<String>,
+) -> AppResult<ProjectInfo> {
     let path = expand_tilde(&path);
-    let full_path = std::path::Path::new(&path).join(&name);
+    let base = std::path::Path::new(&path);
+    // Never `git init` over someone else's non-empty directory: if the target
+    // exists with content, pick a free `<name>-2`, `-3`, … (an empty dir is
+    // adopted). Prompt genesis derives the name from a prompt, so collisions are
+    // real (two "task tracker" ideas → two projects, not one clobbered).
+    let (full_path, name) = resolve_free_project_dir(base, &name)?;
     std::fs::create_dir_all(&full_path)?;
     crate::git_ops::init_repo(&full_path)?;
     // Commit a baseline so the default branch has a tree (otherwise the main
@@ -529,8 +541,38 @@ pub async fn create_project(state: State<'_, AppState>, path: String, name: Stri
     let full_path_str = full_path.to_string_lossy().to_string();
     let db = state.db.lock();
     db.insert_project(&id, &name, &full_path_str)?;
-    ensure_main_workspace(&db, &id, &full_path_str)?;
+    ensure_main_workspace(&db, &id, &full_path_str, task.as_deref())?;
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
+}
+
+/// Resolve a free project directory under `base` for `name`, suffixing `-2`,
+/// `-3`, … only when the target exists AND is non-empty. Returns the chosen path
+/// and the (possibly suffixed) name. An empty existing dir is reused as-is.
+pub(crate) fn resolve_free_project_dir(
+    base: &std::path::Path,
+    name: &str,
+) -> AppResult<(std::path::PathBuf, String)> {
+    let is_free = |p: &std::path::Path| -> bool {
+        match std::fs::read_dir(p) {
+            Ok(mut entries) => entries.next().is_none(), // exists + empty
+            Err(_) => true,                              // doesn't exist
+        }
+    };
+    let first = base.join(name);
+    if is_free(&first) {
+        return Ok((first, name.to_string()));
+    }
+    for n in 2..1000 {
+        let candidate_name = format!("{name}-{n}");
+        let candidate = base.join(&candidate_name);
+        if is_free(&candidate) {
+            return Ok((candidate, candidate_name));
+        }
+    }
+    Err(crate::error::AppError::Other(format!(
+        "couldn't find a free directory for '{name}' under {}",
+        base.display()
+    )))
 }
 
 // ─── Workspace commands ───────────────────────────────────────────
@@ -2736,7 +2778,7 @@ pub async fn clone_project(
         // Auto-create a workspace for the cloned repo's default branch, so the
         // user lands on a usable "main"/"master" workspace instead of the empty
         // state — same as open_project/create_project.
-        ensure_main_workspace(&db, &id, &path_str)?;
+        ensure_main_workspace(&db, &id, &path_str, None)?;
     }
 
     Ok(ProjectInfo {

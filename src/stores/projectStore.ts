@@ -10,7 +10,7 @@ interface ProjectState {
   error: string | null;
 
   open: (path: string) => Promise<void>;
-  create: (path: string, name: string) => Promise<void>;
+  create: (path: string, name: string, task?: string | null) => Promise<void>;
   loadRecent: () => Promise<void>;
   loadClosed: () => Promise<void>;
   closeProject: (id: string) => Promise<void>;
@@ -45,10 +45,10 @@ export const useProjectStore = create<ProjectState>((set) => ({
     }
   },
 
-  create: async (path, name) => {
+  create: async (path, name, task) => {
     set({ loading: true, error: null });
     try {
-      const project = await ipc.createProject(path, name);
+      const project = await ipc.createProject(path, name, task);
       set({ current: project, loading: false });
     } catch (e) {
       set({ error: String(e), loading: false });

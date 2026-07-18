@@ -9246,6 +9246,28 @@ mod mission_tests {
     }
 
     #[test]
+    fn resolve_free_project_dir_suffixes_only_on_nonempty_collision() {
+        // Prompt genesis derives names from prompts, so collisions are real; we
+        // must never `git init` over someone's non-empty dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // Fresh name → used as-is.
+        let (p, n) = crate::commands::resolve_free_project_dir(base, "app").unwrap();
+        assert_eq!(n, "app");
+        assert_eq!(p, base.join("app"));
+        // A NON-empty dir at base/app → next call suffixes -2.
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::write(base.join("app").join("f"), "x").unwrap();
+        let (p2, n2) = crate::commands::resolve_free_project_dir(base, "app").unwrap();
+        assert_eq!(n2, "app-2");
+        assert_eq!(p2, base.join("app-2"));
+        // An EMPTY existing dir is adopted, not suffixed.
+        std::fs::create_dir_all(base.join("empty")).unwrap();
+        let (_, n3) = crate::commands::resolve_free_project_dir(base, "empty").unwrap();
+        assert_eq!(n3, "empty");
+    }
+
+    #[test]
     fn a_workspace_cannot_mix_isolation_modes() {
         // One checkout, one isolation mode — else a readonly agent could resolve
         // (via active_mission_for_workspace) as a writer and modify the checkout.
