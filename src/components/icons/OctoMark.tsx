@@ -1,5 +1,61 @@
 export type OctoState = "static" | "idle" | "working" | "pushed" | "blocked";
 
+/** Geometry-only rig — the animated mark's SVG contents without the <svg>
+ *  wrapper, so the Watcher/Player (chat mascots) can compose the same
+ *  canonical creature and drive it with their own classes/refs. */
+export function OctoRig({
+  eyeR,
+  showBack,
+  withHappy = false,
+}: {
+  eyeR: number;
+  showBack: boolean;
+  withHappy?: boolean;
+}) {
+  const eyeFill = "var(--octo-eye, var(--color-octo-bg))";
+  return (
+    <g className="octo-m-body">
+      {showBack && (
+        <g fill="var(--brass-line)">
+          <circle className="octo-m-b1" cx="10" cy="48.5" r="5" />
+          <circle className="octo-m-b2" cx="21" cy="50" r="5" />
+          <circle className="octo-m-b3" cx="43" cy="50" r="5" />
+          <circle className="octo-m-b4" cx="54" cy="48.5" r="5" />
+        </g>
+      )}
+      <path
+        fill="var(--color-octo-brass)"
+        d="M10 30 C10 17.8 19.8 8 32 8 C44.2 8 54 17.8 54 30 L54 47 L10 47 Z"
+      />
+      <g fill="var(--color-octo-brass)">
+        <ellipse className="octo-m-f1" cx="15.5" cy="47" rx="5.5" ry="5.2" />
+        <ellipse className="octo-m-f2" cx="26.5" cy="47" rx="5.5" ry="5.2" />
+        <ellipse className="octo-m-f3" cx="37.5" cy="47" rx="5.5" ry="5.2" />
+        <ellipse className="octo-m-f4" cx="48.5" cy="47" rx="5.5" ry="5.2" />
+      </g>
+      {/* Eyes ride in their own group: eye-group transforms (scan, gaze)
+          and per-eye transforms (blink) must not share an element — CSS
+          animations on the SAME element's transform override each other. */}
+      <g className="octo-m-eyes">
+        <ellipse className="octo-m-eye" cx="25" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
+        <ellipse className="octo-m-eye" cx="39" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
+      </g>
+      {withHappy && (
+        <g
+          className="octo-m-happy"
+          stroke={eyeFill}
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          fill="none"
+        >
+          <path d="M21.8 28 Q25 24.8 28.2 28" />
+          <path d="M35.8 28 Q39 24.8 42.2 28" />
+        </g>
+      )}
+    </g>
+  );
+}
+
 interface OctoMarkProps {
   /** Rendered width in px; height keeps the 64:66 canonical ratio. */
   size?: number;
@@ -72,36 +128,8 @@ export function OctoMark({ size = 20, state = "static", className }: OctoMarkPro
           opacity="0"
         />
       )}
-      <g className="octo-m-body">
-        {backArms}
-        <path
-          fill="var(--color-octo-brass)"
-          d="M10 30 C10 17.8 19.8 8 32 8 C44.2 8 54 17.8 54 30 L54 47 L10 47 Z"
-        />
-        <g fill="var(--color-octo-brass)">
-          <ellipse className="octo-m-f1" cx="15.5" cy="47" rx="5.5" ry="5.2" />
-          <ellipse className="octo-m-f2" cx="26.5" cy="47" rx="5.5" ry="5.2" />
-          <ellipse className="octo-m-f3" cx="37.5" cy="47" rx="5.5" ry="5.2" />
-          <ellipse className="octo-m-f4" cx="48.5" cy="47" rx="5.5" ry="5.2" />
-        </g>
-        {/* Eyes ride in their own group: the working-state scan animates the
-            group's transform while blink animates each eye's — CSS animations
-            on the SAME element's transform would override each other. */}
-        <g className="octo-m-eyes">
-          <ellipse className="octo-m-eye" cx="25" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
-          <ellipse className="octo-m-eye" cx="39" cy="27" rx={eyeR} ry={eyeR} fill={eyeFill} />
-        </g>
-        <g
-          className="octo-m-happy"
-          stroke={eyeFill}
-          strokeWidth="2.4"
-          strokeLinecap="round"
-          fill="none"
-        >
-          <path d="M21.8 28 Q25 24.8 28.2 28" />
-          <path d="M35.8 28 Q39 24.8 42.2 28" />
-        </g>
-      </g>
+      {/* OctoRig carries the .octo-m-body float group itself. */}
+      <OctoRig eyeR={eyeR} showBack={showBack} withHappy />
     </svg>
   );
 }

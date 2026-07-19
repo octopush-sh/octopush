@@ -398,6 +398,68 @@
 /* blocked — stillness IS the signal; eyes at half-mast */
 .octo-mascot--blocked .octo-m-eye { animation: octo-m-slowblink 7s infinite; }
 
+/* Player roles — the pinned TALK figure acts out the live tool
+   (spec 2026-07-19 §4). Same six rig pieces, different tempos. */
+@keyframes octo-m-typy { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2.2px); } }
+@keyframes octo-m-readline {
+  0% { transform: translate(-2.2px, -0.6px); }
+  62% { transform: translate(2.2px, -0.6px); }
+  70%, 100% { transform: translate(-2.2px, 0.9px); }
+}
+@keyframes octo-m-darty {
+  0%, 14% { transform: translate(-2.2px, -1.2px); }
+  18%, 34% { transform: translate(2.2px, -1px); }
+  38%, 56% { transform: translate(-1.6px, 1.4px); }
+  60%, 78% { transform: translate(2px, 1.2px); }
+  82%, 100% { transform: translate(0, 0); }
+}
+
+/* write / edit — typing arms, eyes down at the text */
+.octo-mascot--write .octo-m-f1 { animation: octo-m-typy 0.46s ease-in-out infinite; }
+.octo-mascot--write .octo-m-f2 { animation: octo-m-typy 0.46s ease-in-out 0.23s infinite; }
+.octo-mascot--write .octo-m-f3 { animation: octo-m-typy 0.46s ease-in-out 0.11s infinite; }
+.octo-mascot--write .octo-m-f4 { animation: octo-m-typy 0.46s ease-in-out 0.34s infinite; }
+.octo-mascot--write .octo-m-eyes { transform: translateY(1.9px); }
+
+/* read — reading saccades: sweep the line, drop to the next */
+.octo-mascot--read .octo-m-f1 { animation: octo-m-float 3.4s ease-in-out infinite; }
+.octo-mascot--read .octo-m-f2 { animation: octo-m-float 3.4s ease-in-out 0.45s infinite; }
+.octo-mascot--read .octo-m-f3 { animation: octo-m-float 3.4s ease-in-out 0.9s infinite; }
+.octo-mascot--read .octo-m-f4 { animation: octo-m-float 3.4s ease-in-out 1.35s infinite; }
+.octo-mascot--read .octo-m-eyes { animation: octo-m-readline 1.5s linear infinite; }
+
+/* search — the gaze darts corner to corner */
+.octo-mascot--search .octo-m-f1 { animation: octo-m-float 2.4s ease-in-out infinite; }
+.octo-mascot--search .octo-m-f2 { animation: octo-m-float 2.4s ease-in-out 0.3s infinite; }
+.octo-mascot--search .octo-m-f3 { animation: octo-m-float 2.4s ease-in-out 0.6s infinite; }
+.octo-mascot--search .octo-m-f4 { animation: octo-m-float 2.4s ease-in-out 0.9s infinite; }
+.octo-mascot--search .octo-m-eyes { animation: octo-m-darty 2.6s infinite; }
+
+/* run — dead still, eyes wide: watching the command */
+.octo-mascot--run .octo-m-eyes { transform: scale(1.18); }
+.octo-mascot--run .octo-m-eye { animation: octo-m-blink 3.2s infinite; }
+
+/* the ✓ beat — happy eyes for half a second as the turn closes */
+.octo-mascot--pushed-beat .octo-m-eye { opacity: 0; animation: none; }
+.octo-mascot--pushed-beat .octo-m-happy { opacity: 1; }
+
+/* Watcher fidget — the back-right arm climbs to the dome and rubs;
+   eyes squint while it happens (spec 2026-07-19 §3). */
+@keyframes octo-m-scratch {
+  0% { transform: translate(0, 0); }
+  16% { transform: translate(-4px, -31px); }
+  27% { transform: translate(-7.5px, -27.5px); }
+  38% { transform: translate(-4px, -31px); }
+  49% { transform: translate(-7.5px, -27.5px); }
+  60% { transform: translate(-4px, -31px); }
+  82%, 100% { transform: translate(0, 0); }
+}
+/* Same specificity as `.octo-mascot--idle .octo-m-b4` — this rule wins by
+   source order, and (unlike !important) stays subordinate to the global
+   reduced-motion neutralizer. */
+.octo-g-scratch .octo-m-b4 { animation: octo-m-scratch 2.8s ease-in-out 1; }
+.octo-g-scratch .octo-m-eye { animation: none; transform: scaleY(0.55); }
+
 @media (prefers-reduced-motion: reduce) {
   /* The app-wide neutralizer below freezes every mascot loop at its base
      pose; the only extra work is keeping the blocked pose readable. */

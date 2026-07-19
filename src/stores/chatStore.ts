@@ -190,6 +190,9 @@ interface ChatState {
   errorByWs: Record<string, string | null>;
   /** Tools currently executing per workspace (live "running" cards). */
   liveToolsByWs: Record<string, LiveTool[]>;
+  /** True between the user pressing Stop and the next turn starting — lets
+   *  the pinned mascot skip the ✓ celebration for a turn the user killed. */
+  stopRequestedByWs: Record<string, boolean>;
 
   /** Conversation threads per workspace (most-recent-first). */
   threadsByWs: Record<string, ChatThread[]>;
@@ -659,6 +662,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     messagesByWs: {},
     streamingByWs: {},
     streamBufferByWs: {},
+    stopRequestedByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
     threadsByWs: {},
@@ -797,6 +801,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
+        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
@@ -935,6 +940,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
+        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
@@ -1047,6 +1053,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Fire-and-forget; the backend emits `chat://stream` done which clears
       // the streaming flag, so we don't optimistically flip it here. Cancel the
       // workspace's active thread (the one being shown).
+      // Remember the kill so the mascot doesn't celebrate an aborted turn.
+      set((s) => ({
+        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: true },
+      }));
       const threadId = get().activeThreadByWs[workspaceId];
       if (threadId) void ipc.cancelChat(threadId).catch(() => {});
       // Retire the cancelled thread's pending approval card immediately — the

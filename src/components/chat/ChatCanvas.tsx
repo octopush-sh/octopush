@@ -6,10 +6,11 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
-import { OctoMark } from "../icons/OctoMark";
+import { OctoWatcher } from "./OctoWatcher";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
 import { ApprovalCard } from "./ApprovalCard";
+import { OctoStatus } from "./OctoStatus";
 
 interface Props {
   workspaceId: string;
@@ -40,6 +41,7 @@ export function ChatCanvas({
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
+  const stopRequested = useChatStore((s) => s.stopRequestedByWs[workspaceId] ?? false);
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
   const respondApproval = useChatStore((s) => s.respondApproval);
@@ -145,15 +147,32 @@ export function ChatCanvas({
   const isEmpty = messages.length === 0 && !streaming && !error;
   const showJump = !atBottom && !isEmpty;
 
+  // Player visibility with a linger: OctoStatus stays mounted ~640ms after
+  // deactivation for its beat+fade exit, so everything that arranges itself
+  // around it (wash, jump pill, bottom padding) must track that window, not
+  // the raw streaming flag — otherwise the pill snaps onto the exiting mascot.
+  const playerActive = streaming || approvalsForThread.length > 0;
+  const [playerVisible, setPlayerVisible] = useState(playerActive);
+  useEffect(() => {
+    if (playerActive) {
+      setPlayerVisible(true);
+      return;
+    }
+    const t = setTimeout(() => setPlayerVisible(false), 700);
+    return () => clearTimeout(t);
+  }, [playerActive]);
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 py-6"
+      className={`octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 pt-6 ${
+        playerVisible ? "pb-[118px]" : "pb-6"
+      }`}
     >
       {isEmpty ? (
-        <EmptyState />
+        <EmptyState areaRef={scrollRef} />
       ) : (
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
           {timeline.map((item) => {
@@ -224,23 +243,8 @@ export function ChatCanvas({
                 }}
                 onOpenInEditor={onOpenInEditor}
               />
-              {/* Explicit "this message is still being written" marker so a live
-                  turn is never mistaken for a finished one when the stream pauses. */}
-              <div className="mt-1.5 flex items-center gap-1.5">
-                <span
-                  aria-hidden
-                  className="inline-block h-1 w-1 animate-pulse rounded-full"
-                  style={{ background: "var(--color-octo-brass)" }}
-                />
-                <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                  Generating
-                </span>
-              </div>
             </div>
           )}
-
-          {/* Only the bare "Thinking…" pulse when nothing else is live. */}
-          {streaming && !streamBuffer && liveTools.length === 0 && <ThinkingIndicator />}
 
           {error && isBudgetError ? (
             <BudgetErrorBlock
@@ -265,13 +269,36 @@ export function ChatCanvas({
         </div>
       )}
     </div>
+      {/* Bottom exit wash — keeps the pinned Player legible over the journal
+          while (and only while) the Player is on stage. A surface, not a line
+          (design-system §3); gone when idle so scrolled history stays legible. */}
+      {!isEmpty && playerVisible && (
+        <div
+          aria-hidden
+          className="octo-fade-in pointer-events-none absolute inset-x-0 bottom-0 h-[110px]"
+          style={{ background: "linear-gradient(transparent, var(--color-octo-bg) 76%)" }}
+        />
+      )}
+
+      {/* The Player — always-visible activity figure (spec 2026-07-19 §4). */}
+      <OctoStatus
+        workspaceId={workspaceId}
+        streaming={streaming}
+        hasError={Boolean(error)}
+        wasStopped={stopRequested}
+        streamBuffer={streamBuffer}
+        liveTools={liveTools}
+        approvals={approvalsForThread.length}
+      />
       {showJump && (
         <button
           type="button"
           onClick={() => scrollToBottom(true)}
           aria-label="Jump to latest"
           title="Jump to latest"
-          className="octo-pop-in absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass"
+          className={`octo-pop-in absolute left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass ${
+            playerVisible ? "bottom-16" : "bottom-3"
+          }`}
         >
           <ArrowDown size={12} />
           Latest
@@ -417,10 +444,10 @@ function RowAction({
   );
 }
 
-function EmptyState() {
+function EmptyState({ areaRef }: { areaRef: React.RefObject<HTMLDivElement | null> }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
-      <OctoMark size={28} state="idle" className="opacity-80" />
+      <OctoWatcher size={72} areaRef={areaRef} />
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Talk
       </div>
@@ -431,15 +458,6 @@ function EmptyState() {
         Ask anything — Octopush will read files, run commands, and write changes
         inside this workspace's worktree.
       </p>
-    </div>
-  );
-}
-
-function ThinkingIndicator() {
-  return (
-    <div className="flex items-center gap-2 self-start">
-      <OctoMark size={18} state="working" />
-      <span className="font-serif text-[13px] text-octo-sage">Thinking…</span>
     </div>
   );
 }

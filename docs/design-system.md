@@ -172,9 +172,18 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
   half-mast — stillness is the signal). All motion ≤2.5px, reduced-motion safe
   (`octo-m-*` keyframes, §6).
 - **Placements:** app icon (`src-tauri/icons/source.svg`), Welcome hero (idle),
-  top-bar live mascot (`useMascotState`: blocked > working > idle), Talk/Project
-  empty states (idle), thinking indicator (working), run-ledger completion
-  moment (pushed), Settings/About/legacy-sidebar (static), dev favicon.
+  top-bar live mascot (`useMascotState`: blocked > working > idle), Project
+  empty state (idle), run-ledger completion moment (pushed),
+  Settings/About/legacy-sidebar (static), dev favicon.
+- **Canvas behaviors:** the TALK empty-state **Watcher** (gaze-follow ±2.4u + fidget
+  cycle look/scratch/peek after 15s idle — `chat/OctoWatcher.tsx`) and the pinned
+  **Player** (`OctoPlayer.tsx` — the shared phase machine + figure): role classes
+  `octo-mascot--write/read/search/run` + `octo-mascot--pushed-beat`. Two adapters
+  feed it: TALK (`chat/OctoStatus.tsx`, `roleForActivity` over streaming/liveTools/
+  approvals, identity = workspace) and DIRECT (`direct/StageOctoStatus.tsx`,
+  `roleForStage` over the stage's live journal + status, identity = stage;
+  `done` beats, `failed` leaves quietly). Keep new roles to eye/arm tempo changes
+  on the same six rig pieces — never add elements to the rig.
 - **Wordmark:** "Octopush" in Fraunces via `.brand-wordmark` — brand surfaces
   only (welcome, settings header, about). Spectral remains the UI serif; body,
   sans, and mono roles are unchanged.
