@@ -13,6 +13,8 @@ interface Props {
   /** Prompt genesis from the wizard: describe → a project is born + a crew is
    *  staged. Location comes from the wizard's own field. */
   onGenesis: (prompt: string, name: string, location: string, model: string | null) => void;
+  /** "Think it through first" from the wizard — open the Sketchbook. */
+  onSketch: (prompt: string) => void;
 }
 
 type ProjectType = "empty" | "clone" | "genesis" | "open";
@@ -84,7 +86,7 @@ export function sshToHttps(url: string): string {
 // Component
 // ──────────────────────────────────────────────────────────────────────────────
 
-export function NewProjectFlow({ onBack, onGenesis }: Props) {
+export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
   const { create, loading: createLoading, error: createError } = useProjectStore();
 
   // Step navigation
@@ -697,6 +699,7 @@ export function NewProjectFlow({ onBack, onGenesis }: Props) {
                 onSubmit={(prompt, name, model) =>
                   onGenesis(prompt, name, genesisLocation.trim() || "~/Octopush", model)
                 }
+                onSketch={onSketch}
               />
               <Field label="LOCATION">
                 <input

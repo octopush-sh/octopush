@@ -49,6 +49,7 @@ import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
 import { initGenesisRename } from "./lib/genesisRename";
+import { deriveProjectName } from "./lib/genesis";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -1580,6 +1581,25 @@ function App() {
     }
   }, [selectWorkspace]);
 
+  // "Make it a project" — promote a Sketchbook thread to a real genesis project,
+  // carrying the sketch's opening prompt (the first user message) as the brief.
+  // The anti-task-manager frontier: a sketch either becomes execution or stays a
+  // document. (What else to copy — the sketch's notes — is a deliberate later
+  // refinement; the seed prompt is enough to start.)
+  const handleMakeProject = useCallback(() => {
+    if (!activeWorkspaceId) return;
+    const firstUser = useChatStore
+      .getState()
+      .getMessages(activeWorkspaceId)
+      .find((m) => m.role === "user");
+    const seed = firstUser?.content.trim();
+    if (!seed) {
+      pushToast({ level: "info", title: "Nothing to build yet", body: "Say what you want first, then make it a project." });
+      return;
+    }
+    void handleGenesis(seed, deriveProjectName(seed), "~/Octopush", null);
+  }, [activeWorkspaceId, handleGenesis]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1744,7 +1764,7 @@ function App() {
     if (appView === "new-project") {
       return (
         <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} />
+          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} onSketch={handleSketch} />
           <ToastContainer />
         </div>
       );
@@ -2135,6 +2155,9 @@ function App() {
             collapsed={isCompanionCollapsed}
             onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
             onOpenLogbook={() => setLogbookOpen(true)}
+            onMakeProject={
+              activeProject?.path.includes("/.octopush/sketchbook") ? handleMakeProject : undefined
+            }
           />
         </div>
         </div>
@@ -2484,6 +2507,7 @@ function App() {
           <NewProjectFlow
             onBack={() => setShowAddProject(false)}
             onGenesis={handleGenesis}
+            onSketch={handleSketch}
           />
         </div>
       )}
