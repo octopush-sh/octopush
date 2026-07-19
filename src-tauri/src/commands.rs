@@ -600,6 +600,15 @@ pub async fn create_project(
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
 }
 
+/// The canonical Sketchbook path (expanded, no side effect — does NOT provision
+/// it). The frontend compares a project's path against this to know whether it's
+/// the Sketchbook, exactly (a substring check would false-match a project opened
+/// from a subfolder inside it) and OS-correctly (the backend owns the separator).
+#[tauri::command]
+pub fn sketchbook_path() -> String {
+    expand_tilde("~/.octopush/sketchbook")
+}
+
 /// Atomically CLAIM a genesis project's one-shot post-build rename (G6),
 /// resolved from a workspace of the just-completed run. Returns the prompt
 /// exactly once (then the marker is set), else `None`. Drives the rename toast.

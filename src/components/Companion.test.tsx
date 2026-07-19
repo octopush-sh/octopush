@@ -48,6 +48,13 @@ describe("Companion cross-mode visibility of issue tracker block", () => {
     expect(screen.getByTestId("backlog")).toBeInTheDocument();
   });
 
+  it("shows 'Make it a project' in TALK only when onMakeProject is wired (Sketchbook)", () => {
+    const { rerender } = render(<Companion mode="talk" {...baseProps} />);
+    expect(screen.queryByText("Make it a project")).not.toBeInTheDocument();
+    rerender(<Companion mode="talk" {...baseProps} onMakeProject={vi.fn()} />);
+    expect(screen.getByText("Make it a project")).toBeInTheDocument();
+  });
+
   it("hides all Jira panels when projectKey is null", () => {
     const propsWithNoKey = {
       ...baseProps,

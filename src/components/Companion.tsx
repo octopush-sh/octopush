@@ -65,6 +65,9 @@ interface Props {
   onToggleCollapsed: () => void;
   /** Opens the Logbook Room (⌘⇧L) from the Companion Logbook card. */
   onOpenLogbook?: () => void;
+  /** Promote a Sketchbook thread to a real project — only wired when the active
+   *  project IS the Sketchbook, so the CTA is hidden everywhere else. */
+  onMakeProject?: () => void;
 }
 
 /** Icons for the collapsed-strip mode switcher (the expanded switcher is text). */
@@ -90,6 +93,7 @@ export function Companion({
   collapsed,
   onToggleCollapsed,
   onOpenLogbook,
+  onMakeProject,
 }: Props) {
   const issues = useIssuesStore((s) => s.issues);
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
@@ -233,6 +237,19 @@ export function Companion({
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
             {workspaceId && <SavingsLedger workspaceId={workspaceId} />}
             {workspaceId && <LogbookCard workspaceId={workspaceId} onOpenRoom={onOpenLogbook} />}
+            {onMakeProject && (
+              <div className="border-t border-octo-hairline px-3 py-3">
+                <button
+                  type="button"
+                  onClick={onMakeProject}
+                  title="Turn this sketch into a real project — a crew builds it from here"
+                  className="w-full rounded-md px-3 py-2 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi"
+                  style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                >
+                  Make it a project
+                </button>
+              </div>
+            )}
           </div>
         )}
         {mode === "run" && workspaceId && (

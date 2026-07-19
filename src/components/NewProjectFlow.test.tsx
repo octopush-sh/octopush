@@ -73,7 +73,7 @@ const { NewProjectFlow } = await import("./NewProjectFlow");
 function render_flow() {
   const onBack = vi.fn();
   const onGenesis = vi.fn();
-  const utils = render(<NewProjectFlow onBack={onBack} onGenesis={onGenesis} />);
+  const utils = render(<NewProjectFlow onBack={onBack} onGenesis={onGenesis} onSketch={vi.fn()} />);
   return { ...utils, onBack, onGenesis };
 }
 
