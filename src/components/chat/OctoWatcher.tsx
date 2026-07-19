@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { OctoRig } from "../icons/OctoMark";
-import { prefersReducedMotion } from "../../lib/motion";
+import { useReducedMotion } from "../../hooks/useReducedMotion";
 
 /** Max eye travel in canonical units; cursor influence saturates at 240px. */
 const MAX_OFFSET = 2.4;
@@ -29,6 +29,7 @@ export function OctoWatcher({
   size?: number;
   areaRef: React.RefObject<HTMLElement | null>;
 }) {
+  const reduced = useReducedMotion();
   const svgRef = useRef<SVGSVGElement>(null);
   const eyesEl = useRef<SVGGElement | null>(null);
   const cur = useRef({ x: 0, y: 0 });
@@ -40,8 +41,10 @@ export function OctoWatcher({
   // Gaze: mousemove on the canvas + rAF lerp loop.
   // Spec §3: under prefers-reduced-motion there is NO gaze-follow and NO
   // fidgeting — the CSS neutralizer can't stop a JS engine, so guard here.
+  // `reduced` is live (matchMedia listener): flipping the OS setting stops
+  // the engine mid-flight and re-centers the eyes.
   useEffect(() => {
-    if (prefersReducedMotion()) return;
+    if (reduced) return;
     eyesEl.current = svgRef.current?.querySelector(".octo-m-eyes") ?? null;
     const area = areaRef.current;
     if (!area) return;
@@ -71,12 +74,15 @@ export function OctoWatcher({
     return () => {
       area.removeEventListener("mousemove", onMove);
       cancelAnimationFrame(raf);
+      cur.current = { x: 0, y: 0 };
+      target.current = { x: 0, y: 0 };
+      eyesEl.current?.removeAttribute("transform");
     };
-  }, [areaRef]);
+  }, [areaRef, reduced]);
 
   // Fidget scheduler: 15s of keyboard silence → next gesture in the cycle.
   useEffect(() => {
-    if (prefersReducedMotion()) return;
+    if (reduced) return;
     let idleTimer: ReturnType<typeof setTimeout>;
     const stepTimers: Array<ReturnType<typeof setTimeout>> = [];
     const setG = (g: Gesture) => {
@@ -123,8 +129,9 @@ export function OctoWatcher({
       clearTimeout(idleTimer);
       stepTimers.forEach(clearTimeout);
       window.removeEventListener("keydown", onKey);
+      setG("none");
     };
-  }, []);
+  }, [reduced]);
 
   return (
     <svg

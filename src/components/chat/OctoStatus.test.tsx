@@ -6,6 +6,16 @@ import type { LiveTool } from "../../stores/chatStore";
 const tool = (toolName: string, done = false): LiveTool =>
   ({ callId: "c1", toolName, toolInput: {}, startedAt: "", done }) as LiveTool;
 
+const base = {
+  workspaceId: "ws-1",
+  streaming: false,
+  hasError: false,
+  wasStopped: false,
+  streamBuffer: "",
+  liveTools: [] as LiveTool[],
+  approvals: 0,
+};
+
 describe("roleForActivity", () => {
   it("approval beats everything", () => {
     const r = roleForActivity({ approvals: 1, liveTools: [tool("Bash")], streamBuffer: "x" });
@@ -43,48 +53,59 @@ describe("OctoStatus", () => {
   afterEach(() => vi.useRealTimers());
 
   it("renders nothing when idle", () => {
-    const { container } = render(
-      <OctoStatus streaming={false} hasError={false} streamBuffer="" liveTools={[]} approvals={0} />,
-    );
+    const { container } = render(<OctoStatus {...base} />);
     expect(container.firstChild).toBeNull();
   });
 
   it("shows the role label and body class while streaming", () => {
     const { container, getByText } = render(
-      <OctoStatus streaming hasError={false} streamBuffer="" liveTools={[tool("Grep")]} approvals={0} />,
+      <OctoStatus {...base} streaming liveTools={[tool("Grep")]} />,
     );
     expect(getByText("Searching…")).toBeTruthy();
     expect(container.querySelector(".octo-mascot--search")).not.toBeNull();
   });
 
   it("waiting label renders in brass", () => {
-    const { getByText } = render(
-      <OctoStatus streaming hasError={false} streamBuffer="" liveTools={[]} approvals={2} />,
-    );
+    const { getByText } = render(<OctoStatus {...base} streaming approvals={2} />);
     expect(getByText("Waiting for you").className).toContain("text-octo-brass");
   });
 
   it("plays the ✓ beat then unmounts when streaming ends cleanly", () => {
-    const { container, rerender } = render(
-      <OctoStatus streaming hasError={false} streamBuffer="x" liveTools={[]} approvals={0} />,
-    );
-    rerender(
-      <OctoStatus streaming={false} hasError={false} streamBuffer="" liveTools={[]} approvals={0} />,
-    );
+    const { container, rerender } = render(<OctoStatus {...base} streaming streamBuffer="x" />);
+    rerender(<OctoStatus {...base} />);
     expect(container.querySelector(".octo-mascot--pushed-beat")).not.toBeNull();
     act(() => vi.advanceTimersByTime(800));
     expect(container.firstChild).toBeNull();
   });
 
   it("skips the beat on error — just leaves", () => {
-    const { container, rerender } = render(
-      <OctoStatus streaming hasError={false} streamBuffer="x" liveTools={[]} approvals={0} />,
-    );
-    rerender(
-      <OctoStatus streaming={false} hasError streamBuffer="" liveTools={[]} approvals={0} />,
-    );
+    const { container, rerender } = render(<OctoStatus {...base} streaming streamBuffer="x" />);
+    rerender(<OctoStatus {...base} hasError />);
     expect(container.querySelector(".octo-mascot--pushed-beat")).toBeNull();
-    act(() => vi.advanceTimersByTime(400));
+    act(() => vi.advanceTimersByTime(300));
     expect(container.firstChild).toBeNull();
+  });
+
+  it("skips the beat when the user stopped the turn", () => {
+    const { container, rerender } = render(<OctoStatus {...base} streaming streamBuffer="x" />);
+    rerender(<OctoStatus {...base} wasStopped />);
+    expect(container.querySelector(".octo-mascot--pushed-beat")).toBeNull();
+    act(() => vi.advanceTimersByTime(300));
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("switching workspace never plays a phantom beat — it hard-resets", () => {
+    const { container, rerender } = render(<OctoStatus {...base} streaming streamBuffer="x" />);
+    // Same render cycle delivers the new workspace id AND its idle state.
+    rerender(<OctoStatus {...base} workspaceId="ws-2" />);
+    expect(container.querySelector(".octo-mascot--pushed-beat")).toBeNull();
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("switching into a streaming workspace shows live immediately", () => {
+    const { container, rerender } = render(<OctoStatus {...base} streaming streamBuffer="x" />);
+    rerender(<OctoStatus {...base} workspaceId="ws-2" streaming liveTools={[tool("Read")]} />);
+    expect(container.querySelector(".octo-mascot--pushed-beat")).toBeNull();
+    expect(container.querySelector(".octo-mascot--read")).not.toBeNull();
   });
 });

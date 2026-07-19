@@ -14,7 +14,7 @@ export function OctoRig({
 }) {
   const eyeFill = "var(--octo-eye, var(--color-octo-bg))";
   return (
-    <>
+    <g className="octo-m-body">
       {showBack && (
         <g fill="var(--brass-line)">
           <circle className="octo-m-b1" cx="10" cy="48.5" r="5" />
@@ -52,7 +52,7 @@ export function OctoRig({
           <path d="M35.8 28 Q39 24.8 42.2 28" />
         </g>
       )}
-    </>
+    </g>
   );
 }
 
@@ -128,9 +128,8 @@ export function OctoMark({ size = 20, state = "static", className }: OctoMarkPro
           opacity="0"
         />
       )}
-      <g className="octo-m-body">
-        <OctoRig eyeR={eyeR} showBack={showBack} withHappy />
-      </g>
+      {/* OctoRig carries the .octo-m-body float group itself. */}
+      <OctoRig eyeR={eyeR} showBack={showBack} withHappy />
     </svg>
   );
 }

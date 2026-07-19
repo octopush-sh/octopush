@@ -41,6 +41,7 @@ export function ChatCanvas({
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
+  const stopRequested = useChatStore((s) => s.stopRequestedByWs[workspaceId] ?? false);
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
   const respondApproval = useChatStore((s) => s.respondApproval);
@@ -146,12 +147,29 @@ export function ChatCanvas({
   const isEmpty = messages.length === 0 && !streaming && !error;
   const showJump = !atBottom && !isEmpty;
 
+  // Player visibility with a linger: OctoStatus stays mounted ~640ms after
+  // deactivation for its beat+fade exit, so everything that arranges itself
+  // around it (wash, jump pill, bottom padding) must track that window, not
+  // the raw streaming flag — otherwise the pill snaps onto the exiting mascot.
+  const playerActive = streaming || approvalsForThread.length > 0;
+  const [playerVisible, setPlayerVisible] = useState(playerActive);
+  useEffect(() => {
+    if (playerActive) {
+      setPlayerVisible(true);
+      return;
+    }
+    const t = setTimeout(() => setPlayerVisible(false), 700);
+    return () => clearTimeout(t);
+  }, [playerActive]);
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 pt-6 pb-[118px]"
+      className={`octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 pt-6 ${
+        playerVisible ? "pb-[118px]" : "pb-6"
+      }`}
     >
       {isEmpty ? (
         <EmptyState areaRef={scrollRef} />
@@ -251,20 +269,23 @@ export function ChatCanvas({
         </div>
       )}
     </div>
-      {/* Bottom exit wash — keeps the pinned Player legible over the journal.
-          A surface, not a line (design-system §3). */}
-      {!isEmpty && (
+      {/* Bottom exit wash — keeps the pinned Player legible over the journal
+          while (and only while) the Player is on stage. A surface, not a line
+          (design-system §3); gone when idle so scrolled history stays legible. */}
+      {!isEmpty && playerVisible && (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-x-0 bottom-0 h-[110px]"
+          className="octo-fade-in pointer-events-none absolute inset-x-0 bottom-0 h-[110px]"
           style={{ background: "linear-gradient(transparent, var(--color-octo-bg) 76%)" }}
         />
       )}
 
       {/* The Player — always-visible activity figure (spec 2026-07-19 §4). */}
       <OctoStatus
+        workspaceId={workspaceId}
         streaming={streaming}
         hasError={Boolean(error)}
+        wasStopped={stopRequested}
         streamBuffer={streamBuffer}
         liveTools={liveTools}
         approvals={approvalsForThread.length}
@@ -276,7 +297,7 @@ export function ChatCanvas({
           aria-label="Jump to latest"
           title="Jump to latest"
           className={`octo-pop-in absolute left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass ${
-            streaming || approvalsForThread.length > 0 ? "bottom-16" : "bottom-3"
+            playerVisible ? "bottom-16" : "bottom-3"
           }`}
         >
           <ArrowDown size={12} />
