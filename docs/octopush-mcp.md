@@ -52,7 +52,10 @@ SQLite store the desktop app uses.
 | `list_projects` | read | Open projects (git repos). |
 | `list_workspaces` | read | Workspaces (worktrees) of a project. |
 | `get_workspace` | read | One workspace: branch, path, status, linked issue. |
-| `create_workspace` | author | Ensure a workspace for a branch (explicit branch used **verbatim**; task-derived ones slugified). Returns `status`: created \| adopted \| existed \| restored. Reuses a tracked workspace, **adopts** an already-checked-out branch rather than failing, else creates a worktree. Never duplicates. The one tool that touches git. Shows in the rail on next focus/refresh. |
+| `list_missions` | read | A project's missions (threads of intent): intent, title, status, the two isolation axes, linked workspace/issue. |
+| `get_mission` | read | One mission by id. |
+| `create_workspace` | author | Ensure a workspace for a branch (explicit branch used **verbatim**; task-derived ones slugified). Returns `status`: created \| adopted \| existed \| restored. Reuses a tracked workspace, **adopts** an already-checked-out branch rather than failing, else creates a worktree. **Pairs the workspace with a mission** — pass `intent` (`build` default / `fix`) — so MCP-created workspaces match the app's "no workspace without a mission" guarantee. Never duplicates. The one tool that touches git. Shows in the rail on next focus/refresh. |
+| `create_mission` | author | Author a mission (a thread of intent). For code work prefer `create_workspace` (it pairs a `build` mission); use this for missions with no worktree (design/probe) or to attach a specific intent/isolation. Authoring only — never executes. |
 | `link_workspace_issue` | author | Link/unlink a workspace to an issue key (metadata only). |
 | `create_run` | author | Stage a run in `draft` from a pipeline + task (does **not** start it). |
 | `list_runs` | read | Runs of a workspace, newest first. |

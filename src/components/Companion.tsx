@@ -8,6 +8,7 @@ import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionTerminals } from "./CompanionTerminals";
 import { CompanionRuns } from "./CompanionRuns";
+import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
@@ -62,6 +63,8 @@ interface Props {
    *  mode switcher, so the user trades panel content for canvas room. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Opens the Logbook Room (⌘⇧L) from the Companion Logbook card. */
+  onOpenLogbook?: () => void;
 }
 
 /** Icons for the collapsed-strip mode switcher (the expanded switcher is text). */
@@ -86,6 +89,7 @@ export function Companion({
   onJumpToFile,
   collapsed,
   onToggleCollapsed,
+  onOpenLogbook,
 }: Props) {
   const issues = useIssuesStore((s) => s.issues);
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
@@ -228,6 +232,7 @@ export function Companion({
             <CompanionHistory {...historyProps} />
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
             {workspaceId && <SavingsLedger workspaceId={workspaceId} />}
+            {workspaceId && <LogbookCard workspaceId={workspaceId} onOpenRoom={onOpenLogbook} />}
           </div>
         )}
         {mode === "run" && workspaceId && (
@@ -243,7 +248,10 @@ export function Companion({
           />
         )}
         {mode === "direct" && workspaceId && (
-          <CompanionRuns workspaceId={workspaceId} />
+          <div className="flex min-h-0 flex-1 flex-col">
+            <CompanionRuns workspaceId={workspaceId} />
+            <LogbookCard workspaceId={workspaceId} onOpenRoom={onOpenLogbook} />
+          </div>
         )}
       </FadeSwap>
 

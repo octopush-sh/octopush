@@ -44,6 +44,7 @@ import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
 import { MissionControl } from "./components/MissionControl";
+import { LogbookRoom } from "./components/LogbookRoom";
 import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
@@ -119,6 +120,10 @@ function App() {
   // 1:1 with code workspaces). Drives the ContextHeader intent chip.
   const activeMissionIntent = useMissionsStore((s) =>
     activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.intent ?? null : null,
+  );
+  // Drives the ContextHeader sandbox (Shield) glyph.
+  const activeMissionExecIsolation = useMissionsStore((s) =>
+    activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.execIsolation ?? null : null,
   );
 
   // Per-workspace "actively processing" signal for the rail's marching bar.
@@ -329,6 +334,7 @@ function App() {
   // Overlay/menu state
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [missionControlOpen, setMissionControlOpen] = useState(false);
+  const [logbookOpen, setLogbookOpen] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
@@ -899,6 +905,13 @@ function App() {
         return;
       }
 
+      // ⌘⇧L → Logbook Room (cross-mission rollup)
+      if (mod && e.shiftKey && (e.key === "L" || e.key === "l")) {
+        e.preventDefault();
+        setLogbookOpen((v) => !v);
+        return;
+      }
+
       // ⌘N → new workspace
       if (mod && !e.shiftKey && e.key === "n") {
         e.preventDefault();
@@ -1455,6 +1468,114 @@ function App() {
     setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
   }, [activeWorkspaceId, workspaces]);
 
+  // Prompt genesis: a prompt becomes a project + a staged crew (intent before
+  // the repo). Composes create_project (born in <1s, local) with the same crew
+  // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
+  // "it's mine, on my disk" is the whole point.
+  const genesisInFlight = useRef(false);
+  const handleGenesis = useCallback(async (promptText: string, name: string, location = "~/Octopush", model: string | null = null) => {
+    // Reentrancy guard: a second submit (double Enter, key-repeat) mid-genesis
+    // must not spawn a duplicate project or let one call's error suppress the
+    // other's crew staging (they share projectStore.error).
+    if (genesisInFlight.current) return;
+    genesisInFlight.current = true;
+    try {
+    await useProjectStore.getState().create(location, name, promptText);
+    const proj = useProjectStore.getState().current;
+    if (!proj || useProjectStore.getState().error) return; // Welcome shows the error; no navigation.
+    // Read workspaces fresh — the project effect also loads them, but the direct
+    // read avoids racing the store (same pattern as handleSendFirstCrew).
+    const wss = await ipc.listWorkspaces(proj.id);
+    const main = wss[0];
+    if (!main) return;
+    // Builtins exist regardless of any provider key, so resolve the flagship
+    // either way and stage it — the prompt is the brief, and the workspace-scoped
+    // prefill survives even the detour to Settings when no key is configured.
+    let pipelines = usePipelineStore.getState().pipelines;
+    if (pipelines.length === 0) {
+      await usePipelineStore.getState().load();
+      pipelines = usePipelineStore.getState().pipelines;
+    }
+    // Genesis stages the Greenfield crew — it knows how to be BORN into an empty
+    // repo (choose the stack → gate → scaffold → first increment → honest verify),
+    // unlike Feature Factory which assumes an existing codebase.
+    const flagship =
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Greenfield") ??
+      pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === "Feature Factory") ??
+      pipelines.find((p) => p.pipeline.isBuiltin);
+    if (flagship) {
+      // A chosen model overrides every api stage of the staged pipeline (the
+      // launcher keys overrides by stage position; cli stages keep their own).
+      const overrides: [number, string][] = model
+        ? flagship.stages.filter((s) => s.substrate === "api").map((s) => [s.position, model])
+        : [];
+      useRunsStore.getState().setLauncherPrefill({
+        task: promptText,
+        pipelineId: flagship.pipeline.id,
+        overrides,
+        workspaceId: main.id,
+      });
+    }
+    setModePerWorkspace((p) => ({ ...p, [main.id]: "direct" }));
+    if (await crewProviderReady()) {
+      useFirstRunStore.getState().markUsed();
+    } else {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "Your crew is staged and waiting — one key in Settings · Models.",
+      });
+    }
+    } finally {
+      genesisInFlight.current = false;
+    }
+  }, []);
+
+  // Genesis "think it through first": open the Sketchbook (a real scratch git
+  // project, auto-provisioned) and start a fresh Talk thread with the prompt as
+  // the first message — no build, no repo of your own yet. This is the path that
+  // subsumes "design missions": you think in a scratch project's Talk, and
+  // promote to a real project when ready (both genesis doors stay available).
+  const sketchInFlight = useRef(false);
+  const handleSketch = useCallback(async (promptText: string) => {
+    if (sketchInFlight.current) return;
+    // A sketch is a real BYOK Talk turn. If there's no key, keep the user on the
+    // Welcome with their prompt still in the textarea (never lost) and point them
+    // to Settings — mirrors genesis's keyless path.
+    if (!(await crewProviderReady())) {
+      setSettingsTab("models");
+      pushToast({
+        level: "info",
+        title: "Add your Anthropic key first",
+        body: "Thinking it through is a Talk turn on Claude — one key in Settings · Models.",
+      });
+      return;
+    }
+    sketchInFlight.current = true;
+    useProjectStore.setState({ loading: true }); // disables the genesis block meanwhile
+    try {
+      const sketchbook = await ipc.ensureSketchbook();
+      useProjectStore.setState({ current: sketchbook, loading: false });
+      const wss = await ipc.listWorkspaces(sketchbook.id);
+      const main = wss[0];
+      if (!main) return;
+      const wsPath = main.worktreePath || sketchbook.path;
+      // Create the fresh thread BEFORE mounting the Talk canvas: ChatCanvas's
+      // mount-time loadHistory keeps a valid prior active thread, so it preserves
+      // this one instead of racing to pick threads[0] (which would strand it).
+      await useChatStore.getState().newThread(main.id);
+      selectWorkspace(main.id);
+      setModePerWorkspace((p) => ({ ...p, [main.id]: "talk" }));
+      await useChatStore.getState().send(main.id, wsPath, promptText);
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't open the Sketchbook", body: String(e).split("\n")[0] });
+    } finally {
+      useProjectStore.setState({ loading: false });
+      sketchInFlight.current = false;
+    }
+  }, [selectWorkspace]);
+
   // ── Project context menu handler ──
   const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
     setProjectContextMenu({ projectId, x, y });
@@ -1619,14 +1740,18 @@ function App() {
     if (appView === "new-project") {
       return (
         <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-          <NewProjectFlow onBack={() => setAppView("project")} />
+          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} />
           <ToastContainer />
         </div>
       );
     }
     return (
       <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-        <WelcomeScreen onNewProject={() => setAppView("new-project")} />
+        <WelcomeScreen
+          onNewProject={() => setAppView("new-project")}
+          onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
+          onSketch={handleSketch}
+        />
         <ToastContainer />
       </div>
     );
@@ -1737,6 +1862,7 @@ function App() {
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}
             missionIntent={activeMissionIntent}
+            missionExecIsolation={activeMissionExecIsolation}
           />
         )}
 
@@ -2004,6 +2130,7 @@ function App() {
             onJumpToFile={handleJumpToFile}
             collapsed={isCompanionCollapsed}
             onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
+            onOpenLogbook={() => setLogbookOpen(true)}
           />
         </div>
         </div>
@@ -2352,6 +2479,7 @@ function App() {
         <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
           <NewProjectFlow
             onBack={() => setShowAddProject(false)}
+            onGenesis={handleGenesis}
           />
         </div>
       )}
@@ -2485,6 +2613,9 @@ function App() {
           onJumpToAttention={handleJumpToAttention}
           onDispatch={handleDispatchCrew}
         />
+      )}
+      {logbookOpen && (
+        <LogbookRoom open onClose={() => setLogbookOpen(false)} project={project} />
       )}
     </div>
   );

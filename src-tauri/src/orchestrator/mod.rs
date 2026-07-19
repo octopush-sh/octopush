@@ -12,6 +12,7 @@ pub mod live;
 pub mod persist;
 pub mod roles;
 pub mod runner;
+pub mod sandbox;
 pub mod types;
 pub mod worker;
 
@@ -719,14 +720,35 @@ impl Orchestrator {
         // stage so the run converges to a clean paused/recoverable state instead of
         // stranding the stage in "running".
         let run_result: AppResult<StageOutcome> = async {
+            let workspace_path = self.workspace_path(run)?;
+            // Re-derive the mission's isolation from the DB every stage (no cached
+            // cross-process state — the detached worker gets it too). A `readonly`
+            // mission (review/probe) is read-only-by-construction: the sandbox is
+            // forced on with temp-only write roots regardless of its exec choice.
+            let mission = self.db.lock().active_mission_for_workspace(&run.workspace_id)?;
+            let git_isolation = mission
+                .as_ref()
+                .map(|m| m.git_isolation.clone())
+                .unwrap_or_else(|| "worktree".to_string());
+            let exec_choice = mission
+                .map(|m| m.exec_isolation)
+                .unwrap_or_else(|| "none".to_string());
+            let ws_str = workspace_path.to_string_lossy().into_owned();
+            let (exec_isolation, allowed_write_roots) =
+                match crate::orchestrator::sandbox::sandbox_write_roots(&git_isolation, &exec_choice, &ws_str) {
+                    Some(roots) => ("sandbox".to_string(), roots),
+                    None => (exec_choice, vec![ws_str]),
+                };
             let ctx = StageContext {
-                workspace_path: self.workspace_path(run)?,
+                workspace_path,
                 task: run.task.clone(),
                 client: self.client.clone(),
                 events: Arc::clone(&self.events),
                 run_id: run.id.clone(),
                 stage_id: stage.id.clone(),
                 cancel,
+                exec_isolation,
+                allowed_write_roots,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

@@ -370,6 +370,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
   GhIssue,
@@ -550,7 +551,9 @@ export const ipc = {
   // ─── Projects ───────────────────────────────────────────────────
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
   listRecentProjects: () => invoke<ProjectInfo[]>("list_recent_projects"),
-  createProject: (path: string, name: string) => invoke<ProjectInfo>("create_project", { path, name }),
+  createProject: (path: string, name: string, task?: string | null) =>
+    invoke<ProjectInfo>("create_project", { path, name, task: task ?? null }),
+  ensureSketchbook: () => invoke<ProjectInfo>("ensure_sketchbook"),
   cloneProject: (args: {
     path: string;
     url: string;
@@ -579,8 +582,9 @@ export const ipc = {
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
                     branch: string, fromBranch: string, setupScript: string,
-                    intent: string | null, gitIsolation: string | null) =>
-    invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation }),
+                    intent: string | null, gitIsolation: string | null,
+                    execIsolation: string | null) =>
+    invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -596,8 +600,14 @@ export const ipc = {
     }),
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey }),
+    execIsolation: string | null = null,
+  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
+
+  // ─── Logbook ────────────────────────────────────────────────────
+  /** Per-mission scope is free; project/global (the Logbook Room) is Pro. */
+  logbookSummary: (scopeType: string, scopeId: string | null, from: string, to: string) =>
+    invoke<LogbookMissionRow[]>("logbook_summary", { scopeType, scopeId, from, to }),
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),

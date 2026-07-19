@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Hammer, Wrench, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Hammer, Wrench, Eye, FlaskConical, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
@@ -24,10 +24,22 @@ interface Props {
 }
 
 type Step = 1 | 2 | 3;
-type Intent = "build" | "fix";
+/** Code intents (build/fix) write to a worktree; non-code intents (review/probe)
+ *  are read-only-by-construction — their agents read the checkout but can't
+ *  modify it (a `readonly` git-isolation enforced by the seatbelt sandbox). */
+type Intent = "build" | "fix" | "review" | "probe";
+/** Intents that don't write code — the wizard forces `readonly` git isolation
+ *  and hides the writer isolation controls for them. */
+const READONLY_INTENTS: Intent[] = ["review", "probe"];
+/** Card order for keyboard navigation (2×2 grid). */
+const INTENT_ORDER: Intent[] = ["build", "fix", "review", "probe"];
 /** The manual git-isolation choices. `pr` is derived (picking a PR), never a
  *  Listbox option — one state, two entry points. */
 type GitIsolation = "worktree" | "ephemeral";
+
+/** The execution-isolation choices offered in the wizard. `container`/`cloud`
+ *  arrive with later movements — zero dead options until they're real. */
+type ExecIsolation = "none" | "sandbox";
 
 /** Flatten a branch to the single-component directory name the backend uses for
  *  the worktree (mirrors `git_ops::slot_name_for`): keep ASCII word chars, `.`;
@@ -69,6 +81,8 @@ function slugify(text: string): string {
 const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: string }> = {
   build: { icon: Hammer, title: "Build something new", desc: "A feature, a surface, a capability." },
   fix: { icon: Wrench, title: "Fix something broken", desc: "A bug, a regression, a rough edge." },
+  review: { icon: Eye, title: "Review the work", desc: "Read the code, judge it — never touch it." },
+  probe: { icon: FlaskConical, title: "Probe a question", desc: "Investigate, read-only. No changes." },
 };
 
 export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
@@ -92,6 +106,8 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [prError, setPrError] = useState<string | null>(null);
   /** Manual git-isolation choice (overridden to `pr` when a PR is picked). */
   const [gitIsolation, setGitIsolation] = useState<GitIsolation>("worktree");
+  /** Execution isolation — free security: sandbox confines the agent's writes. */
+  const [execIsolation, setExecIsolation] = useState<ExecIsolation>("none");
   const [showIsolation, setShowIsolation] = useState(false);
   /** Base in effect before a PR retargeted it — restored when the chip clears. */
   const prevBaseRef = useRef<string | null>(null);
@@ -160,15 +176,25 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   useEffect(() => {
     if (step !== 1) return;
     function onKey(e: KeyboardEvent) {
-      if (e.key === "1") { setIntent("build"); setStep(2); }
-      else if (e.key === "2") { setIntent("fix"); setStep(2); }
-      else if (e.key === "ArrowLeft") setIntent("build");
-      else if (e.key === "ArrowRight") setIntent("fix");
-      else if (e.key === "Enter") setStep(2);
+      const idx = INTENT_ORDER.indexOf(intent);
+      if (/^[1-4]$/.test(e.key)) {
+        const picked = INTENT_ORDER[parseInt(e.key, 10) - 1];
+        if (picked) { setIntent(picked); setStep(2); }
+      } else if (e.key === "ArrowLeft") {
+        setIntent(INTENT_ORDER[Math.max(0, idx - 1)]);
+      } else if (e.key === "ArrowRight") {
+        setIntent(INTENT_ORDER[Math.min(INTENT_ORDER.length - 1, idx + 1)]);
+      } else if (e.key === "ArrowUp") {
+        setIntent(INTENT_ORDER[Math.max(0, idx - 2)]);
+      } else if (e.key === "ArrowDown") {
+        setIntent(INTENT_ORDER[Math.min(INTENT_ORDER.length - 1, idx + 2)]);
+      } else if (e.key === "Enter") {
+        setStep(2);
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [step]);
+  }, [step, intent]);
 
   const branch = branchOverride ?? (slugify(task) || "new-mission");
   const workspaceName = branch;
@@ -185,7 +211,13 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     setCreating(true);
     setError(null);
     // Picking a PR overrides the manual isolation choice — one effective value.
-    const gitIso: string = fromPr ? "pr" : gitIsolation;
+    // Review/probe missions are read-only-by-construction — always `readonly`,
+    // never a writer isolation (enforced in UI and backend).
+    const gitIso: string = READONLY_INTENTS.includes(intent)
+      ? "readonly"
+      : fromPr
+        ? "pr"
+        : gitIsolation;
     let newWs;
     try {
       newWs = await create(
@@ -198,6 +230,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         setupScript,
         intent,
         gitIso,
+        execIsolation,
       );
     } catch (e) {
       setError(String(e));
@@ -406,21 +439,49 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                   Isolation
                 </button>
                 <Reveal open={showIsolation} className="mt-3">
-                  {fromPr ? (
+                  {READONLY_INTENTS.includes(intent) ? (
                     <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
-                      Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
+                      <span className="text-octo-brass">Read-only.</span> This mission gets its own worktree — its agents read the code and never modify it, enforced by the sandbox rather than asked of the agent.
                     </div>
                   ) : (
-                    <Listbox
-                      ariaLabel="Git isolation"
-                      className="max-w-[420px]"
-                      value={gitIsolation}
-                      onChange={(v) => setGitIsolation(v as GitIsolation)}
-                      options={[
-                        { value: "worktree", label: "Own worktree", description: "The default — a dedicated git worktree for this mission." },
-                        { value: "ephemeral", label: "Ephemeral", description: "A throwaway worktree, archived when the mission is done." },
-                      ]}
-                    />
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                        Git state
+                      </div>
+                      {fromPr ? (
+                        <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
+                          Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
+                        </div>
+                      ) : (
+                        <Listbox
+                          ariaLabel="Git isolation"
+                          className="max-w-[420px]"
+                          value={gitIsolation}
+                          onChange={(v) => setGitIsolation(v as GitIsolation)}
+                          options={[
+                            { value: "worktree", label: "Own worktree", description: "The default — a dedicated git worktree for this mission." },
+                            { value: "ephemeral", label: "Ephemeral", description: "A throwaway worktree, archived when the mission is done." },
+                          ]}
+                        />
+                      )}
+                    </div>
+                    <div>
+                      <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                        Execution
+                      </div>
+                      <Listbox
+                        ariaLabel="Execution isolation"
+                        className="max-w-[420px]"
+                        value={execIsolation}
+                        onChange={(v) => setExecIsolation(v as ExecIsolation)}
+                        options={[
+                          { value: "none", label: "None", description: "The default — the agent runs with your normal permissions." },
+                          { value: "sandbox", label: "Local sandbox", description: "Confines the agent's file writes to this workspace — reads and network stay open. Free." },
+                        ]}
+                      />
+                    </div>
+                  </div>
                   )}
                 </Reveal>
               </div>

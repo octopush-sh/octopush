@@ -159,6 +159,40 @@ describe("MissionCreator", () => {
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][7]).toBe("fix");
     });
+
+    it("a Review mission is read-only — records `review` and forces `readonly` git isolation", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      render(
+        <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Audit the auth flow" />,
+      );
+      fireEvent.click(screen.getByText("Review the work"));
+      await screen.findByPlaceholderText(TASK_PLACEHOLDER);
+      // The Isolation disclosure shows the fixed read-only note, not the writer Listboxes.
+      fireEvent.click(screen.getByRole("button", { name: "Isolation" }));
+      expect(await screen.findByText(/Read-only\./)).toBeInTheDocument();
+      expect(screen.queryByText("Own worktree")).not.toBeInTheDocument();
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][7]).toBe("review");
+      expect(mockCreate.mock.calls[0][8]).toBe("readonly");
+    });
+
+    it("a Probe mission also forces `readonly`", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      render(
+        <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Why is startup slow" />,
+      );
+      fireEvent.click(screen.getByText("Probe a question"));
+      await screen.findByPlaceholderText(TASK_PLACEHOLDER);
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][7]).toBe("probe");
+      expect(mockCreate.mock.calls[0][8]).toBe("readonly");
+    });
   });
 
   // ─── Step 2: isolation ─────────────────────────────────────────────

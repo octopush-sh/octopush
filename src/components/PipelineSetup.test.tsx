@@ -21,7 +21,7 @@ vi.mock("../stores/pipelineStore", () => ({
 vi.mock("./ModelPicker", () => ({ ModelPicker: () => <div /> }));
 const entitlementState = vi.hoisted(() => ({ usage: { used: 4, limit: 25 } as { used: number; limit: number | null } | null }));
 vi.mock("../hooks/useEntitlement", () => ({
-  useEntitlement: () => ({ usage: entitlementState.usage }),
+  useEntitlement: () => ({ usage: entitlementState.usage, hasFeature: () => false }),
 }));
 const estimateMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {

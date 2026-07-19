@@ -2,12 +2,19 @@ import { useEffect, useState } from "react";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 import { OctoMark } from "./icons/OctoMark";
+import { GenesisPrompt } from "./GenesisPrompt";
 
 interface Props {
   onNewProject: () => void;
+  /** Prompt genesis: describe what to build → a project is born + a crew is
+   *  staged. `name` is the (editable) derived slug. */
+  onGenesis: (prompt: string, name: string, model: string | null) => void;
+  /** "Think it through first": open the Sketchbook and start a Talk thread with
+   *  the prompt — no build yet. */
+  onSketch: (prompt: string) => void;
 }
 
-export function WelcomeScreen({ onNewProject }: Props) {
+export function WelcomeScreen({ onNewProject, onGenesis, onSketch }: Props) {
   const { open, loadRecent, recent, loading, error, closed, loadClosed } = useProjectStore();
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathValue, setPathValue] = useState("");
@@ -91,25 +98,32 @@ export function WelcomeScreen({ onNewProject }: Props) {
         an atelier for agentic developers
       </div>
 
-      {/* Primary CTA */}
-      <button
-        type="button"
-        onClick={onNewProject}
-        className="mt-6 rounded-md px-5 py-2.5 font-serif text-[14px] text-octo-brass transition"
-        style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-      >
-        Begin a new study
-      </button>
+      {/* ⊕ Genesis — describe what you want to build; a crew scaffolds it.
+          The project is born from the prompt (intent before the repo). */}
+      <div className="mt-8 w-full max-w-[560px]">
+        <GenesisPrompt
+          loading={loading}
+          onSubmit={(p, n, model) => onGenesis(p, n, model)}
+          onSketch={onSketch}
+        />
+      </div>
 
-      {/* Or — open existing */}
-      <div className="mt-4 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+      {/* Or — start from a repo instead (project-first, unchanged). */}
+      <div className="mt-6 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         or
       </div>
 
-      {/* Drop / open path */}
+      {/* Begin a new study · drop / open path */}
       {!showPathInput ? (
         <div className="mt-3 text-center text-[12px] leading-[1.6] text-octo-sage">
-          <span>Drop a folder, or </span>
+          <button
+            type="button"
+            onClick={onNewProject}
+            className="font-serif text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
+          >
+            Begin a new study
+          </button>
+          <span>, drop a folder, or </span>
           <button
             type="button"
             onClick={handleOpenClick}

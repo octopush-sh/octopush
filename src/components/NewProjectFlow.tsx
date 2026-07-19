@@ -1,16 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
-import { Folder, Globe } from "lucide-react";
+import { Folder, Globe, Sparkles } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { GenesisPrompt } from "./GenesisPrompt";
 import { useProjectStore } from "../stores/projectStore";
 import { ipc } from "../lib/ipc";
 import { parseGitUrl } from "../lib/parseGitUrl";
 
 interface Props {
   onBack: () => void;
+  /** Prompt genesis from the wizard: describe → a project is born + a crew is
+   *  staged. Location comes from the wizard's own field. */
+  onGenesis: (prompt: string, name: string, location: string, model: string | null) => void;
 }
 
-type ProjectType = "empty" | "clone" | "template" | "open";
+type ProjectType = "empty" | "clone" | "genesis" | "open";
 type Step = 1 | 2;
 
 interface CloneProgress {
@@ -79,7 +84,7 @@ export function sshToHttps(url: string): string {
 // Component
 // ──────────────────────────────────────────────────────────────────────────────
 
-export function NewProjectFlow({ onBack }: Props) {
+export function NewProjectFlow({ onBack, onGenesis }: Props) {
   const { create, loading: createLoading, error: createError } = useProjectStore();
 
   // Step navigation
@@ -89,6 +94,8 @@ export function NewProjectFlow({ onBack }: Props) {
   // Empty-project fields
   const [repoName, setRepoName] = useState("");
   const [location, setLocation] = useState("~/.octopush/projects");
+  // Genesis projects default to a visible home ("it's mine, on my disk").
+  const [genesisLocation, setGenesisLocation] = useState("~/Octopush");
 
   // Clone fields
   const [cloneUrl, setCloneUrl] = useState("");
@@ -155,7 +162,6 @@ export function NewProjectFlow({ onBack }: Props) {
   const emptyNameValid = repoName.trim().length > 0;
 
   function handleTypeSelect(type: ProjectType) {
-    if (type === "template") return; // still disabled
     setProjectType(type);
     setStep(2);
     if (type !== "open") {
@@ -349,12 +355,11 @@ export function NewProjectFlow({ onBack }: Props) {
                 onClick={() => handleTypeSelect("open")}
               />
               <TypeCard
-                glyph="❦"
-                label="Template"
-                description="Coming soon."
-                selected={projectType === "template"}
-                disabled
-                onClick={() => {}}
+                icon={Sparkles}
+                label="From a prompt"
+                description="Describe it; a crew scaffolds it."
+                selected={projectType === "genesis"}
+                onClick={() => handleTypeSelect("genesis")}
               />
             </div>
           </>
@@ -673,6 +678,58 @@ export function NewProjectFlow({ onBack }: Props) {
               </button>
             </div>
           </>
+        ) : projectType === "genesis" ? (
+          /* ── Step II — From a prompt (genesis) ───────────────────── */
+          <>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+              STEP 2 OF 2
+            </div>
+            <h1 className="mt-3 font-serif text-[26px] leading-[1.05] tracking-[-0.005em] text-octo-ivory">
+              What do you want to build?
+            </h1>
+            <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
+              A project is born from your prompt and a crew is staged to build it — you direct every gate.
+            </p>
+
+            <div className="mt-8 max-w-[520px] space-y-5">
+              <GenesisPrompt
+                loading={createLoading}
+                onSubmit={(prompt, name, model) =>
+                  onGenesis(prompt, name, genesisLocation.trim() || "~/Octopush", model)
+                }
+              />
+              <Field label="LOCATION">
+                <input
+                  value={genesisLocation}
+                  onChange={(e) => setGenesisLocation(e.target.value)}
+                  placeholder="~/Octopush"
+                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                />
+              </Field>
+            </div>
+
+            {displayError && (
+              <div
+                className="mt-6 max-w-[520px] rounded-md px-3 py-2 text-[12px] text-octo-rouge"
+                style={{
+                  borderLeft: "1px solid var(--color-octo-rouge)",
+                  background: "rgba(209, 139, 139, 0.08)",
+                }}
+              >
+                {displayError}
+              </div>
+            )}
+
+            <div className="mt-10 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                className="rounded-md px-3 py-2 text-[12px] text-octo-mute hover:text-octo-sage"
+              >
+                ← Back
+              </button>
+            </div>
+          </>
         ) : (
           /* ── Step II — Empty project details ─────────────────────── */
           <>
@@ -807,17 +864,19 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function TypeCard({
   glyph,
+  icon: Icon,
   label,
   description,
   selected,
-  disabled,
+  disabled = false,
   onClick,
 }: {
-  glyph: string;
+  glyph?: string;
+  icon?: LucideIcon;
   label: string;
   description: string;
   selected: boolean;
-  disabled: boolean;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -832,10 +891,10 @@ function TypeCard({
       }}
     >
       <span
-        className="font-serif text-[20px]"
+        className="flex h-[24px] items-center font-serif text-[20px]"
         style={{ color: selected ? "var(--color-octo-brass)" : "var(--color-octo-sage)" }}
       >
-        {glyph}
+        {Icon ? <Icon size={20} strokeWidth={1.5} aria-hidden /> : glyph}
       </span>
       <div>
         <div

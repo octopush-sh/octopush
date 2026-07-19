@@ -212,6 +212,7 @@ mod db_tests {
             surface: "direct".into(),
             project_id: None,
             workspace_id: Some("ws1".into()),
+            mission_id: None,
             source_id: Some("s1".into()),
             attempt: 1,
             model_raw: "claude-opus-4-8".into(),
@@ -2688,6 +2689,7 @@ mod agentic_loop_tests {
             &emitter,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3112,7 +3114,7 @@ mod pipeline_crud_tests {
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 5); // incl. "Ship it" (issue → PR)
+        assert_eq!(pipelines.len(), 6); // incl. "Ship it" (issue → PR) + "Greenfield" (genesis)
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();
@@ -7177,7 +7179,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -7207,7 +7209,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 2,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
 
         assert!(!out.finished, "iteration exhaustion must not read as success");
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
@@ -7233,7 +7235,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &cancel, &em, None, None).await.unwrap();
+                                   "sys", "do it", dir.path(), 10, &cancel, &em, None, None, None).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -7271,7 +7273,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
 
         assert!(!out.finished, "a block is not a finished answer");
         let ask = out.blocked.expect("ask_director must populate blocked");
@@ -7306,7 +7308,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
 
         let ask = out.blocked.expect("malformed input still yields a block");
         assert_eq!(ask.summary, "need a decision");
@@ -7335,7 +7337,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None).await.unwrap();
+                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
 
         let ask = out.blocked.expect("block");
         assert_eq!(ask.questions.len(), 3, "all three questions must survive, none lost");
@@ -9101,5 +9103,312 @@ mod mission_tests {
         assert!(crate::mission::validate_axes("build", "bogus").is_err());
         assert!(crate::mission::validate_axes("build", "worktree").is_ok());
         assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
+    }
+
+    #[test]
+    fn spend_is_attributed_to_a_mission_and_rolls_up() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // A TALK spend keyed on the workspace id is denormalized onto its mission.
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:00:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.10,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let (cost, tokens) = db.mission_spend(&m.id, "2026-01-01", "2027-01-01").unwrap();
+        assert!((cost - 0.10).abs() < 1e-9, "cost rolls up to the mission: {cost}");
+        assert_eq!(tokens, 150);
+        // A period outside the event excludes it.
+        let (later, _) = db.mission_spend(&m.id, "2026-08-01", "2027-01-01").unwrap();
+        assert_eq!(later, 0.0);
+        // An unknown mission has no attributed spend.
+        assert_eq!(db.mission_spend("ghost", "2026-01-01", "2027-01-01").unwrap().0, 0.0);
+    }
+
+    #[test]
+    fn record_activity_coalesces_within_the_idle_window() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // Two same-surface beats in quick succession extend ONE span.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1, "same surface within window coalesces");
+        // A different surface is its own span.
+        db.record_activity("w1", "terminal", "pty").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2);
+    }
+
+    #[test]
+    fn logbook_summary_unions_overlapping_hours_and_rolls_up_cost() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        // OVERLAPPING spans: talk 10:00–10:10, terminal 10:05–10:15 → the union is
+        // 15 min (900s), NOT the 20-min sum. Per-surface keeps the raw 600+600.
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "talk", "2026-07-17T10:00:00+00:00", "2026-07-17T10:10:00+00:00");
+        db.insert_work_span_for_test(&m.id, "w1", "p1", "terminal", "2026-07-17T10:05:00+00:00", "2026-07-17T10:15:00+00:00");
+        db.record_token_spend(
+            &crate::token_engine::TokenEvent {
+                id: None,
+                session_id: "w1".into(),
+                timestamp: "2026-07-17T10:03:00+00:00".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: "claude-opus-4-8".into(),
+                cost_usd: 0.25,
+            },
+            "talk",
+        )
+        .unwrap();
+
+        let from = "2026-07-01T00:00:00+00:00";
+        let to = "2026-08-01T00:00:00+00:00";
+        let rows = db.logbook_summary("mission", Some(&m.id), from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.hours_secs, 900, "union of overlapping spans, not the 1200s sum");
+        assert!((row.cost_usd - 0.25).abs() < 1e-9);
+        assert_eq!(row.per_surface.iter().find(|s| s.surface == "talk").unwrap().secs, 600);
+        // Scope filtering.
+        assert_eq!(db.logbook_summary("project", Some("p1"), from, to).unwrap().len(), 1);
+        assert_eq!(db.logbook_summary("global", None, from, to).unwrap().len(), 1);
+        assert!(db.logbook_summary("bogus", None, from, to).is_err());
+    }
+
+    #[test]
+    fn create_run_stamps_the_active_mission_so_direct_rolls_up() {
+        // Regression (M2.1 review #1): a run must carry mission_id at birth, else
+        // DIRECT spend / savings / run-count never roll up into the Logbook —
+        // create_run was the only write path and it left the column NULL.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+
+        db.create_run("w1", &pipeline_id, "ship it", None, None, &[]).unwrap();
+
+        let rows = db
+            .logbook_summary("mission", Some(&m.id), "2026-01-01", "2027-01-01")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runs_count, 1, "the run is attributed to its mission");
+    }
+
+    #[test]
+    fn record_activity_splits_the_span_when_the_mission_changes() {
+        // Regression (M2.1 review #3): a mission change inside the idle window must
+        // open a fresh span, not extend the previous mission's — else worked time
+        // is silently attributed to the wrong mission.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 1);
+
+        // Retire mission A and pair a fresh writer on the same workspace.
+        db.archive_mission(&a.id).unwrap();
+        crate::mission::create(&db, "p1", "build", "second", "worktree", "none", Some("w1"), None)
+            .unwrap();
+
+        // Same surface, still within the idle window, but a DIFFERENT active
+        // mission → a new span, not an extend of A's.
+        db.record_activity("w1", "talk", "chat").unwrap();
+        assert_eq!(db.work_span_count_for_test(), 2, "mission change opens a fresh span");
+    }
+
+    #[test]
+    fn workspace_for_terminal_resolves_the_owning_workspace() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        db.create_terminal("t1", "w1", "shell", 0, 0).unwrap();
+        assert_eq!(db.workspace_for_terminal("t1").unwrap().as_deref(), Some("w1"));
+        assert_eq!(db.workspace_for_terminal("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_and_review_surfaces_appear_in_the_logbook_breakdown() {
+        // The M2.1 hooks completed: terminal (PTY) + review (AI) worked time now
+        // rolls up alongside talk + direct, each keeping its own surface. (Spans
+        // are inserted with real duration — a lone instant beat is 0s worked and
+        // correctly contributes nothing; the hooks extend spans over real time.)
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        db.insert_work_span_for_test(
+            &m.id, "w1", "p1", "terminal",
+            "2026-07-18T10:00:00+00:00", "2026-07-18T10:05:00+00:00",
+        );
+        db.insert_work_span_for_test(
+            &m.id, "w1", "p1", "review",
+            "2026-07-18T11:00:00+00:00", "2026-07-18T11:02:00+00:00",
+        );
+        let rows = db
+            .logbook_summary(
+                "mission",
+                Some(&m.id),
+                "2026-07-01T00:00:00+00:00",
+                "2026-08-01T00:00:00+00:00",
+            )
+            .unwrap();
+        let secs = |name: &str| {
+            rows[0].per_surface.iter().find(|s| s.surface == name).map(|s| s.secs)
+        };
+        assert_eq!(secs("terminal"), Some(300));
+        assert_eq!(secs("review"), Some(120));
+        // Disjoint spans → worked hours is the plain sum.
+        assert_eq!(rows[0].hours_secs, 420);
+    }
+
+    #[test]
+    fn update_mission_exec_isolation_sets_the_axis() {
+        // The wizard's Execution choice is applied in place after pairing.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt"), "", None).unwrap();
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        assert_eq!(m.exec_isolation, "none", "missions default to no sandbox");
+        db.update_mission_exec_isolation(&m.id, "sandbox").unwrap();
+        assert_eq!(db.get_mission(&m.id).unwrap().unwrap().exec_isolation, "sandbox");
+    }
+
+    #[test]
+    fn validate_exec_gates_the_execution_axis() {
+        assert!(crate::mission::validate_exec("none").is_ok());
+        assert!(crate::mission::validate_exec("sandbox").is_ok());
+        assert!(crate::mission::validate_exec("bogus").is_err());
+    }
+
+    #[test]
+    fn resolve_free_project_dir_suffixes_only_on_nonempty_collision() {
+        // Prompt genesis derives names from prompts, so collisions are real; we
+        // must never `git init` over someone's non-empty dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // Fresh name → used as-is.
+        let (p, n) = crate::commands::resolve_free_project_dir(base, "app").unwrap();
+        assert_eq!(n, "app");
+        assert_eq!(p, base.join("app"));
+        // A NON-empty dir at base/app → next call suffixes -2.
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::write(base.join("app").join("f"), "x").unwrap();
+        let (p2, n2) = crate::commands::resolve_free_project_dir(base, "app").unwrap();
+        assert_eq!(n2, "app-2");
+        assert_eq!(p2, base.join("app-2"));
+        // An EMPTY existing dir is adopted, not suffixed.
+        std::fs::create_dir_all(base.join("empty")).unwrap();
+        let (_, n3) = crate::commands::resolve_free_project_dir(base, "empty").unwrap();
+        assert_eq!(n3, "empty");
+        // Names that aren't a single safe component are REJECTED (an editable
+        // field feeds this — empty/`..`/separator/absolute would escape the box
+        // or git-init the container itself).
+        for bad in ["", "   ", ".", "..", "a/b", "/etc/evil", "..\\x"] {
+            assert!(
+                crate::commands::resolve_free_project_dir(base, bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sketchbook_project_is_find_or_create_idempotent() {
+        // The Sketchbook (genesis G5) is a canonical singleton project — inserting
+        // it twice reuses the same row (find-or-create by path), never duplicates.
+        let db = test_db();
+        let path = "/tmp/octopush-test-sketchbook";
+        assert!(db.get_project_by_path(path).unwrap().is_none());
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&id, "Sketchbook", path).unwrap();
+        // A second "ensure" resolves the existing row rather than making a new one.
+        let found = db.get_project_by_path(path).unwrap();
+        assert_eq!(found.map(|(i, _, _)| i).as_deref(), Some(id.as_str()));
+        assert_eq!(db.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn greenfield_pipeline_is_seeded_gated_and_idempotent() {
+        // The Greenfield crew (genesis G3): plan-with-stack-choice → gate →
+        // scaffold → first increment → honest verify, ending at a local repo.
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        // Idempotent: a second migrate/seed must not duplicate it.
+        db.seed_builtin_pipelines().unwrap();
+        let gf: Vec<_> = db
+            .list_pipelines()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.name == "Greenfield" && p.is_builtin)
+            .collect();
+        assert_eq!(gf.len(), 1, "exactly one Greenfield builtin");
+        let stages = db.get_pipeline_stages(&gf[0].id).unwrap();
+        let roles: Vec<&str> = stages.iter().map(|s| s.role.as_str()).collect();
+        assert_eq!(roles, ["plan", "implement", "implement", "code_review", "test"]);
+        // The plan stage is a GATE (the director approves the stack before build).
+        assert!(stages[0].checkpoint, "plan is gated — the stack is the director's call");
+        // Every stage carries authored instructions (steer the greenfield arc).
+        assert!(stages.iter().all(|s| s.instructions.as_deref().is_some_and(|i| !i.is_empty())));
+        // The review loops back to the increment, gated ×2.
+        let review = &stages[3];
+        assert_eq!(review.loop_target_position, Some(2));
+        assert_eq!(review.loop_mode.as_deref(), Some("gated"));
+        // Local-only: no pull_request stage (never pushes/opens a PR).
+        assert!(!roles.contains(&"pull_request"), "greenfield ends at a local repo");
+        // The verify stage's instructions demand honesty (no overclaim).
+        assert!(stages[4].instructions.as_deref().unwrap().to_lowercase().contains("could not verify"));
+    }
+
+    #[test]
+    fn a_workspace_cannot_mix_isolation_modes() {
+        // One checkout, one isolation mode — else a readonly agent could resolve
+        // (via active_mission_for_workspace) as a writer and modify the checkout.
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        crate::mission::create(&db, "p1", "build", "b", "worktree", "none", Some("w1"), None)
+            .unwrap();
+        // A readonly mission on the SAME workspace (different isolation) is rejected.
+        let mixed =
+            crate::mission::create(&db, "p1", "review", "r", "readonly", "none", Some("w1"), None);
+        assert!(mixed.is_err(), "readonly can't share a checkout with a writer mission");
+        // Same isolation is fine — two readonly missions may share a checkout.
+        let build_id = db.list_missions("p1").unwrap()[0].id.clone();
+        db.archive_mission(&build_id).unwrap();
+        crate::mission::create(&db, "p1", "review", "r1", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        crate::mission::create(&db, "p1", "probe", "r2", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        assert_eq!(db.list_missions("p1").unwrap().len(), 2, "two readonly missions share fine");
     }
 }

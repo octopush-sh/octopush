@@ -432,7 +432,7 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
         db.reopen_project(&id)?;
         // Heal projects opened by older Octopush versions that didn't auto-
         // create a main workspace.
-        ensure_main_workspace(&db, &id, &p)?;
+        ensure_main_workspace(&db, &id, &p, None)?;
         // Carry the saved Jira project key (if any) so the frontend that
         // builds its project map from this return value doesn't silently
         // zero out a previously-configured mapping.
@@ -447,8 +447,40 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
         db.insert_project(&id, &name, &path)?;
-        ensure_main_workspace(&db, &id, &path)?;
+        ensure_main_workspace(&db, &id, &path, None)?;
         Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None })
+    }
+}
+
+/// Find-or-create the canonical **Sketchbook** — a real git project at
+/// `~/.octopush/sketchbook` where "think it through first" missions live as TALK
+/// threads (genesis G5). A normal project in every respect (so sketches are
+/// versioned for free and there is NO special "design mission" surface) — it's
+/// just singleton + named, unlike `create_project` which suffixes collisions.
+#[tauri::command]
+pub async fn ensure_sketchbook(state: State<'_, AppState>) -> AppResult<ProjectInfo> {
+    let path = expand_tilde("~/.octopush/sketchbook");
+    let path_buf = std::path::PathBuf::from(&path);
+    if !path_buf.exists() || !crate::git_ops::is_git_repo(&path_buf) {
+        std::fs::create_dir_all(&path_buf)?;
+        crate::git_ops::init_repo(&path_buf)?;
+    }
+    crate::git_ops::ensure_initial_commit(&path_buf)?;
+
+    let db = state.db.lock();
+    if let Some((id, _name, p)) = db.get_project_by_path(&path)? {
+        db.reopen_project(&id)?;
+        ensure_main_workspace(&db, &id, &p, None)?;
+        let existing = db.get_project(&id)?;
+        let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
+        let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
+        let tint = existing.as_ref().and_then(|p| p.tint.clone());
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint })
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&id, "Sketchbook", &path)?;
+        ensure_main_workspace(&db, &id, &path, None)?;
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None })
     }
 }
 
@@ -495,6 +527,7 @@ fn ensure_main_workspace(
     db: &crate::db::Db,
     project_id: &str,
     project_path: &str,
+    task: Option<&str>,
 ) -> AppResult<()> {
     let existing = db.list_workspaces(project_id)?;
     if !existing.is_empty() {
@@ -506,8 +539,9 @@ fn ensure_main_workspace(
         .unwrap_or_else(|| "main".into());
     let id = uuid::Uuid::new_v4().to_string();
     // name = branch name so the rail shows "main" / "master" / whatever the
-    // user's default branch is.
-    db.insert_workspace(&id, project_id, &branch, "", &branch, Some(project_path), "", None)?;
+    // user's default branch is. `task`, when present (prompt genesis), seeds the
+    // main workspace's task → becomes the paired mission's title (M1 pairing).
+    db.insert_workspace(&id, project_id, &branch, task.unwrap_or(""), &branch, Some(project_path), "", None)?;
     // Every workspace is born with a mission — the main workspace becomes a
     // 'build' mission owning the project root.
     if let Some(ws) = db.get_workspace(&id)? {
@@ -517,9 +551,29 @@ fn ensure_main_workspace(
 }
 
 #[tauri::command]
-pub async fn create_project(state: State<'_, AppState>, path: String, name: String) -> AppResult<ProjectInfo> {
+pub async fn create_project(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    task: Option<String>,
+) -> AppResult<ProjectInfo> {
     let path = expand_tilde(&path);
-    let full_path = std::path::Path::new(&path).join(&name);
+    let base = std::path::Path::new(&path);
+    // The location must be an absolute path. An editable field feeds this, and an
+    // empty/relative base would make `Path::join` yield a RELATIVE project path —
+    // scaffolded against the process cwd and persisted as a relative string that
+    // resolves differently next launch. Reject it at the source (mirrors the
+    // name guard in resolve_free_project_dir).
+    if path.trim().is_empty() || base.is_relative() {
+        return Err(crate::error::AppError::Other(format!(
+            "'{path}' is not a valid project location — an absolute path is required"
+        )));
+    }
+    // Never `git init` over someone else's non-empty directory: if the target
+    // exists with content, pick a free `<name>-2`, `-3`, … (an empty dir is
+    // adopted). Prompt genesis derives the name from a prompt, so collisions are
+    // real (two "task tracker" ideas → two projects, not one clobbered).
+    let (full_path, name) = resolve_free_project_dir(base, &name)?;
     std::fs::create_dir_all(&full_path)?;
     crate::git_ops::init_repo(&full_path)?;
     // Commit a baseline so the default branch has a tree (otherwise the main
@@ -529,8 +583,54 @@ pub async fn create_project(state: State<'_, AppState>, path: String, name: Stri
     let full_path_str = full_path.to_string_lossy().to_string();
     let db = state.db.lock();
     db.insert_project(&id, &name, &full_path_str)?;
-    ensure_main_workspace(&db, &id, &full_path_str)?;
+    ensure_main_workspace(&db, &id, &full_path_str, task.as_deref())?;
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
+}
+
+/// Resolve a free project directory under `base` for `name`, suffixing `-2`,
+/// `-3`, … only when the target exists AND is non-empty. Returns the chosen path
+/// and the (possibly suffixed) name. An empty existing dir is reused as-is.
+pub(crate) fn resolve_free_project_dir(
+    base: &std::path::Path,
+    name: &str,
+) -> AppResult<(std::path::PathBuf, String)> {
+    // The name must be ONE safe path component. An editable field feeds this, so
+    // an absolute path, a `..`, a separator, or an empty string would escape the
+    // `~/Octopush` sandbox (`Path::join` replaces the base on an absolute arg and
+    // keeps `..` literally) — or, when empty, git-init the container dir itself.
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(crate::error::AppError::Other(format!(
+            "'{name}' is not a valid project name"
+        )));
+    }
+    let is_free = |p: &std::path::Path| -> bool {
+        match std::fs::read_dir(p) {
+            Ok(mut entries) => entries.next().is_none(), // exists + empty → adopt
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // doesn't exist → create
+            Err(_) => false, // exists as a file / unreadable → not usable, suffix past it
+        }
+    };
+    let first = base.join(name);
+    if is_free(&first) {
+        return Ok((first, name.to_string()));
+    }
+    for n in 2..1000 {
+        let candidate_name = format!("{name}-{n}");
+        let candidate = base.join(&candidate_name);
+        if is_free(&candidate) {
+            return Ok((candidate, candidate_name));
+        }
+    }
+    Err(crate::error::AppError::Other(format!(
+        "couldn't find a free directory for '{name}' under {}",
+        base.display()
+    )))
 }
 
 // ─── Workspace commands ───────────────────────────────────────────
@@ -548,6 +648,7 @@ pub async fn create_workspace(
     setup_script: String,
     intent: Option<String>,
     git_isolation: Option<String>,
+    exec_isolation: Option<String>,
 ) -> AppResult<crate::db::WorkspaceRow> {
     // Validate the axes BEFORE anything is created on disk. workspace::create
     // commits a DB row + a git worktree; a bad intent/isolation caught only at
@@ -556,7 +657,9 @@ pub async fn create_workspace(
     // caller of this public command could.
     let intent = intent.as_deref().unwrap_or("build");
     let git_isolation = git_isolation.as_deref().unwrap_or("worktree");
+    let exec_isolation = exec_isolation.as_deref().unwrap_or("none");
     crate::mission::validate_axes(intent, git_isolation)?;
+    crate::mission::validate_exec(exec_isolation)?;
 
     let project_path_expanded = expand_tilde(&project_path);
     let project_path = std::path::Path::new(&project_path_expanded);
@@ -578,9 +681,15 @@ pub async fn create_workspace(
     )?;
     // Pair the workspace with its mission (idempotent — a reused/adopted row
     // keeps its existing mission). Guarantees "no workspace without a mission".
+    // Execution isolation is applied in place afterwards (only when it differs)
+    // so both new and reused missions honor the wizard's Execution choice
+    // without changing the shared pairing signature.
     {
         let db = state.db.lock();
-        crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
+        let mission = crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;
+        if mission.exec_isolation != exec_isolation {
+            db.update_mission_exec_isolation(&mission.id, exec_isolation)?;
+        }
     }
     Ok(ws)
 }
@@ -635,9 +744,13 @@ pub async fn update_mission(
     title: Option<String>,
     status: Option<String>,
     linked_issue_key: Option<String>,
+    exec_isolation: Option<String>,
 ) -> AppResult<crate::db::MissionRow> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
+    }
+    if let Some(e) = exec_isolation.as_deref() {
+        crate::mission::validate_exec(e)?;
     }
     // Scope the DB lock so it's released before the (self-locking) ephemeral
     // auto-archive below — parking_lot's Mutex is not reentrant.
@@ -649,6 +762,11 @@ pub async fn update_mission(
             status.as_deref(),
             linked_issue_key.as_deref(),
         )?;
+        // The Execution axis can now be changed on an existing mission (e.g. the
+        // launcher's "enable sandbox for an unattended run" one-click).
+        if let Some(e) = exec_isolation.as_deref() {
+            db.update_mission_exec_isolation(&mission_id, e)?;
+        }
         db.get_mission(&mission_id)?
             .ok_or_else(|| crate::error::AppError::Other("mission not found".into()))?
     };
@@ -702,6 +820,26 @@ pub async fn archive_mission(state: State<'_, AppState>, mission_id: String) -> 
         }
     }
     Ok(())
+}
+
+/// The Logbook rollup for a scope + period. Per-mission (the Companion card) is
+/// FREE; cross-mission rollups (project / global — the Logbook Room) are Pro
+/// (`logbook.reports`).
+#[tauri::command]
+pub async fn logbook_summary(
+    state: State<'_, AppState>,
+    scope_type: String,
+    scope_id: Option<String>,
+    from: String,
+    to: String,
+) -> AppResult<Vec<crate::db::LogbookMissionRow>> {
+    if scope_type != "mission" {
+        require_logbook_reports()?;
+    }
+    state
+        .db
+        .lock()
+        .logbook_summary(&scope_type, scope_id.as_deref(), &from, &to)
 }
 
 /// Local + remote-tracking branches for the workspace creator's base picker.
@@ -1575,6 +1713,11 @@ fn require_history_sync() -> AppResult<()> {
     require_feature_gate(crate::entitlement::feature::HISTORY_SYNC)
 }
 
+/// Cross-mission Logbook rollups + export are Pro; per-mission is free.
+fn require_logbook_reports() -> AppResult<()> {
+    require_feature_gate(crate::entitlement::feature::LOGBOOK_REPORTS)
+}
+
 /// The local read-only history mirror (instant, no network). The History view
 /// paints this first, then refreshes via `history_sync_pull`. **Entitlement-gated
 /// on read** (not just on pull): the mirror can hold runs pulled by a *previous*
@@ -2333,10 +2476,26 @@ pub async fn spawn_or_attach_terminal(
     use crate::pty_manager::{SpawnMode, SpawnOptions};
 
     let db_for_hook = std::sync::Arc::clone(&state.db);
+    // Logbook: resolve the terminal's workspace once, then beat coalesced PTY
+    // activity from the output hook — throttled to ≤1 write/min per terminal
+    // (record_activity coalesces into one span, so a beat a minute keeps a live
+    // terminal's span growing while output flows, with negligible cost during
+    // heavy output; the span closes on its own after the idle window).
+    let ws_for_activity = state.db.lock().workspace_for_terminal(&id).ok().flatten();
+    let db_for_activity = std::sync::Arc::clone(&state.db);
+    let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
         let engine =
             crate::token_engine::TokenEngine::new(std::sync::Arc::clone(&db_for_hook));
         engine.scan_and_record(sid, seq, bytes);
+        if let Some(ws) = &ws_for_activity {
+            let now = chrono::Utc::now().timestamp();
+            let prev = last_beat.load(std::sync::atomic::Ordering::Relaxed);
+            if now - prev >= 60 {
+                last_beat.store(now, std::sync::atomic::Ordering::Relaxed);
+                let _ = db_for_activity.lock().record_activity(ws, "terminal", "pty");
+            }
+        }
     });
 
     let mode = state.pty.lock().spawn_or_attach(
@@ -2677,7 +2836,7 @@ pub async fn clone_project(
         // Auto-create a workspace for the cloned repo's default branch, so the
         // user lands on a usable "main"/"master" workspace instead of the empty
         // state — same as open_project/create_project.
-        ensure_main_workspace(&db, &id, &path_str)?;
+        ensure_main_workspace(&db, &id, &path_str, None)?;
     }
 
     Ok(ProjectInfo {
@@ -2990,10 +3149,18 @@ pub async fn save_git_credentials(host: String, username: String, token: String)
 
 /// Persist the full provider catalog to ~/.octopush/providers.json.
 #[tauri::command]
-pub async fn save_providers(providers: Vec<crate::provider_router::ProviderConfig>) -> AppResult<()> {
+pub async fn save_providers(
+    state: State<'_, AppState>,
+    providers: Vec<crate::provider_router::ProviderConfig>,
+) -> AppResult<()> {
     crate::provider_router::validate_providers(&providers)
         .map_err(crate::error::AppError::Other)?;
     crate::provider_router::write_providers(&providers)?;
+    // Reload the in-memory router so `list_providers`/`list_models` reflect the
+    // write immediately (else a just-enabled provider stays invisible until an
+    // app restart — which strands genesis's inline-key readiness check).
+    let updated = crate::provider_router::ProviderRouter::load()?;
+    *state.router.lock() = updated;
     Ok(())
 }
 
@@ -4659,6 +4826,10 @@ pub async fn ai_complete(
         // Best-effort: a recording failure must not fail the AI call itself.
         if let Err(e) = state.tokens.record(ai_token_event(workspace_id.as_deref(), &model, &resp, cost), surface) {
             tracing::warn!(error = %e, "failed to record ai_complete token event");
+        }
+        // Logbook: AI review on a workspace is review work on its mission.
+        if let Some(ws) = workspace_id.as_deref() {
+            let _ = state.db.lock().record_activity(ws, "review", "ai");
         }
     }
     let (input_tokens, output_tokens) = (resp.input_tokens, resp.output_tokens);

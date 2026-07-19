@@ -446,13 +446,100 @@ fn tool_definitions() -> serde_json::Value {
 /// signal — `run_command` reports the process exit status, file ops report
 /// whether the syscall succeeded — never a sniff of the result text. Callers
 /// that only want the text can ignore the bool (`let (result, _) = …`).
-pub(crate) fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json::Value) -> (String, bool) {
+/// Kernel-enforced `write_file` for a sandboxed mission: `mkdir -p` + write run
+/// under a seatbelt-wrapped shell, so the KERNEL resolves symlinks and blocks a
+/// target that escapes the workspace (a lexical check can't see through a
+/// symlink). The target is passed as a positional arg (`$1`), never interpolated
+/// into the script. Fail-closed: if the sandbox can't be set up, nothing is
+/// written. The profile guard lives until the child exits.
+fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> (String, bool) {
+    use std::io::Write;
+    // `$0` is a label; `$1` is the (untrusted) absolute target path.
+    let script = r#"mkdir -p "$(dirname "$1")" && cat > "$1""#;
+    let args = vec![
+        "-c".to_string(),
+        script.to_string(),
+        "octopush-write".to_string(),
+        full.to_string_lossy().into_owned(),
+    ];
+    let prepared =
+        match crate::orchestrator::sandbox::prepare(roots, std::ffi::OsStr::new("bash"), &args) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    format!("Sandbox unavailable — refusing to write unconfined: {e}"),
+                    false,
+                );
+            }
+        };
+    let mut child = match std::process::Command::new(&prepared.program)
+        .args(&prepared.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (format!("Sandboxed write failed to start: {e}"), false),
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(content.as_bytes());
+        // Dropping `si` closes stdin so `cat` sees EOF and finishes.
+    }
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => (format!("Wrote {} bytes to {path}", content.len()), true),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            (
+                format!("Sandboxed: could not write {path} (blocked or failed): {}", err.trim()),
+                false,
+            )
+        }
+        Err(e) => (format!("Sandboxed write failed: {e}"), false),
+    }
+}
+
+/// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
+/// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
+/// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
+/// kernel enforces the workspace boundary. Reads stay open (the profile allows
+/// reads too).
+pub(crate) fn execute_tool(
+    workspace_path: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    sandbox_roots: Option<&[String]>,
+) -> (String, bool) {
     match name {
         "run_command" => {
             let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            match std::process::Command::new("bash")
-                .arg("-c")
-                .arg(cmd)
+            let _guard;
+            let mut command = if let Some(roots) = sandbox_roots {
+                match crate::orchestrator::sandbox::prepare(
+                    roots,
+                    std::ffi::OsStr::new("bash"),
+                    &["-c".to_string(), cmd.to_string()],
+                ) {
+                    Ok(p) => {
+                        let mut c = std::process::Command::new(&p.program);
+                        c.args(&p.args);
+                        _guard = Some(p.guard);
+                        c
+                    }
+                    Err(e) => {
+                        return (
+                            format!("Sandbox unavailable — refusing to run the command unconfined: {e}"),
+                            false,
+                        );
+                    }
+                }
+            } else {
+                _guard = None;
+                let mut c = std::process::Command::new("bash");
+                c.arg("-c").arg(cmd);
+                c
+            };
+            match command
                 .current_dir(workspace_path)
                 .output()
             {
@@ -501,6 +588,19 @@ pub(crate) fn execute_tool(workspace_path: &Path, name: &str, input: &serde_json
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let full = workspace_path.join(path);
+            if let Some(roots) = sandbox_roots {
+                // Fast lexical pre-check rejects obvious absolute/`..` escapes
+                // without spawning; the authoritative guard is the KERNEL-enforced
+                // write below, which resolves symlinks a lexical check can't (a
+                // hostile repo can commit `link -> $HOME`).
+                if !crate::orchestrator::sandbox::is_write_allowed(&full, roots) {
+                    return (
+                        format!("Sandboxed: refusing to write outside the mission workspace ({path})"),
+                        false,
+                    );
+                }
+                return sandboxed_write(roots, &full, content, path);
+            }
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1053,6 +1153,26 @@ impl ChatEngine {
 
         let workspace_path = std::path::PathBuf::from(&request.workspace_path);
 
+        // Sandbox scope for this turn's in-process tools: Some(write_roots) when
+        // the mission is confined. When set, run_command routes to the
+        // seatbelt-wrapped execute_tool (bypassing the shared shell) and
+        // write_file is confined. A `readonly` mission (review/probe) is
+        // read-only-by-construction → Some(vec![]) (temp-only, no workspace
+        // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
+        let sandbox_roots: Option<Vec<String>> = self
+            .db
+            .lock()
+            .active_mission_for_workspace(&request.workspace_id)
+            .ok()
+            .flatten()
+            .and_then(|m| {
+                crate::orchestrator::sandbox::sandbox_write_roots(
+                    &m.git_isolation,
+                    &m.exec_isolation,
+                    &request.workspace_path,
+                )
+            });
+
         // Register a fresh cancellation flag for this turn, keyed by thread. The
         // guard removes it from the registry on every exit path (Drop).
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1355,6 +1475,8 @@ impl ChatEngine {
                     tracing::warn!(error = %e, "failed to record chat token event");
                 }
             }
+            // Logbook: a completed chat turn is active TALK work on the mission.
+            let _ = self.db.lock().record_activity(&request.workspace_id, "talk", "chat");
 
             tracing::info!(
                 iteration = iteration,
@@ -1578,9 +1700,12 @@ impl ChatEngine {
                         Ok(Ok(Err(e))) => (format!("MCP error: {e}"), false),
                         _ => ("MCP error: tool call timed out".to_string(), false),
                     }
-                } else if u.name == "run_command" && self.talk_shell.available() {
+                } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
                     // Unify with `$`-direct: the agent runs commands in the SAME
                     // persistent shell, so it shares the user's cwd/env. Capture
+                    // (Sandboxed missions skip the shared shell and fall through to
+                    // the seatbelt-wrapped execute_tool below — per-command
+                    // isolation over shared-shell state.)
                     // to completion with a timeout (which `execute_tool` lacked).
                     let command = u
                         .input
@@ -1644,7 +1769,10 @@ impl ChatEngine {
                             let input = u.input.clone();
                             let (out, ok) = match tokio::time::timeout(
                                 std::time::Duration::from_secs(600),
-                                tokio::task::spawn_blocking(move || execute_tool(&wp, &name, &input)),
+                                // This fallback is only reached for a non-sandboxed
+                                // mission (the shared-shell branch is gated on
+                                // sandbox_roots.is_none()), so it runs unconfined.
+                                tokio::task::spawn_blocking(move || execute_tool(&wp, &name, &input, None)),
                             )
                             .await
                             {
@@ -1660,7 +1788,7 @@ impl ChatEngine {
                         }
                     }
                 } else {
-                    execute_tool(&workspace_path, &u.name, &u.input)
+                    execute_tool(&workspace_path, &u.name, &u.input, sandbox_roots.as_deref())
                 };
 
                 // ── Live card: announce completion (timing + status) ──
@@ -1853,25 +1981,110 @@ mod tests {
         let wp = dir.path();
 
         // run_command: success/failure by EXIT CODE, not output text.
-        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "exit 0"}));
+        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "exit 0"}), None);
         assert!(ok, "exit 0 is success");
-        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "exit 3"}));
+        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "exit 3"}), None);
         assert!(!ok, "non-zero exit is failure");
         // A successful command whose stdout merely *contains* 'Error' is still ok.
-        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "echo 'Error: not really'"}));
+        let (_, ok) = execute_tool(wp, "run_command", &serde_json::json!({"command": "echo 'Error: not really'"}), None);
         assert!(ok, "stdout text must not flip the status");
 
         // File ops: ok reflects whether the syscall succeeded.
-        let (_, ok) = execute_tool(wp, "read_file", &serde_json::json!({"path": "missing.txt"}));
+        let (_, ok) = execute_tool(wp, "read_file", &serde_json::json!({"path": "missing.txt"}), None);
         assert!(!ok, "reading a missing file fails");
-        let (_, ok) = execute_tool(wp, "write_file", &serde_json::json!({"path": "a.txt", "content": "hi"}));
+        let (_, ok) = execute_tool(wp, "write_file", &serde_json::json!({"path": "a.txt", "content": "hi"}), None);
         assert!(ok, "writing succeeds");
-        let (_, ok) = execute_tool(wp, "list_files", &serde_json::json!({"path": "."}));
+        let (_, ok) = execute_tool(wp, "list_files", &serde_json::json!({"path": "."}), None);
         assert!(ok, "listing an existing dir succeeds");
 
         // Unknown tool → failure.
-        let (_, ok) = execute_tool(wp, "frobnicate", &serde_json::json!({}));
+        let (_, ok) = execute_tool(wp, "frobnicate", &serde_json::json!({}), None);
         assert!(!ok);
+    }
+
+    #[test]
+    fn sandboxed_write_file_refuses_paths_outside_the_workspace() {
+        // M3.1b: in-process write_file is path-contained when the mission is
+        // sandboxed (the CLI-substrate wrap doesn't cover TALK / API-stage tools).
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let roots = vec![wp.to_string_lossy().into_owned()];
+
+        // Inside the workspace → allowed.
+        let (_, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": "sub/a.txt", "content": "hi"}),
+            Some(&roots),
+        );
+        assert!(ok, "a write inside the workspace is allowed");
+
+        // Absolute-path escape → refused (Path::join discards the base).
+        let (msg, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": "/tmp/octopush-evil.txt", "content": "x"}),
+            Some(&roots),
+        );
+        assert!(!ok, "an absolute path outside the workspace is refused");
+        assert!(msg.contains("refusing to write outside"), "message: {msg}");
+
+        // `..` escape → refused.
+        let (_, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": "../octopush-evil.txt", "content": "x"}),
+            Some(&roots),
+        );
+        assert!(!ok, "a `..` escape is refused");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sandboxed_write_blocks_symlink_traversal_at_the_kernel() {
+        // The exact escape a lexical check can't catch: a pre-existing symlink
+        // inside the workspace pointing at a DENIED location (a hostile repo can
+        // commit `link -> $HOME`). Lexically `link/…` is under the workspace, so
+        // it passes the fast pre-check — the KERNEL-enforced seatbelt write must
+        // still block it. ($HOME root is denied; only ~/.claude/~/.cache are
+        // writable, and a tempdir would be under the allowed $TMPDIR.)
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let roots = vec![wp.to_string_lossy().into_owned()];
+        let home = std::env::var("HOME").unwrap();
+        let marker = format!("octopush-sandbox-escape-{}.txt", std::process::id());
+        std::os::unix::fs::symlink(&home, wp.join("link")).unwrap();
+
+        let (msg, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": format!("link/{marker}"), "content": "x"}),
+            Some(&roots),
+        );
+        let escaped = std::path::Path::new(&home).join(&marker);
+        let existed = escaped.exists();
+        let _ = std::fs::remove_file(&escaped); // best-effort cleanup
+        assert!(!ok, "symlink traversal must be blocked by the kernel: {msg}");
+        assert!(!existed, "nothing may be written outside the workspace ($HOME)");
+    }
+
+    #[test]
+    fn readonly_mission_empty_roots_refuses_every_write_platform_independently() {
+        // A readonly mission (review/probe) resolves to Some(vec![]) write roots.
+        // The lexical pre-check must then refuse EVERY write_file — even one
+        // inside the workspace — before any macOS-only kernel path, so read-only
+        // holds regardless of platform.
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let empty: Vec<String> = vec![];
+        let (msg, ok) = execute_tool(
+            wp,
+            "write_file",
+            &serde_json::json!({"path": "in_workspace.txt", "content": "x"}),
+            Some(&empty),
+        );
+        assert!(!ok, "a readonly mission refuses even an in-workspace write: {msg}");
+        assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
     }
 
     #[test]

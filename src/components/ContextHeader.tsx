@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Copy, Hammer } from "lucide-react";
+import { Copy, Hammer, Shield } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
 import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -65,6 +65,9 @@ interface Props {
   /** The active mission's intent (build/fix/…). Renders a small mute glyph +
    *  label eyebrow above the workspace name; null falls back to "Workspace". */
   missionIntent?: string | null;
+  /** The active mission's execution isolation. `sandbox` adds a mute Shield glyph
+   *  to the intent eyebrow. */
+  missionExecIsolation?: string | null;
 }
 
 export function ContextHeader({
@@ -77,6 +80,7 @@ export function ContextHeader({
   issueTrackerConfigured = false,
   jiraProjectKey = null,
   missionIntent = null,
+  missionExecIsolation = null,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
@@ -173,6 +177,14 @@ export function ContextHeader({
                 >
                   <Icon size={10} aria-hidden />
                   <span>{missionIntent}</span>
+                  {missionExecIsolation === "sandbox" && (
+                    <span
+                      title="Sandboxed execution — this mission's agents run write-confined to the workspace"
+                      className="flex items-center"
+                    >
+                      <Shield size={10} aria-hidden />
+                    </span>
+                  )}
                 </div>
               );
             })()
