@@ -57,14 +57,30 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
     v
 }
 
+/// A short, stable hex scope key for a string (e.g. a workspace path) — used to
+/// give each mission its OWN cache subtree so one sandboxed mission can't poison
+/// the cache another later compiles.
+fn scope_key(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Env vars that redirect common build toolchains' WRITE caches into a confined
-/// per-run subtree of `$TMPDIR` (already an allowed write root), so a sandboxed
-/// `npm install`/`cargo build` works WITHOUT exposing the user's real `~/.cargo`
-/// etc. Read-only global installs (toolchains, tool binaries on PATH) still work
-/// — reads are open; only writes are redirected. Applied by the CLI substrate
-/// and TALK's sandboxed `run_command`. Pure over `tmpdir`.
-pub fn sandbox_cache_env(tmpdir: &str) -> Vec<(String, String)> {
-    let base = format!("{}/octopush-build-cache", tmpdir.trim_end_matches('/'));
+/// **per-mission** subtree of `$TMPDIR` (already an allowed write root), so a
+/// sandboxed `npm install`/`cargo build` works WITHOUT exposing the user's real
+/// `~/.cargo` etc. AND without two sandboxed missions sharing (and poisoning)
+/// one cache — `scope` (the workspace path) keys the subtree. Read-only global
+/// installs (toolchains, tool binaries on PATH) still work — reads are open;
+/// only writes are redirected. Applied by the CLI substrate and TALK's sandboxed
+/// `run_command`. Pure over its inputs.
+pub fn sandbox_cache_env(tmpdir: &str, scope: &str) -> Vec<(String, String)> {
+    let base = format!(
+        "{}/octopush-build-cache/{}",
+        tmpdir.trim_end_matches('/'),
+        scope_key(scope)
+    );
     vec![
         ("CARGO_HOME".into(), format!("{base}/cargo")), // rust: registry/git/config/bin (fresh, confined)
         ("npm_config_cache".into(), format!("{base}/npm")),
@@ -328,15 +344,20 @@ mod tests {
     #[test]
     fn sandbox_cache_env_redirects_into_the_confined_temp() {
         let env: std::collections::HashMap<String, String> =
-            sandbox_cache_env("/tmp/session").into_iter().collect();
+            sandbox_cache_env("/tmp/session", "/ws-a").into_iter().collect();
         // Every redirect points under the confined temp, never at ~.
         for (k, v) in &env {
-            assert!(v.starts_with("/tmp/session/octopush-build-cache"), "{k}={v} escaped temp");
+            assert!(v.starts_with("/tmp/session/octopush-build-cache/"), "{k}={v} escaped temp");
         }
-        assert_eq!(env.get("CARGO_HOME").map(String::as_str), Some("/tmp/session/octopush-build-cache/cargo"));
+        assert!(env.get("CARGO_HOME").unwrap().ends_with("/cargo"));
         assert!(env.contains_key("npm_config_cache"));
         assert!(env.contains_key("GOPATH"));
         assert!(env.contains_key("GRADLE_USER_HOME"));
+        // Per-mission isolation: a DIFFERENT workspace gets a DIFFERENT cache
+        // subtree, so one sandboxed mission can't poison another's build cache.
+        let other: std::collections::HashMap<String, String> =
+            sandbox_cache_env("/tmp/session", "/ws-b").into_iter().collect();
+        assert_ne!(env.get("CARGO_HOME"), other.get("CARGO_HOME"));
     }
 
     #[test]

@@ -544,7 +544,8 @@ pub(crate) fn execute_tool(
             // ~/.cargo etc. (which the profile no longer exposes).
             if sandbox_roots.is_some() {
                 if let Ok(tmp) = std::env::var("TMPDIR") {
-                    for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp) {
+                    let scope = workspace_path.to_string_lossy();
+                    for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
                         command.env(k, v);
                     }
                 }

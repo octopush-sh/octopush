@@ -357,7 +357,8 @@ impl AgentRunner for CliRunner {
         // any cache vars the login shell set.
         if _profile_guard.is_some() {
             if let Ok(tmp) = std::env::var("TMPDIR") {
-                for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp) {
+                let scope = ctx.workspace_path.to_string_lossy();
+                for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
                     command.env(k, v);
                 }
             }
