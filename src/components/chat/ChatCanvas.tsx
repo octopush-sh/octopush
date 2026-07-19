@@ -6,7 +6,7 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
-import { OctoMark } from "../icons/OctoMark";
+import { OctoWatcher } from "./OctoWatcher";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -154,7 +154,7 @@ export function ChatCanvas({
       className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 pt-6 pb-[118px]"
     >
       {isEmpty ? (
-        <EmptyState />
+        <EmptyState areaRef={scrollRef} />
       ) : (
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
           {timeline.map((item) => {
@@ -423,10 +423,10 @@ function RowAction({
   );
 }
 
-function EmptyState() {
+function EmptyState({ areaRef }: { areaRef: React.RefObject<HTMLDivElement | null> }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
-      <OctoMark size={28} state="idle" className="opacity-80" />
+      <OctoWatcher size={72} areaRef={areaRef} />
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-mute">
         Talk
       </div>
