@@ -3241,6 +3241,7 @@ impl Db {
         // carries per-stage instructions the simple `defs` shape can't express,
         // so it seeds separately (still idempotent on the builtin name).
         self.seed_greenfield_pipeline()?;
+        self.seed_perf_probe_pipeline()?;
 
         // Backfill: existing installs seeded the builtins before loop config existed.
         // Set the gated default on builtin review stages that are still linear. The
@@ -3337,6 +3338,73 @@ impl Db {
                      custom_name, instructions)
                  VALUES (?1,?2,?3,?4,?5,'api',?6,?7,?8,?9,25,?10,?11)",
                 params![id, pid, i as i64, role, model, *checkpoint as i64, lt, lm, lmode, custom_name, instructions],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Seed the "Perf probe" builtin — the crew a `perf` (Chase a regression)
+    /// mission stages: a READ-ONLY investigation of what got slow. Idempotent
+    /// (keyed on the name). Every stage is api + carries authored instructions;
+    /// nothing writes code (the mission is readonly, so the sandbox enforces it —
+    /// the crew reads, measures with existing tooling, and reports its findings as
+    /// the stage artifact, never a file it can't write).
+    fn seed_perf_probe_pipeline(&self) -> AppResult<()> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pipelines WHERE name = ?1 AND is_builtin = 1",
+            params!["Perf probe"],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Ok(());
+        }
+        let pid = self.insert_pipeline(
+            "Perf probe",
+            "Read-only: profile the code and find what regressed.",
+            true,
+        )?;
+        // The `critique` role is read-only-oriented ("verify claims with your
+        // tools"); we override the per-stage tool allowlist so the measure/find
+        // stages can RUN profilers (`run_command`) while the report stage stays
+        // read-only. (The mission is readonly regardless — the sandbox blocks any
+        // write — but a tight allowlist keeps the agent from even trying.)
+        let profile_tools = r#"["read_file","list_files","run_command"]"#;
+        let read_tools = r#"["read_file","list_files"]"#;
+        // (custom_name, checkpoint, instructions, tools_json)
+        let stages: &[(&str, bool, &str, &str)] = &[
+            (
+                "Measure", false,
+                "This is a READ-ONLY performance investigation — you cannot modify the code. Read the \
+                 brief, then MEASURE: identify the hot path(s) with the tooling available (existing \
+                 benchmarks, `time`, a profiler, reading the code's complexity). State what you measured \
+                 and the numbers. Do NOT propose a fix yet.",
+                profile_tools,
+            ),
+            (
+                "Find the regression", false,
+                "From the measurements, IDENTIFY what got slow and WHY — the specific function, query, \
+                 allocation, or algorithm, with the evidence (the code + the numbers). Compare against \
+                 git history if it helps pinpoint the change that introduced it. Read-only: no edits.",
+                profile_tools,
+            ),
+            (
+                "Report", true,
+                "Write the findings as your final answer (the stage artifact — you can't write files in a \
+                 read-only mission): the regression, the evidence, and a RECOMMENDED fix described in \
+                 words (not applied). End with the honest boundary — what you could and could NOT measure \
+                 in this environment. To actually apply the fix, the director starts a `fix` mission.",
+                read_tools,
+            ),
+        ];
+        for (i, (custom_name, checkpoint, instructions, tools)) in stages.iter().enumerate() {
+            let id = Uuid::new_v4().to_string();
+            self.conn.execute(
+                "INSERT INTO pipeline_stages
+                    (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
+                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
+                     custom_name, instructions, tools)
+                 VALUES (?1,?2,?3,'critique','claude-sonnet-4-6','api',?4,NULL,0,NULL,25,?5,?6,?7)",
+                params![id, pid, i as i64, *checkpoint as i64, custom_name, instructions, tools],
             )?;
         }
         Ok(())

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Hammer, Wrench, Eye, FlaskConical, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Hammer, Wrench, Eye, FlaskConical, Gauge, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
@@ -27,12 +27,13 @@ type Step = 1 | 2 | 3;
 /** Code intents (build/fix) write to a worktree; non-code intents (review/probe)
  *  are read-only-by-construction — their agents read the checkout but can't
  *  modify it (a `readonly` git-isolation enforced by the seatbelt sandbox). */
-type Intent = "build" | "fix" | "review" | "probe";
+type Intent = "build" | "fix" | "review" | "probe" | "perf";
 /** Intents that don't write code — the wizard forces `readonly` git isolation
- *  and hides the writer isolation controls for them. */
-const READONLY_INTENTS: Intent[] = ["review", "probe"];
-/** Card order for keyboard navigation (2×2 grid). */
-const INTENT_ORDER: Intent[] = ["build", "fix", "review", "probe"];
+ *  and hides the writer isolation controls for them. `perf` is a specialized
+ *  read-only probe (chase a regression). */
+const READONLY_INTENTS: Intent[] = ["review", "probe", "perf"];
+/** Card order for keyboard navigation. */
+const INTENT_ORDER: Intent[] = ["build", "fix", "review", "probe", "perf"];
 /** The manual git-isolation choices. `pr` is derived (picking a PR), never a
  *  Listbox option — one state, two entry points. */
 type GitIsolation = "worktree" | "ephemeral";
@@ -83,6 +84,7 @@ const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: strin
   fix: { icon: Wrench, title: "Fix something broken", desc: "A bug, a regression, a rough edge." },
   review: { icon: Eye, title: "Review the work", desc: "Read the code, judge it — never touch it." },
   probe: { icon: FlaskConical, title: "Probe a question", desc: "Investigate, read-only. No changes." },
+  perf: { icon: Gauge, title: "Chase a regression", desc: "Profile & find what got slow. Read-only." },
 };
 
 export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
@@ -177,7 +179,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     if (step !== 1) return;
     function onKey(e: KeyboardEvent) {
       const idx = INTENT_ORDER.indexOf(intent);
-      if (/^[1-4]$/.test(e.key)) {
+      if (/^[1-5]$/.test(e.key)) {
         const picked = INTENT_ORDER[parseInt(e.key, 10) - 1];
         if (picked) { setIntent(picked); setStep(2); }
       } else if (e.key === "ArrowLeft") {
