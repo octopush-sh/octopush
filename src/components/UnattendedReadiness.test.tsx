@@ -74,7 +74,25 @@ describe("UnattendedReadiness", () => {
     setEntitled(["runs.detached"]);
     useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("sandbox") } });
     render(<UnattendedReadiness workspaceId="w1" />);
-    expect(screen.getByText(/sandboxed/i)).toBeInTheDocument();
+    expect(screen.getByText(/^sandboxed$/i)).toBeInTheDocument();
     expect(screen.queryByText(/sandbox it/i)).not.toBeInTheDocument();
+  });
+
+  it("a FREE user still gets the sandbox toggle (sandbox is free) alongside the Pro chip", () => {
+    setEntitled([]);
+    useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("none") } });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    expect(screen.getByText(/Unattended · Pro/i)).toBeInTheDocument();
+    expect(screen.getByText(/sandbox it/i)).toBeInTheDocument(); // sandbox is not gated
+  });
+
+  it("a sandboxed mission can be turned OFF (the escape valve for a build that needs to write out)", async () => {
+    setEntitled([]);
+    useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("sandbox") } });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    fireEvent.click(screen.getByText(/^sandboxed$/i));
+    await waitFor(() =>
+      expect(updateMissionMock).toHaveBeenCalledWith("m1", null, null, null, "none"),
+    );
   });
 });

@@ -596,6 +596,16 @@ pub async fn create_project(
     // (the heuristic slug is anonymous; the built thing knows what it is).
     if let Some(t) = task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         let _ = db.meta_set(&format!("genesis_prompt:{id}"), t);
+        // Genesis runs SANDBOXED by default (B3): a brand-new project built by a
+        // crew you're not watching should be write-confined. The build-capable
+        // seatbelt profile covers common toolchains; if a stack needs something
+        // outside it the failure is legible and the sandbox is a one-click toggle
+        // in the launcher. Sets it on the main workspace's just-paired mission.
+        if let Some(m) = db.active_mission_for_workspace(
+            db.list_workspaces(&id)?.first().map(|w| w.id.as_str()).unwrap_or(""),
+        )? {
+            let _ = db.update_mission_exec_isolation(&m.id, "sandbox");
+        }
     }
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
 }

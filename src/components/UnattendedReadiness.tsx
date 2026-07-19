@@ -6,10 +6,14 @@ import { useUpgradeStore } from "../stores/upgradeStore";
 import { pushToast } from "./Toasts";
 
 /**
- * The unattended-readiness affordance in the Direct launcher foot. A detached
- * crew (one that survives app quit) is a Pro capability: Free sees a locked chip
- * that opens the upsell; Pro sees that the crew runs unattended plus a one-click
- * to sandbox the mission — unattended crews run best write-confined.
+ * The unattended-readiness + sandbox affordance in the Direct launcher foot.
+ * Two independent pieces:
+ *  - **Sandbox** (FREE, everyone) — a Shield toggle to confine / un-confine the
+ *    mission's writes. Always available (security is never gated), so a genesis
+ *    project sandboxed by default can be turned OFF here if a build needs to
+ *    write outside the workspace.
+ *  - **Unattended** (Pro) — Free sees a locked chip → the `runs.detached` upsell;
+ *    Pro sees "Runs unattended" (the crew survives app quit).
  */
 export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
   const { hasFeature } = useEntitlement();
@@ -21,33 +25,20 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
   const setExecIsolation = useMissionsStore((s) => s.setExecIsolation);
   const [enabling, setEnabling] = useState(false);
 
-  if (!detached) {
-    return (
-      <button
-        type="button"
-        onClick={() => showUpgrade({ feature: "runs.detached", used: 0, limit: 0 })}
-        title="Run crews unattended — they keep going even if you quit Octopush (Pro)"
-        className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-      >
-        <Lock size={11} aria-hidden />
-        Unattended · Pro
-      </button>
-    );
-  }
-
   const sandboxed = execIso === "sandbox";
-  const enableSandbox = async () => {
+  const toggleSandbox = async () => {
     if (!missionId || enabling) return;
+    const next = sandboxed ? "none" : "sandbox";
     setEnabling(true);
     try {
-      await setExecIsolation(missionId, "sandbox");
-      pushToast({
-        level: "success",
-        title: "Sandbox enabled",
-        body: "Agent writes are now confined to the workspace.",
-      });
+      await setExecIsolation(missionId, next);
+      pushToast(
+        next === "sandbox"
+          ? { level: "success", title: "Sandbox enabled", body: "Agent writes are now confined to the workspace." }
+          : { level: "info", title: "Sandbox off", body: "This mission's agents run with your normal permissions." },
+      );
     } catch (e) {
-      pushToast({ level: "error", title: "Couldn't enable sandbox", body: String(e).split("\n")[0] });
+      pushToast({ level: "error", title: "Couldn't change the sandbox", body: String(e).split("\n")[0] });
     } finally {
       setEnabling(false);
     }
@@ -55,13 +46,29 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div className="flex h-8 shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-[0.2em]">
-      <span
-        className="flex items-center gap-1.5 text-octo-mute"
-        title="This crew keeps going even if you quit Octopush"
-      >
-        <Moon size={11} aria-hidden />
-        Runs unattended
-      </span>
+      {/* Unattended (Pro) — the detach framing. */}
+      {detached ? (
+        <span
+          className="flex items-center gap-1.5 text-octo-mute"
+          title="This crew keeps going even if you quit Octopush"
+        >
+          <Moon size={11} aria-hidden />
+          Runs unattended
+        </span>
+      ) : (
+        <button
+          type="button"
+          onClick={() => showUpgrade({ feature: "runs.detached", used: 0, limit: 0 })}
+          title="Run crews unattended — they keep going even if you quit Octopush (Pro)"
+          className="flex items-center gap-1.5 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          <Lock size={11} aria-hidden />
+          Unattended · Pro
+        </button>
+      )}
+
+      {/* Sandbox (FREE, everyone) — read-only missions are confined by
+          construction; others get a toggle. */}
       {gitIso === "readonly" ? (
         <span
           className="flex items-center gap-1 text-octo-verdigris"
@@ -70,24 +77,22 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
           <Shield size={11} aria-hidden />
           read-only
         </span>
-      ) : sandboxed ? (
-        <span
-          className="flex items-center gap-1 text-octo-verdigris"
-          title="Sandboxed — the agent's writes are confined to the workspace"
-        >
-          <Shield size={11} aria-hidden />
-          sandboxed
-        </span>
       ) : missionId ? (
         <button
           type="button"
-          onClick={() => void enableSandbox()}
+          onClick={() => void toggleSandbox()}
           disabled={enabling}
-          title="Unattended crews run best sandboxed — confine the agent's writes to this workspace. Free."
-          className="flex items-center gap-1 text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
+          title={
+            sandboxed
+              ? "Sandboxed — the agent's writes are confined to the workspace. Click to turn off (e.g. if a build needs to write outside it)."
+              : "Sandbox this mission — confine the agent's writes to the workspace. Free."
+          }
+          className={`flex items-center gap-1 transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50 ${
+            sandboxed ? "text-octo-verdigris hover:text-octo-brass" : "text-octo-brass hover:text-octo-brass-hi"
+          }`}
         >
           <Shield size={11} aria-hidden />
-          {enabling ? "enabling…" : "sandbox it"}
+          {enabling ? "…" : sandboxed ? "sandboxed" : "sandbox it"}
         </button>
       ) : null}
     </div>

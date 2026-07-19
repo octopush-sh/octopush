@@ -46,9 +46,41 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
         // The CLI's own session + generic tool caches — needed for it to run.
         v.push(format!("{h}/.claude"));
         v.push(format!("{h}/.cache"));
+        // Package-manager caches: a sandboxed BUILD mission legitimately runs
+        // npm/cargo/go/… which write outside the workspace to a shared cache;
+        // without these a `npm install` fails opaquely under the sandbox. A
+        // CURATED list of well-known, NON-credential cache dirs (never ~/.ssh,
+        // ~/.aws, ~/.config, ~/.netrc — those stay read-only). Covers the common
+        // stacks; an exotic stack that writes elsewhere surfaces a legible
+        // write-denied error (the sandbox never degrades silently).
+        for dir in PACKAGE_MANAGER_CACHE_DIRS {
+            v.push(format!("{h}/{dir}"));
+        }
     }
     v
 }
+
+/// Home-relative cache dirs common build toolchains write to (node, rust, go,
+/// python, jvm, ruby, deno/bun, swiftpm). Curated + non-credential — see
+/// `system_write_roots`.
+const PACKAGE_MANAGER_CACHE_DIRS: &[&str] = &[
+    ".npm",                                 // node/npm
+    ".yarn",                                // yarn
+    ".pnpm-store",                          // pnpm
+    ".bun",                                 // bun
+    ".cargo",                               // rust crates
+    ".rustup",                              // rust toolchains
+    "go",                                   // GOPATH default (module + build cache)
+    ".gradle",                              // gradle
+    ".m2",                                  // maven
+    ".gem",                                 // ruby gems
+    ".bundle",                              // bundler config/cache
+    ".deno",                                // deno
+    ".nuget",                               // .NET
+    ".cocoapods",                           // iOS CocoaPods spec repo
+    "Library/Caches/org.swift.swiftpm",     // SwiftPM (macOS)
+    "Library/org.swift.swiftpm",            // SwiftPM security-scoped (macOS)
+];
 
 /// Writable individual *files* (as opposed to subtrees). Seatbelt's `subpath`
 /// won't cover a bare file sibling of an allowed dir, so the CLI's top-level
@@ -263,11 +295,17 @@ mod tests {
         assert!(roots.contains(&"/home/u/.claude".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
         assert!(roots.contains(&"/dev".to_string()));
-        // Sensitive/credential home dirs and the home root itself stay read-only,
-        // and we no longer blanket-allow every app's temp under /var/folders.
+        // Package-manager caches ARE writable (a build mission needs them)…
+        assert!(roots.contains(&"/home/u/.npm".to_string()));
+        assert!(roots.contains(&"/home/u/.cargo".to_string()));
+        // …but sensitive/credential home dirs and the home root itself stay
+        // read-only, and we don't blanket-allow every app's temp under
+        // /var/folders or the whole ~/Library/Caches or ~/.config.
         assert!(!roots.iter().any(|r| {
             r == "/home/u/.ssh"
+                || r == "/home/u/.aws"
                 || r == "/home/u/.config"
+                || r == "/home/u/Library/Caches"
                 || r == "/home/u"
                 || r == "/var/folders"
                 || r == "/private/var/folders"
