@@ -49,18 +49,21 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();          // tool name
     expect(screen.getByText("src/auth.rs")).toBeInTheDocument();   // hint
     expect(screen.getByText(/142 lines/)).toBeInTheDocument();     // result detail
-    expect(screen.getByText(/reviewing…/)).toBeInTheDocument();    // running pulse (role verb for code_review)
+    // The old role-verb pulse is retired — the pinned Player narrates instead
+    // (last entry is a settled tool_result → back to thought).
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
-  it("shows the running indicator even when there are no entries yet", () => {
+  it("shows the pinned Player even when there are no entries yet", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    expect(screen.getByText(/reviewing…/)).toBeInTheDocument();
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
   });
 
-  it("shows the role verb while running", () => {
-    render(<StageFocus stage={{ ...baseStage, role: "plan" }} workspacePath="/tmp" />);
-    expect(screen.getByText("planning…")).toBeInTheDocument();
+  it("narrates the live tool in the pinned Player while running", () => {
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Grep", hint: "" }] } });
+    render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
+    expect(screen.getByText("Searching…")).toBeInTheDocument();
   });
 
   it("renders a designed error banner plus the journal at full opacity on failure", () => {

@@ -9,6 +9,7 @@ import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
+import { StageOctoStatus } from "./direct/StageOctoStatus";
 import { IconButton } from "./controls/IconButton";
 import { TogglePill } from "./controls/TogglePill";
 import { Stepper } from "./controls/Stepper";
@@ -17,12 +18,6 @@ import { ModelPicker } from "./ModelPicker";
 import { ModalShell } from "./ModalShell";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
-
-const ROLE_VERBS: Record<string, string> = {
-  plan: "planning…", plan_review: "reviewing…", implement: "implementing…",
-  code_review: "reviewing…", test: "testing…", repro: "reproducing…",
-  fix: "fixing…", verify: "verifying…", critique: "critiquing…", refine: "refining…",
-};
 
 interface ParsedArtifact {
   kind: string;
@@ -335,6 +330,22 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     [viewedRow, logSegments, attemptN],
   );
 
+  // Player visibility with a linger (same contract as ChatCanvas): the pinned
+  // figure stays mounted ~640ms for its beat+fade exit, so the wash and the
+  // journal's bottom padding must track that window, not the raw status.
+  const playerOn =
+    viewedRow == null &&
+    (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
+  const [playerVisible, setPlayerVisible] = useState(playerOn);
+  useEffect(() => {
+    if (playerOn) {
+      setPlayerVisible(true);
+      return;
+    }
+    const t = setTimeout(() => setPlayerVisible(false), 700);
+    return () => clearTimeout(t);
+  }, [playerOn]);
+
   if (!stage) {
     return (
       <div className="flex flex-1 items-center justify-center font-serif text-sm text-octo-mute">
@@ -462,9 +473,12 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
           {directorError}
         </div>
       )}
+      <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={scrollRef}
-        className="chat-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
+        className={`chat-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 pt-3 font-mono text-[12px] leading-relaxed text-octo-sage ${
+          playerVisible ? "pb-[96px]" : "pb-3"
+        }`}
       >
         <FadeSwap swapKey={swapKey} className="flex flex-col gap-2">
           {viewedRow ? (
@@ -544,19 +558,28 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
             </>
           ) : mode === "running" ? (
-            <>
-              {journal}
-              <div className="flex items-center gap-2 font-mono text-[11px] text-octo-brass">
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-octo-brass" />
-                <span>{ROLE_VERBS[stage.role] ?? "working…"}</span>
-              </div>
-            </>
+            /* The scroll-away running marker (brass dot + role verb) retired —
+               the pinned Player below narrates the live work instead. */
+            <>{journal}</>
           ) : journal.length > 0 ? (
             <div className="flex flex-col gap-2">{journal}</div>
           ) : (
             <span className="text-octo-mute">Nothing produced yet.</span>
           )}
         </FadeSwap>
+      </div>
+      {/* Bottom exit wash — keeps the pinned Player legible over the journal
+          while it's on stage (a surface, not a line; design-system §3). */}
+      {playerVisible && (
+        <div
+          aria-hidden
+          className="octo-fade-in pointer-events-none absolute inset-x-0 bottom-0 h-[88px]"
+          style={{ background: "linear-gradient(transparent, var(--color-octo-bg) 76%)" }}
+        />
+      )}
+      {/* The Player — narrates the focused stage (spec 2026-07-19 §4,
+          extended to DIRECT). Hidden while viewing an archived attempt. */}
+      {viewedRow == null && <StageOctoStatus stage={stage} entries={liveEntries} />}
       </div>
     </div>
     {editOpen && (

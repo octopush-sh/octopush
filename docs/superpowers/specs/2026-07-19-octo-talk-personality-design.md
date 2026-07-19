@@ -61,11 +61,25 @@ Unknown tools fall back to **Working…** with the Thinking body. Tool→role ma
 
 **New CSS** (styles.css, mascot section): keyframes `octo-m-typy`, `octo-m-readline`, `octo-m-darty` + role classes `octo-mascot--write/read/search/run` (think = existing working; wait = existing blocked). All inside the existing reduced-motion regime; amplitudes ≤ 2.4 units.
 
-## 5. Out of scope
+## 5. Scope amendment (2026-07-19, pre-merge): the Player in DIRECT
 
-Top-bar mascot, Direct/Run surfaces, Welcome watcher (the welcome Octo stays plain idle), sounds, and any journal re-layout beyond bottom padding + wash.
+Director's call during PR review: the same scroll-away problem exists in DIRECT's
+work journal, so the Player applies there too. The phase machine + figure are
+extracted to a shared `OctoPlayer` (`src/components/OctoPlayer.tsx`; props
+`identity/active/role/skipBeat`); TALK's `OctoStatus` and DIRECT's
+`StageOctoStatus` (`src/components/direct/`) are thin adapters. DIRECT mapping
+(`roleForStage(entries, status)`): `awaiting_checkpoint` → Waiting for you;
+newest live-journal entry — `tool` → its family, `text` → Writing…, else
+Thinking…; `done` → ✓ beat, `failed` → quiet exit; identity = stage id;
+hidden while viewing archived attempts. StageFocus retires its static
+brass-dot + role-verb running marker (the Player narrates instead) and gains
+the same wash/padding/linger treatment as ChatCanvas.
 
-## 6. Docs & tests
+## 6. Out of scope
+
+Top-bar mascot, RUN-mode terminals, Welcome watcher (the welcome Octo stays plain idle), sounds, and any journal re-layout beyond bottom padding + wash.
+
+## 7. Docs & tests
 
 - `docs/FEATURES.md`: update Talk empty state entry (Watcher), replace the "Thinking… indicator" entry with the pinned Player (roles table), note removal of the Generating marker.
 - `docs/design-system.md` mascot section: add the Watcher and the role repertoire.
