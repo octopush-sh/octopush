@@ -4825,6 +4825,14 @@ pub async fn ai_complete(
     workspace_id: Option<String>,
     json_schema: Option<serde_json::Value>,
 ) -> AppResult<AiCompleteResult> {
+    // Phase 3 — backend budget enforcement. AI review / conflict / commit-draft
+    // go through this primitive and were previously ungated; block the spend up
+    // front when a configured budget is already at/over its limit.
+    if let crate::db::BudgetVerdict::Block { scope, spent, limit } =
+        state.db.lock().check_budget(workspace_id.as_deref())?
+    {
+        return Err(AppError::BudgetExceeded { scope, spent, limit });
+    }
     let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&model)?;
     let req = build_ai_request(&model, system, prompt, max_tokens.unwrap_or(8192), json_schema);
     let client = crate::chat_engine::shared_http_client();

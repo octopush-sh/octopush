@@ -741,7 +741,9 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### Budgets (dollar-based, scoped, enforced)
 - **`BudgetRow` schema** — `{scope_type, scope_id, period, limit_usd}` keyed unique on (scope, id, period). Scopes: `global`/`workspace`/`project`; periods: `daily`/`monthly`. _Support:_ `db.rs`; `list_budgets`/`set_budget`/`clear_budget`.
-- **`period_spend`** — Sums `cost_usd` + tokens since start of day/month UTC per scope. _Support:_ `db.rs`; `current_spend`.
+- **`period_spend`** — Sums `cost_usd` + tokens since start of the day/month in the user's **local** timezone (F13: budgets reset at local midnight, not 00:00 UTC) per scope. _Support:_ `db.rs` (`period_since_utc`); `current_spend`.
+- **`check_budget` (backend gate)** — Given a workspace, checks global + its project + workspace budgets × daily/monthly against `period_spend`; returns the first breached scope or `Allow`. The single backend enforcement primitive. _Support:_ `db.rs::check_budget`, `BudgetVerdict`.
+- **Backend budget enforcement (REVIEW)** — `ai_complete` (AI review / conflict / commit-draft — previously ungated) blocks up front via `check_budget`, returning `AppError::BudgetExceeded` (`kind == "BudgetExceeded"`, with scope/spent/limit). _Support:_ `commands.rs::ai_complete`, `error.rs`.
 - **Budgets store** — Caches spend per `scope:id:period`, tracks `notifiedThresholds`, `overrideActive`. _Support:_ `budgetsStore.ts`.
 - **Hard-cap enforcement** — Before a TALK send, `isOverBudget("workspace") || isOverBudget("global")` blocks with `BUDGET_CAP_MSG`; a one-shot per-turn Override. _Support:_ `chatStore`, `budgetsStore`.
 - **Threshold warning toasts (50/80/100%)** — On each finished stream, fires once per (scope:period:threshold). _Support:_ `App.tsx`.
@@ -768,7 +770,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **Two protocols, not N vendors** — Adding any vendor/gateway means choosing `anthropic` or `openai-compatible`; no per-vendor code.
 - **Two stores split** — providers.json (catalog incl. pricing/context) vs settings.json (`providerKeys`, `providerBaseUrls`, `last_pricing_refresh`). Keys never leave the device except in requests to providers.
 - **Token-event schema** — one canonical `spend_events` ledger holds **all** surfaces (TALK/RUN/REVIEW/DIRECT) with explicit `surface` + denormalized project/workspace attribution + `source_id` + idempotency; the `all_spend` view reads it (projecting `session_id = COALESCE(workspace_id, source_id)`), and project-scope budgets/savings join `all_spend → workspaces`. The old `token_events` table is retired to read-only history (migrated in via a one-shot backfill).
-- **Budget enforcement has three points** — pre-send hard gate, one-shot override, post-turn threshold toasts. Two budget systems coexist: dollar-scoped budgets (the live UX) and a legacy per-session token budget (the token "remaining" gauge).
+- **Budget enforcement points** — TALK's pre-send client gate + one-shot override + post-turn threshold toasts, DIRECT's between-stage run-budget park, and the backend `check_budget` gate on REVIEW/`ai_complete` (Phase 3; DIRECT's own-budget consult of global/project + TALK's per-iteration backend gate + backend override grants are the next Phase 3 slice). Two budget systems coexist: dollar-scoped budgets (the live UX) and a legacy per-session token budget (the token "remaining" gauge).
 - **PTY token scraping is best-effort and fragile by design** — the authoritative path is API usage recorded by `chat_engine`/`ai_complete`.
 
 ---

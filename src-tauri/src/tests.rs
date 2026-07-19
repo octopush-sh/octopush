@@ -3554,6 +3554,73 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn check_budget_blocks_only_when_over_a_configured_limit() {
+        // Phase 3 backend gate: blocks only when a *configured* budget is at/over
+        // its limit; no budget → always allow.
+        use crate::db::BudgetVerdict;
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let spend = |cost: f64| crate::token_engine::TokenEvent {
+            id: None,
+            session_id: ws.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-5".into(),
+            cost_usd: cost,
+        };
+
+        // No budgets configured → allow.
+        assert_eq!(db.check_budget(Some(&ws)).unwrap(), BudgetVerdict::Allow);
+
+        db.upsert_budget("global", "", "daily", 1.0).unwrap();
+        db.record_token_spend(&spend(0.50), "talk").unwrap();
+        // $0.50 of $1 → still under.
+        assert_eq!(db.check_budget(Some(&ws)).unwrap(), BudgetVerdict::Allow);
+
+        db.record_token_spend(&spend(0.60), "talk").unwrap();
+        // $1.10 ≥ $1 → blocked, naming the breached scope.
+        match db.check_budget(Some(&ws)).unwrap() {
+            BudgetVerdict::Block { scope, spent, limit } => {
+                assert!(scope.contains("global"));
+                assert!(spent >= 1.0 && (limit - 1.0).abs() < 1e-9);
+            }
+            BudgetVerdict::Allow => panic!("expected a block at $1.10 vs $1 limit"),
+        }
+    }
+
+    #[test]
+    fn retired_reconcile_fills_gap_without_double_counting() {
+        // Residual Phase 2: a run whose retire-inclusive meter exceeds the DIRECT
+        // spend already captured for its stages gets ONE reconciliation row for
+        // the gap — and re-running is a no-op (no double count).
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "api", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        // One live-captured completion.
+        db.complete_run_stage(&stage, "done", 1000, 500, 0.30, None).unwrap();
+        // Simulate retired/looped history: the run meter is higher than captured.
+        db.set_run_cost(&run, 0.50, 0.50).unwrap();
+
+        assert!((db.token_report(None).unwrap().total_cost_usd - 0.30).abs() < 1e-9);
+
+        db.reconcile_retired_direct_spend().unwrap();
+        assert!(
+            (db.token_report(None).unwrap().total_cost_usd - 0.50).abs() < 1e-9,
+            "gap filled → Usage matches the run meter"
+        );
+        // Idempotent.
+        db.reconcile_retired_direct_spend().unwrap();
+        assert!((db.token_report(None).unwrap().total_cost_usd - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
     fn record_attributes_by_surface_not_overloaded_session_id() {
         // F14: record() now writes the canonical ledger with an explicit surface
         // and namespace-derived attribution. TALK spend keyed by a workspace id is

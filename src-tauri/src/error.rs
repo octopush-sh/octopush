@@ -117,6 +117,16 @@ pub enum AppError {
         used: u32,
         limit: u32,
     },
+
+    /// Returned when a backend budget gate blocks a spend (Phase 3 enforcement).
+    /// The frontend detects `kind == "BudgetExceeded"` to surface the budget UI /
+    /// override affordance. `scope` is a human string like "workspace daily".
+    #[error("budget exceeded: {scope} — spent ${spent:.2} of ${limit:.2}")]
+    BudgetExceeded {
+        scope: String,
+        spent: f64,
+        limit: f64,
+    },
 }
 
 impl From<anyhow::Error> for AppError {
@@ -166,6 +176,14 @@ impl Serialize for AppError {
                 map.serialize_entry("kind", "UpgradeRequired")?;
                 map.serialize_entry("feature", feature)?;
                 map.serialize_entry("used", used)?;
+                map.serialize_entry("limit", limit)?;
+                map.end()
+            }
+            AppError::BudgetExceeded { scope, spent, limit } => {
+                let mut map = ser.serialize_map(Some(4))?;
+                map.serialize_entry("kind", "BudgetExceeded")?;
+                map.serialize_entry("scope", scope)?;
+                map.serialize_entry("spent", spent)?;
                 map.serialize_entry("limit", limit)?;
                 map.end()
             }
