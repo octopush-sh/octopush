@@ -255,6 +255,9 @@ export interface PtyForegroundEvent {
 export interface ChatThread {
   id: string;
   workspaceId: string;
+  /** The mission this thread belongs to, stamped when the thread is created.
+   *  Null when the workspace had no mission at creation time. */
+  missionId?: string | null;
   title: string;
   createdAt: string;
   updatedAt: string;

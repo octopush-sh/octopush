@@ -8920,6 +8920,39 @@ mod mission_tests {
     }
 
     #[test]
+    fn new_thread_stamps_the_active_mission() {
+        // M4b.1: a thread created after the one-shot backfill must still carry
+        // its workspace's active mission — the live path was silently dropping it.
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "Fix the header");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let m = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+
+        let t = db.create_chat_thread("w1", "New conversation").unwrap();
+        assert_eq!(
+            t.mission_id.as_deref(),
+            Some(m.id.as_str()),
+            "create_chat_thread must stamp the active mission at birth"
+        );
+        // …and the read path surfaces it, not just the write path.
+        let listed = db.list_chat_threads("w1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].mission_id.as_deref(), Some(m.id.as_str()));
+    }
+
+    #[test]
+    fn new_thread_has_no_mission_when_workspace_has_none() {
+        // A workspace with no mission (e.g. a legacy/dangling row) yields a NULL
+        // mission_id — never a spurious attribution.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "main", "", "main", Some("/tmp/p1"), "", None)
+            .unwrap();
+        let t = db.create_chat_thread("w1", "Orphan").unwrap();
+        assert_eq!(t.mission_id, None, "no mission → no attribution");
+    }
+
+    #[test]
     fn writer_uniqueness_blocks_a_second_active_writer() {
         let db = test_db();
         seed_project_ws(&db, "p1", "w1", "task");

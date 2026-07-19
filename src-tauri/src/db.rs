@@ -2504,14 +2504,22 @@ impl Db {
     pub fn create_chat_thread(&self, workspace_id: &str, title: &str) -> AppResult<ChatThreadRow> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+        // Stamp the thread's mission at birth so mission-first scoping is honest.
+        // The column was only ever written by the one-shot M1 backfill; new
+        // threads left it NULL, so any thread created after the backfill silently
+        // lost its mission. Mirror `create_run`'s birth-stamp.
+        let mission_id = self
+            .active_mission_for_workspace(workspace_id)?
+            .map(|m| m.id);
         self.conn.execute(
-            "INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?4)",
-            params![id, workspace_id, title, now],
+            "INSERT INTO chat_threads (id, workspace_id, mission_id, title, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?5)",
+            params![id, workspace_id, mission_id, title, now],
         )?;
         Ok(ChatThreadRow {
             id,
             workspace_id: workspace_id.to_string(),
+            mission_id,
             title: title.to_string(),
             created_at: now.clone(),
             updated_at: now,
@@ -2531,7 +2539,7 @@ impl Db {
     /// List a workspace's threads, most-recently-active first.
     pub fn list_chat_threads(&self, workspace_id: &str) -> AppResult<Vec<ChatThreadRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, title, created_at, updated_at, pinned
+            "SELECT id, workspace_id, mission_id, title, created_at, updated_at, pinned
              FROM chat_threads WHERE workspace_id = ?1
              ORDER BY pinned DESC, updated_at DESC",
         )?;
@@ -2539,10 +2547,11 @@ impl Db {
             Ok(ChatThreadRow {
                 id: r.get(0)?,
                 workspace_id: r.get(1)?,
-                title: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
-                pinned: r.get::<_, i64>(5)? != 0,
+                mission_id: r.get(2)?,
+                title: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+                pinned: r.get::<_, i64>(6)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5322,6 +5331,12 @@ pub struct ChatMessageRow {
 pub struct ChatThreadRow {
     pub id: String,
     pub workspace_id: String,
+    /// The mission this conversation belongs to, stamped at birth from the
+    /// workspace's active mission. Nullable when the workspace has no mission.
+    /// Drives mission-first thread scoping (a shared checkout can carry threads
+    /// from more than one mission).
+    #[serde(default)]
+    pub mission_id: Option<String>,
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
