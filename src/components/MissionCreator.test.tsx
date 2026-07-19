@@ -193,6 +193,21 @@ describe("MissionCreator", () => {
       expect(mockCreate.mock.calls[0][7]).toBe("probe");
       expect(mockCreate.mock.calls[0][8]).toBe("readonly");
     });
+
+    it("a Perf (Chase a regression) mission records `perf` + forces `readonly`", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      render(
+        <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Startup got 2x slower" />,
+      );
+      fireEvent.click(screen.getByText("Chase a regression"));
+      await screen.findByPlaceholderText(TASK_PLACEHOLDER);
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockCreate.mock.calls[0][7]).toBe("perf");
+      expect(mockCreate.mock.calls[0][8]).toBe("readonly");
+    });
   });
 
   // ─── Step 2: isolation ─────────────────────────────────────────────

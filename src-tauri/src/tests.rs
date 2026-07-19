@@ -3114,7 +3114,7 @@ mod pipeline_crud_tests {
         db.seed_builtin_pipelines().unwrap();
         db.seed_builtin_pipelines().unwrap(); // second call must not duplicate
         let pipelines = db.list_pipelines().unwrap();
-        assert_eq!(pipelines.len(), 6); // incl. "Ship it" (issue → PR) + "Greenfield" (genesis)
+        assert_eq!(pipelines.len(), 7); // + "Ship it", "Greenfield" (genesis), "Perf probe" (perf)
 
         let feature = pipelines.iter().find(|p| p.name == "Feature Factory").unwrap();
         let stages = db.get_pipeline_stages(&feature.id).unwrap();
@@ -9379,6 +9379,39 @@ mod mission_tests {
         let found = db.get_project_by_path(path).unwrap();
         assert_eq!(found.map(|(i, _, _)| i).as_deref(), Some(id.as_str()));
         assert_eq!(db.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn perf_probe_pipeline_is_seeded_readonly_and_idempotent() {
+        // M4.3: the Perf probe crew (a `perf` mission) — a READ-ONLY investigation
+        // that measures, finds the regression, and reports (never edits).
+        let db = test_db();
+        db.seed_builtin_pipelines().unwrap();
+        db.seed_builtin_pipelines().unwrap(); // idempotent
+        let pp: Vec<_> = db
+            .list_pipelines()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.name == "Perf probe" && p.is_builtin)
+            .collect();
+        assert_eq!(pp.len(), 1, "exactly one Perf probe builtin");
+        let stages = db.get_pipeline_stages(&pp[0].id).unwrap();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages.iter().map(|s| s.custom_name.as_deref().unwrap_or("")).collect::<Vec<_>>(),
+            ["Measure", "Find the regression", "Report"]);
+        // All api on the read-only-oriented `critique` role.
+        assert!(stages.iter().all(|s| s.role == "critique" && s.substrate == "api"));
+        // Read-only: NO stage may write files — the measure/find stages get
+        // run_command (to profile) but never write_file; report is read-only.
+        for s in &stages {
+            let tools = s.tools.clone().unwrap_or_default();
+            assert!(!tools.contains(&"write_file".to_string()), "perf probe never writes: {tools:?}");
+        }
+        assert!(stages[0].tools.as_ref().unwrap().contains(&"run_command".to_string()), "measure can profile");
+        assert!(stages[1].tools.as_ref().unwrap().contains(&"run_command".to_string()), "find can profile");
+        // Only the Report gates — measure/find flow straight through.
+        assert!(!stages[0].checkpoint && !stages[1].checkpoint, "investigation flows to the report");
+        assert!(stages[2].checkpoint, "report gates for the director");
     }
 
     #[test]
