@@ -11,6 +11,9 @@ export interface Toast {
   title: string;
   body?: string;
   timeout?: number;
+  /** Optional primary action (e.g. "Rename"). Clicking it runs `onClick` and
+   *  dismisses the toast. */
+  action?: { label: string; onClick: () => void };
 }
 
 const ICONS: Record<ToastLevel, React.ReactNode> = {
@@ -104,6 +107,19 @@ export function ToastContainer() {
             <div className="text-sm font-medium">{t.title}</div>
             {t.body && (
               <div className="mt-0.5 text-xs text-zinc-400">{t.body}</div>
+            )}
+            {t.action && (
+              <button
+                type="button"
+                onClick={() => {
+                  t.action?.onClick();
+                  dismiss(t.id);
+                }}
+                className="mt-2 rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi"
+                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+              >
+                {t.action.label}
+              </button>
             )}
           </div>
           <button

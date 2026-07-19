@@ -9277,6 +9277,29 @@ mod mission_tests {
     }
 
     #[test]
+    fn genesis_rename_marker_is_one_shot_and_keyed_by_project() {
+        // G6: a prompt-born project is marked (genesis_prompt:{id}); the rename is
+        // a one-shot (genesis_renamed:{id}). This exercises the meta contract the
+        // genesis_rename_candidate command reads.
+        let db = test_db();
+        db.insert_project("p1", "ios-track-daily", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "main", "", "main", Some("/tmp/p1"), "", None).unwrap();
+        // A project-first project (no marker) is never a candidate.
+        assert!(db.meta_get("genesis_prompt:p1").unwrap().is_none());
+        // Stamp the genesis marker (create_project does this when a task is given).
+        db.meta_set("genesis_prompt:p1", "Build an app to track daily tasks").unwrap();
+        assert_eq!(
+            db.meta_get("genesis_prompt:p1").unwrap().as_deref(),
+            Some("Build an app to track daily tasks"),
+        );
+        // Not yet offered.
+        assert!(db.meta_get("genesis_renamed:p1").unwrap().is_none());
+        // Mark offered → one-shot.
+        db.meta_set("genesis_renamed:p1", "1").unwrap();
+        assert!(db.meta_get("genesis_renamed:p1").unwrap().is_some());
+    }
+
+    #[test]
     fn sketchbook_project_is_find_or_create_idempotent() {
         // The Sketchbook (genesis G5) is a canonical singleton project — inserting
         // it twice reuses the same row (find-or-create by path), never duplicates.

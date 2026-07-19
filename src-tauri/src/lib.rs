@@ -161,6 +161,8 @@ pub fn run() {
             commands::list_recent_projects,
             commands::create_project,
             commands::ensure_sketchbook,
+            commands::genesis_rename_candidate,
+            commands::mark_genesis_renamed,
             commands::update_project_customization,
             commands::set_project_pinned,
             commands::set_project_order,
