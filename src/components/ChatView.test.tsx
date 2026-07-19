@@ -140,7 +140,7 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("index.html")).toBeInTheDocument();
   });
 
-  it("marks a streaming partial with a 'Generating' indicator (distinct from a finished turn)", () => {
+  it("marks a streaming partial as distinct from a finished turn (pinned Player says Writing…)", () => {
     useChatStore.setState({
       messagesByWs: { "ws-1": [] },
       streamingByWs: { "ws-1": true },
@@ -150,7 +150,9 @@ describe("ChatView — renders tool cards in the DOM", () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
 
     expect(screen.getByText(/Working on it/)).toBeInTheDocument();
-    expect(screen.getByText("Generating")).toBeInTheDocument();
+    // The scroll-away "Generating" dot was replaced by the pinned OctoStatus
+    // figure (spec 2026-07-19 §4): text flowing → "Writing…".
+    expect(screen.getByText("Writing…")).toBeInTheDocument();
   });
 
   it("exposes Edit on user turns and Regenerate on assistant turns", () => {

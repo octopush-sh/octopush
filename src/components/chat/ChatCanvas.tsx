@@ -10,6 +10,7 @@ import { OctoMark } from "../icons/OctoMark";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
 import { ApprovalCard } from "./ApprovalCard";
+import { OctoStatus } from "./OctoStatus";
 
 interface Props {
   workspaceId: string;
@@ -150,7 +151,7 @@ export function ChatCanvas({
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 py-6"
+      className="octo-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-8 pt-6 pb-[118px]"
     >
       {isEmpty ? (
         <EmptyState />
@@ -224,23 +225,8 @@ export function ChatCanvas({
                 }}
                 onOpenInEditor={onOpenInEditor}
               />
-              {/* Explicit "this message is still being written" marker so a live
-                  turn is never mistaken for a finished one when the stream pauses. */}
-              <div className="mt-1.5 flex items-center gap-1.5">
-                <span
-                  aria-hidden
-                  className="inline-block h-1 w-1 animate-pulse rounded-full"
-                  style={{ background: "var(--color-octo-brass)" }}
-                />
-                <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                  Generating
-                </span>
-              </div>
             </div>
           )}
-
-          {/* Only the bare "Thinking…" pulse when nothing else is live. */}
-          {streaming && !streamBuffer && liveTools.length === 0 && <ThinkingIndicator />}
 
           {error && isBudgetError ? (
             <BudgetErrorBlock
@@ -265,13 +251,33 @@ export function ChatCanvas({
         </div>
       )}
     </div>
+      {/* Bottom exit wash — keeps the pinned Player legible over the journal.
+          A surface, not a line (design-system §3). */}
+      {!isEmpty && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-[110px]"
+          style={{ background: "linear-gradient(transparent, var(--color-octo-bg) 76%)" }}
+        />
+      )}
+
+      {/* The Player — always-visible activity figure (spec 2026-07-19 §4). */}
+      <OctoStatus
+        streaming={streaming}
+        hasError={Boolean(error)}
+        streamBuffer={streamBuffer}
+        liveTools={liveTools}
+        approvals={approvalsForThread.length}
+      />
       {showJump && (
         <button
           type="button"
           onClick={() => scrollToBottom(true)}
           aria-label="Jump to latest"
           title="Jump to latest"
-          className="octo-pop-in absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass"
+          className={`octo-pop-in absolute left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-octo-hairline bg-octo-panel px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage shadow-lg transition-colors hover:text-octo-brass ${
+            streaming || approvalsForThread.length > 0 ? "bottom-16" : "bottom-3"
+          }`}
         >
           <ArrowDown size={12} />
           Latest
@@ -431,15 +437,6 @@ function EmptyState() {
         Ask anything — Octopush will read files, run commands, and write changes
         inside this workspace's worktree.
       </p>
-    </div>
-  );
-}
-
-function ThinkingIndicator() {
-  return (
-    <div className="flex items-center gap-2 self-start">
-      <OctoMark size={18} state="working" />
-      <span className="font-serif text-[13px] text-octo-sage">Thinking…</span>
     </div>
   );
 }
