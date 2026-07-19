@@ -48,6 +48,7 @@ import { LogbookRoom } from "./components/LogbookRoom";
 import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
+import { initGenesisRename } from "./lib/genesisRename";
 import { useHistoryStore } from "./stores/historyStore";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
@@ -151,6 +152,9 @@ function App() {
     // Crew notifications — a native ping when a crew gates/finishes while
     // the window is unfocused (the fleet's unattended-operation contract).
     initCrewNotifications();
+    // Post-build rename: a one-shot suggestion after a genesis project's first
+    // crew ships (the built thing knows what it is).
+    initGenesisRename();
   }, [loadActiveRuns]);
 
   // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with

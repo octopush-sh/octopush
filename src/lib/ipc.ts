@@ -554,6 +554,11 @@ export const ipc = {
   createProject: (path: string, name: string, task?: string | null) =>
     invoke<ProjectInfo>("create_project", { path, name, task: task ?? null }),
   ensureSketchbook: () => invoke<ProjectInfo>("ensure_sketchbook"),
+  /** Post-build rename (G6): ATOMICALLY claim the one-shot rename for a
+   *  workspace's project. Returns the prompt once (then marks it offered), else
+   *  null (not a genesis project / already offered / unknown workspace). */
+  claimGenesisRename: (workspaceId: string) =>
+    invoke<{ projectId: string; prompt: string } | null>("claim_genesis_rename", { workspaceId }),
   cloneProject: (args: {
     path: string;
     url: string;

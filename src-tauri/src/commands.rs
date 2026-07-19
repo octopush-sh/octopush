@@ -400,6 +400,13 @@ pub struct ProjectInfo {
     pub tint: Option<String>,
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GenesisRenameCandidate {
+    pub project_id: String,
+    pub prompt: String,
+}
+
 #[tauri::command]
 pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult<ProjectInfo> {
     let path = expand_tilde(&path);
@@ -584,7 +591,28 @@ pub async fn create_project(
     let db = state.db.lock();
     db.insert_project(&id, &name, &full_path_str)?;
     ensure_main_workspace(&db, &id, &full_path_str, task.as_deref())?;
+    // A project created WITH a task is a prompt-genesis project — mark it so the
+    // one-shot post-build rename (G6) can offer a name once its first crew ships
+    // (the heuristic slug is anonymous; the built thing knows what it is).
+    if let Some(t) = task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let _ = db.meta_set(&format!("genesis_prompt:{id}"), t);
+    }
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
+}
+
+/// Atomically CLAIM a genesis project's one-shot post-build rename (G6),
+/// resolved from a workspace of the just-completed run. Returns the prompt
+/// exactly once (then the marker is set), else `None`. Drives the rename toast.
+#[tauri::command]
+pub async fn claim_genesis_rename(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<GenesisRenameCandidate>> {
+    Ok(state
+        .db
+        .lock()
+        .claim_genesis_rename(&workspace_id)?
+        .map(|(project_id, prompt)| GenesisRenameCandidate { project_id, prompt }))
 }
 
 /// Resolve a free project directory under `base` for `name`, suffixing `-2`,

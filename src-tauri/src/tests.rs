@@ -9344,6 +9344,29 @@ mod mission_tests {
     }
 
     #[test]
+    fn claim_genesis_rename_is_atomic_one_shot() {
+        // G6: claim_genesis_rename returns the prompt EXACTLY once for a prompt-
+        // born project, then None (marked offered in the same lock).
+        let db = test_db();
+        db.insert_project("p1", "ios-track-daily", "/tmp/p1").unwrap();
+        db.insert_workspace("w1", "p1", "main", "", "main", Some("/tmp/p1"), "", None).unwrap();
+        // A project-first project (no genesis marker) is never a candidate.
+        assert!(db.claim_genesis_rename("w1").unwrap().is_none());
+        // Stamp the genesis marker (create_project does this when a task is given).
+        db.meta_set("genesis_prompt:p1", "Build an app to track daily tasks").unwrap();
+        // First claim returns the prompt...
+        let first = db.claim_genesis_rename("w1").unwrap();
+        assert_eq!(
+            first.as_ref().map(|(pid, prompt)| (pid.as_str(), prompt.as_str())),
+            Some(("p1", "Build an app to track daily tasks")),
+        );
+        // ...and every claim after is None (one-shot).
+        assert!(db.claim_genesis_rename("w1").unwrap().is_none());
+        // An unknown workspace is safely None.
+        assert!(db.claim_genesis_rename("ghost").unwrap().is_none());
+    }
+
+    #[test]
     fn sketchbook_project_is_find_or_create_idempotent() {
         // The Sketchbook (genesis G5) is a canonical singleton project — inserting
         // it twice reuses the same row (find-or-create by path), never duplicates.
