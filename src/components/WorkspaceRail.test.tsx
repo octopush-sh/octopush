@@ -566,6 +566,42 @@ describe("WorkspaceRail", () => {
     void container;
   });
 
+  it("read-only without sandbox rides the tooltip only — no Shield", () => {
+    useMissionsStore.setState({
+      missionsByProjectId: {},
+      missionByWorkspaceId: {
+        "ws-1": makeMission({ workspaceId: "ws-1", intent: "review", gitIsolation: "readonly" }),
+      },
+    });
+    const projects: ProjectGroup[] = [
+      { id: "proj-1", name: "Project", workspaces: [makeWorkspace({ id: "ws-1", name: "Alpha" })] },
+    ];
+    render(
+      <WorkspaceRail projects={projects} activeWorkspaceId="ws-1" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />,
+    );
+    const posture = screen.getByTitle("review mission · read-only");
+    expect(posture.querySelectorAll("svg").length).toBe(1); // intent glyph only — read-only never adds a glyph
+    useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
+  });
+
+  it("sandbox without read-only shows the Shield and the sandboxed tooltip", () => {
+    useMissionsStore.setState({
+      missionsByProjectId: {},
+      missionByWorkspaceId: {
+        "ws-1": makeMission({ workspaceId: "ws-1", intent: "build", execIsolation: "sandbox" }),
+      },
+    });
+    const projects: ProjectGroup[] = [
+      { id: "proj-1", name: "Project", workspaces: [makeWorkspace({ id: "ws-1", name: "Alpha" })] },
+    ];
+    render(
+      <WorkspaceRail projects={projects} activeWorkspaceId="ws-1" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />,
+    );
+    const posture = screen.getByTitle("build mission · sandboxed");
+    expect(posture.querySelectorAll("svg").length).toBe(2); // intent glyph + Shield
+    useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
+  });
+
   it("adds no Shield for a default (unsandboxed) mission", () => {
     useMissionsStore.setState({
       missionsByProjectId: {},

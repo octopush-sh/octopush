@@ -598,7 +598,11 @@ function WorkspaceRow({
           glyph carries the tooltip (intent · read-only · sandboxed); a sandboxed
           mission adds a mute Shield, the one posture orthogonal to intent. */}
       <span
-        className="flex h-4 min-w-3 flex-shrink-0 items-center justify-center gap-0.5"
+        // Fixed two-glyph width, left-aligned: intent glyphs line up across every
+        // row (sandboxed or not) and the name column never shifts — not on load,
+        // not between a sandboxed row and its neighbours. A lone intent glyph
+        // leaves the Shield's slot reserved-but-empty.
+        className="flex h-4 w-6 flex-shrink-0 items-center justify-start gap-0.5"
         role={posture ? "img" : undefined}
         aria-label={posture ?? undefined}
         title={posture ?? undefined}
