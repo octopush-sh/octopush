@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  ChevronDown, GripVertical, Plus, Hammer,
+  ChevronDown, GripVertical, Plus, Hammer, Shield,
   GitCommitHorizontal, GitPullRequest, ArrowUp, ArrowDown,
 } from "lucide-react";
 import {
@@ -452,10 +452,17 @@ function WorkspaceRow({
   const attentionFlag = useAttentionStore(
     (s) => s.flagsByWs?.[workspace?.id ?? ""],
   );
-  // The row's mission intent (missions are 1:1 with code workspaces). Read here
-  // — like attentionFlag — rather than threaded through every prop layer.
+  // The row's mission posture (missions are 1:1 with code workspaces). Read here
+  // — like attentionFlag — rather than threaded through every prop layer. Three
+  // cheap scalar subscriptions so the row re-renders only on the field it shows.
   const missionIntent = useMissionsStore(
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.intent ?? null,
+  );
+  const missionExec = useMissionsStore(
+    (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.execIsolation ?? null,
+  );
+  const missionGit = useMissionsStore(
+    (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
 
   if (!workspace) return null;
@@ -525,6 +532,22 @@ function WorkspaceRow({
   // the active workspace; git/PR status is sage/verdigris/mute.
   const barColor = active ? "var(--color-octo-brass)" : tint?.accent || "transparent";
 
+  // Mission posture, read at a glance: the intent word, plus read-only and
+  // sandboxed qualifiers. Read-only rides the tooltip (the intent glyph already
+  // signals it — a second icon would be redundant); sandboxed earns its own
+  // Shield because exec isolation is orthogonal to intent (a build mission can
+  // be sandboxed too). Mirrors ContextHeader's Shield.
+  const sandboxed = missionExec === "sandbox";
+  const posture = missionIntent
+    ? [
+        `${missionIntent} mission`,
+        missionGit === "readonly" ? "read-only" : null,
+        sandboxed ? "sandboxed" : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : null;
+
   return (
     <div
       className={`octo-fade-in group relative flex h-9 items-center gap-2.5 rounded-r-md border-l-[3px] pl-2.5 pr-2 transition-colors duration-[180ms] ${
@@ -570,19 +593,24 @@ function WorkspaceRow({
         {mono?.glyph || "?"}
       </button>
 
-      {/* Mission-intent glyph — reserved slot so the row never shifts as
-          missions load; every code workspace has a mission, so it fills fast. */}
+      {/* Mission posture — reserved slot so the row never shifts as missions
+          load; every code workspace has a mission, so it fills fast. The intent
+          glyph carries the tooltip (intent · read-only · sandboxed); a sandboxed
+          mission adds a mute Shield, the one posture orthogonal to intent. */}
       <span
-        className="flex h-4 w-3 flex-shrink-0 items-center justify-center"
-        role={missionIntent ? "img" : undefined}
-        aria-label={missionIntent ? `${missionIntent} mission` : undefined}
-        title={missionIntent ? `${missionIntent} mission` : undefined}
+        className="flex h-4 min-w-3 flex-shrink-0 items-center justify-center gap-0.5"
+        role={posture ? "img" : undefined}
+        aria-label={posture ?? undefined}
+        title={posture ?? undefined}
       >
         {missionIntent &&
           (() => {
             const Icon = INTENT_ICON[missionIntent] ?? Hammer;
             return <Icon size={11} aria-hidden className="octo-pop-in text-octo-mute" />;
           })()}
+        {sandboxed && (
+          <Shield size={10} aria-hidden className="octo-pop-in text-octo-mute" />
+        )}
       </span>
 
       {/* Workspace name — a real button (keyboard-operable) that truncates with
