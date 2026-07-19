@@ -352,6 +352,17 @@ impl AgentRunner for CliRunner {
         for (k, v) in login_shell_env() {
             command.env(k, v);
         }
+        // Sandboxed (guard is Some): redirect build-tool caches into the confined
+        // temp so builds work without exposing the real ~/.cargo etc. Overrides
+        // any cache vars the login shell set.
+        if _profile_guard.is_some() {
+            if let Ok(tmp) = std::env::var("TMPDIR") {
+                let scope = ctx.workspace_path.to_string_lossy();
+                for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
+                    command.env(k, v);
+                }
+            }
+        }
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())

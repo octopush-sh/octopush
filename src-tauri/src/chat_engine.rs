@@ -539,6 +539,17 @@ pub(crate) fn execute_tool(
                 c.arg("-c").arg(cmd);
                 c
             };
+            // Sandboxed: redirect build-tool caches into the confined temp so a
+            // sandboxed `npm install` writes there, not to the user's real
+            // ~/.cargo etc. (which the profile no longer exposes).
+            if sandbox_roots.is_some() {
+                if let Ok(tmp) = std::env::var("TMPDIR") {
+                    let scope = workspace_path.to_string_lossy();
+                    for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
+                        command.env(k, v);
+                    }
+                }
+            }
             match command
                 .current_dir(workspace_path)
                 .output()

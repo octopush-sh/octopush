@@ -47,7 +47,52 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
         v.push(format!("{h}/.claude"));
         v.push(format!("{h}/.cache"));
     }
+    // NB: we do NOT add the global package-manager dirs (~/.cargo, ~/.gradle, …)
+    // to the write roots — several are config/executable dirs, and a sandboxed
+    // agent could plant a `~/.cargo/config.toml` rustc-wrapper or a
+    // `~/.gradle/init.d/*.gradle` that runs OUTSIDE the sandbox on the user's
+    // next build (a full confinement escape). Instead, a sandboxed BUILD is made
+    // to write its caches into the already-allowed temp via env redirection —
+    // see `sandbox_cache_env`.
     v
+}
+
+/// A short, stable hex scope key for a string (e.g. a workspace path) — used to
+/// give each mission its OWN cache subtree so one sandboxed mission can't poison
+/// the cache another later compiles.
+fn scope_key(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Env vars that redirect common build toolchains' WRITE caches into a confined
+/// **per-mission** subtree of `$TMPDIR` (already an allowed write root), so a
+/// sandboxed `npm install`/`cargo build` works WITHOUT exposing the user's real
+/// `~/.cargo` etc. AND without two sandboxed missions sharing (and poisoning)
+/// one cache — `scope` (the workspace path) keys the subtree. Read-only global
+/// installs (toolchains, tool binaries on PATH) still work — reads are open;
+/// only writes are redirected. Applied by the CLI substrate and TALK's sandboxed
+/// `run_command`. Pure over its inputs.
+pub fn sandbox_cache_env(tmpdir: &str, scope: &str) -> Vec<(String, String)> {
+    let base = format!(
+        "{}/octopush-build-cache/{}",
+        tmpdir.trim_end_matches('/'),
+        scope_key(scope)
+    );
+    vec![
+        ("CARGO_HOME".into(), format!("{base}/cargo")), // rust: registry/git/config/bin (fresh, confined)
+        ("npm_config_cache".into(), format!("{base}/npm")),
+        ("YARN_CACHE_FOLDER".into(), format!("{base}/yarn")),
+        ("npm_config_store_dir".into(), format!("{base}/pnpm")), // pnpm store
+        ("GOPATH".into(), format!("{base}/go")),
+        ("GOCACHE".into(), format!("{base}/go-build")),
+        ("GOMODCACHE".into(), format!("{base}/go/pkg/mod")),
+        ("GRADLE_USER_HOME".into(), format!("{base}/gradle")),
+        ("DENO_DIR".into(), format!("{base}/deno")),
+        ("PIP_CACHE_DIR".into(), format!("{base}/pip")),
+    ]
 }
 
 /// Writable individual *files* (as opposed to subtrees). Seatbelt's `subpath`
@@ -263,15 +308,56 @@ mod tests {
         assert!(roots.contains(&"/home/u/.claude".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
         assert!(roots.contains(&"/dev".to_string()));
-        // Sensitive/credential home dirs and the home root itself stay read-only,
-        // and we no longer blanket-allow every app's temp under /var/folders.
+        // No GLOBAL package-manager dirs are writable — several are config/exec
+        // dirs (a sandboxed agent must not plant a ~/.cargo/config.toml
+        // rustc-wrapper or ~/.gradle/init.d/*.gradle that runs outside the
+        // sandbox). Builds get a CONFINED cache via env redirect, not these.
         assert!(!roots.iter().any(|r| {
             r == "/home/u/.ssh"
+                || r == "/home/u/.aws"
                 || r == "/home/u/.config"
+                || r == "/home/u/Library/Caches"
+                || r == "/home/u/.cargo"
+                || r == "/home/u/.gradle"
+                || r == "/home/u/.rustup"
+                || r == "/home/u/go"
                 || r == "/home/u"
                 || r == "/var/folders"
                 || r == "/private/var/folders"
         }));
+    }
+
+    #[test]
+    fn readonly_missions_get_no_write_roots_beyond_temp() {
+        // A readonly (review/probe) mission is `Some(vec![])` → temp-only. It must
+        // NOT gain the workspace OR any package-manager dir. (The gap that let
+        // the first cut of B3 accidentally grant readonly missions write access
+        // to ~/.cargo etc.)
+        let roots = assemble_write_roots(&[], Some("/home/u"), Some("/tmp/session"));
+        assert!(!roots.iter().any(|r| r.starts_with("/home/u/.cargo") || r == "/home/u/go"));
+        assert!(!roots.contains(&"/ws".to_string()));
+        // Temp + the CLI's own dirs are still there (a shell needs them).
+        assert!(roots.contains(&"/tmp/session".to_string()));
+        assert!(roots.contains(&"/home/u/.claude".to_string()));
+    }
+
+    #[test]
+    fn sandbox_cache_env_redirects_into_the_confined_temp() {
+        let env: std::collections::HashMap<String, String> =
+            sandbox_cache_env("/tmp/session", "/ws-a").into_iter().collect();
+        // Every redirect points under the confined temp, never at ~.
+        for (k, v) in &env {
+            assert!(v.starts_with("/tmp/session/octopush-build-cache/"), "{k}={v} escaped temp");
+        }
+        assert!(env.get("CARGO_HOME").unwrap().ends_with("/cargo"));
+        assert!(env.contains_key("npm_config_cache"));
+        assert!(env.contains_key("GOPATH"));
+        assert!(env.contains_key("GRADLE_USER_HOME"));
+        // Per-mission isolation: a DIFFERENT workspace gets a DIFFERENT cache
+        // subtree, so one sandboxed mission can't poison another's build cache.
+        let other: std::collections::HashMap<String, String> =
+            sandbox_cache_env("/tmp/session", "/ws-b").into_iter().collect();
+        assert_ne!(env.get("CARGO_HOME"), other.get("CARGO_HOME"));
     }
 
     #[test]
