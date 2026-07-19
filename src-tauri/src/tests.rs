@@ -9399,6 +9399,8 @@ mod mission_tests {
         assert_eq!(stages.len(), 3);
         assert_eq!(stages.iter().map(|s| s.custom_name.as_deref().unwrap_or("")).collect::<Vec<_>>(),
             ["Measure", "Find the regression", "Report"]);
+        // All api on the read-only-oriented `critique` role.
+        assert!(stages.iter().all(|s| s.role == "critique" && s.substrate == "api"));
         // Read-only: NO stage may write files — the measure/find stages get
         // run_command (to profile) but never write_file; report is read-only.
         for s in &stages {
@@ -9406,6 +9408,9 @@ mod mission_tests {
             assert!(!tools.contains(&"write_file".to_string()), "perf probe never writes: {tools:?}");
         }
         assert!(stages[0].tools.as_ref().unwrap().contains(&"run_command".to_string()), "measure can profile");
+        assert!(stages[1].tools.as_ref().unwrap().contains(&"run_command".to_string()), "find can profile");
+        // Only the Report gates — measure/find flow straight through.
+        assert!(!stages[0].checkpoint && !stages[1].checkpoint, "investigation flows to the report");
         assert!(stages[2].checkpoint, "report gates for the director");
     }
 

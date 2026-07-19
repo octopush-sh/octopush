@@ -34,6 +34,13 @@ vi.mock("../lib/ipc", async (importOriginal) => {
 
 const { PipelineSetup } = await import("./PipelineSetup");
 const { useRunsStore } = await import("../stores/runsStore");
+const { useMissionsStore } = await import("../stores/missionsStore");
+
+const PERF = { pipeline: { id: "pperf", name: "Perf probe", description: "d", isBuiltin: true, createdAt: "t" },
+  stages: [
+    { id: "ps0", pipelineId: "pperf", position: 0, role: "critique", agentModel: "m", substrate: "api", checkpoint: false,
+      loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25 },
+  ] };
 
 // Fix A: dangling-selectedId recovery — the store mock returns the same shared
 // slice, so we cannot cheaply simulate "store reloads without the previously-selected id" in a
@@ -50,6 +57,7 @@ beforeEach(() => {
   estimateMock.mockReset();
   estimateMock.mockResolvedValue({ estimateUsd: 0.05, baselineUsd: 0.4 });
   useRunsStore.setState({ launcherPrefill: null });
+  useMissionsStore.setState({ missionByWorkspaceId: {} });
 });
 
 describe("PipelineSetup begin gate", () => {
@@ -98,6 +106,26 @@ describe("PipelineSetup budget field", () => {
     fireEvent.change(screen.getByPlaceholderText("no budget"), { target: { value: "0" } });
     fireEvent.click(begin); // zero is no budget
     expect(onBegin).toHaveBeenLastCalledWith("p1", "build it", [], null);
+  });
+});
+
+describe("PipelineSetup intent auto-select", () => {
+  it("default-selects the intent-matched builtin (perf → Perf probe)", () => {
+    storeState.pipelines = [PIPE, PERF];
+    useMissionsStore.setState({ missionByWorkspaceId: { w1: { intent: "perf" } as any } });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="find the slowdown" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalledWith("pperf", "find the slowdown", [], null);
+  });
+
+  it("falls back to the first builtin when the intent has no mapping", () => {
+    storeState.pipelines = [PIPE, PERF];
+    useMissionsStore.setState({ missionByWorkspaceId: { w1: { intent: "build" } as any } });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="ship it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalledWith("p1", "ship it", [], null);
   });
 });
 

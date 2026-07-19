@@ -12,6 +12,11 @@ import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
 import { Github } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
+import { useMissionsStore } from "../stores/missionsStore";
+
+/** Builtin pipelines a mission's intent should default-select in the launcher
+ *  (a `perf` mission lands on the Perf probe crew). */
+const INTENT_PIPELINE: Record<string, string> = { perf: "Perf probe" };
 
 interface Props {
   /** The workspace whose launcher this is — guards prefill consumption. */
@@ -68,17 +73,28 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const [showIssuePicker, setShowIssuePicker] = useState(false);
   const [estimate, setEstimate] = useState<{ estimateUsd: number; baselineUsd: number } | null>(null);
 
+  // The active mission's intent — a `perf` mission default-selects Perf probe.
+  const missionIntent = useMissionsStore((s) =>
+    workspaceId ? s.missionByWorkspaceId[workspaceId]?.intent ?? null : null,
+  );
+
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
     const exists = selectedId && pipelines.some((p) => p.pipeline.id === selectedId);
     if (!exists && pipelines.length > 0) {
-      setSelectedId(pipelines[0].pipeline.id);
+      // Prefer the pipeline the mission's intent implies (perf → Perf probe),
+      // else the first builtin.
+      const preferredName = missionIntent ? INTENT_PIPELINE[missionIntent] : undefined;
+      const preferred = preferredName
+        ? pipelines.find((p) => p.pipeline.isBuiltin && p.pipeline.name === preferredName)
+        : undefined;
+      setSelectedId((preferred ?? pipelines[0]).pipeline.id);
       // The selection is being REPLACED (first load, or the selected pipeline
       // was deleted externally) — position-keyed overrides must not carry
       // onto a different pipeline's stages.
       setOverrides({});
     }
-  }, [pipelines, selectedId]);
+  }, [pipelines, selectedId, missionIntent]);
   // "Run it again" (R3): consume the one-shot launcher prefill once the pipeline
   // list is in, so the existence check is meaningful. The task always applies;
   // pipeline + crew only when that pipeline still exists.
