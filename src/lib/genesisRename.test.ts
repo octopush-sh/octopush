@@ -6,9 +6,8 @@ vi.mock("./ipc", async (importOriginal) => {
   return {
     ...actual,
     ipc: {
-      genesisRenameCandidate: vi.fn(),
+      claimGenesisRename: vi.fn(),
       aiComplete: vi.fn(),
-      markGenesisRenamed: vi.fn(),
       updateProjectCustomization: vi.fn(),
     },
   };
@@ -24,9 +23,8 @@ import { ipc } from "./ipc";
 import { maybeOffer } from "./genesisRename";
 
 const m = {
-  candidate: vi.mocked(ipc.genesisRenameCandidate),
+  candidate: vi.mocked(ipc.claimGenesisRename),
   ai: vi.mocked(ipc.aiComplete),
-  marked: vi.mocked(ipc.markGenesisRenamed),
   rename: vi.mocked(ipc.updateProjectCustomization),
 };
 
@@ -38,7 +36,6 @@ const run = (over: Partial<Run> = {}): Run => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
-  m.marked.mockResolvedValue(undefined);
   m.rename.mockResolvedValue(undefined);
 });
 
@@ -47,8 +44,8 @@ describe("genesis post-build rename", () => {
     m.candidate.mockResolvedValue({ projectId: "proj1", prompt: "a CLI to track daily tasks" });
     m.ai.mockResolvedValue({ text: "task-tracker", inputTokens: 1, outputTokens: 1, costUsd: 0 });
     await maybeOffer(run());
-    // One-shot: marked offered regardless of accept/dismiss.
-    expect(m.marked).toHaveBeenCalledWith("proj1");
+    // The claim itself is the one-shot mark (atomic, backend).
+    expect(m.candidate).toHaveBeenCalledWith("w1");
     const toast = pushToastMock.mock.calls[0][0];
     expect(toast.body).toContain("task-tracker");
     // The action performs the rename.

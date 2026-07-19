@@ -3533,6 +3533,34 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically CLAIM a genesis project's one-shot post-build rename (G6),
+    /// resolved from one of its workspaces. Returns `Some((project_id, prompt))`
+    /// exactly once — the first caller after a prompt-born project's first crew
+    /// ships — and `None` thereafter (already claimed), for a non-genesis
+    /// project, or an unknown workspace. Check-and-set under a single lock so two
+    /// runs of the same project completing at once can't both offer.
+    pub fn claim_genesis_rename(&self, workspace_id: &str) -> AppResult<Option<(String, String)>> {
+        let project_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else { return Ok(None) };
+        if self.meta_get(&format!("genesis_renamed:{project_id}"))?.is_some() {
+            return Ok(None);
+        }
+        let Some(prompt) = self.meta_get(&format!("genesis_prompt:{project_id}"))? else {
+            return Ok(None);
+        };
+        // Claim it now (before the slow name generation), so a concurrent
+        // completion sees it already offered.
+        self.meta_set(&format!("genesis_renamed:{project_id}"), "1")?;
+        Ok(Some((project_id, prompt)))
+    }
+
     /// Remove a meta key if present. No-op when absent. Used to re-arm a
     /// one-shot migration (e.g. tests simulating an upgrade from an older DB).
     pub fn meta_delete(&self, key: &str) -> AppResult<()> {

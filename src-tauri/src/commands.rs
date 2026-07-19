@@ -600,32 +600,19 @@ pub async fn create_project(
     Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
 }
 
-/// The genesis prompt for a project reached via one of its workspaces, if that
-/// project was prompt-born AND its post-build rename hasn't been offered yet —
-/// else `None`. Drives G6's one-shot rename suggestion; the frontend calls it
-/// when a run in the project completes.
+/// Atomically CLAIM a genesis project's one-shot post-build rename (G6),
+/// resolved from a workspace of the just-completed run. Returns the prompt
+/// exactly once (then the marker is set), else `None`. Drives the rename toast.
 #[tauri::command]
-pub async fn genesis_rename_candidate(
+pub async fn claim_genesis_rename(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> AppResult<Option<GenesisRenameCandidate>> {
-    let db = state.db.lock();
-    let Some(ws) = db.get_workspace(&workspace_id)? else { return Ok(None) };
-    let project_id = ws.project_id;
-    if db.meta_get(&format!("genesis_renamed:{project_id}"))?.is_some() {
-        return Ok(None); // already offered — one-shot
-    }
-    match db.meta_get(&format!("genesis_prompt:{project_id}"))? {
-        Some(prompt) => Ok(Some(GenesisRenameCandidate { project_id, prompt })),
-        None => Ok(None), // not a genesis project
-    }
-}
-
-/// Mark a genesis project's rename as offered (accepted OR dismissed) so it never
-/// fires again.
-#[tauri::command]
-pub async fn mark_genesis_renamed(state: State<'_, AppState>, project_id: String) -> AppResult<()> {
-    state.db.lock().meta_set(&format!("genesis_renamed:{project_id}"), "1")
+    Ok(state
+        .db
+        .lock()
+        .claim_genesis_rename(&workspace_id)?
+        .map(|(project_id, prompt)| GenesisRenameCandidate { project_id, prompt }))
 }
 
 /// Resolve a free project directory under `base` for `name`, suffixing `-2`,

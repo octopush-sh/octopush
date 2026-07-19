@@ -30,8 +30,8 @@ function slugifyName(raw: string): string {
     .replace(/[\s_]+/g, "-")
     .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40);
+    .slice(0, 40) // bound length first…
+    .replace(/^-|-$/g, ""); // …then strip any hyphen the cut left dangling
 }
 
 /** Suggest a project name from the brief via a brief BYOK call; fall back to the
@@ -57,11 +57,11 @@ export async function maybeOffer(run: Run): Promise<void> {
   if (offering.has(wsId)) return;
   offering.add(wsId);
   try {
-    const candidate = await ipc.genesisRenameCandidate(wsId);
+    // Atomic claim: returns the prompt once and marks it offered in the same
+    // lock, so two runs of the same project completing at once can't both offer.
+    const candidate = await ipc.claimGenesisRename(wsId);
     if (!candidate) return; // not a genesis project, or already offered
     const suggested = await suggestName(candidate.prompt, wsId);
-    // Mark offered NOW (accept or dismiss both retire it) so it never repeats.
-    await ipc.markGenesisRenamed(candidate.projectId);
     pushToast({
       level: "info",
       title: "Name this project?",
