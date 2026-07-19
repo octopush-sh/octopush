@@ -340,6 +340,12 @@ function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [missionControlOpen, setMissionControlOpen] = useState(false);
   const [logbookOpen, setLogbookOpen] = useState(false);
+  // The canonical Sketchbook path (fetched once) — an EXACT project-path match
+  // detects the Sketchbook without false-positiving a project opened inside it.
+  const [sketchbookPath, setSketchbookPath] = useState<string | null>(null);
+  useEffect(() => {
+    void ipc.sketchbookPath().then(setSketchbookPath).catch(() => {});
+  }, []);
   const [showPalette, setShowPalette] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
@@ -1586,13 +1592,17 @@ function App() {
   // The anti-task-manager frontier: a sketch either becomes execution or stays a
   // document. (What else to copy — the sketch's notes — is a deliberate later
   // refinement; the seed prompt is enough to start.)
-  const handleMakeProject = useCallback(() => {
+  const handleMakeProject = useCallback(async () => {
     if (!activeWorkspaceId) return;
-    const firstUser = useChatStore
-      .getState()
-      .getMessages(activeWorkspaceId)
-      .find((m) => m.role === "user");
-    const seed = firstUser?.content.trim();
+    const firstUserSeed = () =>
+      useChatStore.getState().getMessages(activeWorkspaceId).find((m) => m.role === "user")?.content.trim();
+    let seed = firstUserSeed();
+    // Reached from the Rail (not handleSketch), history may not be loaded yet —
+    // load it before concluding there's nothing to build.
+    if (!seed) {
+      await useChatStore.getState().loadHistory(activeWorkspaceId);
+      seed = firstUserSeed();
+    }
     if (!seed) {
       pushToast({ level: "info", title: "Nothing to build yet", body: "Say what you want first, then make it a project." });
       return;
@@ -2156,7 +2166,7 @@ function App() {
             onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
             onOpenLogbook={() => setLogbookOpen(true)}
             onMakeProject={
-              activeProject?.path.includes("/.octopush/sketchbook") ? handleMakeProject : undefined
+              sketchbookPath && activeProject?.path === sketchbookPath ? handleMakeProject : undefined
             }
           />
         </div>
