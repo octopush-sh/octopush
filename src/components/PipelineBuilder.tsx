@@ -143,8 +143,13 @@ function BuilderInner({ pipeline, onClose }: Props) {
 
   const applySnapshot = useCallback(
     (snap: GraphSnapshot) => {
-      setNodes(snap.nodes);
-      setEdges(snap.edges);
+      // Snapshots capture xyflow's internal `selected` flag along with the
+      // node/edge data. Restoring it verbatim can silently re-select a node
+      // that isn't reflected in `selectedId` (the brass ring keys off
+      // `selectedId`, not `selected`) — a later Backspace would then delete
+      // an invisibly-selected node. Strip the flag on restore.
+      setNodes(snap.nodes.map((n) => ({ ...n, selected: false })));
+      setEdges(snap.edges.map((e) => ({ ...e, selected: false })));
       setSelectedId((id) => (id && snap.nodes.some((n) => n.id === id) ? id : null));
     },
     [setNodes, setEdges],
@@ -534,6 +539,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
                 <div
                   data-testid="connect-hint"
                   aria-hidden={!hintVisible}
+                  inert={!hintVisible}
                   className={`flex items-center gap-2 rounded-full border border-octo-hairline bg-octo-panel/95 px-3 py-1.5 font-mono text-[10px] text-octo-sage backdrop-blur-sm transition-opacity duration-[220ms] ${
                     hintVisible ? "" : "pointer-events-none opacity-0"
                   }`}
@@ -562,8 +568,14 @@ function BuilderInner({ pipeline, onClose }: Props) {
           data-testid="stage-dock"
           data-open={dockOpen}
           aria-hidden={!dockOpen}
-          onTransitionEnd={() => {
-            if (!dockOpen) setDockNode(null);
+          onTransitionEnd={(e) => {
+            // `transitionend` bubbles from child transitions (e.g. the 150ms
+            // hover-color transition on the inspector's close button), which
+            // can unmount the dock's content mid-close. Only react to the
+            // dock's own width transition.
+            if (e.target === e.currentTarget && e.propertyName === "width" && !dockOpen) {
+              setDockNode(null);
+            }
           }}
           className={`shrink-0 overflow-hidden border-l bg-octo-panel transition-[width,border-color] duration-[280ms] ease-[var(--ease-octo)] ${
             dockOpen ? "w-[320px] border-octo-hairline" : "w-0 border-transparent"

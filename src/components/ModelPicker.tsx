@@ -212,7 +212,12 @@ export function ModelPicker({
   useEffect(() => {
     if (!open) return;
     function handleKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        // Shield an enclosing bubble-phase Escape listener (e.g. the builder
+        // dock) from also closing on this Escape.
+        e.stopPropagation();
+        setOpen(false);
+      }
     }
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
