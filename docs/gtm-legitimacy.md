@@ -58,7 +58,7 @@ export APPLE_API_KEY_PATH="$HOME/.appstoreconnect/AuthKey_<key-id>.p8"
 npm run release -- <version>
 ```
 
-The script prints `Apple Developer-ID signing + notarization: ON` at the top and `Notarization ticket stapled to the DMG` near the end. The GitHub release notes will omit the `xattr` step. That first notarized build is the visible win — a `.dmg` that opens clean on any Mac.
+The script prints `Apple Developer-ID signing + notarization: ON` at the top and `Notarization ticket stapled to Octopush.app` near the end (Tauri staples the `.app`; the DMG is signed but carries the notarized app inside). The GitHub release notes will omit the `xattr` step. That first notarized build is the visible win — a `.dmg` whose app opens clean on any Mac.
 
 > **Tip:** put the `export` lines in a private, git-ignored file (e.g. `~/.octopush-keys/apple.env`) and `source` it before releasing — never commit them.
 

@@ -133,8 +133,8 @@ if (NOTARIZED) {
   );
 } else {
   console.log(
-    "\x1b[33m▸\x1b[0m Unsigned build (no APPLE_* env). Users will need the `xattr` unblock. " +
-      "To ship a Gatekeeper-clean release, see docs/gtm-legitimacy.md.",
+    "\x1b[33m▸\x1b[0m Unsigned build (no APPLE_SIGNING_IDENTITY). Users will need the `xattr` " +
+      "unblock. To ship a Gatekeeper-clean release, see docs/gtm-legitimacy.md.",
   );
 }
 
@@ -244,11 +244,12 @@ for (const entry of sidecars) {
 }
 
 // ── 3c. Verify Apple signing / notarization actually took ────────
-// Belt-and-suspenders: `tauri build` fails hard if a requested signing identity
-// can't sign, so reaching here already implies success — but we confirm the
-// stapled ticket so a mis-set notarization cred can't silently ship a build we
-// then advertise as Gatekeeper-clean. Warn-only: never fail a good bundle on a
-// flaky verify.
+// A post-build sanity print, not a gate: `tauri build` already hard-fails if a
+// requested identity can't sign or notarization is rejected, so reaching here
+// implies success. We confirm the artifacts so a surprise is visible in the log.
+// Warn-only: never fail a good bundle on a flaky verify.
+// NB: Tauri staples the notarization ticket to the `.app` (the DMG is signed but
+// not stapled), so both checks target the `.app`.
 if (APPLE_SIGN) {
   step("Verifying Apple signature");
   const appPath = join(macosDir, appDir);
@@ -263,12 +264,12 @@ if (APPLE_SIGN) {
   }
   if (NOTARIZED) {
     try {
-      execSync(`xcrun stapler validate "${dmgPath}"`, { stdio: "ignore" });
-      ok("Notarization ticket stapled to the DMG (stapler validate)");
+      execSync(`xcrun stapler validate "${appPath}"`, { stdio: "ignore" });
+      ok("Notarization ticket stapled to Octopush.app (stapler validate)");
     } catch {
       console.log(
-        "\x1b[33m▸\x1b[0m stapler validate did not pass on the DMG — notarization may not have " +
-          "completed. The DMG can still notarize later; do not advertise a clean install until it does.",
+        "\x1b[33m▸\x1b[0m stapler validate did not pass on the .app — notarization may not have " +
+          "completed. Don't advertise a clean install until `xcrun stapler validate` on the .app passes.",
       );
     }
   }
