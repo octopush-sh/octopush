@@ -267,7 +267,7 @@ Missions are the **first-level unit of intent** (build/fix/review/probe/design/p
 - **Per-message token/cost meta** — Assistant turns show `Nk in · Nk out`, with cost persisted. _Support:_ `ChatMessage.tsx`; `token_engine::compute_cost`.
 - **Token-usage recording** — Every billed turn records into the canonical `spend_events` ledger (surface `'talk'`) so Companion CONTEXT + Settings · Usage update. _Support:_ `token_engine::TokenEngine::record` (takes a `surface`; writes `db::record_token_spend`).
 - **max_tokens truncation recovery** — If truncated mid-tool-use, error `tool_result`s are injected and the loop retries. _Support:_ `send_agentic` MaxTokens branch.
-- **Persisted errors** — Provider/loop errors saved as `role="error"` rows, rendered as a rouge "Something went wrong" block (with "Configure API key" CTA when relevant). _Support:_ `ChatCanvas` `ErrorBlock`.
+- **Persisted errors** — Provider/loop errors saved as `role="error"` rows, rendered as a rouge "Something went wrong" block (with "Configure API key" CTA when relevant). A failed turn shows exactly ONE card: the transient banner is suppressed when the post-failure resync brings in a persisted error row with the same text (chatStore `runTurn` catch). _Support:_ `ChatCanvas` `ErrorBlock`.
 
 ### Tool-call cards (icon + LABEL)
 - **Built-in tools** — `run_command` (bash in workspace dir, 50k truncation, exit-code annotation), `read_file` (100k truncation), `write_file` (creates parent dirs, overwrites), `list_files`. _Support:_ `tool_definitions()` + `execute_tool` (chat_engine).
