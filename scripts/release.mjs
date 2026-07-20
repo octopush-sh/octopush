@@ -22,6 +22,18 @@
  *   - Ed25519 keypair at ~/.octopush-keys/updater_key{,.pub}; the
  *     matching public key must be the `pubkey` field in
  *     src-tauri/tauri.conf.json.
+ *
+ * Apple Developer-ID signing + notarization (OPTIONAL — see docs/gtm-legitimacy.md):
+ *   When the following env vars are present, `tauri build` automatically
+ *   Developer-ID-signs, notarizes, and staples the bundle (Tauri 2 reads them
+ *   natively), and the release notes drop the `xattr` unblock step. When they
+ *   are absent, the build is unsigned exactly as before — nothing breaks.
+ *     - APPLE_SIGNING_IDENTITY  (e.g. "Developer ID Application: You (TEAMID)")
+ *         …or APPLE_CERTIFICATE (+ APPLE_CERTIFICATE_PASSWORD) to import a
+ *         base64 .p12 into a temp keychain.
+ *     - Notarization creds, either:
+ *         APPLE_ID + APPLE_PASSWORD (app-specific) + APPLE_TEAM_ID, or
+ *         APPLE_API_ISSUER + APPLE_API_KEY + APPLE_API_KEY_PATH (App Store Connect key).
  */
 
 import { execSync, spawnSync } from "node:child_process";
@@ -97,6 +109,35 @@ if (status) {
 
 step(`Releasing Octopush v${newVersion}`);
 
+// ── Apple signing posture ─────────────────────────────────────────
+// Signing + notarization are fully env-driven: the build spawn below already
+// spreads `process.env`, so Tauri 2 picks these up with no extra plumbing. We
+// only DETECT them here, to (a) tell the operator what kind of build this is and
+// (b) drop the `xattr` unblock from the release notes when the DMG is notarized.
+const APPLE_SIGN = !!(process.env.APPLE_SIGNING_IDENTITY || process.env.APPLE_CERTIFICATE);
+const APPLE_NOTARIZE = !!(
+  (process.env.APPLE_ID && process.env.APPLE_PASSWORD && process.env.APPLE_TEAM_ID) ||
+  (process.env.APPLE_API_ISSUER && process.env.APPLE_API_KEY && process.env.APPLE_API_KEY_PATH)
+);
+const NOTARIZED = APPLE_SIGN && APPLE_NOTARIZE;
+
+if (NOTARIZED) {
+  ok("Apple Developer-ID signing + notarization: ON (env present) — Gatekeeper-clean build");
+} else if (APPLE_SIGN) {
+  // Signing without notarization credentials still leaves Gatekeeper warnings,
+  // so we don't advertise a clean install — but we surface the half-config.
+  console.log(
+    "\x1b[33m▸\x1b[0m Apple signing identity present but notarization creds are NOT — " +
+      "the DMG will be signed yet still quarantined. Set APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID " +
+      "(or APPLE_API_*) to notarize. See docs/gtm-legitimacy.md.",
+  );
+} else {
+  console.log(
+    "\x1b[33m▸\x1b[0m Unsigned build (no APPLE_SIGNING_IDENTITY). Users will need the `xattr` " +
+      "unblock. To ship a Gatekeeper-clean release, see docs/gtm-legitimacy.md.",
+  );
+}
+
 // ── 1. Bump versions ──────────────────────────────────────────────
 
 step("Bumping version in package.json, Cargo.toml, tauri.conf.json");
@@ -124,7 +165,11 @@ ok(`Bumped to ${newVersion}`);
 
 // ── 2. Build ─────────────────────────────────────────────────────
 
-step("Building release bundle (signed) — this takes a few minutes");
+step(
+  `Building release bundle (updater-signed${
+    NOTARIZED ? " + Apple-notarized" : APPLE_SIGN ? " + Apple-signed" : ""
+  }) — this takes a few minutes`,
+);
 
 // Tauri 2 reads the private key content from TAURI_SIGNING_PRIVATE_KEY.
 // (The `_PATH` variant in some docs isn't honored by the bundler.)
@@ -198,6 +243,38 @@ for (const entry of sidecars) {
   ok(`Sidecar bundled: ${name} (${statSync(binPath).size} bytes)`);
 }
 
+// ── 3c. Verify Apple signing / notarization actually took ────────
+// A post-build sanity print, not a gate: `tauri build` already hard-fails if a
+// requested identity can't sign or notarization is rejected, so reaching here
+// implies success. We confirm the artifacts so a surprise is visible in the log.
+// Warn-only: never fail a good bundle on a flaky verify.
+// NB: Tauri staples the notarization ticket to the `.app` (the DMG is signed but
+// not stapled), so both checks target the `.app`.
+if (APPLE_SIGN) {
+  step("Verifying Apple signature");
+  const appPath = join(macosDir, appDir);
+  try {
+    execSync(`codesign --verify --strict --verbose=2 "${appPath}"`, { stdio: "ignore" });
+    ok("Developer-ID signature valid (codesign --verify)");
+  } catch {
+    console.log(
+      "\x1b[33m▸\x1b[0m codesign --verify did not pass on the .app — the signing identity " +
+        "may not have applied. Inspect with: codesign -dv --verbose=4 <app>.",
+    );
+  }
+  if (NOTARIZED) {
+    try {
+      execSync(`xcrun stapler validate "${appPath}"`, { stdio: "ignore" });
+      ok("Notarization ticket stapled to Octopush.app (stapler validate)");
+    } catch {
+      console.log(
+        "\x1b[33m▸\x1b[0m stapler validate did not pass on the .app — notarization may not have " +
+          "completed. Don't advertise a clean install until `xcrun stapler validate` on the .app passes.",
+      );
+    }
+  }
+}
+
 // ── 4. Build latest.json ─────────────────────────────────────────
 
 step("Writing latest.json");
@@ -238,11 +315,25 @@ run(`git push origin v${newVersion}`);
 
 step("Creating GitHub release + uploading assets");
 
-// Release notes: short description plus the Gatekeeper unblock command
-// since Octopush isn't notarized (no Apple Developer Account).
-// Users who already have v0.1.1+ installed get updates in-app via the
-// Tauri updater — they never see this notice.
-const notesBody = `Octopush ${newVersion}
+// Release notes. A notarized build installs clean — no Gatekeeper unblock — so
+// we drop the `xattr` step entirely (shipping it on a notarized build would be
+// wrong and read as amateurish). An unsigned build keeps the unblock. Either
+// way, users already on a prior version update in-app and never see this.
+const notesBody = NOTARIZED
+  ? `Octopush ${newVersion}
+
+Universal binary — runs natively on both **Apple Silicon** and **Intel** Macs.
+Signed with a Developer ID certificate and notarized by Apple.
+
+## Install
+
+1. Download the \`.dmg\` below.
+2. Open it and drag **Octopush.app** to **Applications**.
+3. Launch Octopush from Applications.
+
+Future versions arrive in-app via the auto-updater.
+`
+  : `Octopush ${newVersion}
 
 Universal binary — runs natively on both **Apple Silicon** and **Intel** Macs.
 
