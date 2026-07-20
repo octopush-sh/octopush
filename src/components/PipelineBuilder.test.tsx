@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 // @xyflow/react can't lay out / measure in jsdom, so stub it to a thin shell.
 // The builder's logic we care about (graph → drafts on save, header, save bar,
@@ -12,10 +12,14 @@ vi.mock("@xyflow/react", async () => {
   return {
     // Render the real custom node components through nodeTypes so a node that
     // reads context (useBuilder) is exercised — catches provider-scope bugs.
-    ReactFlow: ({ children, nodes, nodeTypes }: any) =>
+    ReactFlow: ({ children, nodes, nodeTypes, onNodeClick }: any) =>
       React.createElement(
         "div",
         { "data-testid": "flow" },
+        React.createElement("button", {
+          "data-testid": "flow-node-select",
+          onClick: () => nodes?.[0] && onNodeClick?.({}, nodes[0]),
+        }),
         (nodes ?? []).map((n: any) => {
           const Comp = nodeTypes?.[n.type];
           return Comp ? React.createElement(Comp, { key: n.id, id: n.id, data: n.data, selected: false }) : null;
@@ -178,5 +182,25 @@ describe("PipelineBuilder (node canvas)", () => {
     fireEvent.click(screen.getByRole("button", { name: /Confirm delete/ }));
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("p2"));
     expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe("stage dock", () => {
+  it("renders the inspector outside the flow canvas, inside the dock region", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // A fresh pipeline seeds one implement node; select it through the canvas.
+    fireEvent.click(screen.getByTestId("flow-node-select")); // helper added below
+    const dock = screen.getByTestId("stage-dock");
+    expect(within(dock).getByLabelText("Stage name")).toBeTruthy();
+    const flow = screen.getByTestId("flow");
+    expect(within(flow).queryByLabelText("Stage name")).toBeNull();
+  });
+
+  it("Escape closes the dock", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("flow-node-select"));
+    expect(screen.getByTestId("stage-dock").getAttribute("data-open")).toBe("true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("stage-dock").getAttribute("data-open")).toBe("false");
   });
 });

@@ -178,6 +178,14 @@ function BuilderInner({ pipeline, onClose }: Props) {
 
   const selectedNode = nodes.find((n) => n.id === selectedId) ?? null;
 
+  // The dock keeps its content mounted through the close animation; the
+  // rendered node lags selection by one width transition when closing.
+  const [dockNode, setDockNode] = useState<StageNodeT | null>(null);
+  useEffect(() => {
+    if (selectedNode) setDockNode(selectedNode);
+  }, [selectedNode]);
+  const dockOpen = selectedNode !== null;
+
   // The selected review stage's loop, derived from its loop edge.
   const loopEdgeForSelected = selectedId
     ? edges.find((e) => e.data?.kind === "loop" && e.source === selectedId)
@@ -209,6 +217,18 @@ function BuilderInner({ pipeline, onClose }: Props) {
     },
     [selectedId, setEdges],
   );
+
+  // Escape closes the dock — but not while the Role Editor modal is up;
+  // ModalShell owns Escape there.
+  const editorOpenRef = useRef(false);
+  editorOpenRef.current = editorState !== null;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !editorOpenRef.current) setSelectedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const firstBlocking = validation.blocking[0]?.message ?? null;
   const warnCount = validation.warnings.length;
@@ -263,72 +283,88 @@ function BuilderInner({ pipeline, onClose }: Props) {
         />
       </div>
 
-      <div ref={wrapperRef} className="octo-flow relative min-h-0 flex-1" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
-        {/* The provider must wrap ReactFlow so the custom node components it
-            renders can read validation / selection / the remove handler. */}
-        <BuilderProvider
-          value={{
-            validation: validation.byNode,
-            selectedId,
-            onRemove: removeNode,
-            canRemove: nodes.length > 1,
-            // TODO(task 10): wire real disconnect handling; grep for this stub.
-            onDisconnect: () => {},
-          }}
-        >
-          <ReactFlow<StageNodeT, StageEdge>
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onBeforeDelete={onBeforeDelete}
-            onNodesDelete={onNodesDelete}
-            onNodeClick={(_, n) => setSelectedId(n.id)}
-            onPaneClick={() => setSelectedId(null)}
-            nodeTypes={nodeTypes}
-            edgeTypes={edgeTypes}
-            defaultEdgeOptions={defaultEdgeOptions}
-            minZoom={0.4}
-            maxZoom={1.75}
-            fitView
-            fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
-            proOptions={{ hideAttribution: true }}
-            className="bg-transparent"
+      <div className="flex min-h-0 flex-1">
+        <div ref={wrapperRef} className="octo-flow relative min-h-0 flex-1" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
+          {/* The provider must wrap ReactFlow so the custom node components it
+              renders can read validation / selection / the remove handler. */}
+          <BuilderProvider
+            value={{
+              validation: validation.byNode,
+              selectedId,
+              onRemove: removeNode,
+              canRemove: nodes.length > 1,
+              // TODO(task 10): wire real disconnect handling; grep for this stub.
+              onDisconnect: () => {},
+            }}
           >
-            <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
-            <Controls showInteractive={false} className="octo-flow-controls" />
-            <MiniMap
-              pannable
-              zoomable
-              className="octo-flow-minimap"
-              maskColor={`${tokens.onyx}b8`}
-              nodeColor={() => tokens.hairline}
-              nodeStrokeColor={() => tokens.brassDim}
-            />
-            <Panel position="top-left">
-              <NodePalette
-                onAdd={addNode}
-                onNewRole={() => setEditorState({})}
-                onEditRole={(role) => setEditorState({ initial: role })}
+            <ReactFlow<StageNodeT, StageEdge>
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onBeforeDelete={onBeforeDelete}
+              onNodesDelete={onNodesDelete}
+              onNodeClick={(_, n) => setSelectedId(n.id)}
+              onPaneClick={() => setSelectedId(null)}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              defaultEdgeOptions={defaultEdgeOptions}
+              minZoom={0.4}
+              maxZoom={1.75}
+              fitView
+              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              proOptions={{ hideAttribution: true }}
+              className="bg-transparent"
+            >
+              <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
+              <Controls showInteractive={false} className="octo-flow-controls" />
+              <MiniMap
+                pannable
+                zoomable
+                className="octo-flow-minimap"
+                maskColor={`${tokens.onyx}b8`}
+                nodeColor={() => tokens.hairline}
+                nodeStrokeColor={() => tokens.brassDim}
               />
-            </Panel>
-            {selectedNode && (
-              <Panel position="top-right" className="!m-3 max-h-[calc(100%-1.5rem)]">
-                <StageInspector
-                  key={selectedNode.id}
-                  node={selectedNode}
-                  ancestors={loopTargets}
-                  loop={loopState}
-                  issue={validation.byNode[selectedNode.id]}
-                  onPatch={(p) => patchData(selectedNode.id, p)}
-                  onSetLoop={setLoop}
-                  onClose={() => setSelectedId(null)}
+              <Panel position="top-left">
+                <NodePalette
+                  onAdd={addNode}
+                  onNewRole={() => setEditorState({})}
+                  onEditRole={(role) => setEditorState({ initial: role })}
                 />
               </Panel>
-            )}
-          </ReactFlow>
-        </BuilderProvider>
+            </ReactFlow>
+          </BuilderProvider>
+        </div>
+
+        {/* Stage dock — outside the flow's overflow, so it can never clip. */}
+        <div
+          data-testid="stage-dock"
+          data-open={dockOpen}
+          aria-hidden={!dockOpen}
+          onTransitionEnd={() => {
+            if (!dockOpen) setDockNode(null);
+          }}
+          className={`shrink-0 overflow-hidden border-l bg-octo-panel transition-[width,border-color] duration-[280ms] ease-[var(--ease-octo)] ${
+            dockOpen ? "w-[320px] border-octo-hairline" : "w-0 border-transparent"
+          }`}
+        >
+          {dockNode && (
+            <div className="h-full w-[320px]" inert={!dockOpen}>
+              <StageInspector
+                key={dockNode.id}
+                node={dockNode}
+                ancestors={loopTargets}
+                loop={loopState}
+                issue={validation.byNode[dockNode.id]}
+                onPatch={(p) => patchData(dockNode.id, p)}
+                onSetLoop={setLoop}
+                onClose={() => setSelectedId(null)}
+              />
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-8 py-3">
