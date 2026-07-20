@@ -649,6 +649,8 @@ export const ipc = {
     attachments?: { mediaType: string; data: string }[];
     /** Re-run without inserting a new user row (history already ends with it). */
     regenerate?: boolean;
+    /** Skip the backend budget gate for this turn (conscious per-turn override). */
+    overrideBudget?: boolean;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** Delete a message and everything after it (Regenerate / Edit-and-resend). */

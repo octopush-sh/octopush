@@ -59,6 +59,10 @@ pub struct ChatRequest {
     /// user message, so DON'T insert a new user row — just re-run the loop.
     #[serde(default)]
     pub regenerate: bool,
+    /// Per-turn budget override: when true, the backend budget gate is skipped
+    /// for this send (the user consciously chose "Override for this turn").
+    #[serde(default)]
+    pub override_budget: bool,
 }
 
 /// A base64 image attachment sent with a user turn.
