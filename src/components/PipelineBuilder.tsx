@@ -73,6 +73,19 @@ function BuilderInner({ pipeline, onClose }: Props) {
   }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const [paletteOpen, setPaletteOpen] = useState(true);
+
+  // The minimap is a luxury; below this canvas width it yields the corner.
+  const MINIMAP_MIN_CANVAS = 560;
+  const [canvasWidth, setCanvasWidth] = useState(Number.POSITIVE_INFINITY);
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => setCanvasWidth(entries[0].contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const miniMapShown = canvasWidth >= MINIMAP_MIN_CANVAS;
 
   const [name, setName] = useState(() =>
     pipeline ? (isBuiltin ? `${pipeline.pipeline.name} (custom)` : pipeline.pipeline.name) : "",
@@ -318,17 +331,28 @@ function BuilderInner({ pipeline, onClose }: Props) {
               className="bg-transparent"
             >
               <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
-              <Controls showInteractive={false} className="octo-flow-controls" />
+              <Controls
+                showInteractive={false}
+                position="bottom-right"
+                className={`octo-flow-controls !mr-4 transition-[margin] duration-[280ms] ${
+                  miniMapShown ? "!mb-[178px]" : "!mb-4"
+                }`}
+              />
               <MiniMap
                 pannable
                 zoomable
-                className="octo-flow-minimap"
+                position="bottom-right"
+                className={`octo-flow-minimap !m-4 transition-opacity duration-[220ms] ${
+                  miniMapShown ? "" : "pointer-events-none opacity-0"
+                }`}
                 maskColor={`${tokens.onyx}b8`}
                 nodeColor={() => tokens.hairline}
                 nodeStrokeColor={() => tokens.brassDim}
               />
               <Panel position="top-left">
                 <NodePalette
+                  open={paletteOpen}
+                  onToggle={() => setPaletteOpen((v) => !v)}
                   onAdd={addNode}
                   onNewRole={() => setEditorState({})}
                   onEditRole={(role) => setEditorState({ initial: role })}

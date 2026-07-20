@@ -185,6 +185,16 @@ describe("PipelineBuilder (node canvas)", () => {
   });
 });
 
+describe("palette collapse", () => {
+  it("collapses to a pill and back", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText("Hide stage palette"));
+    expect(screen.queryByText("Plan & design")).toBeNull();
+    fireEvent.click(screen.getByLabelText("Show stage palette"));
+    expect(screen.getByText("Plan & design")).toBeTruthy();
+  });
+});
+
 describe("stage dock", () => {
   it("renders the inspector outside the flow canvas, inside the dock region", () => {
     render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
