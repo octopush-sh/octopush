@@ -108,4 +108,18 @@ describe("OctoStatus", () => {
     expect(container.querySelector(".octo-mascot--pushed-beat")).toBeNull();
     expect(container.querySelector(".octo-mascot--read")).not.toBeNull();
   });
+
+  it("a role that flickers away and back within the crossfade never strands the label invisible", () => {
+    // Chained Bash commands: Running… → (tool ends) Thinking… → (next command
+    // starts <200ms later) Running…. The label must remain visible.
+    const { getByText, rerender } = render(
+      <OctoStatus {...base} streaming liveTools={[tool("Bash")]} />,
+    );
+    expect(getByText("Running…").className).toContain("opacity-100");
+    rerender(<OctoStatus {...base} streaming liveTools={[]} />); // swap to Thinking… begins
+    act(() => vi.advanceTimersByTime(80)); // …but the next command lands mid-swap
+    rerender(<OctoStatus {...base} streaming liveTools={[tool("Bash")]} />);
+    act(() => vi.advanceTimersByTime(400)); // give any pending swap time to settle
+    expect(getByText("Running…").className).toContain("opacity-100");
+  });
 });
