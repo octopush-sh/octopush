@@ -408,8 +408,15 @@ describe("reconnectAllowed", () => {
   });
 
   it("rejects a re-route that closes a cycle", () => {
-    // re-routing a→b into c→a would make a → b → c → a
-    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(false);
+    const chain = [tedge("a", "b"), tedge("b", "c"), tedge("c", "d")];
+    const oldCD = chain[2];
+    // re-routing c→d into c→a would make a → b → c → a (a→b, b→c both survive)
+    expect(reconnectAllowed(oldCD, { source: "c", target: "a" }, chain)).toBe(false);
+  });
+
+  it("allows a re-route that would only cycle through the edge being replaced", () => {
+    // Re-routing a→b into c→a is acyclic: a→b no longer exists afterwards.
+    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(true);
   });
 
   it("allows reversing an isolated edge (no cycle through others)", () => {
@@ -437,9 +444,10 @@ Expected: FAIL — `reconnectAllowed` is not exported.
 
 ```ts
 /** May `oldEdge` be re-routed to `conn`? Mirrors the onConnect guards (no
- *  self-links, no duplicates, no cycles) with the old edge excluded from the
- *  checks; loop edges keep their review end and may only return to one of the
- *  review's flow-ancestors. */
+ *  self-links, no duplicates, no cycles) with the old edge excluded from every
+ *  check — a re-route can never cycle through the edge it replaces, since that
+ *  edge no longer exists once the reconnect lands; loop edges keep their
+ *  review end and may only return to one of the review's flow-ancestors. */
 export function reconnectAllowed(
   oldEdge: StageEdge,
   conn: { source: string; target: string },

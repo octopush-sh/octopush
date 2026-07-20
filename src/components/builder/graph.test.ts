@@ -443,8 +443,15 @@ describe("reconnectAllowed", () => {
   });
 
   it("rejects a re-route that closes a cycle", () => {
-    // re-routing a→b into c→a would make a → b → c → a
-    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(false);
+    const chain = [tedge("a", "b"), tedge("b", "c"), tedge("c", "d")];
+    const oldCD = chain[2];
+    // re-routing c→d into c→a would make a → b → c → a (a→b, b→c both survive)
+    expect(reconnectAllowed(oldCD, { source: "c", target: "a" }, chain)).toBe(false);
+  });
+
+  it("allows a re-route that would only cycle through the edge being replaced", () => {
+    // Re-routing a→b into c→a is acyclic: a→b no longer exists afterwards.
+    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(true);
   });
 
   it("allows reversing an isolated edge (no cycle through others)", () => {
