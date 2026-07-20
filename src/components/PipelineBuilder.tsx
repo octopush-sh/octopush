@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -16,6 +16,7 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { Undo2, Redo2 } from "lucide-react";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -40,6 +41,15 @@ import {
   type StageEdge,
   type StageNodeData,
 } from "./builder/graph";
+import {
+  createHistory,
+  pushSnapshot,
+  undo as undoHistory,
+  redo as redoHistory,
+  canUndo,
+  canRedo,
+  type GraphSnapshot,
+} from "./builder/history";
 
 const nodeTypes = { stage: StageNode };
 const edgeTypes = { flow: FlowEdge, loop: LoopEdge };
@@ -107,19 +117,64 @@ function BuilderInner({ pipeline, onClose }: Props) {
 
   const validation = useMemo(() => validateGraph(nodes, edges), [nodes, edges]);
 
+  // Latest graph refs so history callbacks never capture stale state.
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
+
+  const historyRef = useRef(createHistory());
+  const [, bumpHistory] = useReducer((c: number) => c + 1, 0);
+
+  const pushHistory = useCallback((key: string | null = null) => {
+    historyRef.current = pushSnapshot(
+      historyRef.current,
+      { nodes: nodesRef.current, edges: edgesRef.current },
+      key,
+    );
+    bumpHistory();
+  }, []);
+
+  const applySnapshot = useCallback(
+    (snap: GraphSnapshot) => {
+      setNodes(snap.nodes);
+      setEdges(snap.edges);
+      setSelectedId((id) => (id && snap.nodes.some((n) => n.id === id) ? id : null));
+    },
+    [setNodes, setEdges],
+  );
+
+  const applyUndo = useCallback(() => {
+    const r = undoHistory(historyRef.current, { nodes: nodesRef.current, edges: edgesRef.current });
+    if (!r) return;
+    historyRef.current = r.stack;
+    applySnapshot(r.restored);
+    bumpHistory();
+  }, [applySnapshot]);
+
+  const applyRedo = useCallback(() => {
+    const r = redoHistory(historyRef.current, { nodes: nodesRef.current, edges: edgesRef.current });
+    if (!r) return;
+    historyRef.current = r.stack;
+    applySnapshot(r.restored);
+    bumpHistory();
+  }, [applySnapshot]);
+
   const patchData = useCallback(
     (id: string, partial: Partial<StageNodeData>) => {
+      pushHistory(`patch:${id}:${Object.keys(partial).sort().join("+")}`);
       setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...partial } } : n)));
       // Changing a stage out of a review archetype strips its now-invalid loop.
       if (partial.role !== undefined && !isReviewArchetype(partial.role)) {
         setEdges((es) => es.filter((e) => !(e.data?.kind === "loop" && e.source === id)));
       }
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, pushHistory],
   );
 
   const addNode = useCallback(
     (role: string, position?: { x: number; y: number }) => {
+      pushHistory();
       const pos =
         position ??
         (() => {
@@ -133,7 +188,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
       setNodes((ns) => ns.concat(node));
       setSelectedId(node.id);
     },
-    [rf, setNodes],
+    [rf, setNodes, pushHistory],
   );
 
   const onConnect = useCallback(
@@ -151,9 +206,10 @@ function BuilderInner({ pipeline, onClose }: Props) {
         type: "flow",
         data: { kind: "flow" },
       };
+      pushHistory();
       setEdges((es) => es.concat(edge));
     },
-    [edges, setEdges],
+    [edges, setEdges, pushHistory],
   );
 
   const onDrop = useCallback(
@@ -177,9 +233,10 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const onBeforeDelete: OnBeforeDelete<StageNodeT, StageEdge> = useCallback(
     async ({ nodes: toDelete }) => {
       if (toDelete.length > 0 && nodes.length - toDelete.length < 1) return false;
+      pushHistory();
       return true;
     },
-    [nodes.length],
+    [nodes.length, pushHistory],
   );
 
   const onNodesDelete = useCallback(
@@ -222,26 +279,38 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const setLoop = useCallback(
     (next: LoopState) => {
       if (!selectedId) return;
+      pushHistory(`loop:${selectedId}`);
       setEdges((es) => {
         const withoutLoop = es.filter((e) => !(e.data?.kind === "loop" && e.source === selectedId));
         if (!next.target) return withoutLoop;
         return withoutLoop.concat(loopEdge(selectedId, next.target, next.max, next.mode));
       });
     },
-    [selectedId, setEdges],
+    [selectedId, setEdges, pushHistory],
   );
 
   // Escape closes the dock — but not while the Role Editor modal is up;
-  // ModalShell owns Escape there.
+  // ModalShell owns Escape there. Also handles ⌘Z/⇧⌘Z, suppressed while typing.
   const editorOpenRef = useRef(false);
   editorOpenRef.current = editorState !== null;
   useEffect(() => {
+    const isEditable = (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !editorOpenRef.current) setSelectedId(null);
+      if (e.key === "Escape" && !editorOpenRef.current) {
+        setSelectedId(null);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !isEditable(e.target)) {
+        e.preventDefault();
+        if (e.shiftKey) applyRedo();
+        else applyUndo();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [applyUndo, applyRedo]);
 
   const firstBlocking = validation.blocking[0]?.message ?? null;
   const warnCount = validation.warnings.length;
@@ -320,6 +389,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               onNodesDelete={onNodesDelete}
               onNodeClick={(_, n) => setSelectedId(n.id)}
               onPaneClick={() => setSelectedId(null)}
+              onNodeDragStart={() => pushHistory()}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
               defaultEdgeOptions={defaultEdgeOptions}
@@ -357,6 +427,30 @@ function BuilderInner({ pipeline, onClose }: Props) {
                   onNewRole={() => setEditorState({})}
                   onEditRole={(role) => setEditorState({ initial: role })}
                 />
+              </Panel>
+              <Panel position="top-right" className="!m-3">
+                <div className="octo-fade-in flex items-center gap-1 rounded-lg border border-octo-hairline bg-octo-panel/95 p-1 backdrop-blur-sm">
+                  <button
+                    type="button"
+                    aria-label="Undo (⌘Z)"
+                    title="Undo (⌘Z)"
+                    disabled={!canUndo(historyRef.current)}
+                    onClick={applyUndo}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass disabled:opacity-30"
+                  >
+                    <Undo2 size={13} strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Redo (⇧⌘Z)"
+                    title="Redo (⇧⌘Z)"
+                    disabled={!canRedo(historyRef.current)}
+                    onClick={applyRedo}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass disabled:opacity-30"
+                  >
+                    <Redo2 size={13} strokeWidth={1.75} />
+                  </button>
+                </div>
               </Panel>
             </ReactFlow>
           </BuilderProvider>

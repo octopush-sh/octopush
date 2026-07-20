@@ -214,3 +214,42 @@ describe("stage dock", () => {
     expect(screen.getByTestId("stage-dock").getAttribute("data-open")).toBe("false");
   });
 });
+
+describe("undo/redo", () => {
+  it("undoes an added node and redoes it", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // Palette click-adds a Plan node (seeded role) on top of the initial implement node.
+    fireEvent.click(screen.getByText("Plan"));
+    // 2-node state → orphan warning readout; 1-node state → "1 stage · ready".
+    // addNode also selects the new node, so the warning renders in both the
+    // footer readout and the (now-open) stage dock — assert at least one.
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/1 stage ·/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(/Redo/));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+  });
+
+  it("⌘Z triggers undo", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan"));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    fireEvent.keyDown(window, { key: "z", metaKey: true });
+    expect(await screen.findByText(/1 stage ·/)).toBeTruthy();
+  });
+
+  it("⌘Z inside a text input is left to the field", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan"));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    const name = screen.getByLabelText("Pipeline name");
+    fireEvent.keyDown(name, { key: "z", metaKey: true });
+    expect(screen.getAllByText(/isn't connected/).length).toBeGreaterThan(0); // graph untouched
+  });
+
+  it("undo buttons disable at the stack ends", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    expect((screen.getByLabelText(/Undo/) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/Redo/) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
