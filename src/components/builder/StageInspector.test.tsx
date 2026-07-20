@@ -63,3 +63,24 @@ describe("StageInspector — escalate on failure", () => {
     expect(group.getAttribute("aria-disabled")).toBe("true");
   });
 });
+
+describe("StageInspector — escalation disclosure", () => {
+  it("collapses escalation by default on an unconfigured stage", () => {
+    renderInspector({ escalateModel: null, escalateEffort: null });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("opens when the stage already has an escalation model", () => {
+    renderInspector({ escalateModel: "claude-opus-4-6" });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("toggles open on click", () => {
+    renderInspector({ escalateModel: null, escalateEffort: null });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+});
