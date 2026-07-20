@@ -267,7 +267,14 @@ function BuilderInner({ pipeline, onClose }: Props) {
         {/* The provider must wrap ReactFlow so the custom node components it
             renders can read validation / selection / the remove handler. */}
         <BuilderProvider
-          value={{ validation: validation.byNode, selectedId, onRemove: removeNode, canRemove: nodes.length > 1 }}
+          value={{
+            validation: validation.byNode,
+            selectedId,
+            onRemove: removeNode,
+            canRemove: nodes.length > 1,
+            // TODO(task 10): wire real disconnect handling; grep for this stub.
+            onDisconnect: () => {},
+          }}
         >
           <ReactFlow<StageNodeT, StageEdge>
             nodes={nodes}

@@ -10,6 +10,8 @@ export interface BuilderCtx {
   /** Remove a stage node (and its edges). Disabled for the last node. */
   onRemove: (id: string) => void;
   canRemove: boolean;
+  /** Disconnect an edge (via its midpoint pill or Backspace once selected). */
+  onDisconnect: (edgeId: string) => void;
 }
 
 const Ctx = createContext<BuilderCtx | null>(null);
