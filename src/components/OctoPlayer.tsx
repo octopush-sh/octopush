@@ -119,7 +119,14 @@ export function OctoPlayer({ identity, active, role, skipBeat }: Props) {
       if (labelSwap) setLabelSwap(false);
       return;
     }
-    if (role.label === label) return;
+    if (role.label === label) {
+      // The role flickered away and back within the 200ms swap window (e.g.
+      // chained Bash commands: Running… → Thinking… → Running…): the pending
+      // swap timer was cleared by this effect's cleanup, so the swap flag
+      // must be released here or the label stays at opacity-0 forever.
+      if (labelSwap) setLabelSwap(false);
+      return;
+    }
     if (!label || reduced) {
       setLabel(role.label);
       setLabelSwap(false);
