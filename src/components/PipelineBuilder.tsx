@@ -99,6 +99,9 @@ function BuilderInner({ pipeline, onClose }: Props) {
   }, []);
   const miniMapShown = canvasWidth >= MINIMAP_MIN_CANVAS;
 
+  const tidyTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (tidyTimer.current !== null) window.clearTimeout(tidyTimer.current); }, []);
+
   const [name, setName] = useState(() =>
     pipeline ? (isBuiltin ? `${pipeline.pipeline.name} (custom)` : pipeline.pipeline.name) : "",
   );
@@ -163,11 +166,13 @@ function BuilderInner({ pipeline, onClose }: Props) {
   }, [applySnapshot]);
 
   const runTidy = useCallback(() => {
+    if (tidyTimer.current !== null) window.clearTimeout(tidyTimer.current);
     pushHistory();
     setTidying(true);
     setNodes((ns) => tidyLayout(ns, edgesRef.current));
     // Let the position transition play, then settle the viewport on the result.
-    window.setTimeout(() => {
+    tidyTimer.current = window.setTimeout(() => {
+      tidyTimer.current = null;
       setTidying(false);
       void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
     }, 300);

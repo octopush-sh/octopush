@@ -672,9 +672,9 @@ button:not(:disabled),
 
 /* Tidy: node moves glide instead of jumping. The class lives only for the
    move's duration, so normal drags stay unanimated. */
-.octo-flow--tidying .react-flow__node {
+.octo-flow--tidying .react-flow__node:not(.dragging) {
   transition: transform var(--dur-standard) var(--ease-octo);
 }
 @media (prefers-reduced-motion: reduce) {
-  .octo-flow--tidying .react-flow__node { transition: none; }
+  .octo-flow--tidying .react-flow__node:not(.dragging) { transition: none; }
 }
