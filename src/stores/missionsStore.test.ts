@@ -102,6 +102,32 @@ describe("missionsStore", () => {
     expect(s.missionByWorkspaceId["w2"]).toBeTruthy();
   });
 
+  it("a stale load that resolves after a newer one does not clobber the newer result", async () => {
+    // Simulate an older request (e.g. a focus-triggered loadAll issued before
+    // a mission was created) that resolves AFTER a fresher one issued later
+    // (e.g. MissionCreator's post-create refresh). The stale response must be
+    // discarded, not applied last-write-wins.
+    let resolveStale: (missions: Mission[]) => void;
+    const stalePromise = new Promise<Mission[]>((resolve) => {
+      resolveStale = resolve;
+    });
+    listMissionsMock.mockReturnValueOnce(stalePromise);
+    const stale = useMissionsStore.getState().load("p1");
+
+    listMissionsMock.mockResolvedValueOnce([mission({ id: "fresh", workspaceId: "w9" })]);
+    const fresh = useMissionsStore.getState().load("p1");
+    await fresh;
+
+    // The stale request resolves last, but should be a no-op.
+    resolveStale!([mission({ id: "old", workspaceId: "w1" })]);
+    await stale;
+
+    const s = useMissionsStore.getState();
+    expect(s.missionsByProjectId["p1"].map((m) => m.id)).toEqual(["fresh"]);
+    expect(s.missionByWorkspaceId["w9"]).toBeTruthy();
+    expect(s.missionByWorkspaceId["w1"]).toBeUndefined();
+  });
+
   it("create calls ipc with the right args then reloads the project", async () => {
     createMissionMock.mockResolvedValue(mission({ id: "new", workspaceId: "w9" }));
     listMissionsMock.mockResolvedValue([mission({ id: "new", workspaceId: "w9" })]);

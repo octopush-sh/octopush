@@ -8,6 +8,7 @@ import { Listbox } from "./controls/Listbox";
 import type { PrInfo } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useMissionsStore } from "../stores/missionsStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
@@ -239,6 +240,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       setCreating(false);
       return;
     }
+    // `create_workspace` creates the mission (intent) server-side as a side
+    // effect but its response only carries the workspace — refresh
+    // missionsStore so the rail resolves this workspace's intent icon right
+    // away instead of waiting for the next mount/focus refresh.
+    useMissionsStore.getState().load(projectId).catch(() => {});
     // Remember the script (possibly empty) as this project's template.
     useCompanionPrefs.getState().setSetupScriptForProject(projectId, setupScript);
     if (linkIssueKeyOnCreate) {

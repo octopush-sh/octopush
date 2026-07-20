@@ -47,12 +47,23 @@ function reindexByWorkspace(byProject: Record<string, Mission[]>): Record<string
   return byWs;
 }
 
+// Concurrent `load`/`loadAll` calls for the same project can resolve out of
+// order (e.g. a focus-triggered `loadAll` issued before a mission's DB commit
+// resolving after a fresher `load` issued right after that commit). Track the
+// most-recently-*issued* request per project so a late-resolving older fetch
+// can't clobber a newer one's result.
+let missionsRequestSeq = 0;
+const latestRequestSeqByProject: Record<string, number> = {};
+
 export const useMissionsStore = create<MissionsState>((set, get) => ({
   missionsByProjectId: {},
   missionByWorkspaceId: {},
 
   async load(projectId) {
+    const requestId = ++missionsRequestSeq;
+    latestRequestSeqByProject[projectId] = requestId;
     const missions = await ipc.listMissions(projectId);
+    if (latestRequestSeqByProject[projectId] !== requestId) return; // superseded by a newer load
     set((state) => {
       const byProject = { ...state.missionsByProjectId, [projectId]: missions };
       return {
@@ -63,12 +74,19 @@ export const useMissionsStore = create<MissionsState>((set, get) => ({
   },
 
   async loadAll(projectIds) {
+    const requestIds = projectIds.map((id) => {
+      const requestId = ++missionsRequestSeq;
+      latestRequestSeqByProject[id] = requestId;
+      return requestId;
+    });
     const results = await Promise.all(
       projectIds.map(async (id) => [id, await ipc.listMissions(id)] as const),
     );
     set((state) => {
       const byProject = { ...state.missionsByProjectId };
-      for (const [id, missions] of results) byProject[id] = missions;
+      results.forEach(([id, missions], i) => {
+        if (latestRequestSeqByProject[id] === requestIds[i]) byProject[id] = missions;
+      });
       return {
         missionsByProjectId: byProject,
         missionByWorkspaceId: reindexByWorkspace(byProject),
