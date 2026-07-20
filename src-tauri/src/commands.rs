@@ -1133,6 +1133,17 @@ pub async fn send_chat_message(
     state: State<'_, AppState>,
     request: crate::chat_engine::ChatRequest,
 ) -> AppResult<()> {
+    // Phase 3 — backend budget enforcement. This is the authoritative gate: it
+    // backstops the client-side pre-send check (which a direct IPC call bypasses)
+    // and additionally enforces PROJECT-scope budgets the client never checks. A
+    // conscious per-turn override skips it.
+    if !request.override_budget {
+        if let crate::db::BudgetVerdict::Block { scope, spent, limit } =
+            state.db.lock().check_budget(Some(&request.workspace_id))?
+        {
+            return Err(AppError::BudgetExceeded { scope, spent, limit });
+        }
+    }
     state.chat.send_agentic(app, request).await
 }
 

@@ -4,6 +4,7 @@ import { ipc } from "../lib/ipc";
 import type { ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
+import { isBudgetExceeded } from "../lib/budgetError";
 import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
 import { deriveChatTitle } from "../lib/chatTitle";
@@ -154,16 +155,25 @@ const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_HISTORY: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 
-/** True when a turn must be blocked for budget — workspace or global cap is
- *  exceeded and no per-turn override is available to consume. Mirrors the gate
- *  inside `send`; shared by regenerate / editAndResend so they can refuse BEFORE
- *  truncating (a blocked action must not delete the rows it can't re-run). */
-function overBudgetBlocked(workspaceId: string): boolean {
+/** The per-turn budget decision. `blocked` → the workspace/global cap is hit and
+ *  no override was available (refuse the turn). `overrode` → the cap was hit but a
+ *  per-turn override was consumed, so the turn proceeds AND the backend gate must
+ *  be skipped for it. Consumes the override when present, so call exactly once per
+ *  turn and thread `overrode` all the way to the IPC. Shared by send / regenerate /
+ *  editAndResend so they can decide BEFORE truncating (a blocked action must not
+ *  delete rows it can't re-run). */
+function budgetGate(workspaceId: string): { blocked: boolean; overrode: boolean } {
   const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
-  if (isOverBudget("workspace", workspaceId) || isOverBudget("global", "")) {
-    return !consumeOverride();
-  }
-  return false;
+  const clientOver = isOverBudget("workspace", workspaceId) || isOverBudget("global", "");
+  // Always consume any active override: it's the user's conscious "spend anyway
+  // for this turn", and it must bypass the BACKEND gate too (which additionally
+  // enforces project-scope budgets the client doesn't track — otherwise clicking
+  // Override on a project-budget block would loop, since the client never sees
+  // itself as over). A no-op when no override is set.
+  const overrode = consumeOverride();
+  // The client fast-path only blocks on what it can see (workspace/global);
+  // anything it misses is caught by the backend gate on the send.
+  return { blocked: clientOver && !overrode, overrode };
 }
 
 /** Whether an event for `threadId` should apply to the workspace's currently
@@ -272,6 +282,8 @@ interface ChatState {
       systemPrompt?: string;
       attachments?: Attachment[];
       regenerate?: boolean;
+      /** The turn's budget override was consumed → tell the backend to skip its gate. */
+      overrideBudget?: boolean;
     },
   ) => Promise<void>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
@@ -286,6 +298,7 @@ interface ChatState {
       systemPrompt?: string;
       attachments?: Attachment[];
       regenerate?: boolean;
+      overrideBudget?: boolean;
     },
   ) => Promise<void>;
   /** Regenerate an assistant turn: drop it (and any trailing tool rows) back to
@@ -742,15 +755,13 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     send: async (workspaceId, workspacePath, content, systemPrompt) => {
-      // ── Budget hard-stop ────────────────────────────────────────
-      const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
-      if (isOverBudget("workspace", workspaceId) || isOverBudget("global", "")) {
-        if (!consumeOverride()) {
-          set((s) => ({
-            errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
-          }));
-          return;
-        }
+      // ── Budget hard-stop (client fast-path; the backend gate is authoritative) ──
+      const gate = budgetGate(workspaceId);
+      if (gate.blocked) {
+        set((s) => ({
+          errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
+        }));
+        return;
       }
 
       // Guarantee a real thread BEFORE persisting, so a fast first-send during
@@ -787,6 +798,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         userMessage: content,
         systemPrompt,
         attachments,
+        overrideBudget: gate.overrode,
       });
     },
 
@@ -815,13 +827,18 @@ export const useChatStore = create<ChatState>((set, get) => {
             ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
             : undefined,
           regenerate: opts.regenerate || undefined,
+          overrideBudget: opts.overrideBudget || undefined,
         });
       } catch (e) {
+        // A backend budget block (e.g. a project cap the client doesn't track, or
+        // a direct-IPC bypass) surfaces as the same cap message + override
+        // affordance as the client gate.
+        const message = isBudgetExceeded(e) ? BUDGET_CAP_MSG : String(e);
         set((s) => ({
           streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
           streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
           streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
-          errorByWs: { ...s.errorByWs, [workspaceId]: String(e) },
+          errorByWs: { ...s.errorByWs, [workspaceId]: message },
           // Restore the staged attachments so a failed turn doesn't lose them.
           attachmentsByWs: attachments.length
             ? { ...s.attachmentsByWs, [workspaceId]: attachments }
@@ -842,7 +859,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     truncateAndRun: async (workspaceId, workspacePath, threadId, cutoffId, opts) => {
       // Budget gate BEFORE truncating — a blocked action must never delete the
       // rows it can't re-run.
-      if (overBudgetBlocked(workspaceId)) {
+      const gate = budgetGate(workspaceId);
+      if (gate.blocked) {
         set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG } }));
         return;
       }
@@ -865,7 +883,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (opts.attachments?.length) {
         set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
       }
-      await get().runTurn(workspaceId, workspacePath, threadId, opts);
+      await get().runTurn(workspaceId, workspacePath, threadId, {
+        ...opts,
+        overrideBudget: gate.overrode,
+      });
     },
 
     regenerate: async (workspaceId, workspacePath, assistantMessageId, systemPrompt) => {
