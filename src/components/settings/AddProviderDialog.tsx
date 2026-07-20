@@ -112,10 +112,15 @@ export function AddProviderDialog({
               <input
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://my-gateway.example.com"
+                placeholder={protocol === "anthropic" ? "https://api.anthropic.com" : "https://api.example.com/v1"}
                 autoFocus
                 className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
+              <p className="mt-1.5 text-[11px] leading-[1.5] text-octo-mute">
+                {protocol === "anthropic"
+                  ? "Requests go to base URL + /v1/messages. For gateways, use their Anthropic root (e.g. https://api.moonshot.ai/anthropic)."
+                  : "Requests go to base URL + /chat/completions. Most providers' base ends in /v1."}
+              </p>
             </div>
           </div>
         )}

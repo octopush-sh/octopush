@@ -267,7 +267,7 @@ Missions are the **first-level unit of intent** (build/fix/review/probe/design/p
 - **Per-message token/cost meta** — Assistant turns show `Nk in · Nk out`, with cost persisted. _Support:_ `ChatMessage.tsx`; `token_engine::compute_cost`.
 - **Token-usage recording** — Every billed turn records into the canonical `spend_events` ledger (surface `'talk'`) so Companion CONTEXT + Settings · Usage update. _Support:_ `token_engine::TokenEngine::record` (takes a `surface`; writes `db::record_token_spend`).
 - **max_tokens truncation recovery** — If truncated mid-tool-use, error `tool_result`s are injected and the loop retries. _Support:_ `send_agentic` MaxTokens branch.
-- **Persisted errors** — Provider/loop errors saved as `role="error"` rows, rendered as a rouge "Something went wrong" block (with "Configure API key" CTA when relevant). _Support:_ `ChatCanvas` `ErrorBlock`.
+- **Persisted errors** — Provider/loop errors saved as `role="error"` rows, rendered as a rouge "Something went wrong" block (with "Configure API key" CTA when relevant). A failed turn shows exactly ONE card: the transient banner is suppressed when the post-failure resync brings in a persisted error row with the same text (chatStore `runTurn` catch). _Support:_ `ChatCanvas` `ErrorBlock`.
 
 ### Tool-call cards (icon + LABEL)
 - **Built-in tools** — `run_command` (bash in workspace dir, 50k truncation, exit-code annotation), `read_file` (100k truncation), `write_file` (creates parent dirs, overwrites), `list_files`. _Support:_ `tool_definitions()` + `execute_tool` (chat_engine).
@@ -704,8 +704,8 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### Provider abstraction & wire protocols
 - **`LlmProvider` trait** — One normalized `complete(api_base, api_key, req, client) -> LlmResponse` so `chat_engine`/`ai_complete`/orchestrator stay provider-agnostic. _Support:_ `providers/mod.rs` (`LlmRequest`, `LlmMessage`, `LlmContent`, `LlmBlock` {Text, Image}, `LlmTool`, `LlmResponse`, `LlmStopReason`).
-- **Anthropic protocol adapter** — POSTs `{base}/v1/messages` with `x-api-key`, `anthropic-version`, output-128k beta; maps tools to `input_schema`, images as base64; parses `usage` incl. cache-read/creation. Requires a key. _Support:_ `providers/anthropic.rs`.
-- **OpenAI-compatible adapter** — POSTs `{base}/chat/completions` with optional `Authorization: Bearer` (skipped when key empty, for Ollama); tools as functions, images as data URLs; parses `tool_calls`, `finish_reason`, `usage`. Covers OpenAI, DeepSeek, Ollama, vllm, llama.cpp, LMStudio, LocalAI. _Support:_ `providers/openai_compat.rs`.
+- **Anthropic protocol adapter** — POSTs `{base}/v1/messages` with `x-api-key`, `anthropic-version`, output-128k beta; the URL join is idempotent (a base already ending in `/v1` or `/v1/messages` never doubles to `/v1/v1/messages`; gateway subpaths like `…/anthropic` are preserved); maps tools to `input_schema`, images as base64; parses `usage` incl. cache-read/creation. Requires a key. _Support:_ `providers/anthropic.rs::messages_url`.
+- **OpenAI-compatible adapter** — POSTs `{base}/chat/completions` with optional `Authorization: Bearer` (skipped when key empty, for Ollama); the URL join is idempotent (a pasted full endpoint isn't doubled); tools as functions, images as data URLs; parses `tool_calls`, `finish_reason`, `usage`. Covers OpenAI, DeepSeek, Ollama, vllm, llama.cpp, LMStudio, LocalAI. _Support:_ `providers/openai_compat.rs::chat_completions_url`.
 - **Rate-limit headroom parsing** — Anthropic remaining-input-tokens + reset → `RateLimitSnapshot` so the agentic loop paces itself. _Support:_ `anthropic.rs::parse_rate_limit`.
 - **Transient-failure retry** — `complete_with_retry` retries only transient errors (429/529/5xx/dropped), honoring `retry-after`; capped exponential backoff (max 60s, `DEFAULT_MAX_RETRIES = 5`), interruptible by a director stop. _Support:_ `providers/mod.rs`.
 
@@ -719,8 +719,8 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### Provider/Model management UI (Settings → Models)
 - **Master-detail editor** — Provider list + detail pane; an "Unsaved changes" bar appears when the working copy diverges; Save validates server-side then read-modify-writes settings.json (merging keys/baseUrls so it doesn't wipe other settings) and re-fetches models. _Support:_ `settings/ModelsPane.tsx`.
-- **Provider detail** — local/cloud tag, API-key field (password + show/hide, hidden for local), Base URL field, Models list (id, $in/out, ctx, Edit/Remove), "Add a model", "Reset to defaults" / "Remove". _Support:_ `ModelsPane.tsx`.
-- **Add a provider (2-step wizard)** — Name, protocol (Anthropic/OpenAI-compatible), "Runs locally" toggle; step 2 base URL. Step indicator is arabic (`1 · 2`), not Roman. _Support:_ `settings/AddProviderDialog.tsx`.
+- **Provider detail** — local/cloud tag, API-key field (password + show/hide, hidden for local), Base URL field with a per-protocol endpoint hint ("Requests go to base URL + /v1/messages" or "+ /chat/completions"), Models list (id, $in/out, ctx, Edit/Remove), "Add a model", "Reset to defaults" / "Remove". _Support:_ `ModelsPane.tsx`.
+- **Add a provider (2-step wizard)** — Name, protocol (Anthropic/OpenAI-compatible), "Runs locally" toggle; step 2 base URL with a per-protocol placeholder + endpoint hint (Anthropic gateways: use the gateway's Anthropic root, e.g. `…/anthropic`). Step indicator is arabic (`1 · 2`), not Roman. _Support:_ `settings/AddProviderDialog.tsx`.
 - **Add/Edit model dialog** — id (dedup-checked), displayName, inputCostPerM, outputCostPerM, maxContext; preserves non-edited fields. _Support:_ `settings/ModelDialog.tsx`.
 - **Remove provider/model confirmation** — Routed through `ConfirmDialog`; removing a provider prunes its keys/baseUrls. _Support:_ `ModelsPane.tsx`.
 - **Pricing refresh footer** — "Pricing · {relative time}" + spin-on-fetch refresh; refuses while there are unsaved edits; "Updated X of Y". _Support:_ `ModelsPane.tsx`.

@@ -676,3 +676,65 @@ describe("chatStore — message actions (regenerate / edit-and-resend)", () => {
     expect(ipc.sendChatMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("chatStore — failed turn surfaces exactly one error", () => {
+  const PROVIDER_ERR =
+    'OpenAI-compat API error 402 Payment Required: {"error":{"message":"Insufficient Balance"}}';
+
+  function mkRow(id: number, role: string, content: string) {
+    return {
+      id, role, content,
+      model: null, inputTokens: null, outputTokens: null, costUsd: null,
+      createdAt: "2026-07-20T10:00:00Z",
+    };
+  }
+
+  beforeEach(() => {
+    resetStore();
+    vi.clearAllMocks();
+    (ipc.listChatThreads as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "t1", workspaceId: "ws-1", title: "New conversation",
+        createdAt: "2026-07-20T09:00:00Z", updatedAt: "2026-07-20T09:00:00Z" },
+    ]);
+  });
+
+  it("suppresses the transient banner when the backend persisted the same error row", async () => {
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(PROVIDER_ERR);
+    // The post-failure resync returns the persisted error as the last row —
+    // rendering the banner too would show the same card twice.
+    (ipc.listChatMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
+      mkRow(1, "user", "hola"),
+      mkRow(2, "error", PROVIDER_ERR),
+    ]);
+
+    await useChatStore.getState().send("ws-1", "/tmp", "hola");
+
+    expect(useChatStore.getState().getError("ws-1")).toBeNull();
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+    // The persisted row is what carries the error into the conversation.
+    const roles = useChatStore.getState().getMessages("ws-1").map((m) => m.role);
+    expect(roles).toEqual(["user", "error"]);
+  });
+
+  it("keeps the banner when the failure was never persisted", async () => {
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce("db locked");
+    (ipc.listChatMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
+      mkRow(1, "user", "hola"),
+    ]);
+
+    await useChatStore.getState().send("ws-1", "/tmp", "hola");
+
+    expect(useChatStore.getState().getError("ws-1")).toBe("db locked");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+  });
+
+  it("keeps the banner when the post-failure resync itself fails", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(PROVIDER_ERR);
+    (ipc.listChatThreads as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("db gone"));
+
+    await useChatStore.getState().send("ws-1", "/tmp", "hola");
+
+    expect(useChatStore.getState().getError("ws-1")).toBe(PROVIDER_ERR);
+  });
+});

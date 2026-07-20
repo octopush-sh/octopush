@@ -32,6 +32,75 @@ fn sample_request() -> LlmRequest {
 }
 
 #[test]
+fn anthropic_messages_url_plain_base() {
+    assert_eq!(
+        anthropic::messages_url("https://api.anthropic.com"),
+        "https://api.anthropic.com/v1/messages"
+    );
+}
+
+#[test]
+fn anthropic_messages_url_trailing_slash() {
+    assert_eq!(
+        anthropic::messages_url("https://api.anthropic.com/"),
+        "https://api.anthropic.com/v1/messages"
+    );
+}
+
+#[test]
+fn anthropic_messages_url_base_already_has_v1() {
+    // Moonshot-style paste: the user copies the OpenAI-flavored base ending in
+    // /v1. Appending another /v1 produced /v1/v1/messages → provider 404.
+    assert_eq!(
+        anthropic::messages_url("https://api.moonshot.ai/v1"),
+        "https://api.moonshot.ai/v1/messages"
+    );
+    assert_eq!(
+        anthropic::messages_url("https://api.moonshot.ai/v1/"),
+        "https://api.moonshot.ai/v1/messages"
+    );
+}
+
+#[test]
+fn anthropic_messages_url_base_is_full_endpoint() {
+    // Pasting the complete endpoint URL must also work.
+    assert_eq!(
+        anthropic::messages_url("https://api.anthropic.com/v1/messages"),
+        "https://api.anthropic.com/v1/messages"
+    );
+}
+
+#[test]
+fn anthropic_messages_url_gateway_subpath_preserved() {
+    // Gateways mount the Anthropic surface under a subpath (e.g. Moonshot's
+    // /anthropic) — that path segment must survive.
+    assert_eq!(
+        anthropic::messages_url("https://api.moonshot.ai/anthropic"),
+        "https://api.moonshot.ai/anthropic/v1/messages"
+    );
+}
+
+#[test]
+fn openai_chat_completions_url_conventional_base() {
+    assert_eq!(
+        openai_compat::chat_completions_url("https://api.openai.com/v1"),
+        "https://api.openai.com/v1/chat/completions"
+    );
+    assert_eq!(
+        openai_compat::chat_completions_url("http://localhost:11434/v1/"),
+        "http://localhost:11434/v1/chat/completions"
+    );
+}
+
+#[test]
+fn openai_chat_completions_url_base_is_full_endpoint() {
+    assert_eq!(
+        openai_compat::chat_completions_url("https://api.openai.com/v1/chat/completions"),
+        "https://api.openai.com/v1/chat/completions"
+    );
+}
+
+#[test]
 fn anthropic_build_request_shape() {
     let body = anthropic::build_request(&sample_request());
     assert_eq!(body["model"], "test-model");

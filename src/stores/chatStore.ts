@@ -838,12 +838,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         // A backend budget block (e.g. a project cap the client doesn't track, or
         // a direct-IPC bypass) surfaces as the same cap message + override
         // affordance as the client gate.
-        const message = isBudgetExceeded(e) ? BUDGET_CAP_MSG : String(e);
+        const errText = isBudgetExceeded(e) ? BUDGET_CAP_MSG : String(e);
         set((s) => ({
           streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
           streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
           streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
-          errorByWs: { ...s.errorByWs, [workspaceId]: message },
           // Restore the staged attachments so a failed turn doesn't lose them.
           attachmentsByWs: attachments.length
             ? { ...s.attachmentsByWs, [workspaceId]: attachments }
@@ -854,7 +853,20 @@ export const useChatStore = create<ChatState>((set, get) => {
         // then failed — without this the UI keeps the optimistically-removed rows
         // out of view while diverging from what's persisted. (For a plain send
         // failure this is a harmless reload of the same rows.)
-        void get().loadHistory(workspaceId);
+        try {
+          await get().loadHistory(workspaceId);
+        } catch {
+          // Resync failed — fall through and show the banner.
+        }
+        // Provider failures are persisted as an "error" row by the backend
+        // before the command rejects; showing the transient banner too would
+        // render the same card twice. Only banner errors the resync didn't
+        // already bring into the conversation.
+        const msgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+        const last = msgs[msgs.length - 1];
+        if (!(last && last.role === "error" && last.content === errText)) {
+          set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: errText } }));
+        }
       }
     },
 

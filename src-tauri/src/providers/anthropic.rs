@@ -25,7 +25,7 @@ impl LlmProvider for AnthropicProvider {
         })?;
 
         let body = build_request(req);
-        let url = format!("{}/v1/messages", api_base.trim_end_matches('/'));
+        let url = messages_url(api_base);
 
         let resp = client
             .post(&url)
@@ -65,6 +65,20 @@ impl LlmProvider for AnthropicProvider {
         parsed.rate_limit = rate_limit;
         Ok(parsed)
     }
+}
+
+/// Resolve the Messages endpoint from a configured base URL. Users paste bases
+/// in several shapes — bare host (`https://api.anthropic.com`), OpenAI-style
+/// with `/v1`, or the full endpoint — so strip a trailing `/v1` or
+/// `/v1/messages` before appending, never producing `/v1/v1/messages`.
+/// Gateway subpaths (e.g. Moonshot's `/anthropic`) are preserved.
+pub fn messages_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    let base = base
+        .strip_suffix("/v1/messages")
+        .or_else(|| base.strip_suffix("/v1"))
+        .unwrap_or(base);
+    format!("{base}/v1/messages")
 }
 
 /// Parse a `retry-after` header (delta-seconds form, per RFC 9110) into a
