@@ -253,3 +253,16 @@ describe("undo/redo", () => {
     expect((screen.getByLabelText(/Redo/) as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+describe("tidy", () => {
+  it("re-lays nodes and is a single undo step", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan")); // 2 nodes now
+    fireEvent.click(screen.getByLabelText(/Tidy layout/));
+    // Undo once: tidy reverted (still 2 nodes). Undo again: back to 1 node.
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0); // 2-node orphan warning
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/1 stage/)).toBeTruthy();
+  });
+});

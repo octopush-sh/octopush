@@ -669,3 +669,12 @@ button:not(:disabled),
   border: 1px solid var(--color-octo-hairline, #2a2419);
   border-radius: 8px;
 }
+
+/* Tidy: node moves glide instead of jumping. The class lives only for the
+   move's duration, so normal drags stay unanimated. */
+.octo-flow--tidying .react-flow__node {
+  transition: transform var(--dur-standard) var(--ease-octo);
+}
+@media (prefers-reduced-motion: reduce) {
+  .octo-flow--tidying .react-flow__node { transition: none; }
+}

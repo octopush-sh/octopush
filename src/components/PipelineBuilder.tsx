@@ -16,7 +16,7 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Undo2, Redo2 } from "lucide-react";
+import { Undo2, Redo2, Network } from "lucide-react";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -37,6 +37,7 @@ import {
   flowAncestors,
   isReviewArchetype,
   stageLabel,
+  tidyLayout,
   type StageNode as StageNodeT,
   type StageEdge,
   type StageNodeData,
@@ -84,6 +85,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const rf = useReactFlow<StageNodeT, StageEdge>();
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
+  const [tidying, setTidying] = useState(false);
 
   // The minimap is a luxury; below this canvas width it yields the corner.
   const MINIMAP_MIN_CANVAS = 560;
@@ -159,6 +161,17 @@ function BuilderInner({ pipeline, onClose }: Props) {
     applySnapshot(r.restored);
     bumpHistory();
   }, [applySnapshot]);
+
+  const runTidy = useCallback(() => {
+    pushHistory();
+    setTidying(true);
+    setNodes((ns) => tidyLayout(ns, edgesRef.current));
+    // Let the position transition play, then settle the viewport on the result.
+    window.setTimeout(() => {
+      setTidying(false);
+      void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
+    }, 300);
+  }, [pushHistory, setNodes, rf]);
 
   const patchData = useCallback(
     (id: string, partial: Partial<StageNodeData>) => {
@@ -366,7 +379,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
       </div>
 
       <div className="flex min-h-0 flex-1">
-        <div ref={wrapperRef} className="octo-flow relative min-h-0 flex-1" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
+        <div ref={wrapperRef} className={`octo-flow relative min-h-0 flex-1 ${tidying ? "octo-flow--tidying" : ""}`} onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
           {/* The provider must wrap ReactFlow so the custom node components it
               renders can read validation / selection / the remove handler. */}
           <BuilderProvider
@@ -449,6 +462,15 @@ function BuilderInner({ pipeline, onClose }: Props) {
                     className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass disabled:opacity-30"
                   >
                     <Redo2 size={13} strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Tidy layout"
+                    title="Tidy layout — arrange stages on a clean grid"
+                    onClick={runTidy}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                  >
+                    <Network size={13} strokeWidth={1.75} />
                   </button>
                 </div>
               </Panel>
