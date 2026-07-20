@@ -1,4 +1,4 @@
-import { Lock, Pencil, Plus } from "lucide-react";
+import { ChevronsDownUp, ChevronsUpDown, Lock, Pencil, Plus } from "lucide-react";
 import { useRolesStore } from "../../stores/rolesStore";
 import type { Role } from "../../lib/ipc";
 import { archetypes } from "./graph";
@@ -7,6 +7,10 @@ import { iconForRole } from "../../lib/roleIcons";
 export const ARCHETYPE_DND_MIME = "application/octopush-archetype";
 
 interface Props {
+  /** Whether the palette is expanded (parent-owned so state survives re-renders). */
+  open: boolean;
+  /** Toggles the palette open/closed. */
+  onToggle: () => void;
   /** Click-to-add fallback (drag-and-drop is the primary gesture). */
   onAdd: (role: string) => void;
   /** Opens the Role Editor to create a new role. */
@@ -31,9 +35,24 @@ function groupFor(role: string, environment: string, isBuiltin: boolean): GroupN
 /** The well of stage archetypes. Drag one onto the canvas, or click to drop it
  *  at the center. Built-in roles are marked with a lock; custom roles show a
  *  "custom" badge. Groups: Plan & design / Build / Review / Action / Your roles. */
-export function NodePalette({ onAdd, onNewRole, onEditRole }: Props) {
+export function NodePalette({ open, onToggle, onAdd, onNewRole, onEditRole }: Props) {
   const { roles, loaded } = useRolesStore();
   const all = archetypes();
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        aria-label="Show stage palette"
+        title="Show stage palette"
+        onClick={onToggle}
+        className="octo-fade-in flex items-center gap-1.5 rounded-lg border border-octo-hairline bg-octo-panel/95 px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass backdrop-blur-sm transition-colors duration-[150ms] hover:bg-[var(--brass-ghost)]"
+      >
+        Stages
+        <ChevronsUpDown size={11} strokeWidth={1.75} />
+      </button>
+    );
+  }
 
   // Build grouped list. When roles are not yet loaded we render a placeholder.
   const grouped: Record<GroupName, typeof all> = {
@@ -56,14 +75,25 @@ export function NodePalette({ onAdd, onNewRole, onEditRole }: Props) {
 
   return (
     <div className="octo-fade-in flex w-[188px] flex-col gap-1 rounded-lg border border-octo-hairline bg-octo-panel/95 p-2 backdrop-blur-sm">
-      <p className="px-1 pb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">Stages</p>
+      <div className="flex items-center justify-between px-1 pb-1">
+        <p className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">Stages</p>
+        <button
+          type="button"
+          aria-label="Hide stage palette"
+          title="Hide stage palette"
+          onClick={onToggle}
+          className="flex h-5 w-5 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-brass"
+        >
+          <ChevronsDownUp size={11} strokeWidth={1.75} />
+        </button>
+      </div>
 
       {!loaded && (
         <p className="px-2 py-2 font-mono text-[10px] text-octo-mute">Loading roles…</p>
       )}
 
       {loaded && (
-        <div className="flex max-h-[56vh] flex-col gap-0.5 overflow-y-auto">
+        <div className="flex max-h-[min(48vh,420px)] flex-col gap-0.5 overflow-y-auto">
           {GROUP_ORDER.map((group) => {
             const items = grouped[group];
             if (items.length === 0) return null;

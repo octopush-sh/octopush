@@ -624,6 +624,29 @@ button:not(:disabled),
   stroke-width: 1.5;
 }
 
+/* Edge strokes are CSS-owned so interaction states can restyle them.
+   Wrapper classes .react-flow__edge-flow / -loop derive from the edge `type`. */
+.octo-flow .react-flow__edge { cursor: pointer; }
+.octo-flow .react-flow__edge .react-flow__edge-path {
+  stroke: var(--brass-rule-dim);
+  stroke-width: 1.5;
+  transition: stroke var(--dur-quick) var(--ease-octo);
+}
+.octo-flow .react-flow__edge-loop .react-flow__edge-path {
+  stroke: var(--brass-dim);
+  stroke-dasharray: 4 4;
+}
+.octo-flow .react-flow__edge:hover .react-flow__edge-path { stroke: var(--brass-line); }
+.octo-flow .react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-octo-brass, #d4a574); }
+
+/* Forgiving grab target around the 9px handles (the visual stays 9px). */
+.octo-flow .react-flow__handle::after {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 9999px;
+}
+
 .octo-flow .react-flow__controls {
   box-shadow: none;
   border: 1px solid var(--color-octo-hairline, #2a2419);
@@ -647,4 +670,11 @@ button:not(:disabled),
   border-radius: 8px;
 }
 
-.octo-flow .react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-octo-brass, #d4a574); }
+/* Tidy: node moves glide instead of jumping. The class lives only for the
+   move's duration, so normal drags stay unanimated. */
+.octo-flow--tidying .react-flow__node:not(.dragging) {
+  transition: transform var(--dur-standard) var(--ease-octo);
+}
+@media (prefers-reduced-motion: reduce) {
+  .octo-flow--tidying .react-flow__node:not(.dragging) { transition: none; }
+}

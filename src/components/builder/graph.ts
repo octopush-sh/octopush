@@ -255,6 +255,78 @@ export function flowAncestors(nodeId: string, flow: StageEdge[]): Set<string> {
   return seen;
 }
 
+/** May `oldEdge` be re-routed to `conn`? Mirrors the onConnect guards (no
+ *  self-links, no duplicates, no cycles) with the old edge excluded from every
+ *  check — a re-route can never cycle through the edge it replaces, since that
+ *  edge no longer exists once the reconnect lands; loop edges keep their
+ *  review end and may only return to one of the review's flow-ancestors. */
+export function reconnectAllowed(
+  oldEdge: StageEdge,
+  conn: { source: string; target: string },
+  edges: StageEdge[],
+): boolean {
+  if (!conn.source || !conn.target || conn.source === conn.target) return false;
+  const others = edges.filter((e) => e.id !== oldEdge.id);
+  const flow = others.filter((e) => (e.data?.kind ?? "flow") === "flow");
+
+  if ((oldEdge.data?.kind ?? "flow") === "flow") {
+    if (flow.some((e) => e.source === conn.source && e.target === conn.target)) return false;
+    return !flowAncestors(conn.source, flow).has(conn.target);
+  }
+
+  // Loop: the review keeps ownership; only the return target may move.
+  if (conn.source !== oldEdge.source) return false;
+  if (others.some((e) => e.data?.kind === "loop" && e.source === conn.source && e.target === conn.target)) return false;
+  return flowAncestors(conn.source, flow).has(conn.target);
+}
+
+// ─── Tidy auto-layout ────────────────────────────────────────────────────────
+
+export const TIDY_ROW_GAP = 150;
+export const TIDY_COL_GAP = 260;
+
+/** Re-lay the graph on a layered grid: depth = longest flow path from an entry
+ *  node, one row per depth (top→bottom), and within a row nodes keep their
+ *  current left-to-right order so the author's intent survives. A cyclic flow
+ *  returns the nodes untouched (validation already blocks save on cycles). */
+export function tidyLayout(nodes: StageNode[], edges: StageEdge[]): StageNode[] {
+  const flow = edges.filter((e) => (e.data?.kind ?? "flow") === "flow");
+  let ordered: StageNode[];
+  try {
+    ordered = topoOrder(nodes, flow);
+  } catch {
+    return nodes;
+  }
+
+  const parentsOf = new Map<string, string[]>();
+  for (const e of flow) {
+    if (!parentsOf.has(e.target)) parentsOf.set(e.target, []);
+    parentsOf.get(e.target)!.push(e.source);
+  }
+  // `ordered` is topological, so every parent's depth is known before its child.
+  const depth = new Map<string, number>();
+  for (const n of ordered) {
+    const ps = parentsOf.get(n.id) ?? [];
+    depth.set(n.id, ps.length === 0 ? 0 : Math.max(...ps.map((p) => (depth.get(p) ?? 0) + 1)));
+  }
+
+  const rows = new Map<number, StageNode[]>();
+  for (const n of nodes) {
+    const d = depth.get(n.id) ?? 0;
+    if (!rows.has(d)) rows.set(d, []);
+    rows.get(d)!.push(n);
+  }
+
+  const placed = new Map<string, { x: number; y: number }>();
+  for (const [d, row] of rows) {
+    row.sort((a, b) => a.position.x - b.position.x || (a.id < b.id ? -1 : 1));
+    row.forEach((n, i) => {
+      placed.set(n.id, { x: (i - (row.length - 1) / 2) * TIDY_COL_GAP, y: d * TIDY_ROW_GAP });
+    });
+  }
+  return nodes.map((n) => ({ ...n, position: placed.get(n.id) ?? n.position }));
+}
+
 // ─── Compile ⇄ load ──────────────────────────────────────────────────────────
 
 /** Compile the canvas graph into the backend's position-based stage drafts.

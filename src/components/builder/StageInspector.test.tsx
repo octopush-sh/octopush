@@ -46,6 +46,7 @@ describe("StageInspector — escalate on failure", () => {
 
   it("round-trips the escalate effort on an API stage", () => {
     const onPatch = renderInspector({ substrate: "api", escalateEffort: null });
+    fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     fireEvent.click(within(group).getByText("High"));
     expect(onPatch).toHaveBeenCalledWith({ escalateEffort: "high" });
@@ -59,7 +60,29 @@ describe("StageInspector — escalate on failure", () => {
 
   it("disables the escalate-effort control for a CLI stage (effort is API-only)", () => {
     renderInspector({ substrate: "cli" });
+    fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     expect(group.getAttribute("aria-disabled")).toBe("true");
+  });
+});
+
+describe("StageInspector — escalation disclosure", () => {
+  it("collapses escalation by default on an unconfigured stage", () => {
+    renderInspector({ escalateModel: null, escalateEffort: null });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("opens when the stage already has an escalation model", () => {
+    renderInspector({ escalateModel: "claude-opus-4-6" });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("toggles open on click", () => {
+    renderInspector({ escalateModel: null, escalateEffort: null });
+    const toggle = screen.getByRole("button", { name: /escalate on failure/i });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
   });
 });

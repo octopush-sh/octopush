@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -16,6 +16,7 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { Undo2, Redo2, Network, X } from "lucide-react";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -36,10 +37,21 @@ import {
   flowAncestors,
   isReviewArchetype,
   stageLabel,
+  tidyLayout,
+  reconnectAllowed,
   type StageNode as StageNodeT,
   type StageEdge,
   type StageNodeData,
 } from "./builder/graph";
+import {
+  createHistory,
+  pushSnapshot,
+  undo as undoHistory,
+  redo as redoHistory,
+  canUndo,
+  canRedo,
+  type GraphSnapshot,
+} from "./builder/history";
 
 const nodeTypes = { stage: StageNode };
 const edgeTypes = { flow: FlowEdge, loop: LoopEdge };
@@ -73,6 +85,23 @@ function BuilderInner({ pipeline, onClose }: Props) {
   }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const [paletteOpen, setPaletteOpen] = useState(true);
+  const [tidying, setTidying] = useState(false);
+
+  // The minimap is a luxury; below this canvas width it yields the corner.
+  const MINIMAP_MIN_CANVAS = 560;
+  const [canvasWidth, setCanvasWidth] = useState(Number.POSITIVE_INFINITY);
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => setCanvasWidth(entries[0].contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const miniMapShown = canvasWidth >= MINIMAP_MIN_CANVAS;
+
+  const tidyTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (tidyTimer.current !== null) window.clearTimeout(tidyTimer.current); }, []);
 
   const [name, setName] = useState(() =>
     pipeline ? (isBuiltin ? `${pipeline.pipeline.name} (custom)` : pipeline.pipeline.name) : "",
@@ -94,19 +123,82 @@ function BuilderInner({ pipeline, onClose }: Props) {
 
   const validation = useMemo(() => validateGraph(nodes, edges), [nodes, edges]);
 
+  // Latest graph refs so history callbacks never capture stale state.
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
+
+  const historyRef = useRef(createHistory());
+  const [, bumpHistory] = useReducer((c: number) => c + 1, 0);
+
+  const pushHistory = useCallback((key: string | null = null) => {
+    historyRef.current = pushSnapshot(
+      historyRef.current,
+      { nodes: nodesRef.current, edges: edgesRef.current },
+      key,
+    );
+    bumpHistory();
+  }, []);
+
+  const applySnapshot = useCallback(
+    (snap: GraphSnapshot) => {
+      // Snapshots capture xyflow's internal `selected` flag along with the
+      // node/edge data. Restoring it verbatim can silently re-select a node
+      // that isn't reflected in `selectedId` (the brass ring keys off
+      // `selectedId`, not `selected`) — a later Backspace would then delete
+      // an invisibly-selected node. Strip the flag on restore.
+      setNodes(snap.nodes.map((n) => ({ ...n, selected: false })));
+      setEdges(snap.edges.map((e) => ({ ...e, selected: false })));
+      setSelectedId((id) => (id && snap.nodes.some((n) => n.id === id) ? id : null));
+    },
+    [setNodes, setEdges],
+  );
+
+  const applyUndo = useCallback(() => {
+    const r = undoHistory(historyRef.current, { nodes: nodesRef.current, edges: edgesRef.current });
+    if (!r) return;
+    historyRef.current = r.stack;
+    applySnapshot(r.restored);
+    bumpHistory();
+  }, [applySnapshot]);
+
+  const applyRedo = useCallback(() => {
+    const r = redoHistory(historyRef.current, { nodes: nodesRef.current, edges: edgesRef.current });
+    if (!r) return;
+    historyRef.current = r.stack;
+    applySnapshot(r.restored);
+    bumpHistory();
+  }, [applySnapshot]);
+
+  const runTidy = useCallback(() => {
+    if (tidyTimer.current !== null) window.clearTimeout(tidyTimer.current);
+    pushHistory();
+    setTidying(true);
+    setNodes((ns) => tidyLayout(ns, edgesRef.current));
+    // Let the position transition play, then settle the viewport on the result.
+    tidyTimer.current = window.setTimeout(() => {
+      tidyTimer.current = null;
+      setTidying(false);
+      void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
+    }, 300);
+  }, [pushHistory, setNodes, rf]);
+
   const patchData = useCallback(
     (id: string, partial: Partial<StageNodeData>) => {
+      pushHistory(`patch:${id}:${Object.keys(partial).sort().join("+")}`);
       setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...partial } } : n)));
       // Changing a stage out of a review archetype strips its now-invalid loop.
       if (partial.role !== undefined && !isReviewArchetype(partial.role)) {
         setEdges((es) => es.filter((e) => !(e.data?.kind === "loop" && e.source === id)));
       }
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, pushHistory],
   );
 
   const addNode = useCallback(
     (role: string, position?: { x: number; y: number }) => {
+      pushHistory();
       const pos =
         position ??
         (() => {
@@ -120,7 +212,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
       setNodes((ns) => ns.concat(node));
       setSelectedId(node.id);
     },
-    [rf, setNodes],
+    [rf, setNodes, pushHistory],
   );
 
   const onConnect = useCallback(
@@ -138,9 +230,10 @@ function BuilderInner({ pipeline, onClose }: Props) {
         type: "flow",
         data: { kind: "flow" },
       };
+      pushHistory();
       setEdges((es) => es.concat(edge));
     },
-    [edges, setEdges],
+    [edges, setEdges, pushHistory],
   );
 
   const onDrop = useCallback(
@@ -160,13 +253,56 @@ function BuilderInner({ pipeline, onClose }: Props) {
     [rf],
   );
 
+  const onDisconnectEdge = useCallback(
+    (edgeId: string) => {
+      pushHistory();
+      setEdges((es) => es.filter((e) => e.id !== edgeId));
+    },
+    [pushHistory, setEdges],
+  );
+
+  // Reconnect drag: drop on a handle re-routes (guarded), drop on the pane deletes.
+  const reconnectOk = useRef(true);
+  const onReconnectStart = useCallback(() => {
+    reconnectOk.current = false;
+  }, []);
+  const onReconnect = useCallback(
+    (oldEdge: StageEdge, conn: Connection) => {
+      reconnectOk.current = true;
+      if (!conn.source || !conn.target) return;
+      if (oldEdge.source === conn.source && oldEdge.target === conn.target) return;
+      if (!reconnectAllowed(oldEdge, { source: conn.source, target: conn.target }, edgesRef.current)) return;
+      pushHistory();
+      const prefix = oldEdge.data?.kind === "loop" ? "l" : "f";
+      setEdges((es) =>
+        es.map((e) =>
+          e.id === oldEdge.id
+            ? { ...e, id: `${prefix}-${conn.source}-${conn.target}`, source: conn.source!, target: conn.target! }
+            : e,
+        ),
+      );
+    },
+    [pushHistory, setEdges],
+  );
+  const onReconnectEnd = useCallback(
+    (_: MouseEvent | TouchEvent, edge: StageEdge) => {
+      if (!reconnectOk.current) {
+        pushHistory();
+        setEdges((es) => es.filter((e) => e.id !== edge.id));
+      }
+      reconnectOk.current = true;
+    },
+    [pushHistory, setEdges],
+  );
+
   // Guard the last node: a pipeline must keep at least one stage.
   const onBeforeDelete: OnBeforeDelete<StageNodeT, StageEdge> = useCallback(
     async ({ nodes: toDelete }) => {
       if (toDelete.length > 0 && nodes.length - toDelete.length < 1) return false;
+      pushHistory();
       return true;
     },
-    [nodes.length],
+    [nodes.length, pushHistory],
   );
 
   const onNodesDelete = useCallback(
@@ -177,6 +313,14 @@ function BuilderInner({ pipeline, onClose }: Props) {
   );
 
   const selectedNode = nodes.find((n) => n.id === selectedId) ?? null;
+
+  // The dock keeps its content mounted through the close animation; the
+  // rendered node lags selection by one width transition when closing.
+  const [dockNode, setDockNode] = useState<StageNodeT | null>(null);
+  useEffect(() => {
+    if (selectedNode) setDockNode(selectedNode);
+  }, [selectedNode]);
+  const dockOpen = selectedNode !== null;
 
   // The selected review stage's loop, derived from its loop edge.
   const loopEdgeForSelected = selectedId
@@ -201,17 +345,46 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const setLoop = useCallback(
     (next: LoopState) => {
       if (!selectedId) return;
+      pushHistory(`loop:${selectedId}`);
       setEdges((es) => {
         const withoutLoop = es.filter((e) => !(e.data?.kind === "loop" && e.source === selectedId));
         if (!next.target) return withoutLoop;
         return withoutLoop.concat(loopEdge(selectedId, next.target, next.max, next.mode));
       });
     },
-    [selectedId, setEdges],
+    [selectedId, setEdges, pushHistory],
   );
+
+  // Escape closes the dock — but not while the Role Editor modal is up;
+  // ModalShell owns Escape there. Also handles ⌘Z/⇧⌘Z, suppressed while typing.
+  const editorOpenRef = useRef(false);
+  editorOpenRef.current = editorState !== null;
+  useEffect(() => {
+    const isEditable = (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !editorOpenRef.current) {
+        setSelectedId(null);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !isEditable(e.target)) {
+        e.preventDefault();
+        if (e.shiftKey) applyRedo();
+        else applyUndo();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [applyUndo, applyRedo]);
 
   const firstBlocking = validation.blocking[0]?.message ?? null;
   const warnCount = validation.warnings.length;
+
+  const HINT_KEY = "octo.builder.hint.connect";
+  const [hintDismissed, setHintDismissed] = useState(() => localStorage.getItem(HINT_KEY) === "1");
+  const hasFlowEdges = edges.some((e) => (e.data?.kind ?? "flow") === "flow");
+  const hintVisible = !hintDismissed && nodes.length >= 2 && !hasFlowEdges;
 
   const onSave = async () => {
     setSaving(true);
@@ -263,65 +436,166 @@ function BuilderInner({ pipeline, onClose }: Props) {
         />
       </div>
 
-      <div ref={wrapperRef} className="octo-flow relative min-h-0 flex-1" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
-        {/* The provider must wrap ReactFlow so the custom node components it
-            renders can read validation / selection / the remove handler. */}
-        <BuilderProvider
-          value={{ validation: validation.byNode, selectedId, onRemove: removeNode, canRemove: nodes.length > 1 }}
-        >
-          <ReactFlow<StageNodeT, StageEdge>
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onBeforeDelete={onBeforeDelete}
-            onNodesDelete={onNodesDelete}
-            onNodeClick={(_, n) => setSelectedId(n.id)}
-            onPaneClick={() => setSelectedId(null)}
-            nodeTypes={nodeTypes}
-            edgeTypes={edgeTypes}
-            defaultEdgeOptions={defaultEdgeOptions}
-            minZoom={0.4}
-            maxZoom={1.75}
-            fitView
-            fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
-            proOptions={{ hideAttribution: true }}
-            className="bg-transparent"
+      <div className="flex min-h-0 flex-1">
+        <div ref={wrapperRef} className={`octo-flow relative min-h-0 flex-1 ${tidying ? "octo-flow--tidying" : ""}`} onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
+          {/* The provider must wrap ReactFlow so the custom node components it
+              renders can read validation / selection / the remove handler. */}
+          <BuilderProvider
+            value={{
+              validation: validation.byNode,
+              selectedId,
+              onRemove: removeNode,
+              canRemove: nodes.length > 1,
+              onDisconnect: onDisconnectEdge,
+            }}
           >
-            <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
-            <Controls showInteractive={false} className="octo-flow-controls" />
-            <MiniMap
-              pannable
-              zoomable
-              className="octo-flow-minimap"
-              maskColor={`${tokens.onyx}b8`}
-              nodeColor={() => tokens.hairline}
-              nodeStrokeColor={() => tokens.brassDim}
-            />
-            <Panel position="top-left">
-              <NodePalette
-                onAdd={addNode}
-                onNewRole={() => setEditorState({})}
-                onEditRole={(role) => setEditorState({ initial: role })}
+            <ReactFlow<StageNodeT, StageEdge>
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onReconnect={onReconnect}
+              onReconnectStart={onReconnectStart}
+              onReconnectEnd={onReconnectEnd}
+              onBeforeDelete={onBeforeDelete}
+              onNodesDelete={onNodesDelete}
+              onNodeClick={(_, n) => setSelectedId(n.id)}
+              onPaneClick={() => setSelectedId(null)}
+              onNodeDragStart={() => pushHistory()}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              defaultEdgeOptions={defaultEdgeOptions}
+              deleteKeyCode={["Backspace", "Delete"]}
+              minZoom={0.4}
+              maxZoom={1.75}
+              fitView
+              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              proOptions={{ hideAttribution: true }}
+              className="bg-transparent"
+            >
+              <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--brass-faint)" />
+              <Controls
+                showInteractive={false}
+                position="bottom-right"
+                className={`octo-flow-controls !mr-4 transition-[margin] duration-[280ms] ${
+                  miniMapShown ? "!mb-[178px]" : "!mb-4"
+                }`}
               />
-            </Panel>
-            {selectedNode && (
-              <Panel position="top-right" className="!m-3 max-h-[calc(100%-1.5rem)]">
-                <StageInspector
-                  key={selectedNode.id}
-                  node={selectedNode}
-                  ancestors={loopTargets}
-                  loop={loopState}
-                  issue={validation.byNode[selectedNode.id]}
-                  onPatch={(p) => patchData(selectedNode.id, p)}
-                  onSetLoop={setLoop}
-                  onClose={() => setSelectedId(null)}
+              <MiniMap
+                pannable
+                zoomable
+                position="bottom-right"
+                className={`octo-flow-minimap !m-4 transition-opacity duration-[220ms] ${
+                  miniMapShown ? "" : "pointer-events-none opacity-0"
+                }`}
+                maskColor={`${tokens.onyx}b8`}
+                nodeColor={() => tokens.hairline}
+                nodeStrokeColor={() => tokens.brassDim}
+              />
+              <Panel position="top-left">
+                <NodePalette
+                  open={paletteOpen}
+                  onToggle={() => setPaletteOpen((v) => !v)}
+                  onAdd={addNode}
+                  onNewRole={() => setEditorState({})}
+                  onEditRole={(role) => setEditorState({ initial: role })}
                 />
               </Panel>
-            )}
-          </ReactFlow>
-        </BuilderProvider>
+              <Panel position="top-right" className="!m-3">
+                <div className="octo-fade-in flex items-center gap-1 rounded-lg border border-octo-hairline bg-octo-panel/95 p-1 backdrop-blur-sm">
+                  <button
+                    type="button"
+                    aria-label="Undo (⌘Z)"
+                    title="Undo (⌘Z)"
+                    disabled={!canUndo(historyRef.current)}
+                    onClick={applyUndo}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass disabled:opacity-30"
+                  >
+                    <Undo2 size={13} strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Redo (⇧⌘Z)"
+                    title="Redo (⇧⌘Z)"
+                    disabled={!canRedo(historyRef.current)}
+                    onClick={applyRedo}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass disabled:opacity-30"
+                  >
+                    <Redo2 size={13} strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Tidy layout"
+                    title="Tidy layout — arrange stages on a clean grid"
+                    onClick={runTidy}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                  >
+                    <Network size={13} strokeWidth={1.75} />
+                  </button>
+                </div>
+              </Panel>
+              <Panel position="bottom-center" className="!mb-4">
+                <div
+                  data-testid="connect-hint"
+                  aria-hidden={!hintVisible}
+                  inert={!hintVisible}
+                  className={`flex items-center gap-2 rounded-full border border-octo-hairline bg-octo-panel/95 px-3 py-1.5 font-mono text-[10px] text-octo-sage backdrop-blur-sm transition-opacity duration-[220ms] ${
+                    hintVisible ? "" : "pointer-events-none opacity-0"
+                  }`}
+                >
+                  Drag from a stage's edge to connect it
+                  <button
+                    type="button"
+                    aria-label="Dismiss hint"
+                    title="Dismiss"
+                    onClick={() => {
+                      localStorage.setItem(HINT_KEY, "1");
+                      setHintDismissed(true);
+                    }}
+                    className="flex h-4 w-4 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-ivory"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              </Panel>
+            </ReactFlow>
+          </BuilderProvider>
+        </div>
+
+        {/* Stage dock — outside the flow's overflow, so it can never clip. */}
+        <div
+          data-testid="stage-dock"
+          data-open={dockOpen}
+          aria-hidden={!dockOpen}
+          onTransitionEnd={(e) => {
+            // `transitionend` bubbles from child transitions (e.g. the 150ms
+            // hover-color transition on the inspector's close button), which
+            // can unmount the dock's content mid-close. Only react to the
+            // dock's own width transition.
+            if (e.target === e.currentTarget && e.propertyName === "width" && !dockOpen) {
+              setDockNode(null);
+            }
+          }}
+          className={`shrink-0 overflow-hidden border-l bg-octo-panel transition-[width,border-color] duration-[280ms] ease-[var(--ease-octo)] ${
+            dockOpen ? "w-[320px] border-octo-hairline" : "w-0 border-transparent"
+          }`}
+        >
+          {dockNode && (
+            <div className="h-full w-[320px]" inert={!dockOpen}>
+              <StageInspector
+                key={dockNode.id}
+                node={dockNode}
+                ancestors={loopTargets}
+                loop={loopState}
+                issue={validation.byNode[dockNode.id]}
+                onPatch={(p) => patchData(dockNode.id, p)}
+                onSetLoop={setLoop}
+                onClose={() => setSelectedId(null)}
+              />
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center gap-3 border-t border-octo-hairline bg-octo-panel px-8 py-3">

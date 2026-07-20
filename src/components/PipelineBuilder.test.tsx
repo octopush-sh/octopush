@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 // @xyflow/react can't lay out / measure in jsdom, so stub it to a thin shell.
 // The builder's logic we care about (graph → drafts on save, header, save bar,
@@ -12,16 +12,28 @@ vi.mock("@xyflow/react", async () => {
   return {
     // Render the real custom node components through nodeTypes so a node that
     // reads context (useBuilder) is exercised — catches provider-scope bugs.
-    ReactFlow: ({ children, nodes, nodeTypes }: any) =>
-      React.createElement(
+    ReactFlow: (props: any) => {
+      const { children, nodes, nodeTypes, edges, edgeTypes, onNodeClick } = props;
+      return React.createElement(
         "div",
         { "data-testid": "flow" },
+        React.createElement("button", {
+          "data-testid": "flow-node-select",
+          onClick: () => nodes?.[0] && onNodeClick?.({}, nodes[0]),
+        }),
         (nodes ?? []).map((n: any) => {
           const Comp = nodeTypes?.[n.type];
           return Comp ? React.createElement(Comp, { key: n.id, id: n.id, data: n.data, selected: false }) : null;
         }),
+        (edges ?? []).map((e: any) => {
+          const Comp = edgeTypes?.[e.type];
+          return Comp
+            ? React.createElement(Comp, { key: e.id, id: e.id, data: e.data, selected: true, sourceX: 0, sourceY: 0, targetX: 0, targetY: 0, sourcePosition: "bottom", targetPosition: "top" })
+            : null;
+        }),
         children,
-      ),
+      );
+    },
     ReactFlowProvider: Frag,
     Background: () => null,
     BackgroundVariant: { Dots: "dots" },
@@ -178,5 +190,121 @@ describe("PipelineBuilder (node canvas)", () => {
     fireEvent.click(screen.getByRole("button", { name: /Confirm delete/ }));
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("p2"));
     expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe("palette collapse", () => {
+  it("collapses to a pill and back", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText("Hide stage palette"));
+    expect(screen.queryByText("Plan & design")).toBeNull();
+    fireEvent.click(screen.getByLabelText("Show stage palette"));
+    expect(screen.getByText("Plan & design")).toBeTruthy();
+  });
+});
+
+describe("stage dock", () => {
+  it("renders the inspector outside the flow canvas, inside the dock region", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // A fresh pipeline seeds one implement node; select it through the canvas.
+    fireEvent.click(screen.getByTestId("flow-node-select")); // helper added below
+    const dock = screen.getByTestId("stage-dock");
+    expect(within(dock).getByLabelText("Stage name")).toBeTruthy();
+    const flow = screen.getByTestId("flow");
+    expect(within(flow).queryByLabelText("Stage name")).toBeNull();
+  });
+
+  it("Escape closes the dock", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("flow-node-select"));
+    expect(screen.getByTestId("stage-dock").getAttribute("data-open")).toBe("true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("stage-dock").getAttribute("data-open")).toBe("false");
+  });
+});
+
+describe("undo/redo", () => {
+  it("undoes an added node and redoes it", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // Palette click-adds a Plan node (seeded role) on top of the initial implement node.
+    fireEvent.click(screen.getByText("Plan"));
+    // 2-node state → orphan warning readout; 1-node state → "1 stage · ready".
+    // addNode also selects the new node, so the warning renders in both the
+    // footer readout and the (now-open) stage dock — assert at least one.
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/1 stage ·/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(/Redo/));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+  });
+
+  it("⌘Z triggers undo", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan"));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    fireEvent.keyDown(window, { key: "z", metaKey: true });
+    expect(await screen.findByText(/1 stage ·/)).toBeTruthy();
+  });
+
+  it("⌘Z inside a text input is left to the field", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan"));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0);
+    const name = screen.getByLabelText("Pipeline name");
+    fireEvent.keyDown(name, { key: "z", metaKey: true });
+    expect(screen.getAllByText(/isn't connected/).length).toBeGreaterThan(0); // graph untouched
+  });
+
+  it("undo buttons disable at the stack ends", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    expect((screen.getByLabelText(/Undo/) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/Redo/) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("tidy", () => {
+  it("re-lays nodes and is a single undo step", async () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("Plan")); // 2 nodes now
+    fireEvent.click(screen.getByLabelText(/Tidy layout/));
+    // Undo once: tidy reverted (still 2 nodes). Undo again: back to 1 node.
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0); // 2-node orphan warning
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/1 stage/)).toBeTruthy();
+  });
+});
+
+describe("hint chip", () => {
+  beforeEach(() => localStorage.removeItem("octo.builder.hint.connect"));
+
+  it("appears with ≥2 nodes and no connections, and dismisses persistently", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // 1 node → hidden (opacity-0 shell)
+    expect(screen.getByTestId("connect-hint").className).toContain("opacity-0");
+    fireEvent.click(screen.getByText("Plan")); // 2 nodes, 0 edges → visible
+    expect(screen.getByTestId("connect-hint").className).not.toContain("opacity-0");
+    fireEvent.click(screen.getByLabelText("Dismiss hint"));
+    expect(screen.getByTestId("connect-hint").className).toContain("opacity-0");
+    expect(localStorage.getItem("octo.builder.hint.connect")).toBe("1");
+  });
+});
+
+describe("edge disconnect wiring", () => {
+  it("onDisconnect removes the edge and records history", async () => {
+    // Load a 2-stage pipeline WITH an edge, disconnect via context, undo restores it.
+    const pipeline = {
+      pipeline: { id: "p1", name: "P", description: "", isBuiltin: false },
+      stages: [
+        { position: 0, role: "plan", agentModel: "m", substrate: "api", checkpoint: false, maxIterations: 10, parents: [], posX: 0, posY: 0 },
+        { position: 1, role: "implement", agentModel: "m", substrate: "api", checkpoint: false, maxIterations: 10, parents: [0], posX: 0, posY: 150 },
+      ],
+    } as any;
+    render(<PipelineBuilder pipeline={pipeline} onClose={vi.fn()} />);
+    expect(await screen.findByText(/2 stages · ready/)).toBeTruthy();
+    fireEvent.click(screen.getAllByLabelText("Disconnect")[0]); // the real pill — see stub change below
+    expect(await screen.findByText(/isn't connected/)).toBeTruthy(); // now orphaned
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/2 stages · ready/)).toBeTruthy();
   });
 });

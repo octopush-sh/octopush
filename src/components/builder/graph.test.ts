@@ -9,6 +9,10 @@ import {
   archetypeFor,
   archetypes,
   setArchetypes,
+  tidyLayout,
+  TIDY_ROW_GAP,
+  TIDY_COL_GAP,
+  reconnectAllowed,
   type StageNode,
   type StageEdge,
 } from "./graph";
@@ -53,6 +57,13 @@ function node(id: string, role: string, x = 0, y = 0): StageNode {
   return { id, type: "stage", position: { x, y }, data: { ...newStageData(role) } };
 }
 function flow(source: string, target: string): StageEdge {
+  return { id: `f-${source}-${target}`, source, target, type: "flow", data: { kind: "flow" } };
+}
+
+function tnode(id: string, x: number, y: number): StageNode {
+  return { id, type: "stage", position: { x, y }, data: newStageData("implement") };
+}
+function tedge(source: string, target: string): StageEdge {
   return { id: `f-${source}-${target}`, source, target, type: "flow", data: { kind: "flow" } };
 }
 
@@ -353,5 +364,107 @@ describe("validateGraph", () => {
     const nodes = [node("a", "plan", 0, 0), node("b", "implement", 0, 150), node("c", "test", 400, 0)];
     const v = validateGraph(nodes, [flow("a", "b")]);
     expect(v.byNode["c"]?.warning).toMatch(/isn't connected/);
+  });
+});
+
+describe("tidyLayout", () => {
+  it("lays a linear chain as a single centered column", () => {
+    const nodes = [tnode("a", 40, 300), tnode("b", -80, 10), tnode("c", 5, 90)];
+    const edges = [tedge("a", "b"), tedge("b", "c")];
+    const out = tidyLayout(nodes, edges);
+    const pos = Object.fromEntries(out.map((n) => [n.id, n.position]));
+    expect(pos.a).toEqual({ x: 0, y: 0 });
+    expect(pos.b).toEqual({ x: 0, y: TIDY_ROW_GAP });
+    expect(pos.c).toEqual({ x: 0, y: 2 * TIDY_ROW_GAP });
+  });
+
+  it("centers a two-node row and preserves the author's left-to-right order", () => {
+    // diamond: a → (left, right) → d ; "right" currently sits left of "left"
+    const nodes = [tnode("a", 0, 0), tnode("left", 500, 50), tnode("right", -500, 50), tnode("d", 0, 900)];
+    const edges = [tedge("a", "left"), tedge("a", "right"), tedge("left", "d"), tedge("right", "d")];
+    const pos = Object.fromEntries(tidyLayout(nodes, edges).map((n) => [n.id, n.position]));
+    expect(pos.right.x).toBe(-TIDY_COL_GAP / 2); // was left-most, stays left-most
+    expect(pos.left.x).toBe(TIDY_COL_GAP / 2);
+    expect(pos.right.y).toBe(TIDY_ROW_GAP);
+    expect(pos.left.y).toBe(TIDY_ROW_GAP);
+    expect(pos.d).toEqual({ x: 0, y: 2 * TIDY_ROW_GAP });
+  });
+
+  it("depth is the LONGEST path from an entry (join sits below its deepest parent)", () => {
+    // a → b → c, and a → c directly: c must land at depth 2, not 1.
+    const nodes = [tnode("a", 0, 0), tnode("b", 0, 100), tnode("c", 0, 200)];
+    const edges = [tedge("a", "b"), tedge("b", "c"), tedge("a", "c")];
+    const pos = Object.fromEntries(tidyLayout(nodes, edges).map((n) => [n.id, n.position]));
+    expect(pos.c.y).toBe(2 * TIDY_ROW_GAP);
+  });
+
+  it("ignores loop edges when computing depth", () => {
+    const nodes = [tnode("a", 0, 0), tnode("r", 0, 100)];
+    const edges = [tedge("a", "r"), loopEdge("r", "a", 2, "gated")];
+    const pos = Object.fromEntries(tidyLayout(nodes, edges).map((n) => [n.id, n.position]));
+    expect(pos.a.y).toBe(0);
+    expect(pos.r.y).toBe(TIDY_ROW_GAP);
+  });
+
+  it("returns nodes untouched when the flow has a cycle", () => {
+    const nodes = [tnode("a", 7, 8), tnode("b", 9, 10)];
+    const edges = [tedge("a", "b"), tedge("b", "a")];
+    expect(tidyLayout(nodes, edges)).toEqual(nodes);
+  });
+
+  it("orphans land in row 0 alongside entries", () => {
+    const nodes = [tnode("a", 0, 0), tnode("lone", 300, 700)];
+    const pos = Object.fromEntries(tidyLayout(nodes, []).map((n) => [n.id, n.position]));
+    expect(pos.a.y).toBe(0);
+    expect(pos.lone.y).toBe(0);
+    expect(pos.a.x).toBe(-TIDY_COL_GAP / 2);
+    expect(pos.lone.x).toBe(TIDY_COL_GAP / 2);
+  });
+});
+
+describe("reconnectAllowed", () => {
+  // a → b → c (flow), r reviews c with a loop back to a
+  const flowAB = tedge("a", "b");
+  const flowBC = tedge("b", "c");
+  const loopRA = loopEdge("r", "a", 2, "gated");
+  const flowCR = tedge("c", "r");
+  const all = [flowAB, flowBC, flowCR, loopRA];
+
+  it("rejects self-connections", () => {
+    expect(reconnectAllowed(flowAB, { source: "a", target: "a" }, all)).toBe(false);
+  });
+
+  it("allows re-routing a flow edge to a new valid target", () => {
+    expect(reconnectAllowed(flowBC, { source: "b", target: "r" }, all)).toBe(true); // b→r is new and acyclic
+  });
+
+  it("rejects a duplicate of an existing flow edge", () => {
+    expect(reconnectAllowed(flowBC, { source: "a", target: "b" }, all)).toBe(false);
+  });
+
+  it("rejects a re-route that closes a cycle", () => {
+    const chain = [tedge("a", "b"), tedge("b", "c"), tedge("c", "d")];
+    const oldCD = chain[2];
+    // re-routing c→d into c→a would make a → b → c → a (a→b, b→c both survive)
+    expect(reconnectAllowed(oldCD, { source: "c", target: "a" }, chain)).toBe(false);
+  });
+
+  it("allows a re-route that would only cycle through the edge being replaced", () => {
+    // Re-routing a→b into c→a is acyclic: a→b no longer exists afterwards.
+    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(true);
+  });
+
+  it("allows reversing an isolated edge (no cycle through others)", () => {
+    const only = [flowAB];
+    expect(reconnectAllowed(flowAB, { source: "b", target: "a" }, only)).toBe(true);
+  });
+
+  it("loop edges: the review end stays fixed", () => {
+    expect(reconnectAllowed(loopRA, { source: "b", target: "a" }, all)).toBe(false);
+  });
+
+  it("loop edges: new return target must be a flow-ancestor of the review", () => {
+    expect(reconnectAllowed(loopRA, { source: "r", target: "b" }, all)).toBe(true);  // b is upstream of r
+    expect(reconnectAllowed(loopRA, { source: "r", target: "x" }, all)).toBe(false); // x is not
   });
 });
