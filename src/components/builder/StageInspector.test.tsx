@@ -46,6 +46,7 @@ describe("StageInspector — escalate on failure", () => {
 
   it("round-trips the escalate effort on an API stage", () => {
     const onPatch = renderInspector({ substrate: "api", escalateEffort: null });
+    fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     fireEvent.click(within(group).getByText("High"));
     expect(onPatch).toHaveBeenCalledWith({ escalateEffort: "high" });
@@ -59,6 +60,7 @@ describe("StageInspector — escalate on failure", () => {
 
   it("disables the escalate-effort control for a CLI stage (effort is API-only)", () => {
     renderInspector({ substrate: "cli" });
+    fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     expect(group.getAttribute("aria-disabled")).toBe("true");
   });

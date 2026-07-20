@@ -179,11 +179,10 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           {/* Escalate on failure — retry ONCE at a stronger tier before halting.
               The model swap applies to both substrates (the CLI runner reads the
               model too); the effort bump is API-only, like the base effort.
-              The escalation model picker is collapsed until configured — the
-              heaviest control here (dropdown + provider fetch) stays out of the
-              scroll path for stages that never touch it. The effort segment
-              stays visible: it mirrors the always-visible Reasoning control
-              above and is cheap to render even when unset. */}
+              The entire escalation block — model picker, effort segment, and
+              CLI hint — is collapsed until configured: it's ~180px of controls
+              most stages never touch, so none of it belongs in the default
+              scroll path. */}
           <div className="flex flex-col gap-2">
             <button
               type="button"
@@ -203,36 +202,38 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
               )}
             </button>
             <Reveal open={escalateOpen}>
-              <div className="flex items-center gap-2">
-                <ModelPicker
-                  activeModel={data.escalateModel ?? ""}
-                  onSelectModel={(m) => onPatch({ escalateModel: m })}
-                  allowedProviders={isCli ? ["anthropic"] : undefined}
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <ModelPicker
+                    activeModel={data.escalateModel ?? ""}
+                    onSelectModel={(m) => onPatch({ escalateModel: m })}
+                    allowedProviders={isCli ? ["anthropic"] : undefined}
+                  />
+                  {data.escalateModel ? (
+                    <button
+                      type="button"
+                      aria-label="Clear escalation model"
+                      title="No escalation model"
+                      onClick={() => onPatch({ escalateModel: null })}
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-ivory"
+                    >
+                      <X size={12} />
+                    </button>
+                  ) : (
+                    <span className="font-mono text-[9px] text-octo-mute">— none —</span>
+                  )}
+                </div>
+                <SegmentedControl
+                  fill
+                  disabled={isCli}
+                  options={EFFORT_OPTIONS}
+                  value={data.escalateEffort ?? "off"}
+                  onChange={(v) => onPatch({ escalateEffort: v === "off" ? null : v })}
+                  ariaLabel="Escalation effort"
                 />
-                {data.escalateModel ? (
-                  <button
-                    type="button"
-                    aria-label="Clear escalation model"
-                    title="No escalation model"
-                    onClick={() => onPatch({ escalateModel: null })}
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-ivory"
-                  >
-                    <X size={12} />
-                  </button>
-                ) : (
-                  <span className="font-mono text-[9px] text-octo-mute">— none —</span>
-                )}
+                {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
               </div>
             </Reveal>
-            <SegmentedControl
-              fill
-              disabled={isCli}
-              options={EFFORT_OPTIONS}
-              value={data.escalateEffort ?? "off"}
-              onChange={(v) => onPatch({ escalateEffort: v === "off" ? null : v })}
-              ariaLabel="Escalation effort"
-            />
-            {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
           </div>
         </div>
 
