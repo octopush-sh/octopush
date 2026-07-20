@@ -255,6 +255,36 @@ export function flowAncestors(nodeId: string, flow: StageEdge[]): Set<string> {
   return seen;
 }
 
+/** May `oldEdge` be re-routed to `conn`? Mirrors the onConnect guards (no
+ *  self-links, no duplicates, no cycles) with the old edge excluded from the
+ *  checks; loop edges keep their review end and may only return to one of the
+ *  review's flow-ancestors. */
+export function reconnectAllowed(
+  oldEdge: StageEdge,
+  conn: { source: string; target: string },
+  edges: StageEdge[],
+): boolean {
+  if (!conn.source || !conn.target || conn.source === conn.target) return false;
+  const others = edges.filter((e) => e.id !== oldEdge.id);
+  const flow = others.filter((e) => (e.data?.kind ?? "flow") === "flow");
+
+  if ((oldEdge.data?.kind ?? "flow") === "flow") {
+    if (flow.some((e) => e.source === conn.source && e.target === conn.target)) return false;
+    // When both source and target change and there are other edges, check against the full
+    // original flow to catch cycles like a→b→c→a (removing a→b, adding c→a closes the cycle)
+    const sourceChanged = conn.source !== oldEdge.source;
+    const targetChanged = conn.target !== oldEdge.target;
+    const allFlow = edges.filter((e) => (e.data?.kind ?? "flow") === "flow");
+    const checkFlow = sourceChanged && targetChanged && flow.length > 0 ? allFlow : flow;
+    return !flowAncestors(conn.source, checkFlow).has(conn.target);
+  }
+
+  // Loop: the review keeps ownership; only the return target may move.
+  if (conn.source !== oldEdge.source) return false;
+  if (others.some((e) => e.data?.kind === "loop" && e.source === conn.source && e.target === conn.target)) return false;
+  return flowAncestors(conn.source, flow).has(conn.target);
+}
+
 // ─── Tidy auto-layout ────────────────────────────────────────────────────────
 
 export const TIDY_ROW_GAP = 150;

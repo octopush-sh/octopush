@@ -12,6 +12,7 @@ import {
   tidyLayout,
   TIDY_ROW_GAP,
   TIDY_COL_GAP,
+  reconnectAllowed,
   type StageNode,
   type StageEdge,
 } from "./graph";
@@ -418,5 +419,45 @@ describe("tidyLayout", () => {
     expect(pos.lone.y).toBe(0);
     expect(pos.a.x).toBe(-TIDY_COL_GAP / 2);
     expect(pos.lone.x).toBe(TIDY_COL_GAP / 2);
+  });
+});
+
+describe("reconnectAllowed", () => {
+  // a → b → c (flow), r reviews c with a loop back to a
+  const flowAB = tedge("a", "b");
+  const flowBC = tedge("b", "c");
+  const loopRA = loopEdge("r", "a", 2, "gated");
+  const flowCR = tedge("c", "r");
+  const all = [flowAB, flowBC, flowCR, loopRA];
+
+  it("rejects self-connections", () => {
+    expect(reconnectAllowed(flowAB, { source: "a", target: "a" }, all)).toBe(false);
+  });
+
+  it("allows re-routing a flow edge to a new valid target", () => {
+    expect(reconnectAllowed(flowBC, { source: "b", target: "r" }, all)).toBe(true); // b→r is new and acyclic
+  });
+
+  it("rejects a duplicate of an existing flow edge", () => {
+    expect(reconnectAllowed(flowBC, { source: "a", target: "b" }, all)).toBe(false);
+  });
+
+  it("rejects a re-route that closes a cycle", () => {
+    // re-routing a→b into c→a would make a → b → c → a
+    expect(reconnectAllowed(flowAB, { source: "c", target: "a" }, all)).toBe(false);
+  });
+
+  it("allows reversing an isolated edge (no cycle through others)", () => {
+    const only = [flowAB];
+    expect(reconnectAllowed(flowAB, { source: "b", target: "a" }, only)).toBe(true);
+  });
+
+  it("loop edges: the review end stays fixed", () => {
+    expect(reconnectAllowed(loopRA, { source: "b", target: "a" }, all)).toBe(false);
+  });
+
+  it("loop edges: new return target must be a flow-ancestor of the review", () => {
+    expect(reconnectAllowed(loopRA, { source: "r", target: "b" }, all)).toBe(true);  // b is upstream of r
+    expect(reconnectAllowed(loopRA, { source: "r", target: "x" }, all)).toBe(false); // x is not
   });
 });
