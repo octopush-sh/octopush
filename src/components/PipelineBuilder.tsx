@@ -16,7 +16,7 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Undo2, Redo2, Network } from "lucide-react";
+import { Undo2, Redo2, Network, X } from "lucide-react";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -38,6 +38,7 @@ import {
   isReviewArchetype,
   stageLabel,
   tidyLayout,
+  reconnectAllowed,
   type StageNode as StageNodeT,
   type StageEdge,
   type StageNodeData,
@@ -247,6 +248,48 @@ function BuilderInner({ pipeline, onClose }: Props) {
     [rf],
   );
 
+  const onDisconnectEdge = useCallback(
+    (edgeId: string) => {
+      pushHistory();
+      setEdges((es) => es.filter((e) => e.id !== edgeId));
+    },
+    [pushHistory, setEdges],
+  );
+
+  // Reconnect drag: drop on a handle re-routes (guarded), drop on the pane deletes.
+  const reconnectOk = useRef(true);
+  const onReconnectStart = useCallback(() => {
+    reconnectOk.current = false;
+  }, []);
+  const onReconnect = useCallback(
+    (oldEdge: StageEdge, conn: Connection) => {
+      reconnectOk.current = true;
+      if (!conn.source || !conn.target) return;
+      if (oldEdge.source === conn.source && oldEdge.target === conn.target) return;
+      if (!reconnectAllowed(oldEdge, { source: conn.source, target: conn.target }, edgesRef.current)) return;
+      pushHistory();
+      const prefix = oldEdge.data?.kind === "loop" ? "l" : "f";
+      setEdges((es) =>
+        es.map((e) =>
+          e.id === oldEdge.id
+            ? { ...e, id: `${prefix}-${conn.source}-${conn.target}`, source: conn.source!, target: conn.target! }
+            : e,
+        ),
+      );
+    },
+    [pushHistory, setEdges],
+  );
+  const onReconnectEnd = useCallback(
+    (_: MouseEvent | TouchEvent, edge: StageEdge) => {
+      if (!reconnectOk.current) {
+        pushHistory();
+        setEdges((es) => es.filter((e) => e.id !== edge.id));
+      }
+      reconnectOk.current = true;
+    },
+    [pushHistory, setEdges],
+  );
+
   // Guard the last node: a pipeline must keep at least one stage.
   const onBeforeDelete: OnBeforeDelete<StageNodeT, StageEdge> = useCallback(
     async ({ nodes: toDelete }) => {
@@ -333,6 +376,11 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const firstBlocking = validation.blocking[0]?.message ?? null;
   const warnCount = validation.warnings.length;
 
+  const HINT_KEY = "octo.builder.hint.connect";
+  const [hintDismissed, setHintDismissed] = useState(() => localStorage.getItem(HINT_KEY) === "1");
+  const hasFlowEdges = edges.some((e) => (e.data?.kind ?? "flow") === "flow");
+  const hintVisible = !hintDismissed && nodes.length >= 2 && !hasFlowEdges;
+
   const onSave = async () => {
     setSaving(true);
     setError(null);
@@ -393,8 +441,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               selectedId,
               onRemove: removeNode,
               canRemove: nodes.length > 1,
-              // TODO(task 10): wire real disconnect handling; grep for this stub.
-              onDisconnect: () => {},
+              onDisconnect: onDisconnectEdge,
             }}
           >
             <ReactFlow<StageNodeT, StageEdge>
@@ -403,6 +450,9 @@ function BuilderInner({ pipeline, onClose }: Props) {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
+              onReconnect={onReconnect}
+              onReconnectStart={onReconnectStart}
+              onReconnectEnd={onReconnectEnd}
               onBeforeDelete={onBeforeDelete}
               onNodesDelete={onNodesDelete}
               onNodeClick={(_, n) => setSelectedId(n.id)}
@@ -411,6 +461,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
               defaultEdgeOptions={defaultEdgeOptions}
+              deleteKeyCode={["Backspace", "Delete"]}
               minZoom={0.4}
               maxZoom={1.75}
               fitView
@@ -476,6 +527,29 @@ function BuilderInner({ pipeline, onClose }: Props) {
                     className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
                   >
                     <Network size={13} strokeWidth={1.75} />
+                  </button>
+                </div>
+              </Panel>
+              <Panel position="bottom-center" className="!mb-4">
+                <div
+                  data-testid="connect-hint"
+                  aria-hidden={!hintVisible}
+                  className={`flex items-center gap-2 rounded-full border border-octo-hairline bg-octo-panel/95 px-3 py-1.5 font-mono text-[10px] text-octo-sage backdrop-blur-sm transition-opacity duration-[220ms] ${
+                    hintVisible ? "" : "pointer-events-none opacity-0"
+                  }`}
+                >
+                  Drag from a stage's edge to connect it
+                  <button
+                    type="button"
+                    aria-label="Dismiss hint"
+                    title="Dismiss"
+                    onClick={() => {
+                      localStorage.setItem(HINT_KEY, "1");
+                      setHintDismissed(true);
+                    }}
+                    className="flex h-4 w-4 items-center justify-center rounded-sm text-octo-mute transition-colors duration-[150ms] hover:text-octo-ivory"
+                  >
+                    <X size={10} />
                   </button>
                 </div>
               </Panel>

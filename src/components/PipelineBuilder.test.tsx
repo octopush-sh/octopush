@@ -12,8 +12,9 @@ vi.mock("@xyflow/react", async () => {
   return {
     // Render the real custom node components through nodeTypes so a node that
     // reads context (useBuilder) is exercised — catches provider-scope bugs.
-    ReactFlow: ({ children, nodes, nodeTypes, onNodeClick }: any) =>
-      React.createElement(
+    ReactFlow: (props: any) => {
+      const { children, nodes, nodeTypes, edges, edgeTypes, onNodeClick } = props;
+      return React.createElement(
         "div",
         { "data-testid": "flow" },
         React.createElement("button", {
@@ -24,8 +25,15 @@ vi.mock("@xyflow/react", async () => {
           const Comp = nodeTypes?.[n.type];
           return Comp ? React.createElement(Comp, { key: n.id, id: n.id, data: n.data, selected: false }) : null;
         }),
+        (edges ?? []).map((e: any) => {
+          const Comp = edgeTypes?.[e.type];
+          return Comp
+            ? React.createElement(Comp, { key: e.id, id: e.id, data: e.data, selected: true, sourceX: 0, sourceY: 0, targetX: 0, targetY: 0, sourcePosition: "bottom", targetPosition: "top" })
+            : null;
+        }),
         children,
-      ),
+      );
+    },
     ReactFlowProvider: Frag,
     Background: () => null,
     BackgroundVariant: { Dots: "dots" },
@@ -264,5 +272,39 @@ describe("tidy", () => {
     expect((await screen.findAllByText(/isn't connected/)).length).toBeGreaterThan(0); // 2-node orphan warning
     fireEvent.click(screen.getByLabelText(/Undo/));
     expect(await screen.findByText(/1 stage/)).toBeTruthy();
+  });
+});
+
+describe("hint chip", () => {
+  beforeEach(() => localStorage.removeItem("octo.builder.hint.connect"));
+
+  it("appears with ≥2 nodes and no connections, and dismisses persistently", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    // 1 node → hidden (opacity-0 shell)
+    expect(screen.getByTestId("connect-hint").className).toContain("opacity-0");
+    fireEvent.click(screen.getByText("Plan")); // 2 nodes, 0 edges → visible
+    expect(screen.getByTestId("connect-hint").className).not.toContain("opacity-0");
+    fireEvent.click(screen.getByLabelText("Dismiss hint"));
+    expect(screen.getByTestId("connect-hint").className).toContain("opacity-0");
+    expect(localStorage.getItem("octo.builder.hint.connect")).toBe("1");
+  });
+});
+
+describe("edge disconnect wiring", () => {
+  it("onDisconnect removes the edge and records history", async () => {
+    // Load a 2-stage pipeline WITH an edge, disconnect via context, undo restores it.
+    const pipeline = {
+      pipeline: { id: "p1", name: "P", description: "", isBuiltin: false },
+      stages: [
+        { position: 0, role: "plan", agentModel: "m", substrate: "api", checkpoint: false, maxIterations: 10, parents: [], posX: 0, posY: 0 },
+        { position: 1, role: "implement", agentModel: "m", substrate: "api", checkpoint: false, maxIterations: 10, parents: [0], posX: 0, posY: 150 },
+      ],
+    } as any;
+    render(<PipelineBuilder pipeline={pipeline} onClose={vi.fn()} />);
+    expect(await screen.findByText(/2 stages · ready/)).toBeTruthy();
+    fireEvent.click(screen.getAllByLabelText("Disconnect")[0]); // the real pill — see stub change below
+    expect(await screen.findByText(/isn't connected/)).toBeTruthy(); // now orphaned
+    fireEvent.click(screen.getByLabelText(/Undo/));
+    expect(await screen.findByText(/2 stages · ready/)).toBeTruthy();
   });
 });
