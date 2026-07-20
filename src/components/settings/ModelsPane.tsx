@@ -473,6 +473,11 @@ function ProviderDetail({
             placeholder={provider.apiBase}
             className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
           />
+          <p className="mt-1.5 text-[11px] leading-[1.5] text-octo-mute">
+            {provider.protocol === "anthropic"
+              ? "Requests go to base URL + /v1/messages."
+              : "Requests go to base URL + /chat/completions."}
+          </p>
         </div>
       </div>
 

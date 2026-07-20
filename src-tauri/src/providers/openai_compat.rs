@@ -24,7 +24,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         client: &reqwest::Client,
     ) -> AppResult<LlmResponse> {
         let body = build_request(req);
-        let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+        let url = chat_completions_url(api_base);
 
         let mut request = client.post(&url)
             .header("content-type", "application/json")
@@ -61,6 +61,15 @@ impl LlmProvider for OpenAICompatibleProvider {
 
         Ok(parse_response(response))
     }
+}
+
+/// Resolve the chat-completions endpoint from a configured base URL. The
+/// conventional base already includes `/v1` (`https://api.openai.com/v1`);
+/// strip a pasted full endpoint so we never double the path.
+pub fn chat_completions_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    format!("{base}/chat/completions")
 }
 
 /// Whether an OpenAI-family model actually honors `reasoning_effort`. Only the
