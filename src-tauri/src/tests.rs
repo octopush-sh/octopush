@@ -4366,6 +4366,45 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn direct_run_parks_when_a_scope_budget_is_exhausted() {
+        // Phase 3: a DIRECT run must park (not just its own budget_usd cap, which
+        // is unset here) when a global/project/workspace USD budget is exhausted.
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        // A $0.01 global daily budget, already blown by prior spend in this workspace.
+        db.lock().upsert_budget("global", "", "daily", 0.01).unwrap();
+        db.lock()
+            .record_token_spend(
+                &crate::token_engine::TokenEvent {
+                    id: None,
+                    session_id: ws.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    model: "claude-sonnet-5".into(),
+                    cost_usd: 1.00,
+                },
+                "talk",
+            )
+            .unwrap();
+
+        let status = orch_for(&db).run_to_pause(&run).await.unwrap();
+
+        // The scope-budget gate parks the first stage before it ever runs.
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "paused");
+        assert_eq!(
+            db.lock().list_run_stages(&run).unwrap().remove(0).status,
+            "awaiting_checkpoint"
+        );
+    }
+
+    #[tokio::test]
     async fn a_manual_model_override_reruns_at_the_chosen_model_not_the_strong_tier() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
         let seen = Arc::new(Mutex::new(vec![]));

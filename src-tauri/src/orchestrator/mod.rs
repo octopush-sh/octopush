@@ -1061,6 +1061,36 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Park the next pending stage because a global/project/workspace USD budget
+    /// (not the run's own cap) is exhausted — same mechanism as `pause_for_budget`
+    /// so the existing approve/override path releases it. `scope` is a human label
+    /// like "workspace daily".
+    fn pause_for_scope_budget(
+        &self,
+        run_id: &str,
+        stage_id: &str,
+        scope: &str,
+        spent: f64,
+        limit: f64,
+    ) -> AppResult<()> {
+        self.db.lock().set_run_stage_status(stage_id, "awaiting_checkpoint")?;
+        self.db.lock().set_run_status(run_id, "paused", false)?;
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({
+                "runId": run_id,
+                "stageId": stage_id,
+                "entry": {
+                    "kind": "notice",
+                    "text": format!("{scope} budget reached — ${spent:.2} of ${limit:.2} spent"),
+                },
+            }),
+        );
+        self.emit_run_update(run_id);
+        self.emit_checkpoint(run_id, stage_id, "decision");
+        Ok(())
+    }
+
     /// Ask a running run to pause at its next stage boundary. Consumed once, in
     /// `drive_inner`. A no-op if the run isn't driving (the flag is harmless).
     pub fn request_pause(&self, run_id: &str) {
@@ -1148,6 +1178,22 @@ impl Orchestrator {
             if let Some(budget) = run.budget_usd {
                 if !skip_budget_once && budget > 0.0 && run.cost_usd >= budget {
                     self.pause_for_budget(run_id, &stage.id, run.cost_usd, budget)?;
+                    return Ok(RunStatus::Paused);
+                }
+            }
+            // Phase 3 — also honor the global/project/workspace USD budgets so a
+            // DIRECT run can't silently blow through them (it now counts against
+            // them via the spend ledger; here it also blocks). Same park + approve
+            // path as the run's own cap. Skipped on the post-approval first stage.
+            if !skip_budget_once {
+                // Bind the verdict to a `let` FIRST so the `db.lock()` guard drops
+                // before `pause_for_scope_budget` re-acquires it. Holding it across
+                // the `if let` body (temporaries live to the end of the block on
+                // edition 2021) would re-enter the non-reentrant parking_lot mutex
+                // → deadlock.
+                let verdict = self.db.lock().check_budget(Some(&run.workspace_id))?;
+                if let crate::db::BudgetVerdict::Block { scope, spent, limit } = verdict {
+                    self.pause_for_scope_budget(run_id, &stage.id, &scope, spent, limit)?;
                     return Ok(RunStatus::Paused);
                 }
             }
