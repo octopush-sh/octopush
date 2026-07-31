@@ -28,6 +28,21 @@ use chrono;
 
 const MAX_TOOL_ITERATIONS: usize = 25;
 
+/// Decides whether `send_agentic`'s per-iteration budget gate should stop the
+/// turn. Split out as a free function so the exact boundary is unit-tested
+/// without a mock provider: iteration 0 is owned by the entry gate in
+/// `send_chat_message` (never re-blocked here), a conscious per-turn override
+/// bypasses the gate entirely, and only a `Block` verdict stops the loop.
+pub(crate) fn should_stop_for_budget(
+    iteration: usize,
+    override_budget: bool,
+    verdict: &crate::db::BudgetVerdict,
+) -> bool {
+    iteration > 0
+        && !override_budget
+        && matches!(verdict, crate::db::BudgetVerdict::Block { .. })
+}
+
 // ─── Public types ─────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -858,13 +873,54 @@ impl ChatEngine {
         total_input: u64,
         total_output: u64,
     ) -> AppResult<()> {
+        self.finish_with_note(
+            app, workspace_id, thread_id, model, total_input, total_output,
+            "Generation stopped.",
+        )
+    }
+
+    /// Like `finish_stopped`, but the quiet note explains that a budget cap —
+    /// not the user — ended the turn. Emitted by the per-iteration budget gate
+    /// when an agentic loop crosses a configured limit mid-turn. The next send
+    /// hits the entry gate in `send_chat_message`, which surfaces the Override
+    /// affordance, so the note only needs to say why this turn stopped.
+    fn finish_budget_capped(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        model: &str,
+        total_input: u64,
+        total_output: u64,
+    ) -> AppResult<()> {
+        self.finish_with_note(
+            app, workspace_id, thread_id, model, total_input, total_output,
+            "Budget cap reached — turn stopped. Override to continue.",
+        )
+    }
+
+    /// Shared tail for the graceful turn-enders: persist a quiet `stopped`
+    /// marker carrying `note` (never replayed to the model, rendered as a
+    /// system note) and emit the terminal `done` stream event with the turn's
+    /// token totals.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with_note(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        model: &str,
+        total_input: u64,
+        total_output: u64,
+        note: &str,
+    ) -> AppResult<()> {
         let cost = token_engine::cost_for(model, total_input, total_output, 0, 0);
         self.insert_and_emit_message(
             app,
             workspace_id,
             thread_id,
             "stopped",
-            "Generation stopped.",
+            note,
             Some(model),
             Some(total_input as i64),
             Some(total_output as i64),
@@ -1425,6 +1481,26 @@ impl ChatEngine {
             if cancel.load(Ordering::Relaxed) {
                 self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
                 return Ok(());
+            }
+
+            // Phase 3 — per-iteration budget enforcement. The entry gate in
+            // `send_chat_message` authorized this turn's FIRST provider call;
+            // this gate stops a runaway agentic loop that keeps accumulating
+            // spend across up to MAX_TOOL_ITERATIONS calls and crosses a
+            // configured budget mid-turn. The decision lives in the unit-tested
+            // `should_stop_for_budget`; the outer guard only avoids the DB query
+            // when the answer is trivially no (iteration 0 — owned by the entry
+            // gate — or an overridden turn). This runs at the top of the loop
+            // where `messages` is consistent (every prior tool_use already has
+            // its tool_result). Bind the verdict to a `let` BEFORE acting so the
+            // parking_lot guard drops — `finish_budget_capped` re-locks the db
+            // and would otherwise re-entrant-deadlock on edition 2021.
+            if iteration > 0 && !request.override_budget {
+                let verdict = self.db.lock().check_budget(Some(&request.workspace_id))?;
+                if should_stop_for_budget(iteration, request.override_budget, &verdict) {
+                    self.finish_budget_capped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+                    return Ok(());
+                }
             }
 
             let llm_req = LlmRequest {

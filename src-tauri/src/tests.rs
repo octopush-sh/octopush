@@ -3592,6 +3592,35 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn talk_mid_turn_gate_stops_only_after_iteration_zero_and_never_when_overridden() {
+        // Phase 3 last slice: the TALK per-iteration gate stops a runaway
+        // agentic loop that crosses a budget mid-turn. Its decision is the pure
+        // `should_stop_for_budget`; lock the exact boundary so a refactor can't
+        // silently re-block iteration 0 (owned by the entry gate) or ignore a
+        // conscious per-turn override.
+        use crate::chat_engine::should_stop_for_budget;
+        use crate::db::BudgetVerdict;
+        let block = BudgetVerdict::Block {
+            scope: "global".into(),
+            spent: 1.10,
+            limit: 1.0,
+        };
+        let allow = BudgetVerdict::Allow;
+
+        // Iteration 0 is authorized by the entry gate — never re-blocked here,
+        // even when over budget.
+        assert!(!should_stop_for_budget(0, false, &block));
+        // From iteration 1 onward, a Block stops the loop…
+        assert!(should_stop_for_budget(1, false, &block));
+        assert!(should_stop_for_budget(7, false, &block));
+        // …unless the user consciously overrode the cap for this turn.
+        assert!(!should_stop_for_budget(1, true, &block));
+        // An Allow verdict never stops, overridden or not.
+        assert!(!should_stop_for_budget(3, false, &allow));
+        assert!(!should_stop_for_budget(3, true, &allow));
+    }
+
+    #[test]
     fn retired_reconcile_fills_gap_without_double_counting() {
         // Residual Phase 2: a run whose retire-inclusive meter exceeds the DIRECT
         // spend already captured for its stages gets ONE reconciliation row for
