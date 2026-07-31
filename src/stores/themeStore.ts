@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
+import { isHexColor, rgba, solveMatchWashAlpha } from "../lib/contrast";
 import type { ThemeConfig } from "../lib/types";
 
 interface ThemeState {
@@ -36,22 +37,6 @@ export const useThemeStore = create<ThemeState>((set) => ({
     await ipc.setTheme(theme);
   },
 }));
-
-/** Parse `#rrggbb` (with or without leading #) into an [r,g,b] tuple.
- *  Returns null for malformed input so callers can fall back to a static
- *  value rather than emit `rgba(NaN, NaN, NaN, …)`. */
-function hexToRgb(hex: string): [number, number, number] | null {
-  const m = hex.replace("#", "").match(/^([0-9a-f]{6})$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function rgba(hex: string, alpha: number): string {
-  const c = hexToRgb(hex);
-  if (!c) return hex;
-  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${alpha})`;
-}
 
 function applyThemeToDom(t: ThemeConfig) {
   const root = document.documentElement;
@@ -97,6 +82,37 @@ function applyThemeToDom(t: ThemeConfig) {
   // Danger-derived alpha tokens (rouge family) — same reason as above.
   root.style.setProperty("--rouge-active-bg", rgba(t.danger, 0.1));
   root.style.setProperty("--rouge-border", rgba(t.danger, 0.3));
+
+  // Find-in-file match tokens. Unlike the alpha steps above these are not a
+  // fixed ladder: the wash alpha is solved against this theme's own background
+  // so a match is equally present on onyx and on cream (see
+  // solveMatchWashAlpha). The match also owns its foreground — a wash costs
+  // whatever sits on it ~34% of its contrast, which body text absorbs but dim
+  // comments don't. Consumed by components/editor/atelierTheme.ts.
+  //
+  // These four are the only tokens derived here that end up OPAQUE, so unlike
+  // the alpha ladders above they can't lean on `rgba`'s pass-through: a
+  // hand-edited ~/.octopush/theme.json with a short hex (`#fff`) would make
+  // `--octo-match` a solid slab painted over the code. Fall back to the atelier
+  // answer for the whole group instead, so the highlight stays coherent.
+  if (isHexColor(t.accent) && isHexColor(t.bg) && isHexColor(t.text)) {
+    const washAlpha = solveMatchWashAlpha(t.accent, t.bg);
+    root.style.setProperty("--octo-match", rgba(t.accent, washAlpha));
+    root.style.setProperty("--octo-match-ring", rgba(t.accent, Math.min(1, washAlpha * 2)));
+    root.style.setProperty("--octo-match-ink", t.text);
+    root.style.setProperty("--octo-match-current", t.accent);
+    root.style.setProperty("--octo-match-current-ink", t.bg);
+  } else {
+    for (const token of [
+      "--octo-match",
+      "--octo-match-ring",
+      "--octo-match-ink",
+      "--octo-match-current",
+      "--octo-match-current-ink",
+    ]) {
+      root.style.removeProperty(token);
+    }
+  }
 
   // Body bg for first paint before React mounts.
   document.body.style.backgroundColor = t.bg;

@@ -19,6 +19,7 @@ import {
 } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 import type { Extension } from "@codemirror/state";
+import { isDarkBackground } from "../../lib/contrast";
 
 // ── Static fallbacks (canonical Onyx & Brass) ─────────────────────
 const FALLBACK = {
@@ -34,6 +35,13 @@ const FALLBACK = {
   brassGhost: "rgba(212, 165, 116, 0.08)",
   brassFaint: "rgba(212, 165, 116, 0.04)",
   brassGlow:  "rgba(212, 165, 116, 0.12)",
+  // Find-in-file match tokens — see the block comment in styles.css. The wash
+  // alpha is solved per theme by themeStore; these are the atelier answer.
+  match:           "rgba(212, 165, 116, 0.235)",
+  matchRing:       "rgba(212, 165, 116, 0.47)",
+  matchInk:        "#f4ecdb",
+  matchCurrent:    "#d4a574",
+  matchCurrentInk: "#0c0a08",
 } as const;
 
 export interface EditorTokens {
@@ -49,6 +57,17 @@ export interface EditorTokens {
   brassGhost: string;
   brassFaint: string;
   brassGlow: string;
+  /** Wash behind every search match — alpha solved per theme. */
+  match: string;
+  /** 1px ring that bounds a match against the wash. */
+  matchRing: string;
+  /** Forced foreground for matched text, so a hit in a dim comment stays
+   *  as legible as one in body text. */
+  matchInk: string;
+  /** Solid fill for the current match — an inverted seal, not a wash. */
+  matchCurrent: string;
+  /** Foreground on top of `matchCurrent` (the theme's own background). */
+  matchCurrentInk: string;
 }
 
 /** Read one CSS custom property off :root, falling back when it's empty
@@ -74,6 +93,11 @@ export function resolveEditorTokens(): EditorTokens {
     brassGhost: readVar("--brass-ghost", FALLBACK.brassGhost),
     brassFaint: readVar("--brass-faint", FALLBACK.brassFaint),
     brassGlow:  readVar("--brass-glow", FALLBACK.brassGlow),
+    match:           readVar("--octo-match", FALLBACK.match),
+    matchRing:       readVar("--octo-match-ring", FALLBACK.matchRing),
+    matchInk:        readVar("--octo-match-ink", FALLBACK.matchInk),
+    matchCurrent:    readVar("--octo-match-current", FALLBACK.matchCurrent),
+    matchCurrentInk: readVar("--octo-match-current-ink", FALLBACK.matchCurrentInk),
   };
 }
 
@@ -105,9 +129,16 @@ export function makeEditorThemeSpec(t: EditorTokens): Record<string, Record<stri
       borderLeftWidth: "2px",
     },
 
-    "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": {
-      backgroundColor: t.brassGhost,
-    },
+    // The long first selector is deliberate. CodeMirror's light base theme ships
+    // `&light.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground`
+    // at five classes, which outranks a plain `&.cm-focused .cm-selectionBackground`
+    // — so once `dark` follows the theme (below), vellum's focused selection would
+    // fall through to the library's lavender instead of the Atelier token. Matching
+    // that shape ties the specificity, and ours is applied later, so ours wins.
+    "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, &.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection":
+      {
+        backgroundColor: t.brassGhost,
+      },
 
     ".cm-gutters": {
       backgroundColor: t.panel,
@@ -189,12 +220,45 @@ export function makeEditorThemeSpec(t: EditorTokens): Record<string, Record<stri
     ".cm-panel.cm-search .cm-textfield:focus": {
       borderColor: t.brass,
     },
+    // ── Find-in-file matches ────────────────────────────────────────
+    // Every match gets the solved wash plus a ring; the CURRENT match is an
+    // inverted seal — solid accent with the background colour as ink — so the
+    // two are separated by weight rather than by a few points of alpha.
+    //
+    // The `span` half of each selector is load-bearing. A match is a mark
+    // decoration that can nest either side of a syntax-highlight span, and
+    // `color` inherits — so setting it only on `.cm-searchMatch` loses to a
+    // syntax span nested inside it. Painting the descendants too makes the ink
+    // win regardless of which way CodeMirror nested them.
+    // A match that crosses syntax-token boundaries stays ONE element, so the
+    // ring closes around the whole thing: CodeMirror's ContentBuilder reuses an
+    // already-open mark across segments when that mark is the OUTER one
+    // (`ensureMarks`), and at `searchMatchHighlight`'s low precedence the match
+    // is outer — verified in a real engine, where `root = document` produced a
+    // single .cm-searchMatch wrapping three syntax spans.
+    //
+    // A MULTI-LINE match does fragment, one element per line, because lines are
+    // separate DOM parents — so each line gets its own closed box. That reads
+    // correctly (a marked region, line by line) and is only reachable by typing
+    // an escaped newline into the find field. If the precedence above ever
+    // changes so the match nests INSIDE the syntax spans, cross-token matches
+    // would fragment too and the seams would look wrong; switch to
+    // horizontal-only edges (`inset 0 ±1px 0`, no radius) if that happens.
     ".cm-searchMatch": {
-      backgroundColor: t.brassGhost,
-      outline: `1px solid ${t.hairline}`,
+      backgroundColor: t.match,
+      borderRadius: "2px",
+      boxShadow: `inset 0 0 0 1px ${t.matchRing}`,
     },
+    ".cm-searchMatch, .cm-searchMatch span": {
+      color: t.matchInk,
+    },
+    // Must stay after the two rules above: equal specificity, later wins.
     ".cm-searchMatch-selected": {
-      backgroundColor: t.brassGlow,
+      backgroundColor: t.matchCurrent,
+      boxShadow: "none",
+    },
+    ".cm-searchMatch-selected, .cm-searchMatch-selected span": {
+      color: t.matchCurrentInk,
     },
     ".cm-panel button[name=close]": {
       color: t.mute,
@@ -288,11 +352,15 @@ function makeHighlightStyle(t: EditorTokens): HighlightStyle {
 
 /** Build a fresh combined extension (editor theme + syntax highlighting) from
  *  the CURRENTLY active Octopush theme tokens. Call this again — and reconfigure
- *  the editor's theme compartment — whenever the theme changes. */
+ *  the editor's theme compartment — whenever the theme changes.
+ *
+ *  `dark` follows the resolved background rather than being hardcoded: it was
+ *  `true` unconditionally, which handed CodeMirror's dark-mode defaults to the
+ *  vellum light theme. */
 export function buildEditorTheme(): Extension {
   const t = resolveEditorTokens();
   return [
-    EditorView.theme(makeEditorThemeSpec(t), { dark: true }),
+    EditorView.theme(makeEditorThemeSpec(t), { dark: isDarkBackground(t.onyx) }),
     syntaxHighlighting(makeHighlightStyle(t)),
   ];
 }

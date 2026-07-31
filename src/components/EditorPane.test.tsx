@@ -119,6 +119,12 @@ const { blameGutterMock } = vi.hoisted(() => ({
   blameGutterMock: vi.fn(() => ({ blame: true })),
 }));
 vi.mock("./editor/blameGutter", () => ({ blameGutter: blameGutterMock }));
+// Builds its decorations at import time, so it needs the real @codemirror/view
+// which this file replaces with a stub. Behaviour is covered by
+// searchHighlight.test.ts; the marker object lets us assert it stays wired in.
+vi.mock("./editor/searchHighlight", () => ({
+  searchMatchHighlight: { __searchMatchHighlight: true },
+}));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.
@@ -201,6 +207,7 @@ vi.mock("../stores/editorStore", () => ({
   }),
 }));
 
+import { EditorState } from "@codemirror/state";
 import { EditorPane } from "./EditorPane";
 
 beforeEach(() => {
@@ -422,5 +429,19 @@ describe("EditorPane — focus / visibility disk check", () => {
     unmount();
     fireEvent(window, new Event("focus"));
     expect(mockCheckActiveAgainstDisk).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditorPane · search highlighting", () => {
+  it("registers searchMatchHighlight in the editor's extensions", async () => {
+    // Without it, @codemirror/search paints nothing while our overlay owns ⌘F —
+    // the original bug. The behaviour lives in searchHighlight.test.ts; this
+    // only guards the wiring, which nothing else here would notice losing.
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    const create = vi.mocked(EditorState.create);
+    expect(create).toHaveBeenCalled();
+    const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
+    expect(lastCall).toBeDefined();
+    expect(lastCall![0].extensions).toContainEqual({ __searchMatchHighlight: true });
   });
 });

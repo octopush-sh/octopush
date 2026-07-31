@@ -86,6 +86,29 @@
   /* Hunk rail left-border accent — between glow and dim in presence */
   --brass-rule-dim: rgba(212, 165, 116, 0.18);
 
+  /* ── Find-in-file match tokens (editor search) ──────────────────────
+     A search hit must be unmistakable on every theme, so these are NOT
+     reusable alpha steps like --brass-ghost: `--octo-match`'s alpha is
+     SOLVED per theme in stores/themeStore.ts as the smallest value that
+     clears a 1.50 contrast step against that theme's background. A fixed
+     alpha cannot work — 23.5% is a 1.50 step on atelier's onyx but only a
+     1.35 step on vellum's cream, so the light theme would get a visibly
+     weaker highlight. The values here are the atelier answer, used as the
+     first-paint fallback before themeStore runs.
+
+     `--octo-match-ink` repaints the matched text: any wash costs whatever
+     sits on it ~34% of its contrast, which ivory absorbs (16.82 → 11.18)
+     but comments do not (3.35 → 2.23, worse than not searching at all). So
+     the match owns its foreground instead of inheriting the syntax colour.
+
+     Read by components/editor/atelierTheme.ts, which resolves them into
+     CodeMirror's theme() — it takes plain values and can't read var(--…). */
+  --octo-match:             rgba(212, 165, 116, 0.235);
+  --octo-match-ring:        rgba(212, 165, 116, 0.47);
+  --octo-match-ink:         #f4ecdb;
+  --octo-match-current:     #d4a574;
+  --octo-match-current-ink: #0c0a08;
+
   /* Provider identity dots — decorative, ModelPicker + Direct only. */
   --provider-anthropic: #cc785c;
   --provider-openai:    #74aa9c;
