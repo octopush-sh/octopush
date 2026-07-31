@@ -119,6 +119,9 @@ const { blameGutterMock } = vi.hoisted(() => ({
   blameGutterMock: vi.fn(() => ({ blame: true })),
 }));
 vi.mock("./editor/blameGutter", () => ({ blameGutter: blameGutterMock }));
+// Builds its decorations at import time, so it needs the real @codemirror/view
+// which this file replaces with a stub. Covered by searchHighlight.test.ts.
+vi.mock("./editor/searchHighlight", () => ({ searchMatchHighlight: {} }));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.

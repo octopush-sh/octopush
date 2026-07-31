@@ -4,8 +4,12 @@
  * Replaces CodeMirror's built-in search panel (which docks at the top of the
  * viewport and wears the library's own chrome) with a calm floating card that
  * follows the Atelier design system. It drives the editor through the public
- * `@codemirror/search` command API, so match highlighting, regex, case- and
- * whole-word matching, and replace all behave exactly as CodeMirror's own.
+ * `@codemirror/search` command API, so regex, case- and whole-word matching,
+ * and replace all behave exactly as CodeMirror's own.
+ *
+ * Match highlighting is the one thing that does NOT come for free: CodeMirror's
+ * highlighter only runs while its own panel is open, which this overlay
+ * deliberately prevents. `editor/searchHighlight.ts` supplies the marks.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -38,6 +42,9 @@ interface Props {
 }
 
 const MAX_COUNT = 10_000;
+
+/** Clears the editor's search query, and with it every match highlight. */
+const EMPTY_QUERY = new SearchQuery({ search: "" });
 
 /** Count matches for `query` and, when the current selection sits on one,
  *  which 1-based index it is — for the "n of m" readout. */
@@ -98,6 +105,13 @@ export function EditorSearch({ view, focusSignal, onClose }: Props) {
   // Push the query into the editor (drives highlighting) and refresh the tally.
   useEffect(() => {
     if (!query.valid) {
+      // `valid` is false for an EMPTY search as well as a broken regex
+      // (`!!this.search && (!this.regexp || validRegExp(…))`), so this branch
+      // covers clearing the field. It has to clear the editor's query too:
+      // returning early leaves the previous one in place, which used to be
+      // invisible but now means the old matches stay lit while the field reads
+      // empty or "bad pattern".
+      view.dispatch({ effects: setSearchQuery.of(EMPTY_QUERY) });
       setTally({ count: 0, current: 0 });
       return;
     }
@@ -115,7 +129,7 @@ export function EditorSearch({ view, focusSignal, onClose }: Props) {
 
   const close = () => {
     // Clear the query so match highlights vanish, then hand focus back.
-    view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: "" })) });
+    view.dispatch({ effects: setSearchQuery.of(EMPTY_QUERY) });
     view.focus();
     onClose();
   };

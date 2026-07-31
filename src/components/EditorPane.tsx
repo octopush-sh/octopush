@@ -19,6 +19,7 @@ import { xml } from "@codemirror/lang-xml";
 import { yaml } from "@codemirror/lang-yaml";
 import { buildEditorTheme } from "./editor/atelierTheme";
 import { EditorSearch } from "./editor/EditorSearch";
+import { searchMatchHighlight } from "./editor/searchHighlight";
 import { blameGutter } from "./editor/blameGutter";
 import { diffGutter } from "./editor/diffGutter";
 import { selectAllOccurrences } from "./editor/multiCursor";
@@ -90,8 +91,13 @@ function buildState(opts: {
       tabComp.of(tabValue(prefs)),
       wrapComp.of(wrapValue(prefs)),
       fontComp.of(fontValue(prefs)),
-      // The search extension powers match highlighting + the query state.
+      // The search extension provides the query state, commands and keymap —
+      // but NOT the match highlighting. Its highlighter bails unless its own
+      // docked panel is open (`if (!panel …) return Decoration.none`), and the
+      // ⌘F binding below deliberately keeps that panel closed. So the marks
+      // come from our own plugin instead.
       search({ top: true }),
+      searchMatchHighlight,
       keymap.of([
         { key: "Mod-s", run: () => { onSave(); return true; } },
         // Our Octopush-native find overlay owns ⌘F. Listed BEFORE searchKeymap
