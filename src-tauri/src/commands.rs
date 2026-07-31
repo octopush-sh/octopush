@@ -1667,9 +1667,39 @@ fn routine_next_due(kind: &str, spec: &str) -> AppResult<Option<String>> {
 /// Full input validation (schedule spec + cross-field rules like fresh⇒daily),
 /// shared by create and update.
 fn validate_routine_input(input: &crate::db::RoutineInput) -> AppResult<Option<String>> {
-    crate::routines::validate_routine(&input.workspace_mode, &input.schedule_kind)
+    // Schedule SHAPE first (a clear "invalid recurring schedule: …" beats the
+    // cross-field message when the spec is malformed), then the fresh-cadence
+    // cross-field rule, then compute next_due.
+    crate::routines::validate_schedule(&input.schedule_kind, &input.schedule_spec)
         .map_err(AppError::Other)?;
-    routine_next_due(&input.schedule_kind, &input.schedule_spec)
+    crate::routines::validate_routine(
+        &input.workspace_mode,
+        &input.schedule_kind,
+        &input.schedule_spec,
+    )
+    .map_err(AppError::Other)?;
+    Ok(crate::routines::next_due(
+        &input.schedule_kind,
+        &input.schedule_spec,
+        chrono::Local::now(),
+    ))
+}
+
+/// Preview the next `count` fire times (UTC RFC3339) for a schedule, for the
+/// editor's live "next runs" list. Pure/read-only — no entitlement gate, no side
+/// effects. An invalid spec yields an empty list (the editor shows its own error).
+#[tauri::command]
+pub async fn preview_routine_schedule(
+    kind: String,
+    spec: String,
+    count: u32,
+) -> AppResult<Vec<String>> {
+    Ok(crate::routines::next_n_due(
+        &kind,
+        &spec,
+        chrono::Local::now(),
+        count.min(20) as usize,
+    ))
 }
 
 #[tauri::command]

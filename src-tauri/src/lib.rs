@@ -363,6 +363,7 @@ pub fn run() {
             commands::delete_routine,
             commands::set_routine_enabled,
             commands::run_routine_now,
+            commands::preview_routine_schedule,
             // Cross-machine run history (Pro-real Part B / B1)
             commands::history_list,
             commands::history_sync_pull,
