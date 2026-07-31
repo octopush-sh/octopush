@@ -28,6 +28,7 @@ fn sample_request() -> LlmRequest {
         ],
         tool_choice: None,
         effort: None,
+        cache: false,
     }
 }
 
@@ -111,6 +112,85 @@ fn anthropic_build_request_shape() {
     assert_eq!(body["tools"][0]["name"], "read_file");
     assert_eq!(body["tools"][0]["description"], "Read a file.");
     assert!(body["tools"][0]["input_schema"].is_object());
+}
+
+// ── F7: Anthropic prompt-cache breakpoints ────────────────────────────────
+
+#[test]
+fn anthropic_cache_enabled_marks_tools_system_and_last_message() {
+    // A repeated-prefix context (cache=true) drops one ephemeral breakpoint at
+    // the tail of each cache region: last tool, system, last message. That's the
+    // whole F7 win — re-sent context bills at ~0.1× on a hit.
+    let mut req = sample_request();
+    req.cache = true;
+    let body = anthropic::build_request(&req);
+
+    // System is promoted to a text-block array so it can carry a breakpoint.
+    assert!(body["system"].is_array(), "cached system must be a block array");
+    assert_eq!(body["system"][0]["type"], "text");
+    assert_eq!(body["system"][0]["text"], "You are helpful.");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+
+    // Last tool carries a breakpoint.
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+    // The plain-string message body is wrapped into a text block that carries one.
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.last().unwrap()["type"], "text");
+    assert_eq!(content.last().unwrap()["text"], "Hi there.");
+    assert_eq!(content.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+    // Exactly 3 breakpoints — Anthropic allows at most 4.
+    let count = serde_json::to_string(&body).unwrap().matches("cache_control").count();
+    assert_eq!(count, 3, "tools + system + message = 3 breakpoints (≤4)");
+}
+
+#[test]
+fn anthropic_cache_disabled_emits_no_breakpoints() {
+    // One-shot (cache=false): system stays a plain string and nothing is marked,
+    // so we never pay a 1.25× cache write we won't read back.
+    let body = anthropic::build_request(&sample_request());
+    assert!(body["system"].is_string());
+    assert_eq!(body["messages"][0]["content"], "Hi there.");
+    let json = serde_json::to_string(&body).unwrap();
+    assert!(!json.contains("cache_control"), "no breakpoints when cache is off");
+}
+
+#[test]
+fn anthropic_cache_empty_system_still_marks_tools_and_message() {
+    // With no system text there's no block to cache, but the two prefixes that
+    // actually recur — tools and the conversation head — are still marked.
+    let mut req = sample_request();
+    req.cache = true;
+    req.system = "".into();
+    let body = anthropic::build_request(&req);
+    assert_eq!(body["system"], "", "empty system stays a plain string");
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.last().unwrap()["cache_control"]["type"], "ephemeral");
+    let count = serde_json::to_string(&body).unwrap().matches("cache_control").count();
+    assert_eq!(count, 2, "tools + message only");
+}
+
+#[test]
+fn anthropic_cache_marks_only_last_block_of_an_array_message() {
+    // When the last message is already block-form (tool results), the breakpoint
+    // attaches to the LAST block, not every block — the prefix is what's cached.
+    let mut req = sample_request();
+    req.cache = true;
+    req.messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::ToolResults(vec![
+            LlmToolResult { tool_use_id: "a".into(), content: "r1".into(), is_error: false },
+            LlmToolResult { tool_use_id: "b".into(), content: "r2".into(), is_error: false },
+        ]),
+    }];
+    let body = anthropic::build_request(&req);
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert!(content[0].get("cache_control").is_none(), "not the first block");
+    assert_eq!(content.last().unwrap()["cache_control"]["type"], "ephemeral");
 }
 
 #[test]
@@ -257,6 +337,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
         tools: vec![],
         tool_choice: None,
         effort: None,
+        cache: false,
     };
     let body = openai_compat::build_request(&req);
     let m = &body["messages"][0];
@@ -287,6 +368,7 @@ fn openai_tool_results_become_role_tool_messages() {
         tools: vec![],
         tool_choice: None,
         effort: None,
+        cache: false,
     };
     let body = openai_compat::build_request(&req);
     let msgs = body["messages"].as_array().unwrap();

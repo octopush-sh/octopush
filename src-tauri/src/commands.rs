@@ -4819,6 +4819,9 @@ pub fn build_ai_request(
         tool_choice,
         // AI-command calls (structured/prose one-shots) don't request thinking.
         effort: None,
+        // One-shot: the prefix is never re-sent, so a cache write would just be a
+        // wasted 1.25× surcharge with no read to repay it. Keep caching off.
+        cache: false,
     }
 }
 

@@ -124,6 +124,14 @@ Delete `cost_per_token`/`compute_cost` as public API. Single entry point
   subtract from billable input, populate real cache prices in the catalog.
 - **Enable Anthropic prompt caching** in `build_request` (fixes F7): `cache_control` on system + tools +
   conversation-prefix — the single biggest real-dollar saving, and it makes cache columns meaningful.
+  **SHIPPED (2026-07-31):** ephemeral breakpoints at the tail of tools / system (promoted to a block
+  array) / last message, gated by a new opt-in `LlmRequest.cache` — **on** for TALK + DIRECT agentic
+  loops, **off** for REVIEW/`ai_complete` one-shots and forced-`tool_choice` calls (a cache write on a
+  never-repeated prefix is a wasted 1.25× surcharge). GA on current models (no beta header); default
+  5-min TTL. Accounting was already cache-aware end-to-end (parse → record → `spend_events` cache cols →
+  `cost_for`), so this was purely the request markup. 4 unit tests on `build_request`. Anthropic-only by
+  design (OpenAI auto-caches and we already read `cached_tokens`; local models don't cache). **Left for
+  live confirmation:** eyeball `cache_read_input_tokens > 0` on a 2nd loop iteration in-app / Usage.
 
 ### 3.3 Unified budget enforcement — backend `check_budget`
 

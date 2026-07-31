@@ -320,6 +320,9 @@ pub async fn run_agentic_loop(
             tools: tools.clone(),
             tool_choice: None,
             effort,
+            // Agentic stage loop: system prompt, tool schemas and accumulated
+            // history are re-sent every iteration — cache the stable prefix.
+            cache: true,
         };
         // Transient failures (rate limit, overload, 5xx, dropped connection) are
         // retried in place with backoff — the accumulated message history is

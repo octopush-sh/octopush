@@ -1520,6 +1520,9 @@ impl ChatEngine {
                 tool_choice: None,
                 // TALK doesn't drive per-request reasoning effort — behavior unchanged.
                 effort: None,
+                // Agentic loop + multi-turn chat: the system prompt, tool schemas
+                // and prior turns are re-sent every iteration, so cache them.
+                cache: true,
             };
 
             let response = match provider
