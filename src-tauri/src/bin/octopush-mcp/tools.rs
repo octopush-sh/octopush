@@ -379,7 +379,7 @@ fn ROUTINE_INPUT_SCHEMA(edit: bool) -> Value {
         "task": { "type": "string", "description": "The task each fired run should accomplish. Omit for empty (do not pass null)." },
         "scheduleKind": { "type": "string", "enum": ["interval", "daily", "recurring"], "description": "'interval' fires every N seconds; 'daily' fires once at a wall-clock time; 'recurring' fires on chosen days at chosen times (days-of-week, a single date, or a within-day window)." },
         "scheduleSpec": { "type": "string", "description": "For 'interval': a whole number of SECONDS as a string, minimum 60 (e.g. \"3600\" = hourly). For 'daily': \"HH:MM\" 24-hour local time (e.g. \"09:00\"). For 'recurring': a JSON STRING of {days, time}. days = {\"kind\":\"weekly\",\"set\":[1,3,5]} (ISO 1=Mon…7=Sun, non-empty — [1,2,3,4,5,6,7]=every day, [1,2,3,4,5]=weekdays) OR {\"kind\":\"date\",\"date\":\"YYYY-MM-DD\"} (one-shot). time = {\"kind\":\"once\",\"at\":\"09:00\"} OR {\"kind\":\"window\",\"start\":\"09:00\",\"everyMinutes\":60,\"end\":\"15:00\"} (fires start,start+every,…≤end; everyMinutes>=15, end>=start). Example (every hour 9–3 on Mon/Wed/Fri): '{\"days\":{\"kind\":\"weekly\",\"set\":[1,3,5]},\"time\":{\"kind\":\"window\",\"start\":\"09:00\",\"everyMinutes\":60,\"end\":\"15:00\"}}'." },
-        "workspaceMode": { "type": "string", "enum": ["fixed", "fresh"], "description": "'fixed' (default when omitted) fires in one existing workspace (requires fixedWorkspaceId; a fire is skipped while that workspace has a live run); 'fresh' creates a NEW worktree each fire (requires scheduleKind 'daily' — a fresh worktree per run needs a daily cadence). Omit for the default (do not pass null)." },
+        "workspaceMode": { "type": "string", "enum": ["fixed", "fresh"], "description": "'fixed' (default when omitted) fires in one existing workspace (requires fixedWorkspaceId; a fire is skipped while that workspace has a live run); 'fresh' creates a NEW worktree each fire — it must fire AT MOST ONCE A DAY (a new worktree per run needs a daily cadence, no reaper yet), so with fresh use scheduleKind 'daily' or 'recurring' with a single 'once' time (never 'interval' or a 'recurring' window). Omit for the default (do not pass null)." },
         "fixedWorkspaceId": { "type": ["string", "null"], "description": "For 'fixed' mode: the workspace to run in (see list_workspaces). Must exist and belong to projectId. Ignored for 'fresh'." },
         "baseBranch": { "type": ["string", "null"], "description": "For 'fresh' mode: base branch each new worktree branches from. Defaults to the repo default branch." },
         "branchPrefix": { "type": ["string", "null"], "description": "For 'fresh' mode: prefix for the auto-generated branch name per fire." },
@@ -1773,6 +1773,17 @@ mod tests {
         bad["scheduleKind"] = json!("recurring");
         bad["scheduleSpec"] = json!(r#"{"days":{"kind":"weekly","set":[]},"time":{"kind":"once","at":"09:00"}}"#);
         assert!(create_routine(&db, &bad).is_err());
+
+        // Validate ORDER: a fresh routine with a malformed recurring spec must
+        // surface the schedule-shape parse error — NOT the "once a day" cadence
+        // message (validate_schedule runs before validate_routine).
+        let mut fresh_bad = fixed_routine_args(&proj, &pipe, &ws);
+        fresh_bad["workspaceMode"] = json!("fresh");
+        fresh_bad.as_object_mut().unwrap().remove("fixedWorkspaceId");
+        fresh_bad["scheduleKind"] = json!("recurring");
+        fresh_bad["scheduleSpec"] = json!("not valid json");
+        let err = create_routine(&db, &fresh_bad).unwrap_err();
+        assert!(err.contains("invalid recurring schedule"), "shape error should win: {err}");
     }
 
     /// stageModelOverrides (an [pos, model] array) round-trips as the stored JSON

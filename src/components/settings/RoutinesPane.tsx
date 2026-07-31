@@ -681,7 +681,10 @@ function RecurringBuilder({
 
   const timeInput =
     "rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass";
-  const todayISO = new Date().toISOString().slice(0, 10);
+  // Local calendar date (not UTC) so a user at a negative offset can still pick
+  // their own "today" for a one-shot.
+  const now = new Date();
+  const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 
   return (
     <div className="octo-fade-in mt-3 space-y-3.5 rounded-md border border-octo-hairline bg-[var(--brass-faint)] p-3">
