@@ -68,7 +68,7 @@ export interface Routine {
   referenceModel: string | null;
   stageOverrides: string | null;
   budgetUsd: number | null;
-  scheduleKind: "interval" | "daily";
+  scheduleKind: "interval" | "daily" | "recurring";
   /** Interval: whole seconds. Daily: "HH:MM" (24-hour, machine-local). */
   scheduleSpec: string;
   workspaceMode: "fixed" | "fresh";
@@ -98,7 +98,7 @@ export interface RoutineInput {
   referenceModel?: string | null;
   stageOverrides?: string | null;
   budgetUsd?: number | null;
-  scheduleKind: "interval" | "daily";
+  scheduleKind: "interval" | "daily" | "recurring";
   scheduleSpec: string;
   workspaceMode: "fixed" | "fresh";
   fixedWorkspaceId?: string | null;
@@ -1033,6 +1033,10 @@ export const ipc = {
     invoke<void>("set_routine_enabled", { routineId, enabled }),
   runRoutineNow: (routineId: string) =>
     invoke<FireOutcomeView>("run_routine_now", { routineId }),
+  /** Next `count` fire times (RFC3339 UTC) for a schedule — the editor preview.
+   *  Read-only; an invalid spec returns []. */
+  previewRoutineSchedule: (kind: string, spec: string, count: number) =>
+    invoke<string[]>("preview_routine_schedule", { kind, spec, count }),
 
   createRun: (
     workspaceId: string,

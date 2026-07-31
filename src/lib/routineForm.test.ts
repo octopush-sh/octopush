@@ -18,6 +18,14 @@ const baseDraft: RoutineDraft = {
   intervalValue: "6",
   intervalUnit: "hours",
   dailyTime: "09:00",
+  recurDayMode: "weekly",
+  recurDays: [1, 3, 5],
+  recurDate: "",
+  recurTimeMode: "once",
+  recurAt: "09:00",
+  recurStart: "09:00",
+  recurStepMin: "60",
+  recurEnd: "15:00",
   workspaceMode: "fixed",
   fixedWorkspaceId: "w1",
   baseBranch: "",
@@ -73,13 +81,19 @@ describe("draftToInput validation", () => {
     expect(typeof ok === "object" && ok.scheduleSpec).toBe("07:30");
   });
 
-  it("forbids a fresh workspace on a non-daily schedule (phase-1 rule)", () => {
+  it("forbids a fresh workspace on a more-than-once-a-day schedule (phase-1 rule)", () => {
     expect(
       draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "interval", fixedWorkspaceId: "" }),
-    ).toContain("fresh-workspace routine runs daily");
-    // fresh + daily is allowed.
-    const ok = draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "daily", fixedWorkspaceId: "" });
-    expect(typeof ok).toBe("object");
+    ).toContain("at most once a day");
+    // fresh + recurring window is also rejected (fires many times a day)…
+    expect(
+      draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "recurring", recurTimeMode: "window", fixedWorkspaceId: "" }),
+    ).toContain("at most once a day");
+    // …but fresh + daily and fresh + recurring(once) are allowed.
+    expect(typeof draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "daily", fixedWorkspaceId: "" })).toBe("object");
+    expect(
+      typeof draftToInput({ ...baseDraft, workspaceMode: "fresh", scheduleKind: "recurring", recurTimeMode: "once", fixedWorkspaceId: "" }),
+    ).toBe("object");
   });
 
   it("drops the fixed workspace and keeps branch fields in fresh mode", () => {
@@ -105,6 +119,68 @@ describe("draftToInput validation", () => {
     expect(typeof blank === "object" && blank.fireCondition).toBeUndefined();
     const none = draftToInput({ ...baseDraft, fireCondition: "" });
     expect(typeof none === "object" && none.fireCondition).toBeUndefined();
+  });
+});
+
+describe("recurring schedules (Days × Times)", () => {
+  it("summarizes the three canonical cases in plain English", () => {
+    const mwf = `{"days":{"kind":"weekly","set":[1,3,5]},"time":{"kind":"once","at":"09:00"}}`;
+    expect(scheduleSummary("recurring", mwf)).toBe("Mon, Wed & Fri at 9:00 AM");
+    const win = `{"days":{"kind":"weekly","set":[1,2,3,4,5,6,7]},"time":{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}}`;
+    expect(scheduleSummary("recurring", win)).toBe("Every hour, 9:00 AM–3:00 PM · every day");
+    const wk = `{"days":{"kind":"weekly","set":[1,2,3,4,5]},"time":{"kind":"once","at":"09:00"}}`;
+    expect(scheduleSummary("recurring", wk)).toBe("Weekdays at 9:00 AM");
+    const date = `{"days":{"kind":"date","date":"2026-08-15"},"time":{"kind":"once","at":"09:00"}}`;
+    expect(scheduleSummary("recurring", date)).toBe("Once on Aug 15, 2026 at 9:00 AM");
+    expect(scheduleSummary("recurring", "not json")).toBe("—");
+  });
+
+  it("serializes a weekly window draft into the wire spec", () => {
+    const out = draftToInput({
+      ...baseDraft,
+      scheduleKind: "recurring",
+      recurDayMode: "weekly",
+      recurDays: [1, 3, 5],
+      recurTimeMode: "window",
+      recurStart: "09:00",
+      recurStepMin: "60",
+      recurEnd: "15:00",
+    });
+    expect(typeof out).toBe("object");
+    if (typeof out === "object") {
+      expect(JSON.parse(out.scheduleSpec)).toEqual({
+        days: { kind: "weekly", set: [1, 3, 5] },
+        time: { kind: "window", start: "09:00", everyMinutes: 60, end: "15:00" },
+      });
+    }
+  });
+
+  it("round-trips a stored recurring routine into editable fields and back", () => {
+    const spec = `{"days":{"kind":"date","date":"2026-08-15"},"time":{"kind":"once","at":"09:30"}}`;
+    const routine: Routine = {
+      id: "r2", name: "One-shot", projectId: "p1", pipelineId: "pl1", task: "t",
+      referenceModel: null, stageOverrides: null, budgetUsd: null, scheduleKind: "recurring",
+      scheduleSpec: spec, workspaceMode: "fixed", fixedWorkspaceId: "w1",
+      baseBranch: null, branchPrefix: null, enabled: true, lastFiredAt: null,
+      nextDueAt: null, lastRunId: null, createdAt: "t",
+    };
+    const d = draftFromRoutine(routine, "p0");
+    expect(d.recurDayMode).toBe("date");
+    expect(d.recurDate).toBe("2026-08-15");
+    expect(d.recurTimeMode).toBe("once");
+    expect(d.recurAt).toBe("09:30");
+    const back = draftToInput(d);
+    expect(typeof back === "object" && back.scheduleSpec).toBe(spec);
+  });
+
+  it("rejects an empty day set and a sub-15-minute window", () => {
+    expect(draftToInput({ ...baseDraft, scheduleKind: "recurring", recurDays: [] })).toContain("at least one day");
+    expect(
+      draftToInput({ ...baseDraft, scheduleKind: "recurring", recurTimeMode: "window", recurStepMin: "5" }),
+    ).toContain("15 minutes");
+    expect(
+      draftToInput({ ...baseDraft, scheduleKind: "recurring", recurTimeMode: "window", recurStart: "15:00", recurEnd: "09:00" }),
+    ).toContain("end");
   });
 });
 

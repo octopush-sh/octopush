@@ -17,7 +17,9 @@ import { formatRelTime } from "../../lib/relTime";
 import {
   draftFromRoutine,
   draftToInput,
+  recurringSpecOf,
   scheduleSummary,
+  to12h,
   untilLabel,
   type RoutineDraft,
 } from "../../lib/routineForm";
@@ -269,10 +271,15 @@ function RoutineEditor({
   // the old project) — clear it so a stale id can't be saved silently.
   const onProjectChange = (v: string) => setDraft((d) => ({ ...d, projectId: v, fixedWorkspaceId: "" }));
 
-  // A fresh-workspace routine must be daily (phase-1 rule) — force it when the
-  // user picks fresh, so the schedule control can't hold an invalid combo.
+  // A fresh-workspace routine fires at most once a day (phase-1 rule) — coerce to
+  // a valid combo when the user picks fresh: an interval becomes daily; a custom
+  // schedule keeps its days but drops to a single time (no window).
   const onWorkspaceMode = (v: "fixed" | "fresh") =>
-    setDraft((d) => ({ ...d, workspaceMode: v, scheduleKind: v === "fresh" ? "daily" : d.scheduleKind }));
+    setDraft((d) => {
+      if (v !== "fresh") return { ...d, workspaceMode: v };
+      const scheduleKind = d.scheduleKind === "interval" ? "daily" : d.scheduleKind;
+      return { ...d, workspaceMode: v, scheduleKind, recurTimeMode: "once" };
+    });
 
   // Load workspaces for the chosen project (fixed mode). Clear any stale
   // selection if the reloaded list no longer contains it.
@@ -363,17 +370,22 @@ function RoutineEditor({
               <Segmented
                 value={draft.scheduleKind}
                 options={
-                  // Fresh routines are daily-only in phase 1 — offer just Daily.
+                  // Fresh routines fire ≤ once/day — offer Daily + Custom (single
+                  // time); interval is unbounded so it's hidden for fresh.
                   draft.workspaceMode === "fresh"
-                    ? [{ value: "daily", label: "Daily at" }]
+                    ? [
+                        { value: "daily", label: "Daily at" },
+                        { value: "recurring", label: "Custom" },
+                      ]
                     : [
                         { value: "daily", label: "Daily at" },
                         { value: "interval", label: "Every" },
+                        { value: "recurring", label: "Custom" },
                       ]
                 }
-                onChange={(v) => set("scheduleKind", v as "interval" | "daily")}
+                onChange={(v) => set("scheduleKind", v as RoutineDraft["scheduleKind"])}
               />
-              {draft.scheduleKind === "daily" ? (
+              {draft.scheduleKind === "daily" && (
                 <input
                   type="time"
                   value={draft.dailyTime}
@@ -381,7 +393,8 @@ function RoutineEditor({
                   aria-label="Daily time"
                   className="rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
                 />
-              ) : (
+              )}
+              {draft.scheduleKind === "interval" && (
                 <div className="flex items-center gap-2">
                   <input
                     type="number"
@@ -402,6 +415,9 @@ function RoutineEditor({
                 </div>
               )}
             </div>
+            {draft.scheduleKind === "recurring" && (
+              <RecurringBuilder draft={draft} set={set} setDraft={setDraft} freshOnce={draft.workspaceMode === "fresh"} />
+            )}
           </Field>
 
           <Field label="Workspace">
@@ -552,6 +568,217 @@ function Segmented({
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+// ISO weekday chips (1=Mon … 7=Sun), Monday-first.
+const RECUR_DAYS = [
+  { lbl: "Mo", v: 1 },
+  { lbl: "Tu", v: 2 },
+  { lbl: "We", v: 3 },
+  { lbl: "Th", v: 4 },
+  { lbl: "Fr", v: 5 },
+  { lbl: "Sa", v: 6 },
+  { lbl: "Su", v: 7 },
+];
+const STEP_OPTIONS = [
+  { value: "30", label: "30 min" },
+  { value: "60", label: "1 hour" },
+  { value: "120", label: "2 hours" },
+  { value: "180", label: "3 hours" },
+];
+
+/** Format a preview instant as "Today · 9:00 AM" / "Wed, Aug 5 · 9:00 AM". */
+function formatRun(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const now = new Date();
+  const midnight = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((midnight(d) - midnight(now)) / 86400000);
+  const time = to12h(`${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`);
+  if (days === 0) return `Today · ${time}`;
+  if (days === 1) return `Tomorrow · ${time}`;
+  return `${d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} · ${time}`;
+}
+
+/** The Days × Times builder for a `recurring` schedule: presets, day/date and
+ *  time controls, a live natural-language summary, and a next-runs preview
+ *  (driven by the real backend engine). Mirrors the approved Companion mockup. */
+function RecurringBuilder({
+  draft,
+  set,
+  setDraft,
+  freshOnce,
+}: {
+  draft: RoutineDraft;
+  set: <K extends keyof RoutineDraft>(k: K, v: RoutineDraft[K]) => void;
+  setDraft: (fn: (d: RoutineDraft) => RoutineDraft) => void;
+  freshOnce: boolean;
+}) {
+  const [runs, setRuns] = useState<string[]>([]);
+  const spec = recurringSpecOf(draft);
+
+  // Live "next runs" via the real scheduler engine (debounced).
+  useEffect(() => {
+    if (!spec) {
+      setRuns([]);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      ipc
+        .previewRoutineSchedule("recurring", spec, 4)
+        .then((r) => !cancelled && setRuns(r))
+        .catch(() => !cancelled && setRuns([]));
+    }, 180);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [spec]);
+
+  const toggleDay = (v: number) =>
+    setDraft((d) => ({
+      ...d,
+      recurDayMode: "weekly",
+      recurDays: d.recurDays.includes(v)
+        ? d.recurDays.filter((x) => x !== v)
+        : [...d.recurDays, v].sort((a, b) => a - b),
+    }));
+
+  const applyPreset = (p: string) =>
+    setDraft((d) => {
+      switch (p) {
+        case "everyday":
+          return { ...d, recurDayMode: "weekly", recurDays: [1, 2, 3, 4, 5, 6, 7], recurTimeMode: "once" };
+        case "weekdays":
+          return { ...d, recurDayMode: "weekly", recurDays: [1, 2, 3, 4, 5], recurTimeMode: "once" };
+        case "daysofweek":
+          return { ...d, recurDayMode: "weekly", recurDays: d.recurDays.length ? d.recurDays : [1, 3, 5], recurTimeMode: "once" };
+        case "window":
+          return { ...d, recurDayMode: "weekly", recurDays: [1, 2, 3, 4, 5, 6, 7], recurTimeMode: "window", recurStart: "09:00", recurStepMin: "60", recurEnd: "15:00" };
+        case "date":
+          return { ...d, recurDayMode: "date", recurTimeMode: "once" };
+        default:
+          return d;
+      }
+    });
+
+  const presets = [
+    { k: "everyday", label: "Every day" },
+    { k: "weekdays", label: "Weekdays" },
+    { k: "daysofweek", label: "Days of week" },
+    ...(freshOnce ? [] : [{ k: "window", label: "Time window" }]),
+    { k: "date", label: "On a date" },
+  ];
+
+  const timeInput =
+    "rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass";
+
+  return (
+    <div className="mt-3 space-y-3.5 rounded-md border border-octo-hairline bg-[var(--brass-faint)] p-3">
+      {/* presets */}
+      <div className="flex flex-wrap gap-1.5">
+        {presets.map((p) => (
+          <button
+            key={p.k}
+            type="button"
+            onClick={() => applyPreset(p.k)}
+            className="rounded-full border border-octo-hairline bg-octo-panel px-2.5 py-1 text-[11.5px] text-octo-sage transition-colors duration-200 hover:border-[var(--brass-quiet)] hover:text-octo-ivory"
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      {/* days axis */}
+      {draft.recurDayMode === "weekly" ? (
+        <div className="flex flex-wrap gap-1.5">
+          {RECUR_DAYS.map((day) => {
+            const on = draft.recurDays.includes(day.v);
+            return (
+              <button
+                key={day.v}
+                type="button"
+                aria-pressed={on}
+                onClick={() => toggleDay(day.v)}
+                className={`flex h-9 w-9 items-center justify-center rounded-md border font-mono text-[12px] transition-colors duration-200 ${
+                  on
+                    ? "border-[var(--brass-line)] bg-[var(--brass-ghost)] text-octo-brass"
+                    : "border-octo-hairline bg-octo-panel text-octo-mute hover:text-octo-ivory"
+                }`}
+              >
+                {day.lbl}
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <input
+          type="date"
+          value={draft.recurDate}
+          onChange={(e) => set("recurDate", e.target.value)}
+          aria-label="Date"
+          className={timeInput}
+        />
+      )}
+
+      {/* times axis */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Segmented
+          value={draft.recurTimeMode}
+          options={freshOnce ? [{ value: "once", label: "Once" }] : [{ value: "once", label: "Once" }, { value: "window", label: "Window" }]}
+          onChange={(v) => set("recurTimeMode", v as RoutineDraft["recurTimeMode"])}
+        />
+        {draft.recurTimeMode === "once" ? (
+          <>
+            <span className="text-[12px] text-octo-sage">at</span>
+            <input type="time" value={draft.recurAt} onChange={(e) => set("recurAt", e.target.value)} aria-label="Time" className={timeInput} />
+          </>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[12px] text-octo-sage">every</span>
+            <Listbox
+              ariaLabel="Every"
+              triggerClassName={FIELD_SURFACE}
+              value={draft.recurStepMin}
+              options={STEP_OPTIONS}
+              onChange={(v) => set("recurStepMin", v)}
+            />
+            <span className="text-[12px] text-octo-sage">from</span>
+            <input type="time" value={draft.recurStart} onChange={(e) => set("recurStart", e.target.value)} aria-label="Start time" className={timeInput} />
+            <span className="text-[12px] text-octo-sage">to</span>
+            <input type="time" value={draft.recurEnd} onChange={(e) => set("recurEnd", e.target.value)} aria-label="End time" className={timeInput} />
+          </div>
+        )}
+      </div>
+
+      {/* live summary */}
+      <div className="rounded-md border border-octo-hairline border-l-2 border-l-octo-brass bg-octo-bg px-3 py-2.5">
+        <span className="mb-1 block font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">This routine runs</span>
+        <p className="font-serif text-[15px] leading-snug text-octo-ivory">{spec ? scheduleSummary("recurring", spec) : "—"}</p>
+      </div>
+
+      {/* next-runs preview */}
+      <div>
+        <span className="mb-1.5 block font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">Next runs</span>
+        <div className="divide-y divide-octo-hairline overflow-hidden rounded-md border border-octo-hairline">
+          {runs.length === 0 ? (
+            <div className="px-3 py-2 text-[12px] text-octo-mute">{spec ? "Nothing upcoming" : "Pick a day and time"}</div>
+          ) : (
+            runs.map((iso, i) => (
+              <div key={iso} className="flex items-center justify-between px-3 py-2">
+                <span className="font-mono text-[12px] text-octo-ivory">
+                  <span className={`mr-2 inline-block h-1.5 w-1.5 rounded-full align-middle ${i === 0 ? "bg-octo-brass" : "bg-octo-mute"}`} />
+                  {formatRun(iso)}
+                </span>
+                <span className="text-[11.5px] text-octo-sage">{untilLabel(iso)}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 
 use crate::db::RoutineRow;
 use crate::orchestrator::launch;
@@ -30,9 +30,15 @@ const TICK_SECS: u64 = 30;
 /// 30s scheduler tick.
 const CONDITION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The two phase-1 schedule kinds.
+/// The schedule kinds. `interval`/`daily` are the original simple cadences;
+/// `recurring` is the flexible Days×Times model (spec = JSON, see `RecurringSpec`).
 pub const KIND_INTERVAL: &str = "interval";
 pub const KIND_DAILY: &str = "daily";
+pub const KIND_RECURRING: &str = "recurring";
+
+/// The quota-safety floor on a window's step, analogous to `interval`'s 60s
+/// floor: a window can fire at most every 15 minutes (≤ 96 fires/day).
+const MIN_WINDOW_STEP_MIN: i64 = 15;
 
 /// Why a fire skipped its window (each existing skip site maps onto one). Serde
 /// carries a machine token + a human `reason` string for the ipc/toast.
@@ -228,8 +234,137 @@ pub fn next_due(kind: &str, spec: &str, after: DateTime<Local>) -> Option<String
             }
             Some(candidate.with_timezone(&Utc).to_rfc3339())
         }
+        KIND_RECURRING => {
+            let spec = RecurringSpec::parse(spec).ok()?;
+            next_due_recurring(&spec, after)
+        }
         _ => None,
     }
+}
+
+// ── recurring schedules (Days × Times) ──────────────────────────────────────
+
+/// A `recurring` schedule: which days it's active, and at what time(s) within a
+/// day. Serialized as JSON into `schedule_spec`. See the design record.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RecurringSpec {
+    pub days: DaySel,
+    pub time: TimeSel,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum DaySel {
+    /// A non-empty set of ISO weekdays (1 = Monday … 7 = Sunday). Covers "every
+    /// day" (all 7), "weekdays" (1–5), and any specific subset.
+    Weekly { set: Vec<u8> },
+    /// A single calendar date (YYYY-MM-DD) — a one-shot.
+    Date { date: String },
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum TimeSel {
+    /// Fire once per active day, at `at` (HH:MM machine-local).
+    Once { at: String },
+    /// Fire every `every_minutes` from `start` through `end` (inclusive),
+    /// machine-local.
+    Window {
+        start: String,
+        #[serde(rename = "everyMinutes")]
+        every_minutes: i64,
+        end: String,
+    },
+}
+
+impl RecurringSpec {
+    fn parse(spec: &str) -> Result<Self, String> {
+        serde_json::from_str(spec).map_err(|e| format!("invalid recurring schedule: {e}"))
+    }
+}
+
+/// The (hh, mm) fire times within a single active day, ascending. `once` yields
+/// one; `window` enumerates `start, start+every, … ≤ end`. Returns empty on a
+/// malformed HH:MM or a non-positive step (the caller then finds no instant).
+fn day_times(time: &TimeSel) -> Vec<(u32, u32)> {
+    match time {
+        TimeSel::Once { at } => parse_hhmm(at).into_iter().collect(),
+        TimeSel::Window { start, every_minutes, end } => {
+            let (Some((sh, sm)), Some((eh, em))) = (parse_hhmm(start), parse_hhmm(end)) else {
+                return Vec::new();
+            };
+            if *every_minutes <= 0 {
+                return Vec::new();
+            }
+            let start_min = sh as i64 * 60 + sm as i64;
+            let end_min = eh as i64 * 60 + em as i64;
+            let mut out = Vec::new();
+            let mut t = start_min;
+            // Bounded by a day; the ≥15-min validated floor caps this at ≤96.
+            let mut guard = 0;
+            while t <= end_min && guard < 24 * 60 {
+                out.push(((t / 60) as u32, (t % 60) as u32));
+                t += *every_minutes;
+                guard += 1;
+            }
+            out
+        }
+    }
+}
+
+/// Whether `day` (a local calendar date) is active for this day selector.
+fn day_active(day: NaiveDate, days: &DaySel) -> bool {
+    match days {
+        DaySel::Weekly { set } => set.contains(&(day.weekday().number_from_monday() as u8)),
+        DaySel::Date { date } => NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map(|d| d == day)
+            .unwrap_or(false),
+    }
+}
+
+/// Next fire (UTC RFC3339) for a recurring schedule strictly after `after`.
+/// Scans forward day-by-day (bounded) for the first active day with a fire
+/// instant after `after`. A `date` selector whose date is already past → None.
+fn next_due_recurring(spec: &RecurringSpec, after: DateTime<Local>) -> Option<String> {
+    let start_day = after.date_naive();
+    // 400 days covers any weekly cadence plus a full-year lookahead for a `date`.
+    for offset in 0..400 {
+        let day = start_day.checked_add_signed(chrono::Duration::days(offset))?;
+        // One-shot already past: no future fire possible — stop early.
+        if let DaySel::Date { date } = &spec.days {
+            if let Ok(d) = NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+                if day > d {
+                    return None;
+                }
+            }
+        }
+        if !day_active(day, &spec.days) {
+            continue;
+        }
+        for (hh, mm) in day_times(&spec.time) {
+            if let Some(inst) = local_at_date(day, hh, mm) {
+                if inst > after {
+                    return Some(inst.with_timezone(&Utc).to_rfc3339());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The next `n` fires (UTC RFC3339, ascending) after `after`, for the editor
+/// preview. Iterates the real `next_due` — one engine, no drift. Stops early if
+/// the schedule runs out (a past one-shot yields an empty list).
+pub fn next_n_due(kind: &str, spec: &str, after: DateTime<Local>, n: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(n);
+    let mut cursor = after;
+    for _ in 0..n {
+        let Some(iso) = next_due(kind, spec, cursor) else { break };
+        let Ok(parsed) = DateTime::parse_from_rfc3339(&iso) else { break };
+        cursor = parsed.with_timezone(&Local);
+        out.push(iso);
+    }
+    out
 }
 
 /// Validate a schedule spec at authoring time (clear error before it's stored).
@@ -250,20 +385,73 @@ pub fn validate_schedule(kind: &str, spec: &str) -> Result<(), String> {
         KIND_DAILY => parse_hhmm(spec)
             .map(|_| ())
             .ok_or_else(|| "daily time must be HH:MM (24-hour)".to_string()),
+        KIND_RECURRING => validate_recurring(spec),
         other => Err(format!("unknown schedule kind '{other}'")),
     }
 }
 
+/// Validate a `recurring` spec: at least one active day, valid times, and a
+/// window bounded to the ≥15-min floor with end ≥ start.
+fn validate_recurring(spec: &str) -> Result<(), String> {
+    let spec = RecurringSpec::parse(spec)?;
+    match &spec.days {
+        DaySel::Weekly { set } => {
+            if set.is_empty() {
+                return Err("choose at least one day of the week".into());
+            }
+            if set.iter().any(|d| !(1..=7).contains(d)) {
+                return Err("weekday numbers must be 1 (Monday) through 7 (Sunday)".into());
+            }
+        }
+        DaySel::Date { date } => {
+            NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map_err(|_| "date must be YYYY-MM-DD".to_string())?;
+        }
+    }
+    match &spec.time {
+        TimeSel::Once { at } => {
+            parse_hhmm(at).ok_or_else(|| "time must be HH:MM (24-hour)".to_string())?;
+        }
+        TimeSel::Window { start, every_minutes, end } => {
+            let (sh, sm) = parse_hhmm(start).ok_or("window start must be HH:MM (24-hour)")?;
+            let (eh, em) = parse_hhmm(end).ok_or("window end must be HH:MM (24-hour)")?;
+            if *every_minutes < MIN_WINDOW_STEP_MIN {
+                return Err(format!("a window must step at least {MIN_WINDOW_STEP_MIN} minutes"));
+            }
+            let (s, e) = (sh as i64 * 60 + sm as i64, eh as i64 * 60 + em as i64);
+            if e < s {
+                return Err("the window's end time must be at or after its start".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Cross-field validation at authoring time. Phase-1 rule: a `fresh`-workspace
-/// routine must be `daily`. A fresh fire creates a NEW worktree, and phase 1
-/// has no auto-reaper — a sub-daily `fresh` cadence (e.g. every minute) would
-/// generate worktrees without bound. Daily caps it to one/day (the accepted
-/// no-reaper tradeoff) and matches fresh's natural "a clean PR each morning"
-/// shape. Frequent-fresh returns with the retention reaper in phase 2.
-pub fn validate_routine(workspace_mode: &str, schedule_kind: &str) -> Result<(), String> {
-    if workspace_mode == "fresh" && schedule_kind != KIND_DAILY {
+/// routine must fire **at most once per day**. A fresh fire creates a NEW
+/// worktree, and phase 1 has no auto-reaper — a sub-daily `fresh` cadence would
+/// generate worktrees without bound. So a fresh routine may be `daily`, or
+/// `recurring` with a `once` time (any days) — but never `interval` or a
+/// `recurring` `window`. Frequent-fresh returns with the retention reaper.
+pub fn validate_routine(
+    workspace_mode: &str,
+    schedule_kind: &str,
+    schedule_spec: &str,
+) -> Result<(), String> {
+    if workspace_mode != "fresh" {
+        return Ok(());
+    }
+    let once_per_day = match schedule_kind {
+        KIND_DAILY => true,
+        KIND_RECURRING => matches!(
+            RecurringSpec::parse(schedule_spec).map(|s| s.time),
+            Ok(TimeSel::Once { .. })
+        ),
+        _ => false, // interval (unbounded) and anything unknown
+    };
+    if !once_per_day {
         return Err(
-            "a fresh-workspace routine must run daily — a new worktree per run needs a daily cadence (frequent fresh runs arrive with automatic cleanup)".into(),
+            "a fresh-workspace routine must fire at most once a day — a new worktree per run needs a daily cadence (use Daily, or a Custom schedule with a single time; frequent fresh runs arrive with automatic cleanup)".into(),
         );
     }
     Ok(())
@@ -284,9 +472,14 @@ fn parse_hhmm(spec: &str) -> Option<(u32, u32)> {
 /// to the earliest valid instant (a routine at a skipped/dup wall-clock time
 /// still fires once, close to intent).
 fn local_at(reference: DateTime<Local>, hh: u32, mm: u32) -> Option<DateTime<Local>> {
-    let naive = reference
-        .date_naive()
-        .and_hms_opt(hh, mm, 0)?;
+    local_at_date(reference.date_naive(), hh, mm)
+}
+
+/// The local datetime at `date` + `HH:MM`, resolving a DST gap/fold to the
+/// earliest valid instant (a routine at a skipped/dup wall-clock time still
+/// fires once, close to intent).
+fn local_at_date(date: NaiveDate, hh: u32, mm: u32) -> Option<DateTime<Local>> {
+    let naive = date.and_hms_opt(hh, mm, 0)?;
     match Local.from_local_datetime(&naive) {
         chrono::LocalResult::Single(dt) => Some(dt),
         chrono::LocalResult::Ambiguous(a, _) => Some(a),

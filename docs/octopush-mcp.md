@@ -147,11 +147,18 @@ feature; `create_routine`/`update_routine` share one validated payload). It stay
   `scheduleSpec`. All ids are **validated to exist** (a dangling routine would
   fail silently at fire time).
 - **Schedule:** `scheduleKind` `interval` (`scheduleSpec` = whole **seconds** as a
-  string, ≥ 60 — `"3600"` = hourly) or `daily` (`scheduleSpec` = `"HH:MM"` 24h).
+  string, ≥ 60 — `"3600"` = hourly), `daily` (`scheduleSpec` = `"HH:MM"` 24h), or
+  **`recurring`** (`scheduleSpec` = a JSON **string** `{days, time}`: `days` =
+  `{"kind":"weekly","set":[1,3,5]}` (ISO 1=Mon…7=Sun) or
+  `{"kind":"date","date":"YYYY-MM-DD"}`; `time` = `{"kind":"once","at":"09:00"}`
+  or `{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}` —
+  `everyMinutes ≥ 15`, `end ≥ start`). Structured JSON, not cron. Example — every
+  hour 9–3 on Mon/Wed/Fri:
+  `'{"days":{"kind":"weekly","set":[1,3,5]},"time":{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}}'`.
 - **Workspace mode:** `fixed` (default — needs `fixedWorkspaceId`, which must
   exist and belong to `projectId`; a fire is skipped while that workspace has a
-  live run) or `fresh` (a new worktree per fire — **requires `daily`**; takes
-  `baseBranch`/`branchPrefix`).
+  live run) or `fresh` (a new worktree per fire — fires **at most once a day**, so
+  `daily` or `recurring` with a single `once` time; takes `baseBranch`/`branchPrefix`).
 - **Optional:** `task`, `referenceModel`, `budgetUsd`, `stageModelOverrides`
   (`[position, model]` pairs, like `create_run`), and `fireCondition` — a pre-fire
   shell command run in the workspace; the routine fires only if it **exits 0**

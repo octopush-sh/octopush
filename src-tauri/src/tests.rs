@@ -5354,6 +5354,75 @@ mod orchestrator_tests {
         assert!(next_due("weekly", "mon", after).is_none());
     }
 
+    /// Recurring: weekly day-sets pick the right next weekday; windows enumerate
+    /// start→end and roll to the next active day; a past one-shot date is None.
+    #[test]
+    fn routine_next_due_recurring() {
+        use crate::routines::{next_due, next_n_due, KIND_RECURRING};
+        use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
+
+        let after = Local.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).single().unwrap();
+        let loc = |iso: &str| DateTime::parse_from_rfc3339(iso).unwrap().with_timezone(&Local);
+
+        // Weekdays-only, once at 09:00 → next fire is 09:00 on a Mon–Fri.
+        let wk = r#"{"days":{"kind":"weekly","set":[1,2,3,4,5]},"time":{"kind":"once","at":"09:00"}}"#;
+        let n = loc(&next_due(KIND_RECURRING, wk, after).unwrap());
+        assert!(n > after);
+        assert_eq!((n.hour(), n.minute()), (9, 0));
+        assert!((1..=5).contains(&n.weekday().number_from_monday()));
+
+        // A single specific weekday (Wednesday=3) → the fire lands on a Wednesday.
+        let wed = r#"{"days":{"kind":"weekly","set":[3]},"time":{"kind":"once","at":"09:00"}}"#;
+        let n = loc(&next_due(KIND_RECURRING, wed, after).unwrap());
+        assert_eq!(n.weekday().number_from_monday(), 3);
+
+        // Every-day window, every 60m 09:00→15:00: exact next instants.
+        let win = r#"{"days":{"kind":"weekly","set":[1,2,3,4,5,6,7]},"time":{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}}"#;
+        // From 08:00 → today 09:00.
+        assert_eq!(loc(&next_due(KIND_RECURRING, win, after).unwrap()).hour(), 9);
+        // Strictly-after: from exactly 09:00 → 10:00.
+        let at9 = Local.with_ymd_and_hms(2026, 7, 13, 9, 0, 0).single().unwrap();
+        assert_eq!(loc(&next_due(KIND_RECURRING, win, at9).unwrap()).hour(), 10);
+        // Past the window's end → next day's first fire (09:00).
+        let late = Local.with_ymd_and_hms(2026, 7, 13, 16, 0, 0).single().unwrap();
+        let n = loc(&next_due(KIND_RECURRING, win, late).unwrap());
+        assert_eq!((n.date_naive(), n.hour()), (late.date_naive() + chrono::Duration::days(1), 9));
+
+        // next_n_due gives 4 ascending, distinct instants (09,10,11,12 today).
+        let runs = next_n_due(KIND_RECURRING, win, after, 4);
+        assert_eq!(runs.len(), 4);
+        let hours: Vec<u32> = runs.iter().map(|s| loc(s).hour()).collect();
+        assert_eq!(hours, vec![9, 10, 11, 12]);
+
+        // One-shot dates: a future date fires that day; a past date is None.
+        let future = r#"{"days":{"kind":"date","date":"2026-12-25"},"time":{"kind":"once","at":"09:00"}}"#;
+        assert_eq!(loc(&next_due(KIND_RECURRING, future, after).unwrap()).date_naive(),
+                   chrono::NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
+        let past = r#"{"days":{"kind":"date","date":"2026-01-01"},"time":{"kind":"once","at":"09:00"}}"#;
+        assert!(next_due(KIND_RECURRING, past, after).is_none());
+    }
+
+    /// Recurring spec validation: empty/out-of-range day-sets, window floor and
+    /// ordering, and malformed JSON are all rejected; valid specs pass.
+    #[test]
+    fn routine_validate_recurring_spec() {
+        use crate::routines::{validate_schedule, KIND_RECURRING};
+        let ok = |s: &str| validate_schedule(KIND_RECURRING, s).is_ok();
+        let bad = |s: &str| validate_schedule(KIND_RECURRING, s).is_err();
+
+        assert!(ok(r#"{"days":{"kind":"weekly","set":[1,3,5]},"time":{"kind":"once","at":"09:00"}}"#));
+        assert!(ok(r#"{"days":{"kind":"weekly","set":[1,2,3,4,5,6,7]},"time":{"kind":"window","start":"09:00","everyMinutes":30,"end":"15:00"}}"#));
+        assert!(ok(r#"{"days":{"kind":"date","date":"2026-08-15"},"time":{"kind":"once","at":"09:00"}}"#));
+
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[]},"time":{"kind":"once","at":"09:00"}}"#)); // empty
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[0,8]},"time":{"kind":"once","at":"09:00"}}"#)); // out of range
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"once","at":"25:00"}}"#)); // bad time
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"window","start":"09:00","everyMinutes":5,"end":"15:00"}}"#)); // step < 15
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"window","start":"15:00","everyMinutes":60,"end":"09:00"}}"#)); // end < start
+        assert!(bad(r#"{"days":{"kind":"date","date":"nope"},"time":{"kind":"once","at":"09:00"}}"#)); // bad date
+        assert!(bad("not json"));
+    }
+
     #[test]
     fn routine_validate_schedule_bounds() {
         use crate::routines::validate_schedule;
@@ -5372,10 +5441,16 @@ mod orchestrator_tests {
     #[test]
     fn routine_validate_fresh_requires_daily() {
         use crate::routines::validate_routine;
-        assert!(validate_routine("fresh", "daily").is_ok());
-        assert!(validate_routine("fresh", "interval").is_err());
-        assert!(validate_routine("fixed", "interval").is_ok());
-        assert!(validate_routine("fixed", "daily").is_ok());
+        assert!(validate_routine("fresh", "daily", "09:00").is_ok());
+        assert!(validate_routine("fresh", "interval", "3600").is_err());
+        assert!(validate_routine("fixed", "interval", "3600").is_ok());
+        assert!(validate_routine("fixed", "daily", "09:00").is_ok());
+        // fresh + recurring: a single daily time is OK, a window is not.
+        let once = r#"{"days":{"kind":"weekly","set":[1,3,5]},"time":{"kind":"once","at":"09:00"}}"#;
+        let window = r#"{"days":{"kind":"weekly","set":[1,2,3,4,5,6,7]},"time":{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}}"#;
+        assert!(validate_routine("fresh", "recurring", once).is_ok());
+        assert!(validate_routine("fresh", "recurring", window).is_err());
+        assert!(validate_routine("fixed", "recurring", window).is_ok());
     }
 
     /// CRUD roundtrip + the due filter: a routine is `due` only when enabled and

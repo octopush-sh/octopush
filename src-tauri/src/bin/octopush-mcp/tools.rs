@@ -377,8 +377,8 @@ fn ROUTINE_INPUT_SCHEMA(edit: bool) -> Value {
         "projectId": { "type": "string", "description": "The project (git repo) to run in (see list_projects). Must exist." },
         "pipelineId": { "type": "string", "description": "The pipeline to fire (see list_pipelines). Must exist." },
         "task": { "type": "string", "description": "The task each fired run should accomplish. Omit for empty (do not pass null)." },
-        "scheduleKind": { "type": "string", "enum": ["interval", "daily"], "description": "'interval' fires every N seconds; 'daily' fires at a wall-clock time." },
-        "scheduleSpec": { "type": "string", "description": "For 'interval': a whole number of SECONDS as a string, minimum 60 (e.g. \"3600\" = hourly). For 'daily': \"HH:MM\" 24-hour local time (e.g. \"09:00\")." },
+        "scheduleKind": { "type": "string", "enum": ["interval", "daily", "recurring"], "description": "'interval' fires every N seconds; 'daily' fires once at a wall-clock time; 'recurring' fires on chosen days at chosen times (days-of-week, a single date, or a within-day window)." },
+        "scheduleSpec": { "type": "string", "description": "For 'interval': a whole number of SECONDS as a string, minimum 60 (e.g. \"3600\" = hourly). For 'daily': \"HH:MM\" 24-hour local time (e.g. \"09:00\"). For 'recurring': a JSON STRING of {days, time}. days = {\"kind\":\"weekly\",\"set\":[1,3,5]} (ISO 1=Mon…7=Sun, non-empty — [1,2,3,4,5,6,7]=every day, [1,2,3,4,5]=weekdays) OR {\"kind\":\"date\",\"date\":\"YYYY-MM-DD\"} (one-shot). time = {\"kind\":\"once\",\"at\":\"09:00\"} OR {\"kind\":\"window\",\"start\":\"09:00\",\"everyMinutes\":60,\"end\":\"15:00\"} (fires start,start+every,…≤end; everyMinutes>=15, end>=start). Example (every hour 9–3 on Mon/Wed/Fri): '{\"days\":{\"kind\":\"weekly\",\"set\":[1,3,5]},\"time\":{\"kind\":\"window\",\"start\":\"09:00\",\"everyMinutes\":60,\"end\":\"15:00\"}}'." },
         "workspaceMode": { "type": "string", "enum": ["fixed", "fresh"], "description": "'fixed' (default when omitted) fires in one existing workspace (requires fixedWorkspaceId; a fire is skipped while that workspace has a live run); 'fresh' creates a NEW worktree each fire (requires scheduleKind 'daily' — a fresh worktree per run needs a daily cadence). Omit for the default (do not pass null)." },
         "fixedWorkspaceId": { "type": ["string", "null"], "description": "For 'fixed' mode: the workspace to run in (see list_workspaces). Must exist and belong to projectId. Ignored for 'fresh'." },
         "baseBranch": { "type": ["string", "null"], "description": "For 'fresh' mode: base branch each new worktree branches from. Defaults to the repo default branch." },
@@ -1073,7 +1073,11 @@ fn build_routine_input(
 
     // Shared cross-field + schedule validation, then compute next_due — the exact
     // order the app's validate_routine_input uses.
-    octopush_lib::routines::validate_routine(&input.workspace_mode, &input.schedule_kind)?;
+    octopush_lib::routines::validate_routine(
+        &input.workspace_mode,
+        &input.schedule_kind,
+        &input.schedule_spec,
+    )?;
     octopush_lib::routines::validate_schedule(&input.schedule_kind, &input.schedule_spec)?;
     let next_due = octopush_lib::routines::next_due(
         &input.schedule_kind,
@@ -1746,6 +1750,29 @@ mod tests {
         a["scheduleKind"] = json!("daily");
         a["scheduleSpec"] = json!("25:00");
         assert!(create_routine(&db, &a).is_err());
+    }
+
+    /// A recurring routine (Days × Times) round-trips its JSON spec, and an
+    /// invalid recurring spec is rejected via the shared validator.
+    #[test]
+    fn create_routine_recurring_round_trips_and_validates() {
+        let (db, proj, pipe, ws) = seeded_routine_db();
+        let spec = r#"{"days":{"kind":"weekly","set":[1,3,5]},"time":{"kind":"window","start":"09:00","everyMinutes":60,"end":"15:00"}}"#;
+        let mut a = fixed_routine_args(&proj, &pipe, &ws);
+        a["scheduleKind"] = json!("recurring");
+        a["scheduleSpec"] = json!(spec);
+        let id = create_routine(&db, &a).expect("recurring routine should be created")["routineId"]
+            .as_str().unwrap().to_string();
+        let stored = db.get_routine(&id).unwrap().unwrap();
+        assert_eq!(stored.schedule_kind, "recurring");
+        assert_eq!(stored.schedule_spec, spec);
+        assert!(stored.next_due_at.is_some(), "recurring next_due should compute");
+
+        // A malformed recurring spec (empty day set) is rejected.
+        let mut bad = fixed_routine_args(&proj, &pipe, &ws);
+        bad["scheduleKind"] = json!("recurring");
+        bad["scheduleSpec"] = json!(r#"{"days":{"kind":"weekly","set":[]},"time":{"kind":"once","at":"09:00"}}"#);
+        assert!(create_routine(&db, &bad).is_err());
     }
 
     /// stageModelOverrides (an [pos, model] array) round-trips as the stored JSON
