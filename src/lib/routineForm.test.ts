@@ -4,6 +4,8 @@ import {
   untilLabel,
   draftFromRoutine,
   draftToInput,
+  recurringSpecOf,
+  to12h,
   type RoutineDraft,
 } from "./routineForm";
 import type { Routine } from "./ipc";
@@ -133,6 +135,43 @@ describe("recurring schedules (Days × Times)", () => {
     const date = `{"days":{"kind":"date","date":"2026-08-15"},"time":{"kind":"once","at":"09:00"}}`;
     expect(scheduleSummary("recurring", date)).toBe("Once on Aug 15, 2026 at 9:00 AM");
     expect(scheduleSummary("recurring", "not json")).toBe("—");
+  });
+
+  it("says 'On <date>' not 'Once' for a window on a specific date", () => {
+    const dateWin = `{"days":{"kind":"date","date":"2026-08-15"},"time":{"kind":"window","start":"09:00","everyMinutes":30,"end":"11:00"}}`;
+    const s = scheduleSummary("recurring", dateWin);
+    expect(s).toBe("On Aug 15, 2026 — every 30 minutes, 9:00 AM–11:00 AM");
+    expect(s.startsWith("Once")).toBe(false);
+  });
+
+  it("formats 12-hour times at the edges", () => {
+    expect(to12h("00:00")).toBe("12:00 AM");
+    expect(to12h("12:00")).toBe("12:00 PM");
+    expect(to12h("23:59")).toBe("11:59 PM");
+    expect(to12h("13:05")).toBe("1:05 PM");
+  });
+
+  it("recurringSpecOf returns null for an invalid draft, a spec otherwise", () => {
+    expect(recurringSpecOf({ ...baseDraft, scheduleKind: "recurring", recurDays: [] })).toBeNull();
+    const spec = recurringSpecOf({ ...baseDraft, scheduleKind: "recurring", recurDays: [1, 3, 5] });
+    expect(spec && JSON.parse(spec).days).toEqual({ kind: "weekly", set: [1, 3, 5] });
+  });
+
+  it("round-trips a weekly-window routine losslessly", () => {
+    const spec = `{"days":{"kind":"weekly","set":[2,4]},"time":{"kind":"window","start":"08:00","everyMinutes":120,"end":"16:00"}}`;
+    const routine: Routine = {
+      id: "r3", name: "W", projectId: "p1", pipelineId: "pl1", task: "t",
+      referenceModel: null, stageOverrides: null, budgetUsd: null, scheduleKind: "recurring",
+      scheduleSpec: spec, workspaceMode: "fixed", fixedWorkspaceId: "w1",
+      baseBranch: null, branchPrefix: null, enabled: true, lastFiredAt: null,
+      nextDueAt: null, lastRunId: null, createdAt: "t",
+    };
+    const d = draftFromRoutine(routine, "p0");
+    expect(d.recurDays).toEqual([2, 4]);
+    expect(d.recurTimeMode).toBe("window");
+    expect(d.recurStepMin).toBe("120");
+    const back = draftToInput(d);
+    expect(typeof back === "object" && back.scheduleSpec).toBe(spec);
   });
 
   it("serializes a weekly window draft into the wire spec", () => {

@@ -673,11 +673,18 @@ function RecurringBuilder({
     { k: "date", label: "On a date" },
   ];
 
+  // Keep a non-preset step (e.g. a 45-min spec authored via MCP) visible in the
+  // picker instead of rendering blank.
+  const stepOptions = STEP_OPTIONS.some((o) => o.value === draft.recurStepMin)
+    ? STEP_OPTIONS
+    : [...STEP_OPTIONS, { value: draft.recurStepMin, label: `${draft.recurStepMin} min` }];
+
   const timeInput =
     "rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass";
+  const todayISO = new Date().toISOString().slice(0, 10);
 
   return (
-    <div className="mt-3 space-y-3.5 rounded-md border border-octo-hairline bg-[var(--brass-faint)] p-3">
+    <div className="octo-fade-in mt-3 space-y-3.5 rounded-md border border-octo-hairline bg-[var(--brass-faint)] p-3">
       {/* presets */}
       <div className="flex flex-wrap gap-1.5">
         {presets.map((p) => (
@@ -694,7 +701,7 @@ function RecurringBuilder({
 
       {/* days axis */}
       {draft.recurDayMode === "weekly" ? (
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex flex-wrap gap-1.5" role="group" aria-label="Days of the week">
           {RECUR_DAYS.map((day) => {
             const on = draft.recurDays.includes(day.v);
             return (
@@ -718,6 +725,7 @@ function RecurringBuilder({
         <input
           type="date"
           value={draft.recurDate}
+          min={todayISO}
           onChange={(e) => set("recurDate", e.target.value)}
           aria-label="Date"
           className={timeInput}
@@ -743,7 +751,7 @@ function RecurringBuilder({
               ariaLabel="Every"
               triggerClassName={FIELD_SURFACE}
               value={draft.recurStepMin}
-              options={STEP_OPTIONS}
+              options={stepOptions}
               onChange={(v) => set("recurStepMin", v)}
             />
             <span className="text-[12px] text-octo-sage">from</span>

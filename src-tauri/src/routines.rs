@@ -301,10 +301,12 @@ fn day_times(time: &TimeSel) -> Vec<(u32, u32)> {
             let mut out = Vec::new();
             let mut t = start_min;
             // Bounded by a day; the ≥15-min validated floor caps this at ≤96.
+            // `saturating_add` is belt-and-suspenders against a step that slipped
+            // past validation (the validator also caps it at 1440).
             let mut guard = 0;
             while t <= end_min && guard < 24 * 60 {
                 out.push(((t / 60) as u32, (t % 60) as u32));
-                t += *every_minutes;
+                t = t.saturating_add(*every_minutes);
                 guard += 1;
             }
             out
@@ -327,17 +329,24 @@ fn day_active(day: NaiveDate, days: &DaySel) -> bool {
 /// instant after `after`. A `date` selector whose date is already past → None.
 fn next_due_recurring(spec: &RecurringSpec, after: DateTime<Local>) -> Option<String> {
     let start_day = after.date_naive();
-    // 400 days covers any weekly cadence plus a full-year lookahead for a `date`.
+    // A one-shot `date` is a single known day — compute it DIRECTLY (no scan
+    // bound), so a date arbitrarily far in the future still fires. A date fully
+    // in the past (or today with all its times already elapsed) → None.
+    if let DaySel::Date { date } = &spec.days {
+        let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        if d < start_day {
+            return None;
+        }
+        return day_times(&spec.time)
+            .into_iter()
+            .filter_map(|(hh, mm)| local_at_date(d, hh, mm))
+            .find(|inst| *inst > after)
+            .map(|inst| inst.with_timezone(&Utc).to_rfc3339());
+    }
+    // Weekly: a non-empty day set guarantees an active day within 7 — 400 is
+    // ample headroom (and can't miss a fire).
     for offset in 0..400 {
         let day = start_day.checked_add_signed(chrono::Duration::days(offset))?;
-        // One-shot already past: no future fire possible — stop early.
-        if let DaySel::Date { date } = &spec.days {
-            if let Ok(d) = NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-                if day > d {
-                    return None;
-                }
-            }
-        }
         if !day_active(day, &spec.days) {
             continue;
         }
@@ -417,6 +426,11 @@ fn validate_recurring(spec: &str) -> Result<(), String> {
             let (eh, em) = parse_hhmm(end).ok_or("window end must be HH:MM (24-hour)")?;
             if *every_minutes < MIN_WINDOW_STEP_MIN {
                 return Err(format!("a window must step at least {MIN_WINDOW_STEP_MIN} minutes"));
+            }
+            // A window lives inside one day; an upper bound (also) keeps the
+            // enumeration arithmetic well away from overflow.
+            if *every_minutes > 24 * 60 {
+                return Err("a window step can't exceed a day (1440 minutes)".into());
             }
             let (s, e) = (sh as i64 * 60 + sm as i64, eh as i64 * 60 + em as i64);
             if e < s {

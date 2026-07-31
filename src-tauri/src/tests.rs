@@ -5400,6 +5400,19 @@ mod orchestrator_tests {
                    chrono::NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
         let past = r#"{"days":{"kind":"date","date":"2026-01-01"},"time":{"kind":"once","at":"09:00"}}"#;
         assert!(next_due(KIND_RECURRING, past, after).is_none());
+        // A date FAR beyond the weekly scan horizon (>400 days) still fires — the
+        // `date` selector is computed directly, not scanned.
+        let far = r#"{"days":{"kind":"date","date":"2028-06-15"},"time":{"kind":"once","at":"09:00"}}"#;
+        assert_eq!(loc(&next_due(KIND_RECURRING, far, after).unwrap()).date_naive(),
+                   chrono::NaiveDate::from_ymd_opt(2028, 6, 15).unwrap());
+
+        // next_n_due rolls across days: a 6-hour window (09:00, 15:00 = 2/day),
+        // n=3 → today 09, today 15, tomorrow 09.
+        let win6 = r#"{"days":{"kind":"weekly","set":[1,2,3,4,5,6,7]},"time":{"kind":"window","start":"09:00","everyMinutes":360,"end":"15:00"}}"#;
+        let roll = next_n_due(KIND_RECURRING, win6, after, 3);
+        assert_eq!(roll.len(), 3);
+        assert_eq!(loc(&roll[2]).date_naive(), after.date_naive() + chrono::Duration::days(1));
+        assert_eq!(loc(&roll[2]).hour(), 9);
     }
 
     /// Recurring spec validation: empty/out-of-range day-sets, window floor and
@@ -5418,6 +5431,7 @@ mod orchestrator_tests {
         assert!(bad(r#"{"days":{"kind":"weekly","set":[0,8]},"time":{"kind":"once","at":"09:00"}}"#)); // out of range
         assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"once","at":"25:00"}}"#)); // bad time
         assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"window","start":"09:00","everyMinutes":5,"end":"15:00"}}"#)); // step < 15
+        assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"window","start":"09:00","everyMinutes":2000,"end":"15:00"}}"#)); // step > 1440 (overflow guard)
         assert!(bad(r#"{"days":{"kind":"weekly","set":[1]},"time":{"kind":"window","start":"15:00","everyMinutes":60,"end":"09:00"}}"#)); // end < start
         assert!(bad(r#"{"days":{"kind":"date","date":"nope"},"time":{"kind":"once","at":"09:00"}}"#)); // bad date
         assert!(bad("not json"));

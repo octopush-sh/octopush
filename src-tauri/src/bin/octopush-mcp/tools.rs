@@ -1071,14 +1071,14 @@ fn build_routine_input(
         }
     }
 
-    // Shared cross-field + schedule validation, then compute next_due — the exact
-    // order the app's validate_routine_input uses.
+    // Shared schedule-shape then cross-field validation, then compute next_due —
+    // the exact order the app's validate_routine_input uses (shape errors first).
+    octopush_lib::routines::validate_schedule(&input.schedule_kind, &input.schedule_spec)?;
     octopush_lib::routines::validate_routine(
         &input.workspace_mode,
         &input.schedule_kind,
         &input.schedule_spec,
     )?;
-    octopush_lib::routines::validate_schedule(&input.schedule_kind, &input.schedule_spec)?;
     let next_due = octopush_lib::routines::next_due(
         &input.schedule_kind,
         &input.schedule_spec,

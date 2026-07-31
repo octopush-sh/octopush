@@ -98,10 +98,11 @@ export function scheduleSummary(kind: string, spec: string): string {
     if (!s) return "—";
     const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
     if (s.days.kind === "date") {
-      const base = `Once on ${fmtDate(s.days.date)}`;
+      const date = fmtDate(s.days.date);
+      // "Once on X" only when it fires once; a window on a date fires many times.
       return s.time.kind === "once"
-        ? `${base} at ${to12h(s.time.at)}`
-        : `${base} — every ${stepLabel(s.time.everyMinutes)}, ${to12h(s.time.start)}–${to12h(s.time.end)}`;
+        ? `Once on ${date} at ${to12h(s.time.at)}`
+        : `On ${date} — every ${stepLabel(s.time.everyMinutes)}, ${to12h(s.time.start)}–${to12h(s.time.end)}`;
     }
     const dp = weeklyPhrase(s.days.set);
     if (s.time.kind === "once") return `${cap(dp)} at ${to12h(s.time.at)}`;
