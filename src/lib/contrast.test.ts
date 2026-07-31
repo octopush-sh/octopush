@@ -31,8 +31,16 @@ describe("hexToRgb", () => {
     expect(hexToRgb("d4a574")).toEqual([212, 165, 116]);
   });
 
+  it("expands the 3-digit form, which a hand-written theme.json may well use", () => {
+    expect(hexToRgb("#fff")).toEqual([255, 255, 255]);
+    expect(hexToRgb("#000")).toEqual([0, 0, 0]);
+    expect(hexToRgb("#abc")).toEqual([170, 187, 204]);
+    // Must agree with the long form it's shorthand for.
+    expect(hexToRgb("#abc")).toEqual(hexToRgb("#aabbcc"));
+  });
+
   it("returns null for malformed input rather than NaN channels", () => {
-    for (const bad of ["", "#fff", "#12345", "#gggggg", "rgb(1,2,3)"]) {
+    for (const bad of ["", "#ffff", "#12345", "#gggggg", "rgb(1,2,3)", "white"]) {
       expect(hexToRgb(bad)).toBeNull();
     }
   });
@@ -176,18 +184,29 @@ describe("isDarkBackground", () => {
     }
   });
 
+  it("classifies a short-hex white background as light", () => {
+    // The theme.json scenario: `"bg": "#fff"` is valid CSS, so the editor really
+    // is white and must not get CodeMirror's dark defaults.
+    expect(isDarkBackground("#fff")).toBe(false);
+    expect(isDarkBackground("#000")).toBe(true);
+  });
+
   it("assumes dark when the colour can't be parsed", () => {
+    // Only reachable for a genuinely unusable value (a named colour, say), where
+    // there is nothing to measure — dark is the safer guess for a code editor.
     expect(isDarkBackground("")).toBe(true);
+    expect(isDarkBackground("white")).toBe(true);
   });
 });
 
 describe("isHexColor", () => {
-  it("accepts only full 6-digit triplets", () => {
+  it("accepts the 3- and 6-digit forms only", () => {
     expect(isHexColor("#d4a574")).toBe(true);
     expect(isHexColor("d4a574")).toBe(true);
+    expect(isHexColor("#fff")).toBe(true);
     // The shapes that would otherwise slip through `rgba`'s pass-through and
     // become an OPAQUE match wash painted over the code.
-    for (const bad of ["#fff", "#ffff", "red", "rgb(1,2,3)", "", "#gggggg"]) {
+    for (const bad of ["#ffff", "red", "rgb(1,2,3)", "", "#gggggg"]) {
       expect(isHexColor(bad), bad).toBe(false);
     }
   });

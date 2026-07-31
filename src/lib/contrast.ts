@@ -10,14 +10,30 @@
  * the same alpha reads very differently per palette and has to be solved.
  */
 
-/** Parse `#rrggbb` (with or without leading #) into an [r,g,b] tuple.
- *  Returns null for malformed input so callers can fall back to a static
- *  value rather than emit `rgba(NaN, NaN, NaN, …)`. */
+/** Parse `#rgb` or `#rrggbb` (with or without leading #) into an [r,g,b] tuple.
+ *  Returns null for anything else, so callers can fall back to a static value
+ *  rather than emit `rgba(NaN, NaN, NaN, …)`.
+ *
+ *  The 3-digit form matters because a hand-written ~/.octopush/theme.json is
+ *  not validated anywhere: `"bg": "#fff"` is perfectly valid CSS, so the editor
+ *  really would be white. Rejecting it would make `isDarkBackground` fall back
+ *  to its `true` default and hand a white background CodeMirror's dark
+ *  defaults — reinstating the exact bug that function exists to fix. */
 export function hexToRgb(hex: string): [number, number, number] | null {
-  const m = hex.replace("#", "").match(/^([0-9a-f]{6})$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  const s = hex.trim().replace(/^#/, "");
+  if (/^[0-9a-f]{3}$/i.test(s)) {
+    // Each digit doubles: #abc === #aabbcc.
+    return [
+      parseInt(s[0] + s[0], 16),
+      parseInt(s[1] + s[1], 16),
+      parseInt(s[2] + s[2], 16),
+    ];
+  }
+  if (/^[0-9a-f]{6}$/i.test(s)) {
+    const n = parseInt(s, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  return null;
 }
 
 /** `#rrggbb` → `rgba(r, g, b, alpha)`. Passes the input through unchanged when

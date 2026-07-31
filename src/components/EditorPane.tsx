@@ -101,9 +101,11 @@ function buildState(opts: {
       keymap.of([
         { key: "Mod-s", run: () => { onSave(); return true; } },
         // Our Octopush-native find overlay owns ⌘F. Listed BEFORE searchKeymap
-        // so this binding wins and CodeMirror's docked panel never opens — while
+        // so this binding wins and ⌘F never opens CodeMirror's docked panel — while
         // searchKeymap still provides find-next/prev, go-to-line and
-        // select-next-occurrence (⌘G/F3, ⌘⌥G, ⌘D).
+        // select-next-occurrence (⌘G/F3, ⌘⌥G, ⌘D). ⌘G/F3 CAN still open that panel:
+        // they're wrapped in `searchCommand`, which opens it when no valid query is
+        // set. searchHighlight stands down when it does, so nothing double-paints.
         { key: "Mod-f", run: () => { onOpenSearch(); return true; } },
         { key: "Mod-Shift-l", run: selectAllOccurrences },
         { key: "Alt-z", run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },

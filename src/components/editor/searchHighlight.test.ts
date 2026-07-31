@@ -9,6 +9,7 @@ import {
   openSearchPanel,
   closeSearchPanel,
 } from "@codemirror/search";
+import { codeFolding, foldEffect } from "@codemirror/language";
 import { searchMatchHighlight } from "./searchHighlight";
 
 /** Purpose-built: `theme` appears as a whole word, as a substring of
@@ -28,7 +29,10 @@ function mount(doc = DOC) {
   document.body.appendChild(parent);
   view = new EditorView({
     parent,
-    state: EditorState.create({ doc, extensions: [search(), searchMatchHighlight] }),
+    state: EditorState.create({
+      doc,
+      extensions: [search(), codeFolding(), searchMatchHighlight],
+    }),
   });
   return view;
 }
@@ -104,7 +108,7 @@ describe("searchMatchHighlight", () => {
   });
 
   it("stands down while the native search panel is open, so nothing double-paints", () => {
-    // searchKeymap's ⌘G/F3/⌘D fall through to openSearchPanel when there's no
+    // searchKeymap's ⌘G/F3 fall through to openSearchPanel when there's no
     // valid query, and two highlighters nest two .cm-searchMatch spans —
     // doubling the wash and drawing the ring twice.
     const v = mount();
@@ -169,8 +173,7 @@ describe("searchMatchHighlight", () => {
       new SearchQuery({ search: "th[e]me", regexp: true }),
       // Unbalanced group — `valid` is false, so the plugin must bail early.
       new SearchQuery({ search: "th(eme", regexp: true }),
-      // Match the empty string: a mark decoration may not be empty and
-      // RangeSetBuilder throws on one, so these must be skipped.
+      // Match the empty string: skipped, so no zero-width span reaches the DOM.
       new SearchQuery({ search: "x*", regexp: true }),
       new SearchQuery({ search: "(?:)", regexp: true }),
       new SearchQuery({ search: "^", regexp: true }),
@@ -198,10 +201,63 @@ describe("searchMatchHighlight", () => {
   });
 
   it("caps the number of decorated matches", () => {
-    // Insurance against a query that matches nearly every position.
-    const v = mount("ab".repeat(4000));
+    // Insurance against a query matching nearly every position. The doc has to
+    // hold more than MAX_MATCHES matches inside one visible range for this to
+    // assert anything, hence a single needle repeated well past the ceiling.
+    const v = mount("a".repeat(6000));
     setQuery(v, new SearchQuery({ search: "a" }));
-    expect(marks(v).length).toBeGreaterThan(0);
-    expect(marks(v).length).toBeLessThanOrEqual(2000);
+    expect(marks(v).length).toBe(2000);
+  });
+
+  it("rescans when the document changes", () => {
+    // Guards the highest-risk line in the cache: a same-length edit sets
+    // docChanged but NOT viewportChanged, so dropping docChanged from the
+    // rescan condition leaves the stale match painted over the new text.
+    const v = mount();
+    setQuery(v, new SearchQuery({ search: "theme" }));
+    const at = DOC.indexOf("theme");
+    v.dispatch({ changes: { from: at, to: at + 5, insert: "XXXXX" } });
+    expect(marks(v).map((m) => m.textContent)).toEqual(["theme", "theme", "THEME"]);
+  });
+
+  it("repaints from the cache on a bare cursor move, without re-scanning", () => {
+    const v = mount();
+    setQuery(v, new SearchQuery({ search: "theme" }));
+    expect(marks(v)).toHaveLength(4);
+    // Narrow the visible ranges behind the plugin's back. A rescan would now
+    // find one match; a cached repaint must not notice the change.
+    Object.defineProperty(v, "visibleRanges", {
+      configurable: true,
+      get: () => [{ from: 0, to: 10 }],
+    });
+    v.dispatch({ selection: { anchor: 2 } });
+    expect(marks(v)).toHaveLength(4);
+    // A doc change forces the rescan, and the narrowed range takes effect.
+    v.dispatch({ changes: { from: v.state.doc.length, insert: " " } });
+    expect(marks(v)).toHaveLength(1);
+  });
+
+  it("rescans when a viewport change alters the visible ranges", () => {
+    // Folding is the only handle on `viewportChanged` available here, but it
+    // also removes the folded lines from the DOM on its own — so folding a
+    // region that CONTAINS matches would pass even with the flag dropped from
+    // the rescan condition. The fold below covers matchless lines, leaving the
+    // narrowed stub as the only thing that can change the mark count.
+    const doc = [
+      ...Array.from({ length: 5 }, (_, i) => `const theme${i} = ${i};`),
+      ...Array.from({ length: 25 }, (_, i) => `const other${i} = ${i};`),
+    ].join("\n");
+    const v = mount(doc);
+    setQuery(v, new SearchQuery({ search: "theme" }));
+    expect(marks(v)).toHaveLength(5);
+
+    Object.defineProperty(v, "visibleRanges", {
+      configurable: true,
+      get: () => [{ from: 0, to: v.state.doc.line(1).to }],
+    });
+    v.dispatch({
+      effects: foldEffect.of({ from: v.state.doc.line(8).from, to: v.state.doc.line(12).to }),
+    });
+    expect(marks(v)).toHaveLength(1);
   });
 });

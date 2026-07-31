@@ -11,8 +11,9 @@
  *
  * This fills that gap, reusing CodeMirror's own class names so one set of theme
  * rules (see `atelierTheme.ts`) covers both. It deliberately stands down when
- * the native panel IS open — `searchKeymap` can still open it (⌘G/F3/⌘D fall
- * through to `openSearchPanel` when there's no valid query), and running both
+ * the native panel IS open — `searchKeymap` can still open it (`findNext` and
+ * `findPrevious`, i.e. ⌘G/F3, are wrapped in `searchCommand`, which falls through
+ * to `openSearchPanel` when there's no valid query), and running both
  * highlighters nests two `.cm-searchMatch` spans, doubling the wash and the
  * ring.
  */
@@ -31,10 +32,8 @@ import { getSearchQuery, searchPanelOpen, type SearchQuery } from "@codemirror/s
 const MATCH = Decoration.mark({ class: "cm-searchMatch" });
 const CURRENT = Decoration.mark({ class: "cm-searchMatch cm-searchMatch-selected" });
 
-/** How far past a visible range to search, so a match straddling the boundary
- *  isn't lost. Mirrors `RegExpQuery.highlight`'s own margin; it also sets the
- *  gap at which two visible ranges are merged, which is what keeps the widened
- *  windows from overlapping and reporting a match twice. */
+/** How far past a visible range to search for a REGEX match, so one straddling
+ *  the boundary isn't lost. Mirrors `RegExpQuery.highlight`'s own margin. */
 const HIGHLIGHT_MARGIN = 250;
 
 /** Ceiling on decorated matches per pass. The viewport already bounds this;
@@ -72,12 +71,13 @@ function scan(view: EditorView): Match[] {
   if (!query.search || !query.valid) return [];
 
   const docLength = view.state.doc.length;
-  // `unquoted` isn't public, and unquoting only ever shortens the needle, so
-  // `search.length` is a safe over-estimate. Capped at the margin so the
-  // widened windows can't overlap and double-report a match.
-  const pad = query.regexp
-    ? HIGHLIGHT_MARGIN
-    : Math.min(query.search.length, HIGHLIGHT_MARGIN);
+  // Widen each scan window by `pad` so a match straddling a visible-range
+  // boundary is still found — the built-in does the same. For a string query
+  // that's the needle's length: `unquoted` isn't public, but unquoting only ever
+  // shortens (`\n`/`\t`/`\\` collapse 2 chars to 1), so `search.length` is a
+  // safe over-estimate. Deliberately uncapped, matching `StringQuery.highlight`;
+  // the merge gap below is derived from `pad` so the windows still can't overlap.
+  const pad = query.regexp ? HIGHLIGHT_MARGIN : query.search.length;
 
   const matches: Match[] = [];
   const ranges = view.visibleRanges;
@@ -87,9 +87,12 @@ function scan(view: EditorView): Match[] {
   try {
     for (let i = 0; i < ranges.length; i++) {
       let { from, to } = ranges[i];
-      // Merge ranges closer than twice the margin: scanning the gap costs less
-      // than restarting the cursor, and it guarantees non-overlapping windows.
-      while (i < ranges.length - 1 && to > ranges[i + 1].from - 2 * HIGHLIGHT_MARGIN) {
+      // Merge ranges closer than twice the pad: scanning the gap costs less than
+      // restarting the cursor, and it's what guarantees the widened windows never
+      // overlap. After merging, the gap to the next range is >= 2 * pad, so this
+      // window ends at or before the next one begins — a match can't be reported
+      // (and washed) twice.
+      while (i < ranges.length - 1 && to > ranges[i + 1].from - 2 * pad) {
         to = ranges[++i].to;
       }
       const cursor = query.getCursor(
@@ -99,13 +102,15 @@ function scan(view: EditorView): Match[] {
       );
       for (let res = cursor.next(); !res.done; res = cursor.next()) {
         const { from: mFrom, to: mTo } = res.value;
-        // A mark decoration may not be empty and RangeSetBuilder throws on one,
-        // so an all-optional regex match is skipped.
+        // RegExpCursor really does yield empty matches; skipping them keeps a
+        // zero-width span out of the DOM. (RangeSetBuilder.add tolerates an empty
+        // range — the throw lives in MarkDecoration.range, which add never calls.)
         if (mFrom >= mTo) continue;
-        // RangeSetBuilder requires a non-decreasing `from`. Ranges are ascending
-        // and the windows can't overlap, so this shouldn't trigger — it's here
-        // so a surprise from the cursor degrades into a missing highlight
-        // instead of an exception in the render path.
+        // `mFrom < lastFrom` is the one case add() genuinely throws on, and the
+        // duplicate case would silently spawn a second RangeSet layer, i.e. two
+        // stacked washes. Neither should be reachable — ranges are ascending and
+        // the windows can't overlap — so this degrades a surprise from the cursor
+        // into a missing highlight rather than a broken render.
         if (mFrom < lastFrom || (mFrom === lastFrom && mTo === lastTo)) continue;
         matches.push({ from: mFrom, to: mTo });
         lastFrom = mFrom;

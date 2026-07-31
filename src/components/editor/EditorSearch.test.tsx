@@ -12,10 +12,25 @@ vi.mock("@codemirror/search", () => {
   class SearchQuery {
     search: string;
     replace: string;
-    valid = true;
-    constructor(opts: { search?: string; replace?: string }) {
+    regexp: boolean;
+    valid: boolean;
+    constructor(opts: { search?: string; replace?: string; regexp?: boolean }) {
       this.search = opts.search ?? "";
       this.replace = opts.replace ?? "";
+      this.regexp = opts.regexp ?? false;
+      // Mirrors the real
+      // `!!this.search && (!this.regexp || validRegExp(this.search))`.
+      // The empty-search case matters: it's false, which is what drives
+      // EditorSearch to clear the editor's query and with it the highlights.
+      let validPattern = true;
+      if (this.regexp) {
+        try {
+          new RegExp(this.search);
+        } catch {
+          validPattern = false;
+        }
+      }
+      this.valid = !!this.search && validPattern;
     }
     getCursor() {
       const items = [
@@ -87,6 +102,36 @@ describe("EditorSearch", () => {
     render(<EditorSearch view={view} focusSignal={1} onClose={() => {}} />);
     await userEvent.click(screen.getByRole("button", { name: /toggle replace/i }));
     expect(screen.getByLabelText("Replace with")).toBeInTheDocument();
+  });
+
+  it("clears the editor's query when the field is emptied", async () => {
+    // `SearchQuery.valid` is false for an empty search, so this branch has to
+    // dispatch an empty query rather than return early — otherwise the editor
+    // keeps the last one and every match stays highlighted behind an empty box.
+    const view = makeView();
+    render(<EditorSearch view={view} focusSignal={1} onClose={() => {}} />);
+    const input = screen.getByLabelText("Find");
+    await userEvent.type(input, "foo");
+    expect(screen.getByText(/2 found/i)).toBeInTheDocument();
+
+    setSearchQueryOf.mockClear();
+    await userEvent.clear(input);
+    expect(setSearchQueryOf).toHaveBeenCalled();
+    const last = setSearchQueryOf.mock.calls.at(-1)![0] as { search: string };
+    expect(last.search).toBe("");
+    expect(screen.queryByText(/found/i)).not.toBeInTheDocument();
+  });
+
+  it("clears the query on a broken regex instead of leaving stale matches lit", async () => {
+    const view = makeView();
+    render(<EditorSearch view={view} focusSignal={1} onClose={() => {}} />);
+    await userEvent.click(screen.getByRole("button", { name: /regular expression/i }));
+    const input = screen.getByLabelText("Find");
+    await userEvent.type(input, "th(");
+
+    expect(screen.getByText(/bad pattern/i)).toBeInTheDocument();
+    const last = setSearchQueryOf.mock.calls.at(-1)![0] as { search: string };
+    expect(last.search).toBe("");
   });
 
   it("Escape closes, clears the query, and refocuses the editor", () => {

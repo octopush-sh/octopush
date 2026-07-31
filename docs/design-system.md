@@ -132,6 +132,31 @@ The `§` prefix is retired — the tool identity is a `lucide-react` icon from `
 ```
 This replaces the retired brass-rule/gradient recipe everywhere a "flow has passed through here" signal is needed (Direct run-track, builder review-loop edges). No gradient, no grow animation — the color itself is the state; width transitions on the connector's own color property.
 
+### Found-match wash & inverted seal (search hits in text)
+
+For marking occurrences inside a body of text — editor find-in-file today, and the pattern to reuse for any future "N hits, you're on this one" surface.
+
+```css
+/* every hit */
+background: var(--octo-match);                        /* accent, alpha solved per theme */
+box-shadow: inset 0 0 0 1px var(--octo-match-ring);
+border-radius: 2px;
+color: var(--octo-match-ink);                         /* also on descendants */
+
+/* the one you're on — an inverted seal, not a stronger wash */
+background: var(--octo-match-current);                /* solid accent */
+color: var(--octo-match-current-ink);                 /* the theme's own background */
+box-shadow: none;
+```
+
+Three rules make this work, and they generalise:
+
+1. **Separate the current item by weight, not by alpha.** A wash and a slightly-stronger wash are indistinguishable. A wash versus a solid inverted chip is unmistakable, and it survives any palette because the ink is the theme's own background.
+2. **The wash alpha is solved, never picked.** Contrast is a ratio of luminances, so one alpha is not one appearance: the same 23.5% is a 1.50 contrast step on atelier's onyx and only 1.35 on vellum's cream. `solveMatchWashAlpha()` in `lib/contrast.ts` returns the smallest alpha clearing a 1.50 step against the active background — 23.5% atelier through 31% vellum. **Any future translucent overlay whose job is to be *noticed* should be solved the same way rather than hardcoded.**
+3. **A wash must own its foreground.** Laying a wash over text costs whatever sits on it ~34% of its contrast. Body text absorbs that (16.82 → 11.18); deliberately dim text does not (comments: 3.35 → 2.23, i.e. *worse than not highlighting at all*). So the mark sets `color` explicitly — on itself **and its descendants**, since a syntax span can nest inside it and `color` inherits.
+
+Tokens live in `styles.css` (atelier fallbacks) and are written per theme by `themeStore`. They are the only **opaque** colours derived there, so they are the only ones gated on the theme's hex actually parsing — a malformed value would be a solid slab over the content rather than a faint tint.
+
 ---
 
 ## 5. Signature details — structural glyphs and active patterns
