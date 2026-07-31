@@ -238,6 +238,14 @@ Small, high-value, low-risk fixes that don't depend on the rebuild. Ordered:
   UI states which modes block vs warn-only; per-message cost preview reconciled/annotated as estimate
   (F24). Update `docs/FEATURES.md` §8 + composer/budget copy.
 
+**Status — SHIPPED (F4/F13 core done):** `check_budget`/`BudgetVerdict` + F13 local-time cutoffs (PR #160);
+REVIEW `ai_complete` gate (#160); TALK entry gate in `send_chat_message` (#184); DIRECT between-stage
+scope gate `pause_for_scope_budget` (#186); **TALK per-iteration mid-turn gate** `should_stop_for_budget`
++ `finish_budget_capped` in `send_agentic` (this slice). The "backend single-use override grant" (F22
+race) was **dropped as unnecessary** — the existing per-turn `overrideBudget` flag authorizes the whole
+turn (entry + every iteration), so there's no partial-override window to guard. Remaining follow-ups:
+RUN warn-only surfacing, CHECK-constrained scopes (F22 hardening), per-message cost-preview annotation (F24).
+
 ### Phase 4 — RUN structured telemetry (follow-up, optional)
 
 Replace regex PTY scanning with structured telemetry (Claude Code OTEL env hooks / `--output-format json`
