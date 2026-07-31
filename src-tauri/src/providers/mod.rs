@@ -67,6 +67,15 @@ pub struct LlmRequest {
     /// params (the provider omits them). The provider maps it per the
     /// model-capability matrix (see `anthropic::thinking_json`).
     pub effort: Option<Effort>,
+    /// Whether to mark stable prefixes (tools, system, conversation head) with
+    /// Anthropic prompt-cache breakpoints. Set `true` only for **repeated-prefix**
+    /// contexts — agentic loops and multi-turn chat (TALK, DIRECT), where the
+    /// same tokens are re-sent within the cache TTL so the ~0.1× read repays the
+    /// 1.25× write. Leave `false` for one-shot calls (REVIEW / structured
+    /// `tool_choice`), where a cache write would just be a wasted 25% surcharge.
+    /// Anthropic-only: the OpenAI-compatible provider caches automatically and
+    /// ignores this (see `openai_compat::build_request`).
+    pub cache: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]

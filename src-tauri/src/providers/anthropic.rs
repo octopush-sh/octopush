@@ -230,17 +230,45 @@ pub fn thinking_json(
 /// Build the Anthropic Messages API JSON body from a normalized `LlmRequest`.
 /// Exported so tests in Task 6 can call it directly.
 pub fn build_request(req: &LlmRequest) -> Value {
-    let messages: Vec<Value> = req.messages.iter().map(message_to_anthropic).collect();
-    let tools: Vec<Value> = req.tools.iter().map(|t| json!({
+    let mut messages: Vec<Value> = req.messages.iter().map(message_to_anthropic).collect();
+    let mut tools: Vec<Value> = req.tools.iter().map(|t| json!({
         "name": t.name,
         "description": t.description,
         "input_schema": t.input_schema,
     })).collect();
 
+    // Prompt caching (Anthropic-native, opt-in per `req.cache`). Mark the stable
+    // prefixes with ephemeral cache breakpoints so context re-sent within the
+    // cache TTL is billed at ~0.1× on a hit instead of full input price. The API
+    // caches in request order — tools → system → messages — so we drop a
+    // breakpoint at the tail of each: the last tool, the system block, and the
+    // last block of the last message (≤4 breakpoints; we use ≤3). Each request's
+    // trailing breakpoint becomes the next request's cached prefix, which is what
+    // makes an agentic loop's growing history cache incrementally. Below the
+    // model's minimum cacheable prefix the API silently skips caching — no error,
+    // no charge. Cache-hit tokens are already parsed (`parse_response`) and priced
+    // cache-aware (`token_engine::cost_for`). Disabled for one-shots so we never
+    // pay a 1.25× write we won't read back.
+    if req.cache {
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool["cache_control"] = json!({ "type": "ephemeral" });
+        }
+        if let Some(last_msg) = messages.last_mut() {
+            mark_message_cache_breakpoint(last_msg);
+        }
+    }
+    // A non-empty system prompt becomes a text-block array so it can carry its
+    // own breakpoint (caching tools + system); an empty one stays a plain string.
+    let system_value = if req.cache && !req.system.is_empty() {
+        json!([{ "type": "text", "text": req.system, "cache_control": { "type": "ephemeral" } }])
+    } else {
+        Value::String(req.system.clone())
+    };
+
     let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
-        "system": req.system,
+        "system": system_value,
         "tools": tools,
         "messages": messages,
     });
@@ -258,6 +286,29 @@ pub fn build_request(req: &LlmRequest) -> Value {
         body["output_config"] = output_config;
     }
     body
+}
+
+/// Attach an ephemeral cache breakpoint to the final content block of an
+/// already-serialized Anthropic message, normalizing a plain-string body to a
+/// one-element text block so it can carry the marker. Anthropic accepts
+/// `cache_control` on any block type (text, image, tool_use, tool_result), so
+/// the tail block is always a valid anchor.
+fn mark_message_cache_breakpoint(message: &mut Value) {
+    let content = &mut message["content"];
+    if content.is_string() {
+        let text = content.as_str().unwrap_or_default().to_string();
+        *content = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+    } else if let Some(blocks) = content.as_array_mut() {
+        if let Some(last) = blocks.last_mut() {
+            if last.is_object() {
+                last["cache_control"] = json!({ "type": "ephemeral" });
+            }
+        }
+    }
 }
 
 fn message_to_anthropic(msg: &LlmMessage) -> Value {
