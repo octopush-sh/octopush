@@ -364,8 +364,3 @@ export function buildEditorTheme(): Extension {
     syntaxHighlighting(makeHighlightStyle(t)),
   ];
 }
-
-/** Combined CodeMirror extension for the active theme, resolved at import.
- *  Prefer buildEditorTheme() inside a compartment so the editor follows live
- *  theme switches; this static export remains for back-compat. */
-export const atelierTheme: Extension = buildEditorTheme();

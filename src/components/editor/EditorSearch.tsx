@@ -38,6 +38,10 @@ interface Props {
   /** Bumped by the host each time the user presses ⌘F so an already-open
    *  overlay refocuses and selects its query rather than doing nothing. */
   focusSignal: number;
+  /** What the host is searching, for the label and placeholder. A scratchpad
+   *  tab isn't a file, and two mounted overlays need distinguishable landmarks
+   *  (every mode stays mounted, so REVIEW and the scratchpad can both be up). */
+  scope?: string;
   onClose: () => void;
 }
 
@@ -67,7 +71,7 @@ function countMatches(view: EditorView, query: SearchQuery): { count: number; cu
   return { count, current };
 }
 
-export function EditorSearch({ view, focusSignal, onClose }: Props) {
+export function EditorSearch({ view, focusSignal, scope = "file", onClose }: Props) {
   const [search, setSearch] = useState("");
   const [replace, setReplace] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -158,8 +162,11 @@ export function EditorSearch({ view, focusSignal, onClose }: Props) {
   return (
     <div
       role="search"
-      aria-label="Find in file"
-      className="octo-modal-enter absolute right-3 top-3 z-20 w-[320px] rounded-md border border-octo-hairline bg-octo-panel/95 p-2 shadow-2xl backdrop-blur-sm"
+      aria-label={`Find in ${scope}`}
+      // max-w rather than a fixed width: the scratchpad's column can be squeezed
+      // to 20% of the canvas, where a hard 320px is clipped by two nested
+      // overflow-hidden ancestors and loses the left edge of the input.
+      className="octo-modal-enter absolute right-3 top-3 z-20 w-full max-w-[320px] rounded-md border border-octo-hairline bg-octo-panel/95 p-2 shadow-2xl backdrop-blur-sm"
     >
       {/* ── Find row ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-1.5">
@@ -173,7 +180,7 @@ export function EditorSearch({ view, focusSignal, onClose }: Props) {
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
-          placeholder="Find in file"
+          placeholder={`Find in ${scope}`}
           className={`min-w-0 flex-1 bg-transparent font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute ${
             invalidRegex ? "text-octo-rouge" : ""
           }`}
