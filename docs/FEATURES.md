@@ -889,7 +889,10 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 
 ### Scratchpad
 - **Scratchpad store** — Multi-tab in-memory notes/code editor (`tabs{id,name,content,language}`, `activeTabId`); create/delete/rename/setContent/setLanguage. **No persistence** (session-scoped). _Support:_ `scratchpadStore.ts`.
-- **Scratchpad UI** — Right column of a draggable split (`CanvasSplit`); `ScratchpadTabsBar` + `ScratchpadCodeEditor` (CodeMirror 6, live syntax for js/ts/python/rust/java/json/markdown/html/css/xml/yaml, shared atelierTheme); double-click to rename a tab, `+` adds. _Support:_ `ScratchpadEditor.tsx` et al. _Entry:_ top-bar NotebookPen / `ScratchpadIcon`.
+- **Scratchpad UI** — Right column of a draggable split (`CanvasSplit`); `ScratchpadTabsBar` + `ScratchpadCodeEditor` (CodeMirror 6, live syntax for js/ts/python/rust/java/json/markdown/html/css/xml/yaml, shared Atelier editor theme); double-click to rename a tab, `+` adds. _Support:_ `ScratchpadEditor.tsx` et al. _Entry:_ top-bar NotebookPen / `ScratchpadIcon`.
+- **Scratchpad find / replace (⌘F)** — The same `EditorSearch` overlay and theme-solved match highlighting as the REVIEW editor: match case, whole word, regex, "n of m" tally, next/prev, replace, replace all. The overlay's label and placeholder read "Find in tab" here (`scope` prop). Closes — and clears its query, so no highlight lingers — whenever the view is rebuilt (tab switch, and a rename, which re-detects the language) or the scratchpad is hidden, since `CanvasSplit` keeps it mounted. _Support:_ `ScratchpadCodeEditor.tsx`, `editor/EditorSearch.tsx`, `editor/searchHighlight.ts`.
+- **Scratchpad editor shortcuts** — `⌘F` find · `⌘G`/`F3` next/prev · `⌘D` select next occurrence · `⌘⇧L` select all matching · `⌘⌥G` go to line (all from `searchKeymap`) · `Tab` indent. _Support:_ `ScratchpadCodeEditor.tsx`.
+- **Scratchpad follows theme switches** — The editor theme is held in a compartment and rebuilt on `octo:theme`, like `EditorPane`, so the whole surface (including the search-match tokens) tracks the active theme. _Support:_ `ScratchpadCodeEditor.tsx`, `editor/atelierTheme.buildEditorTheme`.
 
 ### OS-integration / platform utilities
 - **`open_file_in_system`** — OS default opener (macOS `open`, Linux `xdg-open`). _Entry:_ file-tree "Open with default app", issue URLs, "What's new".
@@ -997,7 +1000,8 @@ Global shortcuts are owned by a single `keydown` listener in `src/App.tsx`. (The
 | `⌘⌥1` … `⌘⌥9` | Cycle to the Nth terminal within the active workspace |
 | `⌘T` | New session (command palette / session sidebar) |
 | **Chat** | `↵` send · `⇧↵` newline · `↑`/`↓` prompt history |
-| **Editor** | `⌘S` save · `⌘F` find/replace · `⌘G`/`F3` next/prev · `⌘⇧L` select all occurrences · `⌘D` next occurrence · `⌘=`/`⌘−` font · `Alt-Z` wrap |
+| **Editor** | `⌘S` save · `⌘F` find/replace · `⌘G`/`F3` next/prev · `⌘⇧L` select all occurrences · `⌘D` next occurrence · `⌘⌥G` go to line · `⌘=`/`⌘−` font · `Alt-Z` wrap |
+| **Scratchpad** | `⌘F` find/replace · `⌘G`/`F3` next/prev · `⌘D` next occurrence · `⌘⇧L` select all matching · `⌘⌥G` go to line · `Tab` indent |
 | **Diff triage** | `j`/`k`/↓/↑ move hunk · `]`/`[` jump file · `Space` fold · `a` accept · `x` reject · `A` accept file · `v` viewed · `o` open in editor · `w` why · `/` filter · `c` commit · `?` help |
 | **File tree** | ↑/↓ move · →/← expand/collapse · Home/End · Enter/Space activate · ContextMenu/Shift+F10 menu |
 | **Dialogs** | `Esc` close topmost · `Tab` trap within ModalShell |

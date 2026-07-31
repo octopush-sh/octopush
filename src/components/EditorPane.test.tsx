@@ -101,7 +101,6 @@ vi.mock("@codemirror/lang-javascript", () => ({
 }));
 
 vi.mock("../components/editor/atelierTheme", () => ({
-  atelierTheme: [],
   buildEditorTheme: () => [],
 }));
 

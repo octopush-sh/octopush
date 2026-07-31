@@ -877,6 +877,12 @@ function App() {
   // ── Keyboard shortcuts (spec §3.6) ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Something closer to the event already handled this key. CodeMirror calls
+      // preventDefault on a key its keymap consumed but never stopPropagation,
+      // so without this an editor binding and an app-level shortcut both fire:
+      // ⌘⇧L in a code editor multiplied the selection AND opened the Logbook.
+      if (e.defaultPrevented) return;
+
       const mod = e.metaKey || e.ctrlKey;
 
       // ⌘1..⌘9 → switch workspace N
