@@ -54,6 +54,7 @@
     "updater": {
       "active": true,
       "endpoints": [
+        "https://octopush.sh/update/latest.json",
         "https://github.com/octopush-sh/octopush/releases/latest/download/latest.json"
       ],
       "dialog": false,
