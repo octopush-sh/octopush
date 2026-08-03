@@ -37,7 +37,7 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, copyFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,7 +54,14 @@ const BUNDLE_DIR = join(
   REPO,
   "src-tauri/target/universal-apple-darwin/release/bundle",
 );
-const KEY_PATH = join(process.env.HOME, ".octopush-keys/updater_key");
+const KEY_PATH = join(process.env.HOME || "", ".octopush-keys/updater_key");
+
+// CI mode: driven by GitHub Actions (or `--ci`). In CI the tag already exists,
+// signing keys arrive via env/secrets, and the runner is ephemeral — so we skip
+// the local-only ceremony (branch/dirty checks, version bump, commit/tag/push)
+// and go straight to build → verify → publish. One source of build+publish
+// logic serves both the local one-command flow and CI. See docs/RELEASING.md.
+const CI = process.env.CI === "true" || process.argv.includes("--ci");
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -81,7 +88,12 @@ function runCapture(cmd) {
 
 // ── Pre-flight ─────────────────────────────────────────────────────
 
-const newVersion = process.argv[2];
+// Version: an explicit arg wins; in CI we otherwise take it from the committed
+// tauri.conf.json (the tag was cut against that version).
+let newVersion = process.argv.find((a) => /^\d+\.\d+\.\d+(-\w+)?$/.test(a));
+if (!newVersion && CI) {
+  newVersion = JSON.parse(readFileSync(TAURI_CONF, "utf8")).version;
+}
 if (!newVersion || !/^\d+\.\d+\.\d+(-\w+)?$/.test(newVersion)) {
   die(
     `Usage: npm run release -- <version>  (e.g. 0.1.1)\nGot: "${
@@ -90,24 +102,43 @@ if (!newVersion || !/^\d+\.\d+\.\d+(-\w+)?$/.test(newVersion)) {
   );
 }
 
-if (!existsSync(KEY_PATH)) {
+// In CI the private key comes straight from the TAURI_SIGNING_PRIVATE_KEY
+// secret (env), so the on-disk key file is optional there. Locally we require
+// the key file. The updater key is ALWAYS required — an unsigned updater
+// artifact would break in-app updates; only Apple signing degrades gracefully.
+const HAVE_ENV_KEY = !!process.env.TAURI_SIGNING_PRIVATE_KEY;
+if (!HAVE_ENV_KEY && !existsSync(KEY_PATH)) {
   die(
-    `Signing key not found at ${KEY_PATH}\n` +
-      `Generate one with: npx @tauri-apps/cli signer generate --write-keys ${KEY_PATH} --password ""`,
+    `Updater signing key not found.\n` +
+      `  - Local: generate one at ${KEY_PATH} with\n` +
+      `      npx @tauri-apps/cli signer generate --write-keys ${KEY_PATH} --password ""\n` +
+      `  - CI: set the TAURI_SIGNING_PRIVATE_KEY secret.\n` +
+      `The matching public key must be tauri.conf.json → plugins.updater.pubkey.`,
   );
 }
 
-const branch = runCapture("git rev-parse --abbrev-ref HEAD");
-if (branch !== "main") {
-  die(`Releases must be cut from main. You're on \`${branch}\`.`);
+if (!CI) {
+  const branch = runCapture("git rev-parse --abbrev-ref HEAD");
+  if (branch !== "main") {
+    die(`Releases must be cut from main. You're on \`${branch}\`.`);
+  }
+
+  const status = runCapture("git status --porcelain");
+  if (status) {
+    die(`Working tree is dirty:\n${status}\n\nCommit or stash first.`);
+  }
+} else {
+  // Sanity-check the tag matches the version we're about to publish.
+  const ref = process.env.GITHUB_REF_NAME;
+  if (ref && ref !== `v${newVersion}`) {
+    console.log(
+      `\x1b[33m▸\x1b[0m Tag ${ref} does not match tauri.conf.json version ` +
+        `v${newVersion}. Publishing v${newVersion}.`,
+    );
+  }
 }
 
-const status = runCapture("git status --porcelain");
-if (status) {
-  die(`Working tree is dirty:\n${status}\n\nCommit or stash first.`);
-}
-
-step(`Releasing Octopush v${newVersion}`);
+step(`Releasing Octopush v${newVersion}${CI ? " (CI mode)" : ""}`);
 
 // ── Apple signing posture ─────────────────────────────────────────
 // Signing + notarization are fully env-driven: the build spawn below already
@@ -140,28 +171,32 @@ if (NOTARIZED) {
 
 // ── 1. Bump versions ──────────────────────────────────────────────
 
-step("Bumping version in package.json, Cargo.toml, tauri.conf.json");
+if (CI) {
+  ok(`Version ${newVersion} taken from the tagged commit (no bump in CI)`);
+} else {
+  step("Bumping version in package.json, Cargo.toml, tauri.conf.json");
 
-// package.json
-const pkg = JSON.parse(readFileSync(PKG, "utf8"));
-pkg.version = newVersion;
-writeFileSync(PKG, JSON.stringify(pkg, null, 2) + "\n");
+  // package.json
+  const pkg = JSON.parse(readFileSync(PKG, "utf8"));
+  pkg.version = newVersion;
+  writeFileSync(PKG, JSON.stringify(pkg, null, 2) + "\n");
 
-// Cargo.toml — only the [package] version, not deps
-const cargo = readFileSync(CARGO, "utf8");
-const cargoBumped = cargo.replace(
-  /^(\[package\][\s\S]*?\nversion\s*=\s*)"[^"]+"/m,
-  `$1"${newVersion}"`,
-);
-if (cargoBumped === cargo) die("Failed to bump Cargo.toml version");
-writeFileSync(CARGO, cargoBumped);
+  // Cargo.toml — only the [package] version, not deps
+  const cargo = readFileSync(CARGO, "utf8");
+  const cargoBumped = cargo.replace(
+    /^(\[package\][\s\S]*?\nversion\s*=\s*)"[^"]+"/m,
+    `$1"${newVersion}"`,
+  );
+  if (cargoBumped === cargo) die("Failed to bump Cargo.toml version");
+  writeFileSync(CARGO, cargoBumped);
 
-// tauri.conf.json
-const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
-conf.version = newVersion;
-writeFileSync(TAURI_CONF, JSON.stringify(conf, null, 2) + "\n");
+  // tauri.conf.json
+  const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
+  conf.version = newVersion;
+  writeFileSync(TAURI_CONF, JSON.stringify(conf, null, 2) + "\n");
 
-ok(`Bumped to ${newVersion}`);
+  ok(`Bumped to ${newVersion}`);
+}
 
 // ── 2. Build ─────────────────────────────────────────────────────
 
@@ -173,14 +208,19 @@ step(
 
 // Tauri 2 reads the private key content from TAURI_SIGNING_PRIVATE_KEY.
 // (The `_PATH` variant in some docs isn't honored by the bundler.)
-const privateKey = readFileSync(KEY_PATH, "utf8");
+// In CI the key is already in the env (secret); locally we read the key file.
+const privateKey = HAVE_ENV_KEY
+  ? process.env.TAURI_SIGNING_PRIVATE_KEY
+  : readFileSync(KEY_PATH, "utf8");
 
 run("npm run tauri:build:universal", {
   env: {
     ...process.env,
     TAURI_SIGNING_PRIVATE_KEY: privateKey,
-    // Empty password — keep aligned with how the key was generated.
-    TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
+    // Empty password unless one was provided (keep aligned with how the key
+    // was generated; CI can override via TAURI_SIGNING_PRIVATE_KEY_PASSWORD).
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+      process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ?? "",
   },
 });
 
@@ -211,7 +251,16 @@ const tarPath = join(macosDir, tarball);
 const sigPath = join(macosDir, sigFile);
 const signature = readFileSync(sigPath, "utf8").trim();
 
-ok(`DMG: ${dmgFile}`);
+// Stable permalink asset. octopush.sh/download →
+// releases/latest/download/Octopush.dmg, so every release MUST publish an asset
+// named exactly `Octopush.dmg` (a byte-copy of the versioned universal DMG — the
+// code signature lives inside the file, so a copy stays valid/notarized). We keep
+// the versioned name too, for archives.
+const stableDmgPath = join(dmgDir, "Octopush.dmg");
+copyFileSync(dmgPath, stableDmgPath);
+
+ok(`DMG (versioned): ${dmgFile}`);
+ok(`DMG (stable permalink): Octopush.dmg`);
 ok(`Tarball: ${tarball}`);
 ok(`Signature: ${sigFile}`);
 
@@ -272,6 +321,20 @@ if (APPLE_SIGN) {
           "completed. Don't advertise a clean install until `xcrun stapler validate` on the .app passes.",
       );
     }
+    // The Gatekeeper assessment a real user's Mac performs on first launch.
+    try {
+      const assess = execSync(`spctl -a -vv "${appPath}" 2>&1`).toString();
+      if (/accepted/.test(assess)) {
+        ok("Gatekeeper assessment: accepted (spctl -a -vv)");
+      } else {
+        console.log(`\x1b[33m▸\x1b[0m spctl -a -vv did not report 'accepted':\n${assess}`);
+      }
+    } catch (e) {
+      console.log(
+        "\x1b[33m▸\x1b[0m spctl -a -vv rejected the .app — it will show a Gatekeeper warning. " +
+          `Output:\n${e.stdout?.toString?.() ?? e.message}`,
+      );
+    }
   }
 }
 
@@ -303,13 +366,17 @@ ok(`latest.json written (darwin-aarch64 + darwin-x86_64 → universal)`);
 
 // ── 5. Commit, tag, push ─────────────────────────────────────────
 
-step("Commiting version bump + tagging");
+if (CI) {
+  ok("Skipping commit/tag/push (CI publishes from an existing tag)");
+} else {
+  step("Commiting version bump + tagging");
 
-run(`git add package.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json`);
-run(`git commit -m "chore: release v${newVersion}"`);
-run(`git tag v${newVersion}`);
-run(`git push origin main`);
-run(`git push origin v${newVersion}`);
+  run(`git add package.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json`);
+  run(`git commit -m "chore: release v${newVersion}"`);
+  run(`git tag v${newVersion}`);
+  run(`git push origin main`);
+  run(`git push origin v${newVersion}`);
+}
 
 // ── 6. GitHub release ────────────────────────────────────────────
 
@@ -358,16 +425,29 @@ arrive in-app via the auto-updater.
 const notesFile = join(BUNDLE_DIR, ".release-notes.md");
 writeFileSync(notesFile, notesBody);
 
+// Assets: the stable `Octopush.dmg` (permalink target for octopush.sh/download),
+// the versioned DMG (archives), the updater tarball + its .sig, and latest.json.
+const assets = [stableDmgPath, dmgPath, tarPath, sigPath, latestPath];
 const ghCmd = [
   `gh release create v${newVersion}`,
   `--title "v${newVersion}"`,
   `--notes-file "${notesFile}"`,
-  `"${dmgPath}"`,
-  `"${tarPath}"`,
-  `"${sigPath}"`,
-  `"${latestPath}"`,
+  ...assets.map((p) => `"${p}"`),
 ].join(" ");
-run(ghCmd);
+// In CI a release for the tag may already exist (e.g. a re-run) — fall back to
+// uploading assets with --clobber so a retry is idempotent.
+try {
+  run(ghCmd);
+} catch (e) {
+  if (CI) {
+    console.log("\x1b[33m▸\x1b[0m release create failed (may already exist) — uploading assets with --clobber");
+    run(
+      [`gh release upload v${newVersion}`, ...assets.map((p) => `"${p}"`), "--clobber"].join(" "),
+    );
+  } else {
+    throw e;
+  }
+}
 
 console.log("");
 ok(

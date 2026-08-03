@@ -879,6 +879,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 ### Auto-update (tauri-plugin-updater)
 - **Updater store** — Phases `idle|checking|available|no-update|downloading|installing|error`; `checkForUpdates(interactive)`, `installAndRelaunch()`. Background failures stay silent. _Support:_ `updaterStore.ts`.
 - **UpdateNotifier toast** — Auto-checks on mount + every 6 hours; visible only when an update is available/installing/error; "What's new" link, progress bar, Later / Install & restart. Updates verified with an Ed25519 signature. _Support:_ `UpdateNotifier.tsx`.
+- **Updater endpoint (host-indirected)** — `plugins.updater.endpoints` prefers `https://octopush.sh/update/latest.json` (a 302 to the GitHub release asset, so binaries can move hosts without breaking installed apps), falling back to the raw `releases/latest/download/latest.json`. The updater signature is inline in `latest.json` (no separate `.sig` fetch). _Support:_ `src-tauri/tauri.conf.json`; the redirect lives in the `octopush-web` repo (`vercel.json`). See [`docs/RELEASING.md`](RELEASING.md). _Entry:_ automatic.
 
 ### Performance monitor
 - **Backend sampling** — `get_perf_stats` samples processes via `sysinfo` into three groups: **app** (main + macOS "responsible" WebKit helpers via FFI), **daemon** (`octopush-pty-server` only), **total** — each with `rss_bytes`, `cpu_pct`, `process_count`; plus home-volume disk free/total. Persistent `PerfState(Mutex<System>)` for CPU deltas. _Support:_ `perf.rs`; `get_perf_stats`.

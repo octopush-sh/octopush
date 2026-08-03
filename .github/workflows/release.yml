@@ -1,0 +1,96 @@
+# Octopush — release build & publish.
+#
+# Trigger: push a version tag (`v0.4.51`) or run manually (workflow_dispatch).
+# The job builds the universal macOS bundle, signs the updater artifact, and —
+# WHEN the Apple secrets are present — Developer-ID-signs + notarizes + staples,
+# then publishes the GitHub Release with all assets (stable Octopush.dmg,
+# versioned DMG, updater tarball + .sig, latest.json).
+#
+# GRACEFUL DEGRADATION (the Apple account does not exist yet):
+#   - Only TAURI_SIGNING_PRIVATE_KEY is REQUIRED (updater signing; without it
+#     in-app updates break). The workflow fails fast and loudly if it's missing.
+#   - All APPLE_* secrets are OPTIONAL. Absent → an unsigned build ships with the
+#     `xattr` unblock in the notes (scripts/release.mjs prints a loud warning).
+#     Present → signed + notarized + stapled, verified with spctl.
+# Fill the secrets in (repo → Settings → Secrets and variables → Actions) to
+# flip from unsigned to Gatekeeper-clean with zero code changes. See
+# docs/RELEASING.md.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 0.4.51). Defaults to tauri.conf.json.'
+        required: false
+
+permissions:
+  contents: write # create releases + upload assets
+
+jobs:
+  release:
+    # Apple Silicon runner → the universal build's aarch64 slice is native.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight — updater signing key is mandatory
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set. In-app updates"
+            echo "::error::require a signed updater artifact. Generate a keypair with"
+            echo "::error::'npx @tauri-apps/cli signer generate' and add the private key"
+            echo "::error::as a repo secret; the public key must match tauri.conf.json."
+            exit 1
+          fi
+
+      - name: Report Apple signing posture
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+        run: |
+          if [ -n "$APPLE_SIGNING_IDENTITY" ] && [ -n "$APPLE_ID" ]; then
+            echo "Apple signing + notarization secrets present → Gatekeeper-clean build."
+          else
+            echo "::warning::APPLE_* secrets absent → UNSIGNED build (xattr unblock in notes)."
+            echo "::warning::This is expected until the Apple Developer account is set up."
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Add Rust targets (universal build needs both slices)
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build, sign & publish
+        env:
+          # Required — updater artifact signing.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Optional — Apple Developer ID signing (base64 .p12 import or identity).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Optional — notarization (app-specific password OR App Store Connect key).
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+          # `gh` in scripts/release.mjs uses this.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/release.mjs --ci ${{ github.event.inputs.version }}
