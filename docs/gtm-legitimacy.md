@@ -99,6 +99,8 @@ Today sign-in is a single **"Sign in"** button that opens the browser (`AccountP
 | Google login | nothing (Clerk hosted) ✅ | Google OAuth client → Clerk |
 | Native provider buttons (optional) | not started | — (custom URL scheme; ask if wanted) |
 
-### Related legitimacy item (not in this pass)
+### Related legitimacy item — support email ✅ done
 
-The post-payment / support email currently uses a personal Gmail — the most visible "hobby" tell after Gatekeeper. Cheap fix when you're ready: a custom-domain inbox (e.g. Zoho free tier or Porkbun forwarding → `support@octopush.sh`), updated in **Dodo's** support-email setting and the landing's legal config. No app code. Flag it and I'll help wire the copy.
+The post-payment / support email was a personal Gmail — the most visible "hobby" tell after Gatekeeper. It is now **`support@octopush.sh`**, a monitored custom-domain inbox (iCloud custom domains). The landing's legal config (`octopush-web`: `src/legal-config.ts`) is updated, which propagates the address to Terms, Privacy and the Refund policy. No app code was involved.
+
+Remaining manual step: make sure the same address is set as the support email in the **Dodo Payments** dashboard, so post-payment receipts and billing correspondence match.
