@@ -111,6 +111,15 @@ repo secrets (CI). No code changes are needed.
 - `APPLE_ID` + `APPLE_PASSWORD` (an **app-specific** password) + `APPLE_TEAM_ID`, **or**
 - `APPLE_API_ISSUER` + `APPLE_API_KEY` + `APPLE_API_KEY_PATH` (App Store Connect API key).
 
+> **Gotcha (CI):** Tauri decides to codesign based on whether `APPLE_CERTIFICATE`
+> / `APPLE_SIGNING_IDENTITY` are **defined**, not whether they're non-empty — and
+> GitHub renders a missing secret as an empty string. Passing them straight
+> through as workflow `env:` therefore makes the bundler try `security import`
+> with an empty certificate and fail with *"failed to import keychain
+> certificate"*. `.github/workflows/release.yml` routes them through
+> `$GITHUB_ENV` and exports each one only when it carries a value. Keep it that
+> way when editing the workflow.
+
 When both signing and notarization creds are present, Tauri 2 signs, submits to
 `notarytool`, and staples the ticket. `scripts/release.mjs` then verifies:
 `codesign --verify --strict`, `xcrun stapler validate`, and `spctl -a -vv`

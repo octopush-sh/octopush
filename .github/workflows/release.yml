@@ -49,13 +49,51 @@ jobs:
             exit 1
           fi
 
-      - name: Report Apple signing posture
+      # Apple signing vars must be EXPORTED ONLY WHEN THEY CARRY A VALUE.
+      # A missing GitHub secret renders as an empty string, and Tauri decides to
+      # codesign based on whether APPLE_CERTIFICATE/APPLE_SIGNING_IDENTITY are
+      # *defined* — not whether they are non-empty. Passing them through as empty
+      # env vars makes the bundler attempt `security import` with an empty
+      # certificate, which fails the build ("failed to import keychain
+      # certificate"). Routing them through $GITHUB_ENV lets us omit them
+      # entirely, which is what "no Apple account yet" must look like.
+      - name: Configure Apple signing (only when secrets are present)
         env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
         run: |
-          if [ -n "$APPLE_SIGNING_IDENTITY" ] && [ -n "$APPLE_ID" ]; then
-            echo "Apple signing + notarization secrets present → Gatekeeper-clean build."
+          # Heredoc form so multi-line values (certs, keys) survive intact.
+          emit() {
+            if [ -n "${2:-}" ]; then
+              {
+                echo "$1<<__OCTOPUSH_EOF__"
+                echo "$2"
+                echo "__OCTOPUSH_EOF__"
+              } >> "$GITHUB_ENV"
+              echo "  $1: present"
+            else
+              echo "  $1: absent (not exported)"
+            fi
+          }
+          emit APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
+          emit APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+          emit APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+          emit APPLE_ID "$APPLE_ID"
+          emit APPLE_PASSWORD "$APPLE_PASSWORD"
+          emit APPLE_TEAM_ID "$APPLE_TEAM_ID"
+          emit APPLE_API_ISSUER "$APPLE_API_ISSUER"
+          emit APPLE_API_KEY "$APPLE_API_KEY"
+          emit APPLE_API_KEY_PATH "$APPLE_API_KEY_PATH"
+
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] || [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "Apple signing secrets present → Developer-ID signed build."
           else
             echo "::warning::APPLE_* secrets absent → UNSIGNED build (xattr unblock in notes)."
             echo "::warning::This is expected until the Apple Developer account is set up."
@@ -80,17 +118,9 @@ jobs:
           # Required — updater artifact signing.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Optional — Apple Developer ID signing (base64 .p12 import or identity).
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # Optional — notarization (app-specific password OR App Store Connect key).
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+          # NOTE: the APPLE_* vars are deliberately NOT listed here. They arrive
+          # via $GITHUB_ENV from the step above, and only when they hold a value —
+          # see the comment there for why an empty one breaks the bundler.
           # `gh` in scripts/release.mjs uses this.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/release.mjs --ci ${{ github.event.inputs.version }}
