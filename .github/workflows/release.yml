@@ -68,7 +68,7 @@ jobs:
       - name: Add Rust targets (universal build needs both slices)
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
