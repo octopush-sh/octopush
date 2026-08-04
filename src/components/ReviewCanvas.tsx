@@ -187,15 +187,17 @@ export function ReviewCanvas({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // Escape peels back one surface at a time, topmost first. The Why?
-      // drawer owns Escape while open, so leave it alone here.
-      if (e.key !== "Escape" || whyFile) return;
+      // drawer owns Escape while open, so leave it alone here. `active` gates
+      // it for the same reason as ⌥⌘M — this canvas stays mounted under
+      // ModeOverlay, and Escape from TALK must not reach invisible drawers.
+      if (!active || e.key !== "Escape" || whyFile) return;
       if (testsOpen) { setTestsOpen(false); return; }
       if (aiOpen) { setAiOpen(false); return; }
       setTestResult(null);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [whyFile, testsOpen, aiOpen]);
+  }, [active, whyFile, testsOpen, aiOpen]);
 
   // Auto-clear the reject-undo bar after 6s — but keep the error message
   // visible until the user dismisses it (don't let a failed undo vanish).
@@ -309,7 +311,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("diff")}
               aria-label="Diff view"
-              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "diff" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "diff" ? { background: "var(--brass-ghost)" } : undefined}
@@ -320,7 +322,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("editor")}
               aria-label="Editor view"
-              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "editor" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "editor" ? { background: "var(--brass-ghost)" } : undefined}
@@ -345,7 +347,7 @@ export function ReviewCanvas({
                   aria-label={label}
                   aria-pressed={mdView === value}
                   title={title}
-                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     i > 0 ? "border-l border-octo-hairline" : ""
                   } ${mdView === value ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
                   style={mdView === value ? { background: "var(--brass-ghost)" } : undefined}
@@ -365,7 +367,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("inline")}
                   aria-label="Inline"
                   title="Inline diff"
-                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "inline" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "inline" ? { background: "var(--brass-ghost)" } : undefined}
@@ -376,7 +378,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("sbs")}
                   aria-label="Side by side"
                   title="Side-by-side diff"
-                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "sbs" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "sbs" ? { background: "var(--brass-ghost)" } : undefined}
@@ -493,6 +495,7 @@ export function ReviewCanvas({
         {/* Diff view */}
         {viewMode === "diff" && (
           <DiffView
+            active={active}
             files={diffFiles}
             workspacePath={workspacePath}
             stagedCount={

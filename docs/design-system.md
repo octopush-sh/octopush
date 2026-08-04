@@ -159,16 +159,22 @@ Tokens live in `styles.css` (atelier fallbacks) and are written per theme by `th
 
 ### Margin marker (a rendered block pointing back at its source)
 
-For any surface where a *derived* view needs to point at the *authored* thing behind it — today the REVIEW Markdown preview naming the source line of the block under the pointer. One marker exists per pane, not one per block: it's a single absolutely-positioned button that follows the hovered element's `offsetTop`.
+For any surface where a *derived* view needs to point at the *authored* thing behind it — today the REVIEW Markdown preview naming the source line of the block under the pointer. One marker exists per pane, not one per block: a single absolutely-positioned button, moved to the hovered element's offset inside the document wrapper.
 
 ```tsx
-<div className="relative …">          {/* the offsetParent — content, not the scroller */}
+// top = block.getBoundingClientRect().top - body.getBoundingClientRect().top
+<div ref={body} className="relative …">   {/* content, not the scroller */}
   {rendered}
   <button
     className={`absolute -left-8 z-10 rounded-[4px] border px-1.5 py-0.5 font-mono
                 text-[9px] leading-none tabular-nums text-octo-brass
-                transition-opacity duration-200 ${shown ? "opacity-100" : "pointer-events-none opacity-0"}`}
-    style={{ top, background: "var(--brass-ghost)", borderColor: "var(--brass-quiet)" }}
+                ${shown ? "opacity-100" : "pointer-events-none opacity-0"}`}
+    style={{
+      top,
+      background: "var(--brass-ghost)",
+      borderColor: "var(--brass-quiet)",
+      transition: "opacity 220ms cubic-bezier(0.2,0.8,0.3,1)",
+    }}
   >{line}</button>
 </div>
 ```
@@ -176,7 +182,7 @@ For any surface where a *derived* view needs to point at the *authored* thing be
 Four rules:
 
 1. **Reserve the gutter on the scroller, not the block.** The pane pads `pl-11`; the marker sits at `-left-8`. A negative offset inside an `overflow-x` box (a `<pre>`, a table wrapper) gets clipped — so the jump attribute goes on a plain wrapper, never on the scrolling element itself. Measure with `getBoundingClientRect()` against the wrapper, **not `offsetTop`**: a `<tr>`/`<td>`'s `offsetParent` is its `<table>`, so `offsetTop` would be the row's position inside the table.
-2. **One marker, kept mounted — and reachable.** It fades rather than unmounting, so it never appears or disappears abruptly (§6), and hovering across blocks moves one element instead of mounting dozens. **The gutter it sits in belongs to the pane, not to any block**, so the pointer must cross non-block space to reach it: dismiss only on the pane's `mouseleave`, never on "the pointer isn't over a block". A hidden marker is inert, so dismissing early makes it impossible to click. Hide it too when the underlying content changes — a marker measured before a reflow points at the wrong place.
+2. **One marker, kept mounted — and reachable.** It fades rather than unmounting, so it never appears or disappears abruptly (§6), and hovering across blocks moves one element instead of mounting dozens. **The gutter it sits in belongs to the pane, not to any block**, so the pointer must cross non-block space to reach it: dismiss only on the pane's `mouseleave`, never on "the pointer isn't over a block". A hidden marker is inert, so dismissing early makes it impossible to click. Hide it whenever the document reflows — on a content change *and* via a `ResizeObserver`, since a pane animating between layouts, a window resize or a late-loading image all move the blocks while the pointer sits still and no `mouseover` comes to re-measure.
 3. **The quiet path is a modifier, the discoverable path is the marker.** The marker teaches the gesture on hover; `⌘`/`Ctrl`-click is the same action for someone who already knows. Never spend an unmodified click or a double-click on navigation inside selectable prose — those belong to selection and links.
 4. **Numerals, not glyphs.** The marker is the line number in brass mono. No arrow, no connector — both are retired (§5).
 

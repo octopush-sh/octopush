@@ -62,6 +62,18 @@ export function MarkdownPreview({ source, onJumpToLine }: Props) {
     setMarkerShown(false);
   }, [source]);
 
+  // Same hazard without a source change: the pane animating between view
+  // modes, a window resize, or an image loading above the hovered block all
+  // reflow the document while the pointer sits still, so no mouseover comes to
+  // re-measure. One observer on the document covers all three.
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setMarkerShown(false));
+    ro.observe(body);
+    return () => ro.disconnect();
+  }, []);
+
   const onMouseOver = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const body = bodyRef.current;
@@ -111,7 +123,6 @@ export function MarkdownPreview({ source, onJumpToLine }: Props) {
         {onJumpToLine && marker && (
           <button
             type="button"
-            data-md-jump=""
             onClick={() => onJumpToLine(marker.line)}
             title={`Jump to line ${marker.line}`}
             aria-label={`Jump to line ${marker.line}`}

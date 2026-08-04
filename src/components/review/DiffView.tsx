@@ -7,6 +7,10 @@ import type { DiffFile } from "../../lib/diffParser";
 export interface DiffAnchor { filePath: string; startLine: number; endLine: number; }
 
 interface Props {
+  /** True while REVIEW is the mode on screen. The canvas stays mounted under
+   *  ModeOverlay, so without this the bare-letter hunk hotkeys (a/x/A) would
+   *  accept or reject changes from TALK, RUN and DIRECT. */
+  active?: boolean;
   files: DiffFile[];
   workspacePath: string;
   stagedCount?: number;
@@ -21,7 +25,7 @@ interface Props {
 }
 
 export function DiffView(props: Props) {
-  const { files, stagedCount = 0 } = props;
+  const { files, stagedCount = 0, active = true } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const [focused, setFocused] = useState(0);
   const [viewed, setViewed] = useState<Record<string, boolean>>({});
@@ -54,7 +58,7 @@ export function DiffView(props: Props) {
   };
 
   useDiffKeyboard({
-    enabled: files.length > 0,
+    enabled: active && files.length > 0,
     flat,
     focused,
     setFocused,

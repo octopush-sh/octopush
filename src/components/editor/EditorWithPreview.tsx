@@ -109,10 +109,17 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
     setDragging(false);
   }, [showDivider]);
   // Detach on unmount as well (detach() only removes listeners — no setState).
+  useEffect(() => () => { stopDragRef.current?.(); }, []);
+
+  // Drop a pending deferred reveal on unmount AND whenever the workspace
+  // changes. App renders this component without a `key`, so switching
+  // workspaces reconciles instead of remounting: the timer's captured
+  // workspaceId would still satisfy its own fire-time check and write the jump
+  // into the workspace the user just left, where it would sit unconsumed.
   useEffect(() => () => {
-    stopDragRef.current?.();
     if (revealTimerRef.current != null) window.clearTimeout(revealTimerRef.current);
-  }, []);
+    revealTimerRef.current = null;
+  }, [workspaceId]);
 
   /** Rendered block → editor caret. From reading the editor column is still
    *  zero-width, so the jump opens split first and defers the reveal until the

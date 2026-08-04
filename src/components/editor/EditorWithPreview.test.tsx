@@ -96,6 +96,24 @@ describe("EditorWithPreview", () => {
     expect(preview.style.width).toBe("100%");
   });
 
+  // The point of collapsing to zero width instead of conditionally rendering:
+  // CodeMirror's undo history, folds and scroll position live in the view, and
+  // an unmount throws them away. Asserting the DOM node's identity across
+  // every switch is the only way to catch a regression to `{show && <Pane/>}`.
+  it("keeps the very same editor column across every mode switch", () => {
+    seedFile({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    useReviewPrefs.setState({ mdView: "split" });
+    renderIt();
+    const first = columns().editor;
+    const pane = screen.getByTestId("editor-pane");
+
+    for (const next of ["reading", "source", "split"] as const) {
+      act(() => { useReviewPrefs.setState({ mdView: next }); });
+      expect(columns().editor).toBe(first);
+      expect(screen.getByTestId("editor-pane")).toBe(pane);
+    }
+  });
+
   it("a non-markdown tab ignores the markdown view and stays editor-only", () => {
     seedFile({ path: "/r/App.tsx", lang: "javascript", kind: "text" });
     useReviewPrefs.setState({ mdView: "reading" });
@@ -236,6 +254,22 @@ describe("EditorWithPreview — jump to source", () => {
     });
     act(() => { vi.advanceTimersByTime(400); });
     expect(useEditorStore.getState().getPendingReveal(WS)).toBeNull();
+  });
+
+  // App renders this component without a `key`, so a workspace switch
+  // reconciles instead of remounting — the timer's captured workspaceId would
+  // still satisfy its own fire-time check.
+  it("drops a deferred reveal when the workspace changed first", () => {
+    vi.useFakeTimers();
+    seedFile({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    useReviewPrefs.setState({ mdView: "reading" });
+    const { rerender } = renderIt();
+
+    fireEvent.click(screen.getByTestId("md-jump"));
+    rerender(<EditorWithPreview workspaceId="ws2" workspacePath="/r" diffText="" />);
+    act(() => { vi.advanceTimersByTime(400); });
+    expect(useEditorStore.getState().getPendingReveal(WS)).toBeNull();
+    expect(useEditorStore.getState().getPendingReveal("ws2")).toBeNull();
   });
 
   // Flipping back to reading restores the zero-width viewport the deferral

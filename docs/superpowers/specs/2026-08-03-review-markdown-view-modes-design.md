@@ -44,6 +44,12 @@ The preview opts into selection with `.octo-selectable` — the general selectab
 
 **Scroll-linking** (the document dragging the editor along) and **caret-follows** (marking the block the caret sits in) both fall out cheaply once the line map exists, and both were prototyped. Neither ships: scroll-linking reads as possessive when you only wanted to skim one pane, and the marker already answers "where is this in the source?" without a persistent coupling. Revisit only if the jump proves not to be enough.
 
+**A keyboard path from a rendered block to its source.** Both jump affordances need a pointer. The alternative — a focusable button per block — would add dozens of tab stops to a reading surface, which is a worse trade than the gap it closes: the source is always one keypress away via `⌥⌘M`, and the editor has its own go-to-line. If this proves to matter, the right shape is a single "jump to the block at the top of the viewport" command, not per-block focus.
+
+## Known follow-up (found while reviewing, not caused by this change)
+
+`ModeOverlay` keeps its children mounted, which makes every window-level listener under `ReviewCanvas` fire from TALK, RUN and DIRECT. This change introduced the `active` prop and threaded it through the ⌥⌘M binding, the Escape drawer-dismissal, and `DiffView`'s bare-letter hunk hotkeys (`a`/`x`/`A` were accepting and rejecting hunks from other modes whenever focus sat on `document.body`). Other always-mounted surfaces have not been audited for the same trap.
+
 ## Files
 
 `stores/reviewPrefsStore.ts` · `stores/editorStore.ts` (`revealLine`) · `lib/markdownComponents.tsx` (`lineAttr`) · `components/editor/MarkdownPreview.tsx` · `components/editor/EditorWithPreview.tsx` · `components/ReviewCanvas.tsx` · `styles.css` (`.octo-selectable`) · `docs/FEATURES.md` · `docs/design-system.md` (margin marker + selectable islands recipes).
