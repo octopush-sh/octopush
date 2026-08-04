@@ -364,7 +364,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   // not an early return — an early return would unmount the host on the
   // null→active transition and the `[]` effect would never create the view.
   return (
-    <div className="chat-selectable flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div className="octo-selectable flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="relative min-h-0 flex-1">
         <div
           ref={hostRef}

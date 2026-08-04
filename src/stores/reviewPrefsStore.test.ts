@@ -27,21 +27,31 @@ describe("reviewPrefsStore", () => {
   });
 });
 
-describe("reviewPrefsStore — markdown preview", () => {
+describe("reviewPrefsStore — markdown view", () => {
   beforeEach(() => {
-    useReviewPrefs.setState({ mdPreview: true, mdPreviewSplit: 50 });
+    useReviewPrefs.setState({ mdView: "split", mdPreviewSplit: 50 });
   });
 
-  it("defaults mdPreview to true and mdPreviewSplit to 50", () => {
-    expect(useReviewPrefs.getState().mdPreview).toBe(true);
+  it("defaults mdView to split and mdPreviewSplit to 50", () => {
+    expect(useReviewPrefs.getState().mdView).toBe("split");
     expect(useReviewPrefs.getState().mdPreviewSplit).toBe(50);
   });
 
-  it("toggleMdPreview flips the flag", () => {
-    useReviewPrefs.getState().toggleMdPreview();
-    expect(useReviewPrefs.getState().mdPreview).toBe(false);
-    useReviewPrefs.getState().toggleMdPreview();
-    expect(useReviewPrefs.getState().mdPreview).toBe(true);
+  it("setMdView picks a layout directly", () => {
+    useReviewPrefs.getState().setMdView("reading");
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+    useReviewPrefs.getState().setMdView("source");
+    expect(useReviewPrefs.getState().mdView).toBe("source");
+  });
+
+  it("cycleMdView walks source → split → reading and wraps", () => {
+    useReviewPrefs.getState().setMdView("source");
+    useReviewPrefs.getState().cycleMdView();
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+    useReviewPrefs.getState().cycleMdView();
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+    useReviewPrefs.getState().cycleMdView();
+    expect(useReviewPrefs.getState().mdView).toBe("source");
   });
 
   it("setMdPreviewSplit clamps to 25..75 and rounds", () => {
@@ -77,13 +87,48 @@ describe("clampSplit", () => {
 });
 
 describe("reviewPrefsStore — rehydrate", () => {
-  it("re-clamps an out-of-range persisted mdPreviewSplit on load", async () => {
-    localStorage.setItem(
-      "octo-review-prefs",
-      JSON.stringify({ state: { mdPreviewSplit: 999 }, version: 0 }),
-    );
+  async function rehydrateWith(state: Record<string, unknown>) {
+    localStorage.setItem("octo-review-prefs", JSON.stringify({ state, version: 0 }));
     await useReviewPrefs.persist.rehydrate();
-    expect(useReviewPrefs.getState().mdPreviewSplit).toBe(75);
+  }
+
+  beforeEach(() => {
     localStorage.clear();
+    useReviewPrefs.setState({ mdView: "split", mdPreviewSplit: 50 });
+  });
+
+  it("re-clamps an out-of-range persisted mdPreviewSplit on load", async () => {
+    await rehydrateWith({ mdPreviewSplit: 999 });
+    expect(useReviewPrefs.getState().mdPreviewSplit).toBe(75);
+  });
+
+  it("keeps a valid persisted mdView", async () => {
+    await rehydrateWith({ mdView: "reading" });
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+  });
+
+  it("falls back to the default when the persisted mdView is unknown", async () => {
+    await rehydrateWith({ mdView: "sideways" });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  // Migration from the pre-three-state pref: preview-off was "editor only",
+  // preview-on was the fixed split. The legacy key must not survive the merge.
+  it("maps a legacy mdPreview:false onto the source view", async () => {
+    await rehydrateWith({ mdPreview: false });
+    expect(useReviewPrefs.getState().mdView).toBe("source");
+    expect("mdPreview" in useReviewPrefs.getState()).toBe(false);
+  });
+
+  it("maps a legacy mdPreview:true onto the split view", async () => {
+    useReviewPrefs.setState({ mdView: "reading" });
+    await rehydrateWith({ mdPreview: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+    expect("mdPreview" in useReviewPrefs.getState()).toBe(false);
+  });
+
+  it("prefers an explicit mdView over a stale legacy mdPreview", async () => {
+    await rehydrateWith({ mdView: "reading", mdPreview: false });
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
   });
 });

@@ -289,6 +289,57 @@ describe("editorStore.openFile — open at line (pending reveal)", () => {
   });
 });
 
+describe("editorStore.revealLine", () => {
+  beforeEach(reset);
+
+  async function openA() {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.md");
+  }
+
+  it("records a reveal for an already-open file", async () => {
+    await openA();
+    useEditorStore.getState().revealLine("ws", "/a.md", 12);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/a.md", line: 12,
+    });
+  });
+
+  it("is a no-op for a path that isn't open", async () => {
+    await openA();
+    useEditorStore.getState().revealLine("ws", "/never-opened.md", 12);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+  });
+
+  // EditorPane's reveal effect keys on the reveal's identity, so repeating the
+  // same jump has to hand it a fresh object or the second jump never fires.
+  it("hands a fresh object to the same line twice", async () => {
+    await openA();
+    useEditorStore.getState().revealLine("ws", "/a.md", 12);
+    const first = useEditorStore.getState().getPendingReveal("ws");
+    useEditorStore.getState().revealLine("ws", "/a.md", 12);
+    const second = useEditorStore.getState().getPendingReveal("ws");
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+  });
+
+  it("floors the line at 1 and rounds a fractional line", async () => {
+    await openA();
+    useEditorStore.getState().revealLine("ws", "/a.md", 0);
+    expect(useEditorStore.getState().getPendingReveal("ws")?.line).toBe(1);
+    useEditorStore.getState().revealLine("ws", "/a.md", 4.6);
+    expect(useEditorStore.getState().getPendingReveal("ws")?.line).toBe(5);
+  });
+
+  it("keeps other workspaces' reveals untouched", async () => {
+    await openA();
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws2", "/b.md");
+    useEditorStore.getState().revealLine("ws", "/a.md", 3);
+    expect(useEditorStore.getState().getPendingReveal("ws2")).toBeNull();
+  });
+});
+
 describe("editorStore.reorderFiles", () => {
   beforeEach(reset);
 

@@ -476,7 +476,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={scrollRef}
-        className={`chat-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 pt-3 font-mono text-[12px] leading-relaxed text-octo-sage ${
+        className={`octo-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 pt-3 font-mono text-[12px] leading-relaxed text-octo-sage ${
           playerVisible ? "pb-[96px]" : "pb-3"
         }`}
       >

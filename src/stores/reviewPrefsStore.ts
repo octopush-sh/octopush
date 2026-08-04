@@ -3,6 +3,24 @@ import { persist } from "zustand/middleware";
 
 export type ReadingMode = "inline" | "sbs";
 
+/** How a Markdown tab is laid out in REVIEW's editor view:
+ *  `source` = editor only · `split` = editor ‖ rendered · `reading` = rendered only. */
+export type MdView = "source" | "split" | "reading";
+
+/** Cycle order for ⌥⌘M — the same left-to-right order as the toolbar control. */
+const MD_VIEW_ORDER: readonly MdView[] = ["source", "split", "reading"];
+
+export function isMdView(v: unknown): v is MdView {
+  return typeof v === "string" && (MD_VIEW_ORDER as readonly string[]).includes(v);
+}
+
+/** Map the pre-3-state persisted pref (`mdPreview: boolean`) onto a view.
+ *  Preview-off was "editor only"; preview-on was the fixed 50/50 split. */
+function legacyMdView(mdPreview: unknown): MdView | null {
+  if (typeof mdPreview !== "boolean") return null;
+  return mdPreview ? "split" : "source";
+}
+
 /** Clamp a split percent to the allowed [25,75] range and round to an integer,
  *  so persisted ratios and inline column widths stay tidy (no
  *  `width: 33.41666…%`). Shared by the write path and the rehydrate merge. */
@@ -15,14 +33,15 @@ interface ReviewPrefsState {
   ignoreWhitespace: boolean;
   /** Per-workspace "show gitignored files in the tree" pref, keyed by rootPath. */
   showIgnoredFiles: Record<string, boolean>;
-  /** Markdown preview: open the rendered pane beside the editor for .md tabs. */
-  mdPreview: boolean;
+  /** Markdown layout for .md tabs in the editor view. */
+  mdView: MdView;
   /** Source-column width percent for the editor‖preview split (25..75). */
   mdPreviewSplit: number;
   setReadingMode: (m: ReadingMode) => void;
   setIgnoreWhitespace: (v: boolean) => void;
   toggleShowIgnored: (rootPath: string) => void;
-  toggleMdPreview: () => void;
+  setMdView: (v: MdView) => void;
+  cycleMdView: () => void;
   setMdPreviewSplit: (pct: number) => void;
 }
 
@@ -32,7 +51,7 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
       readingMode: "inline",
       ignoreWhitespace: false,
       showIgnoredFiles: {},
-      mdPreview: true,
+      mdView: "split",
       mdPreviewSplit: 50,
       setReadingMode: (readingMode) => set({ readingMode }),
       setIgnoreWhitespace: (ignoreWhitespace) => set({ ignoreWhitespace }),
@@ -46,23 +65,35 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
           }
           return { showIgnoredFiles: next };
         }),
-      toggleMdPreview: () => set((s) => ({ mdPreview: !s.mdPreview })),
+      setMdView: (mdView) => set({ mdView }),
+      cycleMdView: () =>
+        set((s) => {
+          const i = MD_VIEW_ORDER.indexOf(s.mdView);
+          return { mdView: MD_VIEW_ORDER[(i + 1) % MD_VIEW_ORDER.length] };
+        }),
       setMdPreviewSplit: (pct) => set({ mdPreviewSplit: clampSplit(pct) }),
     }),
     {
       name: "octo-review-prefs",
-      // Re-clamp the persisted split on load. The clamp on the write path can't
-      // guard a stale or hand-edited storage value (or one written by a future
-      // build with a different range); without this, a bad value would render
-      // an editor or preview column at an extreme (near-0% or >100%) width.
+      // Rehydrate defensively. Two things the write paths can't guard:
+      //  · a stale, hand-edited or future-build `mdPreviewSplit` — re-clamped,
+      //    otherwise a bad value renders a column at a near-0% / >100% width;
+      //  · the legacy `mdPreview` boolean written before the three-state view —
+      //    mapped once and then dropped, so it never lingers in storage.
       merge: (persisted, current) => {
-        const p = (persisted ?? {}) as Partial<ReviewPrefsState>;
+        const {
+          mdView,
+          mdPreviewSplit,
+          mdPreview,
+          ...rest
+        } = (persisted ?? {}) as Partial<ReviewPrefsState> & { mdPreview?: unknown };
         return {
           ...current,
-          ...p,
+          ...rest,
+          mdView: isMdView(mdView) ? mdView : legacyMdView(mdPreview) ?? current.mdView,
           mdPreviewSplit:
-            typeof p.mdPreviewSplit === "number"
-              ? clampSplit(p.mdPreviewSplit)
+            typeof mdPreviewSplit === "number"
+              ? clampSplit(mdPreviewSplit)
               : current.mdPreviewSplit,
         };
       },

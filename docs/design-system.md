@@ -157,6 +157,33 @@ Three rules make this work, and they generalise:
 
 Tokens live in `styles.css` (atelier fallbacks) and are written per theme by `themeStore`. They are the only **opaque** colours derived there, so they are the only ones gated on the theme's hex actually parsing — a malformed value would be a solid slab over the content rather than a faint tint.
 
+### Margin marker (a rendered block pointing back at its source)
+
+For any surface where a *derived* view needs to point at the *authored* thing behind it — today the REVIEW Markdown preview naming the source line of the block under the pointer. One marker exists per pane, not one per block: it's a single absolutely-positioned button that follows the hovered element's `offsetTop`.
+
+```tsx
+<div className="relative …">          {/* the offsetParent — content, not the scroller */}
+  {rendered}
+  <button
+    className={`absolute -left-8 z-10 rounded-[4px] border px-1.5 py-0.5 font-mono
+                text-[9px] leading-none tabular-nums text-octo-brass
+                transition-opacity duration-200 ${shown ? "opacity-100" : "pointer-events-none opacity-0"}`}
+    style={{ top, background: "var(--brass-ghost)", borderColor: "var(--brass-quiet)" }}
+  >{line}</button>
+</div>
+```
+
+Four rules:
+
+1. **Reserve the gutter on the scroller, not the block.** The pane pads `pl-11`; the marker sits at `-left-8`. A negative offset inside an `overflow-x` box (a `<pre>`, a table wrapper) gets clipped — so the jump attribute goes on a plain wrapper, never on the scrolling element itself.
+2. **One marker, kept mounted.** It fades rather than unmounting, so it never appears or disappears abruptly (§6), and hovering across blocks moves one element instead of mounting dozens.
+3. **The quiet path is a modifier, the discoverable path is the marker.** The marker teaches the gesture on hover; `⌘`/`Ctrl`-click is the same action for someone who already knows. Never spend an unmodified click or a double-click on navigation inside selectable prose — those belong to selection and links.
+4. **Numerals, not glyphs.** The marker is the line number in brass mono. No arrow, no connector — both are retired (§5).
+
+### Selectable content islands
+
+`<body>` is `user-select: none` (a native desktop feel). Any surface whose text a user legitimately wants to copy — chat, editor, run journals, the Markdown preview — opts back in with **`.octo-selectable`**. Do not re-derive this per component, and do not ship a read-only text surface without it: prose a user cannot copy reads as a bug, not as chrome.
+
 ---
 
 ## 5. Signature details — structural glyphs and active patterns

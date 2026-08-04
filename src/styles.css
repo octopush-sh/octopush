@@ -606,9 +606,12 @@ button:not(:disabled),
   user-select: text;
 }
 
-/* Chat content is selectable so users can copy prompts, responses, and errors */
-.chat-selectable,
-.chat-selectable * {
+/* Selectable content islands. The app sets `user-select: none` on <body> for a
+   native desktop feel; every surface whose text a user legitimately wants to
+   copy opts back in here — chat prompts and responses, editor buffers, run
+   journals, and the rendered Markdown preview. */
+.octo-selectable,
+.octo-selectable * {
   user-select: text;
   -webkit-user-select: text;
 }

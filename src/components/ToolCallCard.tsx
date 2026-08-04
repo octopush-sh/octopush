@@ -156,7 +156,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
   }, [expanded, outputExpanded, tool.result]);
 
   return (
-    <div className="chat-selectable" style={cardStyle}>
+    <div className="octo-selectable" style={cardStyle}>
       <div style={{ display: "flex", alignItems: "center" }}>
         <div
           role="button"
