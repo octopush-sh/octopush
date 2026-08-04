@@ -10,6 +10,8 @@ export type MdView = "source" | "split" | "reading";
 /** Cycle order for ⌥⌘M — the same left-to-right order as the toolbar control. */
 const MD_VIEW_ORDER: readonly MdView[] = ["source", "split", "reading"];
 
+const DEFAULT_MD_VIEW: MdView = "split";
+
 export function isMdView(v: unknown): v is MdView {
   return typeof v === "string" && (MD_VIEW_ORDER as readonly string[]).includes(v);
 }
@@ -51,7 +53,7 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
       readingMode: "inline",
       ignoreWhitespace: false,
       showIgnoredFiles: {},
-      mdView: "split",
+      mdView: DEFAULT_MD_VIEW,
       mdPreviewSplit: 50,
       setReadingMode: (readingMode) => set({ readingMode }),
       setIgnoreWhitespace: (ignoreWhitespace) => set({ ignoreWhitespace }),
@@ -75,22 +77,35 @@ export const useReviewPrefs = create<ReviewPrefsState>()(
     }),
     {
       name: "octo-review-prefs",
-      // Rehydrate defensively. Two things the write paths can't guard:
-      //  · a stale, hand-edited or future-build `mdPreviewSplit` — re-clamped,
-      //    otherwise a bad value renders a column at a near-0% / >100% width;
-      //  · the legacy `mdPreview` boolean written before the three-state view —
-      //    mapped once and then dropped, so it never lingers in storage.
+      version: 1,
+      // v0 → v1: the `mdPreview` boolean became the three-state `mdView`.
+      // This belongs in `migrate`, not only in `merge`, because zustand writes
+      // the store back to storage ONLY after a real version migration — put it
+      // in `merge` alone and the dead key lingers in localStorage until some
+      // unrelated pref happens to be written.
+      migrate: (persisted, version) => {
+        if (version >= 1) return persisted;
+        const { mdPreview, ...rest } = (persisted ?? {}) as Record<string, unknown>;
+        return {
+          ...rest,
+          mdView: isMdView(rest.mdView) ? rest.mdView : legacyMdView(mdPreview) ?? DEFAULT_MD_VIEW,
+        };
+      },
+      // Rehydrate defensively — neither write path can guard a stale,
+      // hand-edited or future-build value: a bad `mdPreviewSplit` would render
+      // a column at a near-0% / >100% width, and an unknown `mdView` would
+      // render no layout at all. Both fall back rather than propagate.
       merge: (persisted, current) => {
         const {
           mdView,
           mdPreviewSplit,
-          mdPreview,
+          mdPreview: _legacy,
           ...rest
         } = (persisted ?? {}) as Partial<ReviewPrefsState> & { mdPreview?: unknown };
         return {
           ...current,
           ...rest,
-          mdView: isMdView(mdView) ? mdView : legacyMdView(mdPreview) ?? current.mdView,
+          mdView: isMdView(mdView) ? mdView : current.mdView,
           mdPreviewSplit:
             typeof mdPreviewSplit === "number"
               ? clampSplit(mdPreviewSplit)

@@ -214,4 +214,41 @@ describe("EditorWithPreview — jump to source", () => {
     act(() => { vi.advanceTimersByTime(400); });
     expect(useEditorStore.getState().getPendingReveal(WS)).toBeNull();
   });
+
+  // EditorPane refuses a reveal aimed at a non-active path WITHOUT consuming
+  // it, so a reveal written after a tab switch would sit in the store and
+  // ambush the user the next time they open that tab.
+  it("drops a deferred reveal when the active tab changed first", () => {
+    vi.useFakeTimers();
+    const md = { path: "/r/README.md", lang: "markdown", kind: "text" } as OpenFile;
+    const other = { path: "/r/OTHER.md", lang: "markdown", kind: "text" } as OpenFile;
+    useEditorStore.setState({
+      filesByWs: { [WS]: [{ ...md, content: "# a", savedContent: "# a", mtime: 0, size: 1, version: 0, diskStale: false } as OpenFile,
+                          { ...other, content: "# b", savedContent: "# b", mtime: 0, size: 1, version: 0, diskStale: false } as OpenFile] },
+      activeByWs: { [WS]: md.path },
+    });
+    useReviewPrefs.setState({ mdView: "reading" });
+    renderIt();
+
+    fireEvent.click(screen.getByTestId("md-jump"));
+    act(() => {
+      useEditorStore.setState((s) => ({ activeByWs: { ...s.activeByWs, [WS]: other.path } }));
+    });
+    act(() => { vi.advanceTimersByTime(400); });
+    expect(useEditorStore.getState().getPendingReveal(WS)).toBeNull();
+  });
+
+  // Flipping back to reading restores the zero-width viewport the deferral
+  // exists to avoid, so the jump is stale.
+  it("drops a deferred reveal when the view returns to reading first", () => {
+    vi.useFakeTimers();
+    seedFile({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    useReviewPrefs.setState({ mdView: "reading" });
+    renderIt();
+
+    fireEvent.click(screen.getByTestId("md-jump"));
+    act(() => { useReviewPrefs.setState({ mdView: "reading" }); });
+    act(() => { vi.advanceTimersByTime(400); });
+    expect(useEditorStore.getState().getPendingReveal(WS)).toBeNull();
+  });
 });

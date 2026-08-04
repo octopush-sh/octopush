@@ -103,13 +103,40 @@ describe("MarkdownPreview — jump to source", () => {
     expect(marker()).toHaveTextContent("6");
   });
 
-  it("keeps the marker mounted but inert once the pointer leaves", () => {
+  // The marker sits in the pane's left gutter, which belongs to the pane and
+  // not to any block. Hiding it there would make it unreachable: it goes
+  // pointer-events-none the moment it hides, so the pointer could never
+  // finish crossing the gap to click it.
+  it("stays visible while the pointer crosses the gutter toward it", () => {
+    render(<MarkdownPreview source={DOC} onJumpToLine={vi.fn()} />);
+    fireEvent.mouseOver(screen.getByText("A paragraph of prose."));
+    expect(marker()?.className).toContain("opacity-100");
+
+    fireEvent.mouseOver(screen.getByTestId("markdown-preview"));
+    expect(marker()).toHaveTextContent("3");
+    expect(marker()?.className).toContain("opacity-100");
+    expect(marker()?.className).not.toContain("pointer-events-none");
+  });
+
+  it("keeps the marker mounted but inert once the pointer leaves the pane", () => {
     render(<MarkdownPreview source={DOC} onJumpToLine={vi.fn()} />);
     fireEvent.mouseOver(screen.getByText("A paragraph of prose."));
     expect(marker()?.className).toContain("opacity-100");
     fireEvent.mouseLeave(screen.getByTestId("markdown-preview"));
     expect(marker()?.className).toContain("opacity-0");
     expect(marker()?.className).toContain("pointer-events-none");
+  });
+
+  // The preview renders the LIVE buffer: typing in the source column reflows
+  // the document under a resting pointer, so a marker measured before the edit
+  // now points somewhere else.
+  it("hides a stale marker when the buffer changes underneath it", () => {
+    const { rerender } = render(<MarkdownPreview source={DOC} onJumpToLine={vi.fn()} />);
+    fireEvent.mouseOver(screen.getByText("A paragraph of prose."));
+    expect(marker()?.className).toContain("opacity-100");
+
+    rerender(<MarkdownPreview source={`# New heading\n\n${DOC}`} onJumpToLine={vi.fn()} />);
+    expect(marker()?.className).toContain("opacity-0");
   });
 
   it("⌘-click on a block jumps to its line", () => {
@@ -140,5 +167,42 @@ describe("MarkdownPreview — jump to source", () => {
     render(<MarkdownPreview source={DOC} onJumpToLine={onJumpToLine} />);
     fireEvent.click(screen.getByTestId("markdown-preview"), { metaKey: true });
     expect(onJumpToLine).not.toHaveBeenCalled();
+  });
+
+  // A table is the one block whose rows are individually addressable, and the
+  // one whose marker position can't come from `offsetTop` (a <tr>'s
+  // offsetParent is its <table>, not the document wrapper).
+  describe("tables", () => {
+    const TABLE = ["| A | B |", "| - | - |", "| 1 | 2 |", "| 3 | 4 |"].join("\n");
+
+    it("stamps the wrapper and every body row", () => {
+      const { container } = render(<MarkdownPreview source={TABLE} />);
+      expect(container.querySelector("[data-md-line]")).toHaveAttribute("data-md-line", "1");
+      const rows = container.querySelectorAll("tbody tr");
+      expect(rows[0]).toHaveAttribute("data-md-line", "3");
+      expect(rows[1]).toHaveAttribute("data-md-line", "4");
+    });
+
+    it("⌘-click on a cell jumps to that row, not to the table", () => {
+      const onJumpToLine = vi.fn();
+      render(<MarkdownPreview source={TABLE} onJumpToLine={onJumpToLine} />);
+      fireEvent.click(screen.getByRole("cell", { name: "4" }), { metaKey: true });
+      expect(onJumpToLine).toHaveBeenCalledWith(4);
+    });
+
+    it("positions the row marker against the document, not the table", () => {
+      const { container } = render(<MarkdownPreview source={TABLE} onJumpToLine={vi.fn()} />);
+      const body = container.querySelector(".relative") as HTMLElement;
+      const row = container.querySelectorAll("tbody tr")[1] as HTMLElement;
+      // jsdom reports 0 for every layout metric, so stub the two rects the
+      // measurement actually reads. `offsetTop` stays 0 — a regression back to
+      // it would place the marker at the top of the document.
+      body.getBoundingClientRect = () => ({ top: 100 }) as DOMRect;
+      row.getBoundingClientRect = () => ({ top: 460 }) as DOMRect;
+
+      fireEvent.mouseOver(row);
+      expect(marker()).toHaveTextContent("4");
+      expect((marker() as HTMLElement).style.top).toBe("360px");
+    });
   });
 });

@@ -19,9 +19,9 @@ Reading a spec inside Octopush had three specific frictions, each with a differe
 `mdPreview: boolean` becomes `mdView: "source" | "split" | "reading"`.
 
 - **Toolbar:** an icon-only segmented control (`Code` / `Columns2` / `BookOpen`) beside the existing Diff/Editor pair, rendered only in Editor view for a markdown tab. Icon-only with `title` tooltips matches the reading-mode and whitespace controls it sits next to, and keeps the row from wrapping.
-- **Keyboard:** `⌥⌘M` cycles source → split → reading. Bound in `ReviewCanvas` rather than `App` because that is the only surface it applies to, and keyed on the physical `KeyM` because macOS turns ⌥M into "µ".
+- **Keyboard:** `⌥⌘M` cycles source → split → reading. Bound in `ReviewCanvas` rather than `App` because that is the only surface it applies to, and keyed on the physical `KeyM` because macOS turns ⌥M into "µ". `ModeOverlay` keeps its children mounted, so the canvas takes an `active` prop — without it the binding would keep firing from TALK, RUN and DIRECT. It also stands down on `defaultPrevented`/`repeat`, the house rule for anything CodeMirror can reach first.
 - **The editor never unmounts.** A hidden column collapses to zero width. CodeMirror's undo history, folds, scroll position and per-tab `EditorState` all survive every switch — an unmount would throw them away.
-- **Migration:** the persist `merge` hook maps a legacy `mdPreview` boolean once (`false` → source, `true` → split) and drops the key, so it never lingers in storage. An unknown persisted `mdView` falls back to the default rather than rendering an undefined layout.
+- **Migration:** a `version: 1` bump plus a `migrate` hook maps a legacy `mdPreview` boolean (`false` → source, `true` → split) and drops the key. It has to live in `migrate` rather than `merge`: zustand writes the store back to storage **only** after a real version migration, so a `merge`-only mapping is correct in memory while the dead key lingers on disk. `merge` keeps the defensive job — re-clamping a bad `mdPreviewSplit`, falling back on an unknown `mdView`.
 - A non-markdown tab renders editor-only regardless of the pref.
 
 ### 2 · Jump to source
@@ -32,8 +32,9 @@ Reading a spec inside Octopush had three specific frictions, each with a differe
   - **Margin marker** (discoverable) — hovering a block reveals a brass line-number button in the left gutter; clicking it jumps.
   - **⌘/Ctrl-click** (the editor idiom) — same action, anywhere in the block, including over a link, since a plain click already opens the link.
   - **Rejected: double-click** (it is how you select a word — it would spend the gesture most needed for copying) and **single click** (it fires on every click while reading and makes links unreachable).
+- The marker is positioned with `getBoundingClientRect()` against the document wrapper, not `offsetTop` — a `<tr>`'s `offsetParent` is its `<table>`. It holds position while the pointer crosses the gutter (which belongs to the pane, not to a block; dismissing there would make an inert marker impossible to click) and hides when the buffer reflows underneath it.
 - The jump reuses the existing one-shot reveal: `editorStore.revealLine` writes `pendingRevealByWs`; `EditorPane` places the caret, centre-scrolls and consumes it. `revealLine` is a no-op for a path that isn't open, and hands a **fresh object** every call so repeating the same jump re-fires the effect.
-- **From reading**, the jump opens split first and defers the reveal by the width transition (280 ms, skipped under reduced motion). Revealing mid-animation would measure CodeMirror against a zero-width viewport. The timer is cancelled by a newer jump and on unmount.
+- **From reading**, the jump opens split first and defers the reveal by the width transition (280 ms, skipped under reduced motion). Revealing mid-animation would measure CodeMirror against a zero-width viewport. The timer is cancelled by a newer jump and on unmount, and **re-checks at fire time**: `EditorPane` refuses a reveal aimed at a non-active path *without consuming it*, so a jump that lands after a tab switch would sit in the store and ambush the user when they next open that tab.
 
 ### 3 · Selectable prose
 

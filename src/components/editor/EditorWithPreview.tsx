@@ -136,6 +136,13 @@ export function EditorWithPreview({ workspaceId, workspacePath, diffText }: Prop
       }
       revealTimerRef.current = window.setTimeout(() => {
         revealTimerRef.current = null;
+        // Re-check at fire time, not at arm time. Inside the 300ms window the
+        // user can switch tabs (EditorPane would refuse the reveal without
+        // consuming it, and it would ambush them on returning to this tab) or
+        // flip back to reading (the zero-width viewport this deferral exists
+        // to avoid). Either way the jump is stale — drop it.
+        if (useEditorStore.getState().getActivePath(workspaceId) !== path) return;
+        if (useReviewPrefs.getState().mdView === "reading") return;
         revealLine(workspaceId, path, line);
       }, WIDTH_MS + 20);
     },

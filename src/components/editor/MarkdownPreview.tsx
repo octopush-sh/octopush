@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { markdownComponents } from "../../lib/markdownComponents";
@@ -55,17 +55,30 @@ export function MarkdownPreview({ source, onJumpToLine }: Props) {
   const [marker, setMarker] = useState<{ line: number; top: number } | null>(null);
   const [markerShown, setMarkerShown] = useState(false);
 
+  // A stale marker points at the wrong place: the preview renders the LIVE
+  // buffer, so typing in the source column reflows the document underneath a
+  // resting pointer. Hide it and let the next hover re-measure.
+  useEffect(() => {
+    setMarkerShown(false);
+  }, [source]);
+
   const onMouseOver = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!onJumpToLine) return;
-      // Moving the pointer onto the marker itself must not dismiss it.
-      if (e.target instanceof globalThis.Element && e.target.closest("[data-md-jump]")) return;
-      const block = blockFor(e.target, bodyRef.current);
-      if (!block) {
-        setMarkerShown(false);
-        return;
-      }
-      setMarker({ line: block.line, top: block.el.offsetTop });
+      const body = bodyRef.current;
+      if (!onJumpToLine || !body) return;
+      const block = blockFor(e.target, body);
+      // Everything that isn't a block — the marker itself, and the gutter strip
+      // the pointer must cross to reach it — leaves the marker exactly as it
+      // is. Only leaving the pane dismisses it; dismissing on the gutter would
+      // make the marker unreachable, since it turns inert the moment it hides.
+      if (!block) return;
+      // Measured against the document wrapper rather than with `offsetTop`:
+      // a <tr>/<td>'s offsetParent is its <table>, not the wrapper, so the
+      // offset would be the row's position INSIDE the table.
+      const top = block.el.getBoundingClientRect().top - body.getBoundingClientRect().top;
+      setMarker((prev) =>
+        prev && prev.line === block.line && prev.top === top ? prev : { line: block.line, top },
+      );
       setMarkerShown(true);
     },
     [onJumpToLine],
@@ -102,13 +115,16 @@ export function MarkdownPreview({ source, onJumpToLine }: Props) {
             onClick={() => onJumpToLine(marker.line)}
             title={`Jump to line ${marker.line}`}
             aria-label={`Jump to line ${marker.line}`}
-            className={`absolute -left-8 z-10 rounded-[4px] border px-1.5 py-0.5 font-mono text-[9px] leading-none tabular-nums text-octo-brass transition-opacity duration-200 focus-visible:opacity-100 focus-visible:outline focus-visible:outline-1 focus-visible:outline-octo-brass ${
+            className={`absolute -left-8 z-10 rounded-[4px] border px-1.5 py-0.5 font-mono text-[9px] leading-none tabular-nums text-octo-brass focus-visible:opacity-100 focus-visible:outline focus-visible:outline-1 focus-visible:outline-octo-brass ${
               markerShown ? "opacity-100" : "pointer-events-none opacity-0"
             }`}
             style={{
               top: marker.top,
               background: "var(--brass-ghost)",
               borderColor: "var(--brass-quiet)",
+              // The house curve and duration band (§6); the app-wide
+              // reduced-motion neutralizer in styles.css freezes it.
+              transition: "opacity 220ms cubic-bezier(0.2,0.8,0.3,1)",
             }}
           >
             {marker.line}

@@ -267,9 +267,9 @@ describe("ReviewCanvas — markdown view control", () => {
     useReviewPrefs.setState({ mdView: "split" });
   });
 
-  function renderCanvas(viewMode: "diff" | "editor") {
+  function renderCanvas(viewMode: "diff" | "editor", active = true) {
     return render(
-      <ReviewCanvas workspaceId={WS} workspacePath="/r" gitStatus={null} gitDiff="" viewMode={viewMode} onViewModeChange={() => {}}>
+      <ReviewCanvas active={active} workspaceId={WS} workspacePath="/r" gitStatus={null} gitDiff="" viewMode={viewMode} onViewModeChange={() => {}}>
         <div />
       </ReviewCanvas>,
     );
@@ -339,6 +339,28 @@ describe("ReviewCanvas — markdown view control", () => {
     seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
     renderCanvas("editor");
     fireEvent.keyDown(window, { code: "KeyM", key: "m", metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  // ModeOverlay keeps its children mounted, so a window-level shortcut bound
+  // here would otherwise keep firing from TALK, RUN and DIRECT.
+  it("⌥⌘M does nothing while REVIEW is not the mode on screen", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor", false);
+    fireEvent.keyDown(window, { code: "KeyM", key: "µ", altKey: true, metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  // CodeMirror preventDefaults without stopping propagation, so a key another
+  // surface already handled must not be handled a second time here.
+  it("ignores a ⌥⌘M that another handler already consumed", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    const e = new KeyboardEvent("keydown", {
+      code: "KeyM", key: "µ", altKey: true, metaKey: true, cancelable: true, bubbles: true,
+    });
+    e.preventDefault();
+    window.dispatchEvent(e);
     expect(useReviewPrefs.getState().mdView).toBe("split");
   });
 });

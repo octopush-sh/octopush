@@ -49,6 +49,10 @@ const MD_VIEWS: { value: MdView; Icon: LucideIcon; label: string; title: string 
 ];
 
 interface Props {
+  /** True while REVIEW is the mode on screen. `ModeOverlay` keeps its children
+   *  mounted, so window-level shortcuts bound here would otherwise keep firing
+   *  from TALK, RUN and DIRECT. Defaults to true for standalone renders. */
+  active?: boolean;
   workspaceId: string;
   workspacePath: string;
   gitStatus: GitStatus | null;
@@ -76,6 +80,7 @@ interface Props {
 // ─── ReviewCanvas ──────────────────────────────────────────────────
 
 export function ReviewCanvas({
+  active = true,
   workspaceId,
   workspacePath,
   gitStatus,
@@ -112,12 +117,17 @@ export function ReviewCanvas({
     : null;
   const showMdViewControl = viewMode === "editor" && isMarkdownFile(activeEditorFile);
 
-  // ⌥⌘M cycles source → split → reading, and only while the control is on
-  // screen. Bound here rather than in App.tsx because ReviewCanvas is the only
-  // surface it applies to. macOS turns ⌥M into "µ", so the physical key wins.
+  // ⌥⌘M cycles source → split → reading, and only while the control it drives
+  // is actually on screen — REVIEW is the visible mode AND the active tab is a
+  // markdown file in editor view. Bound here rather than in App.tsx because
+  // ReviewCanvas is the only surface it applies to. macOS turns ⌥M into "µ",
+  // so the physical key wins over `e.key`.
   useEffect(() => {
-    if (!showMdViewControl) return;
+    if (!active || !showMdViewControl) return;
     const onKey = (e: KeyboardEvent) => {
+      // House rule (see App.tsx): CodeMirror preventDefaults without stopping
+      // propagation, so an already-handled key must not be handled twice.
+      if (e.defaultPrevented || e.repeat) return;
       if (!e.altKey || !(e.metaKey || e.ctrlKey)) return;
       if (e.code !== "KeyM" && e.key.toLowerCase() !== "m") return;
       e.preventDefault();
@@ -125,7 +135,7 @@ export function ReviewCanvas({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showMdViewControl, cycleMdView]);
+  }, [active, showMdViewControl, cycleMdView]);
 
   // Reject-undo inline bar (error=true when applyHunk couldn't restore the change)
   const [undo, setUndo] = useState<{ rawText: string; error?: boolean } | null>(null);
@@ -299,7 +309,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("diff")}
               aria-label="Diff view"
-              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "diff" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "diff" ? { background: "var(--brass-ghost)" } : undefined}
@@ -310,7 +320,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("editor")}
               aria-label="Editor view"
-              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "editor" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "editor" ? { background: "var(--brass-ghost)" } : undefined}
@@ -335,7 +345,7 @@ export function ReviewCanvas({
                   aria-label={label}
                   aria-pressed={mdView === value}
                   title={title}
-                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     i > 0 ? "border-l border-octo-hairline" : ""
                   } ${mdView === value ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
                   style={mdView === value ? { background: "var(--brass-ghost)" } : undefined}
@@ -355,7 +365,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("inline")}
                   aria-label="Inline"
                   title="Inline diff"
-                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "inline" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "inline" ? { background: "var(--brass-ghost)" } : undefined}
@@ -366,7 +376,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("sbs")}
                   aria-label="Side by side"
                   title="Side-by-side diff"
-                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "sbs" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "sbs" ? { background: "var(--brass-ghost)" } : undefined}

@@ -175,8 +175,8 @@ For any surface where a *derived* view needs to point at the *authored* thing be
 
 Four rules:
 
-1. **Reserve the gutter on the scroller, not the block.** The pane pads `pl-11`; the marker sits at `-left-8`. A negative offset inside an `overflow-x` box (a `<pre>`, a table wrapper) gets clipped — so the jump attribute goes on a plain wrapper, never on the scrolling element itself.
-2. **One marker, kept mounted.** It fades rather than unmounting, so it never appears or disappears abruptly (§6), and hovering across blocks moves one element instead of mounting dozens.
+1. **Reserve the gutter on the scroller, not the block.** The pane pads `pl-11`; the marker sits at `-left-8`. A negative offset inside an `overflow-x` box (a `<pre>`, a table wrapper) gets clipped — so the jump attribute goes on a plain wrapper, never on the scrolling element itself. Measure with `getBoundingClientRect()` against the wrapper, **not `offsetTop`**: a `<tr>`/`<td>`'s `offsetParent` is its `<table>`, so `offsetTop` would be the row's position inside the table.
+2. **One marker, kept mounted — and reachable.** It fades rather than unmounting, so it never appears or disappears abruptly (§6), and hovering across blocks moves one element instead of mounting dozens. **The gutter it sits in belongs to the pane, not to any block**, so the pointer must cross non-block space to reach it: dismiss only on the pane's `mouseleave`, never on "the pointer isn't over a block". A hidden marker is inert, so dismissing early makes it impossible to click. Hide it too when the underlying content changes — a marker measured before a reflow points at the wrong place.
 3. **The quiet path is a modifier, the discoverable path is the marker.** The marker teaches the gesture on hover; `⌘`/`Ctrl`-click is the same action for someone who already knows. Never spend an unmodified click or a double-click on navigation inside selectable prose — those belong to selection and links.
 4. **Numerals, not glyphs.** The marker is the line number in brass mono. No arrow, no connector — both are retired (§5).
 

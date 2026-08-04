@@ -87,10 +87,11 @@ describe("clampSplit", () => {
 });
 
 describe("reviewPrefsStore — rehydrate", () => {
-  async function rehydrateWith(state: Record<string, unknown>) {
-    localStorage.setItem("octo-review-prefs", JSON.stringify({ state, version: 0 }));
+  async function rehydrateWith(state: Record<string, unknown>, version = 0) {
+    localStorage.setItem("octo-review-prefs", JSON.stringify({ state, version }));
     await useReviewPrefs.persist.rehydrate();
   }
+  const stored = () => JSON.parse(localStorage.getItem("octo-review-prefs")!);
 
   beforeEach(() => {
     localStorage.clear();
@@ -98,22 +99,31 @@ describe("reviewPrefsStore — rehydrate", () => {
   });
 
   it("re-clamps an out-of-range persisted mdPreviewSplit on load", async () => {
-    await rehydrateWith({ mdPreviewSplit: 999 });
+    await rehydrateWith({ mdPreviewSplit: 999 }, 1);
     expect(useReviewPrefs.getState().mdPreviewSplit).toBe(75);
   });
 
   it("keeps a valid persisted mdView", async () => {
-    await rehydrateWith({ mdView: "reading" });
+    await rehydrateWith({ mdView: "reading" }, 1);
     expect(useReviewPrefs.getState().mdView).toBe("reading");
   });
 
-  it("falls back to the default when the persisted mdView is unknown", async () => {
-    await rehydrateWith({ mdView: "sideways" });
+  // Seeded to "reading" so this can't pass by accident: an unknown value must
+  // leave the live pref alone, not silently become the store's own default.
+  it("keeps the current view when a v1 payload carries an unknown mdView", async () => {
+    useReviewPrefs.setState({ mdView: "reading" });
+    await rehydrateWith({ mdView: "sideways" }, 1);
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+  });
+
+  it("normalises an unknown mdView to the default while migrating v0", async () => {
+    useReviewPrefs.setState({ mdView: "reading" });
+    await rehydrateWith({ mdView: "sideways" }, 0);
     expect(useReviewPrefs.getState().mdView).toBe("split");
   });
 
   // Migration from the pre-three-state pref: preview-off was "editor only",
-  // preview-on was the fixed split. The legacy key must not survive the merge.
+  // preview-on was the fixed split.
   it("maps a legacy mdPreview:false onto the source view", async () => {
     await rehydrateWith({ mdPreview: false });
     expect(useReviewPrefs.getState().mdView).toBe("source");
@@ -130,5 +140,16 @@ describe("reviewPrefsStore — rehydrate", () => {
   it("prefers an explicit mdView over a stale legacy mdPreview", async () => {
     await rehydrateWith({ mdView: "reading", mdPreview: false });
     expect(useReviewPrefs.getState().mdView).toBe("reading");
+  });
+
+  // In-memory correctness isn't enough: zustand only writes the store back
+  // after a REAL version migration, so the dead key has to be dropped there
+  // rather than in `merge` — otherwise it lingers in localStorage.
+  it("rewrites storage without the legacy key", async () => {
+    await rehydrateWith({ mdPreview: true, readingMode: "sbs" });
+    expect(stored().version).toBe(1);
+    expect(stored().state.mdPreview).toBeUndefined();
+    expect(stored().state.mdView).toBe("split");
+    expect(stored().state.readingMode).toBe("sbs");
   });
 });

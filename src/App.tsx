@@ -2014,6 +2014,10 @@ function App() {
                     {/* Centre: ReviewCanvas with Diff/Editor toggle */}
                     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                       <ReviewCanvas
+                        // ModeOverlay keeps its children mounted, so the canvas
+                        // has to be told when it is the mode on screen — its
+                        // window-level shortcuts must not fire from TALK/RUN.
+                        active={activeMode === "review"}
                         workspaceId={activeWorkspaceId!}
                         workspacePath={activeWorkspace.worktreePath || project.path}
                         gitStatus={gitStatus}
