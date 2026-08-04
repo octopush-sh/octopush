@@ -18,14 +18,17 @@ import {
   FlaskConical,
   Sparkles,
   X,
-  Eye,
+  Code,
+  BookOpen,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
 import { parseFullDiff } from "../lib/diffParser";
 import { revealDiffTarget } from "../lib/diffJump";
 import type { ChatMessage, FileEdit, GitStatus, TestRunResult } from "../lib/types";
 import { useReviewPrefs } from "../stores/reviewPrefsStore";
+import type { MdView } from "../stores/reviewPrefsStore";
 import { useEditorStore } from "../stores/editorStore";
 import { useAiReview } from "../stores/aiReviewStore";
 import { isMarkdownFile } from "../lib/isMarkdownFile";
@@ -37,7 +40,19 @@ import { TestDrawer } from "./review/TestDrawer";
 
 export type ReviewViewMode = "diff" | "editor";
 
+/** The three Markdown layouts, in the order the toolbar shows them and ⌥⌘M
+ *  cycles them. Icon-only with tooltips, like the reading-mode pair beside it. */
+const MD_VIEWS: { value: MdView; Icon: LucideIcon; label: string; title: string }[] = [
+  { value: "source", Icon: Code, label: "Markdown source only", title: "Source only · ⌥⌘M cycles" },
+  { value: "split", Icon: Columns2, label: "Markdown split view", title: "Source and rendered document · ⌥⌘M cycles" },
+  { value: "reading", Icon: BookOpen, label: "Markdown reading view", title: "Rendered document only · ⌥⌘M cycles" },
+];
+
 interface Props {
+  /** True while REVIEW is the mode on screen. `ModeOverlay` keeps its children
+   *  mounted, so window-level shortcuts bound here would otherwise keep firing
+   *  from TALK, RUN and DIRECT. Defaults to true for standalone renders. */
+  active?: boolean;
   workspaceId: string;
   workspacePath: string;
   gitStatus: GitStatus | null;
@@ -65,6 +80,7 @@ interface Props {
 // ─── ReviewCanvas ──────────────────────────────────────────────────
 
 export function ReviewCanvas({
+  active = true,
   workspaceId,
   workspacePath,
   gitStatus,
@@ -91,14 +107,35 @@ export function ReviewCanvas({
   const ignoreWhitespace = useReviewPrefs((s) => s.ignoreWhitespace);
   const setReadingMode = useReviewPrefs((s) => s.setReadingMode);
   const setIgnoreWhitespace = useReviewPrefs((s) => s.setIgnoreWhitespace);
-  const mdPreview = useReviewPrefs((s) => s.mdPreview);
-  const toggleMdPreview = useReviewPrefs((s) => s.toggleMdPreview);
+  const mdView = useReviewPrefs((s) => s.mdView);
+  const setMdView = useReviewPrefs((s) => s.setMdView);
+  const cycleMdView = useReviewPrefs((s) => s.cycleMdView);
   const activePath = useEditorStore((s) => s.getActivePath(workspaceId));
   const editorFiles = useEditorStore((s) => s.getFiles(workspaceId));
   const activeEditorFile = activePath
     ? editorFiles.find((f) => f.path === activePath) ?? null
     : null;
-  const showPreviewToggle = viewMode === "editor" && isMarkdownFile(activeEditorFile);
+  const showMdViewControl = viewMode === "editor" && isMarkdownFile(activeEditorFile);
+
+  // ⌥⌘M cycles source → split → reading, and only while the control it drives
+  // is actually on screen — REVIEW is the visible mode AND the active tab is a
+  // markdown file in editor view. Bound here rather than in App.tsx because
+  // ReviewCanvas is the only surface it applies to. macOS turns ⌥M into "µ",
+  // so the physical key wins over `e.key`.
+  useEffect(() => {
+    if (!active || !showMdViewControl) return;
+    const onKey = (e: KeyboardEvent) => {
+      // House rule (see App.tsx): CodeMirror preventDefaults without stopping
+      // propagation, so an already-handled key must not be handled twice.
+      if (e.defaultPrevented || e.repeat) return;
+      if (!e.altKey || !(e.metaKey || e.ctrlKey)) return;
+      if (e.code !== "KeyM" && e.key.toLowerCase() !== "m") return;
+      e.preventDefault();
+      cycleMdView();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active, showMdViewControl, cycleMdView]);
 
   // Reject-undo inline bar (error=true when applyHunk couldn't restore the change)
   const [undo, setUndo] = useState<{ rawText: string; error?: boolean } | null>(null);
@@ -150,15 +187,17 @@ export function ReviewCanvas({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // Escape peels back one surface at a time, topmost first. The Why?
-      // drawer owns Escape while open, so leave it alone here.
-      if (e.key !== "Escape" || whyFile) return;
+      // drawer owns Escape while open, so leave it alone here. `active` gates
+      // it for the same reason as ⌥⌘M — this canvas stays mounted under
+      // ModeOverlay, and Escape from TALK must not reach invisible drawers.
+      if (!active || e.key !== "Escape" || whyFile) return;
       if (testsOpen) { setTestsOpen(false); return; }
       if (aiOpen) { setAiOpen(false); return; }
       setTestResult(null);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [whyFile, testsOpen, aiOpen]);
+  }, [active, whyFile, testsOpen, aiOpen]);
 
   // Auto-clear the reject-undo bar after 6s — but keep the error message
   // visible until the user dismisses it (don't let a failed undo vanish).
@@ -272,7 +311,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("diff")}
               aria-label="Diff view"
-              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "diff" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "diff" ? { background: "var(--brass-ghost)" } : undefined}
@@ -283,7 +322,7 @@ export function ReviewCanvas({
             <button
               onClick={() => setViewMode("editor")}
               aria-label="Editor view"
-              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              className={`flex items-center gap-1 whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                 viewMode === "editor" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={viewMode === "editor" ? { background: "var(--brass-ghost)" } : undefined}
@@ -293,20 +332,30 @@ export function ReviewCanvas({
             </button>
           </div>
 
-          {/* Rendered Markdown preview toggle — editor view, .md files only */}
-          {showPreviewToggle && (
-            <button
-              onClick={toggleMdPreview}
-              aria-label="Toggle rendered preview"
-              aria-pressed={mdPreview}
-              title="Toggle rendered preview"
-              className={`flex shrink-0 items-center justify-center rounded-md border border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
-                mdPreview ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
-              }`}
-              style={mdPreview ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" } : undefined}
+          {/* Markdown layout — editor view, .md files only */}
+          {showMdViewControl && (
+            <div
+              role="group"
+              aria-label="Markdown view"
+              className="flex shrink-0 items-center overflow-hidden rounded-md border"
+              style={{ borderColor: "var(--brass-dim)" }}
             >
-              <Eye size={13} />
-            </button>
+              {MD_VIEWS.map(({ value, Icon, label, title }, i) => (
+                <button
+                  key={value}
+                  onClick={() => setMdView(value)}
+                  aria-label={label}
+                  aria-pressed={mdView === value}
+                  title={title}
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                    i > 0 ? "border-l border-octo-hairline" : ""
+                  } ${mdView === value ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
+                  style={mdView === value ? { background: "var(--brass-ghost)" } : undefined}
+                >
+                  <Icon size={13} />
+                </button>
+              ))}
+            </div>
           )}
 
           {/* Reading mode + whitespace — only meaningful in Diff view.
@@ -318,7 +367,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("inline")}
                   aria-label="Inline"
                   title="Inline diff"
-                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  className={`flex items-center justify-center px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "inline" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "inline" ? { background: "var(--brass-ghost)" } : undefined}
@@ -329,7 +378,7 @@ export function ReviewCanvas({
                   onClick={() => setReadingMode("sbs")}
                   aria-label="Side by side"
                   title="Side-by-side diff"
-                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  className={`flex items-center justify-center border-l border-octo-hairline px-2 py-1 transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                     readingMode === "sbs" ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                   }`}
                   style={readingMode === "sbs" ? { background: "var(--brass-ghost)" } : undefined}
@@ -446,6 +495,7 @@ export function ReviewCanvas({
         {/* Diff view */}
         {viewMode === "diff" && (
           <DiffView
+            active={active}
             files={diffFiles}
             workspacePath={workspacePath}
             stagedCount={

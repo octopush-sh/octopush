@@ -254,9 +254,9 @@ describe("ReviewCanvas misc", () => {
   });
 });
 
-// ─── Markdown preview toggle ────────────────────────────────────────
+// ─── Markdown view control ──────────────────────────────────────────
 
-describe("ReviewCanvas — markdown preview toggle", () => {
+describe("ReviewCanvas — markdown view control", () => {
   const WS = "wsR";
   function seed(file: Pick<OpenFile, "path" | "lang" | "kind">) {
     const f = { content: "# D", savedContent: "# D", mtime: 0, size: 1, version: 0, diskStale: false, ...file } as OpenFile;
@@ -264,39 +264,103 @@ describe("ReviewCanvas — markdown preview toggle", () => {
   }
   beforeEach(() => {
     useEditorStore.setState({ filesByWs: {}, activeByWs: {} });
-    useReviewPrefs.setState({ mdPreview: true });
+    useReviewPrefs.setState({ mdView: "split" });
   });
 
-  function renderCanvas(viewMode: "diff" | "editor") {
+  function renderCanvas(viewMode: "diff" | "editor", active = true) {
     return render(
-      <ReviewCanvas workspaceId={WS} workspacePath="/r" gitStatus={null} gitDiff="" viewMode={viewMode} onViewModeChange={() => {}}>
+      <ReviewCanvas active={active} workspaceId={WS} workspacePath="/r" gitStatus={null} gitDiff="" viewMode={viewMode} onViewModeChange={() => {}}>
         <div />
       </ReviewCanvas>,
     );
   }
 
-  it("shows the Eye toggle in editor mode for a markdown file", () => {
+  const splitBtn = () => screen.queryByRole("button", { name: /markdown split view/i });
+
+  it("shows all three layouts in editor mode for a markdown file", () => {
     seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
     renderCanvas("editor");
-    expect(screen.getByRole("button", { name: /toggle rendered preview/i })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /markdown view/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /markdown source only/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /markdown split view/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /markdown reading view/i })).toBeInTheDocument();
   });
 
-  it("hides the toggle in diff mode", () => {
+  it("marks the active layout with aria-pressed", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    useReviewPrefs.setState({ mdView: "reading" });
+    renderCanvas("editor");
+    expect(splitBtn()).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /markdown reading view/i })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("hides the control in diff mode", () => {
     seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
     renderCanvas("diff");
-    expect(screen.queryByRole("button", { name: /toggle rendered preview/i })).toBeNull();
+    expect(splitBtn()).toBeNull();
   });
 
-  it("hides the toggle for a non-markdown file", () => {
+  it("hides the control for a non-markdown file", () => {
     seed({ path: "/r/App.tsx", lang: "javascript", kind: "text" });
     renderCanvas("editor");
-    expect(screen.queryByRole("button", { name: /toggle rendered preview/i })).toBeNull();
+    expect(splitBtn()).toBeNull();
   });
 
-  it("clicking the toggle flips the mdPreview pref", () => {
+  it("clicking a layout writes it to the pref", () => {
     seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
     renderCanvas("editor");
-    fireEvent.click(screen.getByRole("button", { name: /toggle rendered preview/i }));
-    expect(useReviewPrefs.getState().mdPreview).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: /markdown reading view/i }));
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+    fireEvent.click(screen.getByRole("button", { name: /markdown source only/i }));
+    expect(useReviewPrefs.getState().mdView).toBe("source");
+  });
+
+  // macOS turns ⌥M into "µ", so the handler keys off the physical code.
+  it("⌥⌘M cycles the layout while the control is on screen", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    fireEvent.keyDown(window, { code: "KeyM", key: "µ", altKey: true, metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("reading");
+    fireEvent.keyDown(window, { code: "KeyM", key: "µ", altKey: true, metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("source");
+  });
+
+  it("⌥⌘M does nothing when the control is hidden", () => {
+    seed({ path: "/r/App.tsx", lang: "javascript", kind: "text" });
+    renderCanvas("editor");
+    fireEvent.keyDown(window, { code: "KeyM", key: "m", altKey: true, metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  it("ignores ⌘M without the Alt modifier", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    fireEvent.keyDown(window, { code: "KeyM", key: "m", metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  // ModeOverlay keeps its children mounted, so a window-level shortcut bound
+  // here would otherwise keep firing from TALK, RUN and DIRECT.
+  it("⌥⌘M does nothing while REVIEW is not the mode on screen", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor", false);
+    fireEvent.keyDown(window, { code: "KeyM", key: "µ", altKey: true, metaKey: true });
+    expect(useReviewPrefs.getState().mdView).toBe("split");
+  });
+
+  // CodeMirror preventDefaults without stopping propagation, so a key another
+  // surface already handled must not be handled a second time here.
+  it("ignores a ⌥⌘M that another handler already consumed", () => {
+    seed({ path: "/r/README.md", lang: "markdown", kind: "text" });
+    renderCanvas("editor");
+    const e = new KeyboardEvent("keydown", {
+      code: "KeyM", key: "µ", altKey: true, metaKey: true, cancelable: true, bubbles: true,
+    });
+    e.preventDefault();
+    window.dispatchEvent(e);
+    expect(useReviewPrefs.getState().mdView).toBe("split");
   });
 });

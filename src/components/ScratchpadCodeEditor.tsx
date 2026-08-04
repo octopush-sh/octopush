@@ -229,7 +229,7 @@ export function ScratchpadCodeEditor() {
 
   return (
     // `relative` anchors the find overlay, which positions itself top-right.
-    <div className="chat-selectable relative flex min-h-0 flex-1 flex-col overflow-hidden bg-octo-onyx">
+    <div className="octo-selectable relative flex min-h-0 flex-1 flex-col overflow-hidden bg-octo-onyx">
       <div
         ref={hostRef}
         data-testid="scratchpad-host"

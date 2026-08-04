@@ -71,6 +71,10 @@ interface EditorStore {
     confirm?: OpenConfirm,
     line?: number,
   ) => Promise<void>;
+  /** Request a one-shot cursor reveal at `line` in a file that is ALREADY open
+   *  — the rendered-Markdown jump uses it. A no-op when the path isn't open,
+   *  so a stale request can never point the editor at a closed buffer. */
+  revealLine: (workspaceId: string, path: string, line: number) => void;
   clearPendingReveal: (workspaceId: string) => void;
   closeFile: (workspaceId: string, path: string) => void;
   setActive: (workspaceId: string, path: string) => void;
@@ -211,6 +215,16 @@ export const useEditorStore = create<EditorStore>((set, get) => {
           : {}),
       };
     });
+  },
+
+  revealLine: (workspaceId, path, line) => {
+    if (!findFile(workspaceId, path)) return;
+    // A fresh object on every call, so repeating the same jump still re-fires
+    // EditorPane's reveal effect (it keys on the reveal's identity).
+    const reveal: PendingReveal = { path, line: Math.max(1, Math.round(line)) };
+    set((s) => ({
+      pendingRevealByWs: { ...s.pendingRevealByWs, [workspaceId]: reveal },
+    }));
   },
 
   clearPendingReveal: (workspaceId) =>
