@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { PanelRightClose, PanelRightOpen, SquareTerminal, MessagesSquare, GitCompare, Workflow } from "lucide-react";
-import { MODES, MODE_LABELS, type WorkspaceMode } from "../lib/modes";
+import { PanelRightClose, PanelRightOpen } from "lucide-react";
+import { type WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
 import { SavingsLedger } from "./chat/SavingsLedger";
@@ -12,10 +12,8 @@ import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
-import { ModeSwitcher } from "./ModeSwitcher";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useIssuesStore } from "../stores/issuesStore";
-import { useAttentionStore } from "../stores/attentionStore";
 import { selectElsewhereCount } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 
@@ -53,14 +51,14 @@ interface Props {
   project: ProjectInfo | null;
   issueTrackerConfigured: boolean;
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
-  onModeChange: (next: WorkspaceMode) => void;
   /** Review-mode context for the companion cockpit (scope, provenance, sync). */
   reviewProps?: { gitStatus: GitStatus | null; gitDiff: string; workspacePath: string } | null;
   /** Jump to a file in the diff from the companion (e.g. a provenance chip). */
   onJumpToFile?: (file: string, line: number | null) => void;
   /** Collapsed state is owned by the parent (App), mirroring the rail. When
-   *  collapsed the companion shrinks to a slim strip that still carries the
-   *  mode switcher, so the user trades panel content for canvas room. */
+   *  collapsed the companion shrinks to a slim strip carrying only the expand
+   *  control — the modes live in the band above the canvas, which stays put
+   *  either way, so the strip has nothing else to hold. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Opens the Logbook Room (⌘⇧L) from the Companion Logbook card. */
@@ -69,14 +67,6 @@ interface Props {
    *  project IS the Sketchbook, so the CTA is hidden everywhere else. */
   onMakeProject?: () => void;
 }
-
-/** Icons for the collapsed-strip mode switcher (the expanded switcher is text). */
-const MODE_ICONS: Record<WorkspaceMode, typeof SquareTerminal> = {
-  run: SquareTerminal,
-  talk: MessagesSquare,
-  review: GitCompare,
-  direct: Workflow,
-};
 
 export function Companion({
   mode,
@@ -87,7 +77,6 @@ export function Companion({
   project,
   issueTrackerConfigured,
   onBacklogTicketContextMenu,
-  onModeChange,
   reviewProps,
   onJumpToFile,
   collapsed,
@@ -97,13 +86,6 @@ export function Companion({
 }: Props) {
   const issues = useIssuesStore((s) => s.issues);
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
-
-  // In-workspace attention: pulse the Run/Talk icon when a chat/terminal in
-  // this workspace needs the eye and the user is in a different mode — the same
-  // signal the expanded ModeSwitcher gives, preserved while collapsed.
-  const attentionFlag = useAttentionStore((s) => (workspaceId ? s.flagsByWs[workspaceId] : undefined));
-  const flagMode: WorkspaceMode | null =
-    attentionFlag?.kind === "chat" ? "talk" : attentionFlag?.kind === "terminal" ? "run" : null;
 
   // The elsewhere list is scoped to the current project — never let an
   // open modal survive a project switch and show stale context.
@@ -143,38 +125,6 @@ export function Companion({
         >
           <PanelRightOpen size={16} />
         </button>
-        <div className="mt-1 h-px w-5 bg-octo-hairline" aria-hidden />
-        <div className="mt-1 flex flex-col items-center gap-1.5">
-          {MODES.map((m) => {
-            const Icon = MODE_ICONS[m];
-            const active = m === mode;
-            const pulse = flagMode === m && !active;
-            return (
-              <button
-                key={m}
-                type="button"
-                onClick={() => onModeChange(m)}
-                aria-pressed={active}
-                aria-label={pulse ? `${MODE_LABELS[m]} — needs your attention` : MODE_LABELS[m]}
-                title={pulse ? `${MODE_LABELS[m]} needs your attention` : MODE_LABELS[m]}
-                className={`flex h-7 w-7 items-center justify-center rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
-                  active
-                    ? "text-octo-brass"
-                    : pulse
-                      ? "animate-attention-pulse !text-octo-brass border-transparent"
-                      : "border-transparent text-octo-mute hover:text-octo-sage"
-                }`}
-                style={
-                  active
-                    ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
-                    : undefined
-                }
-              >
-                <Icon size={15} />
-              </button>
-            );
-          })}
-        </div>
       </aside>
     );
   }
@@ -185,17 +135,12 @@ export function Companion({
       className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
-      {/* The collapse button is in-flow (reserves its space) so the centered
-          ModeSwitcher can never slide under it; its wrapper is min-w-0 and
-          scrolls if the companion is narrowed past the switcher's width. */}
-      <div className="flex items-center gap-1 border-b border-octo-hairline px-2 py-2">
-        <div className="flex min-w-0 flex-1 justify-center overflow-x-auto [scrollbar-width:thin]">
-          <ModeSwitcher
-            mode={mode}
-            onChange={onModeChange}
-            workspaceId={workspaceId ?? undefined}
-          />
-        </div>
+      {/* Header: the panel's name and its collapse control. The mode switcher
+          used to live here; it now has a band of its own above the canvas. */}
+      <div className="flex items-center gap-1 border-b border-octo-hairline px-3 py-2">
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
+          Companion
+        </span>
         <button
           type="button"
           onClick={onToggleCollapsed}

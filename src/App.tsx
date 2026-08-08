@@ -7,6 +7,7 @@ import { AppTopBar } from "./components/AppTopBar";
 import { useScratchpadStore } from "./stores/scratchpadStore";
 import { usePerfStore } from "./stores/perfStore";
 import { ContextHeader } from "./components/ContextHeader";
+import { ModeBand } from "./components/ModeBand";
 import { Companion } from "./components/Companion";
 import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
 import { MissionCreator } from "./components/MissionCreator";
@@ -74,6 +75,7 @@ import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
+import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
 import { ipc } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
@@ -1164,6 +1166,35 @@ function App() {
     setMode,
   ]);
 
+  // ── Mode band status tail ────────────────────────────────
+  // One glanceable line per mode, telling the user what the room they are
+  // looking at currently holds. All of it is state App already keeps, so the
+  // band costs no extra IPC. The diff stat is only non-zero in review mode —
+  // that is the only mode this component fetches `gitDiff` for — which is
+  // also the only mode whose tail reads it.
+  const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
+  const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
+  const modeMeta = useMemo(
+    () =>
+      modeMetaLabel(activeMode, {
+        terminalCount: terminals.length,
+        tokensUsed: lastTurnInputTokens,
+        tokensLimit: activeModelMaxContext,
+        changedCount: gitStatus?.changedFiles.length ?? 0,
+        diffStat: workingDiffStat,
+        runState: runTailState(activeRuns),
+      }),
+    [
+      activeMode,
+      terminals.length,
+      lastTurnInputTokens,
+      activeModelMaxContext,
+      gitStatus,
+      workingDiffStat,
+      activeRuns,
+    ],
+  );
+
   // Re-derive titles whenever new messages arrive — title comes from the
   // first user message, meta comes from the relative time of the latest.
   // Select ONLY the active workspace's slice: subscribing to the whole
@@ -1916,6 +1947,19 @@ function App() {
             unmounting every running PTY whenever the user crossed that
             boundary. */}
         <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
+          {/* MODE BAND — the switcher's own line, spanning the canvas column
+              only (the modes govern the canvas, not the Companion). Gated on
+              an active workspace like the ContextHeader is: with no workspace
+              the empty-project layer below covers this column anyway, and a
+              live control must never sit under it. */}
+          {activeWorkspace && (
+            <ModeBand
+              mode={activeMode}
+              onChange={setMode}
+              workspaceId={activeWorkspaceId ?? undefined}
+              meta={modeMeta}
+            />
+          )}
           <CanvasSplit>
             <div className="relative w-full h-full min-w-0 flex-1 overflow-hidden">
               {/* Talk panel — chat for the active workspace. */}
@@ -2161,7 +2205,6 @@ function App() {
             project={activeProject ?? null}
             issueTrackerConfigured={issueTrackerConfigured}
             onBacklogTicketContextMenu={handleBacklogTicketContextMenu}
-            onModeChange={setMode}
             reviewProps={
               activeWorkspace
                 ? {
