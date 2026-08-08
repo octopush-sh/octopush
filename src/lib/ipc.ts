@@ -544,7 +544,9 @@ export const ipc = {
     invoke<string>("export_session_csv", { sessionId }),
 
   // ─── Theme ────────────────────────────────────────────────────
-  getTheme: () => invoke<ThemeConfig>("get_theme"),
+  /** `null` when the user has never chosen a theme — themeStore then seeds
+   *  from `prefers-color-scheme` and keeps following the OS. */
+  getTheme: () => invoke<ThemeConfig | null>("get_theme"),
   setTheme: (theme: ThemeConfig) => invoke<void>("set_theme", { theme }),
   listThemes: () => invoke<ThemeConfig[]>("list_themes"),
 

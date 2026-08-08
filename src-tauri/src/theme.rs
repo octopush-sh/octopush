@@ -23,6 +23,19 @@ pub struct ThemeConfig {
     #[serde(default = "default_panel_2")]
     pub panel_2: String,
     pub border: String,
+    /// Boundary colour for **interactive** chrome — input outlines, button
+    /// edges, the focus ring. WCAG 1.4.11 asks 3:1 of any control boundary,
+    /// which `border` deliberately does not meet: `border` is the decorative
+    /// hairline that separates panels, and pushing it to 3:1 would draw a hard
+    /// line around every surface in the app.
+    ///
+    /// Defaulted for serde so a `~/.octopush/theme.json` written before this
+    /// field existed still loads. The fallback is atelier's value, which is
+    /// wrong for a hand-written light theme — but a stale config keeping a
+    /// slightly-off control border is a far better failure than refusing to
+    /// start.
+    #[serde(default = "default_border_strong")]
+    pub border_strong: String,
     pub accent: String,
     pub accent_dim: String,
     pub success: String,
@@ -39,6 +52,10 @@ fn default_panel_2() -> String {
     "#1a160f".into()
 }
 
+fn default_border_strong() -> String {
+    "#786747".into()
+}
+
 pub fn builtin_themes() -> Vec<ThemeConfig> {
     vec![
         // ─── Brand default ───────────────────────────────────────────
@@ -48,6 +65,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#14110d".into(),
             panel_2: "#1a160f".into(),
             border: "#2a2419".into(),
+            border_strong: "#786747".into(),
             accent: "#d4a574".into(),
             accent_dim: "#e8c39a".into(),
             success: "#8fc9a8".into(),
@@ -66,21 +84,48 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
         // Vellum: the brand in daylight. Cream parchment, chestnut ink,
         // gilded edges. The only light theme — meant for users who want
         // Octopush at a sunlit workbench.
+        //
+        // Every ink here is SOLVED, not eyeballed, and the arithmetic is
+        // enforced by `vellum_clears_wcag_aa_on_every_surface` below. Three
+        // decisions distinguish it from a naive inversion of atelier:
+        //
+        //  1. Ratios are checked against the WORST of the three surfaces —
+        //     `panel_2`, the hover/popover ground — because a token that
+        //     passes on the canvas and fails on hover has still failed.
+        //  2. Inks darken along their own hue while GAINING saturation. On
+        //     onyx an accent earns contrast by lightening, which desaturates
+        //     it; on cream the move reverses, and darkening alone would leave
+        //     the palette muddy.
+        //  3. `accent_dim` inverts its meaning. On onyx it is the *brighter*
+        //     sibling used for emphasis; on cream emphasis runs the other way,
+        //     so vellum's is a deeper chestnut (7.54:1) for hover/pressed.
+        //
+        // The ground is off-white and the ink off-black on purpose: pure
+        // #000-on-#fff is 21:1, which halates for astigmatic readers and
+        // fatigues everyone across a full-screen IDE. This pairing lands at
+        // 13.5:1 — well past AA, well short of glare.
         ThemeConfig {
             name: "vellum".into(),
-            bg: "#f0e7d2".into(),
-            panel: "#f8efd9".into(),
-            panel_2: "#e5dabf".into(),
-            border: "#c4b390".into(),
-            accent: "#8b5a3c".into(),
-            accent_dim: "#b07952".into(),
-            success: "#3d7a59".into(),
-            warning: "#b8801d".into(),
-            danger: "#a8392f".into(),
+            bg: "#f2ece0".into(),
+            panel: "#faf6ec".into(),
+            // Light-mode elevation inverts: there is no headroom above `panel`
+            // before it becomes paper-white, so the "raised" surface RECESSES
+            // instead, and lift is carried by border + shadow.
+            panel_2: "#ece4d4".into(),
+            border: "#ddd2bb".into(),
+            border_strong: "#8a7a5f".into(),
+            accent: "#91522c".into(),
+            accent_dim: "#6d3710".into(),
+            success: "#246f47".into(),
+            // Amber is the token that fails light mode most reliably — the
+            // shipped #b8801d sat at 2.46:1. Bronze keeps the caution read
+            // while clearing AA as body text.
+            warning: "#7f5300".into(),
+            danger: "#b33024".into(),
             text: "#2a201a".into(),
-            text_dim: "#6b5e4d".into(),
-            text_muted: "#9b8b72".into(),
-            terminal_bg: "#f0e7d2".into(),
+            text_dim: "#6d5e4b".into(),
+            text_muted: "#6f5f4a".into(),
+            terminal_bg: "#f2ece0".into(),
         },
 
         // Mossbank: deep evergreen and warm amber. Forest atelier.
@@ -90,6 +135,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#121b14".into(),
             panel_2: "#1a261c".into(),
             border: "#233028".into(),
+            border_strong: "#597a66".into(),
             accent: "#c89669".into(),
             accent_dim: "#dbac82".into(),
             success: "#8fc9a8".into(),
@@ -109,6 +155,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#121830".into(),
             panel_2: "#1a223d".into(),
             border: "#2a3252".into(),
+            border_strong: "#606fad".into(),
             accent: "#d4a5b8".into(),
             accent_dim: "#e6c3d2".into(),
             success: "#8fc8b4".into(),
@@ -127,6 +174,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#1a0e0a".into(),
             panel_2: "#251510".into(),
             border: "#2d1d15".into(),
+            border_strong: "#915e44".into(),
             accent: "#d4805c".into(),
             accent_dim: "#e09975".into(),
             success: "#9bc89d".into(),
@@ -145,6 +193,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#101013".into(),
             panel_2: "#16161c".into(),
             border: "#1f1f25".into(),
+            border_strong: "#67677a".into(),
             accent: "#a78bfa".into(),
             accent_dim: "#7c6dd8".into(),
             success: "#34d399".into(),
@@ -161,6 +210,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#161b22".into(),
             panel_2: "#1a212a".into(),
             border: "#21262d".into(),
+            border_strong: "#627185".into(),
             accent: "#58a6ff".into(),
             accent_dim: "#388bfd".into(),
             success: "#3fb950".into(),
@@ -177,6 +227,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             panel: "#073642".into(),
             panel_2: "#0a4351".into(),
             border: "#586e75".into(),
+            border_strong: "#779199".into(),
             accent: "#268bd2".into(),
             accent_dim: "#2176b8".into(),
             success: "#859900".into(),
@@ -197,14 +248,20 @@ fn config_path() -> PathBuf {
         .join("theme.json")
 }
 
-pub fn load_theme() -> AppResult<ThemeConfig> {
+/// The theme the user explicitly chose, or `None` when they never have.
+///
+/// This used to fall back to `atelier` on a missing file, which silently
+/// erased the distinction between "chose the dark theme" and "has not chosen".
+/// The frontend needs that distinction: with no stored choice it seeds from
+/// `prefers-color-scheme` and keeps following the OS, so a light-desktop user
+/// gets vellum on first launch instead of onyx.
+pub fn load_stored_theme() -> AppResult<Option<ThemeConfig>> {
     let path = config_path();
-    if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&content)?)
-    } else {
-        Ok(builtin_themes().into_iter().next().unwrap())
+    if !path.exists() {
+        return Ok(None);
     }
+    let content = std::fs::read_to_string(&path)?;
+    Ok(Some(serde_json::from_str(&content)?))
 }
 
 pub fn save_theme(theme: &ThemeConfig) -> AppResult<()> {
@@ -272,6 +329,166 @@ mod tests {
         for t in builtin_themes() {
             assert!(!t.panel_2.is_empty(), "{} is missing panel_2", t.name);
             assert!(t.panel_2.starts_with('#'), "{} panel_2 must be hex", t.name);
+        }
+    }
+
+    #[test]
+    fn every_theme_specifies_border_strong() {
+        for t in builtin_themes() {
+            assert!(
+                t.border_strong.starts_with('#') && t.border_strong.len() == 7,
+                "{} border_strong must be a #rrggbb hex",
+                t.name
+            );
+        }
+    }
+
+    // ── WCAG gates ──────────────────────────────────────────────────
+    //
+    // These exist so a palette regression breaks `cargo test` rather than a
+    // design review. The mirror of this arithmetic lives in
+    // `src/lib/contrast.ts`; both implement WCAG 2.1 relative luminance.
+
+    /// Linearise one sRGB channel, per WCAG 2.1.
+    fn channel_luminance(c: u8) -> f64 {
+        let s = c as f64 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(hex: &str) -> f64 {
+        let s = hex.trim_start_matches('#');
+        let ch = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0);
+        0.2126 * channel_luminance(ch(0))
+            + 0.7152 * channel_luminance(ch(2))
+            + 0.0722 * channel_luminance(ch(4))
+    }
+
+    /// WCAG contrast ratio between two opaque `#rrggbb` colours, in [1, 21].
+    fn contrast_ratio(a: &str, b: &str) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Worst ratio of `ink` across a theme's three painted surfaces. Checking
+    /// only `bg` is the trap that produced the original vellum: `panel_2` is
+    /// the hover/popover ground, and an ink that passes on the canvas but
+    /// fails on hover has still failed the user.
+    fn worst_surface_ratio(t: &ThemeConfig, ink: &str) -> f64 {
+        [&t.bg, &t.panel, &t.panel_2]
+            .iter()
+            .map(|s| contrast_ratio(ink, s))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[test]
+    fn contrast_ratio_matches_known_wcag_values() {
+        // Anchors from the WCAG definition itself, so a refactor of the maths
+        // above can't quietly drift.
+        assert!((contrast_ratio("#000000", "#ffffff") - 21.0).abs() < 0.01);
+        assert!((contrast_ratio("#ffffff", "#ffffff") - 1.0).abs() < 0.001);
+        // Order must not matter.
+        assert!(
+            (contrast_ratio("#0c0a08", "#d4a574") - contrast_ratio("#d4a574", "#0c0a08")).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn vellum_clears_wcag_aa_on_every_surface() {
+        let vellum = builtin_themes()
+            .into_iter()
+            .find(|t| t.name == "vellum")
+            .expect("vellum must exist");
+
+        // Every ink vellum can paint text with, against the worst surface.
+        // 4.5:1 is AA for body text — the size most of these actually render at.
+        for (label, ink) in [
+            ("text", &vellum.text),
+            ("text_dim", &vellum.text_dim),
+            ("text_muted", &vellum.text_muted),
+            ("accent", &vellum.accent),
+            ("accent_dim", &vellum.accent_dim),
+            ("success", &vellum.success),
+            ("warning", &vellum.warning),
+            ("danger", &vellum.danger),
+        ] {
+            let r = worst_surface_ratio(&vellum, ink);
+            assert!(
+                r >= 4.5,
+                "vellum {label} ({ink}) is {r:.2}:1 on its worst surface, needs 4.5:1"
+            );
+        }
+
+        // Interactive boundaries and the focus ring: WCAG 1.4.11, 3:1.
+        // The focus ring reuses `accent`, already asserted above at 4.5.
+        let border = worst_surface_ratio(&vellum, &vellum.border_strong);
+        assert!(
+            border >= 3.0,
+            "vellum border_strong ({}) is {border:.2}:1, needs 3.0:1",
+            vellum.border_strong
+        );
+    }
+
+    #[test]
+    fn vellum_avoids_the_halation_extremes() {
+        let vellum = builtin_themes()
+            .into_iter()
+            .find(|t| t.name == "vellum")
+            .expect("vellum must exist");
+
+        // Pure #000 on #fff is 21:1 and smears for astigmatic readers across a
+        // full-screen IDE. Off-black on off-white keeps AA with room to spare
+        // while staying clear of that ceiling.
+        let ink = contrast_ratio(&vellum.text, &vellum.bg);
+        assert!(
+            (10.0..=16.0).contains(&ink),
+            "vellum text-on-bg is {ink:.2}:1; expected 10–16 (AA without glare)"
+        );
+        assert!(
+            contrast_ratio(&vellum.panel, "#ffffff") > 1.02,
+            "vellum's lightest surface must be off-white, not paper-white"
+        );
+    }
+
+    #[test]
+    fn every_designed_theme_clears_aa_for_text_and_accent() {
+        // Scope note: this gate covers the themes we actively design. The three
+        // LEGACY themes (dark, midnight, solarized-dark) predate the design
+        // system and are kept only so existing configs keep working —
+        // solarized-dark's own text sits at 3.43:1, which is inherent to the
+        // upstream Solarized palette and not ours to restyle.
+        //
+        // `text_muted` is deliberately absent here: it clears AA in vellum but
+        // fails in EVERY dark theme (atelier 3.06:1, midnight 1.96:1). That is a
+        // real, pre-existing accessibility debt across the dark palettes, and
+        // fixing it means changing how the flagship looks — a brand decision,
+        // not a light-mode one. Tracked in docs/design-system.md.
+        const LEGACY: [&str; 3] = ["dark", "midnight", "solarized-dark"];
+
+        for t in builtin_themes() {
+            if LEGACY.contains(&t.name.as_str()) {
+                continue;
+            }
+            for (label, ink) in [("text", &t.text), ("accent", &t.accent)] {
+                let r = worst_surface_ratio(&t, ink);
+                assert!(
+                    r >= 4.5,
+                    "{} {label} ({ink}) is {r:.2}:1 on its worst surface, needs 4.5:1",
+                    t.name
+                );
+            }
+            let b = worst_surface_ratio(&t, &t.border_strong);
+            assert!(
+                b >= 3.0,
+                "{} border_strong ({}) is {b:.2}:1, needs 3.0:1",
+                t.name,
+                t.border_strong
+            );
         }
     }
 

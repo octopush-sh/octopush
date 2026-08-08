@@ -3,9 +3,49 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
     <title>Octopush</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      // ── Pre-paint theme ───────────────────────────────────────────────
+      // The real theme lives in ~/.octopush/theme.json and arrives over async
+      // IPC, which resolves several frames after first paint — so a vellum user
+      // used to watch the window flash onyx on every launch. stores/themeStore
+      // mirrors the applied theme into localStorage under "octo:theme"; this
+      // script reads it synchronously and paints the ground before anything
+      // renders. themeStore still writes the full token set moments later, so
+      // this only needs the handful that are visible on a blank canvas.
+      //
+      // `color-scheme` was previously a hardcoded <meta content="dark">, which
+      // left native scrollbars, form controls and the caret dark-styled under
+      // the light theme regardless of the palette.
+      (function () {
+        // Both are #rrggbb literals from the corresponding entry in
+        // src-tauri/src/theme.rs; keep the pairs in sync with it.
+        var ATELIER = { bg: "#0c0a08", panel: "#14110d", text: "#f4ecdb", dark: true };
+        var VELLUM = { bg: "#f2ece0", panel: "#faf6ec", text: "#2a201a", dark: false };
+        var t = null;
+        try {
+          t = JSON.parse(localStorage.getItem("octo:theme"));
+        } catch (e) {
+          /* absent, or written by a build that predates the mirror */
+        }
+        if (!t || typeof t.bg !== "string" || typeof t.dark !== "boolean") {
+          // No mirror yet (first ever launch): match what themeStore will pick
+          // once it resolves, so the seeded theme doesn't arrive as a flash.
+          t =
+            window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+              ? VELLUM
+              : ATELIER;
+        }
+        var root = document.documentElement;
+        root.style.setProperty("color-scheme", t.dark ? "dark" : "light");
+        root.style.setProperty("--color-octo-bg", t.bg);
+        root.style.setProperty("--color-octo-onyx", t.bg);
+        root.style.setProperty("--color-octo-panel", t.panel);
+        root.style.setProperty("--color-octo-ivory", t.text);
+        root.style.backgroundColor = t.bg;
+      })();
+    </script>
   </head>
   <body class="bg-octo-bg text-octo-ivory antialiased">
     <div id="root"></div>
