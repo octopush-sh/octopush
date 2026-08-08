@@ -352,10 +352,10 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 ```
 ┌────┬─────────────────────────────────┬───────────────────┐
-│    │ ContextHeader        Modes      │                   │
-│ R  │                                 │                   │
+│    │ ContextHeader                   │                   │
+│ R  │ Modes              status tail  │                   │
 │ a  │   Canvas                        │   Companion       │
-│ i  │   (Talk | Run | Review)         │   (per-mode)      │
+│ i  │   (Talk | Run | Review | Direct)│   (per-mode)      │
 │ l  │                                 │                   │
 │    │   Input bar                     │                   │
 └────┴─────────────────────────────────┴───────────────────┘
@@ -364,8 +364,9 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | Surface       | Width | Notes |
 |---------------|-------|-------|
 | Rail          | 48px  | Workspace monograms (italic serif, brass on active), brass vertical indicator. |
-| ContextHeader | flex  | Floating card. Workspace name in italic serif + branch in mono. |
-| ModeSwitcher  | auto  | Top right. Brass-ghost pill on active mode, brass indicator glides. Four modes: Talk / Run / Review / Direct. |
+| ContextHeader | flex  | Floating card. Workspace name in italic serif + branch in mono. Identity only — never the modes. |
+| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). Switcher left-aligned; the active mode's status tail (mono caps, mute) right-aligned. |
+| ModeSwitcher  | auto  | A segmented control: hairline-bordered pill on onyx, mono/caps segments, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each label. Four modes: Run / Talk / Review / Direct. |
 | Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
 | Companion     | 280px | Per-mode panels: Context+History · Terminals+Quick · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Italic-serif placeholder, ⌘K kbd hint. |

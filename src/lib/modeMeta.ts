@@ -28,14 +28,28 @@ export interface ModeMetaInput {
   runState: RunTailState;
 }
 
-/** Added/removed line counts from a unified diff. The `+++`/`---` file headers
- *  are skipped, so every file in the diff would otherwise inflate both counts
- *  by one. */
+/** Added/removed line counts from a unified diff.
+ *
+ *  Only lines inside a hunk are counted, which is the only way to tell a file
+ *  header from content: matching `+++`/`---` by prefix alone eats real changed
+ *  lines that happen to start that way — `++i;`, `--i;`, a SQL `-- comment`,
+ *  a Markdown `---` rule — and silently under-reports the stat. So a `@@`
+ *  opens the counting window and the next file's `diff --git` closes it,
+ *  leaving every header (`index`, `---`, `+++`, mode/rename lines) outside. */
 export function diffStat(diff: string): DiffStat {
   let added = 0;
   let removed = 0;
+  let inHunk = false;
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("diff --git")) {
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
     if (line.startsWith("+")) added++;
     else if (line.startsWith("-")) removed++;
   }
@@ -43,14 +57,18 @@ export function diffStat(diff: string): DiffStat {
 }
 
 /** Collapses a workspace's runs into the one word the tail shows. "running"
- *  wins over "paused": an in-flight crew is the more current fact, and the
- *  paused one already has the attention beacon. */
+ *  wins over waiting: an in-flight crew is the more current fact.
+ *
+ *  `draft` counts as waiting, not as settled — `beacon.ts` treats an active
+ *  draft run as a pending decision (it is a staged run the director has not
+ *  launched), so calling it "idle" here would have the band contradict the
+ *  beacon about the same workspace. */
 export function runTailState(
   runs: readonly { status: string }[] | undefined,
 ): RunTailState {
   if (!runs || runs.length === 0) return "none";
   if (runs.some((r) => r.status === "running")) return "running";
-  if (runs.some((r) => r.status === "paused")) return "paused";
+  if (runs.some((r) => r.status === "paused" || r.status === "draft")) return "paused";
   return "settled";
 }
 

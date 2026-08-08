@@ -11,9 +11,21 @@ const base: ModeMetaInput = {
 };
 
 describe("diffStat", () => {
-  it("counts added and removed lines", () => {
-    const diff = ["+one", "+two", "-gone", " context"].join("\n");
+  it("counts added and removed lines inside a hunk", () => {
+    const diff = ["@@ -1,2 +1,3 @@", "+one", "+two", "-gone", " context"].join("\n");
     expect(diffStat(diff)).toEqual({ added: 2, removed: 1 });
+  });
+
+  it("counts nothing outside a hunk", () => {
+    // Header-only output (e.g. a pure rename or mode change) has no hunk, so
+    // there are no changed lines to report.
+    const diff = [
+      "diff --git a/a.ts b/b.ts",
+      "similarity index 100%",
+      "rename from a.ts",
+      "rename to b.ts",
+    ].join("\n");
+    expect(diffStat(diff)).toEqual({ added: 0, removed: 0 });
   });
 
   it("ignores the +++/--- file headers", () => {
@@ -26,6 +38,42 @@ describe("diffStat", () => {
       "-removed",
     ].join("\n");
     expect(diffStat(diff)).toEqual({ added: 1, removed: 1 });
+  });
+
+  it("counts changed lines whose own content starts with ++ / --", () => {
+    // The trap: prefix-matching "+++"/"---" to skip file headers also eats
+    // real content — increments, SQL comments, Markdown rules.
+    const diff = [
+      "diff --git a/a.ts b/a.ts",
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1,3 +1,3 @@",
+      "+++i;",
+      "---i;",
+      "--- drop me",
+    ].join("\n");
+    expect(diffStat(diff)).toEqual({ added: 1, removed: 2 });
+  });
+
+  it("sums across files and ignores every per-file header", () => {
+    const diff = [
+      "diff --git a/a.ts b/a.ts",
+      "index 111..222 100644",
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+      "diff --git a/b.ts b/b.ts",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/b.ts",
+      "@@ -0,0 +1,2 @@",
+      "+one",
+      "+two",
+      "\\ No newline at end of file",
+    ].join("\n");
+    expect(diffStat(diff)).toEqual({ added: 3, removed: 1 });
   });
 
   it("returns zeroes for an empty diff", () => {
@@ -45,6 +93,10 @@ describe("runTailState", () => {
 
   it("reports paused when nothing is in flight", () => {
     expect(runTailState([{ status: "completed" }, { status: "paused" }])).toBe("paused");
+  });
+
+  it("treats a staged draft as waiting, matching the beacon", () => {
+    expect(runTailState([{ status: "draft" }])).toBe("paused");
   });
 
   it("reports settled when every run has finished", () => {

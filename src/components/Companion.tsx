@@ -169,7 +169,7 @@ export function Companion({
       )}
 
       {/* Mode-specific content — crossfades (exit 120ms, then enter) when the
-          mode changes, following the gliding ModeSwitcher indicator. The
+          mode changes, following the band's gliding brass indicator. The
           shared header and Jira block above stay outside this wrapper so they
           persist across modes. Review mode shows a "change intelligence"
           cockpit (readiness, provenance, branch/publish) — the Changes/Files

@@ -271,8 +271,9 @@ function App() {
   const COMPANION_DEFAULT_WIDTH = 312;
   const COMPANION_MIN_WIDTH = 280;
   const COMPANION_MAX_WIDTH = 600;
-  // Collapsed, the companion shrinks to a slim strip (like the rail) that
-  // still carries the mode switcher — trading panel content for canvas room.
+  // Collapsed, the companion shrinks to a slim strip (like the rail) carrying
+  // only the expand control — trading panel content for canvas room. Mode
+  // switching is unaffected: the band above the canvas is always on screen.
   const COMPANION_COLLAPSED_WIDTH = 56;
   const [isCompanionCollapsed, setIsCompanionCollapsed] = useState<boolean>(() => {
     try {
@@ -1918,10 +1919,10 @@ function App() {
       />
 
       <main className="ml-4 flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* TOP HEADER BAND — spans the full main width and includes the mode
-            switcher on its right, so the entire top of the app reads as one
-            unified header card instead of two floating containers in
-            separate columns. */}
+        {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR),
+            spanning the full main width so the top of the app reads as one
+            unified header card. The modes are NOT here: they sit in their own
+            band below, over the canvas column they govern. */}
         {activeWorkspace && (
           <ContextHeader
             workspaceName={activeWorkspace.name}
@@ -2173,8 +2174,8 @@ function App() {
 
         {/* RIGHT COLUMN — Companion always mounted. When there's no active
             workspace the panel just shows empty/default data; the structure
-            is preserved. The mode switcher now lives in the unified header
-            band above. Resizable via the 4px handle on the left edge:
+            is preserved. The mode switcher lives in the ModeBand above the
+            canvas, not here. Resizable via the 4px handle on the left edge:
             drag to widen/narrow, double-click to reset to default. */}
         <div
           className={`relative flex shrink-0 flex-col pt-0 transition-all duration-[220ms] ${
