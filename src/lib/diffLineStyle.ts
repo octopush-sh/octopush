@@ -13,7 +13,8 @@ export interface DiffLineStyle {
  *  atelier verdigris and rouge at a flat 8% — the dark palette's hues at an
  *  alpha tuned against near-black — so under the vellum light theme a diff row
  *  was tinted with colours from a theme the user wasn't running. `themeStore`
- *  now solves both per theme against that theme's own panel, holding one
+ *  now solves both per theme against that theme's own background — the surface
+ *  DiffViewer's rows actually sit on — holding one
  *  constant perceptual step (see `DIFF_TINT_TARGET`), and publishes them as
  *  `--diff-add-bg` / `--diff-del-bg`. */
 export function diffLineStyle(line: string): DiffLineStyle {

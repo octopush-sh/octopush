@@ -31,18 +31,19 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 **Surgical brass norm:** in any screen, brass should occupy ≤ 5% of pixels. If you're using brass on more than 2–3 elements at once, you're using it too much. (Not to be confused with the "brass rule" divider component, which is fully retired — see §3.)
 
-**Two border tiers, and they are not interchangeable.** `--color-octo-hairline` divides panels; it is decorative and deliberately quiet. `--color-octo-border-strong` bounds anything a user operates — input outlines, control edges, the focus ring — and clears **3:1 on every surface** because WCAG 1.4.11 applies to controls. Reaching for the hairline on a control is an accessibility bug; reaching for the strong border on a panel divider draws a hard box around every surface in the app.
+**Two border tiers, and they are not interchangeable.** `--color-octo-hairline` divides panels; it is decorative and deliberately quiet. `--color-octo-border-strong` bounds anything a user operates — input outlines, control edges, the focus ring — and clears **3:1 on every surface** because WCAG 1.4.11 applies to controls. Reaching for the hairline on a control is an accessibility bug; reaching for the strong border on a panel divider draws a hard box around every surface in the app. **This is enforced:** `themePalette.drift.test.ts` fails the build if any `<input>`/`<textarea>`/`<select>` rests on the hairline.
 
 ### 1.1 Light mode is its own set of decisions (2026-08-08)
 
-The `vellum` theme is not atelier inverted. Six rules govern it, and they generalise to any light palette added later:
+The `vellum` theme is not atelier inverted. Seven rules govern it, and they generalise to any light palette added later:
 
 1. **Solve against the worst surface, not the canvas.** Every theme paints on three grounds — `bg`, `panel`, `panel_2`. `panel_2` is the hover/popover ground and is the strictest of the three in a light theme. The palette this replaced passed on `bg` and failed on hover.
 2. **Darken *and* saturate.** On onyx an ink earns contrast by lightening, which desaturates it. On cream the move reverses. Darkening alone leaves the palette muddy, so accents gain saturation as they lose lightness.
 3. **`accent_dim` inverts.** On onyx it is the *brighter* sibling used for emphasis; on cream emphasis runs the other way and it becomes the *deeper* chestnut.
-4. **Elevation inverts too.** Dark mode raises a surface by lightening it; a light theme has no headroom above `panel` before it hits paper-white. So `panel_2` **recesses**, and lift comes from border + shadow. Borders carry structure that brightness used to.
-5. **Never `#000` on `#fff`.** 21:1 halates for astigmatic readers and fatigues everyone across a full-screen IDE. Off-black on off-white, ~13:1.
-6. **Amber is the token that fails.** A warning yellow essentially never clears AA on a light ground. Darken it to bronze, or put it in a chip with its own fill — and pair it with a glyph regardless, since WCAG 1.4.1 forbids carrying state in hue alone.
+4. **The hairline gets stronger, not fainter.** Vellum's reads at 1.63:1 against its canvas where atelier's reads 1.28:1 against onyx. This is the same principle as the next point: structure that dark mode carries with brightness, light mode carries with line.
+5. **Elevation inverts too.** Dark mode raises a surface by lightening it; a light theme has no headroom above `panel` before it hits paper-white. So `panel_2` **recesses**, and lift comes from border + shadow. Borders carry structure that brightness used to.
+6. **Never `#000` on `#fff`.** 21:1 halates for astigmatic readers and fatigues everyone across a full-screen IDE. Off-black on off-white, ~13:1.
+7. **Amber is the token that fails.** A warning yellow essentially never clears AA on a light ground. Darken it to bronze, or put it in a chip with its own fill — and pair it with a glyph regardless, since WCAG 1.4.1 forbids carrying state in hue alone.
 
 **Every alpha is solved, never fixed.** A ratio is a function of two luminances, so the same alpha reads differently per palette. `themeStore` solves the search-match wash (`solveMatchWashAlpha`) and the diff-row tints (`solveTintAlpha` + `DIFF_TINT_TARGET`) against each theme's own background. Adding a new tint means adding a target, not a magic number.
 

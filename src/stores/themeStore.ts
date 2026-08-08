@@ -70,13 +70,23 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
         return;
       }
 
+      // An `apply()` may have landed while the IPC above was in flight — a
+      // click during startup, or a second `load()`. `stored` is a snapshot
+      // taken before that choice existed, so seeding from it now would both
+      // repaint over the user's pick and switch OS-following back on, leaving
+      // the listener free to overwrite the choice until restart.
+      if (get().theme && !get().followingSystem) {
+        set({ themes, loading: false });
+        return;
+      }
+
       // No explicit choice: honour the OS and keep honouring it. We do NOT
       // persist this — writing theme.json here would freeze the app to
       // whatever the desktop happened to be on first launch, which is the
       // opposite of respecting the preference.
       const seeded = seedTheme(themes, darkQuery?.matches ?? true);
       set({ theme: seeded, themes, loading: false, followingSystem: true });
-      if (seeded) applyThemeToDom(seeded);
+      if (seeded) applyThemeToDom(seeded, { following: true });
 
       if (darkQuery && !systemListenerBound) {
         systemListenerBound = true;
@@ -87,7 +97,7 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
           const next = seedTheme(get().themes, e.matches);
           if (!next) return;
           set({ theme: next });
-          applyThemeToDom(next);
+          applyThemeToDom(next, { following: true });
         });
       }
     } catch {
@@ -102,7 +112,13 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   },
 }));
 
-function applyThemeToDom(t: ThemeConfig) {
+/** @param following - true when `t` was seeded from the OS rather than chosen.
+ *  A seeded theme must NOT leave a colour mirror behind: the pre-paint script
+ *  trusts the mirror over `matchMedia`, so a stale one would paint last
+ *  night's appearance after the desktop changed while the app was closed —
+ *  reintroducing the very flash the mirror exists to remove, for exactly the
+ *  never-chose population that this path serves. */
+function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
   const root = document.documentElement;
 
   // Legacy token names — still used by current components.
@@ -230,10 +246,16 @@ function applyThemeToDom(t: ThemeConfig) {
   // here costs a one-frame flash on the NEXT launch, never this session, so it
   // must not break theme application.
   try {
-    window.localStorage.setItem(
-      MIRROR_KEY,
-      JSON.stringify({ bg: t.bg, panel: t.panel, text: t.text, dark }),
-    );
+    if (following) {
+      // Clear rather than skip: an earlier explicit choice may have left a
+      // mirror behind, and it would now outrank the OS on next launch.
+      window.localStorage.removeItem(MIRROR_KEY);
+    } else {
+      window.localStorage.setItem(
+        MIRROR_KEY,
+        JSON.stringify({ bg: t.bg, panel: t.panel, text: t.text, dark }),
+      );
+    }
   } catch {
     /* private mode / quota — the app still themes correctly this session */
   }

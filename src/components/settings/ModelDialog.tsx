@@ -67,7 +67,7 @@ export function ModelDialog({
               onChange={(e) => setId(e.target.value)}
               placeholder="model id (e.g. claude-3-5-sonnet-20241022)"
               autoFocus
-              className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+              className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
             />
           </DialogField>
 
@@ -76,7 +76,7 @@ export function ModelDialog({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="display name (optional)"
-              className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+              className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
             />
           </DialogField>
 
@@ -85,21 +85,21 @@ export function ModelDialog({
               <input
                 type="number" min="0" step="0.01" value={inC}
                 onChange={(e) => setInC(e.target.value)} placeholder="0"
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
             </DialogField>
             <DialogField label="Cost out /M" className="flex-1">
               <input
                 type="number" min="0" step="0.01" value={outC}
                 onChange={(e) => setOutC(e.target.value)} placeholder="0"
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
             </DialogField>
             <DialogField label="Context" className="flex-1">
               <input
                 type="number" min="0" step="1000" value={ctx}
                 onChange={(e) => setCtx(e.target.value)} placeholder="200000"
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
             </DialogField>
           </div>

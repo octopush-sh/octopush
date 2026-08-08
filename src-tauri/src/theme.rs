@@ -112,7 +112,10 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             // before it becomes paper-white, so the "raised" surface RECESSES
             // instead, and lift is carried by border + shadow.
             panel_2: "#ece4d4".into(),
-            border: "#ddd2bb".into(),
+            // Stronger than atelier's hairline reads on onyx (1.63:1 vs 1.28:1)
+            // and on purpose: a light theme cannot lift a surface by brightening
+            // it, so its borders carry structure the dark theme gets for free.
+            border: "#c9ba95".into(),
             border_strong: "#8a7a5f".into(),
             accent: "#91522c".into(),
             accent_dim: "#6d3710".into(),

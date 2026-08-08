@@ -79,7 +79,7 @@ export function FileNameDialog({
             spellCheck={false}
             autoCorrect="off"
             autoCapitalize="off"
-            className="w-full rounded border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[13px] text-octo-ivory outline-none transition focus:border-octo-brass"
+            className="w-full rounded border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[13px] text-octo-ivory outline-none transition focus:border-octo-brass"
           />
           {error && (
             <p role="alert" className="octo-rise-in mt-2 font-mono text-[11px] text-octo-rouge">

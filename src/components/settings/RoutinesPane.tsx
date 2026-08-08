@@ -391,7 +391,7 @@ function RoutineEditor({
                   value={draft.dailyTime}
                   onChange={(e) => set("dailyTime", e.target.value)}
                   aria-label="Daily time"
-                  className="rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
+                  className="rounded-md border border-octo-border-strong bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
                 />
               )}
               {draft.scheduleKind === "interval" && (
@@ -402,7 +402,7 @@ function RoutineEditor({
                     value={draft.intervalValue}
                     onChange={(e) => set("intervalValue", e.target.value)}
                     aria-label="Interval amount"
-                    className="w-16 rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
+                    className="w-16 rounded-md border border-octo-border-strong bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
                   />
                   <Segmented
                     value={draft.intervalUnit}
@@ -460,7 +460,7 @@ function RoutineEditor({
               onChange={(e) => set("task", e.target.value)}
               rows={3}
               placeholder="What should the crew do each run?"
-              className="w-full resize-none rounded-md border border-octo-hairline bg-octo-bg px-3 py-2 text-[13px] leading-[1.5] text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute"
+              className="w-full resize-none rounded-md border border-octo-border-strong bg-octo-bg px-3 py-2 text-[13px] leading-[1.5] text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute"
             />
           </Field>
 
@@ -538,7 +538,7 @@ function TextInput({
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
       spellCheck={mono ? false : undefined}
-      className={`w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-1.5 text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute ${
+      className={`w-full rounded-md border border-octo-border-strong bg-octo-bg px-3 py-1.5 text-octo-ivory outline-none focus:border-octo-brass placeholder:text-octo-mute ${
         mono ? "font-mono text-[12px]" : "text-[13px]"
       }`}
     />

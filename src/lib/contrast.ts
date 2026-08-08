@@ -137,7 +137,7 @@ export function solveTintAlpha(
 /**
  * Smallest alpha at which `accent` over `bg` reaches MATCH_WASH_TARGET.
  *
- * Solving per theme lands on 23.5% for atelier through ~28.5% for vellum, so
+ * Solving per theme lands on 23.5% for atelier through 29.5% for vellum, so
  * every theme gets an equally present search highlight.
  */
 export function solveMatchWashAlpha(accent: string, bg: string): number {

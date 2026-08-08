@@ -146,7 +146,7 @@ export function WorkspaceRail({
             placeholder="Filter projects & missions"
             spellCheck={false}
             aria-label="Filter the rail"
-            className="mx-3 mb-1 rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
+            className="mx-3 mb-1 rounded-md border border-octo-border-strong bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
           />
         )}
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>

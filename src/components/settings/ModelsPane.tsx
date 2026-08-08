@@ -450,7 +450,7 @@ function ProviderDetail({
                 value={apiKey}
                 onChange={(e) => onChangeKey(e.target.value)}
                 placeholder="API key"
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 pr-12 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 pr-12 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
               <button
                 type="button"
@@ -471,7 +471,7 @@ function ProviderDetail({
             value={baseUrl}
             onChange={(e) => onChangeBaseUrl(e.target.value)}
             placeholder={provider.apiBase}
-            className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+            className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
           />
           <p className="mt-1.5 text-[11px] leading-[1.5] text-octo-mute">
             {provider.protocol === "anthropic"

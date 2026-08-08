@@ -84,8 +84,8 @@
   color-scheme: dark;
 
   /* Diff row tints — solved per theme by themeStore against that theme's own
-     panel, so one constant perceptual step survives both onyx and cream. These
-     are the atelier answers, used at first paint. Consumed via
+     background, so one constant perceptual step survives both onyx and cream.
+     These are the atelier answers, used at first paint. Consumed via
      lib/diffLineStyle.ts. */
   --diff-add-bg: rgba(143, 201, 168, 0.08);
   --diff-del-bg: rgba(209, 139, 139, 0.08);

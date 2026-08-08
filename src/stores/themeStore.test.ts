@@ -30,7 +30,7 @@ const VELLUM: ThemeConfig = {
   bg: "#f2ece0",
   panel: "#faf6ec",
   panel2: "#ece4d4",
-  border: "#ddd2bb",
+  border: "#c9ba95",
   borderStrong: "#8a7a5f",
   accent: "#91522c",
   accentDim: "#6d3710",
@@ -145,6 +145,29 @@ describe("themeStore · stored choice vs system preference", () => {
     await useThemeStore.getState().apply(VELLUM);
     expect(ipcMock.setTheme).toHaveBeenCalledWith(VELLUM);
   });
+
+  it("does not let an in-flight load overwrite a choice made while it ran", async () => {
+    // `stored` is a snapshot taken before the click. Seeding from it would
+    // repaint over the user's pick AND switch OS-following back on, leaving
+    // the listener free to overwrite the choice until restart.
+    prefersDark = true;
+    let releaseGetTheme!: (v: null) => void;
+    ipcMock.getTheme.mockReturnValue(
+      new Promise<null>((resolve) => {
+        releaseGetTheme = resolve;
+      }),
+    );
+
+    const loading = useThemeStore.getState().load();
+    await useThemeStore.getState().apply(VELLUM); // user picks mid-flight
+    releaseGetTheme(null);
+    await loading;
+
+    expect(useThemeStore.getState().theme?.name).toBe("vellum");
+    expect(useThemeStore.getState().followingSystem).toBe(false);
+    // The themes list still lands, so the picker is populated either way.
+    expect(useThemeStore.getState().themes).toHaveLength(2);
+  });
 });
 
 describe("themeStore · applyThemeToDom", () => {
@@ -201,7 +224,7 @@ describe("themeStore · applyThemeToDom", () => {
     expect(read("--diff-del-bg")).toBe("rgba(179, 48, 36, 0.075)");
   });
 
-  it("mirrors the theme to localStorage for the pre-paint script", async () => {
+  it("mirrors an explicitly chosen theme to localStorage for the pre-paint script", async () => {
     // index.html reads this synchronously to avoid a dark flash on launch.
     await useThemeStore.getState().apply(VELLUM);
     const mirror = JSON.parse(localStorage.getItem("octo:theme")!);
@@ -214,6 +237,23 @@ describe("themeStore · applyThemeToDom", () => {
 
     await useThemeStore.getState().apply(ATELIER);
     expect(JSON.parse(localStorage.getItem("octo:theme")!).dark).toBe(true);
+  });
+
+  it("clears the mirror while following the OS, so a stale one cannot outrank it", async () => {
+    // The mirror outranks matchMedia in the pre-paint script. If a SEEDED
+    // theme left one behind, a user who never chose a theme and flips their
+    // desktop to light overnight would be painted last night's onyx on the
+    // next launch — the exact flash the mirror exists to remove.
+    await useThemeStore.getState().apply(ATELIER); // writes a mirror
+    expect(localStorage.getItem("octo:theme")).not.toBeNull();
+
+    prefersDark = false;
+    ipcMock.getTheme.mockResolvedValue(null);
+    useThemeStore.setState({ theme: null, followingSystem: false });
+    await useThemeStore.getState().load();
+
+    expect(useThemeStore.getState().followingSystem).toBe(true);
+    expect(localStorage.getItem("octo:theme")).toBeNull();
   });
 
   it("still applies the theme when localStorage is unavailable", async () => {

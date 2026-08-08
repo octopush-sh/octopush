@@ -486,7 +486,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     value={cloneUrl}
                     onChange={(e) => setCloneUrl(e.target.value)}
                     placeholder="*Paste a git remote URL…*"
-                    className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                    className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
                   {parsedCloneUrl && (
                     <span className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
@@ -507,7 +507,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     setCloneNameManual(true);
                   }}
                   placeholder="*auto-detected from URL*"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -516,7 +516,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   value={cloneLocation}
                   onChange={(e) => setCloneLocation(e.target.value)}
                   placeholder="~/.octopush/projects"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
             </div>
@@ -564,7 +564,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                       value={authUsername}
                       onChange={(e) => setAuthUsername(e.target.value)}
                       placeholder="*your username*"
-                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                      className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>
 
@@ -574,7 +574,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                       value={authToken}
                       onChange={(e) => setAuthToken(e.target.value)}
                       placeholder="ghp_…"
-                      className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                      className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>
                 </div>
@@ -584,7 +584,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     type="checkbox"
                     checked={authRemember}
                     onChange={(e) => setAuthRemember(e.target.checked)}
-                    className="rounded border-octo-hairline"
+                    className="rounded border-octo-border-strong"
                   />
                   <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-sage">
                     Remember for {authHost}
@@ -706,7 +706,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   value={genesisLocation}
                   onChange={(e) => setGenesisLocation(e.target.value)}
                   placeholder="~/Octopush"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
             </div>
@@ -756,7 +756,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     if (e.key === "Enter" && emptyNameValid) void handleCreate();
                   }}
                   placeholder="Hyperion"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -765,7 +765,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   value={location}
                   onChange={(e) => setLocation(e.target.value)}
                   placeholder="~/.octopush/projects"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
             </div>

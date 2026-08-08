@@ -29,13 +29,27 @@
         } catch (e) {
           /* absent, or written by a build that predates the mirror */
         }
-        if (!t || typeof t.bg !== "string" || typeof t.dark !== "boolean") {
-          // No mirror yet (first ever launch): match what themeStore will pick
-          // once it resolves, so the seeded theme doesn't arrive as a flash.
+        // Every field is checked, not just one: a partial mirror would set
+        // e.g. `--color-octo-panel: undefined`, which is a VALID custom
+        // property whose var() is then invalid-at-computed-value — panels
+        // would render transparent until the store repaints.
+        var usable =
+          t &&
+          typeof t.bg === "string" &&
+          typeof t.panel === "string" &&
+          typeof t.text === "string" &&
+          typeof t.dark === "boolean";
+        if (!usable) {
+          // No usable mirror — either the first ever launch, or the user has
+          // never chosen a theme (themeStore clears the mirror while it is
+          // following the OS, so this branch stays authoritative rather than
+          // painting a stale appearance). Probe the SAME query themeStore
+          // does, so a `no-preference` engine can't make the two disagree and
+          // produce the flash this script exists to remove.
           t =
-            window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
-              ? VELLUM
-              : ATELIER;
+            window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? ATELIER
+              : VELLUM;
         }
         var root = document.documentElement;
         root.style.setProperty("color-scheme", t.dark ? "dark" : "light");
