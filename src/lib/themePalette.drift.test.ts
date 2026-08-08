@@ -131,10 +131,33 @@ describe("interactive boundaries", () => {
     import: "default",
   }) as Record<string, string>;
 
-  /** Opening tags of native form controls, brace-aware so a `>` inside a JSX
-   *  expression (`onChange={(e) => …}`) doesn't truncate the tag. */
-  function controlTags(src: string): string[] {
-    const tags: string[] = [];
+  /** `const NAME = "…"` string constants, so a control whose className lives in
+   *  a shared variable is still inspected. The first version of this gate only
+   *  read class literals inside the tag, which is exactly how nine inputs in
+   *  the settings panes kept the hairline while the suite stayed green. */
+  function classConstants(src: string): Record<string, string> {
+    const consts: Record<string, string> = {};
+    for (const m of src.matchAll(/const (\w+) =\s*\n?\s*"([^"]*)"/g)) {
+      if (m[2].includes("border-octo-")) consts[m[1]] = m[2];
+    }
+    return consts;
+  }
+
+  /** Opening tags of native form controls, with any referenced class constant
+   *  inlined. Brace-aware so a `>` inside a JSX expression
+   *  (`onChange={(e) => …}`) doesn't truncate the tag.
+   *
+   *  Deliberately NOT quote-aware. Tracking quotes sounds stricter and is
+   *  worse: a JS comment inside an arrow body ("…octopush-mcp's behaviour")
+   *  opens a quote that never closes, and the scan then runs to end-of-file
+   *  and reports every later hairline in the file as if it were on this
+   *  control. Brace-only is correct for every construct in this codebase, and
+   *  `tagLooksTruncated` below turns the remaining risk — a literal `>` inside
+   *  an attribute string, which would end the tag early — into a loud failure
+   *  rather than a silently exempted control. */
+  function controlTags(src: string): Array<{ raw: string; expanded: string }> {
+    const consts = classConstants(src);
+    const tags: Array<{ raw: string; expanded: string }> = [];
     for (const m of src.matchAll(/<(input|textarea|select)\b/g)) {
       let i = m.index! + m[0].length;
       let depth = 0;
@@ -145,10 +168,45 @@ describe("interactive boundaries", () => {
         else if (c === ">" && depth === 0) break;
         i++;
       }
-      tags.push(src.slice(m.index!, i + 1));
+      const raw = src.slice(m.index!, i + 1);
+      let expanded = raw;
+      for (const [name, value] of Object.entries(consts)) {
+        if (new RegExp(`\\b${name}\\b`).test(raw)) expanded += ` /*${name}*/ ${value}`;
+      }
+      tags.push({ raw, expanded });
     }
     return tags;
   }
+
+  /** An opening tag longer than any real one in this codebase means the
+   *  brace tracker lost sync and the tag swallowed unrelated markup — which
+   *  would make every finding after it meaningless. */
+  const tagLostSync = (raw: string) => raw.length > 2200 || !raw.trimEnd().endsWith(">");
+
+  /** A control's RESTING boundary. Variant-prefixed classes (`hover:`,
+   *  `focus:`) are excluded on purpose: a field that is borderless at rest and
+   *  hints with a hairline on hover — the inline-edit pattern in
+   *  PipelineBuilder — is a deliberate design, and 1.4.11 has nothing to say
+   *  about a hover hint. Inline `style` is checked too, since a border set
+   *  there bypasses Tailwind entirely. */
+  function restingHairline(tag: string): boolean {
+    const stripped = tag.replace(/[\w-]+:border-octo-[\w-]+/g, "");
+    return (
+      /\bborder-octo-hairline\b/.test(stripped) ||
+      /border:[^,}]*var\(--color-octo-hairline\)/.test(stripped)
+    );
+  }
+
+  it("never loses sync while scanning a tag", () => {
+    // Guards the failure mode that makes every other assertion here worthless.
+    const broken: string[] = [];
+    for (const [path, src] of Object.entries(sources)) {
+      for (const tag of controlTags(src)) {
+        if (tagLostSync(tag.raw)) broken.push(`${path}: ${tag.raw.length} chars`);
+      }
+    }
+    expect(broken, "control-tag scanner lost sync").toEqual([]);
+  });
 
   it("finds the controls it claims to check", () => {
     // Without this the suite below passes vacuously if the glob or the tag
@@ -162,9 +220,9 @@ describe("interactive boundaries", () => {
     const offenders: string[] = [];
     for (const [path, src] of Object.entries(sources)) {
       if (path.endsWith(".test.tsx")) continue;
-      for (const tag of controlTags(src)) {
-        if (tag.includes("border-octo-hairline")) {
-          offenders.push(`${path}: ${tag.slice(0, 90).replace(/\s+/g, " ")}…`);
+      for (const { expanded } of controlTags(src)) {
+        if (restingHairline(expanded)) {
+          offenders.push(`${path}: ${expanded.slice(0, 90).replace(/\s+/g, " ")}…`);
         }
       }
     }
@@ -177,7 +235,7 @@ describe("interactive boundaries", () => {
 
   it("at least one control actually consumes border_strong", () => {
     const used = Object.values(sources).some((s) =>
-      controlTags(s).some((t) => t.includes("border-octo-border-strong")),
+      controlTags(s).some((t) => t.expanded.includes("border-octo-border-strong")),
     );
     expect(used).toBe(true);
   });

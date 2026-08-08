@@ -29,7 +29,7 @@ const ROUTINES_FEATURE = "routines.scheduled";
 // Listbox trigger surface that matches this form's TextInput/time/number fields
 // (same border/bg/focus tokens) so the pickers read as siblings, in both themes.
 const FIELD_SURFACE =
-  "border border-octo-hairline bg-octo-bg text-octo-ivory hover:border-[var(--brass-dim)] focus:border-octo-brass";
+  "border border-octo-border-strong bg-octo-bg text-octo-ivory hover:border-[var(--brass-dim)] focus:border-octo-brass";
 
 /** The last evaluation, legible in the list row ("dispatched · 5m ago" /
  *  "condition not met · 2m ago") so a routine that keeps skipping doesn't look
@@ -680,7 +680,7 @@ function RecurringBuilder({
     : [...STEP_OPTIONS, { value: draft.recurStepMin, label: `${draft.recurStepMin} min` }];
 
   const timeInput =
-    "rounded-md border border-octo-hairline bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass";
+    "rounded-md border border-octo-border-strong bg-octo-bg px-2 py-1.5 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass";
   // Local calendar date (not UTC) so a user at a negative offset can still pick
   // their own "today" for a one-shot.
   const now = new Date();

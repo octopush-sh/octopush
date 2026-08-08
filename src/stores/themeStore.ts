@@ -64,19 +64,25 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
         ipc.listThemes(),
       ]);
 
-      if (stored) {
-        set({ theme: stored, themes, loading: false, followingSystem: false });
-        applyThemeToDom(stored);
+      // An `apply()` may have landed while the IPC above was in flight — a
+      // click during startup, or a second `load()`. Everything below derives
+      // from `stored`, a snapshot taken before that choice existed, so acting
+      // on it now would repaint over the user's pick (and, on the seed path,
+      // switch OS-following back on, leaving the listener free to keep
+      // overwriting it until restart). The themes list is still worth
+      // keeping — it only populates the picker.
+      //
+      // Checked BEFORE the `stored` branch, not after: a returning user is
+      // precisely the case where `stored` is non-null, so guarding only the
+      // seed path would leave the more common half of the race open.
+      if (get().theme && !get().followingSystem) {
+        set({ themes, loading: false });
         return;
       }
 
-      // An `apply()` may have landed while the IPC above was in flight — a
-      // click during startup, or a second `load()`. `stored` is a snapshot
-      // taken before that choice existed, so seeding from it now would both
-      // repaint over the user's pick and switch OS-following back on, leaving
-      // the listener free to overwrite the choice until restart.
-      if (get().theme && !get().followingSystem) {
-        set({ themes, loading: false });
+      if (stored) {
+        set({ theme: stored, themes, loading: false, followingSystem: false });
+        applyThemeToDom(stored);
         return;
       }
 

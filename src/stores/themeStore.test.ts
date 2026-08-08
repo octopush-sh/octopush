@@ -146,6 +146,29 @@ describe("themeStore · stored choice vs system preference", () => {
     expect(ipcMock.setTheme).toHaveBeenCalledWith(VELLUM);
   });
 
+  it("does not let an in-flight load overwrite a choice when a theme IS stored", async () => {
+    // The returning-user half of the race: `stored` is non-null, so a guard
+    // placed after the `if (stored)` branch would never run and last launch's
+    // theme would clobber the click — and rewrite the pre-paint mirror with it,
+    // carrying the wrong ground into the next launch too.
+    let releaseGetTheme!: (v: ThemeConfig) => void;
+    ipcMock.getTheme.mockReturnValue(
+      new Promise<ThemeConfig>((resolve) => {
+        releaseGetTheme = resolve;
+      }),
+    );
+
+    const loading = useThemeStore.getState().load();
+    await useThemeStore.getState().apply(VELLUM); // user picks mid-flight
+    releaseGetTheme(ATELIER); // last launch's stored theme finally arrives
+    await loading;
+
+    expect(useThemeStore.getState().theme?.name).toBe("vellum");
+    expect(useThemeStore.getState().followingSystem).toBe(false);
+    expect(read("--color-octo-bg")).toBe(VELLUM.bg);
+    expect(JSON.parse(localStorage.getItem("octo:theme")!).bg).toBe(VELLUM.bg);
+  });
+
   it("does not let an in-flight load overwrite a choice made while it ran", async () => {
     // `stored` is a snapshot taken before the click. Seeding from it would
     // repaint over the user's pick AND switch OS-following back on, leaving
