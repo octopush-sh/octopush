@@ -134,7 +134,7 @@ function EditorCommandRow() {
         placeholder={detected[0]?.command ?? "code"}
         spellCheck={false}
         className="mt-2 w-full rounded-md px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none"
-        style={{ background: "var(--color-octo-onyx)", border: "1px solid var(--color-octo-hairline)" }}
+        style={{ background: "var(--color-octo-onyx)", border: "1px solid var(--color-octo-border-strong)" }}
       />
       {saved && <div className="mt-1 font-mono text-[10px] text-octo-verdigris">Saved</div>}
     </div>

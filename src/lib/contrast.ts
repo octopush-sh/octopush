@@ -88,32 +88,60 @@ export function composite(
  *  penalty grows fast above it (~38% at a 1.60 step). */
 export const MATCH_WASH_TARGET = 1.5;
 
+/** Contrast step a diff row's background tint must clear against the surface
+ *  behind it. Derived, not invented: it is the step atelier's own
+ *  `rgba(143, 201, 168, 0.08)` addition tint produces over onyx (1.114). Diff
+ *  rows are read as a *field* of colour rather than a point highlight, so they
+ *  sit far below MATCH_WASH_TARGET — loud enough to group the row, quiet
+ *  enough that syntax colours on top of it survive. */
+export const DIFF_TINT_TARGET = 1.11;
+
 /** Alpha the atelier accent needs to clear MATCH_WASH_TARGET on atelier onyx.
  *  Used as the fallback when a colour can't be parsed. */
 const ATELIER_WASH_ALPHA = 0.235;
 
 /**
- * Smallest alpha in [0.04, 0.60] at which `accent` over `bg` reaches
- * MATCH_WASH_TARGET contrast against `bg`.
+ * Smallest alpha in [`min`, `max`] at which `color` composited over `bg`
+ * reaches `target` contrast against that same `bg`.
  *
- * This is the whole reason the match tokens are computed rather than
- * hardcoded: one fixed alpha reads very differently per palette. The same
- * 23.5% is a 1.50 step against atelier's near-black onyx but only 1.35
- * against vellum's cream. Solving per theme lands on 23.5% for atelier
- * through 31% for vellum, so every theme gets an equally present highlight.
+ * Every alpha tint in the app has to be solved rather than fixed, because a
+ * ratio is a function of two luminances: the same 8% verdigris that reads as a
+ * clear "added line" band on near-black onyx is a different perceptual step on
+ * cream, and the same 23.5% accent that marks a search hit on onyx marks
+ * almost nothing on vellum. Solving per theme gives every palette an equally
+ * present tint instead of one that was tuned for whichever theme came first.
+ *
+ * Returns `null` when either colour is unparseable, so callers can fall back to
+ * a static value rather than emitting `rgba(NaN, …)`.
  */
-export function solveMatchWashAlpha(accent: string, bg: string): number {
-  const a = hexToRgb(accent);
+export function solveTintAlpha(
+  color: string,
+  bg: string,
+  target: number,
+  min = 0.02,
+  max = 0.6,
+): number | null {
+  const a = hexToRgb(color);
   const b = hexToRgb(bg);
-  if (!a || !b) return ATELIER_WASH_ALPHA;
-  for (let alpha = 0.04; alpha <= 0.601; alpha += 0.005) {
-    if (contrastRatio(composite(a, alpha, b), b) >= MATCH_WASH_TARGET) {
+  if (!a || !b) return null;
+  for (let alpha = min; alpha <= max + 1e-9; alpha += 0.005) {
+    if (contrastRatio(composite(a, alpha, b), b) >= target) {
       return Math.round(alpha * 1000) / 1000;
     }
   }
-  // Accent too close to the background to ever reach the target (no built-in
-  // theme does this). Take the ceiling — the most visible wash available.
-  return 0.6;
+  // Colour too close to the background to ever reach the target (no built-in
+  // theme does this). Take the ceiling — the most visible tint available.
+  return max;
+}
+
+/**
+ * Smallest alpha at which `accent` over `bg` reaches MATCH_WASH_TARGET.
+ *
+ * Solving per theme lands on 23.5% for atelier through 29.5% for vellum, so
+ * every theme gets an equally present search highlight.
+ */
+export function solveMatchWashAlpha(accent: string, bg: string): number {
+  return solveTintAlpha(accent, bg, MATCH_WASH_TARGET, 0.04) ?? ATELIER_WASH_ALPHA;
 }
 
 /** True when `bg` is dark enough that CodeMirror should apply its dark-mode

@@ -301,7 +301,7 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
 }
 
 const inputClass =
-  "w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass";
+  "w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass";
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

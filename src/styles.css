@@ -60,6 +60,11 @@
      Same hex as their canonical counterpart so nothing visibly breaks. ── */
   --color-octo-bg:         #0c0a08;
   --color-octo-border:     #2a2419;
+  /* Interactive boundary — input outlines, control edges, focus rings. Held
+     apart from --color-octo-border because WCAG 1.4.11's 3:1 applies to
+     controls, not to the hairlines that divide panels. Every built-in theme
+     ships its own value (src-tauri/src/theme.rs), enforced by a cargo test. */
+  --color-octo-border-strong: #786747;
   --color-octo-accent:     #d4a574;
   --color-octo-accent-dim: #e8c39a;
   --color-octo-success:    #8fc9a8;
@@ -73,6 +78,18 @@
 
 /* ── Brass alpha utilities — not Tailwind-class-generated, used directly ── */
 :root {
+  /* Native scrollbars, form controls and the caret follow this. themeStore
+     overwrites it per theme (and index.html's pre-paint script sets it before
+     first paint); this is the no-JS floor. */
+  color-scheme: dark;
+
+  /* Diff row tints — solved per theme by themeStore against that theme's own
+     background, so one constant perceptual step survives both onyx and cream.
+     These are the atelier answers, used at first paint. Consumed via
+     lib/diffLineStyle.ts. */
+  --diff-add-bg: rgba(143, 201, 168, 0.08);
+  --diff-del-bg: rgba(209, 139, 139, 0.08);
+
   /* Solid traversed-connector ink (no gradients — lines are solid or hairline). */
   --brass-line:     rgba(212, 165, 116, 0.55);
   --brass-dim:      rgba(212, 165, 116, 0.4);

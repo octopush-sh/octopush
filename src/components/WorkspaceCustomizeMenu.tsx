@@ -61,7 +61,7 @@ export function WorkspaceCustomizeMenu({
         value={glyph}
         onChange={(e) => setGlyph(e.target.value)}
         maxLength={2}
-        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
+        className="mt-1 w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
       />
 
       <div className="mt-3 font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute">

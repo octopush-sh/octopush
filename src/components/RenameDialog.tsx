@@ -36,7 +36,7 @@ export function RenameDialog({ title, label, initialValue, onSubmit, onCancel }:
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => { if (e.key === "Escape") onCancel(); }}
-        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none focus:border-octo-brass"
+        className="mt-1 w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none focus:border-octo-brass"
       />
       <div className="mt-4 flex items-center gap-2">
         <button

@@ -118,7 +118,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
           placeholder="search by key or summary…"
-          className="w-full rounded border border-octo-hairline bg-octo-onyx py-1 pl-7 pr-12 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
+          className="w-full rounded border border-octo-border-strong bg-octo-onyx py-1 pl-7 pr-12 font-mono text-[12px] text-octo-ivory outline-none focus:border-octo-brass"
         />
         <button
           type="button"

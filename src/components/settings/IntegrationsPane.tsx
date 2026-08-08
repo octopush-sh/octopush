@@ -140,7 +140,7 @@ function ClaudeCodeCard() {
               type="text"
               value={status?.manualCommand ?? "claude mcp add octopush -s user -- /path/to/octopush-mcp"}
               readOnly
-              className="flex-1 rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none"
+              className="flex-1 rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none"
             />
             <button
               type="button"

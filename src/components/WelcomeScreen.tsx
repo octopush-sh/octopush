@@ -140,7 +140,7 @@ export function WelcomeScreen({ onNewProject, onGenesis, onSketch }: Props) {
             onChange={(e) => setPathValue(e.target.value)}
             onKeyDown={handlePathKeyDown}
             placeholder="/path/to/project"
-            className="min-w-0 flex-1 rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+            className="min-w-0 flex-1 rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
           />
           <button
             type="button"

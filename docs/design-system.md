@@ -11,7 +11,8 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 --color-octo-onyx:      #0c0a08;  /* app bg, warm black */
 --color-octo-panel:     #14110d;  /* rail, header, companion */
 --color-octo-panel-2:   #1a160f;  /* active input, hover */
---color-octo-hairline:  #2a2419;  /* 1px borders */
+--color-octo-hairline:  #2a2419;  /* 1px borders — decorative panel dividers */
+--color-octo-border-strong: #786747; /* interactive boundaries: inputs, control edges, focus ring */
 --color-octo-brass:     #d4a574;  /* THE accent */
 --color-octo-brass-hi:  #e8c39a;  /* hover/pressed brass */
 --color-octo-ivory:     #f4ecdb;  /* high-emphasis text */
@@ -29,6 +30,24 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 - `--brass-quiet: rgba(212, 165, 116, 0.22)` — reserved for a quieter "done, long settled" dot shade (`StageDots`); not yet wired into a consumer as of the fleet redesign.
 
 **Surgical brass norm:** in any screen, brass should occupy ≤ 5% of pixels. If you're using brass on more than 2–3 elements at once, you're using it too much. (Not to be confused with the "brass rule" divider component, which is fully retired — see §3.)
+
+**Two border tiers, and they are not interchangeable.** `--color-octo-hairline` divides panels; it is decorative and deliberately quiet. `--color-octo-border-strong` bounds anything a user operates — input outlines, control edges, the focus ring — and clears **3:1 on every surface** because WCAG 1.4.11 applies to controls. Reaching for the hairline on a control is an accessibility bug; reaching for the strong border on a panel divider draws a hard box around every surface in the app. **Partly enforced:** `themePalette.drift.test.ts` fails the build if any *native* `<input>`/`<textarea>`/`<select>` rests on the hairline — resolving shared class constants and inline `style`, not just tag-literal classes. Custom widgets that receive a class through a prop are outside its reach and remain a manual check.
+
+### 1.1 Light mode is its own set of decisions (2026-08-08)
+
+The `vellum` theme is not atelier inverted. Seven rules govern it, and they generalise to any light palette added later:
+
+1. **Solve against the worst surface, not the canvas.** Every theme paints on three grounds — `bg`, `panel`, `panel_2`. `panel_2` is the hover/popover ground and is the strictest of the three in a light theme. The palette this replaced passed on `bg` and failed on hover.
+2. **Darken *and* saturate.** On onyx an ink earns contrast by lightening, which desaturates it. On cream the move reverses. Darkening alone leaves the palette muddy, so accents gain saturation as they lose lightness.
+3. **`accent_dim` inverts.** On onyx it is the *brighter* sibling used for emphasis; on cream emphasis runs the other way and it becomes the *deeper* chestnut.
+4. **The hairline gets stronger, not fainter.** Vellum's reads at 1.63:1 against its canvas where atelier's reads 1.28:1 against onyx. This is the same principle as the next point: structure that dark mode carries with brightness, light mode carries with line.
+5. **Elevation inverts too.** Dark mode raises a surface by lightening it; a light theme has no headroom above `panel` before it hits paper-white. So `panel_2` **recesses**, and lift comes from border + shadow. Borders carry structure that brightness used to.
+6. **Never `#000` on `#fff`.** 21:1 halates for astigmatic readers and fatigues everyone across a full-screen IDE. Off-black on off-white, ~13:1.
+7. **Amber is the token that fails.** A warning yellow essentially never clears AA on a light ground. Darken it to bronze, or put it in a chip with its own fill — and pair it with a glyph regardless, since WCAG 1.4.1 forbids carrying state in hue alone.
+
+**Every alpha is solved, never fixed.** A ratio is a function of two luminances, so the same alpha reads differently per palette. `themeStore` solves the search-match wash (`solveMatchWashAlpha`) and the diff-row tints (`solveTintAlpha` + `DIFF_TINT_TARGET`) against each theme's own background. Adding a new tint means adding a target, not a magic number.
+
+**Known debt — `text_muted` in the dark themes.** Vellum's clears AA at 4.87:1. Every dark theme's does not: atelier 3.06:1, mossbank 2.81:1, ember 2.82:1, porcelain-indigo 2.64:1, and the legacy themes worse. It carries labels, meta and code comments, so this is a genuine AA failure — but correcting it changes how the flagship looks, which is a brand decision rather than a light-mode one. Deliberately out of scope for the vellum pass; the cargo gate documents the exclusion rather than hiding it.
 
 ---
 

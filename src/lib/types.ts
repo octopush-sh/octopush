@@ -483,6 +483,10 @@ export interface ThemeConfig {
    *  themes it can be a step darker, providing the same contrast cue. */
   panel2: string;
   border: string;
+  /** Boundary colour for interactive chrome — input outlines, control edges,
+   *  the focus ring. Held apart from `border` because WCAG 1.4.11's 3:1 applies
+   *  to controls, not to the hairlines that merely divide panels. */
+  borderStrong: string;
   accent: string;
   accentDim: string;
   success: string;

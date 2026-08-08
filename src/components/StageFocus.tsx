@@ -604,7 +604,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               value={draftInstructions}
               onChange={(e) => setDraftInstructions(e.target.value)}
               placeholder="Additional guidance for this stage…"
-              className="h-28 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
+              className="h-28 resize-none rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
           </label>
           <div className="flex flex-wrap items-center gap-4">
