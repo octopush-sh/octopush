@@ -125,6 +125,39 @@ export function ReviewSidebar({
     });
   }, [registerFocusCommit, tab, collapsed, setTab, setCollapsedPersist]);
 
+  // ── Locate orchestration (the ⌖ Reveal / ⌘⇧E path) ──────────────
+  // Same problem as the commit shortcut above, same shape: the tree is only
+  // mounted on the Files tab, and Review defaults to Changes whenever the
+  // workspace has changes — i.e. exactly when a reviewer asks "where is this
+  // file". So reveal has to open the tab (and expand the sidebar) first, then
+  // replay the request once the tree mounts and hands us its `locate`.
+  const treeLocateRef = useRef<((absPath: string) => void) | null>(null);
+  const pendingLocateRef = useRef<string | null>(null);
+
+  const handleTreeLocateRegister = useCallback((fn: (absPath: string) => void) => {
+    treeLocateRef.current = fn;
+    const pending = pendingLocateRef.current;
+    if (pending) {
+      pendingLocateRef.current = null;
+      fn(pending);
+    }
+  }, []);
+
+  useEffect(() => {
+    fileTree.registerLocate?.((absPath: string) => {
+      if (tab === "files" && !collapsed && treeLocateRef.current) {
+        treeLocateRef.current(absPath);
+      } else {
+        pendingLocateRef.current = absPath;
+        setTab("files");
+        setCollapsedPersist(false);
+      }
+    });
+    // `fileTree` is rebuilt each render by the parent's useMemo; only its
+    // registrar identity matters here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileTree.registerLocate, tab, collapsed, setTab, setCollapsedPersist]);
+
   // ── Collapsed strip — slim icons, mirrors the workspace rail ────
   if (collapsed) {
     return (
@@ -203,7 +236,7 @@ export function ReviewSidebar({
             changedPaths={fileTree.changedPaths}
             onFileClick={fileTree.onFileClick}
             activePath={fileTree.activePath}
-            registerLocate={fileTree.registerLocate}
+            registerLocate={handleTreeLocateRegister}
             headerLeading={headerLeading}
           />
         )}

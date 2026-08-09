@@ -384,6 +384,9 @@ export function CompanionFileTree({
       seenPathsRef.current = new Set(); // the new root's rows get their entrance
       lostFocusRef.current = null;
       setExpanded(cached ? new Set(cached.expanded) : new Set([rootPath]));
+      // A reveal aimed at the PREVIOUS worktree must not fire later against
+      // this one — it would steal focus and scroll on an unrelated row.
+      setPendingLocate(null);
       setChildren(sameIgnored ? cached.children : {});
       setFocusedPath(sameIgnored ? cached.focusedPath : rootPath);
       const toRevalidate = new Set(cached ? cached.expanded : []);

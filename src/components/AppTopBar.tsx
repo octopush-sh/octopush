@@ -55,7 +55,10 @@ export function AppTopBar({
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
       {/* Center logo + wordmark */}
-      <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
+      <div // pointer-events-none: this group is painted OVER the in-flow
+        // controls, and the project name widens it toward them — it must
+        // never swallow a click meant for History/Scratchpad/Settings.
+        className="pointer-events-none absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
         {/* The live mascot — body language mirrors app state (spec §4.4):
             needs-you → blocked (frozen, eyes half-mast), agents busy →
             working (paddling, eyes scanning), otherwise idle. */}

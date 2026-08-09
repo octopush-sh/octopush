@@ -45,7 +45,7 @@
 
 ### App shell layout & structure
 - **Vertical app frame** — The shell stacks `AppTopBar` (28px chrome) → main row (Rail · main · Companion) → `PerfMonitorBar` (footer), all `h-screen w-screen bg-octo-bg`. _Support:_ `src/App.tsx`. _Entry:_ always present once a project is open.
-- **Unified header band + content row** — `<main>` renders a full-width `ContextHeader` band, then a content row holding the canvas (left) and Companion (right) flush beneath it. _Support:_ `src/App.tsx`. _Entry:_ automatic when an active workspace exists.
+- **Three-column shell** — `<main>` holds the middle column only: a `ContextHeader` band (workspace identity) over the canvas column. The `WorkspaceRail` (left) and the `Companion` (right) are its SIBLINGS — both full height between the top bar and the status bar, both flush to their window edge, each carrying one hairline (`border-r` / `border-l`) toward the canvas. `<main>` is inset `mx-4` from both. _Support:_ `src/App.tsx`, `Companion.tsx`, `WorkspaceRail.tsx`. _Entry:_ structural.
 - **Always-mounted canvas (PTY survival)** — The left canvas column is never gated on `activeWorkspace`; empty-project/creator layers overlay it instead, so running terminals across projects keep their PTYs and xterm scrollback. _Support:_ `src/App.tsx`; `allTerminalRefs` flattens every `(workspace, terminal)` pair so all `TerminalPane`s mount simultaneously. _Entry:_ structural.
 - **macOS traffic-light reservation + window drag** — Top bar reserves 78px for overlaid traffic lights and is a `data-tauri-drag-region`, so the window drags from any empty area. _Support:_ `src/components/AppTopBar.tsx`. _Entry:_ the top chrome bar.
 

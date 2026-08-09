@@ -96,7 +96,23 @@ describe("RichPromptTextarea", () => {
   it("⌘⏎ does not submit while a reference list is open — Enter picks", async () => {
     const onSubmit = vi.fn();
     const onChange = vi.fn();
-    render(
+    // Start EMPTY and let the change event carry the new text: firing a change
+    // whose value equals the current one is suppressed by React's value
+    // tracker, so `onChange` never runs and the list never opens — that was a
+    // ~35% flake, not a timing quirk.
+    const { rerender } = render(
+      <RichPromptTextarea
+        value=""
+        onChange={onChange}
+        workspacePath={WS}
+        onSubmit={onSubmit}
+        aria-label="brief"
+      />,
+    );
+    await waitFor(() => expect(mockListSkills).toHaveBeenCalled());
+    const ta = screen.getByLabelText("brief") as HTMLTextAreaElement;
+    type(ta, "Ship it, then /code");
+    rerender(
       <RichPromptTextarea
         value="Ship it, then /code"
         onChange={onChange}
@@ -105,15 +121,32 @@ describe("RichPromptTextarea", () => {
         aria-label="brief"
       />,
     );
-    const ta = screen.getByLabelText("brief") as HTMLTextAreaElement;
-    await waitFor(() => expect(mockListSkills).toHaveBeenCalled());
-    type(ta, "Ship it, then /code");
-    // The catalogs are read from disk in the real app; under a loaded test
-    // runner that resolve can take longer than the 1s default.
     await screen.findByText("code-review", {}, { timeout: 4000 });
 
     fireEvent.keyDown(ta, { key: "Enter", metaKey: true });
     expect(onSubmit).not.toHaveBeenCalled();
     expect(onChange).toHaveBeenCalledWith("Ship it, then /code-review ");
+  });
+
+  it("shows no menu — and no empty-state panel — for a slash in ordinary prose", async () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <RichPromptTextarea value="" onChange={onChange} workspacePath={WS} aria-label="brief" />,
+    );
+    await waitFor(() => expect(mockListSkills).toHaveBeenCalled());
+    const ta = screen.getByLabelText("brief") as HTMLTextAreaElement;
+    type(ta, "write it to /usr");
+    rerender(
+      <RichPromptTextarea
+        value="write it to /usr"
+        onChange={onChange}
+        workspacePath={WS}
+        aria-label="brief"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/No skills found/i)).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
   });
 });

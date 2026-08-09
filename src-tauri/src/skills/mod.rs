@@ -188,26 +188,24 @@ pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
 }
 
 /// Whether `text` carries a standalone `/name` token.
+///
+/// Boundaries are compared as CHARS, not bytes: a byte-level test treats every
+/// UTF-8 continuation byte as "not alphanumeric", so `docs/café/code-review.md`
+/// and `🚀/code-review` would count as references and silently append a whole
+/// skill body to every stage's prompt.
 fn mentions_skill(text: &str, name: &str) -> bool {
-    let bytes = text.as_bytes();
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
+    }
     let needle = format!("/{name}");
     let mut from = 0usize;
     while let Some(rel) = text[from..].find(&needle) {
         let start = from + rel;
         let end = start + needle.len();
-        // The slash must not be glued to a preceding word (a path segment).
-        let before_ok = start == 0
-            || !bytes[start - 1].is_ascii_alphanumeric()
-                && bytes[start - 1] != b'/'
-                && bytes[start - 1] != b'.'
-                && bytes[start - 1] != b'-'
-                && bytes[start - 1] != b'_';
+        // The slash must not be glued to a preceding word (a path segment)…
+        let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word_char(c));
         // …and the name must end the token.
-        let after_ok = end >= bytes.len()
-            || !(bytes[end].is_ascii_alphanumeric()
-                || bytes[end] == b'-'
-                || bytes[end] == b'_'
-                || bytes[end] == b'/');
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_word_char(c));
         if before_ok && after_ok {
             return true;
         }
@@ -270,6 +268,24 @@ mod tests {
                 "false positive for: {brief}"
             );
         }
+    }
+
+    #[test]
+    fn non_ascii_neighbours_do_not_make_a_reference() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "code-review", "b");
+        // A byte-level boundary test treats UTF-8 continuation bytes as
+        // non-word characters, so these used to count as references.
+        for brief in ["see docs/café/code-review.md", "ñ/code-review"] {
+            assert!(
+                referenced_skills(tmp.path(), brief).is_empty(),
+                "false positive for: {brief}"
+            );
+        }
+        // A non-word neighbour IS a boundary, whatever its byte width: an emoji
+        // or a comma before the slash leaves a genuine reference standing.
+        assert_eq!(referenced_skills(tmp.path(), "🚀 /code-review").len(), 1);
+        assert_eq!(referenced_skills(tmp.path(), "café, then /code-review").len(), 1);
     }
 
     #[test]

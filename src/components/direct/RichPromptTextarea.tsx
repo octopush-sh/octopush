@@ -192,20 +192,33 @@ export function RichPromptTextarea({
 
   return (
     <div className="relative">
-      {slashOpen ? (
+      {/* Both open DOWNWARD here: the brief sits mid-canvas inside a
+          scrolling launcher, and upward overflow is clipped by that ancestor
+          rather than scrolled to — the active row would be the first thing
+          cut off. TALK keeps the upward default (its composer is at the
+          bottom of the screen).
+          `slashItems.length > 0` is a guard, not a nicety: SlashMenu renders a
+          "No skills found" panel on an empty list, and since `popoverOpen` is
+          false there, Escape would not dismiss it — typing `/usr/local` mid-
+          brief would leave it stuck until the caret left the token. */}
+      {slashOpen && slashItems.length > 0 ? (
         <SlashMenu
           items={slashItems}
           activeIndex={slashIndex}
           onSelect={selectSkill}
           onHover={setSlashIndex}
+          placement="down"
         />
       ) : (
-        <MentionPopover
-          items={mentionItems}
-          activeIndex={mentionIndex}
-          onSelect={selectMention}
-          onHover={setMentionIndex}
-        />
+        !slashOpen && (
+          <MentionPopover
+            items={mentionItems}
+            activeIndex={mentionIndex}
+            onSelect={selectMention}
+            onHover={setMentionIndex}
+            placement="down"
+          />
+        )
       )}
       <textarea
         ref={ref}
