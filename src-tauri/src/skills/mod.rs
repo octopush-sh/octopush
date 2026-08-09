@@ -160,9 +160,139 @@ pub fn load_skill(worktree: &Path, name: &str) -> Option<Skill> {
     scan_skills(worktree).into_iter().find(|s| s.name == name)
 }
 
+/// The skills a piece of prose names with a `/slug` token, in the order they
+/// first appear, deduped.
+///
+/// DIRECT has no per-run "active skill" field the way a TALK turn does — the
+/// brief is the only channel the director has. So a reference has to survive as
+/// text and be resolved when the stage actually runs, which is also what makes
+/// it robust: a hand-typed `/code-review` works exactly like one inserted from
+/// the picker.
+///
+/// Matching is against the worktree's KNOWN skills only, so ordinary prose
+/// (a path like `src/lib`, a date, `and/or`) can never be mistaken for a
+/// reference. The token must also stand alone — `/code-review` matches,
+/// `/code-review-notes` and `x/code-review` do not.
+pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
+    let known = scan_skills(worktree);
+    let mut out: Vec<Skill> = Vec::new();
+    for skill in known {
+        if out.iter().any(|s| s.name == skill.name) {
+            continue;
+        }
+        if mentions_skill(text, &skill.name) {
+            out.push(skill);
+        }
+    }
+    out
+}
+
+/// Whether `text` carries a standalone `/name` token.
+fn mentions_skill(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = format!("/{name}");
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        // The slash must not be glued to a preceding word (a path segment).
+        let before_ok = start == 0
+            || !bytes[start - 1].is_ascii_alphanumeric()
+                && bytes[start - 1] != b'/'
+                && bytes[start - 1] != b'.'
+                && bytes[start - 1] != b'-'
+                && bytes[start - 1] != b'_';
+        // …and the name must end the token.
+        let after_ok = end >= bytes.len()
+            || !(bytes[end].is_ascii_alphanumeric()
+                || bytes[end] == b'-'
+                || bytes[end] == b'_'
+                || bytes[end] == b'/');
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The section appended to a stage's system prompt for each skill the brief
+/// named. Same shape TALK uses for its active skill, so an agent meets the
+/// instructions in a form it has already been trained on in this app.
+pub fn skill_prompt_section(skills: &[Skill]) -> String {
+    let mut out = String::new();
+    for skill in skills {
+        out.push_str(&format!("\n\n# Active skill: {}\n{}", skill.name, skill.body));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
+
+    /// Writes a project skill into `<root>/.claude/skills/<name>/SKILL.md`.
+    fn write_skill(root: &Path, name: &str, body: &str) {
+        let dir = root.join(".claude/skills").join(name);
+        fs::create_dir_all(&dir).expect("mkdir skill");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\n{body}"),
+        )
+        .expect("write skill");
+    }
+
+    #[test]
+    fn brief_reference_resolves_to_the_skill_body() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "code-review", "Review like a hawk.");
+        let found = referenced_skills(tmp.path(), "Ship the parser, then /code-review it.");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "code-review");
+        assert!(found[0].body.contains("Review like a hawk."));
+    }
+
+    #[test]
+    fn unknown_slash_tokens_and_paths_are_not_references() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "code-review", "b");
+        // A path segment, a longer slug, and a skill that does not exist.
+        for brief in [
+            "look at src/code-review.ts",
+            "run the /code-review-notes checklist",
+            "use the /security-review skill",
+            "and/or something",
+        ] {
+            assert!(
+                referenced_skills(tmp.path(), brief).is_empty(),
+                "false positive for: {brief}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_named_twice_is_carried_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "simplify", "b");
+        let found = referenced_skills(tmp.path(), "/simplify now, then /simplify again");
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn skill_section_is_the_shape_talk_uses() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "code-review", "Review like a hawk.");
+        let section = skill_prompt_section(&referenced_skills(tmp.path(), "/code-review"));
+        assert!(section.contains("# Active skill: code-review"));
+        assert!(section.contains("Review like a hawk."));
+    }
+
+    #[test]
+    fn no_reference_appends_nothing() {
+        assert_eq!(skill_prompt_section(&[]), "");
+    }
 
     #[test]
     fn parses_frontmatter_and_body() {

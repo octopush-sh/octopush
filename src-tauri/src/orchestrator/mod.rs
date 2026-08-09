@@ -739,6 +739,11 @@ impl Orchestrator {
                     Some(roots) => ("sandbox".to_string(), roots),
                     None => (exec_choice, vec![ws_str]),
                 };
+            // Resolve the brief's `/slug` references against THIS worktree, at
+            // the moment the stage starts — a skill added (or edited) since the
+            // run was created is picked up, and a run whose worktree has no
+            // such skill simply carries none.
+            let skills = crate::skills::referenced_skills(&workspace_path, &run.task);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -749,6 +754,7 @@ impl Orchestrator {
                 cancel,
                 exec_isolation,
                 allowed_write_roots,
+                skills,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

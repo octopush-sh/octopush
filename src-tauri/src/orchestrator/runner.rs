@@ -34,6 +34,10 @@ pub struct StageContext {
     pub exec_isolation: String,
     /// Directories a sandbox may write to (the workspace worktree at minimum).
     pub allowed_write_roots: Vec<String>,
+    /// Skills the run's brief named (`/slug`), resolved against this worktree
+    /// when the stage starts. Both substrates append their instructions to the
+    /// stage's system prompt.
+    pub skills: Vec<crate::skills::Skill>,
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -202,7 +206,11 @@ impl AgentRunner for ApiRunner {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
         // API substrate: the `ask_director` escape valve is available, so the
         // carve-out is included (`can_ask_director = true`).
-        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        // Skills the brief named reach the stage as instructions, not as a
+        // literal `/slug` the agent would have to guess at — resolved here, at
+        // the moment this role actually runs.
+        system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
         let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
