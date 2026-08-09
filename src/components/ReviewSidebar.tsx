@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelLeftClose, PanelLeftOpen, FileDiff, FolderTree } from "lucide-react";
 import { ChangesPanel } from "./ChangesPanel";
 import { CompanionFileTree } from "./CompanionFileTree";
+import { NO_LOCATE } from "../lib/locate";
 import { FadeSwap } from "./primitives/FadeSwap";
 
 type Tab = "changes" | "files";
@@ -25,6 +26,11 @@ interface FileTreeProps {
   rootLabel: string;
   changedPaths: Set<string>;
   onFileClick?: (absPath: string) => void;
+  /** The file open in the editor — marked in the tree wherever it's visible. */
+  activePath?: string | null;
+  /** Receives the tree's `locate(absPath)` so the editor breadcrumb can point
+   *  the tree at the open file on demand. */
+  registerLocate?: (fn: (absPath: string) => void) => void;
 }
 
 interface Props {
@@ -120,6 +126,46 @@ export function ReviewSidebar({
     });
   }, [registerFocusCommit, tab, collapsed, setTab, setCollapsedPersist]);
 
+  // ── Locate orchestration (the ⌖ Reveal / ⌘⇧E path) ──────────────
+  // Same problem as the commit shortcut above, same shape: the tree is only
+  // mounted on the Files tab, and Review defaults to Changes whenever the
+  // workspace has changes — i.e. exactly when a reviewer asks "where is this
+  // file". So reveal has to open the tab (and expand the sidebar) first, then
+  // replay the request once the tree mounts and hands us its `locate`.
+  const treeLocateRef = useRef<((absPath: string) => void) | null>(null);
+  const pendingLocateRef = useRef<string | null>(null);
+
+  const handleTreeLocateRegister = useCallback((fn: (absPath: string) => void) => {
+    // An unmounting tree registers the NO_LOCATE sentinel; it must neither
+    // become the live locate nor consume a pending reveal, which belongs to
+    // the tree that mounts next.
+    if (fn === NO_LOCATE) {
+      treeLocateRef.current = null;
+      return;
+    }
+    treeLocateRef.current = fn;
+    const pending = pendingLocateRef.current;
+    if (pending) {
+      pendingLocateRef.current = null;
+      fn(pending);
+    }
+  }, []);
+
+  useEffect(() => {
+    fileTree.registerLocate?.((absPath: string) => {
+      if (tab === "files" && !collapsed && treeLocateRef.current) {
+        treeLocateRef.current(absPath);
+      } else {
+        pendingLocateRef.current = absPath;
+        setTab("files");
+        setCollapsedPersist(false);
+      }
+    });
+    // `fileTree` is rebuilt each render by the parent's useMemo; only its
+    // registrar identity matters here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileTree.registerLocate, tab, collapsed, setTab, setCollapsedPersist]);
+
   // ── Collapsed strip — slim icons, mirrors the workspace rail ────
   if (collapsed) {
     return (
@@ -197,6 +243,8 @@ export function ReviewSidebar({
             rootLabel={fileTree.rootLabel}
             changedPaths={fileTree.changedPaths}
             onFileClick={fileTree.onFileClick}
+            activePath={fileTree.activePath}
+            registerLocate={handleTreeLocateRegister}
             headerLeading={headerLeading}
           />
         )}

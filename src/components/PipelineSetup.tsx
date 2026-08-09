@@ -12,6 +12,7 @@ import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
 import { Github } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
+import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
 
 /** Builtin pipelines a mission's intent should default-select in the launcher
@@ -180,16 +181,14 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
 
         {/* The brief — the noblest object: serif on panel. ⌘⏎ begins. */}
         <div className="mb-8 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
-          <textarea
+          {/* `@file` points the crew at code; `/skill` is resolved when the
+              stage runs, so the role that needs it gets its instructions. */}
+          <RichPromptTextarea
             value={task}
-            onChange={(e) => setTask(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                e.preventDefault();
-                beginNow();
-              }
-            }}
-            placeholder="What should the ensemble take on?"
+            onChange={setTask}
+            workspacePath={workspacePath}
+            onSubmit={beginNow}
+            placeholder="What should the ensemble take on?  @file · /skill"
             aria-label="The brief"
             className="h-20 w-full resize-none bg-transparent font-serif text-[15px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
           />

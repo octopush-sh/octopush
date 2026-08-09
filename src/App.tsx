@@ -29,6 +29,7 @@ import { ChatView } from "./components/ChatView";
 import { ReviewSidebar } from "./components/ReviewSidebar";
 import { EditorWithPreview } from "./components/editor/EditorWithPreview";
 import { EditorTabs } from "./components/EditorTabs";
+import { EditorBreadcrumb } from "./components/EditorBreadcrumb";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
 import { ModeOverlay } from "./components/ModeOverlay";
@@ -932,6 +933,20 @@ function App() {
         return;
       }
 
+      // ⌘⇧E → point the Review file tree at the file open in the editor.
+      // Review-only: outside it there is no tree listening. Both the mode and
+      // the open path are read LIVE — this listener is registered with a dep
+      // array that carries neither, so anything closed over here would be the
+      // value from whenever it last re-registered.
+      if (mod && e.shiftKey && (e.key === "E" || e.key === "e")) {
+        e.preventDefault();
+        if (focusGlobal.mode === "review" && activeWorkspaceId) {
+          const openPath = useEditorStore.getState().getActivePath(activeWorkspaceId);
+          if (openPath) locateInTreeFn.current?.(openPath);
+        }
+        return;
+      }
+
       // ⌘N → new workspace
       if (mod && !e.shiftKey && e.key === "n") {
         e.preventDefault();
@@ -1343,6 +1358,17 @@ function App() {
     [navigateToFile],
   );
 
+  // ── Review · locate the open file in the tree ────────────────────
+  // The tree never follows the editor on its own (that would shift it under
+  // the reader mid-diff); it exposes a `locate` the breadcrumb calls, the same
+  // register-a-callback shape ChangesPanel uses for the commit box.
+  const locateInTreeFn = useRef<((absPath: string) => void) | null>(null);
+  const registerLocateInTree = useCallback((fn: (absPath: string) => void) => {
+    locateInTreeFn.current = fn;
+  }, []);
+  const editorActivePath = useEditorStore((s) =>
+    activeWorkspaceId ? s.getActivePath(activeWorkspaceId) : null,
+  );
   const fileTreeProps = useMemo(() => {
     if (!activeWorkspace) return undefined;
     const rootPath = activeWorkspace.worktreePath || project!.path;
@@ -1354,8 +1380,17 @@ function App() {
       ),
       // FILES rail click → land in the Editor with the file open as a tab.
       onFileClick: (p: string) => navigateToFile(p, "editor"),
+      activePath: editorActivePath,
+      registerLocate: registerLocateInTree,
     };
-  }, [activeWorkspace, project, gitStatus, navigateToFile]);
+  }, [
+    activeWorkspace,
+    project,
+    gitStatus,
+    navigateToFile,
+    editorActivePath,
+    registerLocateInTree,
+  ]);
 
   // ── Customize menu submit ──
   const handleCustomizeSubmit = useCallback(
@@ -1895,6 +1930,7 @@ function App() {
         onOpenSettings={() => setSettingsTab("general")}
         onToggleScratchpad={toggleScratchpad}
         onOpenMissionControl={() => setMissionControlOpen(true)}
+        projectName={activeProject?.name ?? project?.name ?? null}
       />
       <div className="flex min-h-0 flex-1">
       <WorkspaceRail
@@ -1918,11 +1954,12 @@ function App() {
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
       />
 
-      <main className="ml-4 flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR),
-            spanning the full main width so the top of the app reads as one
-            unified header card. The modes are NOT here: they sit in their own
-            band below, over the canvas column they govern. */}
+      <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">
+        {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR).
+            It spans the middle column only: the rail and the Companion are
+            both full-height siblings of <main>, so the header sits between
+            them rather than over the Companion. The modes are NOT here: they
+            sit in their own band below, over the canvas column they govern. */}
         {activeWorkspace && (
           <ContextHeader
             workspaceName={activeWorkspace.name}
@@ -1938,7 +1975,7 @@ function App() {
           />
         )}
 
-        {/* CONTENT ROW — columns flush under the header band. */}
+        {/* CONTENT ROW — the canvas column, filling what the header leaves. */}
         <div className="flex min-w-0 flex-1 overflow-hidden">
         {/* LEFT COLUMN — always mounted so the canvas (and the TerminalPanes
             inside the Run mode panel) survive any moment when there's no
@@ -2088,6 +2125,11 @@ function App() {
                       >
                         {/* Editor mode content */}
                         <EditorTabs workspaceId={activeWorkspaceId!} />
+                        <EditorBreadcrumb
+                          path={editorActivePath}
+                          rootPath={activeWorkspace.worktreePath || project.path}
+                          onReveal={(p) => locateInTreeFn.current?.(p)}
+                        />
                         <EditorWithPreview
                           workspaceId={activeWorkspaceId!}
                           workspacePath={activeWorkspace.worktreePath || project.path}
@@ -2171,18 +2213,22 @@ function App() {
               </div>
             )}
         </div>
+        </div>
+      </main>
 
-        {/* RIGHT COLUMN — Companion always mounted. When there's no active
-            workspace the panel just shows empty/default data; the structure
-            is preserved. The mode switcher lives in the ModeBand above the
-            canvas, not here. Resizable via the 4px handle on the left edge:
-            drag to widen/narrow, double-click to reset to default. */}
-        <div
-          className={`relative flex shrink-0 flex-col pt-0 transition-all duration-[220ms] ${
-            isCompanionCollapsed ? "px-2 pb-4" : "p-4"
-          }`}
-          style={{ width: isCompanionCollapsed ? COMPANION_COLLAPSED_WIDTH : companionWidth }}
-        >
+      {/* RIGHT RAIL — the Companion, always mounted. When there's no active
+          workspace the panel just shows empty/default data; the structure is
+          preserved. It is a SIBLING of the WorkspaceRail, not a child of
+          <main>: full height between the top bar and the status bar, flush to
+          the window's right edge, carrying a single `border-l` hairline — the
+          mirror of the rail's `border-r`. That is also why the ContextHeader
+          above no longer spans it. The mode switcher lives in the ModeBand
+          over the canvas, not here. Resizable via the 4px handle on the left
+          edge: drag to widen/narrow, double-click to reset to default. */}
+      <div
+        className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
+        style={{ width: isCompanionCollapsed ? COMPANION_COLLAPSED_WIDTH : companionWidth }}
+      >
           {/* The resize handle only makes sense when expanded. */}
           {!isCompanionCollapsed && (
             <div
@@ -2222,10 +2268,8 @@ function App() {
             onMakeProject={
               sketchbookPath && activeProject?.path === sketchbookPath ? handleMakeProject : undefined
             }
-          />
-        </div>
-        </div>
-      </main>
+        />
+      </div>
       </div>
       <PerfMonitorBar
         workspacePath={activeWorkspace?.worktreePath ?? project?.path}

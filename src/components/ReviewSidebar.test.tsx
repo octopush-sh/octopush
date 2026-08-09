@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const { changesFocusSpy } = vi.hoisted(() => ({ changesFocusSpy: vi.fn() }));
@@ -7,6 +7,7 @@ const { changesFocusSpy } = vi.hoisted(() => ({ changesFocusSpy: vi.fn() }));
 // Stub the heavy panels — we only test the sidebar's tab + collapse logic.
 // Each stub echoes the injected headerLeading so the tab switcher is reachable;
 // the ChangesPanel stub registers a focuser so we can exercise the `c` shortcut.
+const treeLocateSpy = vi.fn();
 vi.mock("./ChangesPanel", () => ({
   ChangesPanel: ({
     headerLeading,
@@ -20,9 +21,16 @@ vi.mock("./ChangesPanel", () => ({
   },
 }));
 vi.mock("./CompanionFileTree", () => ({
-  CompanionFileTree: ({ headerLeading }: { headerLeading?: React.ReactNode }) => (
-    <div data-testid="files-tree">{headerLeading}</div>
-  ),
+  CompanionFileTree: ({
+    headerLeading,
+    registerLocate,
+  }: {
+    headerLeading?: React.ReactNode;
+    registerLocate?: (fn: (p: string) => void) => void;
+  }) => {
+    registerLocate?.(treeLocateSpy);
+    return <div data-testid="files-tree">{headerLeading}</div>;
+  },
 }));
 
 import { ReviewSidebar } from "./ReviewSidebar";
@@ -37,6 +45,7 @@ const baseProps = {
 beforeEach(() => {
   localStorage.clear();
   changesFocusSpy.mockClear();
+  treeLocateSpy.mockClear();
 });
 
 describe("ReviewSidebar", () => {
@@ -90,5 +99,46 @@ describe("ReviewSidebar", () => {
     act(() => focusCommit?.());
     expect(await screen.findByTestId("changes-panel")).toBeInTheDocument();
     expect(changesFocusSpy).toHaveBeenCalled();
+  });
+
+  it("reveal from the Changes tab opens Files and replays the request", async () => {
+    // The blocking regression: the tree is only mounted on the Files tab, and
+    // Review defaults to Changes whenever there are changes — which is exactly
+    // when a reviewer asks "where is this file".
+    let reveal: ((p: string) => void) | null = null;
+    render(
+      <ReviewSidebar
+        changedCount={3}
+        {...baseProps}
+        fileTree={{ ...baseProps.fileTree, registerLocate: (fn) => { reveal = fn; } }}
+      />,
+    );
+    expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+    expect(treeLocateSpy).not.toHaveBeenCalled();
+
+    await act(async () => reveal!("/repo/src/App.tsx"));
+
+    // FadeSwap holds the outgoing panel for its 120ms exit before the tree
+    // mounts and registers — the replay lands then, not synchronously.
+    await screen.findByTestId("files-tree");
+    await waitFor(() => expect(treeLocateSpy).toHaveBeenCalledWith("/repo/src/App.tsx"));
+  });
+
+  it("reveal from a collapsed sidebar expands it and replays the request", async () => {
+    localStorage.setItem("reviewSidebarCollapsed", "1");
+    let reveal: ((p: string) => void) | null = null;
+    render(
+      <ReviewSidebar
+        changedCount={0}
+        {...baseProps}
+        fileTree={{ ...baseProps.fileTree, registerLocate: (fn) => { reveal = fn; } }}
+      />,
+    );
+    expect(screen.queryByTestId("files-tree")).not.toBeInTheDocument();
+
+    await act(async () => reveal!("/repo/src/lib/modeMeta.ts"));
+
+    await screen.findByTestId("files-tree");
+    await waitFor(() => expect(treeLocateSpy).toHaveBeenCalledWith("/repo/src/lib/modeMeta.ts"));
   });
 });

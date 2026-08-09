@@ -290,7 +290,12 @@ impl AgentRunner for CliRunner {
         // instructions still shape the stage via the system prompt.
         // CLI substrate has no `ask_director` tool — keep the strict never-ask
         // preamble by NOT appending the carve-out (`can_ask_director = false`).
-        let system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), false);
+        let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), false);
+        // Same skill instructions the API substrate gets. The CLI resolves
+        // `/slug` itself only for its own interactive input; a stage prompt is
+        // not that, so the body is inlined here rather than hoping the CLI
+        // reads the token out of the brief.
+        system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
                 build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),

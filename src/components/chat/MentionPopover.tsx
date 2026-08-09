@@ -3,6 +3,11 @@ interface Props {
   activeIndex: number;
   onSelect: (path: string) => void;
   onHover: (index: number) => void;
+  /** Which way the list opens. TALK's composer sits at the bottom of the
+   *  screen, so `up` is the default; a mid-canvas host (DIRECT's brief)
+   *  must pass `down` — upward overflow cannot be scrolled to inside an
+   *  `overflow:auto` ancestor, it is simply clipped. */
+  placement?: "up" | "down";
 }
 
 /**
@@ -11,11 +16,11 @@ interface Props {
  * Composer so it can coexist with the textarea's own key handling. The active
  * row is brass-tinted; the basename is emphasized over its dimmed directory.
  */
-export function MentionPopover({ items, activeIndex, onSelect, onHover }: Props) {
+export function MentionPopover({ items, activeIndex, onSelect, onHover, placement = "up" }: Props) {
   if (items.length === 0) return null;
   return (
     <div
-      className="octo-pop-in absolute bottom-full left-0 z-20 mb-1.5 max-h-64 w-[min(28rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg"
+      className={`octo-pop-in ${placement === "down" ? "top-full mt-1.5" : "bottom-full mb-1.5"} absolute left-0 z-20 max-h-64 w-[min(28rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg`}
       role="listbox"
       id="mention-popover"
       aria-label="Worktree files"

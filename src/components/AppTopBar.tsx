@@ -24,9 +24,18 @@ interface Props {
   onToggleScratchpad: () => void;
   /** Open the Mission Control room (the fleet cockpit). */
   onOpenMissionControl: () => void;
+  /** The active workspace's parent project. Rides with the wordmark so the
+   *  user always knows which project they are standing in. Null before a
+   *  project resolves — the divider and name are then omitted entirely. */
+  projectName?: string | null;
 }
 
-export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionControl }: Props) {
+export function AppTopBar({
+  onOpenSettings,
+  onToggleScratchpad,
+  onOpenMissionControl,
+  projectName = null,
+}: Props) {
   const openHistory = useHistoryStore((s) => s.openSheet);
   const showUpgrade = useUpgradeStore((s) => s.show);
   const { hasFeature } = useEntitlement();
@@ -46,7 +55,10 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
       className="flex h-[28px] w-full flex-shrink-0 items-center border-b border-octo-hairline bg-octo-panel pl-[78px] pr-3"
     >
       {/* Center logo + wordmark */}
-      <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
+      <div // pointer-events-none: this group is painted OVER the in-flow
+        // controls, and the project name widens it toward them — it must
+        // never swallow a click meant for History/Scratchpad/Settings.
+        className="pointer-events-none absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
         {/* The live mascot — body language mirrors app state (spec §4.4):
             needs-you → blocked (frozen, eyes half-mast), agents busy →
             working (paddling, eyes scanning), otherwise idle. */}
@@ -54,13 +66,37 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
           role="img"
           aria-label={mascot.label}
           title={mascot.label}
-          className="flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
+          // pointer-events-auto: the group is inert so it cannot swallow
+          // clicks meant for the right-hand controls, but this span owns a
+          // title/aria tooltip and sits at the group's LEFT edge, nowhere
+          // near them.
+          className="pointer-events-auto flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
         >
           <OctoMark size={20} state={mascot.state} />
         </span>
         <span className="brand-wordmark text-[13px] text-octo-brass">
           Octopush
         </span>
+        {/* The project the active workspace belongs to. Mono/mute so the
+            brand keeps the voice and the project reads as state, and
+            truncating so a long name can never push the mark off centre. */}
+        {projectName && (
+          <>
+            <span aria-hidden className="text-[11px] text-octo-mute">
+              ·
+            </span>
+            <span
+              title={`Project · ${projectName}`}
+              // Narrower than it could be (and pointer-events-auto for its
+              // tooltip, which is the only way to read a truncated name):
+              // this span is the part of the group that reaches toward the
+              // right-hand controls, so it trades width for clearance.
+              className="pointer-events-auto max-w-[180px] truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage"
+            >
+              {projectName}
+            </span>
+          </>
+        )}
       </div>
       <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">

@@ -949,3 +949,76 @@ describe("CompanionFileTree", () => {
     );
   });
 });
+
+describe("CompanionFileTree · locating the open file", () => {
+  it("marks the open file's row wherever it is already visible", async () => {
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        activePath="/repo/pom.xml"
+      />,
+    );
+    const row = await screen.findByTestId("file-row-/repo/pom.xml");
+    expect(row).toHaveAttribute("aria-current", "true");
+    // …and it is the only marked row.
+    expect(document.querySelectorAll('[aria-current="true"]')).toHaveLength(1);
+  });
+
+  it("does not follow the editor on its own — a collapsed folder stays collapsed", async () => {
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        activePath="/repo/src/Main.java"
+      />,
+    );
+    await screen.findByText("src");
+    // src is collapsed, so the active file's row must NOT have been revealed.
+    expect(screen.queryByTestId("file-row-/repo/src/Main.java")).not.toBeInTheDocument();
+  });
+
+  it("expands the ancestors and shows the row when asked to locate", async () => {
+    let locate: ((p: string) => void) | null = null;
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        activePath="/repo/src/Main.java"
+        registerLocate={(fn) => {
+          locate = fn;
+        }}
+      />,
+    );
+    await screen.findByText("src");
+    expect(screen.queryByTestId("file-row-/repo/src/Main.java")).not.toBeInTheDocument();
+
+    locate!("/repo/src/Main.java");
+
+    const row = await screen.findByTestId("file-row-/repo/src/Main.java");
+    expect(row).toHaveAttribute("aria-current", "true");
+  });
+
+  it("ignores a path outside the worktree", async () => {
+    let locate: ((p: string) => void) | null = null;
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        registerLocate={(fn) => {
+          locate = fn;
+        }}
+      />,
+    );
+    await screen.findByText("src");
+    locate!("/somewhere/else/x.ts");
+    // src stays collapsed: nothing was expanded on its behalf.
+    await waitFor(() =>
+      expect(screen.queryByTestId("file-row-/repo/src/Main.java")).not.toBeInTheDocument(),
+    );
+  });
+});

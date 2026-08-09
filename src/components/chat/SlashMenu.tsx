@@ -6,6 +6,11 @@ interface Props {
   activeIndex: number;
   onSelect: (skill: SkillMeta) => void;
   onHover: (index: number) => void;
+  /** Which way the list opens. TALK's composer sits at the bottom of the
+   *  screen, so `up` is the default; a mid-canvas host (DIRECT's brief)
+   *  must pass `down` — upward overflow cannot be scrolled to inside an
+   *  `overflow:auto` ancestor, it is simply clipped. */
+  placement?: "up" | "down";
 }
 
 /**
@@ -14,10 +19,10 @@ interface Props {
  * in the Composer (shared with the @file popover). Selecting a skill activates
  * it for subsequent turns until cleared.
  */
-export function SlashMenu({ items, activeIndex, onSelect, onHover }: Props) {
+export function SlashMenu({ items, activeIndex, onSelect, onHover, placement = "up" }: Props) {
   return (
     <div
-      className="octo-pop-in absolute bottom-full left-0 z-20 mb-1.5 max-h-64 w-[min(30rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg"
+      className={`octo-pop-in ${placement === "down" ? "top-full mt-1.5" : "bottom-full mb-1.5"} absolute left-0 z-20 max-h-64 w-[min(30rem,100%)] overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-lg`}
       role="listbox"
       id="slash-popover"
       aria-label="Skills"
