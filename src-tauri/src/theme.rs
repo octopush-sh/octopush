@@ -458,16 +458,40 @@ mod tests {
         );
     }
 
-    /// The one theme excluded from the AA gate below.
+    /// The one theme excluded from the text-ink AA gate below.
     ///
-    /// Solarized is a published, named palette, and its dark variant does not
-    /// meet WCAG AA by design: upstream's own body text (base0 `#839496`) is
-    /// 3.43:1 on base03, and its comment tone (base01) is 2.02:1. Raising
-    /// `text_muted` alone would make the *quietest* token the brightest one,
-    /// inverting the hierarchy; raising the whole ramp would mean the theme is
-    /// no longer Solarized. We keep it verbatim so existing configs are
-    /// untouched, and exclude it explicitly rather than silently.
+    /// Solarized is a published, named palette whose dark variant does not
+    /// carry an AA-capable text ramp. Measured against *upstream's own*
+    /// surfaces: body text (base0 `#839496`) is 4.75:1 on base03 but 4.11:1 on
+    /// base02, and the comment tone (base01 `#586e75`) is 2.79:1 and 2.42:1 —
+    /// below AA wherever it sits. Raising `text_muted` alone would make the
+    /// *quietest* token the brightest one, inverting the hierarchy; raising the
+    /// whole ramp would mean the theme is no longer Solarized. We keep it
+    /// verbatim so existing configs are untouched, and exclude it explicitly
+    /// rather than silently.
+    ///
+    /// Note on the numbers: it is tempting to quote this theme's worst-surface
+    /// ratios (3.43:1 / 2.02:1), but those are measured against `panel_2`
+    /// (`#0a4351`) — a surface OCTOPUSH invented, not part of Solarized. Using
+    /// them here would blame upstream for our own choice.
     const NOT_AA_CAPABLE: [&str; 1] = ["solarized-dark"];
+
+    #[test]
+    fn every_theme_without_exception_has_a_usable_control_border() {
+        // `border_strong` is ours in every theme — it has no upstream
+        // counterpart anywhere — so NOT_AA_CAPABLE has no bearing on it. It
+        // used to sit inside that exclusion, which meant solarized-dark's could
+        // be darkened below 3:1 with the suite still green.
+        for t in builtin_themes() {
+            let b = worst_surface_ratio(&t, &t.border_strong);
+            assert!(
+                b >= 3.0,
+                "{} border_strong ({}) is {b:.2}:1, needs 3.0:1",
+                t.name,
+                t.border_strong
+            );
+        }
+    }
 
     #[test]
     fn every_theme_clears_aa_for_its_text_inks() {
@@ -491,12 +515,60 @@ mod tests {
                     t.name
                 );
             }
-            let b = worst_surface_ratio(&t, &t.border_strong);
-            assert!(
-                b >= 3.0,
-                "{} border_strong ({}) is {b:.2}:1, needs 3.0:1",
-                t.name,
-                t.border_strong
+        }
+    }
+
+    /// `src/styles.css`'s `@theme` block is the first-paint copy of atelier —
+    /// what the window shows before `themeStore` writes anything, and what
+    /// Tailwind compiles its utility classes against. It drifted once already:
+    /// `text_muted` was raised here to clear AA and the stylesheet kept the old
+    /// 3.06:1 value, so every `text-octo-mute` element painted the failing
+    /// colour until the store caught up.
+    ///
+    /// Asserted from Rust rather than vitest because vitest stubs `.css`
+    /// imports to an empty string, which would make the same check pass
+    /// vacuously on the frontend side.
+    #[test]
+    fn styles_css_first_paint_matches_atelier() {
+        let css = include_str!("../../src/styles.css");
+        let atelier = &builtin_themes()[0];
+
+        for (token, expected) in [
+            ("--color-octo-onyx", &atelier.bg),
+            ("--color-octo-panel", &atelier.panel),
+            ("--color-octo-panel-2", &atelier.panel_2),
+            ("--color-octo-hairline", &atelier.border),
+            ("--color-octo-border-strong", &atelier.border_strong),
+            ("--color-octo-brass", &atelier.accent),
+            ("--color-octo-brass-hi", &atelier.accent_dim),
+            ("--color-octo-ivory", &atelier.text),
+            ("--color-octo-sage", &atelier.text_dim),
+            ("--color-octo-mute", &atelier.text_muted),
+            ("--color-octo-verdigris", &atelier.success),
+            ("--color-octo-rouge", &atelier.danger),
+            ("--color-octo-warning", &atelier.warning),
+        ] {
+            let needle = format!("{token}:");
+            let line = css
+                .lines()
+                .find(|l| l.trim_start().starts_with(&needle))
+                .unwrap_or_else(|| panic!("{token} must be declared in src/styles.css"));
+            // Take the first whitespace-delimited word FIRST, then strip the
+            // semicolon: several declarations carry a trailing `/* … */`, so
+            // trimming `;` off the whole remainder strips nothing and leaves
+            // the value as `#dfae4a;`.
+            let value: String = line
+                .split(':')
+                .nth(1)
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .to_lowercase();
+            assert_eq!(
+                &value, expected,
+                "src/styles.css {token} is {value}, but atelier ships {expected}"
             );
         }
     }

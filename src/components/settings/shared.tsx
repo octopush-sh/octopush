@@ -246,9 +246,9 @@ function readChartColors(): ChartColors {
       tooltipBg: "#14110d",
       hairline: "#2a2419",
       ivory: "#f4ecdb",
-      mute: "#6d6354",
+      mute: "#8c7f6c",
       sage: "#95897a",
-      series: ["#d4a574", "#8fc9a8", "#7a9cb8", "#a888b8", "#d18b8b", "#6d6354"],
+      series: ["#d4a574", "#8fc9a8", "#7a9cb8", "#a888b8", "#d18b8b", "#8c7f6c"],
     };
   }
   const s = getComputedStyle(document.documentElement);
@@ -257,7 +257,7 @@ function readChartColors(): ChartColors {
   const stateBlue = readVar(s, "--color-octo-state-blue", "#7a9cb8");
   const statePurple = readVar(s, "--color-octo-state-purple", "#a888b8");
   const rouge = readVar(s, "--color-octo-rouge", "#d18b8b");
-  const mute = readVar(s, "--color-octo-mute", "#6d6354");
+  const mute = readVar(s, "--color-octo-mute", "#8c7f6c");
   return {
     accent,
     tooltipBg: readVar(s, "--color-octo-panel", "#14110d"),

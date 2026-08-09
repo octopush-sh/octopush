@@ -6,6 +6,9 @@ import indexHtml from "../../index.html?raw";
 import themeRs from "../../src-tauri/src/theme.rs?raw";
 import contrastSrc from "./contrast.test.ts?raw";
 import storeSrc from "../stores/themeStore.test.ts?raw";
+import tokensSrc from "./tokens.ts?raw";
+import xtermSrc from "./xtermTheme.ts?raw";
+import editorThemeSrc from "../components/editor/atelierTheme.ts?raw";
 
 /**
  * Drift gate for the palettes that are necessarily duplicated outside
@@ -120,6 +123,59 @@ describe("palette drift", () => {
   });
 });
 
+describe("static fallbacks track theme.rs", () => {
+  // Several places hold a copy of atelier as a literal, because they run before
+  // `themeStore` has written anything (first paint) or outside a DOM entirely
+  // (unit tests, CodeMirror/xterm theme construction). They drifted once
+  // already: `text_muted` was raised in theme.rs to clear AA and every one of
+  // these kept shipping the old 3.06:1 value, so the first frame — and the
+  // whole non-DOM path — stayed at the failing colour.
+  //
+  // `src/styles.css` is the one layer NOT checked here: vitest stubs `.css`
+  // imports to an empty string, so `?raw` yields nothing and any assertion
+  // against it would pass vacuously. It is asserted from the Rust side
+  // instead — `styles_css_first_paint_matches_atelier` in theme.rs, which
+  // reads it with `include_str!`.
+  const atelier = () => themeFromRust("atelier");
+
+  it("the TS token mirror and the non-DOM fallbacks match atelier", () => {
+    const a = atelier();
+    const grab = (src: string, key: string) => {
+      const m = src.match(new RegExp(`\\b${key}:\\s*"(#[0-9a-fA-F]{6})"`));
+      return m ? m[1].toLowerCase() : null;
+    };
+    // lib/tokens.ts — the typed mirror components use for runtime inline styles.
+    expect(grab(tokensSrc, "mute"), "tokens.ts mute").toBe(a.text_muted);
+    expect(grab(tokensSrc, "sage"), "tokens.ts sage").toBe(a.text_dim);
+    expect(grab(tokensSrc, "ivory"), "tokens.ts ivory").toBe(a.text);
+    // xterm + CodeMirror: used before `octo:theme` lands and in jsdom tests.
+    expect(grab(xtermSrc, "mute"), "xtermTheme fallback mute").toBe(a.text_muted);
+    expect(grab(xtermSrc, "sage"), "xtermTheme fallback sage").toBe(a.text_dim);
+    expect(grab(editorThemeSrc, "mute"), "atelierTheme fallback mute").toBe(a.text_muted);
+    expect(grab(editorThemeSrc, "sage"), "atelierTheme fallback sage").toBe(a.text_dim);
+  });
+
+  it("no component hardcodes a palette hex where a token would do", () => {
+    // ToolCallCard held the entire atelier palette as literals, so its cards
+    // rendered onyx-on-cream under vellum and froze `mute` at the pre-AA value.
+    // Inline styles are still fine there — they just have to resolve var().
+    const offenders: string[] = [];
+    for (const [path, src] of Object.entries(
+      import.meta.glob("../components/**/*.tsx", {
+        eager: true,
+        query: "?raw",
+        import: "default",
+      }) as Record<string, string>,
+    )) {
+      if (path.endsWith(".test.tsx")) continue;
+      for (const m of src.matchAll(/^const [A-Z_]+ = "(#[0-9a-fA-F]{6})";/gm)) {
+        offenders.push(`${path}: ${m[0]}`);
+      }
+    }
+    expect(offenders, "use var(--color-octo-*) in the inline style instead").toEqual([]);
+  });
+});
+
 describe("interactive boundaries", () => {
   // Guards the regression this gate was written for: `border_strong` shipped
   // once as a fully-themed, fully-tested token that NO component used, while
@@ -139,6 +195,14 @@ describe("interactive boundaries", () => {
     const consts: Record<string, string> = {};
     for (const m of src.matchAll(/const (\w+) =\s*\n?\s*"([^"]*)"/g)) {
       if (m[2].includes("border-octo-")) consts[m[1]] = m[2];
+    }
+    // Destructured default parameters (`triggerClassName = DEFAULT_SURFACE,`)
+    // alias a constant onto the prop name the tag actually interpolates. Without
+    // this, Listbox's own combobox trigger — the default surface behind every
+    // dropdown in the app — was scanned but never resolved, so the gate passed
+    // while it sat on the hairline.
+    for (const m of src.matchAll(/(\w+)\s*=\s*([A-Z][A-Z0-9_]*)\s*[,)]/g)) {
+      if (consts[m[2]]) consts[m[1]] = consts[m[2]];
     }
     return consts;
   }
@@ -191,17 +255,56 @@ describe("interactive boundaries", () => {
    *  there bypasses Tailwind entirely. */
   function restingHairline(tag: string): boolean {
     const stripped = tag.replace(/[\w-]+:border-octo-[\w-]+/g, "");
-    return (
+    const mentionsHairline =
       /\bborder-octo-hairline\b/.test(stripped) ||
-      /border:[^,}]*var\(--color-octo-hairline\)/.test(stripped)
-    );
+      /border:[^,}]*var\(--color-octo-hairline\)/.test(stripped);
+    if (!mentionsHairline) return false;
+
+    // A SINGLE-SIDE border is a divider, not a control outline: `border-b` on a
+    // role="tablist" separates the tab strip from the editor below it, and
+    // 1.4.11 governs the boundary that identifies a component, not every rule
+    // an element happens to draw. Only an all-sides `border` counts — which is
+    // what an actual control track (SegmentedControl, the Listbox trigger)
+    // uses. Without this the gate flags real dividers and becomes noise.
+    const allSides = /(?:^|[\s"'`{])border(?![-\w])/.test(stripped);
+    return allSides;
+  }
+
+  /** Elements that are controls by ARIA role rather than by tag — the custom
+   *  combobox trigger and the two switch styles. Walks back from the role
+   *  attribute to its own `<`, then forward with the same brace tracker. */
+  function roleControlTags(src: string): Array<{ raw: string; expanded: string }> {
+    const consts = classConstants(src);
+    const out: Array<{ raw: string; expanded: string }> = [];
+    for (const m of src.matchAll(/role="(switch|combobox|radiogroup|tablist)"/g)) {
+      const open = src.lastIndexOf("<", m.index!);
+      if (open === -1) continue;
+      let i = open + 1;
+      let depth = 0;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "{") depth++;
+        else if (c === "}") depth--;
+        else if (c === ">" && depth === 0) break;
+        i++;
+      }
+      const raw = src.slice(open, i + 1);
+      let expanded = raw;
+      for (const [name, value] of Object.entries(consts)) {
+        if (new RegExp(`\\b${name}\\b`).test(raw)) expanded += ` /*${name}*/ ${value}`;
+      }
+      out.push({ raw, expanded });
+    }
+    return out;
   }
 
   it("never loses sync while scanning a tag", () => {
     // Guards the failure mode that makes every other assertion here worthless.
     const broken: string[] = [];
     for (const [path, src] of Object.entries(sources)) {
-      for (const tag of controlTags(src)) {
+      // Both scanners: roleControlTags walks BACKWARD to find its opening `<`,
+      // so a `<` inside an earlier attribute would derail it just as silently.
+      for (const tag of [...controlTags(src), ...roleControlTags(src)]) {
         if (tagLostSync(tag.raw)) broken.push(`${path}: ${tag.raw.length} chars`);
       }
     }
@@ -233,44 +336,21 @@ describe("interactive boundaries", () => {
     ).toEqual([]);
   });
 
-  /** Elements that are controls by ARIA role rather than by tag — the custom
-   *  combobox trigger and the two switch styles. Walks back from the role
-   *  attribute to its own `<`, then forward with the same brace tracker. */
-  function roleControlTags(src: string): Array<{ raw: string; expanded: string }> {
-    const consts = classConstants(src);
-    const out: Array<{ raw: string; expanded: string }> = [];
-    for (const m of src.matchAll(/role="(switch|combobox)"/g)) {
-      const open = src.lastIndexOf("<", m.index!);
-      if (open === -1) continue;
-      let i = open + 1;
-      let depth = 0;
-      while (i < src.length) {
-        const c = src[i];
-        if (c === "{") depth++;
-        else if (c === "}") depth--;
-        else if (c === ">" && depth === 0) break;
-        i++;
-      }
-      const raw = src.slice(open, i + 1);
-      let expanded = raw;
-      for (const [name, value] of Object.entries(consts)) {
-        if (new RegExp(`\\b${name}\\b`).test(raw)) expanded += ` /*${name}*/ ${value}`;
-      }
-      out.push({ raw, expanded });
-    }
-    return out;
-  }
-
   it("finds the role-based controls it claims to check", () => {
     const total = Object.values(sources).reduce((n, s) => n + roleControlTags(s).length, 0);
     expect(total, "expected the switches and the combobox trigger").toBeGreaterThan(3);
   });
 
-  it("no switch or combobox rests on the decorative hairline", () => {
+  it("no switch, combobox or radiogroup rests on the decorative hairline", () => {
     // The gap the second review left open: a control that is a <button> with
     // role="switch", or one that receives its surface through a prop, is
     // invisible to the native-tag scan above. Both are user-operated, so
     // 1.4.11 applies to them exactly the same.
+    //
+    // Scope, stated honestly: this covers elements that DECLARE a control role.
+    // A bare <button> with a text label and a border does not, and is not
+    // scanned — 1.4.11's application to those is genuinely arguable, and
+    // guessing would make the gate noisy rather than useful.
     const offenders: string[] = [];
     for (const [path, src] of Object.entries(sources)) {
       if (path.endsWith(".test.tsx")) continue;
@@ -281,6 +361,16 @@ describe("interactive boundaries", () => {
       }
     }
     expect(offenders, "role-based controls must use border-octo-border-strong").toEqual([]);
+  });
+
+  it("finds the trigger surfaces it claims to check", () => {
+    // Without this, renaming the prop (or switching every call site to a
+    // template literal) would leave the scan below asserting nothing at all.
+    let seen = 0;
+    for (const src of Object.values(sources)) {
+      seen += [...src.matchAll(/triggerClassName\s*=/g)].length;
+    }
+    expect(seen, "expected Listbox's default plus its call-site overrides").toBeGreaterThan(4);
   });
 
   it("no trigger surface passed as a prop rests on the hairline", () => {

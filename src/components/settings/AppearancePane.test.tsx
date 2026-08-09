@@ -14,7 +14,7 @@ function theme(name: string, accent: string): ThemeConfig {
     name,
     bg: "#0c0a08", panel: "#14110d", panel2: "#1a160f", border: "#2a2419",
     accent, accentDim: "#e8c39a",
-    text: "#f4ecdb", textDim: "#95897a", textMuted: "#6d6354",
+    text: "#f4ecdb", textDim: "#95897a", textMuted: "#8c7f6c",
     success: "#8fc9a8", warning: "#dfae4a", danger: "#d18b8b",
   } as ThemeConfig;
 }

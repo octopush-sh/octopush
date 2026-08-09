@@ -57,18 +57,25 @@ export function summarizeTool(
   }
 }
 
-// Onyx & Brass design tokens. Defined inline because this component renders
-// inside react-markdown siblings — the previous fix cycle (commit d9c1517)
-// proved Tailwind cascade can leak in this context. Inline styles are
-// deliberate and load-bearing.
-const BRASS = "#d4a574";
-const BRASS_DIM = "rgba(212, 165, 116, 0.4)";
-const BRASS_GHOST = "rgba(212, 165, 116, 0.08)";
-const IVORY = "#f4ecdb";
-const SAGE = "#95897a";
-const MUTE = "#6d6354";
-const ONYX = "#0c0a08";
-const HAIRLINE = "#2a2419";
+// Onyx & Brass design tokens. Still applied as INLINE STYLES, because this
+// component renders inside react-markdown siblings and the previous fix cycle
+// (commit d9c1517) proved Tailwind cascade can leak in this context — that
+// rationale is unchanged and load-bearing.
+//
+// What changed: the values are `var(--color-octo-*)` rather than atelier hex.
+// An inline style resolving a custom property is still an inline style, so it
+// is equally immune to the cascade leak — but it follows the active theme.
+// Hardcoded hex meant these cards rendered an onyx panel with ivory text no
+// matter the theme, so under vellum a tool call was a dark box on cream; it
+// also froze `MUTE` at the pre-AA #6d6354 (3.06:1 on onyx).
+const BRASS = "var(--color-octo-brass)";
+const BRASS_DIM = "var(--brass-dim)";
+const BRASS_GHOST = "var(--brass-ghost)";
+const IVORY = "var(--color-octo-ivory)";
+const SAGE = "var(--color-octo-sage)";
+const MUTE = "var(--color-octo-mute)";
+const ONYX = "var(--color-octo-onyx)";
+const HAIRLINE = "var(--color-octo-hairline)";
 // Same load-bearing-inline rationale as the colors above: the mono stack must be
 // inline here (react-markdown cascade leak), but it lives in ONE const so the
 // new output controls don't scatter another copy of the literal.
@@ -373,7 +380,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
                 fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
                 letterSpacing: "0.2em",
                 textTransform: "uppercase",
-                color: copied ? "#8fc9a8" : MUTE,
+                color: copied ? "var(--color-octo-verdigris)" : MUTE,
                 cursor: "pointer",
                 padding: "2px 6px",
               }}
