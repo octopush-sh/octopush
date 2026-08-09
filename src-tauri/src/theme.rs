@@ -75,7 +75,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#d18b8b".into(),
             text: "#f4ecdb".into(),
             text_dim: "#95897a".into(),
-            text_muted: "#6d6354".into(),
+            text_muted: "#8c7f6c".into(),
             terminal_bg: "#0c0a08".into(),
         },
 
@@ -146,7 +146,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#d18b8b".into(),
             text: "#e8e5da".into(),
             text_dim: "#95a098".into(),
-            text_muted: "#5e6b62".into(),
+            text_muted: "#7f8f84".into(),
             terminal_bg: "#0a120c".into(),
         },
 
@@ -166,7 +166,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#d18888".into(),
             text: "#e8e8ee".into(),
             text_dim: "#999fb5".into(),
-            text_muted: "#5e6378".into(),
+            text_muted: "#858a9f".into(),
             terminal_bg: "#0a0e1c".into(),
         },
 
@@ -185,7 +185,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#c86060".into(),
             text: "#f0e0d0".into(),
             text_dim: "#a09080".into(),
-            text_muted: "#6d5e50".into(),
+            text_muted: "#937f6c".into(),
             terminal_bg: "#100806".into(),
         },
 
@@ -204,7 +204,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#f87171".into(),
             text: "#e4e4e7".into(),
             text_dim: "#a1a1aa".into(),
-            text_muted: "#52525b".into(),
+            text_muted: "#7f7f8c".into(),
             terminal_bg: "#0a0a0b".into(),
         },
         ThemeConfig {
@@ -221,7 +221,7 @@ pub fn builtin_themes() -> Vec<ThemeConfig> {
             danger: "#f85149".into(),
             text: "#c9d1d9".into(),
             text_dim: "#8b949e".into(),
-            text_muted: "#484f58".into(),
+            text_muted: "#7e8996".into(),
             terminal_bg: "#0d1117".into(),
         },
         ThemeConfig {
@@ -458,26 +458,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_designed_theme_clears_aa_for_text_and_accent() {
-        // Scope note: this gate covers the themes we actively design. The three
-        // LEGACY themes (dark, midnight, solarized-dark) predate the design
-        // system and are kept only so existing configs keep working —
-        // solarized-dark's own text sits at 3.43:1, which is inherent to the
-        // upstream Solarized palette and not ours to restyle.
-        //
-        // `text_muted` is deliberately absent here: it clears AA in vellum but
-        // fails in EVERY dark theme (atelier 3.06:1, midnight 1.96:1). That is a
-        // real, pre-existing accessibility debt across the dark palettes, and
-        // fixing it means changing how the flagship looks — a brand decision,
-        // not a light-mode one. Tracked in docs/design-system.md.
-        const LEGACY: [&str; 3] = ["dark", "midnight", "solarized-dark"];
+    /// The one theme excluded from the AA gate below.
+    ///
+    /// Solarized is a published, named palette, and its dark variant does not
+    /// meet WCAG AA by design: upstream's own body text (base0 `#839496`) is
+    /// 3.43:1 on base03, and its comment tone (base01) is 2.02:1. Raising
+    /// `text_muted` alone would make the *quietest* token the brightest one,
+    /// inverting the hierarchy; raising the whole ramp would mean the theme is
+    /// no longer Solarized. We keep it verbatim so existing configs are
+    /// untouched, and exclude it explicitly rather than silently.
+    const NOT_AA_CAPABLE: [&str; 1] = ["solarized-dark"];
 
+    #[test]
+    fn every_theme_clears_aa_for_its_text_inks() {
         for t in builtin_themes() {
-            if LEGACY.contains(&t.name.as_str()) {
+            if NOT_AA_CAPABLE.contains(&t.name.as_str()) {
                 continue;
             }
-            for (label, ink) in [("text", &t.text), ("accent", &t.accent)] {
+            // `text_muted` is included: it carries labels, meta and code
+            // comments, and used to fail in every dark theme (atelier 3.06:1,
+            // midnight 1.96:1) while passing in vellum.
+            for (label, ink) in [
+                ("text", &t.text),
+                ("text_dim", &t.text_dim),
+                ("text_muted", &t.text_muted),
+                ("accent", &t.accent),
+            ] {
                 let r = worst_surface_ratio(&t, ink);
                 assert!(
                     r >= 4.5,
@@ -491,6 +497,31 @@ mod tests {
                 "{} border_strong ({}) is {b:.2}:1, needs 3.0:1",
                 t.name,
                 t.border_strong
+            );
+        }
+    }
+
+    #[test]
+    fn the_text_ramp_stays_ordered() {
+        // Clearing AA is not enough on its own: a token could be lifted past
+        // the threshold and end up louder than the tier above it, which is how
+        // a "fix" quietly destroys the visual hierarchy. muted ≤ dim ≤ text
+        // must hold in every theme, including the excluded one.
+        for t in builtin_themes() {
+            let (muted, dim, text) = (
+                worst_surface_ratio(&t, &t.text_muted),
+                worst_surface_ratio(&t, &t.text_dim),
+                worst_surface_ratio(&t, &t.text),
+            );
+            assert!(
+                muted <= dim,
+                "{}: text_muted ({muted:.2}) must not out-shout text_dim ({dim:.2})",
+                t.name
+            );
+            assert!(
+                dim <= text,
+                "{}: text_dim ({dim:.2}) must not out-shout text ({text:.2})",
+                t.name
             );
         }
     }

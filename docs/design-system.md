@@ -17,7 +17,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 --color-octo-brass-hi:  #e8c39a;  /* hover/pressed brass */
 --color-octo-ivory:     #f4ecdb;  /* high-emphasis text */
 --color-octo-sage:      #95897a;  /* body text */
---color-octo-mute:      #6d6354;  /* labels, meta */
+--color-octo-mute:      #8c7f6c;  /* labels, meta — AA on all three surfaces */
 --color-octo-verdigris: #8fc9a8;  /* success / diff adds */
 --color-octo-rouge:     #d18b8b;  /* error / diff dels */
 --color-octo-warning:   #dfae4a;  /* amber — warning/caution, never the accent */
@@ -31,7 +31,7 @@ One‑page reference for **Atelier in Onyx & Brass**. For the full design, motio
 
 **Surgical brass norm:** in any screen, brass should occupy ≤ 5% of pixels. If you're using brass on more than 2–3 elements at once, you're using it too much. (Not to be confused with the "brass rule" divider component, which is fully retired — see §3.)
 
-**Two border tiers, and they are not interchangeable.** `--color-octo-hairline` divides panels; it is decorative and deliberately quiet. `--color-octo-border-strong` bounds anything a user operates — input outlines, control edges, the focus ring — and clears **3:1 on every surface** because WCAG 1.4.11 applies to controls. Reaching for the hairline on a control is an accessibility bug; reaching for the strong border on a panel divider draws a hard box around every surface in the app. **Partly enforced:** `themePalette.drift.test.ts` fails the build if any *native* `<input>`/`<textarea>`/`<select>` rests on the hairline — resolving shared class constants and inline `style`, not just tag-literal classes. Custom widgets that receive a class through a prop are outside its reach and remain a manual check.
+**Two border tiers, and they are not interchangeable.** `--color-octo-hairline` divides panels; it is decorative and deliberately quiet. `--color-octo-border-strong` bounds anything a user operates — input outlines, control edges, the focus ring — and clears **3:1 on every surface** because WCAG 1.4.11 applies to controls. Reaching for the hairline on a control is an accessibility bug; reaching for the strong border on a panel divider draws a hard box around every surface in the app. **Enforced:** `themePalette.drift.test.ts` fails the build if any control rests on the hairline. It covers native `<input>`/`<textarea>`/`<select>`, elements that are controls by ARIA role (`role="switch"`, `role="combobox"`), and surfaces handed down through a `triggerClassName` prop — resolving shared class constants and inline `style` in each case, not just tag-literal classes. Variant-prefixed classes (`hover:`, `focus:`) are ignored: a field that is borderless at rest and hints on hover has no resting boundary for 1.4.11 to govern.
 
 ### 1.1 Light mode is its own set of decisions (2026-08-08)
 
@@ -47,7 +47,9 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 
 **Every alpha is solved, never fixed.** A ratio is a function of two luminances, so the same alpha reads differently per palette. `themeStore` solves the search-match wash (`solveMatchWashAlpha`) and the diff-row tints (`solveTintAlpha` + `DIFF_TINT_TARGET`) against each theme's own background. Adding a new tint means adding a target, not a magic number.
 
-**Known debt — `text_muted` in the dark themes.** Vellum's clears AA at 4.87:1. Every dark theme's does not: atelier 3.06:1, mossbank 2.81:1, ember 2.82:1, porcelain-indigo 2.64:1, and the legacy themes worse. It carries labels, meta and code comments, so this is a genuine AA failure — but correcting it changes how the flagship looks, which is a brand decision rather than a light-mode one. Deliberately out of scope for the vellum pass; the cargo gate documents the exclusion rather than hiding it.
+**`text_muted` now clears AA in every theme but one (2026-08-09).** It carries labels, meta and code comments, and used to fail everywhere — atelier 3.06:1, midnight 1.96:1, porcelain-indigo 2.64:1. Each was lifted along its own hue to just over 4.5:1 on the worst surface, which is why the tone barely shifts while the legibility does. The gate also asserts the ramp stays *ordered* (`text_muted ≤ text_dim ≤ text`): clearing a threshold is not enough if a token ends up louder than the tier above it.
+
+**The one exclusion: `solarized-dark`.** Solarized is a published, named palette whose dark variant does not meet AA by design — upstream's own body text (base0) is 3.43:1 and its comment tone (base01) is 2.02:1. Lifting `text_muted` alone would invert the hierarchy; lifting the whole ramp would mean it is no longer Solarized. It stays verbatim so existing configs are untouched, and `NOT_AA_CAPABLE` in `theme.rs` names it explicitly rather than leaving a silent hole.
 
 ---
 

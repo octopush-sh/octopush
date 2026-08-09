@@ -78,7 +78,7 @@ export function ToggleRow({
         className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
         style={{
           background: checked ? "var(--brass-ghost)" : "var(--color-octo-onyx)",
-          border: `1px solid ${checked ? "var(--brass-dim)" : "var(--color-octo-hairline)"}`,
+          border: `1px solid ${checked ? "var(--brass-dim)" : "var(--color-octo-border-strong)"}`,
         }}
       >
         <span

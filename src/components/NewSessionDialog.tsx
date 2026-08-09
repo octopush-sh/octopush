@@ -186,7 +186,7 @@ export function NewSessionDialog({ open, onClose }: Props) {
             <Listbox
               ariaLabel="Model"
               className="w-full"
-              triggerClassName="border border-octo-border bg-octo-bg text-octo-ivory hover:border-octo-accent/50 focus:border-octo-accent"
+              triggerClassName="border border-octo-border-strong bg-octo-bg text-octo-ivory hover:border-octo-accent/50 focus:border-octo-accent"
               value={selectedModel}
               onChange={setSelectedModel}
               options={[

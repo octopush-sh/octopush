@@ -233,6 +233,70 @@ describe("interactive boundaries", () => {
     ).toEqual([]);
   });
 
+  /** Elements that are controls by ARIA role rather than by tag — the custom
+   *  combobox trigger and the two switch styles. Walks back from the role
+   *  attribute to its own `<`, then forward with the same brace tracker. */
+  function roleControlTags(src: string): Array<{ raw: string; expanded: string }> {
+    const consts = classConstants(src);
+    const out: Array<{ raw: string; expanded: string }> = [];
+    for (const m of src.matchAll(/role="(switch|combobox)"/g)) {
+      const open = src.lastIndexOf("<", m.index!);
+      if (open === -1) continue;
+      let i = open + 1;
+      let depth = 0;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "{") depth++;
+        else if (c === "}") depth--;
+        else if (c === ">" && depth === 0) break;
+        i++;
+      }
+      const raw = src.slice(open, i + 1);
+      let expanded = raw;
+      for (const [name, value] of Object.entries(consts)) {
+        if (new RegExp(`\\b${name}\\b`).test(raw)) expanded += ` /*${name}*/ ${value}`;
+      }
+      out.push({ raw, expanded });
+    }
+    return out;
+  }
+
+  it("finds the role-based controls it claims to check", () => {
+    const total = Object.values(sources).reduce((n, s) => n + roleControlTags(s).length, 0);
+    expect(total, "expected the switches and the combobox trigger").toBeGreaterThan(3);
+  });
+
+  it("no switch or combobox rests on the decorative hairline", () => {
+    // The gap the second review left open: a control that is a <button> with
+    // role="switch", or one that receives its surface through a prop, is
+    // invisible to the native-tag scan above. Both are user-operated, so
+    // 1.4.11 applies to them exactly the same.
+    const offenders: string[] = [];
+    for (const [path, src] of Object.entries(sources)) {
+      if (path.endsWith(".test.tsx")) continue;
+      for (const { expanded } of roleControlTags(src)) {
+        if (restingHairline(expanded)) {
+          offenders.push(`${path}: ${expanded.slice(0, 90).replace(/\s+/g, " ")}…`);
+        }
+      }
+    }
+    expect(offenders, "role-based controls must use border-octo-border-strong").toEqual([]);
+  });
+
+  it("no trigger surface passed as a prop rests on the hairline", () => {
+    // `triggerClassName` is how a caller overrides Listbox's own surface, so it
+    // bypasses both scanners above.
+    const offenders: string[] = [];
+    for (const [path, src] of Object.entries(sources)) {
+      if (path.endsWith(".test.tsx")) continue;
+      for (const m of src.matchAll(/triggerClassName=(?:"([^"]*)"|\{(\w+)\})/g)) {
+        const value = m[1] ?? classConstants(src)[m[2]] ?? "";
+        if (restingHairline(value)) offenders.push(`${path}: ${value.slice(0, 70)}…`);
+      }
+    }
+    expect(offenders, "trigger surfaces must use border-octo-border-strong").toEqual([]);
+  });
+
   it("at least one control actually consumes border_strong", () => {
     const used = Object.values(sources).some((s) =>
       controlTags(s).some((t) => t.expanded.includes("border-octo-border-strong")),

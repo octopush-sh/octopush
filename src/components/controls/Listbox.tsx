@@ -28,8 +28,11 @@ const PANEL_MAX_H = 280;
 const TRIGGER_STRUCTURE =
   "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-left transition-colors duration-[180ms]";
 
-/** Default trigger surface — the ModelPicker's onyx look. */
-const DEFAULT_TRIGGER_SURFACE = "border border-octo-hairline bg-octo-onyx hover:border-[var(--brass-dim)]";
+/** Default trigger surface — the ModelPicker's onyx look.
+ *  Uses `border-octo-border-strong`, not the panel hairline: this is a
+ *  combobox the user operates, so WCAG 1.4.11 asks 3:1 of its boundary. */
+const DEFAULT_TRIGGER_SURFACE =
+  "border border-octo-border-strong bg-octo-onyx hover:border-[var(--brass-dim)]";
 
 /** Anchored popover listbox in the ModelPicker's visual language.
  *  Portal + position:fixed so overflow containers never clip it (PR #8 lesson).
