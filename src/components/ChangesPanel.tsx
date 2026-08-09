@@ -580,7 +580,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
             placeholder="Describe the change…"
             rows={3}
             disabled={committing}
-            className="w-full resize-none rounded-md border border-octo-hairline bg-octo-onyx p-2 pr-16 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
+            className="w-full resize-none rounded-md border border-octo-border-strong bg-octo-onyx p-2 pr-16 font-mono text-[12px] leading-[1.5] text-octo-ivory outline-none transition-colors placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
           />
           <button
             type="button"

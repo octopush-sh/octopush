@@ -106,7 +106,7 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
         rows={2}
         disabled={loading}
         placeholder="Describe what you want to build…"
-        className="w-full resize-none rounded-lg border border-octo-hairline bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-60"
+        className="w-full resize-none rounded-lg border border-octo-border-strong bg-octo-onyx px-4 py-3 text-[13px] leading-[1.5] text-octo-ivory outline-none transition-colors duration-[180ms] placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass disabled:opacity-60"
       />
       <p className="mt-2 text-[12px] leading-[1.4] text-octo-sage">{GENESIS_PROMISE}</p>
 
@@ -124,7 +124,7 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
             }}
             aria-label="Anthropic API key"
             placeholder="Paste an Anthropic API key to wake the crew"
-            className="min-w-0 flex-1 rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
+            className="min-w-0 flex-1 rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
           />
           <button
             type="button"

@@ -71,7 +71,7 @@ export function ConfirmDialog({
               placeholder="Type here to confirm"
               aria-label={`Type "${requireInput}" to confirm`}
               autoFocus
-              className="w-full rounded-md border border-octo-hairline bg-octo-bg px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none transition focus:border-octo-brass"
+              className="w-full rounded-md border border-octo-border-strong bg-octo-bg px-3 py-2 font-mono text-[11px] text-octo-ivory outline-none transition focus:border-octo-brass"
             />
           </div>
         )}

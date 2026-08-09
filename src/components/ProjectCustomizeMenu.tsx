@@ -42,7 +42,7 @@ export function ProjectCustomizeMenu({
         type="text"
         value={name}
         onChange={(e) => setName(e.target.value)}
-        className="mt-1 w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
+        className="mt-1 w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-serif text-[18px] text-octo-ivory outline-none focus:border-octo-brass"
         placeholder="Project name"
       />
 

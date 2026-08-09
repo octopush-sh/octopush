@@ -373,7 +373,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     if (e.key === "Enter" && taskValid) setStep(3);
                   }}
                   placeholder="e.g. Add dark mode, Fix checkout bug"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
@@ -537,7 +537,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                   onChange={(e) => setSetupScript(e.target.value)}
                   placeholder="npm install"
                   rows={6}
-                  className="w-full resize-y rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full resize-y rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 

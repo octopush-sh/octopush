@@ -11,7 +11,7 @@ type TestState =
   | { kind: "error"; message: string };
 
 const inputClass =
-  "w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass";
+  "w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass";
 const labelClass =
   "mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute";
 

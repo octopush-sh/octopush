@@ -84,7 +84,7 @@ export function AddProviderDialog({
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. my-gateway"
                 autoFocus
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
             </div>
             <div>
@@ -114,7 +114,7 @@ export function AddProviderDialog({
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder={protocol === "anthropic" ? "https://api.anthropic.com" : "https://api.example.com/v1"}
                 autoFocus
-                className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
               />
               <p className="mt-1.5 text-[11px] leading-[1.5] text-octo-mute">
                 {protocol === "anthropic"

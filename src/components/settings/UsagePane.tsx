@@ -227,7 +227,7 @@ export function UsagePane() {
               type="date"
               value={exportStart}
               onChange={(e) => setExportStart(e.target.value)}
-              className="rounded border border-octo-hairline bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass"
+              className="rounded border border-octo-border-strong bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass"
             />
           </div>
           <div className="flex items-center gap-2">
@@ -237,7 +237,7 @@ export function UsagePane() {
               type="date"
               value={exportEnd}
               onChange={(e) => setExportEnd(e.target.value)}
-              className="rounded border border-octo-hairline bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass"
+              className="rounded border border-octo-border-strong bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass"
             />
           </div>
           <button
@@ -412,7 +412,7 @@ function BudgetsSection({
                     value={addState.scopeId}
                     onChange={(e) => setAddState((s) => ({ ...s, scopeId: e.target.value }))}
                     placeholder={`Enter ${addState.scope} id`}
-                    className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                    className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
                   />
                 </div>
               )}
@@ -438,7 +438,7 @@ function BudgetsSection({
                   value={addState.limit}
                   onChange={(e) => setAddState((s) => ({ ...s, limit: e.target.value }))}
                   placeholder="5.00"
-                  className="w-full rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
+                  className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </div>
             </div>

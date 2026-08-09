@@ -64,7 +64,7 @@ export function JiraProjectKeyModal({ initialValue, projectName, onSave, onClose
             onKeyDown={handleKeyDown}
             placeholder="PROJ"
             aria-label="Jira project key"
-            className="w-full rounded border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-[13px] text-octo-ivory outline-none focus:border-octo-brass"
+            className="w-full rounded border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[13px] text-octo-ivory outline-none focus:border-octo-brass"
           />
           <div className="mt-4 flex justify-end gap-2">
             <button

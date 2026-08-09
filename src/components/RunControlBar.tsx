@@ -210,7 +210,7 @@ function BlockedAskBar({
               value={answers[i] ?? ""}
               onChange={(e) => setAnswer(i, e.target.value)}
               placeholder={q.recommendedDefault || "Your decision…"}
-              className="rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
+              className="rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
           </div>
         ))}
@@ -439,7 +439,7 @@ function DecisionBar({
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
               placeholder={mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
-              className="h-20 resize-none rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
+              className="h-20 resize-none rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
             <div className="flex gap-2">
               <button type="button" onClick={submitFeedback}

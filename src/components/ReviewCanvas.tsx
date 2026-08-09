@@ -430,7 +430,7 @@ export function ReviewCanvas({
                       if (e.key === "Enter") { void saveTestCommand(); handleRunTests(); setTestsOpen(false); }
                       if (e.key === "Escape") { e.stopPropagation(); setTestsOpen(false); }
                     }}
-                    className="min-w-0 flex-1 rounded border border-octo-hairline bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
+                    className="min-w-0 flex-1 rounded border border-octo-border-strong bg-octo-onyx px-2 py-1 font-mono text-[11px] text-octo-ivory outline-none focus:border-octo-brass placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
                     placeholder="npm test"
                     autoFocus
                   />

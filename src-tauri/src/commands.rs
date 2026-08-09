@@ -329,9 +329,11 @@ pub async fn get_session_recap(
 
 // ─── Theme ────────────────────────────────────────────────────────
 
+/// `null` when the user has never picked a theme — the frontend then seeds from
+/// `prefers-color-scheme` and keeps following the OS until they choose one.
 #[tauri::command]
-pub async fn get_theme() -> AppResult<crate::theme::ThemeConfig> {
-    crate::theme::load_theme()
+pub async fn get_theme() -> AppResult<Option<crate::theme::ThemeConfig>> {
+    crate::theme::load_stored_theme()
 }
 
 #[tauri::command]
