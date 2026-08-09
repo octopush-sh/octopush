@@ -66,7 +66,11 @@ export function AppTopBar({
           role="img"
           aria-label={mascot.label}
           title={mascot.label}
-          className="flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
+          // pointer-events-auto: the group is inert so it cannot swallow
+          // clicks meant for the right-hand controls, but this span owns a
+          // title/aria tooltip and sits at the group's LEFT edge, nowhere
+          // near them.
+          className="pointer-events-auto flex shrink-0 items-center [--octo-eye:var(--color-octo-panel)]"
         >
           <OctoMark size={20} state={mascot.state} />
         </span>
@@ -83,7 +87,11 @@ export function AppTopBar({
             </span>
             <span
               title={`Project · ${projectName}`}
-              className="max-w-[220px] truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage"
+              // Narrower than it could be (and pointer-events-auto for its
+              // tooltip, which is the only way to read a truncated name):
+              // this span is the part of the group that reaches toward the
+              // right-hand controls, so it trades width for clearance.
+              className="pointer-events-auto max-w-[180px] truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage"
             >
               {projectName}
             </span>

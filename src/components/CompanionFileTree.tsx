@@ -9,6 +9,7 @@ import { FileNameDialog } from "./FileNameDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { pushToast } from "./Toasts";
 import { useVirtualRows } from "../lib/useVirtualRows";
+import { NO_LOCATE } from "../lib/locate";
 
 /** Every row (node or placeholder) renders at exactly this height — the
  *  fixed-row contract the windowing math depends on. */
@@ -535,6 +536,10 @@ export function CompanionFileTree({
 
   useEffect(() => {
     registerLocate?.(locate);
+    // FadeSwap holds this subtree for 120ms after a tab switch, so without an
+    // unregister the parent can hold — and call — the locate of an unmounted
+    // tree during the swap, silently dropping the reveal.
+    return () => registerLocate?.(NO_LOCATE);
   }, [registerLocate, locate]);
 
   const focusNodeAt = useCallback(

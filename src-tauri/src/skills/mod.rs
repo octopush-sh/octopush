@@ -285,6 +285,8 @@ mod tests {
         // A non-word neighbour IS a boundary, whatever its byte width: an emoji
         // or a comma before the slash leaves a genuine reference standing.
         assert_eq!(referenced_skills(tmp.path(), "🚀 /code-review").len(), 1);
+        // Glued, too — the policy is "not a word char" and an emoji is not one.
+        assert_eq!(referenced_skills(tmp.path(), "🚀/code-review").len(), 1);
         assert_eq!(referenced_skills(tmp.path(), "café, then /code-review").len(), 1);
     }
 

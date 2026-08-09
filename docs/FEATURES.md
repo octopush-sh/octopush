@@ -1028,7 +1028,7 @@ Global shortcuts are owned by a single `keydown` listener in `src/App.tsx`. (The
 | **Editor** | `⌘S` save · `⌘F` find/replace · `⌘G`/`F3` next/prev · `⌘⇧L` select all occurrences · `⌘D` next occurrence · `⌘⌥G` go to line · `⌘=`/`⌘−` font · `Alt-Z` wrap |
 | **Scratchpad** | `⌘F` find/replace · `⌘G`/`F3` next/prev · `⌘D` next occurrence · `⌘⇧L` select all matching · `⌘⌥G` go to line · `Tab` indent |
 | **Diff triage** | `j`/`k`/↓/↑ move hunk · `]`/`[` jump file · `Space` fold · `a` accept · `x` reject · `A` accept file · `v` viewed · `o` open in editor · `w` why · `/` filter · `c` commit · `?` help |
-| `⌘⇧E` | Review: reveal the open file in the file tree |
+| **Review** | `⌘⇧E` reveal the open file in the file tree |
 | **File tree** | ↑/↓ move · →/← expand/collapse · Home/End · Enter/Space activate · ContextMenu/Shift+F10 menu |
 | **Dialogs** | `Esc` close topmost · `Tab` trap within ModalShell |
 

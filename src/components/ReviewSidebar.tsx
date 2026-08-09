@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelLeftClose, PanelLeftOpen, FileDiff, FolderTree } from "lucide-react";
 import { ChangesPanel } from "./ChangesPanel";
 import { CompanionFileTree } from "./CompanionFileTree";
+import { NO_LOCATE } from "../lib/locate";
 import { FadeSwap } from "./primitives/FadeSwap";
 
 type Tab = "changes" | "files";
@@ -135,6 +136,13 @@ export function ReviewSidebar({
   const pendingLocateRef = useRef<string | null>(null);
 
   const handleTreeLocateRegister = useCallback((fn: (absPath: string) => void) => {
+    // An unmounting tree registers the NO_LOCATE sentinel; it must neither
+    // become the live locate nor consume a pending reveal, which belongs to
+    // the tree that mounts next.
+    if (fn === NO_LOCATE) {
+      treeLocateRef.current = null;
+      return;
+    }
     treeLocateRef.current = fn;
     const pending = pendingLocateRef.current;
     if (pending) {
