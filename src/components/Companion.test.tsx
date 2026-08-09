@@ -27,7 +27,6 @@ const baseProps = {
   },
   // jiraProjectKey drives resolveJiraProjectKey — set it so projectKey != null
   project: { id: "p1", name: "Test", path: "/tmp/repo", jiraProjectKey: "CLPNSNS", pinned: false, tint: null },
-  onModeChange: vi.fn(),
   collapsed: false,
   onToggleCollapsed: vi.fn(),
 };
@@ -83,24 +82,18 @@ describe("Companion collapse", () => {
     expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
   });
 
-  it("collapsed: shows an expand control and a vertical mode switcher", () => {
-    const onModeChange = vi.fn();
+  it("collapsed: shows only the expand control — the modes live in the band now", () => {
     const onToggleCollapsed = vi.fn();
     render(
-      <Companion
-        mode="review"
-        {...baseProps}
-        collapsed
-        onModeChange={onModeChange}
-        onToggleCollapsed={onToggleCollapsed}
-      />,
+      <Companion mode="review" {...baseProps} collapsed onToggleCollapsed={onToggleCollapsed} />,
     );
     // The expanded panel chrome is gone…
     expect(screen.queryByRole("button", { name: /collapse companion/i })).not.toBeInTheDocument();
-    // …replaced by the expand control + a vertical mode switcher.
+    // …replaced by the expand control, and nothing else: the strip no longer
+    // carries a mode switcher, because the band above the canvas always does.
+    const buttons = screen.getAllByRole("button");
+    expect(buttons).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: /expand companion/i }));
     expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole("button", { name: /^talk$/i }));
-    expect(onModeChange).toHaveBeenCalledWith("talk");
   });
 });

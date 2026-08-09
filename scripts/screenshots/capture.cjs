@@ -314,7 +314,7 @@ async function shoot(page, name) {
 }
 
 async function clickMode(page, label) {
-  // ModeSwitcher renders text buttons (Talk/Run/Review/Direct) in the Companion header.
+  // ModeSwitcher renders text buttons (Talk/Run/Review/Direct) in the mode band above the canvas.
   const tries = [
     () => page.getByRole("button", { name: label, exact: true }).first().click({ timeout: 2500 }),
     () => page.locator("button", { hasText: new RegExp("^" + label + "$") }).first().click({ timeout: 2500 }),

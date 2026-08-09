@@ -30,7 +30,7 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
   // two labels is constant (fixed-width buttons made the gaps look uneven as
   // the labels lengthened). The active indicator is measured from the live
   // button geometry — so it glides AND resizes to each label, and stays correct
-  // when the companion is resized or web fonts finish loading.
+  // when the canvas is resized or web fonts finish loading.
   const groupRef = useRef<HTMLDivElement>(null);
   const btnRefs = useRef(new Map<WorkspaceMode, HTMLButtonElement>());
   const [indicator, setIndicator] = useState<{ left: number; width: number } | null>(null);
@@ -62,16 +62,20 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
       ref={groupRef}
       role="group"
       aria-label="Workspace mode"
-      // No own border/bg: the group sits inside Companion's already-bordered
-      // header on the same panel surface — the gliding brass-ghost indicator
-      // alone marks the active mode.
-      className="relative inline-flex items-center gap-0.5"
+      // A segmented-control shell: the group now sits in a band of its own
+      // above the canvas, on the bare onyx ground, so it needs its own border
+      // to read as one control rather than four loose words. That border is
+      // `border-strong`, not the hairline — this is a control the user
+      // operates, and control edges owe 3:1 on every theme (WCAG 1.4.11); the
+      // hairline is the decorative panel-divider tier. The 2px padding is what
+      // the indicator is inset by (inset-y-0.5 below).
+      className="relative inline-flex items-center gap-0.5 rounded-md border border-octo-border-strong bg-octo-onyx p-0.5"
     >
       {/* Gliding brass indicator — measured to the active button's box. */}
       {indicator && (
         <div
           aria-hidden
-          className="absolute inset-y-0 rounded-md transition-[transform,width] duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
+          className="absolute inset-y-0.5 rounded-md transition-[transform,width] duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
           style={{
             left: 0,
             width: `${indicator.width}px`,
@@ -102,7 +106,10 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
             className={clsx(
               // Label color glides on the same clock as the indicator (280ms)
               // so the brass handoff and the rect arrive together.
-              "relative z-10 whitespace-nowrap rounded-md px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]",
+              // Roomier than the old companion-header tabs (px-2.5 py-1): the
+              // band gives the control a line of its own, and the space it
+              // buys goes into hit targets rather than point size.
+              "relative z-10 whitespace-nowrap rounded-md px-3.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass",
               active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage",
               pulse && "animate-attention-pulse !text-octo-brass",
             )}
