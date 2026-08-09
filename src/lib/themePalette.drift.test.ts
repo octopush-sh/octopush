@@ -9,6 +9,7 @@ import storeSrc from "../stores/themeStore.test.ts?raw";
 import tokensSrc from "./tokens.ts?raw";
 import xtermSrc from "./xtermTheme.ts?raw";
 import editorThemeSrc from "../components/editor/atelierTheme.ts?raw";
+import sharedSrc from "../components/settings/shared.tsx?raw";
 
 /**
  * Drift gate for the palettes that are necessarily duplicated outside
@@ -144,15 +145,54 @@ describe("static fallbacks track theme.rs", () => {
       const m = src.match(new RegExp(`\\b${key}:\\s*"(#[0-9a-fA-F]{6})"`));
       return m ? m[1].toLowerCase() : null;
     };
-    // lib/tokens.ts — the typed mirror components use for runtime inline styles.
-    expect(grab(tokensSrc, "mute"), "tokens.ts mute").toBe(a.text_muted);
-    expect(grab(tokensSrc, "sage"), "tokens.ts sage").toBe(a.text_dim);
-    expect(grab(tokensSrc, "ivory"), "tokens.ts ivory").toBe(a.text);
-    // xterm + CodeMirror: used before `octo:theme` lands and in jsdom tests.
-    expect(grab(xtermSrc, "mute"), "xtermTheme fallback mute").toBe(a.text_muted);
-    expect(grab(xtermSrc, "sage"), "xtermTheme fallback sage").toBe(a.text_dim);
-    expect(grab(editorThemeSrc, "mute"), "atelierTheme fallback mute").toBe(a.text_muted);
-    expect(grab(editorThemeSrc, "sage"), "atelierTheme fallback sage").toBe(a.text_dim);
+    // Every key each fallback object actually declares, not a sample of three:
+    // the drift that shipped was in ONE field, and a partial check is how a
+    // partial fix looks correct.
+    const cases: Array<[string, string, Record<string, string>]> = [
+      // lib/tokens.ts — the typed mirror used for runtime inline styles.
+      ["tokens.ts", tokensSrc, { ivory: a.text, sage: a.text_dim, mute: a.text_muted }],
+      // xterm + CodeMirror: used before `octo:theme` lands and in jsdom tests.
+      [
+        "xtermTheme.ts",
+        xtermSrc,
+        {
+          brass: a.accent,
+          ivory: a.text,
+          sage: a.text_dim,
+          mute: a.text_muted,
+          verdigris: a.success,
+          rouge: a.danger,
+          warning: a.warning,
+          panel2: a.panel_2,
+        },
+      ],
+      [
+        "editor/atelierTheme.ts",
+        editorThemeSrc,
+        {
+          onyx: a.bg,
+          panel: a.panel,
+          hairline: a.border,
+          brass: a.accent,
+          ivory: a.text,
+          sage: a.text_dim,
+          mute: a.text_muted,
+          rouge: a.danger,
+          verdigris: a.success,
+        },
+      ],
+      // The Recharts fallback palette, used when readVar finds nothing.
+      [
+        "settings/shared.tsx",
+        sharedSrc,
+        { accent: a.accent, hairline: a.border, ivory: a.text, sage: a.text_dim, mute: a.text_muted },
+      ],
+    ];
+    for (const [label, src, expected] of cases) {
+      for (const [key, want] of Object.entries(expected)) {
+        expect(grab(src, key), `${label} fallback ${key}`).toBe(want);
+      }
+    }
   });
 
   it("no component hardcodes a palette hex where a token would do", () => {
