@@ -29,7 +29,7 @@ const FALLBACK = {
   brass:      "#d4a574",
   ivory:      "#f4ecdb",
   sage:       "#95897a",
-  mute:       "#6d6354",
+  mute:       "#8c7f6c",
   rouge:      "#d18b8b",
   verdigris:  "#8fc9a8",
   brassGhost: "rgba(212, 165, 116, 0.08)",

@@ -21,7 +21,7 @@ const ATELIER: ThemeConfig = {
   danger: "#d18b8b",
   text: "#f4ecdb",
   textDim: "#95897a",
-  textMuted: "#6d6354",
+  textMuted: "#8c7f6c",
   terminalBg: "#0c0a08",
 };
 

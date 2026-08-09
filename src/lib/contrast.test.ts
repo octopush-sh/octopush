@@ -17,13 +17,13 @@ import {
  *  Kept here so the search-match guarantee is asserted against the real
  *  palettes rather than against invented colours. */
 const THEMES = [
-  { name: "atelier", bg: "#0c0a08", accent: "#d4a574", text: "#f4ecdb", muted: "#6d6354" },
+  { name: "atelier", bg: "#0c0a08", accent: "#d4a574", text: "#f4ecdb", muted: "#8c7f6c" },
   { name: "vellum", bg: "#f2ece0", accent: "#91522c", text: "#2a201a", muted: "#6f5f4a" },
-  { name: "mossbank", bg: "#0a120c", accent: "#c89669", text: "#e8e5da", muted: "#5e6b62" },
-  { name: "porcelain-indigo", bg: "#0a0e1c", accent: "#d4a5b8", text: "#e8e8ee", muted: "#5e6378" },
-  { name: "ember", bg: "#100806", accent: "#d4805c", text: "#f0e0d0", muted: "#6d5e50" },
-  { name: "dark", bg: "#0a0a0b", accent: "#a78bfa", text: "#e4e4e7", muted: "#52525b" },
-  { name: "midnight", bg: "#0d1117", accent: "#58a6ff", text: "#c9d1d9", muted: "#484f58" },
+  { name: "mossbank", bg: "#0a120c", accent: "#c89669", text: "#e8e5da", muted: "#7f8f84" },
+  { name: "porcelain-indigo", bg: "#0a0e1c", accent: "#d4a5b8", text: "#e8e8ee", muted: "#858a9f" },
+  { name: "ember", bg: "#100806", accent: "#d4805c", text: "#f0e0d0", muted: "#937f6c" },
+  { name: "dark", bg: "#0a0a0b", accent: "#a78bfa", text: "#e4e4e7", muted: "#7f7f8c" },
+  { name: "midnight", bg: "#0d1117", accent: "#58a6ff", text: "#c9d1d9", muted: "#7e8996" },
   { name: "solarized-dark", bg: "#002b36", accent: "#268bd2", text: "#839496", muted: "#586e75" },
 ];
 

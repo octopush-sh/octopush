@@ -85,7 +85,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
           className={`rounded-full border px-2 py-[2px] ${
             scope === "project"
               ? "border-octo-brass text-octo-brass"
-              : "border-octo-hairline text-octo-mute"
+              : "border-octo-border-strong text-octo-mute"
           }`}
           style={scope === "project" ? { background: "var(--brass-ghost)" } : undefined}
           disabled={!projectKey}
@@ -99,7 +99,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
           className={`rounded-full border px-2 py-[2px] ${
             scope === "all"
               ? "border-octo-brass text-octo-brass"
-              : "border-octo-hairline text-octo-mute"
+              : "border-octo-border-strong text-octo-mute"
           }`}
           style={scope === "all" ? { background: "var(--brass-ghost)" } : undefined}
         >

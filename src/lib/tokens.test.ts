@@ -11,7 +11,7 @@ describe("design tokens — Onyx & Brass", () => {
     expect(tokens.brassHi).toBe("#e8c39a");
     expect(tokens.ivory).toBe("#f4ecdb");
     expect(tokens.sage).toBe("#95897a");
-    expect(tokens.mute).toBe("#6d6354");
+    expect(tokens.mute).toBe("#8c7f6c");
     expect(tokens.verdigris).toBe("#8fc9a8");
     expect(tokens.rouge).toBe("#d18b8b");
     // Warning is amber — deliberately NOT the brass hex.

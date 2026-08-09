@@ -25,7 +25,7 @@ export const tokens = {
   // Text
   ivory: "#f4ecdb",
   sage: "#95897a",
-  mute: "#6d6354",
+  mute: "#8c7f6c",
 
   // Status
   verdigris: "#8fc9a8",

@@ -31,7 +31,7 @@ export function SegmentedControl<T extends string>({ options, value, onChange, a
       role="radiogroup"
       aria-label={ariaLabel}
       aria-disabled={disabled}
-      className={`items-center gap-0.5 rounded-md border border-octo-hairline bg-octo-onyx p-0.5 ${
+      className={`items-center gap-0.5 rounded-md border border-octo-border-strong bg-octo-onyx p-0.5 ${
         fill ? "flex w-full" : "inline-flex shrink-0"
       } ${disabled ? "opacity-40" : ""}`}
     >

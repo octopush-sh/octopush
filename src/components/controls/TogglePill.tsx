@@ -19,7 +19,7 @@ export function TogglePill({ on, onChange, label, ariaLabel }: Props) {
       className={`shrink-0 rounded-sm border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.25em] transition-colors duration-[220ms] ${
         on
           ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)] text-octo-brass"
-          : "border-octo-hairline text-octo-mute hover:text-octo-sage"
+          : "border-octo-border-strong text-octo-mute hover:text-octo-sage"
       }`}
     >
       {label}
