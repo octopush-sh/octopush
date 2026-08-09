@@ -25,6 +25,11 @@ interface FileTreeProps {
   rootLabel: string;
   changedPaths: Set<string>;
   onFileClick?: (absPath: string) => void;
+  /** The file open in the editor — marked in the tree wherever it's visible. */
+  activePath?: string | null;
+  /** Receives the tree's `locate(absPath)` so the editor breadcrumb can point
+   *  the tree at the open file on demand. */
+  registerLocate?: (fn: (absPath: string) => void) => void;
 }
 
 interface Props {
@@ -197,6 +202,8 @@ export function ReviewSidebar({
             rootLabel={fileTree.rootLabel}
             changedPaths={fileTree.changedPaths}
             onFileClick={fileTree.onFileClick}
+            activePath={fileTree.activePath}
+            registerLocate={fileTree.registerLocate}
             headerLeading={headerLeading}
           />
         )}

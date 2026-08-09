@@ -29,6 +29,7 @@ import { ChatView } from "./components/ChatView";
 import { ReviewSidebar } from "./components/ReviewSidebar";
 import { EditorWithPreview } from "./components/editor/EditorWithPreview";
 import { EditorTabs } from "./components/EditorTabs";
+import { EditorBreadcrumb } from "./components/EditorBreadcrumb";
 import { ReviewCanvas, type ReviewViewMode } from "./components/ReviewCanvas";
 import { DirectCanvas } from "./components/DirectCanvas";
 import { ModeOverlay } from "./components/ModeOverlay";
@@ -932,6 +933,20 @@ function App() {
         return;
       }
 
+      // ⌘⇧E → point the Review file tree at the file open in the editor.
+      // Review-only: outside it there is no tree listening. Both the mode and
+      // the open path are read LIVE — this listener is registered with a dep
+      // array that carries neither, so anything closed over here would be the
+      // value from whenever it last re-registered.
+      if (mod && e.shiftKey && (e.key === "E" || e.key === "e")) {
+        e.preventDefault();
+        if (focusGlobal.mode === "review" && activeWorkspaceId) {
+          const openPath = useEditorStore.getState().getActivePath(activeWorkspaceId);
+          if (openPath) locateInTreeFn.current?.(openPath);
+        }
+        return;
+      }
+
       // ⌘N → new workspace
       if (mod && !e.shiftKey && e.key === "n") {
         e.preventDefault();
@@ -1343,6 +1358,17 @@ function App() {
     [navigateToFile],
   );
 
+  // ── Review · locate the open file in the tree ────────────────────
+  // The tree never follows the editor on its own (that would shift it under
+  // the reader mid-diff); it exposes a `locate` the breadcrumb calls, the same
+  // register-a-callback shape ChangesPanel uses for the commit box.
+  const locateInTreeFn = useRef<((absPath: string) => void) | null>(null);
+  const registerLocateInTree = useCallback((fn: (absPath: string) => void) => {
+    locateInTreeFn.current = fn;
+  }, []);
+  const editorActivePath = useEditorStore((s) =>
+    activeWorkspaceId ? s.getActivePath(activeWorkspaceId) : null,
+  );
   const fileTreeProps = useMemo(() => {
     if (!activeWorkspace) return undefined;
     const rootPath = activeWorkspace.worktreePath || project!.path;
@@ -1354,8 +1380,17 @@ function App() {
       ),
       // FILES rail click → land in the Editor with the file open as a tab.
       onFileClick: (p: string) => navigateToFile(p, "editor"),
+      activePath: editorActivePath,
+      registerLocate: registerLocateInTree,
     };
-  }, [activeWorkspace, project, gitStatus, navigateToFile]);
+  }, [
+    activeWorkspace,
+    project,
+    gitStatus,
+    navigateToFile,
+    editorActivePath,
+    registerLocateInTree,
+  ]);
 
   // ── Customize menu submit ──
   const handleCustomizeSubmit = useCallback(
@@ -1895,6 +1930,7 @@ function App() {
         onOpenSettings={() => setSettingsTab("general")}
         onToggleScratchpad={toggleScratchpad}
         onOpenMissionControl={() => setMissionControlOpen(true)}
+        projectName={activeProject?.name ?? project?.name ?? null}
       />
       <div className="flex min-h-0 flex-1">
       <WorkspaceRail
@@ -2089,6 +2125,11 @@ function App() {
                       >
                         {/* Editor mode content */}
                         <EditorTabs workspaceId={activeWorkspaceId!} />
+                        <EditorBreadcrumb
+                          path={editorActivePath}
+                          rootPath={activeWorkspace.worktreePath || project.path}
+                          onReveal={(p) => locateInTreeFn.current?.(p)}
+                        />
                         <EditorWithPreview
                           workspaceId={activeWorkspaceId!}
                           workspacePath={activeWorkspace.worktreePath || project.path}

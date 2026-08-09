@@ -19,6 +19,15 @@ interface Props {
   rootLabel: string;
   changedPaths: Set<string>;
   onFileClick?: (absPath: string) => void;
+  /** The file currently open in the editor. Marked whenever its row is on
+   *  screen, so the tree answers "where am I" without having to move. */
+  activePath?: string | null;
+  /** Hands the parent a `locate(absPath)` function: expands the file's
+   *  ancestors, scrolls its row into view and focuses it. Deliberately
+   *  caller-driven — the tree never follows the editor on its own, so it
+   *  cannot shift under the user mid-review. Mirrors ChangesPanel's
+   *  `registerFocusCommit`. */
+  registerLocate?: (fn: (absPath: string) => void) => void;
   /** Optional node rendered at the start of the eyebrow in place of the
    *  static "Files" title — used by ReviewSidebar to host its Changes|Files
    *  tab switcher and collapse control without stacking a second bar. */
@@ -176,7 +185,15 @@ function flattenFiltered(
   return { rows, matchCount };
 }
 
-export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileClick, headerLeading }: Props) {
+export function CompanionFileTree({
+  rootPath,
+  rootLabel,
+  changedPaths,
+  onFileClick,
+  activePath = null,
+  registerLocate,
+  headerLeading,
+}: Props) {
   const showIgnored = useReviewPrefs((s) => !!s.showIgnoredFiles[rootPath]);
   const toggleShowIgnored = useReviewPrefs((s) => s.toggleShowIgnored);
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -477,6 +494,46 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     }
   });
 
+  // ── Locate a file in the tree (the Review breadcrumb's ⌖ Reveal) ──
+  // Expanding the ancestors is synchronous, but their children are fetched by
+  // the effect that watches `expanded`, so the target row usually does not
+  // exist yet. `pendingLocate` survives until it does; the effect below then
+  // scrolls the virtual window to it and hands it to the focus machinery.
+  const [pendingLocate, setPendingLocate] = useState<string | null>(null);
+
+  const locate = useCallback(
+    (absPath: string) => {
+      if (!absPath.startsWith(`${rootPath}/`)) return; // not in this worktree
+      const parts = absPath.slice(rootPath.length + 1).split("/");
+      const ancestors = [rootPath];
+      let cur = rootPath;
+      for (let i = 0; i < parts.length - 1; i++) {
+        cur = `${cur}/${parts[i]}`;
+        ancestors.push(cur);
+      }
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        for (const dir of ancestors) next.add(dir);
+        return next;
+      });
+      // Expanding a folder does not load it: `fetchChildren` is what fills a
+      // directory, and it is called per-path by toggleExpand rather than by an
+      // effect watching `expanded`. Revealing has to do the same, or the
+      // ancestors open onto nothing and the target row never appears.
+      for (const dir of ancestors) void fetchChildren(dir);
+      // A filtered tree hides everything that doesn't match, including the
+      // file we were just asked to point at — so revealing clears the filter.
+      setFilterOpen(false);
+      setFilterQuery("");
+      setPendingLocate(absPath);
+    },
+    [rootPath, fetchChildren],
+  );
+
+  useEffect(() => {
+    registerLocate?.(locate);
+  }, [registerLocate, locate]);
+
   const focusNodeAt = useCallback(
     (idx: number) => {
       const target = nodeRows[idx];
@@ -495,6 +552,18 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
     },
     [nodeRows, flatRows, scrollToRow],
   );
+
+  // Resolve a pending locate as soon as its row exists in the flat list — the
+  // ancestors' children may take a tick (or several) to load.
+  useEffect(() => {
+    if (!pendingLocate) return;
+    const idx = flatRows.findIndex((r) => r.kind === "node" && r.path === pendingLocate);
+    if (idx === -1) return;
+    setPendingLocate(null);
+    pendingFocusRef.current = pendingLocate;
+    setFocusedPath(pendingLocate);
+    scrollToRow(idx);
+  }, [pendingLocate, flatRows, scrollToRow]);
 
   /** Keyboard model over the flat list (visual order = array order). */
   const onRowKeyDown = useCallback(
@@ -672,6 +741,7 @@ export function CompanionFileTree({ rootPath, rootLabel, changedPaths, onFileCli
               key={row.path}
               row={row}
               isChanged={!row.isDir && changedPaths.has(row.path)}
+              isActive={!row.isDir && row.path === activePath}
               isFocused={row.path === focusedPath}
               isNew={!seenPathsRef.current.has(row.path)}
               onActivate={() => {
@@ -749,6 +819,8 @@ function depthColorClass(depth: number, isChanged: boolean): string {
 interface TreeRowProps {
   row: NodeRow;
   isChanged: boolean;
+  /** This row is the file open in the editor. */
+  isActive: boolean;
   isFocused: boolean;
   /** True only in the commit where this path's data first appears — gates
    *  the rise-in entrance so scrolling never replays it. */
@@ -763,6 +835,7 @@ interface TreeRowProps {
 function TreeRow({
   row,
   isChanged,
+  isActive,
   isFocused,
   isNew,
   onActivate,
@@ -787,29 +860,43 @@ function TreeRow({
       aria-expanded={isDir ? isExpanded : undefined}
       aria-level={depth + 1}
       tabIndex={isFocused ? 0 : -1}
+      aria-current={isActive ? "true" : undefined}
       data-depth={depth}
       ref={(el) => registerEl(path, el)}
       onFocus={() => onFocusRow(path)}
-      title={isIgnored ? "Ignored by .gitignore" : undefined}
+      title={isIgnored ? "Ignored by .gitignore" : isActive ? "Open in the editor" : undefined}
       className={`${riseIn ? "octo-rise-in " : ""}group relative flex cursor-pointer items-center gap-1 rounded-sm pr-1 transition duration-[220ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass${
         isIgnored ? " opacity-60" : ""
       }`}
       style={{
         height: `${ROW_HEIGHT}px`,
         paddingLeft: `${depth * 14 + 4}px`,
-        background: "transparent",
+        // The open file keeps a resting tint; hover has to step ABOVE it
+        // rather than replace it, and leaving must fall back to it — not to
+        // transparent, which would wipe the mark off the row on mouse-out.
+        background: isActive ? "var(--brass-ghost)" : "transparent",
       }}
       onMouseEnter={(e) => {
-        (e.currentTarget as HTMLElement).style.background = "var(--brass-ghost)";
+        (e.currentTarget as HTMLElement).style.background = isActive
+          ? "var(--brass-glow)"
+          : "var(--brass-ghost)";
       }}
       onMouseLeave={(e) => {
-        (e.currentTarget as HTMLElement).style.background = "transparent";
+        (e.currentTarget as HTMLElement).style.background = isActive
+          ? "var(--brass-ghost)"
+          : "transparent";
       }}
       onClick={onActivate}
       onKeyDown={(e) => onKeyDown(e, row)}
       onContextMenu={onContextMenu}
       data-testid={!isDir ? `file-row-${path}` : undefined}
     >
+      {/* The open file's edge — the same 2px brass mark the rail gives the
+          active workspace, so "you are here" reads identically on both. */}
+      {isActive && (
+        <span aria-hidden className="absolute inset-y-0 left-0 w-[2px] rounded-full bg-octo-brass" />
+      )}
+
       {/* Chevron (dirs) or dot indicator (files) */}
       {isDir ? (
         <span

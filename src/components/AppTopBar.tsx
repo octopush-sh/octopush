@@ -24,9 +24,18 @@ interface Props {
   onToggleScratchpad: () => void;
   /** Open the Mission Control room (the fleet cockpit). */
   onOpenMissionControl: () => void;
+  /** The active workspace's parent project. Rides with the wordmark so the
+   *  user always knows which project they are standing in. Null before a
+   *  project resolves — the divider and name are then omitted entirely. */
+  projectName?: string | null;
 }
 
-export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionControl }: Props) {
+export function AppTopBar({
+  onOpenSettings,
+  onToggleScratchpad,
+  onOpenMissionControl,
+  projectName = null,
+}: Props) {
   const openHistory = useHistoryStore((s) => s.openSheet);
   const showUpgrade = useUpgradeStore((s) => s.show);
   const { hasFeature } = useEntitlement();
@@ -61,6 +70,22 @@ export function AppTopBar({ onOpenSettings, onToggleScratchpad, onOpenMissionCon
         <span className="brand-wordmark text-[13px] text-octo-brass">
           Octopush
         </span>
+        {/* The project the active workspace belongs to. Mono/mute so the
+            brand keeps the voice and the project reads as state, and
+            truncating so a long name can never push the mark off centre. */}
+        {projectName && (
+          <>
+            <span aria-hidden className="text-[11px] text-octo-mute">
+              ·
+            </span>
+            <span
+              title={`Project · ${projectName}`}
+              className="max-w-[220px] truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage"
+            >
+              {projectName}
+            </span>
+          </>
+        )}
       </div>
       <RunsTray onOpen={onOpenMissionControl} />
       <div className="ml-auto flex items-center gap-1">
