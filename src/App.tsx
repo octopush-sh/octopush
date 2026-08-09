@@ -1918,11 +1918,12 @@ function App() {
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
       />
 
-      <main className="ml-4 flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR),
-            spanning the full main width so the top of the app reads as one
-            unified header card. The modes are NOT here: they sit in their own
-            band below, over the canvas column they govern. */}
+      <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">
+        {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR).
+            It spans the middle column only: the rail and the Companion are
+            both full-height siblings of <main>, so the header sits between
+            them rather than over the Companion. The modes are NOT here: they
+            sit in their own band below, over the canvas column they govern. */}
         {activeWorkspace && (
           <ContextHeader
             workspaceName={activeWorkspace.name}
@@ -1938,7 +1939,7 @@ function App() {
           />
         )}
 
-        {/* CONTENT ROW — columns flush under the header band. */}
+        {/* CONTENT ROW — the canvas column, filling what the header leaves. */}
         <div className="flex min-w-0 flex-1 overflow-hidden">
         {/* LEFT COLUMN — always mounted so the canvas (and the TerminalPanes
             inside the Run mode panel) survive any moment when there's no
@@ -2171,18 +2172,22 @@ function App() {
               </div>
             )}
         </div>
+        </div>
+      </main>
 
-        {/* RIGHT COLUMN — Companion always mounted. When there's no active
-            workspace the panel just shows empty/default data; the structure
-            is preserved. The mode switcher lives in the ModeBand above the
-            canvas, not here. Resizable via the 4px handle on the left edge:
-            drag to widen/narrow, double-click to reset to default. */}
-        <div
-          className={`relative flex shrink-0 flex-col pt-0 transition-all duration-[220ms] ${
-            isCompanionCollapsed ? "px-2 pb-4" : "p-4"
-          }`}
-          style={{ width: isCompanionCollapsed ? COMPANION_COLLAPSED_WIDTH : companionWidth }}
-        >
+      {/* RIGHT RAIL — the Companion, always mounted. When there's no active
+          workspace the panel just shows empty/default data; the structure is
+          preserved. It is a SIBLING of the WorkspaceRail, not a child of
+          <main>: full height between the top bar and the status bar, flush to
+          the window's right edge, carrying a single `border-l` hairline — the
+          mirror of the rail's `border-r`. That is also why the ContextHeader
+          above no longer spans it. The mode switcher lives in the ModeBand
+          over the canvas, not here. Resizable via the 4px handle on the left
+          edge: drag to widen/narrow, double-click to reset to default. */}
+      <div
+        className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
+        style={{ width: isCompanionCollapsed ? COMPANION_COLLAPSED_WIDTH : companionWidth }}
+      >
           {/* The resize handle only makes sense when expanded. */}
           {!isCompanionCollapsed && (
             <div
@@ -2222,10 +2227,8 @@ function App() {
             onMakeProject={
               sketchbookPath && activeProject?.path === sketchbookPath ? handleMakeProject : undefined
             }
-          />
-        </div>
-        </div>
-      </main>
+        />
+      </div>
       </div>
       <PerfMonitorBar
         workspacePath={activeWorkspace?.worktreePath ?? project?.path}

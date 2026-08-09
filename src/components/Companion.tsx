@@ -113,7 +113,9 @@ export function Companion({
   if (collapsed) {
     return (
       <aside
-        className="flex h-full min-h-0 flex-col items-center gap-1 rounded-md border border-octo-hairline bg-octo-panel py-2"
+        // Flush to the window's right edge, floor to ceiling — the mirror of
+        // the WorkspaceRail. One `border-l` hairline, no radius, no margin.
+        className="flex h-full min-h-0 flex-col items-center gap-1 border-l border-octo-hairline bg-octo-panel py-2"
         aria-label="Companion"
       >
         <button
@@ -132,7 +134,11 @@ export function Companion({
   // ── Expanded panel ──────────────────────────────────────────────
   return (
     <aside
-      className="flex min-h-0 flex-1 flex-col overflow-y-auto rounded-md border border-octo-hairline bg-octo-panel"
+      // Flush to the window's right edge, floor to ceiling — the mirror of the
+      // WorkspaceRail. One `border-l` hairline, no radius, no margin, so the
+      // app reads as three columns with two hairlines rather than a canvas
+      // with a card floating beside it.
+      className="flex h-full min-h-0 flex-col overflow-y-auto border-l border-octo-hairline bg-octo-panel"
       aria-label="Companion"
     >
       {/* Header: the panel's name and its collapse control. The mode switcher
