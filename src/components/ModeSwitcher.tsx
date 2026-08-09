@@ -63,10 +63,13 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
       role="group"
       aria-label="Workspace mode"
       // A segmented-control shell: the group now sits in a band of its own
-      // above the canvas, on the bare onyx ground, so it needs its own hairline
-      // to read as one control rather than four loose words. The 2px padding is
-      // what the indicator is inset by (inset-y-0.5 below).
-      className="relative inline-flex items-center gap-0.5 rounded-md border border-octo-hairline bg-octo-onyx p-0.5"
+      // above the canvas, on the bare onyx ground, so it needs its own border
+      // to read as one control rather than four loose words. That border is
+      // `border-strong`, not the hairline — this is a control the user
+      // operates, and control edges owe 3:1 on every theme (WCAG 1.4.11); the
+      // hairline is the decorative panel-divider tier. The 2px padding is what
+      // the indicator is inset by (inset-y-0.5 below).
+      className="relative inline-flex items-center gap-0.5 rounded-md border border-octo-border-strong bg-octo-onyx p-0.5"
     >
       {/* Gliding brass indicator — measured to the active button's box. */}
       {indicator && (
