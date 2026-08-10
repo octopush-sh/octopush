@@ -1,6 +1,9 @@
 # DIRECT — multi-provider CLI substrates & parallel DAG scheduling (design note)
 
-**Status:** proposed (deliberately deferred from the 2026-08-10 architecture-hardening pass)
+**Status:** SHIPPED (2026-08-10, second pass) — B6 shipped as model-derived dialects (claude + codex;
+the `cli_dialect` column was simplified away — the model picker is the selector); C10 shipped as
+Phase 1 (ready-set scheduling with write-set gating; run-level pauses preserved). Phase 2
+(worktree-per-branch with join-merge) and a Gemini dialect remain open follow-ups.
 **Context:** the adversarial architecture review of DIRECT mode (2026-08-10) identified and fixed
 16 of 18 findings in place (tool parity, loop memory, structured verdicts, conventions injection,
 ask_director continuation, intra-stage budgets, context compaction, commit detection, read-only

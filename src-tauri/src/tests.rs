@@ -6130,6 +6130,164 @@ mod orchestrator_tests {
         (orch, run_id, db)
     }
 
+    /// StageDraft helper for authored-graph (C10) tests.
+    fn draft_with(
+        role: &str,
+        parents: Vec<i64>,
+        tools: Option<Vec<String>>,
+        checkpoint: bool,
+    ) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents, tools,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+    fn ro_tools() -> Option<Vec<String>> {
+        Some(vec!["read_file".into(), "list_files".into()])
+    }
+
+    /// Runner for concurrency assertions: counts stages currently in flight
+    /// (and the max ever seen); read-only "critique" stages BLOCK until the
+    /// expected number are in flight together — a serial scheduler times out.
+    struct ConcurrencyRunner {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// CUMULATIVE entries — the rendezvous waits on this, not on
+        /// `in_flight` (a sibling can enter and finish between the waiter's
+        /// polls on a single-threaded runtime).
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: Arc<std::sync::atomic::AtomicUsize>,
+        /// Roles that must rendezvous (wait until `expected` have entered).
+        rendezvous_role: &'static str,
+        expected: usize,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for ConcurrencyRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(now, Ordering::SeqCst);
+            if stage.role == self.rendezvous_role {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                // Rendezvous: both branches must have STARTED while this one
+                // is still in flight — impossible under a serial scheduler.
+                let mut waited = 0;
+                while self.entered.load(Ordering::SeqCst) < self.expected && waited < 600 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    waited += 1;
+                }
+                assert!(waited < 600, "rendezvous timed out — branches did not run concurrently");
+            } else {
+                // Give siblings a chance to overlap if the scheduler lets them.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.01,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn authored_read_only_branches_run_concurrently() {
+        // C10 Phase 1: plan(0, writer) → two READ-ONLY critique branches that
+        // both depend only on the plan. They must execute in the SAME batch,
+        // concurrently — the rendezvous inside the runner fails on a serial
+        // scheduler.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("critique", vec![0], ro_tools(), false),
+            draft_with("critique", vec![0], ro_tools(), false),
+        ];
+        let pid = db.lock().save_pipeline(None, "Parallel RO", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink,
+            Box::new(ConcurrencyRunner {
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_seen: Arc::clone(&max_seen),
+                rendezvous_role: "critique",
+                expected: 2,
+            }),
+        );
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the two read-only branches overlapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_writer_branches_never_run_concurrently() {
+        // Write-set gating: two WRITER branches (implement) off one plan must
+        // serialize — the worktree is a shared blackboard. Both still complete.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("implement", vec![0], None, false),
+            draft_with("implement", vec![0], None, false),
+        ];
+        let pid = db.lock().save_pipeline(None, "Parallel W", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink,
+            Box::new(ConcurrencyRunner {
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_seen: Arc::clone(&max_seen),
+                rendezvous_role: "never",
+                expected: 0,
+            }),
+        );
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "writers serialize: at most one in flight"
+        );
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(rows.iter().all(|s| s.status == "done"), "both writers still completed");
+    }
+
+    #[tokio::test]
+    async fn parked_branch_does_not_prevent_its_batch_sibling_from_running() {
+        // A gated review branch and an independent read-only sibling are ready
+        // together: BOTH run in the batch; the gate then pauses the run with
+        // the sibling's work already done — a park no longer starves an
+        // independent branch that was ready alongside it.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("plan_review", vec![0], ro_tools(), true), // gated review branch
+            draft_with("critique", vec![0], ro_tools(), false),   // independent sibling
+        ];
+        let pid = db.lock().save_pipeline(None, "Park+Sibling", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(rows[1].status, "awaiting_checkpoint", "the gated branch parked");
+        assert_eq!(rows[2].status, "done", "the independent sibling ran in the same batch");
+        // Resolving the gate completes the run.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+    }
+
     #[tokio::test]
     async fn gated_loop_review_stage_pauses_for_checkpoint() {
         let (orch, run_id, db) = looped_run(2);
