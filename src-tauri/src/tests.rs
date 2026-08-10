@@ -2757,6 +2757,7 @@ mod runner_helpers_tests {
                 position: 0,
                 text: text.into(),
                 refs_worktree: false,
+                full_detail: true,
             }],
             refs_worktree: false,
             worktree_diff: None,
@@ -2887,6 +2888,7 @@ mod runner_helpers_tests {
                     position: 0,
                     text: "Refined plan: add the toggle to Settings".into(),
                     refs_worktree: false,
+                full_detail: true,
                 },
                 InputSection {
                     kind: ArtifactKind::Review,
@@ -2894,6 +2896,7 @@ mod runner_helpers_tests {
                     position: 1,
                     text: "Looks solid. VERDICT: PASS".into(),
                     refs_worktree: false,
+                full_detail: true,
                 },
             ],
             refs_worktree: false,
@@ -3045,6 +3048,7 @@ mod runner_helpers_tests {
                 position: 0,
                 text: "   ".into(),
                 refs_worktree: false,
+                full_detail: true,
             }],
             refs_worktree: false,
             worktree_diff: None,
@@ -5123,10 +5127,12 @@ mod orchestrator_tests {
         assert!(input.sections[1].text.contains("plan_review output"));
     }
 
-    /// Two producers of the same kind: the fresher one supersedes (refine's
-    /// refined plan replaces the original plan in the dossier — never both).
+    /// Two producers of the same kind: BOTH survive into the dossier — the
+    /// fresher at full detail, the older compact. (The old latest-per-kind
+    /// eviction silently erased a code review when a security review followed
+    /// it, and dropped whole branches at a join.)
     #[tokio::test]
-    async fn fresher_artifact_of_same_kind_supersedes_older() {
+    async fn same_kind_sections_all_survive_with_the_freshest_at_full_detail() {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P2", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -5149,9 +5155,44 @@ mod orchestrator_tests {
             .iter()
             .filter(|s| s.kind == ArtifactKind::Plan)
             .collect();
-        assert_eq!(plans.len(), 1, "exactly one Plan section");
-        assert_eq!(plans[0].role, "refine", "the refined plan supersedes the original");
-        assert!(plans[0].text.contains("refine output"));
+        assert_eq!(plans.len(), 2, "both Plan sections survive");
+        let original = plans.iter().find(|s| s.role == "plan").unwrap();
+        let refined = plans.iter().find(|s| s.role == "refine").unwrap();
+        assert!(refined.full_detail, "the freshest of the kind is the primary input");
+        assert!(!original.full_detail, "the older one is compact context");
+        // The rendered prompt labels the compact one as earlier context.
+        let prompt = crate::orchestrator::runner::user_input_for("implement", "task", input, None);
+        assert!(prompt.contains("earlier context"), "{prompt}");
+    }
+
+    /// The A2 headline case: two DIFFERENT review stages (code review, then
+    /// security review) both reach the downstream fix stage — the older one
+    /// used to be silently evicted by latest-per-kind.
+    #[tokio::test]
+    async fn two_reviews_both_reach_the_downstream_stage() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P4", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "security_review", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 3, "fix", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "task", None, None, &[]).unwrap();
+        let seen = Arc::new(Mutex::new(vec![]));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(RecordingRunner { seen: Arc::clone(&seen) }),
+        );
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock();
+        let (role, input) = &seen[3];
+        assert_eq!(role, "fix");
+        let reviews: Vec<_> = input.sections.iter().filter(|s| s.kind == ArtifactKind::Review).collect();
+        assert_eq!(reviews.len(), 2, "both reviews reach the fix stage: {:?}",
+            input.sections.iter().map(|s| (&s.role, &s.kind)).collect::<Vec<_>>());
+        assert!(reviews.iter().any(|s| s.role == "code_review" && !s.full_detail));
+        assert!(reviews.iter().any(|s| s.role == "security_review" && s.full_detail));
     }
 
     /// Startup recovery: a stage orphaned in `running` by a dead process must

@@ -70,19 +70,24 @@ pub trait AgentRunner: Send + Sync {
 }
 
 
-/// Cap (chars) on a single dossier section fed to a stage. Generous enough for
-/// a full plan or review (~4k tokens), tight enough that a runaway artifact
-/// can't blow up every later stage's prompt. Truncation keeps head + tail —
-/// intent and conclusions survive; boilerplate middles are what get dropped.
-const SECTION_CAP_CHARS: usize = 16_000;
+/// Cap (chars) on a single full-detail dossier section fed to a stage.
+/// Generous enough for a full plan or review (~4k tokens), tight enough that
+/// a runaway artifact can't blow up every later stage's prompt. Truncation
+/// keeps head + tail — intent and conclusions survive; boilerplate middles
+/// are what get dropped.
+pub(crate) const SECTION_CAP_CHARS: usize = 16_000;
 
-/// Middle-truncate `s` to [`SECTION_CAP_CHARS`] on char boundaries.
-pub(crate) fn cap_section(s: &str) -> String {
-    if s.len() <= SECTION_CAP_CHARS {
+/// Cap for an older same-kind section (kept for context, not the primary
+/// input — see `InputSection::full_detail`).
+pub(crate) const COMPACT_SECTION_CAP_CHARS: usize = 4_000;
+
+/// Middle-truncate `s` to `cap` chars on char boundaries.
+pub(crate) fn cap_to(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
         return s.to_string();
     }
-    let head_budget = SECTION_CAP_CHARS * 3 / 4;
-    let tail_budget = SECTION_CAP_CHARS - head_budget;
+    let head_budget = cap * 3 / 4;
+    let tail_budget = cap - head_budget;
     let mut head_end = head_budget.min(s.len());
     while !s.is_char_boundary(head_end) {
         head_end -= 1;
@@ -96,6 +101,11 @@ pub(crate) fn cap_section(s: &str) -> String {
         &s[..head_end],
         &s[tail_start..],
     )
+}
+
+/// Middle-truncate `s` to [`SECTION_CAP_CHARS`] on char boundaries.
+pub(crate) fn cap_section(s: &str) -> String {
+    cap_to(s, SECTION_CAP_CHARS)
 }
 
 /// Human-readable role for prompt attribution ("plan_review" → "plan review").
@@ -163,12 +173,25 @@ pub fn user_input_for(
         if sec.text.trim().is_empty() {
             continue;
         }
-        s.push_str(&format!(
-            "{} (from the {} stage):\n{}\n\n",
-            section_label(&sec.kind),
-            role_words(&sec.role),
-            cap_section(&sec.text),
-        ));
+        if sec.full_detail {
+            s.push_str(&format!(
+                "{} (from the {} stage):\n{}\n\n",
+                section_label(&sec.kind),
+                role_words(&sec.role),
+                cap_section(&sec.text),
+            ));
+        } else {
+            // An earlier same-kind section: kept (compact) instead of being
+            // silently evicted — the freshest section of this kind above/below
+            // is the primary input.
+            s.push_str(&format!(
+                "{} (from the {} stage, step {} — earlier context; a fresher section of this kind follows the pipeline order):\n{}\n\n",
+                section_label(&sec.kind),
+                role_words(&sec.role),
+                sec.position + 1,
+                cap_to(&sec.text, COMPACT_SECTION_CAP_CHARS),
+            ));
+        }
     }
     // A reviewer/tester must judge the ACTUAL code: include the live worktree
     // diff when it was captured; otherwise fall back to the tools hint. This

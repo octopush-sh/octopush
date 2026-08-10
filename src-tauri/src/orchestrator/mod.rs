@@ -1059,46 +1059,60 @@ impl Orchestrator {
             None => p < position,
         };
 
-        // Freshest artifact per kind among the stages that feed `position`.
-        // `stages` is position-ordered, so a plain overwrite keeps the latest.
-        // The worktree flag is OR'd across ALL feeding artifacts, not just
-        // retained sections — an empty-text code artifact still means "changes
-        // on disk". NOTE: the dossier is bounded to one section per kind, so a
-        // join fed by two same-kind branches (e.g. two reviews) keeps only the
-        // later one — the deliberate token-cost ceiling, not a per-branch fan-in.
-        let mut latest: std::collections::HashMap<&'static str, InputSection> =
-            std::collections::HashMap::new();
+        // EVERY feeding stage's live artifact becomes a section (an artifact
+        // nulled by a reset never rides along). The old shape kept only the
+        // freshest per KIND, which silently evicted real information — a
+        // security review erased the code review before it, and a join fed by
+        // two same-kind branches kept only one. Token cost stays bounded at
+        // render time instead: the freshest section of each kind renders at
+        // the full cap, older same-kind sections render compact, and a global
+        // dossier budget drops compact sections oldest-first when exceeded.
+        let mut sections: Vec<InputSection> = Vec::new();
         let mut refs_worktree = false;
         for s in stages.iter().filter(|s| feeds(s.position)) {
             let Some(json) = &s.artifact else { continue };
             let Ok(a) = serde_json::from_str::<StageArtifact>(json) else { continue };
             refs_worktree |= a.refs_worktree;
-            // An empty-text artifact must never EVICT an older, non-empty
-            // section of the same kind (e.g. a fix stage whose final message
-            // was empty would otherwise erase implement's summary).
             if a.text.trim().is_empty() {
                 continue;
             }
-            let key = match a.kind {
-                ArtifactKind::Plan => "plan",
-                ArtifactKind::Review => "review",
-                ArtifactKind::Tests => "tests",
-                ArtifactKind::Diff => "diff",
-                ArtifactKind::Note => "note",
-            };
-            latest.insert(
-                key,
-                InputSection {
-                    kind: a.kind,
-                    role: s.role.clone(),
-                    position: s.position,
-                    text: a.text,
-                    refs_worktree: a.refs_worktree,
-                },
-            );
+            sections.push(InputSection {
+                kind: a.kind,
+                role: s.role.clone(),
+                position: s.position,
+                text: a.text,
+                refs_worktree: a.refs_worktree,
+                full_detail: true,
+            });
         }
-        let mut sections: Vec<InputSection> = latest.into_values().collect();
-        sections.sort_by_key(|s| s.position);
+        // `sections` is position-ordered (stages was). Freshest per kind keeps
+        // full detail; earlier same-kind sections render compact.
+        let mut newest: std::collections::HashMap<&'static str, i64> = std::collections::HashMap::new();
+        for sec in &sections {
+            let e = newest.entry(sec.kind.as_db()).or_insert(sec.position);
+            if sec.position > *e {
+                *e = sec.position;
+            }
+        }
+        for sec in &mut sections {
+            sec.full_detail = newest[sec.kind.as_db()] == sec.position;
+        }
+        // Global dossier budget over the RENDERED sizes. Freshest-per-kind
+        // sections are never dropped; compact ones go oldest-first.
+        const DOSSIER_CAP_CHARS: usize = 60_000;
+        let rendered_len = |sec: &InputSection| {
+            sec.text.len().min(if sec.full_detail {
+                crate::orchestrator::runner::SECTION_CAP_CHARS
+            } else {
+                crate::orchestrator::runner::COMPACT_SECTION_CAP_CHARS
+            })
+        };
+        let mut total: usize = sections.iter().map(rendered_len).sum();
+        while total > DOSSIER_CAP_CHARS {
+            let Some(i) = sections.iter().position(|s| !s.full_detail) else { break };
+            total -= rendered_len(&sections[i]);
+            sections.remove(i);
+        }
 
         // One-line orientation: the full pipeline with statuses, current marked.
         let breadcrumb = stages

@@ -217,6 +217,11 @@ pub struct InputSection {
     pub text: String,
     /// True when the producing artifact's real output lives in the worktree.
     pub refs_worktree: bool,
+    /// True for the FRESHEST section of its kind — rendered at the full
+    /// section cap. Older same-kind sections render compact (a smaller cap,
+    /// labeled as earlier context) instead of being silently evicted: two
+    /// reviews from different stages both survive into the dossier now.
+    pub full_detail: bool,
 }
 
 /// The assembled input for a stage. Instead of only the immediately-previous
