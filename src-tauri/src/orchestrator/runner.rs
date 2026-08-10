@@ -271,6 +271,7 @@ impl AgentRunner for ApiRunner {
             } else {
                 None
             },
+            matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
         )
         .await;
 
@@ -333,7 +334,10 @@ impl AgentRunner for ApiRunner {
                 }
                 let kind = stage.artifact_kind.clone();
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
-                let verdict = parse_verdict(&r.text);
+                // Structured verdict first (submit_verdict tool call); the
+                // text sentinel remains as a fallback for models that wrote
+                // the line instead of calling the tool.
+                let verdict = r.verdict.clone().or_else(|| parse_verdict(&r.text));
                 if let Some(v) = &verdict {
                     emitter.notice(match v {
                         crate::orchestrator::types::ReviewVerdict::Pass => "Verdict: passed",

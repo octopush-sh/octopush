@@ -92,6 +92,10 @@ pub struct AgenticResult {
     /// stage is blocked on a director decision. The caller parks it as a
     /// checkpoint and re-runs it once answered. `finished` stays false.
     pub blocked: Option<BlockedAsk>,
+    /// Structured verdict from a `submit_verdict` tool call (auto-loop review
+    /// stages only). `None` when the stage didn't call it — the caller may
+    /// still fall back to the text sentinel.
+    pub verdict: Option<crate::orchestrator::types::ReviewVerdict>,
 }
 
 /// The DIRECT-only escape-valve tool. Appended to every DIRECT stage's toolset
@@ -134,6 +138,64 @@ fn ask_director_tool() -> LlmTool {
             "required": ["summary", "questions"]
         }),
     }
+}
+
+/// The structured verdict channel for auto-loop review stages (API substrate).
+/// A tool call parses identically across providers, where the `VERDICT:` text
+/// sentinel depended on model compliance and silently gated the run when a
+/// model phrased it differently.
+pub const SUBMIT_VERDICT_TOOL: &str = "submit_verdict";
+
+fn submit_verdict_tool() -> LlmTool {
+    LlmTool {
+        name: SUBMIT_VERDICT_TOOL.to_string(),
+        description: "Deliver your review verdict. Call this EXACTLY ONCE, when your findings are \
+            complete: verdict `pass` if the work is acceptable, `changes_requested` if it must be \
+            revised. Put your full findings in `findings` — that text is handed to the next stage \
+            (and, on `changes_requested`, to the stage being sent back), so include every finding \
+            with its severity, location, and the concrete fix."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["pass", "changes_requested"],
+                    "description": "The review outcome."
+                },
+                "findings": {
+                    "type": "string",
+                    "description": "The complete findings backing the verdict."
+                }
+            },
+            "required": ["verdict", "findings"]
+        }),
+    }
+}
+
+/// Parse a `submit_verdict` tool input. Tolerant on the verdict token (case,
+/// hyphens); `None` for an unrecognized value — the caller falls back to the
+/// text sentinel and, failing that, the human gate.
+fn parse_submit_verdict(u: &LlmToolUse) -> (Option<crate::orchestrator::types::ReviewVerdict>, String) {
+    use crate::orchestrator::types::ReviewVerdict;
+    let verdict = u
+        .input
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"))
+        .and_then(|s| match s.as_str() {
+            "pass" => Some(ReviewVerdict::Pass),
+            "changes_requested" => Some(ReviewVerdict::ChangesRequested),
+            _ => None,
+        });
+    let findings = u
+        .input
+        .get("findings")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (verdict, findings)
 }
 
 /// The last-resort question text when a block carries no usable summary either.
@@ -272,6 +334,9 @@ pub async fn run_agentic_loop(
     // Sandbox write roots when the mission is sandboxed (`Some` ⇒ in-process
     // `run_command` runs under seatbelt and `write_file` is confined).
     sandbox_roots: Option<&[String]>,
+    // Auto-loop review stage: expose `submit_verdict` so the verdict arrives
+    // as a structured tool call instead of a fragile text sentinel.
+    verdict_tool: bool,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -293,6 +358,11 @@ pub async fn run_agentic_loop(
     // read-only. It is deliberately NOT part of `build_llm_tools` (shared with
     // TALK), which has a human present and no use for a director-ask tool.
     tools.push(ask_director_tool());
+    // Same placement rationale for the auto-loop verdict channel: it must
+    // survive a review stage's read-only allowlist.
+    if verdict_tool {
+        tools.push(submit_verdict_tool());
+    }
     let mut messages: Vec<LlmMessage> = vec![LlmMessage {
         role: LlmRole::User,
         content: LlmContent::Text(initial_user.to_string()),
@@ -376,6 +446,21 @@ pub async fn run_agentic_loop(
             return Ok(out);
         }
 
+        // Structured verdict: a well-formed `submit_verdict` call ends the
+        // stage — the findings ARE the artifact. Sibling tool calls in the
+        // same turn are discarded (the verdict supersedes further acting). A
+        // malformed verdict value falls through to the execution loop, which
+        // feeds an error result back so the model retries with a valid token.
+        if let Some(u) = resp.tool_uses.iter().find(|u| u.name == SUBMIT_VERDICT_TOOL) {
+            let (verdict, findings) = parse_submit_verdict(u);
+            if let Some(v) = verdict {
+                out.verdict = Some(v);
+                out.text = if findings.is_empty() { resp.text.trim().to_string() } else { findings };
+                out.finished = true;
+                return Ok(out);
+            }
+        }
+
         let is_final =
             resp.stop_reason != LlmStopReason::ToolUse || resp.tool_uses.is_empty();
 
@@ -434,6 +519,19 @@ pub async fn run_agentic_loop(
         // Execute each tool, collect results + log.
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
+            // A malformed `submit_verdict` (unrecognized verdict token) gets an
+            // error result instead of executing — the model retries with a
+            // valid value; sibling tools in the turn still run normally.
+            if u.name == SUBMIT_VERDICT_TOOL {
+                results.push(LlmToolResult {
+                    tool_use_id: u.id.clone(),
+                    content: "ERROR: unrecognized verdict — call submit_verdict again with verdict \
+                              set to exactly `pass` or `changes_requested`."
+                        .into(),
+                    is_error: true,
+                });
+                continue;
+            }
             emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
             // The chat engine consumes execute_tool's structural `ok`; the
             // orchestrator keeps its own text-based classifier for journal

@@ -523,6 +523,21 @@ impl Orchestrator {
         }
     }
 
+    /// Append a notice entry to a stage's work journal, persisted AND emitted
+    /// live — the shared shape for orchestration decisions that must explain
+    /// themselves in the journal (gate fallbacks, escalations, loop events).
+    /// Best-effort: a journal write failure never masks the decision itself.
+    fn journal_notice(&self, run_id: &str, stage_id: &str, text: &str) {
+        let entry = serde_json::json!({ "kind": "notice", "text": text });
+        if let Err(e) = self.db.lock().append_stage_log(run_id, stage_id, &entry.to_string()) {
+            tracing::warn!(stage_id = %stage_id, "journal notice write failed: {e}");
+        }
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run_id, "stageId": stage_id, "entry": entry }),
+        );
+    }
+
     /// Append a terminal entry to the stage's work journal so the journal
     /// explains the halt instead of just stopping mid-action. Persisted AND
     /// emitted live (best-effort — a journal write must never mask the failure).
@@ -1286,6 +1301,17 @@ impl Orchestrator {
                             }
                             _ => {
                                 // ChangesRequested at cap, or unparseable verdict → gate.
+                                // Say WHY in the journal — a silent downgrade from
+                                // autonomous to gated reads as a hang to the director.
+                                let why = if verdict.is_none() {
+                                    "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision".to_string()
+                                } else {
+                                    format!(
+                                        "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
+                                        stage.loop_iterations, stage.loop_max_iterations
+                                    )
+                                };
+                                self.journal_notice(run_id, &stage.id, &why);
                                 self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
                                 self.db.lock().set_run_status(run_id, "paused", false)?;
                                 self.emit_checkpoint(run_id, &stage.id, "decision");
