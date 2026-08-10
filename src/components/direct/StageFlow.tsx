@@ -156,11 +156,13 @@ function CrewCard({
         <span className="font-mono text-[10px] text-octo-mute">{index + 1}</span>
       </div>
 
-      {/* Model chip — clicking it tunes the crew right on the pipeline. */}
+      {/* Model chip — clicking it tunes the crew right on the pipeline.
+          CLI stages accept Anthropic (Claude Code) AND OpenAI (Codex CLI)
+          models — the model selects the CLI dialect (B6). */}
       <ModelPicker
         activeModel={model}
         onSelectModel={onModel}
-        allowedProviders={cliManaged ? ["anthropic"] : undefined}
+        allowedProviders={cliManaged ? ["anthropic", "openai"] : undefined}
       />
 
       <div className="flex items-center gap-2">

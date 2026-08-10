@@ -7355,6 +7355,133 @@ mod cli_args_tests {
 }
 
 #[cfg(test)]
+mod cli_dialect_tests {
+    use crate::orchestrator::cli_runner::{
+        build_codex_outcome, codex_fold_event, codex_usage_from_event, dialect_for_model,
+        CliDialect, CodexAccum,
+    };
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
+    use serde_json::json;
+
+    #[test]
+    fn dialect_derives_from_the_model_id() {
+        assert_eq!(dialect_for_model("claude-sonnet-4-6"), CliDialect::Claude);
+        assert_eq!(dialect_for_model("claude-haiku-4-5"), CliDialect::Claude);
+        assert_eq!(dialect_for_model("gpt-5"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("gpt-5-codex"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("o3-mini"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("codex-mini-latest"), CliDialect::Codex);
+        // Unknown/proxy ids keep the historical claude behavior.
+        assert_eq!(dialect_for_model("my-proxy-model"), CliDialect::Claude);
+    }
+
+    #[test]
+    fn codex_argv_maps_read_only_to_its_native_sandbox() {
+        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false);
+        assert_eq!(rw[0], "exec");
+        assert!(rw.contains(&"--json".to_string()));
+        assert!(rw.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(rw.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"), "{rw:?}");
+        assert_eq!(rw.last().map(String::as_str), Some("-"), "prompt rides stdin");
+        // System prompt never appears in argv (codex has no flag for it).
+        assert!(!rw.iter().any(|a| a.contains("system prompt")));
+
+        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true);
+        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+
+        // Codex has no confirmed resume contract → fresh-run fallback.
+        assert!(CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false).is_none());
+        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false).is_some());
+
+        // Stdin payload: claude = user only; codex = system + user joined.
+        assert_eq!(CliDialect::Claude.stdin_payload("SYS", "USER"), "USER");
+        let codex = CliDialect::Codex.stdin_payload("SYS", "USER");
+        assert!(codex.contains("SYS") && codex.contains("USER"));
+    }
+
+    #[test]
+    fn codex_modern_stream_accumulates_message_session_and_error() {
+        let mut a = CodexAccum::default();
+        codex_fold_event(&mut a, &json!({"type":"thread.started","thread_id":"th_1"}));
+        assert_eq!(a.session_id.as_deref(), Some("th_1"));
+
+        // Command execution → tool + tool_result journal entries.
+        let started = codex_fold_event(&mut a, &json!({"type":"item.started",
+            "item":{"item_type":"command_execution","command":"cargo test"}}));
+        assert_eq!(started[0]["kind"], "tool");
+        assert_eq!(started[0]["tool"], "run_command");
+        let done = codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"command_execution","command":"cargo test","exit_code":0,"aggregated_output":"ok"}}));
+        assert_eq!(done[0]["kind"], "tool_result");
+        assert_eq!(done[0]["ok"], true);
+
+        // The LAST assistant message wins as the artifact.
+        codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"assistant_message","text":"first draft"}}));
+        codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"assistant_message","text":"final answer"}}));
+        assert_eq!(a.final_message.as_deref(), Some("final answer"));
+
+        let mut b = CodexAccum::default();
+        let errs = codex_fold_event(&mut b, &json!({"type":"turn.failed","error":{"message":"boom"}}));
+        assert_eq!(b.error.as_deref(), Some("boom"));
+        assert_eq!(errs[0]["kind"], "notice");
+    }
+
+    #[test]
+    fn codex_legacy_stream_shape_still_parses() {
+        let mut a = CodexAccum::default();
+        codex_fold_event(&mut a, &json!({"id":"0","msg":{"type":"session_configured","session_id":"s9"}}));
+        codex_fold_event(&mut a, &json!({"id":"1","msg":{"type":"agent_message","message":"hello"}}));
+        codex_fold_event(&mut a, &json!({"id":"2","msg":{"type":"task_complete","last_agent_message":"done!"}}));
+        assert_eq!(a.session_id.as_deref(), Some("s9"));
+        assert_eq!(a.final_message.as_deref(), Some("done!"));
+    }
+
+    #[test]
+    fn codex_usage_splits_cached_input_and_keys_turns_distinctly() {
+        // Modern per-turn usage: distinct events, cached input split out.
+        let (key, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}})).unwrap();
+        assert!(key.is_none(), "each turn is its own entry");
+        assert_eq!(u.input_tokens, 400, "billable fresh input excludes cached");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.output_tokens, 50);
+        // Non-usage events report nothing.
+        assert!(codex_usage_from_event(&json!({"type":"turn.started"})).is_none());
+    }
+
+    #[test]
+    fn codex_outcome_is_the_last_message_or_an_honest_failure() {
+        let usage = Default::default();
+        // Final message → Done, with the verdict sentinel still parsed.
+        let ok = build_codex_outcome(
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()) },
+            usage, true, ArtifactKind::Review, "gpt-5", "",
+        );
+        assert!(matches!(ok.status, StageStatus::Done));
+        assert_eq!(ok.artifact.text, "findings\nVERDICT: PASS");
+        assert!(ok.verdict.is_some(), "the text verdict sentinel works across dialects");
+        assert_eq!(ok.session_id.as_deref(), Some("th"));
+
+        // turn.failed → Failed, last message preserved as context.
+        let failed = build_codex_outcome(
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None },
+            usage, true, ArtifactKind::Diff, "gpt-5", "",
+        );
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let msg = failed.error.as_deref().unwrap();
+        assert!(msg.contains("rate limited") && msg.contains("partial"), "{msg}");
+
+        // No message at all → honest no-result failure.
+        let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
+        assert!(matches!(empty.status, StageStatus::Failed));
+        assert!(empty.error.as_deref().unwrap().contains("no final message"));
+    }
+}
+
+#[cfg(test)]
 mod cli_question_tests {
     use crate::orchestrator::cli_runner::detect_trailing_question;
 

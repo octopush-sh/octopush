@@ -368,6 +368,394 @@ pub fn is_result_event(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("result")
 }
 
+// ─── CLI dialects (B6) ────────────────────────────────────────────────────
+//
+// The `cli` substrate used to be hardcoded to Claude Code. A stage's MODEL now
+// selects the CLI dialect: `claude-*` runs Claude Code exactly as before, and
+// OpenAI-family ids (`gpt-*`, `o1/o3/o4*`, anything containing `codex`) run
+// Codex CLI (`codex exec --json`). Deriving the dialect from the model —
+// instead of the design note's `cli_dialect` column — needs no migration and
+// no new builder control: the model picker the author already uses is the
+// selector, and the builder's existing "CLI needs a matching model" warning
+// covers the mismatch case. The enum keeps the seams (argv / resume /
+// event-parse / result) in one place so an explicit per-stage override or a
+// third dialect (Gemini CLI) can be added without touching the runner loop.
+
+/// Which CLI runs a `cli`-substrate stage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CliDialect {
+    Claude,
+    Codex,
+}
+
+/// Derive the dialect from the stage's model id. Unknown ids fall back to
+/// Claude (the historical behavior — and `claude` is the CLI most likely to
+/// be configured for a proxy model).
+pub fn dialect_for_model(model: &str) -> CliDialect {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gpt-")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("codex")
+    {
+        CliDialect::Codex
+    } else {
+        CliDialect::Claude
+    }
+}
+
+impl CliDialect {
+    pub fn binary(&self) -> &'static str {
+        match self {
+            CliDialect::Claude => "claude",
+            CliDialect::Codex => "codex",
+        }
+    }
+
+    /// Fresh-run argv. Codex has no `--append-system-prompt` or `--max-turns`
+    /// equivalent: the system prompt rides stdin (see [`CliDialect::stdin_payload`])
+    /// and the turn budget is bounded by the runner's idle/absolute timeouts.
+    /// `read_only` maps to each CLI's native mechanism: Claude denies the edit
+    /// tools; Codex runs in its own `read-only` sandbox.
+    pub fn argv(&self, model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+        match self {
+            CliDialect::Claude => build_cli_args(model, system_prompt, max_turns, read_only),
+            CliDialect::Codex => {
+                let mut a = vec![
+                    "exec".to_string(),
+                    "--json".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "-m".to_string(),
+                    model.to_string(),
+                ];
+                if read_only {
+                    a.push("--sandbox".to_string());
+                    a.push("read-only".to_string());
+                } else {
+                    // The Octopush worktree + mission sandbox own isolation;
+                    // codex's approval prompts would hang a headless stage.
+                    a.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                }
+                // `-` = read the prompt from stdin.
+                a.push("-".to_string());
+                a
+            }
+        }
+    }
+
+    /// Resume argv, for dialects with a confirmed session-continuation
+    /// contract. `None` ⇒ the runner falls back to a fresh run (worktree
+    /// preserved, feedback in the prompt) — the already-graceful path.
+    pub fn resume_argv(
+        &self,
+        model: &str,
+        session_id: &str,
+        max_turns: i64,
+        read_only: bool,
+    ) -> Option<Vec<String>> {
+        match self {
+            CliDialect::Claude => Some(build_cli_args_resume(model, session_id, max_turns, read_only)),
+            // Codex has a `codex exec resume` in newer builds, but the contract
+            // isn't stable enough to bet a stage on — fresh re-run instead.
+            CliDialect::Codex => None,
+        }
+    }
+
+    /// What is written to the child's stdin. Claude gets the user prompt (the
+    /// system prompt rides `--append-system-prompt`); Codex gets both, joined —
+    /// it has no separate system-prompt channel.
+    pub fn stdin_payload(&self, system: &str, user: &str) -> String {
+        match self {
+            CliDialect::Claude => user.to_string(),
+            CliDialect::Codex => format!("{system}\n\n---\n\n{user}"),
+        }
+    }
+
+    fn not_found_message(&self) -> String {
+        match self {
+            CliDialect::Claude => "Claude Code CLI (`claude`) was not found. Octopush searched your PATH, \
+                 login-shell PATH, and common install dirs (e.g. ~/.local/bin, /opt/homebrew/bin). \
+                 Ensure `claude` is installed and on your shell's PATH."
+                .to_string(),
+            CliDialect::Codex => "Codex CLI (`codex`) was not found. Octopush searched your PATH, \
+                 login-shell PATH, and common install dirs (e.g. ~/.local/bin, /opt/homebrew/bin). \
+                 Install it (`npm i -g @openai/codex`) or switch this stage to a Claude model / the API substrate."
+                .to_string(),
+        }
+    }
+}
+
+/// What a Codex stream has told us so far. Codex has no single terminal
+/// `result` event — the outcome is assembled from the accumulated stream:
+/// the LAST assistant message is the artifact, `turn.failed`/`error` mark
+/// failure, and `thread.started` carries the session id.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CodexAccum {
+    pub final_message: Option<String>,
+    pub error: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// A string field that may be a plain string or an array of strings (codex
+/// renders commands both ways across versions).
+fn string_or_join(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => Some(
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// Fold one Codex NDJSON event into the accumulator and return any journal
+/// entries it implies. Tolerant of BOTH Codex stream schemas — the modern
+/// `{"type":"item.completed","item":{…}}` thread events and the older
+/// `{"msg":{"type":"agent_message",…}}` experimental shape — because the CLI's
+/// JSON contract has drifted across versions; unknown events are skipped, so a
+/// schema surprise degrades to "no result" (an honest, recoverable failure),
+/// never a crash.
+pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> {
+    use serde_json::json;
+    let mut entries = Vec::new();
+    // ── Modern thread-event schema ──
+    if let Some(t) = v.get("type").and_then(Value::as_str) {
+        match t {
+            "thread.started" => {
+                if let Some(id) = v.get("thread_id").and_then(Value::as_str) {
+                    accum.session_id = Some(id.to_string());
+                }
+            }
+            "turn.failed" | "error" => {
+                let msg = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .or_else(|| v.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("codex reported an error");
+                accum.error = Some(msg.to_string());
+                entries.push(json!({ "kind": "notice", "text": format!("codex error — {msg}") }));
+            }
+            "item.started" | "item.updated" | "item.completed" => {
+                if let Some(item) = v.get("item") {
+                    let itype = item
+                        .get("item_type")
+                        .or_else(|| item.get("type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let completed = t == "item.completed";
+                    match itype {
+                        "assistant_message" | "agent_message" => {
+                            if completed {
+                                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                    if !text.trim().is_empty() {
+                                        accum.final_message = Some(text.to_string());
+                                        entries.push(json!({ "kind": "text", "text": text.trim() }));
+                                    }
+                                }
+                            }
+                        }
+                        "command_execution" => {
+                            let cmd = string_or_join(item.get("command")).unwrap_or_default();
+                            if t == "item.started" {
+                                entries.push(json!({ "kind": "tool", "tool": "run_command",
+                                    "hint": crate::orchestrator::live::summarize(&cmd) }));
+                            } else if completed {
+                                let ok = item
+                                    .get("exit_code")
+                                    .and_then(Value::as_i64)
+                                    .map(|c| c == 0)
+                                    .unwrap_or(true);
+                                let out = item
+                                    .get("aggregated_output")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                entries.push(json!({ "kind": "tool_result", "ok": ok,
+                                    "detail": crate::orchestrator::live::summarize(out) }));
+                            }
+                        }
+                        "file_change" => {
+                            if completed {
+                                let paths = item
+                                    .get("changes")
+                                    .and_then(Value::as_array)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|c| c.get("path").and_then(Value::as_str))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                entries.push(json!({ "kind": "tool", "tool": "edit_file",
+                                    "hint": crate::orchestrator::live::summarize(&paths) }));
+                            }
+                        }
+                        "mcp_tool_call" | "web_search" => {
+                            if completed {
+                                entries.push(json!({ "kind": "tool", "tool": itype, "hint": "" }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        return entries;
+    }
+    // ── Legacy experimental schema ──
+    if let Some(msg) = v.get("msg") {
+        match msg.get("type").and_then(Value::as_str).unwrap_or("") {
+            "agent_message" => {
+                if let Some(text) = msg.get("message").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        accum.final_message = Some(text.to_string());
+                        entries.push(json!({ "kind": "text", "text": text.trim() }));
+                    }
+                }
+            }
+            "task_complete" => {
+                if let Some(text) = msg.get("last_agent_message").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        accum.final_message = Some(text.to_string());
+                    }
+                }
+            }
+            "exec_command_begin" => {
+                let cmd = string_or_join(msg.get("command")).unwrap_or_default();
+                entries.push(json!({ "kind": "tool", "tool": "run_command",
+                    "hint": crate::orchestrator::live::summarize(&cmd) }));
+            }
+            "exec_command_end" => {
+                let ok = msg.get("exit_code").and_then(Value::as_i64).map(|c| c == 0).unwrap_or(true);
+                entries.push(json!({ "kind": "tool_result", "ok": ok, "detail": "" }));
+            }
+            "session_configured" => {
+                if let Some(id) = msg.get("session_id").and_then(Value::as_str) {
+                    accum.session_id = Some(id.to_string());
+                }
+            }
+            "error" => {
+                let m = msg.get("message").and_then(Value::as_str).unwrap_or("codex reported an error");
+                accum.error = Some(m.to_string());
+                entries.push(json!({ "kind": "notice", "text": format!("codex error — {m}") }));
+            }
+            _ => {}
+        }
+    }
+    entries
+}
+
+/// Usage from a Codex stream event. Modern: `turn.completed` carries per-turn
+/// usage (each event is a distinct key — `None` id ⇒ caller keys it uniquely).
+/// Legacy: `token_count` events are cumulative, so they share the fixed key
+/// `"token_count"` and latest-wins. Codex reports the FULL input including
+/// cached tokens (OpenAI-style), so the cached slice is split out for pricing.
+pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
+    let (usage, key) = if v.get("type").and_then(Value::as_str) == Some("turn.completed") {
+        (v.get("usage")?, None)
+    } else if v.get("msg").and_then(|m| m.get("type")).and_then(Value::as_str) == Some("token_count")
+    {
+        (
+            v.get("msg")?.get("info").and_then(|i| i.get("total_token_usage")).or_else(|| v.get("msg"))?,
+            Some("token_count".to_string()),
+        )
+    } else {
+        return None;
+    };
+    let g = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let input = g("input_tokens");
+    let cached = g("cached_input_tokens").min(input);
+    Some((
+        key,
+        CliUsage {
+            input_tokens: input - cached,
+            output_tokens: g("output_tokens"),
+            cache_read_input_tokens: cached,
+            cache_creation_input_tokens: 0,
+        },
+    ))
+}
+
+/// Assemble a Codex stage outcome from the accumulated stream: the last
+/// assistant message is the artifact; `turn.failed`/`error` (or a bad exit
+/// with no message) is a failure. Usage is the deduped stream sum, priced
+/// through the catalog (codex reports no USD).
+pub(crate) fn build_codex_outcome(
+    accum: &CodexAccum,
+    usage: CliUsage,
+    exit_success: bool,
+    artifact_kind: ArtifactKind,
+    model: &str,
+    stderr_text: &str,
+) -> StageOutcome {
+    let cost = crate::orchestrator::cost::stage_cost(
+        model,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    let failed = accum.error.is_some() || (!exit_success && accum.final_message.is_none());
+    if failed {
+        let mut error = accum
+            .error
+            .clone()
+            .unwrap_or_else(|| "codex exited with an error".to_string());
+        if let Some(m) = accum.final_message.as_deref().filter(|m| !m.trim().is_empty()) {
+            error.push_str(&format!("\n— last message —\n{m}"));
+        }
+        let tail = stderr_tail(stderr_text, 10);
+        if !tail.is_empty() {
+            error.push_str(&format!("\n— stderr —\n{tail}"));
+        }
+        let mut out = failed_stage(&error);
+        out.input_tokens = usage.input_tokens;
+        out.output_tokens = usage.output_tokens;
+        out.cost_usd = cost;
+        out.session_id = accum.session_id.clone();
+        return out;
+    }
+    match accum.final_message.as_deref().filter(|m| !m.trim().is_empty()) {
+        Some(text) => {
+            let refs_worktree = matches!(artifact_kind, ArtifactKind::Diff | ArtifactKind::Tests);
+            StageOutcome {
+                artifact: StageArtifact {
+                    kind: artifact_kind,
+                    text: text.to_string(),
+                    payload: None,
+                    refs_worktree,
+                },
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: cost,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: parse_verdict(text),
+                session_id: accum.session_id.clone(),
+                blocked: None,
+                blocked_transcript: None,
+            }
+        }
+        None => {
+            let mut out = failed_stage(&format!(
+                "codex produced no final message: {}",
+                failure_detail(stderr_text, "the stream ended without an assistant message")
+            ));
+            out.input_tokens = usage.input_tokens;
+            out.output_tokens = usage.output_tokens;
+            out.cost_usd = cost;
+            out.session_id = accum.session_id.clone();
+            out
+        }
+    }
+}
+
 /// How the stdout read loop ended — drives the post-loop handling.
 enum ReadEnd {
     Eof(Option<String>, std::collections::VecDeque<String>),
@@ -402,9 +790,19 @@ impl AgentRunner for CliRunner {
         // their write access — committing/pushing IS their job).
         let read_only = matches!(stage.artifact_kind, ArtifactKind::Review)
             && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree);
-        let (args, user) = match stage.resume_session.as_deref() {
-            Some(sid) => (
-                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations, read_only),
+        // The MODEL selects the CLI dialect (B6): claude-* → Claude Code,
+        // OpenAI-family ids → Codex CLI. See `dialect_for_model`.
+        let dialect = dialect_for_model(&stage.agent_model);
+        // Resume only on dialects with a confirmed continuation contract; a
+        // dialect without one falls back to a fresh run (worktree preserved,
+        // feedback in the prompt) even when a session id is on the row.
+        let resume_args = stage
+            .resume_session
+            .as_deref()
+            .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only));
+        let (args, user) = match resume_args {
+            Some(argv) => (
+                argv,
                 // An answered question-block resumes with the director's
                 // decisions in the nudge — the CLI counterpart of the API
                 // substrate's transcript continuation. A plain halt-recovery
@@ -419,15 +817,18 @@ impl AgentRunner for CliRunner {
                 },
             ),
             None => (
-                build_cli_args(&stage.agent_model, &system, stage.max_iterations, read_only),
-                user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
+                dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only),
+                dialect.stdin_payload(
+                    &system,
+                    &user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
+                ),
             ),
         };
 
         let path_env = resolved_cli_path();
-        let real_program: std::ffi::OsString = resolve_executable("claude", &path_env)
+        let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
             .map(Into::into)
-            .unwrap_or_else(|| "claude".into());
+            .unwrap_or_else(|| dialect.binary().into());
 
         // Seatbelt sandbox (macOS): when the mission asks for it, wrap the spawn
         // in `sandbox-exec -f <profile> claude …`. NO silent fallback — if the
@@ -493,13 +894,9 @@ impl AgentRunner for CliRunner {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(failed_stage(
-                    "Claude Code CLI (`claude`) was not found. Octopush searched your PATH, \
-                     login-shell PATH, and common install dirs (e.g. ~/.local/bin, /opt/homebrew/bin). \
-                     Ensure `claude` is installed and on your shell's PATH.",
-                ));
+                return Ok(failed_stage(&dialect.not_found_message()));
             }
-            Err(e) => return Ok(failed_stage(&format!("failed to launch claude: {e}"))),
+            Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -537,6 +934,12 @@ impl AgentRunner for CliRunner {
         let streamed_usage: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, CliUsage>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let usage_in_loop = std::sync::Arc::clone(&streamed_usage);
+        // Codex terminal state accumulates across the stream (there is no
+        // single `result` event); shared so the timeout/salvage paths below
+        // can read it too.
+        let codex_accum: std::sync::Arc<parking_lot::Mutex<CodexAccum>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(CodexAccum::default()));
+        let codex_in_loop = std::sync::Arc::clone(&codex_accum);
         let read_loop = async {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut result_line: Option<String> = None;
@@ -580,16 +983,31 @@ impl AgentRunner for CliRunner {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
-                if is_result_event(&value) {
-                    result_line = Some(trimmed.to_string());
-                }
-                if let Some((id, u)) = usage_from_stream_event(&value) {
-                    let mut map = usage_in_loop.lock();
-                    let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
-                    map.insert(key, u);
-                }
-                for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
-                    emitter.emit_raw_entry(entry);
+                match dialect {
+                    CliDialect::Claude => {
+                        if is_result_event(&value) {
+                            result_line = Some(trimmed.to_string());
+                        }
+                        if let Some((id, u)) = usage_from_stream_event(&value) {
+                            let mut map = usage_in_loop.lock();
+                            let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                            map.insert(key, u);
+                        }
+                        for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
+                            emitter.emit_raw_entry(entry);
+                        }
+                    }
+                    CliDialect::Codex => {
+                        let entries = codex_fold_event(&mut codex_in_loop.lock(), &value);
+                        for entry in entries {
+                            emitter.emit_raw_entry(entry);
+                        }
+                        if let Some((id, u)) = codex_usage_from_event(&value) {
+                            let mut map = usage_in_loop.lock();
+                            let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                            map.insert(key, u);
+                        }
+                    }
                 }
             }
             ReadEnd::Eof(result_line, tail)
@@ -623,28 +1041,28 @@ impl AgentRunner for CliRunner {
                 ));
             }
         };
-        let (result_line, tail, salvaged) = match read_end {
-            ReadEnd::Eof(r, t) => (r, t, false),
-            ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
-            ReadEnd::Idle(None, _) => {
-                stderr_task.abort();
-                let u = sum_usage(&streamed_usage.lock());
-                return Ok(failed_stage_with_usage(
-                    "claude timed out — no output for 5 minutes",
-                    &stage.agent_model,
-                    u,
-                ));
-            }
-            ReadEnd::AbsCap(None, _) => {
-                stderr_task.abort();
-                let u = sum_usage(&streamed_usage.lock());
-                return Ok(failed_stage_with_usage(
-                    "claude exceeded the 60-minute cap",
-                    &stage.agent_model,
-                    u,
-                ));
-            }
+        let bin = dialect.binary();
+        let (result_line, tail, timeout_kind) = match read_end {
+            ReadEnd::Eof(r, t) => (r, t, None),
+            ReadEnd::Idle(r, t) => (r, t, Some("timed out — no output for 5 minutes")),
+            ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap")),
         };
+        // Is there a salvageable terminal state? Claude: a captured `result`
+        // line. Codex: an accumulated final assistant message.
+        let has_terminal = match dialect {
+            CliDialect::Claude => result_line.is_some(),
+            CliDialect::Codex => codex_accum.lock().final_message.is_some(),
+        };
+        if let (Some(kind), false) = (timeout_kind, has_terminal) {
+            stderr_task.abort();
+            let u = sum_usage(&streamed_usage.lock());
+            return Ok(failed_stage_with_usage(
+                &format!("{bin} {kind}"),
+                &stage.agent_model,
+                u,
+            ));
+        }
+        let salvaged = timeout_kind.is_some();
 
         // When we salvaged a result from a slow-EOF idle/cap, the child may still
         // be lingering — kill it instead of blocking on wait(), and trust the
@@ -665,43 +1083,60 @@ impl AgentRunner for CliRunner {
         .and_then(|r| r.ok())
         .unwrap_or_default();
 
-        match result_line {
-            Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                Ok(mut outcome) => {
-                    // Question-as-result guard: a Done outcome whose text is
-                    // a person-addressed question becomes a director block —
-                    // the question must reach the human, not the next stage's
-                    // prompt disguised as a result. Verdict-bearing reviews
-                    // are exempt (they finished; the verdict drives the loop).
-                    if matches!(outcome.status, StageStatus::Done) && outcome.verdict.is_none() {
-                        if let Some(ask) = detect_trailing_question(&outcome.artifact.text) {
-                            emitter.notice(&format!(
-                                "the agent ended with a question — pausing for the director: {}",
-                                ask.questions[0].question
-                            ));
-                            outcome.status = StageStatus::AwaitingCheckpoint;
-                            outcome.blocked = Some(ask);
-                        }
-                    }
-                    Ok(outcome)
+        // Question-as-result guard (both dialects): a Done outcome whose text
+        // is a person-addressed question becomes a director block — the
+        // question must reach the human, not the next stage's prompt disguised
+        // as a result. Verdict-bearing reviews are exempt (they finished; the
+        // verdict drives the loop).
+        let apply_question_guard = |mut outcome: StageOutcome| -> StageOutcome {
+            if matches!(outcome.status, StageStatus::Done) && outcome.verdict.is_none() {
+                if let Some(ask) = detect_trailing_question(&outcome.artifact.text) {
+                    emitter.notice(&format!(
+                        "the agent ended with a question — pausing for the director: {}",
+                        ask.questions[0].question
+                    ));
+                    outcome.status = StageStatus::AwaitingCheckpoint;
+                    outcome.blocked = Some(ask);
                 }
-                Err(_) => Ok(failed_stage(&format!(
-                    "claude produced no parseable result: {}",
-                    failure_detail(&stderr_out, &line)
-                ))),
-            },
-            None => {
-                let recent = tail.into_iter().collect::<Vec<_>>().join("\n");
-                let fallback = if recent.trim().is_empty() {
-                    "claude emitted no result event"
-                } else {
-                    &recent
-                };
-                Ok(failed_stage(&format!(
-                    "claude produced no result: {}",
-                    failure_detail(&stderr_out, fallback)
-                )))
             }
+            outcome
+        };
+
+        match dialect {
+            CliDialect::Codex => {
+                let accum = codex_accum.lock().clone();
+                let u = sum_usage(&streamed_usage.lock());
+                let outcome = build_codex_outcome(
+                    &accum,
+                    u,
+                    exit_success,
+                    stage.artifact_kind.clone(),
+                    &stage.agent_model,
+                    &stderr_out,
+                );
+                Ok(apply_question_guard(outcome))
+            }
+            CliDialect::Claude => match result_line {
+                Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
+                    Ok(outcome) => Ok(apply_question_guard(outcome)),
+                    Err(_) => Ok(failed_stage(&format!(
+                        "claude produced no parseable result: {}",
+                        failure_detail(&stderr_out, &line)
+                    ))),
+                },
+                None => {
+                    let recent = tail.into_iter().collect::<Vec<_>>().join("\n");
+                    let fallback = if recent.trim().is_empty() {
+                        "claude emitted no result event"
+                    } else {
+                        &recent
+                    };
+                    Ok(failed_stage(&format!(
+                        "claude produced no result: {}",
+                        failure_detail(&stderr_out, fallback)
+                    )))
+                }
+            },
         }
     }
 }

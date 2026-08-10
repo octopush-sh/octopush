@@ -149,6 +149,21 @@ export type StageEdge = Edge<EdgeData>;
 export const DEFAULT_MAX_TURNS = 25;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
+/** Whether a model id maps to a CLI dialect the backend can run — mirrors
+ *  `dialect_for_model` in src-tauri/src/orchestrator/cli_runner.rs:
+ *  claude-* → Claude Code; gpt-*, o1/o3/o4*, codex* → Codex CLI. */
+export function cliDialectSupported(model: string): boolean {
+  const m = model.toLowerCase();
+  return (
+    /claude/.test(m) ||
+    m.startsWith("gpt-") ||
+    m.startsWith("o1") ||
+    m.startsWith("o3") ||
+    m.startsWith("o4") ||
+    m.includes("codex")
+  );
+}
+
 // Auto-layout constants for legacy pipelines (no saved coordinates).
 const COLUMN_X = 0;
 const ROW_GAP = 150;
@@ -474,8 +489,14 @@ export function validateGraph(nodes: StageNode[], edges: StageEdge[]): GraphVali
     const a = archetypeFor(n.data.role);
     if (!n.data.agentModel || n.data.agentModel.trim() === "") {
       addErr(n.id, `${stageLabel(n.data)} has no model.`);
-    } else if (n.data.substrate === "cli" && !/claude/i.test(n.data.agentModel)) {
-      addWarn(n.id, `${stageLabel(n.data)} runs on the CLI (Claude Code) — pick a Claude model.`);
+    } else if (n.data.substrate === "cli" && !cliDialectSupported(n.data.agentModel)) {
+      // The model picks the CLI dialect: claude-* → Claude Code, OpenAI-family
+      // ids (gpt-*, o1/o3/o4*, codex*) → Codex CLI. Anything else has no CLI
+      // to run it — warn (the backend falls back to the claude binary).
+      addWarn(
+        n.id,
+        `${stageLabel(n.data)} runs on a CLI, and no CLI dialect matches this model — pick a Claude model (Claude Code) or an OpenAI model (Codex CLI).`,
+      );
     }
     if (n.data.maxIterations < 1 || n.data.maxIterations > 100) {
       addErr(n.id, `${stageLabel(n.data)}: max turns must be 1–100.`);
