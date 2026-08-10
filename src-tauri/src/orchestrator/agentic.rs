@@ -105,6 +105,14 @@ pub struct AgenticResult {
     /// the `ask_director` turn, so the answered stage can CONTINUE the same
     /// conversation instead of re-running — and re-paying — from scratch.
     pub blocked_transcript: Option<BlockedTranscript>,
+    /// Spend from `ask_stage` peer consultations, priced at each PEER model's
+    /// rate (the caller must add it to the stage cost rather than re-pricing
+    /// these tokens at the stage's own model).
+    pub peer_cost_usd: f64,
+    /// Peer-consultation token counts (kept out of the main counters so the
+    /// stage-model pricing stays correct).
+    pub peer_input_tokens: u64,
+    pub peer_output_tokens: u64,
 }
 
 /// The conversation state persisted while a stage is parked on `ask_director`:
@@ -263,6 +271,149 @@ pub fn user_messages(text: &str) -> Vec<LlmMessage> {
     vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(text.to_string()) }]
 }
 
+/// A completed earlier stage a running stage may consult via `ask_stage`:
+/// its archived artifact + journal narration, and the model that produced
+/// them (the answer comes from THAT model — the point is to ask the mind
+/// that did the work, not to re-read its paper).
+#[derive(Clone, Debug)]
+pub struct PeerStage {
+    /// 0-based pipeline position (surfaced to the model as 1-based `step`).
+    pub position: i64,
+    pub role: String,
+    pub model: String,
+    /// The stage's artifact text, pre-capped by the builder.
+    pub artifact_text: String,
+    /// Digest of the stage's journal narration, pre-capped by the builder.
+    pub journal_digest: String,
+}
+
+/// The inter-stage query channel: lets a stage ask a completed earlier stage
+/// a question instead of guessing at its intent. Only offered when peers
+/// exist.
+pub const ASK_STAGE_TOOL: &str = "ask_stage";
+
+fn ask_stage_tool(peers: &[PeerStage]) -> LlmTool {
+    let roster = peers
+        .iter()
+        .map(|p| format!("step {}: {} ({})", p.position + 1, p.role.replace('_', " "), p.model))
+        .collect::<Vec<_>>()
+        .join("; ");
+    LlmTool {
+        name: ASK_STAGE_TOOL.to_string(),
+        description: format!(
+            "Ask a completed earlier pipeline stage a SPECIFIC question about its work — its \
+             intent, a decision it made, or a detail its summary omits. The answer comes from \
+             that stage's own model with its archived work as context. Available stages: {roster}. \
+             Use sparingly (each question costs a model call); prefer reading the workspace for \
+             anything a file can answer."
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "step": {
+                    "type": "integer",
+                    "description": "The 1-based step number of the stage to ask."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The specific question."
+                }
+            },
+            "required": ["step", "question"]
+        }),
+    }
+}
+
+/// Answer an `ask_stage` call: a one-shot, tool-less completion against the
+/// PEER's model, seeded with the peer's archived artifact + journal. Returns
+/// `(answer_text, cost_usd, input_tokens, output_tokens)`; errors come back
+/// as tool-result error strings so the asking stage can carry on without the
+/// answer.
+async fn answer_ask_stage(
+    peers: &[PeerStage],
+    u: &LlmToolUse,
+    client: &reqwest::Client,
+    cancel: &AtomicBool,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+) -> (String, bool, f64, u64, u64) {
+    let step = u.input.get("step").and_then(|v| v.as_i64()).unwrap_or(0);
+    let question = u.input.get("question").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let Some(peer) = peers.iter().find(|p| p.position + 1 == step) else {
+        let roster = peers.iter().map(|p| (p.position + 1).to_string()).collect::<Vec<_>>().join(", ");
+        return (
+            format!("ERROR: no completed stage at step {step} — available steps: {roster}"),
+            false,
+            0.0,
+            0,
+            0,
+        );
+    };
+    if question.is_empty() {
+        return ("ERROR: ask_stage needs a non-empty question".into(), false, 0.0, 0, 0);
+    }
+    let (provider, api_base, api_key) = match crate::chat_engine::resolve_provider(&peer.model) {
+        Ok(t) => t,
+        Err(e) => return (format!("ERROR: could not reach that stage's model: {e}"), false, 0.0, 0, 0),
+    };
+    let system = format!(
+        "You are the {} stage of an automated development pipeline. You already completed your \
+         work; below is your archived output. A later stage is asking you a question about it. \
+         Answer concisely and concretely, grounded in your archived work — say so plainly if the \
+         archive doesn't contain the answer.",
+        peer.role.replace('_', " "),
+    );
+    let mut context = String::new();
+    if !peer.artifact_text.trim().is_empty() {
+        context.push_str(&format!("Your final output was:\n{}\n\n", peer.artifact_text));
+    }
+    if !peer.journal_digest.trim().is_empty() {
+        context.push_str(&format!("Your working notes were:\n{}\n\n", peer.journal_digest));
+    }
+    context.push_str(&format!("The question from the later stage:\n{question}"));
+    let req = LlmRequest {
+        model: peer.model.clone(),
+        max_tokens: 2048,
+        system,
+        messages: user_messages(&context),
+        tools: vec![],
+        tool_choice: None,
+        effort: None,
+        cache: false,
+    };
+    let mut on_retry = |attempt: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
+        emitter.notice(&format!(
+            "{} — retrying in {delay}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
+            kind.label()
+        ));
+    };
+    match complete_with_retry(
+        provider.as_ref(),
+        &api_base,
+        api_key.as_deref(),
+        &req,
+        client,
+        cancel,
+        DEFAULT_MAX_RETRIES,
+        &mut on_retry,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let cost = crate::orchestrator::cost::stage_cost(
+                &peer.model,
+                resp.input_tokens,
+                resp.output_tokens,
+                resp.cache_read_tokens,
+                resp.cache_creation_tokens,
+            );
+            let text = resp.text.trim().to_string();
+            let answer = if text.is_empty() { "(the stage had no answer)".to_string() } else { text };
+            (answer, true, cost, resp.input_tokens, resp.output_tokens)
+        }
+        Err(e) => (format!("ERROR: the stage could not answer: {e}"), false, 0.0, 0, 0),
+    }
+}
+
 /// The last-resort question text when a block carries no usable summary either.
 const BLOCK_FALLBACK_QUESTION: &str = "The stage needs a decision to proceed.";
 
@@ -411,6 +562,9 @@ pub async fn run_agentic_loop(
     // stops opening new tool turns once the stage's own spend crosses it and
     // closes with what it has (same forced-close path as the iteration cap).
     spend_limit: Option<f64>,
+    // Completed earlier stages this stage may consult via `ask_stage`.
+    // Empty ⇒ the tool is not offered.
+    peers: &[PeerStage],
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -436,6 +590,11 @@ pub async fn run_agentic_loop(
     // survive a review stage's read-only allowlist.
     if verdict_tool {
         tools.push(submit_verdict_tool());
+    }
+    // Inter-stage query channel — also allowlist-independent (asking an
+    // earlier stage is not a workspace mutation).
+    if !peers.is_empty() {
+        tools.push(ask_stage_tool(peers));
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
@@ -617,6 +776,7 @@ pub async fn run_agentic_loop(
                 out.cache_read_tokens,
                 out.cache_creation_tokens,
             );
+            let spent = spent + out.peer_cost_usd;
             if spent >= limit {
                 emitter.notice(&format!(
                     "run budget reached mid-stage (${spent:.2} spent by this stage) — closing with what it has"
@@ -640,6 +800,30 @@ pub async fn run_agentic_loop(
         // Execute each tool, collect results + log.
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
+            // Inter-stage consultation: answered by the PEER stage's model in
+            // a one-shot completion (async — handled here, not in
+            // execute_tool). Errors come back as error results so the asking
+            // stage carries on.
+            if u.name == ASK_STAGE_TOOL {
+                emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
+                let (answer, ok, cost, itok, otok) =
+                    answer_ask_stage(peers, u, client, cancel, emitter).await;
+                emitter.tool_result(ok, &crate::orchestrator::live::summarize(&answer));
+                out.peer_cost_usd += cost;
+                out.peer_input_tokens += itok;
+                out.peer_output_tokens += otok;
+                out.tool_calls.push(ToolCallLog {
+                    name: u.name.clone(),
+                    input: u.input.clone(),
+                    result: answer.clone(),
+                });
+                results.push(LlmToolResult {
+                    tool_use_id: u.id.clone(),
+                    content: cap_tool_result(&answer),
+                    is_error: !ok,
+                });
+                continue;
+            }
             // A malformed `submit_verdict` (unrecognized verdict token) gets an
             // error result instead of executing — the model retries with a
             // valid value; sibling tools in the turn still run normally.

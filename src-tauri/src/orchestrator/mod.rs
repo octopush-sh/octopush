@@ -799,6 +799,52 @@ impl Orchestrator {
         // don't spend a worktree-diff capture on it.
         let input = self.assemble_stage_input(run, stage.position, !resuming)?;
 
+        // Peers for the `ask_stage` consultation channel: completed upstream
+        // stages (same ancestry rule as the dossier) with their archived
+        // artifact + journal digest and the model that did the work — the
+        // asking stage consults that model, not just its paper trail.
+        let peers: Vec<crate::orchestrator::agentic::PeerStage> = {
+            let all = self.db.lock().list_run_stages(&run.id)?;
+            let authored = all.iter().any(|s| !s.parents.is_empty());
+            let anc = if authored { Some(ancestors_of(&all, stage.position)) } else { None };
+            all.iter()
+                .filter(|s| {
+                    s.status == "done"
+                        && match &anc {
+                            Some(a) => a.contains(&s.position),
+                            None => s.position < stage.position,
+                        }
+                })
+                .filter_map(|s| {
+                    let artifact_text = s
+                        .artifact
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<StageArtifact>(j).ok())
+                        .map(|a| a.text)
+                        .unwrap_or_default();
+                    let journal_digest = self
+                        .salvage_journal_text(&s.id)
+                        .map(|t| crate::orchestrator::runner::cap_to(&t, 6_000))
+                        .unwrap_or_default();
+                    if artifact_text.trim().is_empty() && journal_digest.trim().is_empty() {
+                        return None;
+                    }
+                    let model = if s.escalated {
+                        s.escalate_model.clone().unwrap_or_else(|| s.agent_model.clone())
+                    } else {
+                        s.agent_model.clone()
+                    };
+                    Some(crate::orchestrator::agentic::PeerStage {
+                        position: s.position,
+                        role: s.role.clone(),
+                        model,
+                        artifact_text: crate::orchestrator::runner::cap_to(&artifact_text, 8_000),
+                        journal_digest,
+                    })
+                })
+                .collect()
+        };
+
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
         // Reset any prior live log for this stage (re-runs reuse the same id).
         self.events.emit(
@@ -888,6 +934,7 @@ impl Orchestrator {
                 allowed_write_roots,
                 skills,
                 spend_limit,
+                peers,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

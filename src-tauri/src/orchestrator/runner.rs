@@ -44,6 +44,10 @@ pub struct StageContext {
     /// substrate cannot be metered mid-flight and relies on the between-stage
     /// gate plus `--max-turns`.
     pub spend_limit: Option<f64>,
+    /// Completed upstream stages this stage may consult via the `ask_stage`
+    /// tool (API substrate): archived artifact + journal digest + the model
+    /// that produced them.
+    pub peers: Vec<crate::orchestrator::agentic::PeerStage>,
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -339,18 +343,21 @@ impl AgentRunner for ApiRunner {
             },
             matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
             ctx.spend_limit,
+            &ctx.peers,
         )
         .await;
 
         match result {
             Ok(r) => {
+                // Own spend at the stage model's rate, plus any `ask_stage`
+                // peer consultations already priced at each PEER model's rate.
                 let cost = crate::orchestrator::cost::stage_cost(
                     &stage.agent_model,
                     r.input_tokens,
                     r.output_tokens,
                     r.cache_read_tokens,
                     r.cache_creation_tokens,
-                );
+                ) + r.peer_cost_usd;
                 // Escape valve: the stage called `ask_director`. This is neither
                 // a success nor a failure — it's a block. Carry the questions up
                 // so the drive parks the stage as an `awaiting_checkpoint`
@@ -363,8 +370,8 @@ impl AgentRunner for ApiRunner {
                             payload: None,
                             refs_worktree: false,
                         },
-                        input_tokens: r.input_tokens,
-                        output_tokens: r.output_tokens,
+                        input_tokens: r.input_tokens + r.peer_input_tokens,
+                        output_tokens: r.output_tokens + r.peer_output_tokens,
                         cost_usd: cost,
                         status: StageStatus::AwaitingCheckpoint,
                         tool_calls: r.tool_calls,
@@ -392,8 +399,8 @@ impl AgentRunner for ApiRunner {
                             payload: None,
                             refs_worktree: false,
                         },
-                        input_tokens: r.input_tokens,
-                        output_tokens: r.output_tokens,
+                        input_tokens: r.input_tokens + r.peer_input_tokens,
+                        output_tokens: r.output_tokens + r.peer_output_tokens,
                         cost_usd: cost,
                         status: StageStatus::Failed,
                         tool_calls: r.tool_calls,
@@ -434,8 +441,8 @@ impl AgentRunner for ApiRunner {
                         payload: None,
                         refs_worktree,
                     },
-                    input_tokens: r.input_tokens,
-                    output_tokens: r.output_tokens,
+                    input_tokens: r.input_tokens + r.peer_input_tokens,
+                    output_tokens: r.output_tokens + r.peer_output_tokens,
                     cost_usd: cost,
                     status: StageStatus::Done,
                     tool_calls: r.tool_calls,

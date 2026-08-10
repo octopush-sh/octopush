@@ -2692,6 +2692,7 @@ mod agentic_loop_tests {
             None,
             false,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -7701,7 +7702,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -7735,7 +7736,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(out.finished, "a successful forced close is a finished stage");
         assert!(out.closed_at_cap, "…but flagged as closed at the cap");
@@ -7763,7 +7764,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(!out.finished, "an empty forced close must not read as success");
         assert!(!out.closed_at_cap);
@@ -7788,7 +7789,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10, &cancel, &em, None, None, None, false, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10, &cancel, &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -7817,7 +7818,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None, &[]).await.unwrap();
         assert!(out.finished, "a structured verdict is a finished stage");
         assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::ChangesRequested));
         assert_eq!(out.text, "BLOCKING: null deref in foo()", "the findings are the artifact");
@@ -7843,10 +7844,45 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None, &[]).await.unwrap();
         assert!(out.finished);
         assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::Pass),
             "case-tolerant retry lands the verdict");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_ask_stage_unknown_step_errors_and_continues() {
+        use crate::orchestrator::agentic::PeerStage;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 asks a NON-EXISTENT step → error tool result, loop continues;
+        // turn 2 finishes normally.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("consulting",
+                 vec![LlmToolUse { id: "q".into(), name: "ask_stage".into(),
+                     input: json!({"step": 9, "question": "why?"}) }],
+                 LlmStopReason::ToolUse),
+            resp("done anyway", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let peers = vec![PeerStage {
+            position: 0,
+            role: "plan".into(),
+            model: "m".into(),
+            artifact_text: "the plan".into(),
+            journal_digest: String::new(),
+        }];
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
+                                   None, &peers).await.unwrap();
+        assert!(out.finished);
+        assert_eq!(out.text, "done anyway");
+        // The failed consultation is in the tool log with a usable error.
+        let ask = out.tool_calls.iter().find(|t| t.name == "ask_stage").unwrap();
+        assert!(ask.result.contains("available steps: 1"), "{}", ask.result);
+        assert_eq!(out.peer_cost_usd, 0.0, "a failed consult costs nothing");
     }
 
     #[tokio::test]
@@ -7869,7 +7905,7 @@ mod live_tests {
         let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-4-5",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
-                                   Some(1e-9)).await.unwrap();
+                                   Some(1e-9), &[]).await.unwrap();
         assert!(out.finished, "budget stop closes with a real answer");
         assert!(out.closed_at_cap);
         assert_eq!(out.text, "stopping here: summary of partial work");
@@ -7920,7 +7956,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(!out.finished, "a block is not a finished answer");
         let ask = out.blocked.expect("ask_director must populate blocked");
@@ -7955,7 +7991,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         let ask = out.blocked.expect("malformed input still yields a block");
         assert_eq!(ask.summary, "need a decision");
@@ -7984,7 +8020,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
-                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         let ask = out.blocked.expect("block");
         assert_eq!(ask.questions.len(), 3, "all three questions must survive, none lost");
