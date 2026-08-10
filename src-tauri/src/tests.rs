@@ -576,7 +576,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None, blocked_questions: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
@@ -607,7 +607,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
@@ -2682,7 +2682,7 @@ mod agentic_loop_tests {
             &client,
             "test-model",
             "you are a test",
-            "do something",
+            crate::orchestrator::agentic::user_messages("do something"),
             tmp.path(),
             25,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3999,6 +3999,7 @@ mod orchestrator_tests {
                             recommended_default: "Postgres".into(),
                         }],
                     }),
+                    blocked_transcript: None,
                 });
             }
             Ok(StageOutcome {
@@ -4010,6 +4011,7 @@ mod orchestrator_tests {
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None, session_id: None, blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4040,6 +4042,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4074,6 +4077,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4097,6 +4101,7 @@ mod orchestrator_tests {
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
                 status: StageStatus::Failed,
                 tool_calls: vec![], error: Some("boom".into()), verdict: None, session_id: None, blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4138,6 +4143,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4663,6 +4669,118 @@ mod orchestrator_tests {
         assert!(artifact.contains("Director: Postgres"), "the default became the decision: {artifact}");
     }
 
+    /// Blocks once WITH a saved transcript; the second run records whether the
+    /// orchestrator handed the transcript back (the D18 continuation contract).
+    struct BlockWithTranscriptRunner {
+        asked: std::sync::atomic::AtomicBool,
+        seen_transcript: Arc<Mutex<Option<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for BlockWithTranscriptRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first = !self.asked.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                let transcript = crate::orchestrator::agentic::BlockedTranscript {
+                    messages: crate::orchestrator::agentic::user_messages("the exploration so far"),
+                    ask_tool_use_id: "ask-1".into(),
+                };
+                return Ok(StageOutcome {
+                    artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+                    input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    status: StageStatus::AwaitingCheckpoint,
+                    tool_calls: vec![], error: None, verdict: None, session_id: None,
+                    blocked: Some(BlockedAsk {
+                        summary: "which datastore?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "Postgres or SQLite?".into(),
+                            why_blocked: String::new(),
+                            recommended_default: "Postgres".into(),
+                        }],
+                    }),
+                    blocked_transcript: Some(serde_json::to_string(&transcript).unwrap()),
+                });
+            }
+            *self.seen_transcript.lock() = stage.blocked_transcript.clone();
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "resolved".into(), payload: None, refs_worktree: false },
+                input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                status: StageStatus::Done,
+                tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_block_hands_the_transcript_to_the_rerun_then_clears_it() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(None));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(BlockWithTranscriptRunner { asked: Default::default(), seen_transcript: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+        // Parked: the transcript is persisted on the row.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].blocked_transcript.is_some(), "transcript persisted while parked");
+
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()] })
+            .await
+            .unwrap();
+        // The re-run received the transcript through its StageSpec…
+        let got = seen.lock().clone().expect("re-run saw the transcript");
+        let parsed: crate::orchestrator::agentic::BlockedTranscript = serde_json::from_str(&got).unwrap();
+        assert_eq!(parsed.ask_tool_use_id, "ask-1");
+        // …and the row is clean afterwards (consume-once).
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].blocked_transcript.is_none(), "transcript cleared after the re-run");
+        assert_eq!(stages[0].status, "done");
+    }
+
+    #[test]
+    fn resume_messages_answer_the_ask_and_void_sibling_tools() {
+        use crate::orchestrator::agentic::{resume_messages_for_answered_block, BlockedTranscript};
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolUse};
+        let transcript = BlockedTranscript {
+            messages: vec![
+                LlmMessage { role: LlmRole::User, content: LlmContent::Text("task".into()) },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: LlmContent::AssistantWithTools {
+                        raw: vec![],
+                        text: "I need to ask".into(),
+                        tool_uses: vec![
+                            LlmToolUse { id: "ask-9".into(), name: "ask_director".into(), input: serde_json::json!({}) },
+                            LlmToolUse { id: "read-1".into(), name: "read_file".into(), input: serde_json::json!({"path":"a"}) },
+                        ],
+                    },
+                },
+            ],
+            ask_tool_use_id: "ask-9".into(),
+        };
+        let msgs = resume_messages_for_answered_block(&transcript, "Director: SQLite");
+        assert_eq!(msgs.len(), 3);
+        let LlmContent::ToolResults(results) = &msgs.last().unwrap().content else {
+            panic!("last message must be tool results");
+        };
+        assert_eq!(results.len(), 2, "EVERY tool_use gets a result (API contract)");
+        let ask = results.iter().find(|r| r.tool_use_id == "ask-9").unwrap();
+        assert!(!ask.is_error);
+        assert!(ask.content.contains("SQLite"));
+        let sibling = results.iter().find(|r| r.tool_use_id == "read-1").unwrap();
+        assert!(sibling.is_error, "sibling tools are voided, not silently dropped");
+    }
+
     #[test]
     fn blocked_ask_serde_round_trips_camel_case() {
         let ask = BlockedAsk {
@@ -4963,6 +5081,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6036,6 +6155,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6319,6 +6439,7 @@ mod orchestrator_tests {
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6489,6 +6610,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6636,6 +6758,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -7503,7 +7626,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
@@ -7537,7 +7660,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 2,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         assert!(out.finished, "a successful forced close is a finished stage");
@@ -7565,7 +7688,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 2,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         assert!(!out.finished, "an empty forced close must not read as success");
@@ -7591,7 +7714,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &cancel, &em, None, None, None, false).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10, &cancel, &em, None, None, None, false).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -7619,7 +7742,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "review it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true).await.unwrap();
         assert!(out.finished, "a structured verdict is a finished stage");
         assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::ChangesRequested));
@@ -7645,7 +7768,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "review it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true).await.unwrap();
         assert!(out.finished);
         assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::Pass),
@@ -7676,7 +7799,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         assert!(!out.finished, "a block is not a finished answer");
@@ -7711,7 +7834,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         let ask = out.blocked.expect("malformed input still yields a block");
@@ -7740,7 +7863,7 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
         let ask = out.blocked.expect("block");
@@ -8794,7 +8917,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
-            blocked_questions: None,
+            blocked_questions: None, blocked_transcript: None,
         }
     }
 

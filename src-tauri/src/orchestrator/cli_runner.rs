@@ -200,6 +200,7 @@ pub fn parse_cli_result(
             session_id: parsed.session_id.clone(),
             // `ask_director` is an API-substrate tool only; a CLI stage never blocks.
             blocked: None,
+                blocked_transcript: None,
         });
     }
 
@@ -221,6 +222,7 @@ pub fn parse_cli_result(
         verdict: parse_verdict(&parsed.result),
         session_id: parsed.session_id.clone(),
         blocked: None,
+                blocked_transcript: None,
     })
 }
 
@@ -575,5 +577,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         verdict: None,
         session_id: None,
         blocked: None,
+                blocked_transcript: None,
     }
 }

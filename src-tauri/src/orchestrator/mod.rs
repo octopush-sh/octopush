@@ -749,6 +749,7 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
             role_prompt: role_def.prompt_body,
             role_environment: role_def.environment,
@@ -759,6 +760,11 @@ impl Orchestrator {
         let resuming = stage.resume_pending;
         if stage.resume_pending {
             self.db.lock().set_stage_resume_pending(&stage.id, false)?;
+        }
+        // Consume-once: the ask_director transcript feeds exactly the run it
+        // was answered for — any later re-run starts fresh.
+        if stage.blocked_transcript.is_some() {
+            self.db.lock().set_stage_blocked_transcript(&stage.id, None)?;
         }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
@@ -878,6 +884,15 @@ impl Orchestrator {
                 None,
             )?;
             self.db.lock().set_run_stage_blocked(&stage.id, Some(&json))?;
+            // Persist the conversation so the answered re-run CONTINUES it
+            // (D18) — the exploration that produced the question is not
+            // re-paid. Best-effort: without it, the re-run falls back to a
+            // fresh start with the answers as feedback.
+            if let Some(t) = outcome.blocked_transcript.as_deref() {
+                if let Err(e) = self.db.lock().set_stage_blocked_transcript(&stage.id, Some(t)) {
+                    tracing::warn!(stage_id = %stage.id, "blocked transcript persist failed: {e}");
+                }
+            }
             self.recompute_run_cost(&run.id)?;
             return Ok((StageStatus::AwaitingCheckpoint, None));
         }
@@ -1887,10 +1902,12 @@ impl Orchestrator {
             self.archive_and_reset_stage(run_id, s, None, None)?;
             // `reset_run_stage` deliberately preserves session/resume/loop
             // state (loop-back relies on that) — a re-run wants the opposite:
-            // never resume the old CLI session, and start the loop fresh.
+            // never resume the old CLI session, start the loop fresh, and
+            // never continue a stale ask_director conversation.
             self.db.lock().set_stage_session(&s.id, None)?;
             self.db.lock().set_stage_resume_pending(&s.id, false)?;
             self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+            self.db.lock().set_stage_blocked_transcript(&s.id, None)?;
         }
         // The target is back to pending + un-started, so the no-guard applier
         // is safe here; the re-driven stage builds its StageSpec from this row

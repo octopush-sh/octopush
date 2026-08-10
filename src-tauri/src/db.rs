@@ -754,6 +754,9 @@ impl Db {
         // The escape valve: a parked stage's `ask_director` questions (JSON
         // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
+        // D18: the ask_director conversation transcript, so an answered block
+        // CONTINUES its conversation instead of re-running from scratch.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_transcript TEXT")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -3997,7 +4000,7 @@ impl Db {
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
                     session_id, resume_pending, baseline_commit, effort, blocked_questions,
-                    escalate_model, escalate_effort, escalated
+                    escalate_model, escalate_effort, escalated, blocked_transcript
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -4036,6 +4039,7 @@ impl Db {
                 resume_pending: r.get::<_, i64>(27)? != 0,
                 baseline_commit: r.get(28)?,
                 blocked_questions: r.get(30)?,
+                blocked_transcript: r.get(34)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -4595,6 +4599,15 @@ impl Db {
         self.conn.execute(
             "UPDATE run_stages SET blocked_questions = ?2 WHERE id = ?1",
             params![stage_id, questions_json],
+        )?;
+        Ok(())
+    }
+
+    /// Set/clear the stage's persisted ask_director conversation transcript.
+    pub fn set_stage_blocked_transcript(&self, stage_id: &str, json: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET blocked_transcript = ?2 WHERE id = ?1",
+            params![stage_id, json],
         )?;
         Ok(())
     }
@@ -5845,6 +5858,11 @@ pub struct RunStageRow {
     /// structured questions, not a JSON string to re-parse.
     #[serde(serialize_with = "serialize_blocked_questions")]
     pub blocked_questions: Option<String>,
+    /// Serialized ask_director conversation transcript (API substrate). Set
+    /// while the stage is parked on a block; consumed by the answered re-run.
+    /// Never serialized to the frontend (internal continuation state).
+    #[serde(skip_serializing)]
+    pub blocked_transcript: Option<String>,
 }
 
 /// Serialize a stored JSON string as its parsed value (or `null`) so a

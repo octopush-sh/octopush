@@ -291,6 +291,11 @@ pub struct StageSpec {
     pub instructions: Option<String>,
     /// CLI session to `--resume` on this run (set only by a Resume action).
     pub resume_session: Option<String>,
+    /// Serialized [`BlockedTranscript`](crate::orchestrator::agentic::BlockedTranscript)
+    /// of an answered `ask_director` block: the API runner continues that
+    /// conversation (answer as tool_result) instead of re-running the stage
+    /// from scratch. Consumed once — cleared when the stage starts.
+    pub blocked_transcript: Option<String>,
     /// The stage id, so the runner can clear `resume_pending` once it starts.
     pub stage_id: String,
     /// Resolved from the role's definition at spec-build time.
@@ -330,6 +335,10 @@ pub struct StageOutcome {
     /// ask the director a blocking question. Neither `Done` nor `Failed` — the
     /// drive parks it as an `awaiting_checkpoint` decision (see `run_stage_once`).
     pub blocked: Option<BlockedAsk>,
+    /// Serialized conversation transcript accompanying `blocked` (API substrate
+    /// only): persisted on the stage row so the answered re-run continues the
+    /// same conversation instead of starting over.
+    pub blocked_transcript: Option<String>,
 }
 
 /// What the user chose at a checkpoint.

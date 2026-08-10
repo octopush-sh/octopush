@@ -101,6 +101,61 @@ pub struct AgenticResult {
     /// answer with what it had. `finished` is true, but the caller should
     /// annotate the artifact as possibly incomplete.
     pub closed_at_cap: bool,
+    /// Set alongside `blocked`: the full conversation up to (and including)
+    /// the `ask_director` turn, so the answered stage can CONTINUE the same
+    /// conversation instead of re-running — and re-paying — from scratch.
+    pub blocked_transcript: Option<BlockedTranscript>,
+}
+
+/// The conversation state persisted while a stage is parked on `ask_director`:
+/// every message so far, the assistant turn that asked included (with its raw
+/// content blocks, so signed thinking replays), plus the ask's tool_use id —
+/// the director's answers come back as that call's tool_result.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BlockedTranscript {
+    pub messages: Vec<LlmMessage>,
+    pub ask_tool_use_id: String,
+}
+
+/// Build the resume message list for an answered `ask_director` block: the
+/// saved transcript plus a tool-result turn answering the ask (and an
+/// explicit not-executed error for any sibling tool calls from that turn —
+/// the API requires a result for every tool_use). `answer` is the formatted
+/// director-decisions text.
+pub fn resume_messages_for_answered_block(
+    transcript: &BlockedTranscript,
+    answer: &str,
+) -> Vec<LlmMessage> {
+    let mut messages = transcript.messages.clone();
+    let mut results: Vec<LlmToolResult> = Vec::new();
+    if let Some(LlmMessage { content: LlmContent::AssistantWithTools { tool_uses, .. }, .. }) =
+        messages.last()
+    {
+        for u in tool_uses {
+            if u.id == transcript.ask_tool_use_id {
+                results.push(LlmToolResult {
+                    tool_use_id: u.id.clone(),
+                    content: answer.to_string(),
+                    is_error: false,
+                });
+            } else {
+                results.push(LlmToolResult {
+                    tool_use_id: u.id.clone(),
+                    content: "not executed — superseded by ask_director; call it again if still needed"
+                        .to_string(),
+                    is_error: true,
+                });
+            }
+        }
+    }
+    if results.is_empty() {
+        // Defensive: a transcript whose tail isn't a tool turn can't take
+        // tool results — deliver the answer as a plain user turn instead.
+        messages.push(LlmMessage { role: LlmRole::User, content: LlmContent::Text(answer.to_string()) });
+    } else {
+        messages.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(results) });
+    }
+    messages
 }
 
 /// The DIRECT-only escape-valve tool. Appended to every DIRECT stage's toolset
@@ -201,6 +256,11 @@ fn parse_submit_verdict(u: &LlmToolUse) -> (Option<crate::orchestrator::types::R
         .trim()
         .to_string();
     (verdict, findings)
+}
+
+/// One plain user message — the seed conversation for a fresh stage.
+pub fn user_messages(text: &str) -> Vec<LlmMessage> {
+    vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text(text.to_string()) }]
 }
 
 /// The last-resort question text when a block carries no usable summary either.
@@ -323,7 +383,10 @@ pub async fn run_agentic_loop(
     client: &reqwest::Client,
     model: &str,
     system: &str,
-    initial_user: &str,
+    // The seed conversation: a fresh stage passes one user message
+    // (`initial_user_messages`); an answered `ask_director` block passes its
+    // saved transcript + the answer turn (see `resume_messages_for_answered_block`).
+    initial_messages: Vec<LlmMessage>,
     workspace_path: &Path,
     max_iterations: usize,
     cancel: &std::sync::Arc<AtomicBool>,
@@ -368,10 +431,7 @@ pub async fn run_agentic_loop(
     if verdict_tool {
         tools.push(submit_verdict_tool());
     }
-    let mut messages: Vec<LlmMessage> = vec![LlmMessage {
-        role: LlmRole::User,
-        content: LlmContent::Text(initial_user.to_string()),
-    }];
+    let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
     // How long to pace before the next call, set from the previous response's
     // reported rate-limit headroom (see `compute_throttle`). Applied at the top
@@ -447,6 +507,20 @@ pub async fn run_agentic_loop(
         if let Some(u) = resp.tool_uses.iter().find(|u| u.name == ASK_DIRECTOR_TOOL) {
             let ask = parse_ask_director(u);
             emitter.notice(&format!("paused to ask the director: {}", ask.summary));
+            // Persist the conversation INCLUDING the asking turn, so the
+            // answered stage continues right here instead of re-running (and
+            // re-paying for) everything that led to the question.
+            let mut tmsgs = messages.clone();
+            tmsgs.push(LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::AssistantWithTools {
+                    raw: resp.raw_content.clone(),
+                    text: resp.text.clone(),
+                    tool_uses: resp.tool_uses.clone(),
+                },
+            });
+            out.blocked_transcript =
+                Some(BlockedTranscript { messages: tmsgs, ask_tool_use_id: u.id.clone() });
             out.blocked = Some(ask);
             return Ok(out);
         }

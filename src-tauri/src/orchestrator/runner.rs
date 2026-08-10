@@ -255,10 +255,37 @@ impl AgentRunner for ApiRunner {
         // literal `/slug` the agent would have to guess at — resolved here, at
         // the moment this role actually runs.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
-        let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
+        // An answered ask_director block CONTINUES its saved conversation —
+        // the exploration that led to the question is not re-run or re-paid.
+        // The director's decisions (already formatted into `feedback`) arrive
+        // as the ask's tool_result. A missing/corrupt transcript falls back
+        // to the normal fresh-run seeding, where the same feedback text is
+        // injected by `user_input_for`.
+        let resumed_block = stage.blocked_transcript.as_deref().and_then(|json| {
+            serde_json::from_str::<crate::orchestrator::agentic::BlockedTranscript>(json).ok()
+        });
+        let initial_messages = match &resumed_block {
+            Some(t) => {
+                let answer = stage
+                    .feedback
+                    .as_deref()
+                    .filter(|f| !f.trim().is_empty())
+                    .unwrap_or("The director approved proceeding with your recommended defaults.");
+                crate::orchestrator::agentic::resume_messages_for_answered_block(t, answer)
+            }
+            None => crate::orchestrator::agentic::user_messages(&user_input_for(
+                &stage.role,
+                &ctx.task,
+                input,
+                stage.feedback.as_deref(),
+            )),
+        };
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
+        if resumed_block.is_some() {
+            emitter.notice("continuing the stage's own conversation with the director's answers");
+        }
         // The per-stage tool-turn budget (validated 1..=100 at save time);
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
@@ -269,7 +296,7 @@ impl AgentRunner for ApiRunner {
             &ctx.client,
             &stage.agent_model,
             &system,
-            &user,
+            initial_messages,
             &ctx.workspace_path,
             max_iterations,
             &ctx.cancel,
@@ -315,6 +342,10 @@ impl AgentRunner for ApiRunner {
                         verdict: None,
                         session_id: None,
                         blocked: Some(ask),
+                        blocked_transcript: r
+                            .blocked_transcript
+                            .as_ref()
+                            .and_then(|t| serde_json::to_string(t).ok()),
                     });
                 }
                 // An unfinished loop is a failure, not a thin success: the
@@ -340,6 +371,7 @@ impl AgentRunner for ApiRunner {
                         verdict: None,
                         session_id: None,
                         blocked: None,
+                    blocked_transcript: None,
                     });
                 }
                 let kind = stage.artifact_kind.clone();
@@ -381,6 +413,7 @@ impl AgentRunner for ApiRunner {
                     verdict,
                     session_id: None,
                     blocked: None,
+                    blocked_transcript: None,
                 })
             }
             Err(e) => Ok(StageOutcome {
@@ -399,6 +432,7 @@ impl AgentRunner for ApiRunner {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                    blocked_transcript: None,
             }),
         }
     }
