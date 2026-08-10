@@ -228,7 +228,7 @@ impl AgentRunner for ApiRunner {
             &user,
             &ctx.workspace_path,
             max_iterations,
-            ctx.cancel.as_ref(),
+            &ctx.cancel,
             &emitter,
             stage.tools.as_deref(),
             stage.effort,

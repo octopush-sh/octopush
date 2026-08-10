@@ -398,13 +398,17 @@ fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "run_command",
-            "description": "Run a shell command in the workspace directory. Use this for git operations, running tests, installing packages, or any shell task. The command runs with bash.",
+            "description": "Run a shell command in the workspace directory. Use this for git operations, running tests, installing packages, or any shell task. The command runs with bash. Commands are killed after a timeout (default 600s) — never start servers, watchers, or other non-exiting processes; pass timeout_secs for a genuinely long build.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Optional wall-clock limit for this command in seconds (default 600, max 3600)"
                     }
                 },
                 "required": ["command"]
@@ -412,13 +416,21 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "read_file",
-            "description": "Read the contents of a file in the workspace.",
+            "description": "Read the contents of a file in the workspace. For large files, pass offset/limit to read a window of lines instead of the whole file.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Relative path from workspace root"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Optional 1-based line number to start reading from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of lines to read"
                     }
                 },
                 "required": ["path"]
@@ -518,6 +530,153 @@ fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> 
     }
 }
 
+/// Default wall-clock bound on one `run_command` invocation. Before this
+/// existed, a command that never exits (`npm run dev`, a REPL) hung the agent
+/// turn forever — and, in DIRECT, an entire stage with no way to stop it. The
+/// model can raise it per call via `timeout_secs` (capped at [`RUN_COMMAND_TIMEOUT_MAX`])
+/// for a genuinely long build.
+const RUN_COMMAND_TIMEOUT_SECS: u64 = 600;
+/// Upper bound a per-call `timeout_secs` override may request.
+const RUN_COMMAND_TIMEOUT_MAX: u64 = 3600;
+
+/// Truncate `s` to at most `max` BYTES on a char boundary (a plain byte slice
+/// panics mid-codepoint on multibyte text).
+pub(crate) fn truncate_char_safe(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Kill `child` and everything in its process group (the child is spawned with
+/// `process_group(0)`, so grandchildren die too), then reap it.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Spawn `command` and wait for it, bounded by `timeout_secs` and (when given)
+/// the caller's cancel flag — polled every ~100ms so a director stop lands
+/// promptly instead of waiting on a process that may never exit. stdout/stderr
+/// are drained on threads (a full pipe buffer would deadlock the child).
+/// On timeout/cancel the whole process GROUP is killed and whatever output was
+/// captured so far is returned as evidence.
+fn wait_command_bounded(
+    mut command: std::process::Command,
+    timeout_secs: u64,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> (String, bool) {
+    use std::sync::atomic::Ordering;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return (format!("Failed to execute command: {e}"), false),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let drain = |pipe: Option<std::process::ChildStdout>| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let drain_err = |pipe: Option<std::process::ChildStderr>| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_task = drain(stdout);
+    let err_task = drain_err(stderr);
+    let started = std::time::Instant::now();
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => {
+                kill_process_group(&mut child);
+                break Err(format!("Failed waiting for command: {e}"));
+            }
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            kill_process_group(&mut child);
+            break Err("Command stopped by the director.".to_string());
+        }
+        if started.elapsed().as_secs() >= timeout_secs {
+            kill_process_group(&mut child);
+            break Err(format!(
+                "Command timed out after {timeout_secs}s and was killed. If it was a long build, \
+                 re-run with a larger `timeout_secs`; never start servers or other non-exiting \
+                 processes with this tool."
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let stdout_buf = out_task.join().unwrap_or_default();
+    let stderr_buf = err_task.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("[stderr] ");
+        result.push_str(&stderr);
+    }
+    match ended {
+        Ok(status) => {
+            if result.is_empty() {
+                result = format!("(exit code {})", status.code().unwrap_or(-1));
+            }
+            if result.len() > 50_000 {
+                let cut = truncate_char_safe(&result, 50_000).len();
+                result.truncate(cut);
+                result.push_str("\n... (truncated)");
+            }
+            (result, status.success())
+        }
+        Err(msg) => {
+            // Timeout / stop / wait error: surface the reason first, then any
+            // captured output as evidence of what the command was doing.
+            let mut s = msg;
+            if !result.is_empty() {
+                s.push_str("\n— output before the stop —\n");
+                let capped = truncate_char_safe(&result, 20_000);
+                s.push_str(capped);
+            }
+            (s, false)
+        }
+    }
+}
+
 /// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
 /// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
 /// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
@@ -529,9 +688,27 @@ pub(crate) fn execute_tool(
     input: &serde_json::Value,
     sandbox_roots: Option<&[String]>,
 ) -> (String, bool) {
+    execute_tool_cancellable(workspace_path, name, input, sandbox_roots, None)
+}
+
+/// [`execute_tool`] with a director cancel flag: a long `run_command` polls it
+/// and kills the process group when set, so a DIRECT stage stop interrupts
+/// in-flight tool work instead of waiting for a process that may never exit.
+pub(crate) fn execute_tool_cancellable(
+    workspace_path: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    sandbox_roots: Option<&[String]>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> (String, bool) {
     match name {
         "run_command" => {
             let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            let timeout_secs = input
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(RUN_COMMAND_TIMEOUT_SECS)
+                .clamp(1, RUN_COMMAND_TIMEOUT_MAX);
             let _guard;
             let mut command = if let Some(roots) = sandbox_roots {
                 match crate::orchestrator::sandbox::prepare(
@@ -569,44 +746,48 @@ pub(crate) fn execute_tool(
                     }
                 }
             }
-            match command
-                .current_dir(workspace_path)
-                .output()
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let mut result = String::new();
-                    if !stdout.is_empty() {
-                        result.push_str(&stdout);
-                    }
-                    if !stderr.is_empty() {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str("[stderr] ");
-                        result.push_str(&stderr);
-                    }
-                    if result.is_empty() {
-                        result = format!("(exit code {})", output.status.code().unwrap_or(-1));
-                    }
-                    // Truncate very long outputs
-                    if result.len() > 50_000 {
-                        result.truncate(50_000);
-                        result.push_str("\n... (truncated)");
-                    }
-                    (result, output.status.success())
-                }
-                Err(e) => (format!("Failed to execute command: {e}"), false),
-            }
+            command.current_dir(workspace_path);
+            wait_command_bounded(command, timeout_secs, cancel)
         }
         "read_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let full = workspace_path.join(path);
             match std::fs::read_to_string(&full) {
                 Ok(content) => {
+                    // Optional line-window: `offset` (1-based first line) and/or
+                    // `limit` (line count) let the model page through a large
+                    // file instead of re-reading (and re-paying for) all of it.
+                    let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let limit = input.get("limit").and_then(|v| v.as_u64());
+                    if offset > 1 || limit.is_some() {
+                        let start = offset.max(1) as usize - 1;
+                        let total = content.lines().count();
+                        let window: Vec<&str> = content
+                            .lines()
+                            .skip(start)
+                            .take(limit.map(|l| l.max(1) as usize).unwrap_or(usize::MAX))
+                            .collect();
+                        let shown = window.len();
+                        let body = window.join("\n");
+                        let body = truncate_char_safe(&body, 100_000);
+                        return (
+                            format!(
+                                "(lines {}-{} of {total})\n{body}",
+                                start + 1,
+                                start + shown,
+                            ),
+                            true,
+                        );
+                    }
                     if content.len() > 100_000 {
-                        (format!("{}... (truncated, {} bytes total)", &content[..100_000], content.len()), true)
+                        let head = truncate_char_safe(&content, 100_000);
+                        (
+                            format!(
+                                "{head}... (truncated, {} bytes total — re-read with `offset`/`limit` to see the rest)",
+                                content.len()
+                            ),
+                            true,
+                        )
                     } else {
                         (content, true)
                     }
@@ -2094,6 +2275,78 @@ mod tests {
         // Unknown tool → failure.
         let (_, ok) = execute_tool(wp, "frobnicate", &serde_json::json!({}), None);
         assert!(!ok);
+    }
+
+    #[test]
+    fn read_file_truncates_multibyte_content_on_a_char_boundary() {
+        // Regression: the old `&content[..100_000]` byte slice panicked when
+        // byte 100k fell inside a multibyte character.
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        // 'é' is 2 bytes in UTF-8 — 60k of them straddle every even boundary.
+        let content = "é".repeat(60_000);
+        std::fs::write(wp.join("acc.txt"), &content).unwrap();
+        let (out, ok) = execute_tool(wp, "read_file", &serde_json::json!({"path": "acc.txt"}), None);
+        assert!(ok);
+        assert!(out.contains("truncated"), "large file is truncated: {}", &out[out.len().saturating_sub(120)..]);
+    }
+
+    #[test]
+    fn read_file_offset_limit_windows_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let content = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(wp.join("w.txt"), content).unwrap();
+        let (out, ok) = execute_tool(
+            wp,
+            "read_file",
+            &serde_json::json!({"path": "w.txt", "offset": 3, "limit": 2}),
+            None,
+        );
+        assert!(ok);
+        assert!(out.contains("(lines 3-4 of 10)"), "window header: {out}");
+        assert!(out.contains("line3") && out.contains("line4") && !out.contains("line5"), "{out}");
+    }
+
+    #[test]
+    fn run_command_times_out_and_kills_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let started = std::time::Instant::now();
+        let (out, ok) = execute_tool(
+            wp,
+            "run_command",
+            &serde_json::json!({"command": "echo MARK_PRE; sleep 60; echo MARK_POST", "timeout_secs": 1}),
+            None,
+        );
+        assert!(!ok, "a timed-out command fails");
+        assert!(started.elapsed().as_secs() < 30, "the kill is prompt, not a full wait");
+        assert!(out.contains("timed out"), "message names the timeout: {out}");
+        assert!(out.contains("MARK_PRE") && !out.contains("MARK_POST"), "partial output survives: {out}");
+    }
+
+    #[test]
+    fn run_command_cancel_flag_stops_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flip = std::sync::Arc::clone(&cancel);
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            flip.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let (out, ok) = execute_tool_cancellable(
+            wp,
+            "run_command",
+            &serde_json::json!({"command": "sleep 60"}),
+            None,
+            Some(&cancel),
+        );
+        h.join().unwrap();
+        assert!(!ok);
+        assert!(started.elapsed().as_secs() < 30, "cancel lands promptly");
+        assert!(out.contains("stopped by the director"), "{out}");
     }
 
     #[test]

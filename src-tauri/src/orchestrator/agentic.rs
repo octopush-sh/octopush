@@ -2,7 +2,7 @@
 //! (`build_llm_tools`, `execute_tool`) but, unlike `chat_engine::send_agentic`,
 //! it persists nothing and emits no events — it just runs and returns a result.
 
-use crate::chat_engine::{build_llm_tools, execute_tool};
+use crate::chat_engine::{build_llm_tools, execute_tool_cancellable};
 use crate::error::{AppResult, ProviderErrorKind};
 use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
@@ -259,7 +259,7 @@ pub async fn run_agentic_loop(
     initial_user: &str,
     workspace_path: &Path,
     max_iterations: usize,
-    cancel: &AtomicBool,
+    cancel: &std::sync::Arc<AtomicBool>,
     emitter: &crate::orchestrator::live::LiveEmitter<'_>,
     // Per-stage tool allowlist. `None` grants the full workspace tool set;
     // `Some(list)` restricts the agent to exactly those tools (a review stage
@@ -427,7 +427,24 @@ pub async fn run_agentic_loop(
             // The chat engine consumes execute_tool's structural `ok`; the
             // orchestrator keeps its own text-based classifier for journal
             // continuity, so it deliberately ignores the bool here.
-            let (result, _) = execute_tool(workspace_path, &u.name, &u.input, sandbox_roots);
+            //
+            // Off-thread (`spawn_blocking`): tool execution is synchronous
+            // (process spawns, filesystem) and would otherwise pin a tokio
+            // worker for its whole duration — one hung stage could starve
+            // every other run in the process. The cancel flag rides along so
+            // a director stop interrupts a long `run_command` mid-flight.
+            let (result, _) = {
+                let wp = workspace_path.to_path_buf();
+                let name = u.name.clone();
+                let input = u.input.clone();
+                let roots = sandbox_roots.map(|r| r.to_vec());
+                let cancel_flag = std::sync::Arc::clone(cancel);
+                tokio::task::spawn_blocking(move || {
+                    execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag))
+                })
+                .await
+                .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
+            };
             emitter.tool_result(!crate::orchestrator::live::looks_like_error(&result), &crate::orchestrator::live::summarize(&result));
             // The journal keeps the FULL result as evidence; only the copy fed
             // back to the model is capped, to bound input-token growth.

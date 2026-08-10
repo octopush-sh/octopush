@@ -2685,7 +2685,7 @@ mod agentic_loop_tests {
             "do something",
             tmp.path(),
             25,
-            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &emitter,
             None,
             None,
@@ -7336,7 +7336,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -7366,7 +7366,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 2,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None).await.unwrap();
 
         assert!(!out.finished, "iteration exhaustion must not read as success");
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
@@ -7390,7 +7390,7 @@ mod live_tests {
         let rec = Recorder { events: Mutex::new(vec![]) };
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
-        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10, &cancel, &em, None, None, None).await.unwrap();
 
@@ -7430,7 +7430,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None).await.unwrap();
 
         assert!(!out.finished, "a block is not a finished answer");
         let ask = out.blocked.expect("ask_director must populate blocked");
@@ -7465,7 +7465,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None).await.unwrap();
 
         let ask = out.blocked.expect("malformed input still yields a block");
         assert_eq!(ask.summary, "need a decision");
@@ -7494,7 +7494,7 @@ mod live_tests {
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
                                    "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None).await.unwrap();
 
         let ask = out.blocked.expect("block");
         assert_eq!(ask.questions.len(), 3, "all three questions must survive, none lost");
