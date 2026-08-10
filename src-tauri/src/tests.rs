@@ -4788,6 +4788,246 @@ mod orchestrator_tests {
     }
 
     #[test]
+    fn continuation_note_lands_in_the_tool_results_tail() {
+        use crate::orchestrator::agentic::{resume_messages_for_continuation, BlockedTranscript};
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
+        let transcript = BlockedTranscript {
+            messages: vec![
+                LlmMessage { role: LlmRole::User, content: LlmContent::Text("task".into()) },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: LlmContent::AssistantWithTools {
+                        raw: vec![],
+                        text: "reading".into(),
+                        tool_uses: vec![],
+                    },
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: LlmContent::ToolResults(vec![LlmToolResult {
+                        tool_use_id: "read-1".into(),
+                        content: "file body".into(),
+                        is_error: false,
+                    }]),
+                },
+            ],
+            ask_tool_use_id: String::new(),
+        };
+        let msgs = resume_messages_for_continuation(&transcript, "fresh budget granted — continue");
+        // No new message: the note rides inside the trailing tool results so
+        // the user/assistant alternation the API demands is preserved.
+        assert_eq!(msgs.len(), 3);
+        let LlmContent::ToolResults(results) = &msgs.last().unwrap().content else {
+            panic!("tail must stay tool results");
+        };
+        assert!(results[0].content.contains("file body"), "original result kept");
+        assert!(results[0].content.contains("fresh budget granted"), "note appended");
+    }
+
+    #[test]
+    fn continuation_note_becomes_a_user_turn_without_a_tool_results_tail() {
+        use crate::orchestrator::agentic::{resume_messages_for_continuation, BlockedTranscript};
+        use crate::providers::{LlmContent, LlmMessage, LlmRole};
+        let transcript = BlockedTranscript {
+            messages: vec![
+                LlmMessage { role: LlmRole::User, content: LlmContent::Text("task".into()) },
+                LlmMessage { role: LlmRole::Assistant, content: LlmContent::Text("thinking out loud".into()) },
+            ],
+            ask_tool_use_id: String::new(),
+        };
+        let msgs = resume_messages_for_continuation(&transcript, "continue");
+        assert_eq!(msgs.len(), 3, "assistant tail → a new user turn carries the note");
+        let last = msgs.last().unwrap();
+        assert!(matches!(last.role, crate::providers::LlmRole::User));
+        let LlmContent::Text(t) = &last.content else { panic!("text turn") };
+        assert_eq!(t, "continue");
+    }
+
+    /// Fails once at the turn cap WITH a saved transcript (empty ask id — the
+    /// unfinished-failure flavor); later runs record the transcript and turn
+    /// budget the orchestrator handed them.
+    struct FailWithTranscriptRunner {
+        failed: std::sync::atomic::AtomicBool,
+        seen_transcript: Arc<Mutex<Option<Option<String>>>>,
+        seen_max_iterations: Arc<Mutex<Option<i64>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for FailWithTranscriptRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                let transcript = crate::orchestrator::agentic::BlockedTranscript {
+                    messages: crate::orchestrator::agentic::user_messages("the exploration so far"),
+                    ask_tool_use_id: String::new(),
+                };
+                return Ok(StageOutcome {
+                    artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+                    input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    status: StageStatus::Failed,
+                    tool_calls: vec![],
+                    error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                    verdict: None, session_id: None, blocked: None,
+                    blocked_transcript: Some(serde_json::to_string(&transcript).unwrap()),
+                });
+            }
+            *self.seen_transcript.lock() = Some(stage.blocked_transcript.clone());
+            *self.seen_max_iterations.lock() = Some(stage.max_iterations);
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
+                input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                status: StageStatus::Done,
+                tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    fn fail_with_transcript_fixture() -> (
+        Arc<Mutex<Db>>,
+        String,
+        Arc<Mutex<Option<Option<String>>>>,
+        Arc<Mutex<Option<i64>>>,
+        Orchestrator,
+    ) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen_t = Arc::new(Mutex::new(None));
+        let seen_mi = Arc::new(Mutex::new(None));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(FailWithTranscriptRunner {
+                failed: Default::default(),
+                seen_transcript: Arc::clone(&seen_t),
+                seen_max_iterations: Arc::clone(&seen_mi),
+            }),
+        );
+        (db, run_id, seen_t, seen_mi, orch)
+    }
+
+    #[tokio::test]
+    async fn resume_after_cap_failure_continues_the_conversation() {
+        let (db, run_id, seen_t, seen_mi, orch) = fail_with_transcript_fixture();
+        orch.run_to_pause(&run_id).await.unwrap();
+        // The unfinished failure persisted its conversation on the row.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "failed");
+        assert!(stages[0].blocked_transcript.is_some(), "cap failure persists the transcript");
+
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: Some(100) })
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        // The re-run CONTINUED the conversation (transcript handed via the spec)
+        // with the raised turn budget…
+        let got = seen_t.lock().clone().expect("second run happened").expect("re-run saw the transcript");
+        let parsed: crate::orchestrator::agentic::BlockedTranscript = serde_json::from_str(&got).unwrap();
+        assert!(parsed.ask_tool_use_id.is_empty(), "continuation flavor, not an answered ask");
+        assert_eq!(seen_mi.lock().unwrap(), 100, "+turns override reached the re-run");
+        // …and consume-once left the row clean.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].blocked_transcript.is_none(), "transcript cleared after the re-run");
+        assert_eq!(stages[0].status, "done");
+    }
+
+    #[tokio::test]
+    async fn reject_after_cap_failure_starts_fresh_without_the_transcript() {
+        let (db, run_id, seen_t, _seen_mi, orch) = fail_with_transcript_fixture();
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert!(db.lock().list_run_stages(&run_id).unwrap()[0].blocked_transcript.is_some());
+
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Reject {
+                feedback: Some("start over, differently".into()),
+                model_override: None,
+                max_turns_override: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        // Reject means a FRESH attempt: the re-run got no transcript.
+        let got = seen_t.lock().clone().expect("second run happened");
+        assert!(got.is_none(), "rejected re-run must not continue the old conversation");
+    }
+
+    /// A CLI stage that fails at the cap keeping its session id; later runs
+    /// record the resume session + turn budget the orchestrator handed them.
+    struct CliFailThenResumeRunner {
+        failed: std::sync::atomic::AtomicBool,
+        seen_resume: Arc<Mutex<Option<(Option<String>, i64)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CliFailThenResumeRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                return Ok(StageOutcome {
+                    artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+                    input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    status: StageStatus::Failed,
+                    tool_calls: vec![],
+                    error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                    verdict: None,
+                    session_id: Some("sess-cli-1".into()),
+                    blocked: None, blocked_transcript: None,
+                });
+            }
+            *self.seen_resume.lock() = Some((stage.resume_session.clone(), stage.max_iterations));
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
+                input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                status: StageStatus::Done,
+                tool_calls: vec![], error: None, verdict: None,
+                session_id: Some("sess-cli-1".into()),
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_after_cli_cap_failure_resumes_the_session_with_more_turns() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        // claude-family model id → Claude dialect → sessions are resumable.
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(None));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CliFailThenResumeRunner { failed: Default::default(), seen_resume: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "failed");
+        assert_eq!(stages[0].session_id.as_deref(), Some("sess-cli-1"), "failure kept the session");
+
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: Some(100) })
+            .await
+            .unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        let (resume_session, max_iterations) = seen.lock().clone().expect("second run happened");
+        assert_eq!(resume_session.as_deref(), Some("sess-cli-1"), "re-run --resumes the same session");
+        assert_eq!(max_iterations, 100, "+turns override reached the re-run");
+    }
+
+    #[test]
     fn blocked_ask_serde_round_trips_camel_case() {
         let ask = BlockedAsk {
             summary: "s".into(),

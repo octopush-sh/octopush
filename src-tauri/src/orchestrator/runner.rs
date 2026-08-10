@@ -298,6 +298,23 @@ impl AgentRunner for ApiRunner {
             serde_json::from_str::<crate::orchestrator::agentic::BlockedTranscript>(json).ok()
         });
         let initial_messages = match &resumed_block {
+            // Empty ask id = a CONTINUATION transcript (iteration-cap failure
+            // or director stop, now Resumed): pick up exactly where the
+            // conversation left off with a fresh turn budget.
+            Some(t) if t.ask_tool_use_id.is_empty() => {
+                let note = match stage.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
+                    Some(fb) => format!(
+                        "{fb}\n\nThe director granted a fresh turn budget. Continue EXACTLY from \
+                         where you left off — do not start over or redo completed work; finish the \
+                         remaining work, then give your final answer."
+                    ),
+                    None => "The director granted a fresh turn budget. Continue EXACTLY from where \
+                             you left off — do not start over or redo completed work; finish the \
+                             remaining work, then give your final answer."
+                        .to_string(),
+                };
+                crate::orchestrator::agentic::resume_messages_for_continuation(t, &note)
+            }
             Some(t) => {
                 let answer = stage
                     .feedback
@@ -316,8 +333,12 @@ impl AgentRunner for ApiRunner {
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
-        if resumed_block.is_some() {
-            emitter.notice("continuing the stage's own conversation with the director's answers");
+        if let Some(t) = &resumed_block {
+            emitter.notice(if t.ask_tool_use_id.is_empty() {
+                "continuing the stage's previous conversation with a fresh turn budget"
+            } else {
+                "continuing the stage's own conversation with the director's answers"
+            });
         }
         // The per-stage tool-turn budget (validated 1..=100 at save time);
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
@@ -408,7 +429,12 @@ impl AgentRunner for ApiRunner {
                         verdict: None,
                         session_id: None,
                         blocked: None,
-                    blocked_transcript: None,
+                        // The spent turns' conversation, so a Resume CONTINUES
+                        // here with a fresh budget instead of starting over.
+                        blocked_transcript: r
+                            .blocked_transcript
+                            .as_ref()
+                            .and_then(|t| serde_json::to_string(t).ok()),
                     });
                 }
                 let kind = stage.artifact_kind.clone();
