@@ -6355,6 +6355,68 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn auto_loop_at_cap_escalates_the_target_once_before_gating() {
+        // D17: the review keeps requesting changes and the loop cap is hit —
+        // but the target carries an unused escalation policy. Instead of
+        // surrendering to a human gate, the target escalates and gets ONE
+        // more loop-back; only after that does the run gate.
+        let (db, ws) = db_with_workspace();
+        let mk = |role: &str| crate::db::StageDraft {
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        };
+        let mut impl_d = mk("implement");
+        impl_d.escalate_model = Some("strong-model".into());
+        let mut rev_d = mk("code_review");
+        rev_d.loop_target_position = Some(0);
+        rev_d.loop_max_iterations = 1;
+        rev_d.loop_mode = Some("auto".into());
+        let pid = db.lock().save_pipeline(None, "AutoEsc", "d", &[impl_d, rev_d]).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(VerdictRunner { verdict: "CHANGES_REQUESTED" }));
+
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].escalated, "the loop target escalated at the cap");
+        // One normal loop + one escalated loop, then the gate.
+        assert_eq!(stages[1].loop_iterations, 2);
+        assert_eq!(stages[1].status, "awaiting_checkpoint");
+    }
+
+    #[tokio::test]
+    async fn outer_loop_back_resets_inner_loop_counters() {
+        // D16: implement(0) → verify(1, gated loop→0) → code_review(2, gated
+        // loop→0). After verify has consumed a loop iteration, a send-back
+        // from code_review (whose window covers verify) must hand verify a
+        // FRESH loop budget — not a pre-exhausted counter.
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Nested", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "verify", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        orch.run_to_pause(&run_id).await.unwrap(); // parked at verify's gate
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        // parked at verify again after the inner loop; consume one iteration.
+        assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[1].loop_iterations, 1);
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        // now parked at code_review's gate — send the whole window back.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].loop_iterations, 0, "inner loop budget refreshed by the outer loop-back");
+        assert_eq!(stages[2].loop_iterations, 1, "the outer review's own counter advanced");
+    }
+
+    #[tokio::test]
     async fn auto_unparseable_verdict_gates_instead_of_looping() {
         let (orch, run_id, db) = auto_run("", 2); // no VERDICT line
         let status = orch.run_to_pause(&run_id).await.unwrap();
@@ -7456,16 +7518,20 @@ mod live_tests {
     }
 
     #[tokio::test]
-    async fn agentic_loop_exhaustion_is_not_finished() {
+    async fn agentic_loop_exhaustion_forces_a_toolless_close() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
 
-        // Every turn asks for another tool — the loop never reaches a final answer.
+        // Two tool turns exhaust the cap; the forced close (no tools) then
+        // produces a real final answer instead of throwing the work away.
         let tool_turn = || resp("still digging",
             vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
                   input: serde_json::json!({"path": "a.rs"}) }],
             LlmStopReason::ToolUse);
-        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![tool_turn(), tool_turn()])) };
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            tool_turn(), tool_turn(),
+            resp("what I got done: X; still missing: Y", vec![], LlmStopReason::EndTurn),
+        ])) };
 
         let rec = Recorder { events: Mutex::new(vec![]) };
         let em = LiveEmitter::new(&rec, "r", "s");
@@ -7474,17 +7540,44 @@ mod live_tests {
                                    "sys", "do it", dir.path(), 2,
                                    &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
 
-        assert!(!out.finished, "iteration exhaustion must not read as success");
-        assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
-        // Usage from the burned iterations is preserved for cost accounting.
-        assert_eq!(out.input_tokens, 2);
-        assert_eq!(out.output_tokens, 2);
+        assert!(out.finished, "a successful forced close is a finished stage");
+        assert!(out.closed_at_cap, "…but flagged as closed at the cap");
+        assert_eq!(out.text, "what I got done: X; still missing: Y");
+        // Usage from ALL calls (including the close) is preserved.
+        assert_eq!(out.input_tokens, 3);
         assert_eq!(out.tool_calls.len(), 2);
-        // F1: the journal must END with a notice explaining why the stage stopped.
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_exhaustion_without_a_usable_close_is_not_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let tool_turn = || resp("still digging",
+            vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                  input: serde_json::json!({"path": "a.rs"}) }],
+            LlmStopReason::ToolUse);
+        // The forced close returns empty text → the stage stays unfinished.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            tool_turn(), tool_turn(),
+            resp("", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", "do it", dir.path(), 2,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false).await.unwrap();
+
+        assert!(!out.finished, "an empty forced close must not read as success");
+        assert!(!out.closed_at_cap);
+        assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
+        // The journal explains the cap (notice emitted before the close attempt).
         let events = rec.events.lock();
-        let last = &events.last().expect("exhaustion must emit entries").1["entry"];
-        assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
-        assert_eq!(last["text"], "iteration cap reached — 2 of 2 tool turns used");
+        let notices: Vec<String> = events.iter()
+            .filter(|(_, p)| p["entry"]["kind"] == "notice")
+            .map(|(_, p)| p["entry"]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(notices.iter().any(|n| n.contains("iteration cap reached")), "{notices:?}");
     }
 
     #[tokio::test]

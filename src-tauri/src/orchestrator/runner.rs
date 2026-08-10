@@ -354,10 +354,21 @@ impl AgentRunner for ApiRunner {
                         crate::orchestrator::types::ReviewVerdict::ChangesRequested => "Verdict: changes requested",
                     });
                 }
+                // A forced close at the iteration cap is a REAL but possibly
+                // incomplete handoff — annotate it so the next stage (and any
+                // reviewer) judges it with the right expectations.
+                let text = if r.closed_at_cap {
+                    format!(
+                        "(this stage hit its tool-turn cap and was closed early — the summary below may be incomplete; verify before relying on it)\n\n{}",
+                        r.text
+                    )
+                } else {
+                    r.text.clone()
+                };
                 Ok(StageOutcome {
                     artifact: StageArtifact {
                         kind,
-                        text: r.text.clone(),
+                        text,
                         payload: None,
                         refs_worktree,
                     },

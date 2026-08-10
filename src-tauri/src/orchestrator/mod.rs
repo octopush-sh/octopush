@@ -433,6 +433,15 @@ impl Orchestrator {
                 let cf = if s.id == review.id { feedback } else { None };
                 let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb)?;
+                // An INNER review inside the window gets a fresh loop budget
+                // for each outer iteration — without this, its counter
+                // persisted across outer loops and the inner loop arrived
+                // pre-exhausted on the second outer pass. (The outer review's
+                // own counter is the one `increment_loop_iteration` below
+                // advances; it is deliberately NOT reset.)
+                if s.id != review.id && s.loop_target_position.is_some() && s.loop_iterations > 0 {
+                    self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+                }
             }
         }
         self.db.lock().increment_loop_iteration(&review.id)?;
@@ -635,6 +644,51 @@ impl Orchestrator {
             crate::orchestrator::live::RUN_LOG_EVENT,
             serde_json::json!({ "runId": run_id, "stageId": fresh.id, "entry": entry }),
         );
+        Ok(true)
+    }
+
+    /// Quality escalation (the auto-loop counterpart of [`try_escalate`]):
+    /// the review at `review` hit its loop cap still requesting changes. If
+    /// the loop TARGET has an unused escalation policy that would actually
+    /// change its tier, mark it escalated and report `true` — the caller then
+    /// loop-backs once more, so the strong tier gets one attempt before the
+    /// run surrenders to a human gate. Bounded exactly like failure
+    /// escalation: the sticky `escalated` flag allows this once per stage.
+    fn try_escalate_loop_target(
+        &self,
+        run_id: &str,
+        review: &RunStageRow,
+    ) -> AppResult<bool> {
+        let Some(target_pos) = review.loop_target_position else { return Ok(false) };
+        let stages = self.db.lock().list_run_stages(run_id)?;
+        let Some(target) = stages.iter().find(|s| s.position == target_pos) else {
+            return Ok(false);
+        };
+        if target.escalated {
+            return Ok(false);
+        }
+        let model_changes = target
+            .escalate_model
+            .as_deref()
+            .is_some_and(|m| m != target.agent_model);
+        let effort_changes = matches!(
+            AgentSubstrate::from_db(&target.substrate),
+            Some(AgentSubstrate::Api)
+        ) && target.escalate_effort.is_some()
+            && target.escalate_effort != target.effort;
+        if !(model_changes || effort_changes) {
+            return Ok(false);
+        }
+        self.db.lock().set_run_stage_escalated(&target.id, true)?;
+        let tier = target
+            .escalate_model
+            .clone()
+            .filter(|m| m != &target.agent_model)
+            .unwrap_or_else(|| "higher effort".to_string());
+        self.journal_notice(run_id, &review.id, &format!(
+            "auto loop: changes still requested at the loop cap — escalating the {} stage to {tier} for one more attempt",
+            target.role.replace('_', " ")
+        ));
         Ok(true)
     }
 
@@ -1346,35 +1400,56 @@ impl Orchestrator {
                     // Auto-loop verdict decision runs BEFORE gated/checkpoint pause.
                     if Self::stage_has_auto_loop(&stage) {
                         let remaining = stage.loop_iterations < stage.loop_max_iterations;
+                        // The review's findings, read from the freshly-persisted
+                        // row — used by both the normal loop-back and the
+                        // quality-escalation loop-back below.
+                        let read_findings = || -> AppResult<Option<String>> {
+                            let fresh_stages = self.db.lock().list_run_stages(run_id)?;
+                            Ok(fresh_stages
+                                .iter()
+                                .find(|s| s.id == stage.id)
+                                .and_then(|s| s.artifact.as_deref())
+                                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string)))
+                        };
                         match verdict {
                             Some(ReviewVerdict::Pass) => {
                                 // Fall through to checkpoint/continue below.
                             }
                             Some(ReviewVerdict::ChangesRequested) if remaining => {
-                                // Re-read the freshly-persisted stage to get the artifact.
-                                let fresh_stages = self.db.lock().list_run_stages(run_id)?;
-                                let fresh = fresh_stages.iter().find(|s| s.id == stage.id);
-                                let findings = fresh
-                                    .and_then(|s| s.artifact.as_deref())
-                                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string));
+                                let findings = read_findings()?;
                                 self.loop_back(run_id, &stage, findings.as_deref())?;
                                 self.emit_run_update(run_id);
                                 continue;
                             }
-                            _ => {
-                                // ChangesRequested at cap, or unparseable verdict → gate.
-                                // Say WHY in the journal — a silent downgrade from
-                                // autonomous to gated reads as a hang to the director.
-                                let why = if verdict.is_none() {
-                                    "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision".to_string()
-                                } else {
-                                    format!(
-                                        "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
-                                        stage.loop_iterations, stage.loop_max_iterations
-                                    )
-                                };
-                                self.journal_notice(run_id, &stage.id, &why);
+                            Some(ReviewVerdict::ChangesRequested) => {
+                                // Loop cap reached on quality grounds. Before
+                                // surrendering to a human gate, try the loop
+                                // target's escalation policy: this is exactly
+                                // the case escalation exists for (the cheap
+                                // tier couldn't satisfy the reviewer), yet it
+                                // historically only fired on hard failures.
+                                if self.try_escalate_loop_target(run_id, &stage)? {
+                                    let findings = read_findings()?;
+                                    self.loop_back(run_id, &stage, findings.as_deref())?;
+                                    self.emit_run_update(run_id);
+                                    continue;
+                                }
+                                self.journal_notice(run_id, &stage.id, &format!(
+                                    "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
+                                    stage.loop_iterations, stage.loop_max_iterations
+                                ));
+                                self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+                                self.db.lock().set_run_status(run_id, "paused", false)?;
+                                self.emit_checkpoint(run_id, &stage.id, "decision");
+                                return Ok(RunStatus::Paused);
+                            }
+                            None => {
+                                // Unparseable verdict → gate. Say WHY in the
+                                // journal — a silent downgrade from autonomous
+                                // to gated reads as a hang to the director.
+                                self.journal_notice(run_id, &stage.id,
+                                    "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision");
                                 self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
                                 self.db.lock().set_run_status(run_id, "paused", false)?;
                                 self.emit_checkpoint(run_id, &stage.id, "decision");

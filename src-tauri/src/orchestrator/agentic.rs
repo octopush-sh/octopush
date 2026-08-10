@@ -96,6 +96,11 @@ pub struct AgenticResult {
     /// stages only). `None` when the stage didn't call it — the caller may
     /// still fall back to the text sentinel.
     pub verdict: Option<crate::orchestrator::types::ReviewVerdict>,
+    /// True when `text` came from the forced close at the iteration cap: the
+    /// loop ran out of tool turns and the model was asked to write its final
+    /// answer with what it had. `finished` is true, but the caller should
+    /// annotate the artifact as possibly incomplete.
+    pub closed_at_cap: bool,
 }
 
 /// The DIRECT-only escape-valve tool. Appended to every DIRECT stage's toolset
@@ -574,11 +579,72 @@ pub async fn run_agentic_loop(
         });
     }
 
-    // Exhaustion: close the journal with a terminal notice so the stage's end
-    // explains itself instead of just stopping mid-stream.
+    // Exhaustion: the cap landed mid-work. Before declaring the stage lost,
+    // force a close — ONE more request with NO tools ("write your final
+    // answer with what you have"). 24 turns of good work used to be thrown
+    // away because the model never got to write its closing summary; a
+    // possibly-incomplete but real handoff beats an empty failure, and the
+    // caller annotates it so a downstream review judges it accordingly.
     emitter.notice(&format!(
-        "iteration cap reached — {max_iterations} of {max_iterations} tool turns used"
+        "iteration cap reached — {max_iterations} of {max_iterations} tool turns used; asking the model to close with what it has"
     ));
+    if !cancel.load(Ordering::Relaxed) {
+        messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(
+                "Your tool budget for this stage is exhausted — you cannot call any more tools. \
+                 Write your final answer NOW with what you already know: what you accomplished, \
+                 what remains undone, and anything the next stage must know to continue. \
+                 If you were reviewing, state your findings so far."
+                    .to_string(),
+            ),
+        });
+        let req = LlmRequest {
+            model: model.to_string(),
+            max_tokens: max_tokens_for(effort),
+            system: system.to_string(),
+            messages: messages.clone(),
+            tools: vec![],
+            tool_choice: None,
+            effort,
+            cache: true,
+        };
+        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+            emitter.notice(&format!(
+                "{} — retrying in {delay}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
+                kind.label()
+            ));
+        };
+        match complete_with_retry(
+            provider,
+            api_base,
+            api_key,
+            &req,
+            client,
+            cancel,
+            DEFAULT_MAX_RETRIES,
+            &mut on_retry,
+        )
+        .await
+        {
+            Ok(resp) => {
+                out.input_tokens += resp.input_tokens;
+                out.output_tokens += resp.output_tokens;
+                out.cache_read_tokens += resp.cache_read_tokens;
+                out.cache_creation_tokens += resp.cache_creation_tokens;
+                let text = resp.text.trim().to_string();
+                if !text.is_empty() {
+                    out.text = text;
+                    out.finished = true;
+                    out.closed_at_cap = true;
+                    return Ok(out);
+                }
+            }
+            Err(e) => {
+                emitter.notice(&format!("forced close failed — {e}"));
+            }
+        }
+    }
     out.text = format!("(agentic loop hit {max_iterations} iterations without finishing)");
     Ok(out)
 }
