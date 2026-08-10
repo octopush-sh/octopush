@@ -78,19 +78,19 @@ pub struct LlmRequest {
     pub cache: bool,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LlmMessage {
     pub role: LlmRole,
     pub content: LlmContent,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum LlmRole {
     User,
     Assistant,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum LlmContent {
     /// Plain text (most common — user prompts, simple assistant replies).
     Text(String),
@@ -117,14 +117,14 @@ pub enum LlmContent {
 }
 
 /// A single block within a multimodal message.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum LlmBlock {
     Text(String),
     /// A base64-encoded image with its IANA media type (e.g. `image/png`).
     Image { media_type: String, data: String },
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LlmToolUse {
     /// Provider-assigned id used to correlate tool_result back to tool_use.
     pub id: String,
@@ -132,7 +132,7 @@ pub struct LlmToolUse {
     pub input: serde_json::Value,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LlmToolResult {
     pub tool_use_id: String,
     pub content: String,

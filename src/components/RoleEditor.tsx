@@ -31,7 +31,7 @@ type ArtifactKind = Role["artifactKind"];
 type Environment = Role["environment"];
 type Substrate = Role["defaultSubstrate"];
 
-const TOOL_KEYS = ["read_file", "list_files", "write_file", "run_command"] as const;
+const TOOL_KEYS = ["read_file", "list_files", "grep", "glob", "write_file", "edit_file", "run_command"] as const;
 type ToolKey = (typeof TOOL_KEYS)[number];
 
 const ARTIFACT_LABELS: Record<ArtifactKind, string> = {

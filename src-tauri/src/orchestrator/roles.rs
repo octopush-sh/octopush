@@ -55,30 +55,42 @@ pub const ASK_DIRECTOR_CLAUSE: &str = " The one exception: if you hit a decision
     expensive or irreversible changes. For anything you can reasonably decide yourself, choose a \
     sensible default and note it — do not ask.";
 
-/// Appended to a stage prompt when the stage is in auto-loop mode (verbatim copy
-/// of the historical VERDICT_INSTRUCTION).
+/// Appended to a CLI-substrate stage prompt in auto-loop mode (verbatim copy
+/// of the historical VERDICT_INSTRUCTION). The CLI has no `submit_verdict`
+/// tool, so the text sentinel remains its only verdict channel.
 pub const VERDICT_INSTRUCTION: &str = "\n\nThis is an automated review. After your findings, end your \
     response with EXACTLY ONE line, on its own line: `VERDICT: PASS` if the changes are acceptable, \
     or `VERDICT: CHANGES_REQUESTED` if they must be revised. Emit nothing after that line.";
 
+/// Appended to an API-substrate stage prompt in auto-loop mode: the structured
+/// verdict channel. A tool call parses identically on every provider —
+/// Anthropic-native or OpenAI-compat — where the text sentinel silently
+/// degraded an autonomous pipeline to a human gate whenever a model phrased
+/// its verdict differently. The sentinel line still parses as a fallback.
+pub const VERDICT_TOOL_INSTRUCTION: &str = "\n\nThis is an automated review. When your findings are \
+    complete, call the `submit_verdict` tool EXACTLY ONCE: verdict `pass` if the changes are \
+    acceptable, or `changes_requested` if they must be revised, with your full findings in the \
+    `findings` field — that text is what the next stage receives, so make it complete and specific.";
+
 /// Compose the full system prompt: environment preamble + (API only) the
 /// `ask_director` carve-out + role body + author instructions + (auto-loop only)
-/// the verdict line. `can_ask_director` gates the escape-valve clause: API stages
-/// pass `true` (they have the tool); CLI stages pass `false` (they don't, and
-/// keep the strict never-ask preamble).
+/// the verdict instruction. `api_substrate` selects the substrate-specific
+/// pieces: API stages get the `ask_director` carve-out (they have the tool)
+/// and the tool-based verdict instruction; CLI stages keep the strict
+/// never-ask preamble and the text-sentinel verdict.
 pub fn compose_system_prompt(
     prompt_body: &str,
     environment: RoleEnvironment,
     loop_mode: Option<LoopMode>,
     instructions: Option<&str>,
-    can_ask_director: bool,
+    api_substrate: bool,
 ) -> String {
     let preamble = match environment {
         RoleEnvironment::Worktree => PREAMBLE_WORKTREE,
         RoleEnvironment::Action => PREAMBLE_ACTION,
     };
     let mut s = String::from(preamble);
-    if can_ask_director {
+    if api_substrate {
         s.push_str(ASK_DIRECTOR_CLAUSE);
     }
     s.push_str("\n\n");
@@ -88,14 +100,14 @@ pub fn compose_system_prompt(
         s.push_str(instr);
     }
     if matches!(loop_mode, Some(LoopMode::Auto)) {
-        s.push_str(VERDICT_INSTRUCTION);
+        s.push_str(if api_substrate { VERDICT_TOOL_INSTRUCTION } else { VERDICT_INSTRUCTION });
     }
     s
 }
 
-fn ro() -> Vec<String> { vec!["read_file".into(), "list_files".into()] }
-fn run_() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "run_command".into()] }
-fn full() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "write_file".into(), "run_command".into()] }
+fn ro() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into()] }
+fn run_() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into(), "run_command".into()] }
+fn full() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into(), "write_file".into(), "edit_file".into(), "run_command".into()] }
 
 /// All 15 built-in roles. Keys, prompts, artifact kinds, loop eligibility,
 /// default tools and token estimates here are the single source of truth

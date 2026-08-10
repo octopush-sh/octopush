@@ -32,7 +32,10 @@ export interface ToolMeta {
 export const TOOLS: ToolMeta[] = [
   { id: "read_file", label: "Read", hint: "Read file contents in the workspace", writes: false },
   { id: "list_files", label: "List", hint: "List files and directories", writes: false },
+  { id: "grep", label: "Grep", hint: "Search file contents by regex, respecting .gitignore", writes: false },
+  { id: "glob", label: "Glob", hint: "Find files by glob pattern", writes: false },
   { id: "write_file", label: "Write", hint: "Create or overwrite files", writes: true },
+  { id: "edit_file", label: "Edit", hint: "Replace an exact string in a file", writes: true },
   { id: "run_command", label: "Run", hint: "Run shell commands (tests, git, build)", writes: true },
 ];
 

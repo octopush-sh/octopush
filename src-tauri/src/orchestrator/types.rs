@@ -217,6 +217,11 @@ pub struct InputSection {
     pub text: String,
     /// True when the producing artifact's real output lives in the worktree.
     pub refs_worktree: bool,
+    /// True for the FRESHEST section of its kind — rendered at the full
+    /// section cap. Older same-kind sections render compact (a smaller cap,
+    /// labeled as earlier context) instead of being silently evicted: two
+    /// reviews from different stages both survive into the dossier now.
+    pub full_detail: bool,
 }
 
 /// The assembled input for a stage. Instead of only the immediately-previous
@@ -240,6 +245,11 @@ pub struct StageInput {
     /// of it. Best-effort (`None` on capture failure or an empty diff; the
     /// prompt then falls back to "inspect with your tools"). Capped at render.
     pub worktree_diff: Option<String>,
+    /// Compact digest of THIS stage's archived attempts (loop-backs, rejects,
+    /// escalations — from `stage_iterations`). Without it, iteration N ran
+    /// blind to what iterations 1..N-1 tried and why they were closed — the
+    /// setup for the classic review-loop oscillation between two answers.
+    pub history: Option<String>,
 }
 
 /// A director's hot-edit riding along with a re-run: validated BEFORE any
@@ -286,6 +296,11 @@ pub struct StageSpec {
     pub instructions: Option<String>,
     /// CLI session to `--resume` on this run (set only by a Resume action).
     pub resume_session: Option<String>,
+    /// Serialized [`BlockedTranscript`](crate::orchestrator::agentic::BlockedTranscript)
+    /// of an answered `ask_director` block: the API runner continues that
+    /// conversation (answer as tool_result) instead of re-running the stage
+    /// from scratch. Consumed once — cleared when the stage starts.
+    pub blocked_transcript: Option<String>,
     /// The stage id, so the runner can clear `resume_pending` once it starts.
     pub stage_id: String,
     /// Resolved from the role's definition at spec-build time.
@@ -325,6 +340,10 @@ pub struct StageOutcome {
     /// ask the director a blocking question. Neither `Done` nor `Failed` — the
     /// drive parks it as an `awaiting_checkpoint` decision (see `run_stage_once`).
     pub blocked: Option<BlockedAsk>,
+    /// Serialized conversation transcript accompanying `blocked` (API substrate
+    /// only): persisted on the stage row so the answered re-run continues the
+    /// same conversation instead of starting over.
+    pub blocked_transcript: Option<String>,
 }
 
 /// What the user chose at a checkpoint.

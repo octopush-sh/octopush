@@ -38,6 +38,16 @@ pub struct StageContext {
     /// when the stage starts. Both substrates append their instructions to the
     /// stage's system prompt.
     pub skills: Vec<crate::skills::Skill>,
+    /// Remaining run-budget headroom (USD) when this stage started, when the
+    /// run has a budget. The API substrate stops opening new tool turns once
+    /// the stage's own spend crosses it (see `run_agentic_loop`); the CLI
+    /// substrate cannot be metered mid-flight and relies on the between-stage
+    /// gate plus `--max-turns`.
+    pub spend_limit: Option<f64>,
+    /// Completed upstream stages this stage may consult via the `ask_stage`
+    /// tool (API substrate): archived artifact + journal digest + the model
+    /// that produced them.
+    pub peers: Vec<crate::orchestrator::agentic::PeerStage>,
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -64,19 +74,24 @@ pub trait AgentRunner: Send + Sync {
 }
 
 
-/// Cap (chars) on a single dossier section fed to a stage. Generous enough for
-/// a full plan or review (~4k tokens), tight enough that a runaway artifact
-/// can't blow up every later stage's prompt. Truncation keeps head + tail —
-/// intent and conclusions survive; boilerplate middles are what get dropped.
-const SECTION_CAP_CHARS: usize = 16_000;
+/// Cap (chars) on a single full-detail dossier section fed to a stage.
+/// Generous enough for a full plan or review (~4k tokens), tight enough that
+/// a runaway artifact can't blow up every later stage's prompt. Truncation
+/// keeps head + tail — intent and conclusions survive; boilerplate middles
+/// are what get dropped.
+pub(crate) const SECTION_CAP_CHARS: usize = 16_000;
 
-/// Middle-truncate `s` to [`SECTION_CAP_CHARS`] on char boundaries.
-pub(crate) fn cap_section(s: &str) -> String {
-    if s.len() <= SECTION_CAP_CHARS {
+/// Cap for an older same-kind section (kept for context, not the primary
+/// input — see `InputSection::full_detail`).
+pub(crate) const COMPACT_SECTION_CAP_CHARS: usize = 4_000;
+
+/// Middle-truncate `s` to `cap` chars on char boundaries.
+pub(crate) fn cap_to(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
         return s.to_string();
     }
-    let head_budget = SECTION_CAP_CHARS * 3 / 4;
-    let tail_budget = SECTION_CAP_CHARS - head_budget;
+    let head_budget = cap * 3 / 4;
+    let tail_budget = cap - head_budget;
     let mut head_end = head_budget.min(s.len());
     while !s.is_char_boundary(head_end) {
         head_end -= 1;
@@ -92,9 +107,44 @@ pub(crate) fn cap_section(s: &str) -> String {
     )
 }
 
+/// Middle-truncate `s` to [`SECTION_CAP_CHARS`] on char boundaries.
+pub(crate) fn cap_section(s: &str) -> String {
+    cap_to(s, SECTION_CAP_CHARS)
+}
+
 /// Human-readable role for prompt attribution ("plan_review" → "plan review").
 fn role_words(role: &str) -> String {
     role.replace('_', " ")
+}
+
+/// Repo agent-convention files surfaced to API-substrate stages, in priority
+/// order. The Claude CLI reads these itself; an API-substrate agent (any
+/// OpenAI-compat model) never saw them — so it wrote code ignoring the
+/// project's own rules and the next reviewer bounced it for that. Mirrored
+/// files (CLAUDE.md and AGENTS.md are often identical) dedupe by content.
+const CONVENTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md", "CONVENTIONS.md"];
+
+/// The project-conventions section appended to an API-substrate stage's system
+/// prompt: each convention file found at the workspace root, capped, deduped.
+/// Empty string when none exist.
+pub(crate) fn repo_conventions_section(workspace_path: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for name in CONVENTION_FILES {
+        let Ok(content) = std::fs::read_to_string(workspace_path.join(name)) else {
+            continue;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() || seen.iter().any(|s| s == trimmed) {
+            continue;
+        }
+        seen.push(trimmed.to_string());
+        out.push_str(&format!(
+            "\n\nProject conventions from {name} — follow these while working in this repository:\n{}",
+            cap_section(trimmed),
+        ));
+    }
+    out
 }
 
 /// The dossier label for a section of the given kind.
@@ -127,12 +177,25 @@ pub fn user_input_for(
         if sec.text.trim().is_empty() {
             continue;
         }
-        s.push_str(&format!(
-            "{} (from the {} stage):\n{}\n\n",
-            section_label(&sec.kind),
-            role_words(&sec.role),
-            cap_section(&sec.text),
-        ));
+        if sec.full_detail {
+            s.push_str(&format!(
+                "{} (from the {} stage):\n{}\n\n",
+                section_label(&sec.kind),
+                role_words(&sec.role),
+                cap_section(&sec.text),
+            ));
+        } else {
+            // An earlier same-kind section: kept (compact) instead of being
+            // silently evicted — the freshest section of this kind above/below
+            // is the primary input.
+            s.push_str(&format!(
+                "{} (from the {} stage, step {} — earlier context; a fresher section of this kind follows the pipeline order):\n{}\n\n",
+                section_label(&sec.kind),
+                role_words(&sec.role),
+                sec.position + 1,
+                cap_to(&sec.text, COMPACT_SECTION_CAP_CHARS),
+            ));
+        }
     }
     // A reviewer/tester must judge the ACTUAL code: include the live worktree
     // diff when it was captured; otherwise fall back to the tools hint. This
@@ -157,6 +220,16 @@ pub fn user_input_for(
         );
     } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
+    }
+    // Attempt history BEFORE the current feedback: the history is context,
+    // the feedback below is the binding directive for THIS attempt.
+    if let Some(h) = input.history.as_deref().filter(|h| !h.trim().is_empty()) {
+        s.push_str(&format!(
+            "This stage has run before in this run. History of its previous attempts:\n{h}\n"
+        ));
+        s.push_str(
+            "Do not repeat an approach that was already rejected, and do not undo a fix that earlier feedback demanded — that causes the loop to oscillate.\n\n",
+        );
     }
     if let Some(fb) = feedback {
         s.push_str(&format!("Reviewer feedback to address this time:\n{fb}\n\n"));
@@ -207,14 +280,45 @@ impl AgentRunner for ApiRunner {
         // API substrate: the `ask_director` escape valve is available, so the
         // carve-out is included (`can_ask_director = true`).
         let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        // Repo conventions (CLAUDE.md/AGENTS.md/…): the CLI substrate reads
+        // them itself; the API substrate must be handed them explicitly or a
+        // non-Claude implementer works blind to the project's rules.
+        system.push_str(&repo_conventions_section(&ctx.workspace_path));
         // Skills the brief named reach the stage as instructions, not as a
         // literal `/slug` the agent would have to guess at — resolved here, at
         // the moment this role actually runs.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
-        let user = user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref());
+        // An answered ask_director block CONTINUES its saved conversation —
+        // the exploration that led to the question is not re-run or re-paid.
+        // The director's decisions (already formatted into `feedback`) arrive
+        // as the ask's tool_result. A missing/corrupt transcript falls back
+        // to the normal fresh-run seeding, where the same feedback text is
+        // injected by `user_input_for`.
+        let resumed_block = stage.blocked_transcript.as_deref().and_then(|json| {
+            serde_json::from_str::<crate::orchestrator::agentic::BlockedTranscript>(json).ok()
+        });
+        let initial_messages = match &resumed_block {
+            Some(t) => {
+                let answer = stage
+                    .feedback
+                    .as_deref()
+                    .filter(|f| !f.trim().is_empty())
+                    .unwrap_or("The director approved proceeding with your recommended defaults.");
+                crate::orchestrator::agentic::resume_messages_for_answered_block(t, answer)
+            }
+            None => crate::orchestrator::agentic::user_messages(&user_input_for(
+                &stage.role,
+                &ctx.task,
+                input,
+                stage.feedback.as_deref(),
+            )),
+        };
 
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
+        if resumed_block.is_some() {
+            emitter.notice("continuing the stage's own conversation with the director's answers");
+        }
         // The per-stage tool-turn budget (validated 1..=100 at save time);
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
@@ -225,10 +329,10 @@ impl AgentRunner for ApiRunner {
             &ctx.client,
             &stage.agent_model,
             &system,
-            &user,
+            initial_messages,
             &ctx.workspace_path,
             max_iterations,
-            ctx.cancel.as_ref(),
+            &ctx.cancel,
             &emitter,
             stage.tools.as_deref(),
             stage.effort,
@@ -237,18 +341,23 @@ impl AgentRunner for ApiRunner {
             } else {
                 None
             },
+            matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
+            ctx.spend_limit,
+            &ctx.peers,
         )
         .await;
 
         match result {
             Ok(r) => {
+                // Own spend at the stage model's rate, plus any `ask_stage`
+                // peer consultations already priced at each PEER model's rate.
                 let cost = crate::orchestrator::cost::stage_cost(
                     &stage.agent_model,
                     r.input_tokens,
                     r.output_tokens,
                     r.cache_read_tokens,
                     r.cache_creation_tokens,
-                );
+                ) + r.peer_cost_usd;
                 // Escape valve: the stage called `ask_director`. This is neither
                 // a success nor a failure — it's a block. Carry the questions up
                 // so the drive parks the stage as an `awaiting_checkpoint`
@@ -261,8 +370,8 @@ impl AgentRunner for ApiRunner {
                             payload: None,
                             refs_worktree: false,
                         },
-                        input_tokens: r.input_tokens,
-                        output_tokens: r.output_tokens,
+                        input_tokens: r.input_tokens + r.peer_input_tokens,
+                        output_tokens: r.output_tokens + r.peer_output_tokens,
                         cost_usd: cost,
                         status: StageStatus::AwaitingCheckpoint,
                         tool_calls: r.tool_calls,
@@ -270,6 +379,10 @@ impl AgentRunner for ApiRunner {
                         verdict: None,
                         session_id: None,
                         blocked: Some(ask),
+                        blocked_transcript: r
+                            .blocked_transcript
+                            .as_ref()
+                            .and_then(|t| serde_json::to_string(t).ok()),
                     });
                 }
                 // An unfinished loop is a failure, not a thin success: the
@@ -286,8 +399,8 @@ impl AgentRunner for ApiRunner {
                             payload: None,
                             refs_worktree: false,
                         },
-                        input_tokens: r.input_tokens,
-                        output_tokens: r.output_tokens,
+                        input_tokens: r.input_tokens + r.peer_input_tokens,
+                        output_tokens: r.output_tokens + r.peer_output_tokens,
                         cost_usd: cost,
                         status: StageStatus::Failed,
                         tool_calls: r.tool_calls,
@@ -295,26 +408,41 @@ impl AgentRunner for ApiRunner {
                         verdict: None,
                         session_id: None,
                         blocked: None,
+                    blocked_transcript: None,
                     });
                 }
                 let kind = stage.artifact_kind.clone();
                 let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
-                let verdict = parse_verdict(&r.text);
+                // Structured verdict first (submit_verdict tool call); the
+                // text sentinel remains as a fallback for models that wrote
+                // the line instead of calling the tool.
+                let verdict = r.verdict.clone().or_else(|| parse_verdict(&r.text));
                 if let Some(v) = &verdict {
                     emitter.notice(match v {
                         crate::orchestrator::types::ReviewVerdict::Pass => "Verdict: passed",
                         crate::orchestrator::types::ReviewVerdict::ChangesRequested => "Verdict: changes requested",
                     });
                 }
+                // A forced close at the iteration cap is a REAL but possibly
+                // incomplete handoff — annotate it so the next stage (and any
+                // reviewer) judges it with the right expectations.
+                let text = if r.closed_at_cap {
+                    format!(
+                        "(this stage hit its tool-turn cap and was closed early — the summary below may be incomplete; verify before relying on it)\n\n{}",
+                        r.text
+                    )
+                } else {
+                    r.text.clone()
+                };
                 Ok(StageOutcome {
                     artifact: StageArtifact {
                         kind,
-                        text: r.text.clone(),
+                        text,
                         payload: None,
                         refs_worktree,
                     },
-                    input_tokens: r.input_tokens,
-                    output_tokens: r.output_tokens,
+                    input_tokens: r.input_tokens + r.peer_input_tokens,
+                    output_tokens: r.output_tokens + r.peer_output_tokens,
                     cost_usd: cost,
                     status: StageStatus::Done,
                     tool_calls: r.tool_calls,
@@ -322,6 +450,7 @@ impl AgentRunner for ApiRunner {
                     verdict,
                     session_id: None,
                     blocked: None,
+                    blocked_transcript: None,
                 })
             }
             Err(e) => Ok(StageOutcome {
@@ -340,6 +469,7 @@ impl AgentRunner for ApiRunner {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                    blocked_transcript: None,
             }),
         }
     }

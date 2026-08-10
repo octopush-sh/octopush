@@ -41,16 +41,51 @@ struct CliResult {
     session_id: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default)]
-struct CliUsage {
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct CliUsage {
     #[serde(default)]
-    input_tokens: u64,
+    pub(crate) input_tokens: u64,
     #[serde(default)]
-    output_tokens: u64,
+    pub(crate) output_tokens: u64,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+}
+
+impl CliUsage {
+    fn add(&mut self, other: &CliUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+}
+
+/// Per-message usage from an `assistant` NDJSON stream event: the message id
+/// (the CLI emits ONE assistant event per content block, each repeating the
+/// same message's usage — summing raw events double/triple-counts multi-block
+/// turns) plus the usage tuple. Callers keep the LATEST usage per id and sum
+/// across ids, so a stop/timeout that never sees the terminal `result` event
+/// still reports an honest ESTIMATE of the burned spend instead of zero.
+/// A missing id yields `None` for the id — the caller keys it uniquely.
+pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let msg = v.get("message")?;
+    let u = msg.get("usage")?;
+    let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let id = msg.get("id").and_then(Value::as_str).map(str::to_string);
+    Some((
+        id,
+        CliUsage {
+            input_tokens: g("input_tokens"),
+            output_tokens: g("output_tokens"),
+            cache_read_input_tokens: g("cache_read_input_tokens"),
+            cache_creation_input_tokens: g("cache_creation_input_tokens"),
+        },
+    ))
 }
 
 /// Merge PATH-like dir lists into one, de-duplicating while preserving
@@ -156,6 +191,51 @@ fn resolved_cli_path() -> String {
     merge_path_dirs(&[login_path, &inherited, &defaults])
 }
 
+/// Markers that make a trailing question read as ADDRESSED TO A PERSON (the
+/// conservative half of the question-as-result detector below).
+const QUESTION_MARKERS: &[&str] = &[
+    "should i",
+    "shall i",
+    "do you want",
+    "would you like",
+    "do you prefer",
+    "which of",
+    "which one",
+    "let me know",
+    "please confirm",
+    "can you confirm",
+    "could you clarify",
+];
+
+/// Detect a CLI stage that finished by ASKING A QUESTION instead of doing the
+/// work. The CLI has no `ask_director` tool and its preamble forbids asking —
+/// but a genuinely blocked model asks anyway, in prose, and that question then
+/// flowed downstream as if it were a result ("¿Postgres or SQLite?" handed to
+/// the reviewer as a plan). Deliberately conservative — BOTH must hold:
+/// the final non-empty line ends with '?', AND that line (or the one before
+/// it) carries a person-addressed marker. Returns the synthesized ask;
+/// `None` for ordinary results (including rhetorical trailing questions).
+pub fn detect_trailing_question(text: &str) -> Option<crate::orchestrator::types::BlockedAsk> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let last = *lines.last()?;
+    if !last.ends_with('?') {
+        return None;
+    }
+    let window = lines[lines.len().saturating_sub(2)..].join(" ").to_lowercase();
+    if !QUESTION_MARKERS.iter().any(|m| window.contains(m)) {
+        return None;
+    }
+    Some(crate::orchestrator::types::BlockedAsk {
+        summary: "The stage stopped to ask a question instead of finishing.".to_string(),
+        questions: vec![crate::orchestrator::types::BlockedQuestion {
+            question: last.to_string(),
+            why_blocked: "The agent ended its work with this question — it needs an answer to proceed."
+                .to_string(),
+            recommended_default: String::new(),
+        }],
+    })
+}
+
 /// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
 /// A non-zero exit OR `is_error: true` produces a Failed outcome. `stderr_text`
 /// is appended to the failure message when the result itself gives no detail.
@@ -200,6 +280,7 @@ pub fn parse_cli_result(
             session_id: parsed.session_id.clone(),
             // `ask_director` is an API-substrate tool only; a CLI stage never blocks.
             blocked: None,
+                blocked_transcript: None,
         });
     }
 
@@ -221,16 +302,26 @@ pub fn parse_cli_result(
         verdict: parse_verdict(&parsed.result),
         session_id: parsed.session_id.clone(),
         blocked: None,
+                blocked_transcript: None,
     })
 }
+
+/// File-mutating Claude Code tools denied to a read-only (review) CLI stage.
+/// The API substrate enforces read-only reviewers through its tool allowlist;
+/// the CLI ran with `bypassPermissions` and nothing but a "Do not modify
+/// files" prompt — a reviewer that "fixes" what it reviews corrupts the very
+/// diff the gate then approves. `Bash` stays allowed (reviewers must run
+/// builds/tests), so this is a guardrail, not a sandbox.
+pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 
 /// Build the argv (after the program name) for a headless `claude -p` run.
 /// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
-/// independently and non-JSON log lines are simply skipped.
-pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<String> {
-    vec![
+/// independently and non-JSON log lines are simply skipped. `read_only` adds
+/// the review-stage tool denial (see [`REVIEW_DISALLOWED_TOOLS`]).
+pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -243,14 +334,19 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<S
         "bypassPermissions".to_string(),
         "--max-turns".to_string(),
         max_turns.max(1).to_string(),
-    ]
+    ];
+    if read_only {
+        args.push("--disallowedTools".to_string());
+        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
+    }
+    args
 }
 
 /// Argv for resuming an existing headless session: continue the same
 /// conversation (`--resume <id>`) with a fresh turn budget. The continuation
 /// nudge is supplied via stdin by the caller.
-pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> Vec<String> {
-    vec![
+pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         "--output-format".to_string(), "stream-json".to_string(),
         "--verbose".to_string(),
@@ -258,7 +354,12 @@ pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> V
         "--resume".to_string(), session_id.to_string(),
         "--permission-mode".to_string(), "bypassPermissions".to_string(),
         "--max-turns".to_string(), max_turns.max(1).to_string(),
-    ]
+    ];
+    if read_only {
+        args.push("--disallowedTools".to_string());
+        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
+    }
+    args
 }
 
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
@@ -296,14 +397,29 @@ impl AgentRunner for CliRunner {
         // not that, so the body is inlined here rather than hoping the CLI
         // reads the token out of the brief.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
+        // A worktree review stage runs read-only: its whole contract is to
+        // judge the diff, not to change it (Action-environment roles keep
+        // their write access — committing/pushing IS their job).
+        let read_only = matches!(stage.artifact_kind, ArtifactKind::Review)
+            && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree);
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
-                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
-                "Continue the task from where you left off. You have a fresh turn budget; \
-                 finish the remaining work, then stop.".to_string(),
+                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations, read_only),
+                // An answered question-block resumes with the director's
+                // decisions in the nudge — the CLI counterpart of the API
+                // substrate's transcript continuation. A plain halt-recovery
+                // resume has no feedback and keeps the generic nudge.
+                match stage.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
+                    Some(fb) => format!(
+                        "{fb}\n\nContinue the task from where you left off with these decisions. \
+                         You have a fresh turn budget; finish the remaining work, then stop."
+                    ),
+                    None => "Continue the task from where you left off. You have a fresh turn budget; \
+                             finish the remaining work, then stop.".to_string(),
+                },
             ),
             None => (
-                build_cli_args(&stage.agent_model, &system, stage.max_iterations),
+                build_cli_args(&stage.agent_model, &system, stage.max_iterations, read_only),
                 user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
             ),
         };
@@ -412,6 +528,15 @@ impl AgentRunner for CliRunner {
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
         );
+        // Running usage estimate from streamed assistant events, readable from
+        // the cancel branch too — a stop/timeout used to record ZERO usage
+        // ("unknowable mid-flight"), silently understating real spend against
+        // the budget. Keyed by message id (latest usage per message wins) so
+        // the CLI's one-event-per-content-block stream never double-counts a
+        // multi-block turn; id-less events get a unique synthetic key.
+        let streamed_usage: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, CliUsage>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let usage_in_loop = std::sync::Arc::clone(&streamed_usage);
         let read_loop = async {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut result_line: Option<String> = None;
@@ -458,6 +583,11 @@ impl AgentRunner for CliRunner {
                 if is_result_event(&value) {
                     result_line = Some(trimmed.to_string());
                 }
+                if let Some((id, u)) = usage_from_stream_event(&value) {
+                    let mut map = usage_in_loop.lock();
+                    let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                    map.insert(key, u);
+                }
                 for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
                     emitter.emit_raw_entry(entry);
                 }
@@ -483,8 +613,13 @@ impl AgentRunner for CliRunner {
             end = read_loop => end,
             _ = cancel_watch => {
                 let _ = child.kill().await;
-                return Ok(failed_stage(
+                // Estimated spend from the streamed assistant events — a stop
+                // used to record zero and silently understate the budget.
+                let u = sum_usage(&streamed_usage.lock());
+                return Ok(failed_stage_with_usage(
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
+                    &stage.agent_model,
+                    u,
                 ));
             }
         };
@@ -493,11 +628,21 @@ impl AgentRunner for CliRunner {
             ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
             ReadEnd::Idle(None, _) => {
                 stderr_task.abort();
-                return Ok(failed_stage("claude timed out — no output for 5 minutes"));
+                let u = sum_usage(&streamed_usage.lock());
+                return Ok(failed_stage_with_usage(
+                    "claude timed out — no output for 5 minutes",
+                    &stage.agent_model,
+                    u,
+                ));
             }
             ReadEnd::AbsCap(None, _) => {
                 stderr_task.abort();
-                return Ok(failed_stage("claude exceeded the 60-minute cap"));
+                let u = sum_usage(&streamed_usage.lock());
+                return Ok(failed_stage_with_usage(
+                    "claude exceeded the 60-minute cap",
+                    &stage.agent_model,
+                    u,
+                ));
             }
         };
 
@@ -522,7 +667,24 @@ impl AgentRunner for CliRunner {
 
         match result_line {
             Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                Ok(outcome) => Ok(outcome),
+                Ok(mut outcome) => {
+                    // Question-as-result guard: a Done outcome whose text is
+                    // a person-addressed question becomes a director block —
+                    // the question must reach the human, not the next stage's
+                    // prompt disguised as a result. Verdict-bearing reviews
+                    // are exempt (they finished; the verdict drives the loop).
+                    if matches!(outcome.status, StageStatus::Done) && outcome.verdict.is_none() {
+                        if let Some(ask) = detect_trailing_question(&outcome.artifact.text) {
+                            emitter.notice(&format!(
+                                "the agent ended with a question — pausing for the director: {}",
+                                ask.questions[0].question
+                            ));
+                            outcome.status = StageStatus::AwaitingCheckpoint;
+                            outcome.blocked = Some(ask);
+                        }
+                    }
+                    Ok(outcome)
+                }
                 Err(_) => Ok(failed_stage(&format!(
                     "claude produced no parseable result: {}",
                     failure_detail(&stderr_out, &line)
@@ -558,6 +720,33 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Sum the per-message usage map into one total (see `usage_from_stream_event`).
+fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
+    let mut total = CliUsage::default();
+    for u in map.values() {
+        total.add(u);
+    }
+    total
+}
+
+/// A failed outcome carrying the ESTIMATED usage summed from the streamed
+/// assistant events (no terminal `result` event arrived to be authoritative).
+/// Cost is priced through the normal catalog so the run meter and budget see
+/// the burned spend instead of zero.
+fn failed_stage_with_usage(msg: &str, model: &str, u: CliUsage) -> StageOutcome {
+    let mut out = failed_stage(msg);
+    out.input_tokens = u.input_tokens;
+    out.output_tokens = u.output_tokens;
+    out.cost_usd = crate::orchestrator::cost::stage_cost(
+        model,
+        u.input_tokens,
+        u.output_tokens,
+        u.cache_read_input_tokens,
+        u.cache_creation_input_tokens,
+    );
+    out
+}
+
 fn failed_stage(msg: &str) -> StageOutcome {
     StageOutcome {
         artifact: StageArtifact {
@@ -575,5 +764,6 @@ fn failed_stage(msg: &str) -> StageOutcome {
         verdict: None,
         session_id: None,
         blocked: None,
+                blocked_transcript: None,
     }
 }

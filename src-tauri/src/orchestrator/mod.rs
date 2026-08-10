@@ -424,10 +424,24 @@ impl Orchestrator {
             };
             if in_window && feeds_review {
                 // The feedback that closed the iteration is recorded on the
-                // review row only.
+                // review row only. Every OTHER stage in the reset window gets
+                // the review's findings as re-run feedback — not just the
+                // target: an intermediate stage (e.g. test between implement
+                // and review) used to re-run blind to why the loop happened,
+                // because the review artifact it might have read is nulled by
+                // this very reset.
                 let cf = if s.id == review.id { feedback } else { None };
-                let fb = if s.position == target_pos { feedback } else { None };
+                let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb)?;
+                // An INNER review inside the window gets a fresh loop budget
+                // for each outer iteration — without this, its counter
+                // persisted across outer loops and the inner loop arrived
+                // pre-exhausted on the second outer pass. (The outer review's
+                // own counter is the one `increment_loop_iteration` below
+                // advances; it is deliberately NOT reset.)
+                if s.id != review.id && s.loop_target_position.is_some() && s.loop_iterations > 0 {
+                    self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+                }
             }
         }
         self.db.lock().increment_loop_iteration(&review.id)?;
@@ -471,14 +485,15 @@ impl Orchestrator {
             .ok_or_else(|| AppError::Other("workspace has no worktree_path".into()))
     }
 
-    /// The COMPLETE uncommitted picture of a run's worktree: staged (HEAD→index)
-    /// plus unstaged/untracked (index→workdir) diffs concatenated. Staged
-    /// changes matter — a CLI-substrate agent habitually `git add`s part of its
-    /// edits despite the preamble, and an index-only diff would silently hide
-    /// them from the reviewer certifying "the actual code changes". Best-effort:
-    /// every capture failure is LOGGED; `None` when the workspace/unstaged side
-    /// fails, and a staged-side failure degrades to unstaged-only (warned).
-    /// Emptiness is the CALLER's concern.
+    /// The COMPLETE picture of a run's changes: any commits made during the
+    /// run (a stage that `git commit`ed despite the preamble — without this
+    /// segment that work silently VANISHED from the diff the reviewer
+    /// certifies), plus staged (HEAD→index) and unstaged/untracked
+    /// (index→workdir) diffs, concatenated. Staged changes matter — a
+    /// CLI-substrate agent habitually `git add`s part of its edits.
+    /// Best-effort: every capture failure is LOGGED; `None` when the
+    /// workspace/unstaged side fails; the committed/staged segments degrade
+    /// to absent (warned). Emptiness is the CALLER's concern.
     fn full_worktree_diff(&self, run: &crate::db::RunRow) -> Option<String> {
         let path = match self.workspace_path(run) {
             Ok(p) => p,
@@ -487,6 +502,31 @@ impl Orchestrator {
                 return None;
             }
         };
+        // Committed-during-run segment: the run's start HEAD is the parent of
+        // the earliest stage baseline (a dangling commit whose parent was
+        // HEAD at capture time). HEAD unchanged ⇒ empty diff ⇒ skipped.
+        let committed = self
+            .db
+            .lock()
+            .list_run_stages(&run.id)
+            .ok()
+            .and_then(|ss| {
+                ss.into_iter()
+                    .filter(|s| s.baseline_commit.is_some())
+                    .min_by_key(|s| s.position)
+                    .and_then(|s| s.baseline_commit)
+            })
+            .and_then(|baseline| {
+                let head = crate::git_ops::head_sha(&path)?;
+                match crate::git_ops::range_diff_text(&path, &format!("{baseline}^"), &head) {
+                    Ok(d) if !d.trim().is_empty() => Some(d),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(run_id = %run.id, "worktree diff: committed segment failed: {e}");
+                        None
+                    }
+                }
+            });
         let staged = crate::git_ops::get_staged_diff_text(&path).unwrap_or_else(|e| {
             tracing::warn!(run_id = %run.id, "worktree diff: staged capture failed: {e}");
             String::new()
@@ -498,11 +538,12 @@ impl Orchestrator {
                 return None;
             }
         };
-        Some(match (staged.trim().is_empty(), unstaged.trim().is_empty()) {
-            (true, _) => unstaged,
-            (false, true) => staged,
-            (false, false) => format!("{staged}\n{unstaged}"),
-        })
+        let parts: Vec<String> = [committed, Some(staged), Some(unstaged)]
+            .into_iter()
+            .flatten()
+            .filter(|d| !d.trim().is_empty())
+            .collect();
+        Some(parts.join("\n"))
     }
 
     /// Best-effort: persist the worktree diff onto a just-finished stage, so the
@@ -521,6 +562,21 @@ impl Orchestrator {
         if let Err(e) = result {
             tracing::warn!(stage_id = %stage_id, "diff snapshot capture failed: {e}");
         }
+    }
+
+    /// Append a notice entry to a stage's work journal, persisted AND emitted
+    /// live — the shared shape for orchestration decisions that must explain
+    /// themselves in the journal (gate fallbacks, escalations, loop events).
+    /// Best-effort: a journal write failure never masks the decision itself.
+    fn journal_notice(&self, run_id: &str, stage_id: &str, text: &str) {
+        let entry = serde_json::json!({ "kind": "notice", "text": text });
+        if let Err(e) = self.db.lock().append_stage_log(run_id, stage_id, &entry.to_string()) {
+            tracing::warn!(stage_id = %stage_id, "journal notice write failed: {e}");
+        }
+        self.events.emit(
+            crate::orchestrator::live::RUN_LOG_EVENT,
+            serde_json::json!({ "runId": run_id, "stageId": stage_id, "entry": entry }),
+        );
     }
 
     /// Append a terminal entry to the stage's work journal so the journal
@@ -618,6 +674,51 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Quality escalation (the auto-loop counterpart of [`try_escalate`]):
+    /// the review at `review` hit its loop cap still requesting changes. If
+    /// the loop TARGET has an unused escalation policy that would actually
+    /// change its tier, mark it escalated and report `true` — the caller then
+    /// loop-backs once more, so the strong tier gets one attempt before the
+    /// run surrenders to a human gate. Bounded exactly like failure
+    /// escalation: the sticky `escalated` flag allows this once per stage.
+    fn try_escalate_loop_target(
+        &self,
+        run_id: &str,
+        review: &RunStageRow,
+    ) -> AppResult<bool> {
+        let Some(target_pos) = review.loop_target_position else { return Ok(false) };
+        let stages = self.db.lock().list_run_stages(run_id)?;
+        let Some(target) = stages.iter().find(|s| s.position == target_pos) else {
+            return Ok(false);
+        };
+        if target.escalated {
+            return Ok(false);
+        }
+        let model_changes = target
+            .escalate_model
+            .as_deref()
+            .is_some_and(|m| m != target.agent_model);
+        let effort_changes = matches!(
+            AgentSubstrate::from_db(&target.substrate),
+            Some(AgentSubstrate::Api)
+        ) && target.escalate_effort.is_some()
+            && target.escalate_effort != target.effort;
+        if !(model_changes || effort_changes) {
+            return Ok(false);
+        }
+        self.db.lock().set_run_stage_escalated(&target.id, true)?;
+        let tier = target
+            .escalate_model
+            .clone()
+            .filter(|m| m != &target.agent_model)
+            .unwrap_or_else(|| "higher effort".to_string());
+        self.journal_notice(run_id, &review.id, &format!(
+            "auto loop: changes still requested at the loop cap — escalating the {} stage to {tier} for one more attempt",
+            target.role.replace('_', " ")
+        ));
+        Ok(true)
+    }
+
     /// Execute one stage and persist its outcome + cost/baseline.
     async fn run_stage_once(
         &self,
@@ -675,6 +776,7 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
             role_prompt: role_def.prompt_body,
             role_environment: role_def.environment,
@@ -686,11 +788,66 @@ impl Orchestrator {
         if stage.resume_pending {
             self.db.lock().set_stage_resume_pending(&stage.id, false)?;
         }
+        // Consume-once: the ask_director transcript feeds exactly the run it
+        // was answered for — any later re-run starts fresh.
+        if stage.blocked_transcript.is_some() {
+            self.db.lock().set_stage_blocked_transcript(&stage.id, None)?;
+        }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
         // A resuming CLI stage discards the input for its resumed session, so
         // don't spend a worktree-diff capture on it.
         let input = self.assemble_stage_input(run, stage.position, !resuming)?;
+
+        // Peers for the `ask_stage` consultation channel: completed upstream
+        // stages (same ancestry rule as the dossier) with their archived
+        // artifact + journal digest and the model that did the work — the
+        // asking stage consults that model, not just its paper trail.
+        // API-substrate only: CliRunner never reads `ctx.peers`, and building
+        // the digests is O(prior stages) of journal reads per stage start.
+        let peers: Vec<crate::orchestrator::agentic::PeerStage> = if !matches!(spec.substrate, AgentSubstrate::Api) {
+            Vec::new()
+        } else {
+            let all = self.db.lock().list_run_stages(&run.id)?;
+            let authored = all.iter().any(|s| !s.parents.is_empty());
+            let anc = if authored { Some(ancestors_of(&all, stage.position)) } else { None };
+            all.iter()
+                .filter(|s| {
+                    s.status == "done"
+                        && match &anc {
+                            Some(a) => a.contains(&s.position),
+                            None => s.position < stage.position,
+                        }
+                })
+                .filter_map(|s| {
+                    let artifact_text = s
+                        .artifact
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<StageArtifact>(j).ok())
+                        .map(|a| a.text)
+                        .unwrap_or_default();
+                    let journal_digest = self
+                        .salvage_journal_text(&s.id)
+                        .map(|t| crate::orchestrator::runner::cap_to(&t, 6_000))
+                        .unwrap_or_default();
+                    if artifact_text.trim().is_empty() && journal_digest.trim().is_empty() {
+                        return None;
+                    }
+                    let model = if s.escalated {
+                        s.escalate_model.clone().unwrap_or_else(|| s.agent_model.clone())
+                    } else {
+                        s.agent_model.clone()
+                    };
+                    Some(crate::orchestrator::agentic::PeerStage {
+                        position: s.position,
+                        role: s.role.clone(),
+                        model,
+                        artifact_text: crate::orchestrator::runner::cap_to(&artifact_text, 8_000),
+                        journal_digest,
+                    })
+                })
+                .collect()
+        };
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
         // Reset any prior live log for this stage (re-runs reuse the same id).
@@ -702,7 +859,10 @@ impl Orchestrator {
 
         // Snapshot the worktree NOW so a later Discard reverts only this stage's
         // edits. Best-effort & forensic: a capture failure never blocks the run.
+        // `head_before` feeds the mid-pipeline commit detector below.
+        let mut head_before: Option<String> = None;
         if let Ok(ws) = self.workspace_path(run) {
+            head_before = crate::git_ops::head_sha(&ws);
             match crate::orchestrator::git_baseline::capture_baseline(&ws) {
                 Ok(Some(sha)) => { let _ = self.db.lock().set_stage_baseline(&stage.id, Some(&sha)); }
                 Ok(None) => {}
@@ -754,6 +914,18 @@ impl Orchestrator {
                 reference_text.push_str(extra);
             }
             let skills = crate::skills::referenced_skills(&workspace_path, &reference_text);
+            // Intra-stage budget: the headroom left under the run's own cap
+            // when this stage starts. The between-stage gate already blocked
+            // a start at/over budget, so this is the amount ONE stage may
+            // spend before the loop stops opening new tool turns. A stage
+            // that starts with NO headroom can only be the director's
+            // conscious budget override — that runs unmetered (None), as the
+            // override intends.
+            let spend_limit = run
+                .budget_usd
+                .filter(|b| *b > 0.0)
+                .map(|b| b - run.cost_usd)
+                .filter(|r| *r > 0.0);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -765,6 +937,8 @@ impl Orchestrator {
                 exec_isolation,
                 allowed_write_roots,
                 skills,
+                spend_limit,
+                peers,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,
@@ -775,6 +949,28 @@ impl Orchestrator {
 
         // The stage is no longer in flight — a stop after this point is a no-op.
         self.cancels.lock().remove(&run.id);
+
+        // Mid-pipeline commit detector: a WORKTREE stage that moved HEAD
+        // ignored the never-commit contract. The committed work is still
+        // carried into the run diff (see `full_worktree_diff`), but say so in
+        // the journal — silently, the baseline/Discard assumptions degrade.
+        // Action-environment stages (commit/PR/merge/release) are exempt:
+        // moving HEAD is their documented job.
+        let worktree_env = matches!(
+            spec.role_environment,
+            crate::orchestrator::types::RoleEnvironment::Worktree
+        );
+        if let (true, Some(before), Ok(ws)) = (worktree_env, &head_before, self.workspace_path(run)) {
+            if let Some(after) = crate::git_ops::head_sha(&ws) {
+                if *before != after {
+                    let b = &before[..before.len().min(8)];
+                    let a = &after[..after.len().min(8)];
+                    self.journal_notice(&run.id, &stage.id, &format!(
+                        "⚠ this stage created git commit(s) ({b}…{a}) — pipeline stages should leave work uncommitted; the committed changes remain part of the run's diff"
+                    ));
+                }
+            }
+        }
 
         let outcome = match run_result {
             Ok(o) => o,
@@ -804,6 +1000,22 @@ impl Orchestrator {
                 None,
             )?;
             self.db.lock().set_run_stage_blocked(&stage.id, Some(&json))?;
+            // Persist the conversation so the answered re-run CONTINUES it
+            // (D18) — the exploration that produced the question is not
+            // re-paid. Best-effort: without it, the re-run falls back to a
+            // fresh start with the answers as feedback.
+            if let Some(t) = outcome.blocked_transcript.as_deref() {
+                if let Err(e) = self.db.lock().set_stage_blocked_transcript(&stage.id, Some(t)) {
+                    tracing::warn!(stage_id = %stage.id, "blocked transcript persist failed: {e}");
+                }
+            }
+            // A CLI question-block carries the session id of the run that
+            // asked — persist it so the answered re-run `--resume`s that
+            // session (the CLI's own continuation channel) instead of
+            // re-paying the whole exploration.
+            if outcome.session_id.is_some() {
+                self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
+            }
             self.recompute_run_cost(&run.id)?;
             return Ok((StageStatus::AwaitingCheckpoint, None));
         }
@@ -911,46 +1123,60 @@ impl Orchestrator {
             None => p < position,
         };
 
-        // Freshest artifact per kind among the stages that feed `position`.
-        // `stages` is position-ordered, so a plain overwrite keeps the latest.
-        // The worktree flag is OR'd across ALL feeding artifacts, not just
-        // retained sections — an empty-text code artifact still means "changes
-        // on disk". NOTE: the dossier is bounded to one section per kind, so a
-        // join fed by two same-kind branches (e.g. two reviews) keeps only the
-        // later one — the deliberate token-cost ceiling, not a per-branch fan-in.
-        let mut latest: std::collections::HashMap<&'static str, InputSection> =
-            std::collections::HashMap::new();
+        // EVERY feeding stage's live artifact becomes a section (an artifact
+        // nulled by a reset never rides along). The old shape kept only the
+        // freshest per KIND, which silently evicted real information — a
+        // security review erased the code review before it, and a join fed by
+        // two same-kind branches kept only one. Token cost stays bounded at
+        // render time instead: the freshest section of each kind renders at
+        // the full cap, older same-kind sections render compact, and a global
+        // dossier budget drops compact sections oldest-first when exceeded.
+        let mut sections: Vec<InputSection> = Vec::new();
         let mut refs_worktree = false;
         for s in stages.iter().filter(|s| feeds(s.position)) {
             let Some(json) = &s.artifact else { continue };
             let Ok(a) = serde_json::from_str::<StageArtifact>(json) else { continue };
             refs_worktree |= a.refs_worktree;
-            // An empty-text artifact must never EVICT an older, non-empty
-            // section of the same kind (e.g. a fix stage whose final message
-            // was empty would otherwise erase implement's summary).
             if a.text.trim().is_empty() {
                 continue;
             }
-            let key = match a.kind {
-                ArtifactKind::Plan => "plan",
-                ArtifactKind::Review => "review",
-                ArtifactKind::Tests => "tests",
-                ArtifactKind::Diff => "diff",
-                ArtifactKind::Note => "note",
-            };
-            latest.insert(
-                key,
-                InputSection {
-                    kind: a.kind,
-                    role: s.role.clone(),
-                    position: s.position,
-                    text: a.text,
-                    refs_worktree: a.refs_worktree,
-                },
-            );
+            sections.push(InputSection {
+                kind: a.kind,
+                role: s.role.clone(),
+                position: s.position,
+                text: a.text,
+                refs_worktree: a.refs_worktree,
+                full_detail: true,
+            });
         }
-        let mut sections: Vec<InputSection> = latest.into_values().collect();
-        sections.sort_by_key(|s| s.position);
+        // `sections` is position-ordered (stages was). Freshest per kind keeps
+        // full detail; earlier same-kind sections render compact.
+        let mut newest: std::collections::HashMap<&'static str, i64> = std::collections::HashMap::new();
+        for sec in &sections {
+            let e = newest.entry(sec.kind.as_db()).or_insert(sec.position);
+            if sec.position > *e {
+                *e = sec.position;
+            }
+        }
+        for sec in &mut sections {
+            sec.full_detail = newest[sec.kind.as_db()] == sec.position;
+        }
+        // Global dossier budget over the RENDERED sizes. Freshest-per-kind
+        // sections are never dropped; compact ones go oldest-first.
+        const DOSSIER_CAP_CHARS: usize = 60_000;
+        let rendered_len = |sec: &InputSection| {
+            sec.text.len().min(if sec.full_detail {
+                crate::orchestrator::runner::SECTION_CAP_CHARS
+            } else {
+                crate::orchestrator::runner::COMPACT_SECTION_CAP_CHARS
+            })
+        };
+        let mut total: usize = sections.iter().map(rendered_len).sum();
+        while total > DOSSIER_CAP_CHARS {
+            let Some(i) = sections.iter().position(|s| !s.full_detail) else { break };
+            total -= rendered_len(&sections[i]);
+            sections.remove(i);
+        }
 
         // One-line orientation: the full pipeline with statuses, current marked.
         let breadcrumb = stages
@@ -988,7 +1214,65 @@ impl Orchestrator {
             None
         };
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff })
+        // Loop memory: what this stage's earlier attempts were and why they
+        // were closed — so iteration N stops re-trying what iteration N-1
+        // already had rejected (and a reviewer can spot a regression to a
+        // finding it already reported).
+        let history = stages
+            .iter()
+            .find(|s| s.position == position)
+            .and_then(|s| self.attempt_history_digest(&s.id));
+
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history })
+    }
+
+    /// Compact digest of a stage's archived attempts (`stage_iterations`),
+    /// oldest→newest, for the re-run prompt: what each attempt was and what
+    /// closed it (review feedback / rejection / failure). Bounded: the last
+    /// [`HISTORY_MAX_ATTEMPTS`] attempts, each field snipped. `None` when the
+    /// stage has no archived attempts (the common first run).
+    fn attempt_history_digest(&self, stage_id: &str) -> Option<String> {
+        const HISTORY_MAX_ATTEMPTS: usize = 5;
+        const FEEDBACK_SNIP: usize = 700;
+        const ERROR_SNIP: usize = 300;
+        let snip = |s: &str, max: usize| -> String {
+            let t = s.trim();
+            let cut = crate::chat_engine::truncate_char_safe(t, max);
+            if cut.len() < t.len() { format!("{cut}…") } else { cut.to_string() }
+        };
+        let iters = self.db.lock().list_stage_iterations(stage_id).ok()?;
+        if iters.is_empty() {
+            return None;
+        }
+        let total = iters.len();
+        let skip = total.saturating_sub(HISTORY_MAX_ATTEMPTS);
+        let mut lines: Vec<String> = Vec::new();
+        if skip > 0 {
+            lines.push(format!("(showing the last {HISTORY_MAX_ATTEMPTS} of {total} attempts)"));
+        }
+        for it in iters.iter().skip(skip) {
+            let mut line = format!("Attempt {} ({}, {})", it.iteration, it.agent_model, it.status);
+            if let Some(fb) = it
+                .closing_feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                line.push_str(&format!(" — closed with feedback: {}", snip(fb, FEEDBACK_SNIP)));
+            } else if let Some(err) = it.error.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" — failed: {}", snip(err, ERROR_SNIP)));
+            } else if let Some(text) = it
+                .artifact
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<StageArtifact>(j).ok())
+                .map(|a| a.text)
+                .filter(|t| !t.trim().is_empty())
+            {
+                line.push_str(&format!(" — produced: {}", snip(&text, ERROR_SNIP)));
+            }
+            lines.push(line);
+        }
+        Some(lines.join("\n"))
     }
 
     /// Sum stage costs; recompute the baseline by re-pricing each stage's tokens
@@ -1268,24 +1552,56 @@ impl Orchestrator {
                     // Auto-loop verdict decision runs BEFORE gated/checkpoint pause.
                     if Self::stage_has_auto_loop(&stage) {
                         let remaining = stage.loop_iterations < stage.loop_max_iterations;
+                        // The review's findings, read from the freshly-persisted
+                        // row — used by both the normal loop-back and the
+                        // quality-escalation loop-back below.
+                        let read_findings = || -> AppResult<Option<String>> {
+                            let fresh_stages = self.db.lock().list_run_stages(run_id)?;
+                            Ok(fresh_stages
+                                .iter()
+                                .find(|s| s.id == stage.id)
+                                .and_then(|s| s.artifact.as_deref())
+                                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string)))
+                        };
                         match verdict {
                             Some(ReviewVerdict::Pass) => {
                                 // Fall through to checkpoint/continue below.
                             }
                             Some(ReviewVerdict::ChangesRequested) if remaining => {
-                                // Re-read the freshly-persisted stage to get the artifact.
-                                let fresh_stages = self.db.lock().list_run_stages(run_id)?;
-                                let fresh = fresh_stages.iter().find(|s| s.id == stage.id);
-                                let findings = fresh
-                                    .and_then(|s| s.artifact.as_deref())
-                                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string));
+                                let findings = read_findings()?;
                                 self.loop_back(run_id, &stage, findings.as_deref())?;
                                 self.emit_run_update(run_id);
                                 continue;
                             }
-                            _ => {
-                                // ChangesRequested at cap, or unparseable verdict → gate.
+                            Some(ReviewVerdict::ChangesRequested) => {
+                                // Loop cap reached on quality grounds. Before
+                                // surrendering to a human gate, try the loop
+                                // target's escalation policy: this is exactly
+                                // the case escalation exists for (the cheap
+                                // tier couldn't satisfy the reviewer), yet it
+                                // historically only fired on hard failures.
+                                if self.try_escalate_loop_target(run_id, &stage)? {
+                                    let findings = read_findings()?;
+                                    self.loop_back(run_id, &stage, findings.as_deref())?;
+                                    self.emit_run_update(run_id);
+                                    continue;
+                                }
+                                self.journal_notice(run_id, &stage.id, &format!(
+                                    "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
+                                    stage.loop_iterations, stage.loop_max_iterations
+                                ));
+                                self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+                                self.db.lock().set_run_status(run_id, "paused", false)?;
+                                self.emit_checkpoint(run_id, &stage.id, "decision");
+                                return Ok(RunStatus::Paused);
+                            }
+                            None => {
+                                // Unparseable verdict → gate. Say WHY in the
+                                // journal — a silent downgrade from autonomous
+                                // to gated reads as a hang to the director.
+                                self.journal_notice(run_id, &stage.id,
+                                    "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision");
                                 self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
                                 self.db.lock().set_run_status(run_id, "paused", false)?;
                                 self.emit_checkpoint(run_id, &stage.id, "decision");
@@ -1442,6 +1758,14 @@ impl Orchestrator {
                             .ok();
                             let feedback = format_blocker_feedback(ask.as_ref(), &answers);
                             self.archive_and_reset_stage(run_id, s, None, Some(&feedback))?;
+                            // A blocked CLI stage with a session resumes it —
+                            // the answers reach the SAME conversation via the
+                            // resume nudge (the CLI counterpart of the API's
+                            // transcript continuation).
+                            let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                            if can_resume {
+                                self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                            }
                             self.recompute_run_cost(run_id)?;
                         }
                     }
@@ -1723,10 +2047,12 @@ impl Orchestrator {
             self.archive_and_reset_stage(run_id, s, None, None)?;
             // `reset_run_stage` deliberately preserves session/resume/loop
             // state (loop-back relies on that) — a re-run wants the opposite:
-            // never resume the old CLI session, and start the loop fresh.
+            // never resume the old CLI session, start the loop fresh, and
+            // never continue a stale ask_director conversation.
             self.db.lock().set_stage_session(&s.id, None)?;
             self.db.lock().set_stage_resume_pending(&s.id, false)?;
             self.db.lock().set_stage_loop_iterations(&s.id, 0)?;
+            self.db.lock().set_stage_blocked_transcript(&s.id, None)?;
         }
         // The target is back to pending + un-started, so the no-guard applier
         // is safe here; the re-driven stage builds its StageSpec from this row

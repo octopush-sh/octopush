@@ -576,7 +576,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None, blocked_questions: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
@@ -607,7 +607,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
@@ -2682,14 +2682,17 @@ mod agentic_loop_tests {
             &client,
             "test-model",
             "you are a test",
-            "do something",
+            crate::orchestrator::agentic::user_messages("do something"),
             tmp.path(),
             25,
-            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &emitter,
             None,
             None,
             None,
+            false,
+            None,
+            &[],
         )
         .await
         .unwrap();
@@ -2727,6 +2730,24 @@ mod runner_helpers_tests {
     use crate::orchestrator::runner::user_input_for;
     use crate::orchestrator::types::{ArtifactKind, InputSection, StageInput};
 
+    #[test]
+    fn repo_conventions_section_reads_and_dedupes() {
+        use crate::orchestrator::runner::repo_conventions_section;
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing there → empty.
+        assert_eq!(repo_conventions_section(dir.path()), "");
+        // CLAUDE.md + a mirrored AGENTS.md → included ONCE.
+        std::fs::write(dir.path().join("CLAUDE.md"), "Use tabs.\n").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Use tabs.\n").unwrap();
+        let s = repo_conventions_section(dir.path());
+        assert_eq!(s.matches("Use tabs.").count(), 1, "mirrored files dedupe: {s}");
+        assert!(s.contains("from CLAUDE.md"));
+        // A distinct AGENTS.md adds its own section.
+        std::fs::write(dir.path().join("AGENTS.md"), "Never use tabs.\n").unwrap();
+        let s = repo_conventions_section(dir.path());
+        assert!(s.contains("from CLAUDE.md") && s.contains("from AGENTS.md"), "{s}");
+    }
+
     /// Dossier with one Plan section, for the single-section tests.
     fn plan_input(text: &str) -> StageInput {
         StageInput {
@@ -2737,9 +2758,11 @@ mod runner_helpers_tests {
                 position: 0,
                 text: text.into(),
                 refs_worktree: false,
+                full_detail: true,
             }],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         }
     }
 
@@ -2816,13 +2839,18 @@ mod runner_helpers_tests {
         use crate::orchestrator::types::LoopMode;
         let roles = builtin_roles();
         let cr = roles.iter().find(|r| r.key == "code_review").unwrap();
-        let auto = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None, true);
-        assert!(auto.contains("VERDICT:"));
+        // API substrate: the structured tool channel, not the text sentinel.
+        let auto_api = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None, true);
+        assert!(auto_api.contains("submit_verdict"), "{auto_api}");
+        assert!(!auto_api.contains("VERDICT:"), "API auto prompt drops the sentinel: {auto_api}");
+        // CLI substrate: no submit_verdict tool exists — the sentinel remains.
+        let auto_cli = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Auto), None, false);
+        assert!(auto_cli.contains("VERDICT:"), "{auto_cli}");
         let gated = compose_system_prompt(&cr.prompt_body, cr.environment, Some(LoopMode::Gated), None, true);
-        assert!(!gated.contains("VERDICT:"));
+        assert!(!gated.contains("VERDICT:") && !gated.contains("submit_verdict"));
         let impl_r = roles.iter().find(|r| r.key == "implement").unwrap();
         let plain = compose_system_prompt(&impl_r.prompt_body, impl_r.environment, None, None, true);
-        assert!(!plain.contains("VERDICT:"));
+        assert!(!plain.contains("VERDICT:") && !plain.contains("submit_verdict"));
     }
 
     #[test]
@@ -2861,6 +2889,7 @@ mod runner_helpers_tests {
                     position: 0,
                     text: "Refined plan: add the toggle to Settings".into(),
                     refs_worktree: false,
+                full_detail: true,
                 },
                 InputSection {
                     kind: ArtifactKind::Review,
@@ -2868,10 +2897,12 @@ mod runner_helpers_tests {
                     position: 1,
                     text: "Looks solid. VERDICT: PASS".into(),
                     refs_worktree: false,
+                full_detail: true,
                 },
             ],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -3018,9 +3049,11 @@ mod runner_helpers_tests {
                 position: 0,
                 text: "   ".into(),
                 refs_worktree: false,
+                full_detail: true,
             }],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -3972,6 +4005,7 @@ mod orchestrator_tests {
                             recommended_default: "Postgres".into(),
                         }],
                     }),
+                    blocked_transcript: None,
                 });
             }
             Ok(StageOutcome {
@@ -3983,6 +4017,7 @@ mod orchestrator_tests {
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None, session_id: None, blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4013,6 +4048,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4047,6 +4083,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4070,6 +4107,7 @@ mod orchestrator_tests {
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
                 status: StageStatus::Failed,
                 tool_calls: vec![], error: Some("boom".into()), verdict: None, session_id: None, blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4111,6 +4149,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4636,6 +4675,118 @@ mod orchestrator_tests {
         assert!(artifact.contains("Director: Postgres"), "the default became the decision: {artifact}");
     }
 
+    /// Blocks once WITH a saved transcript; the second run records whether the
+    /// orchestrator handed the transcript back (the D18 continuation contract).
+    struct BlockWithTranscriptRunner {
+        asked: std::sync::atomic::AtomicBool,
+        seen_transcript: Arc<Mutex<Option<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for BlockWithTranscriptRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first = !self.asked.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                let transcript = crate::orchestrator::agentic::BlockedTranscript {
+                    messages: crate::orchestrator::agentic::user_messages("the exploration so far"),
+                    ask_tool_use_id: "ask-1".into(),
+                };
+                return Ok(StageOutcome {
+                    artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+                    input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    status: StageStatus::AwaitingCheckpoint,
+                    tool_calls: vec![], error: None, verdict: None, session_id: None,
+                    blocked: Some(BlockedAsk {
+                        summary: "which datastore?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "Postgres or SQLite?".into(),
+                            why_blocked: String::new(),
+                            recommended_default: "Postgres".into(),
+                        }],
+                    }),
+                    blocked_transcript: Some(serde_json::to_string(&transcript).unwrap()),
+                });
+            }
+            *self.seen_transcript.lock() = stage.blocked_transcript.clone();
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "resolved".into(), payload: None, refs_worktree: false },
+                input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                status: StageStatus::Done,
+                tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_block_hands_the_transcript_to_the_rerun_then_clears_it() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(None));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(BlockWithTranscriptRunner { asked: Default::default(), seen_transcript: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+        // Parked: the transcript is persisted on the row.
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].blocked_transcript.is_some(), "transcript persisted while parked");
+
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()] })
+            .await
+            .unwrap();
+        // The re-run received the transcript through its StageSpec…
+        let got = seen.lock().clone().expect("re-run saw the transcript");
+        let parsed: crate::orchestrator::agentic::BlockedTranscript = serde_json::from_str(&got).unwrap();
+        assert_eq!(parsed.ask_tool_use_id, "ask-1");
+        // …and the row is clean afterwards (consume-once).
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].blocked_transcript.is_none(), "transcript cleared after the re-run");
+        assert_eq!(stages[0].status, "done");
+    }
+
+    #[test]
+    fn resume_messages_answer_the_ask_and_void_sibling_tools() {
+        use crate::orchestrator::agentic::{resume_messages_for_answered_block, BlockedTranscript};
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolUse};
+        let transcript = BlockedTranscript {
+            messages: vec![
+                LlmMessage { role: LlmRole::User, content: LlmContent::Text("task".into()) },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: LlmContent::AssistantWithTools {
+                        raw: vec![],
+                        text: "I need to ask".into(),
+                        tool_uses: vec![
+                            LlmToolUse { id: "ask-9".into(), name: "ask_director".into(), input: serde_json::json!({}) },
+                            LlmToolUse { id: "read-1".into(), name: "read_file".into(), input: serde_json::json!({"path":"a"}) },
+                        ],
+                    },
+                },
+            ],
+            ask_tool_use_id: "ask-9".into(),
+        };
+        let msgs = resume_messages_for_answered_block(&transcript, "Director: SQLite");
+        assert_eq!(msgs.len(), 3);
+        let LlmContent::ToolResults(results) = &msgs.last().unwrap().content else {
+            panic!("last message must be tool results");
+        };
+        assert_eq!(results.len(), 2, "EVERY tool_use gets a result (API contract)");
+        let ask = results.iter().find(|r| r.tool_use_id == "ask-9").unwrap();
+        assert!(!ask.is_error);
+        assert!(ask.content.contains("SQLite"));
+        let sibling = results.iter().find(|r| r.tool_use_id == "read-1").unwrap();
+        assert!(sibling.is_error, "sibling tools are voided, not silently dropped");
+    }
+
     #[test]
     fn blocked_ask_serde_round_trips_camel_case() {
         let ask = BlockedAsk {
@@ -4936,6 +5087,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -4976,10 +5128,12 @@ mod orchestrator_tests {
         assert!(input.sections[1].text.contains("plan_review output"));
     }
 
-    /// Two producers of the same kind: the fresher one supersedes (refine's
-    /// refined plan replaces the original plan in the dossier — never both).
+    /// Two producers of the same kind: BOTH survive into the dossier — the
+    /// fresher at full detail, the older compact. (The old latest-per-kind
+    /// eviction silently erased a code review when a security review followed
+    /// it, and dropped whole branches at a join.)
     #[tokio::test]
-    async fn fresher_artifact_of_same_kind_supersedes_older() {
+    async fn same_kind_sections_all_survive_with_the_freshest_at_full_detail() {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P2", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -5002,9 +5156,44 @@ mod orchestrator_tests {
             .iter()
             .filter(|s| s.kind == ArtifactKind::Plan)
             .collect();
-        assert_eq!(plans.len(), 1, "exactly one Plan section");
-        assert_eq!(plans[0].role, "refine", "the refined plan supersedes the original");
-        assert!(plans[0].text.contains("refine output"));
+        assert_eq!(plans.len(), 2, "both Plan sections survive");
+        let original = plans.iter().find(|s| s.role == "plan").unwrap();
+        let refined = plans.iter().find(|s| s.role == "refine").unwrap();
+        assert!(refined.full_detail, "the freshest of the kind is the primary input");
+        assert!(!original.full_detail, "the older one is compact context");
+        // The rendered prompt labels the compact one as earlier context.
+        let prompt = crate::orchestrator::runner::user_input_for("implement", "task", input, None);
+        assert!(prompt.contains("earlier context"), "{prompt}");
+    }
+
+    /// The A2 headline case: two DIFFERENT review stages (code review, then
+    /// security review) both reach the downstream fix stage — the older one
+    /// used to be silently evicted by latest-per-kind.
+    #[tokio::test]
+    async fn two_reviews_both_reach_the_downstream_stage() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P4", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "security_review", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 3, "fix", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "task", None, None, &[]).unwrap();
+        let seen = Arc::new(Mutex::new(vec![]));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(RecordingRunner { seen: Arc::clone(&seen) }),
+        );
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock();
+        let (role, input) = &seen[3];
+        assert_eq!(role, "fix");
+        let reviews: Vec<_> = input.sections.iter().filter(|s| s.kind == ArtifactKind::Review).collect();
+        assert_eq!(reviews.len(), 2, "both reviews reach the fix stage: {:?}",
+            input.sections.iter().map(|s| (&s.role, &s.kind)).collect::<Vec<_>>());
+        assert!(reviews.iter().any(|s| s.role == "code_review" && !s.full_detail));
+        assert!(reviews.iter().any(|s| s.role == "security_review" && s.full_detail));
     }
 
     /// Startup recovery: a stage orphaned in `running` by a dead process must
@@ -5979,6 +6168,86 @@ mod orchestrator_tests {
         assert!(spent_after + 1e-9 >= spent_before);
     }
 
+    /// Records every (position, StageInput) the orchestrator hands a runner,
+    /// then completes the stage. For loop-memory assertions.
+    struct InputRecordingRunner {
+        seen: Arc<Mutex<Vec<(i64, StageInput)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for InputRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push((stage.position, input.clone()));
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_usd: 0.01,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: None,
+                session_id: None,
+                blocked: None,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_back_feeds_every_stage_in_the_window_and_carries_history() {
+        // implement(0) → test(1) → code_review(2, gated loop → 0, cap 2).
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Window", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "test", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(vec![]));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(InputRecordingRunner { seen: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        // Send the work back: the review's findings must land as feedback on
+        // EVERY stage in the reset window (D15), not just the loop target —
+        // the review artifact itself is nulled by the reset, so an
+        // intermediate stage would otherwise re-run blind.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None })
+            .await
+            .unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].feedback.as_deref(), Some("did code_review"), "target gets findings");
+        assert_eq!(stages[1].feedback.as_deref(), Some("did code_review"), "intermediate stage gets findings too");
+
+        // Loop memory (A3): the SECOND run of the target carries a history
+        // digest of its archived first attempt.
+        let inputs = seen.lock();
+        let second_impl = inputs
+            .iter()
+            .filter(|(p, _)| *p == 0)
+            .nth(1)
+            .expect("the loop re-ran the target");
+        let hist = second_impl.1.history.as_deref().expect("re-run carries attempt history");
+        assert!(hist.contains("Attempt 1"), "{hist}");
+        // The reviewer's own re-run knows its previous verdict as well.
+        let second_review = inputs.iter().filter(|(p, _)| *p == 2).nth(1)
+            .expect("the review re-ran");
+        assert!(second_review.1.history.is_some(), "reviewer carries its own attempt history");
+    }
+
     #[tokio::test]
     async fn send_back_at_cap_does_not_loop() {
         let (orch, run_id, db) = looped_run(1);
@@ -6213,6 +6482,7 @@ mod orchestrator_tests {
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6246,6 +6516,68 @@ mod orchestrator_tests {
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(stages[1].status, "awaiting_checkpoint");
         assert_eq!(stages[1].loop_iterations, 2); // looped exactly `max_iter` times
+    }
+
+    #[tokio::test]
+    async fn auto_loop_at_cap_escalates_the_target_once_before_gating() {
+        // D17: the review keeps requesting changes and the loop cap is hit —
+        // but the target carries an unused escalation policy. Instead of
+        // surrendering to a human gate, the target escalates and gets ONE
+        // more loop-back; only after that does the run gate.
+        let (db, ws) = db_with_workspace();
+        let mk = |role: &str| crate::db::StageDraft {
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        };
+        let mut impl_d = mk("implement");
+        impl_d.escalate_model = Some("strong-model".into());
+        let mut rev_d = mk("code_review");
+        rev_d.loop_target_position = Some(0);
+        rev_d.loop_max_iterations = 1;
+        rev_d.loop_mode = Some("auto".into());
+        let pid = db.lock().save_pipeline(None, "AutoEsc", "d", &[impl_d, rev_d]).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(VerdictRunner { verdict: "CHANGES_REQUESTED" }));
+
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(stages[0].escalated, "the loop target escalated at the cap");
+        // One normal loop + one escalated loop, then the gate.
+        assert_eq!(stages[1].loop_iterations, 2);
+        assert_eq!(stages[1].status, "awaiting_checkpoint");
+    }
+
+    #[tokio::test]
+    async fn outer_loop_back_resets_inner_loop_counters() {
+        // D16: implement(0) → verify(1, gated loop→0) → code_review(2, gated
+        // loop→0). After verify has consumed a loop iteration, a send-back
+        // from code_review (whose window covers verify) must hand verify a
+        // FRESH loop budget — not a pre-exhausted counter.
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Nested", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "verify", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+
+        orch.run_to_pause(&run_id).await.unwrap(); // parked at verify's gate
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        // parked at verify again after the inner loop; consume one iteration.
+        assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[1].loop_iterations, 1);
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        // now parked at code_review's gate — send the whole window back.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None }).await.unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[1].loop_iterations, 0, "inner loop budget refreshed by the outer loop-back");
+        assert_eq!(stages[2].loop_iterations, 1, "the outer review's own counter advanced");
     }
 
     #[tokio::test]
@@ -6321,6 +6653,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6468,6 +6801,7 @@ mod orchestrator_tests {
                 verdict: None,
                 session_id: None,
                 blocked: None,
+                blocked_transcript: None,
             })
         }
     }
@@ -6980,8 +7314,22 @@ mod cli_args_tests {
     use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume};
 
     #[test]
+    fn read_only_review_stages_disallow_write_tools() {
+        // B9: a worktree review stage must not be able to edit files — the API
+        // substrate enforces this via its allowlist; the CLI does it with
+        // --disallowedTools. Non-review stages carry no denial.
+        let ro = build_cli_args("m", "sys", 10, true);
+        let i = ro.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+        assert!(ro[i + 1].contains("Write") && ro[i + 1].contains("Edit"), "{ro:?}");
+        let rw = build_cli_args("m", "sys", 10, false);
+        assert!(!rw.contains(&"--disallowedTools".to_string()));
+        let ro_resume = build_cli_args_resume("m", "sess", 10, true);
+        assert!(ro_resume.contains(&"--disallowedTools".to_string()));
+    }
+
+    #[test]
     fn args_include_model_format_and_permission() {
-        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40);
+        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40, false);
         assert!(args.contains(&"-p".to_string()));
         let i = args.iter().position(|a| a == "--output-format").unwrap();
         assert_eq!(args[i + 1], "stream-json");
@@ -7000,9 +7348,40 @@ mod cli_args_tests {
 
     #[test]
     fn build_cli_args_resume_uses_resume_flag() {
-        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50);
+        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50, false);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
         assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
+    }
+}
+
+#[cfg(test)]
+mod cli_question_tests {
+    use crate::orchestrator::cli_runner::detect_trailing_question;
+
+    #[test]
+    fn person_addressed_trailing_question_becomes_a_block() {
+        let ask = detect_trailing_question(
+            "I explored the schema options.\n\nShould I use Postgres or SQLite for this?",
+        )
+        .expect("a person-addressed trailing question is detected");
+        assert!(ask.questions[0].question.contains("Postgres or SQLite"));
+
+        // Marker on the second-to-last line still counts.
+        assert!(detect_trailing_question(
+            "Two options exist. Do you want me to proceed with option A,\nor with option B instead?"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn ordinary_results_and_rhetorical_questions_pass_through() {
+        // Real work summaries don't convert.
+        assert!(detect_trailing_question("Implemented the feature.\nAll tests pass.").is_none());
+        // A trailing '?' without a person-addressed marker is rhetorical.
+        assert!(detect_trailing_question("Fixed the bug. What a strange edge case that was?").is_none());
+        // A marker WITHOUT a trailing '?' doesn't convert either.
+        assert!(detect_trailing_question("Let me know if anything breaks. Done.").is_none());
+        assert!(detect_trailing_question("").is_none());
     }
 }
 
@@ -7241,6 +7620,24 @@ mod g4_staging_tests {
     }
 
     #[test]
+    fn head_sha_and_range_diff_expose_mid_run_commits() {
+        // F22: a stage that commits mid-pipeline moves HEAD; head_sha detects
+        // it and range_diff_text recovers the committed work for the run diff.
+        let dir = tempdir().unwrap();
+        init_with_commit(dir.path());
+        let before = crate::git_ops::head_sha(dir.path()).expect("repo has a HEAD");
+        std::fs::write(dir.path().join("rogue.txt"), "committed by a stage\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "rogue commit"]);
+        let after = crate::git_ops::head_sha(dir.path()).unwrap();
+        assert_ne!(before, after, "a mid-stage commit moves HEAD");
+        let diff = crate::git_ops::range_diff_text(dir.path(), &before, &after).unwrap();
+        assert!(diff.contains("rogue.txt"), "committed work is recoverable: {diff}");
+        // Identical endpoints → empty diff (the no-commit fast path).
+        assert!(crate::git_ops::range_diff_text(dir.path(), &after, &after).unwrap().trim().is_empty());
+    }
+
+    #[test]
     fn friendly_git_error_maps_known_failures() {
         assert!(friendly_git_error("error: patch does not apply").contains("no longer matches"));
         assert!(friendly_git_error("error: while searching for:\n...").contains("no longer matches"));
@@ -7335,8 +7732,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert_eq!(out.text, "looks good"); // final answer is the artifact, not a live entry
         assert!(out.finished, "a final answer marks the result finished");
@@ -7350,35 +7747,66 @@ mod live_tests {
     }
 
     #[tokio::test]
-    async fn agentic_loop_exhaustion_is_not_finished() {
+    async fn agentic_loop_exhaustion_forces_a_toolless_close() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
 
-        // Every turn asks for another tool — the loop never reaches a final answer.
+        // Two tool turns exhaust the cap; the forced close (no tools) then
+        // produces a real final answer instead of throwing the work away.
         let tool_turn = || resp("still digging",
             vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
                   input: serde_json::json!({"path": "a.rs"}) }],
             LlmStopReason::ToolUse);
-        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![tool_turn(), tool_turn()])) };
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            tool_turn(), tool_turn(),
+            resp("what I got done: X; still missing: Y", vec![], LlmStopReason::EndTurn),
+        ])) };
 
         let rec = Recorder { events: Mutex::new(vec![]) };
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 2,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
-        assert!(!out.finished, "iteration exhaustion must not read as success");
-        assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
-        // Usage from the burned iterations is preserved for cost accounting.
-        assert_eq!(out.input_tokens, 2);
-        assert_eq!(out.output_tokens, 2);
+        assert!(out.finished, "a successful forced close is a finished stage");
+        assert!(out.closed_at_cap, "…but flagged as closed at the cap");
+        assert_eq!(out.text, "what I got done: X; still missing: Y");
+        // Usage from ALL calls (including the close) is preserved.
+        assert_eq!(out.input_tokens, 3);
         assert_eq!(out.tool_calls.len(), 2);
-        // F1: the journal must END with a notice explaining why the stage stopped.
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_exhaustion_without_a_usable_close_is_not_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let tool_turn = || resp("still digging",
+            vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                  input: serde_json::json!({"path": "a.rs"}) }],
+            LlmStopReason::ToolUse);
+        // The forced close returns empty text → the stage stays unfinished.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            tool_turn(), tool_turn(),
+            resp("", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 2,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
+
+        assert!(!out.finished, "an empty forced close must not read as success");
+        assert!(!out.closed_at_cap);
+        assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
+        // The journal explains the cap (notice emitted before the close attempt).
         let events = rec.events.lock();
-        let last = &events.last().expect("exhaustion must emit entries").1["entry"];
-        assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
-        assert_eq!(last["text"], "iteration cap reached — 2 of 2 tool turns used");
+        let notices: Vec<String> = events.iter()
+            .filter(|(_, p)| p["entry"]["kind"] == "notice")
+            .map(|(_, p)| p["entry"]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(notices.iter().any(|n| n.contains("iteration cap reached")), "{notices:?}");
     }
 
     #[tokio::test]
@@ -7390,9 +7818,9 @@ mod live_tests {
         let rec = Recorder { events: Mutex::new(vec![]) };
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
-        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10, &cancel, &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10, &cancel, &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(!out.finished, "a director stop must not read as success");
         assert_eq!(out.text, "(stopped by the director)");
@@ -7403,6 +7831,186 @@ mod live_tests {
         let last = &events.last().expect("cancel must close the journal").1["entry"];
         assert_eq!(last["kind"], "notice", "last journal entry is a notice: {last}");
         assert_eq!(last["text"], "stopped by the director");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_submit_verdict_finishes_with_structured_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        // One turn calls submit_verdict — the loop ends with the verdict and
+        // the findings as the artifact text (a second turn would panic).
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("narration",
+                 vec![LlmToolUse { id: "v".into(), name: "submit_verdict".into(),
+                     input: json!({"verdict": "changes_requested", "findings": "BLOCKING: null deref in foo()"}) }],
+                 LlmStopReason::ToolUse),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None, &[]).await.unwrap();
+        assert!(out.finished, "a structured verdict is a finished stage");
+        assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::ChangesRequested));
+        assert_eq!(out.text, "BLOCKING: null deref in foo()", "the findings are the artifact");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_malformed_verdict_feeds_back_an_error_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: bad verdict token → error result → the model retries.
+        // Turn 2: valid verdict → finished.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("",
+                 vec![LlmToolUse { id: "v1".into(), name: "submit_verdict".into(),
+                     input: json!({"verdict": "approved", "findings": "fine"}) }],
+                 LlmStopReason::ToolUse),
+            resp("",
+                 vec![LlmToolUse { id: "v2".into(), name: "submit_verdict".into(),
+                     input: json!({"verdict": "PASS", "findings": "fine"}) }],
+                 LlmStopReason::ToolUse),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("review it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None, &[]).await.unwrap();
+        assert!(out.finished);
+        assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::Pass),
+            "case-tolerant retry lands the verdict");
+    }
+
+    #[test]
+    fn compact_history_shrinks_old_tool_results_not_the_tail() {
+        use crate::orchestrator::agentic::compact_history_for_tests as compact;
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
+        let big = "x".repeat(20_000);
+        let mk_results = |id: &str| LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult {
+                tool_use_id: id.into(),
+                content: big.clone(),
+                is_error: false,
+            }]),
+        };
+        let mut messages = vec![
+            mk_results("old1"),
+            mk_results("old2"),
+            mk_results("t1"),
+            mk_results("t2"),
+            mk_results("t3"),
+            mk_results("t4"),
+        ];
+        // Budget forces compaction of the two oldest; the 4-message tail is
+        // protected even though shrinking it would fit the budget better.
+        let n = compact(&mut messages, 0, 90_000);
+        assert!(n >= 1, "compacted something");
+        let text_of = |m: &LlmMessage| match &m.content {
+            LlmContent::ToolResults(rs) => rs[0].content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(text_of(&messages[0]).contains("compacted"), "oldest shrank");
+        for m in &messages[2..] {
+            assert!(!text_of(m).contains("compacted"), "the tail is untouched");
+        }
+        // Already under budget → untouched.
+        let mut small = vec![mk_results("a")];
+        assert_eq!(compact(&mut small, 0, 1_000_000), 0);
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_ask_stage_unknown_step_errors_and_continues() {
+        use crate::orchestrator::agentic::PeerStage;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 asks a NON-EXISTENT step → error tool result, loop continues;
+        // turn 2 finishes normally.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("consulting",
+                 vec![LlmToolUse { id: "q".into(), name: "ask_stage".into(),
+                     input: json!({"step": 9, "question": "why?"}) }],
+                 LlmStopReason::ToolUse),
+            resp("done anyway", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let peers = vec![PeerStage {
+            position: 0,
+            role: "plan".into(),
+            model: "m".into(),
+            artifact_text: "the plan".into(),
+            journal_digest: String::new(),
+        }];
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
+                                   None, &peers).await.unwrap();
+        assert!(out.finished);
+        assert_eq!(out.text, "done anyway");
+        // The failed consultation is in the tool log with a usable error.
+        let ask = out.tool_calls.iter().find(|t| t.name == "ask_stage").unwrap();
+        assert!(ask.result.contains("available steps: 1"), "{}", ask.result);
+        assert_eq!(out.peer_cost_usd, 0.0, "a failed consult costs nothing");
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_budget_stop_closes_instead_of_spending_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        // Turn 1 wants a tool, but its own usage already crosses the (tiny)
+        // spend limit → the tool is NOT executed and the forced close (turn 2)
+        // produces the artifact.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("digging",
+                 vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                       input: serde_json::json!({"path": "a.rs"}) }],
+                 LlmStopReason::ToolUse),
+            resp("stopping here: summary of partial work", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-4-5",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
+                                   Some(1e-9), &[]).await.unwrap();
+        assert!(out.finished, "budget stop closes with a real answer");
+        assert!(out.closed_at_cap);
+        assert_eq!(out.text, "stopping here: summary of partial work");
+        assert_eq!(out.tool_calls.len(), 0, "the over-budget turn's tools never ran");
+        let notices: Vec<String> = rec.events.lock().iter()
+            .filter(|(_, p)| p["entry"]["kind"] == "notice")
+            .map(|(_, p)| p["entry"]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(notices.iter().any(|n| n.contains("run budget reached mid-stage")), "{notices:?}");
+    }
+
+    #[test]
+    fn cli_usage_from_stream_events_dedupes_by_message_id() {
+        use crate::orchestrator::cli_runner::usage_from_stream_event;
+        // The CLI emits one assistant event PER CONTENT BLOCK, each repeating
+        // the same message's usage — keying by id must collapse them to one.
+        let mk = |id: &str, input: u64| serde_json::json!({
+            "type": "assistant",
+            "message": { "id": id, "usage": { "input_tokens": input, "output_tokens": 7,
+                                     "cache_read_input_tokens": 50, "cache_creation_input_tokens": 3 } }
+        });
+        let (id1, u1) = usage_from_stream_event(&mk("msg_1", 100)).unwrap();
+        assert_eq!(id1.as_deref(), Some("msg_1"));
+        assert_eq!(u1.input_tokens, 100);
+        assert_eq!(u1.output_tokens, 7);
+        // Two blocks of the same message: latest-per-id keeps ONE entry.
+        let mut map = std::collections::HashMap::new();
+        for ev in [mk("msg_1", 100), mk("msg_1", 100), mk("msg_2", 40)] {
+            let (id, u) = usage_from_stream_event(&ev).unwrap();
+            map.insert(id.unwrap(), u);
+        }
+        let total: u64 = map.values().map(|u| u.input_tokens).sum();
+        assert_eq!(total, 140, "duplicate blocks of one message count once");
+        // Non-assistant events report nothing.
+        let other = serde_json::json!({ "type": "user", "message": { "usage": { "input_tokens": 9 } } });
+        assert!(usage_from_stream_event(&other).is_none());
     }
 
     #[tokio::test]
@@ -7429,8 +8037,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         assert!(!out.finished, "a block is not a finished answer");
         let ask = out.blocked.expect("ask_director must populate blocked");
@@ -7464,8 +8072,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         let ask = out.blocked.expect("malformed input still yields a block");
         assert_eq!(ask.summary, "need a decision");
@@ -7493,8 +8101,8 @@ mod live_tests {
         let em = LiveEmitter::new(&rec, "r", "s");
         let client = reqwest::Client::new();
         let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
-                                   "sys", "do it", dir.path(), 10,
-                                   &std::sync::atomic::AtomicBool::new(false), &em, None, None, None).await.unwrap();
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[]).await.unwrap();
 
         let ask = out.blocked.expect("block");
         assert_eq!(ask.questions.len(), 3, "all three questions must survive, none lost");
@@ -8547,7 +9155,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
-            blocked_questions: None,
+            blocked_questions: None, blocked_transcript: None,
         }
     }
 
