@@ -6130,6 +6130,199 @@ mod orchestrator_tests {
         (orch, run_id, db)
     }
 
+    /// StageDraft helper for authored-graph (C10) tests.
+    fn draft_with(
+        role: &str,
+        parents: Vec<i64>,
+        tools: Option<Vec<String>>,
+        checkpoint: bool,
+    ) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents, tools,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+    fn ro_tools() -> Option<Vec<String>> {
+        Some(vec!["read_file".into(), "list_files".into()])
+    }
+
+    /// Runner for concurrency assertions: counts stages currently in flight
+    /// (and the max ever seen); read-only "critique" stages BLOCK until the
+    /// expected number are in flight together — a serial scheduler times out.
+    struct ConcurrencyRunner {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// CUMULATIVE entries — the rendezvous waits on this, not on
+        /// `in_flight` (a sibling can enter and finish between the waiter's
+        /// polls on a single-threaded runtime).
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: Arc<std::sync::atomic::AtomicUsize>,
+        /// Roles that must rendezvous (wait until `expected` have entered).
+        rendezvous_role: &'static str,
+        expected: usize,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for ConcurrencyRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(now, Ordering::SeqCst);
+            if stage.role == self.rendezvous_role {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                // Rendezvous: both branches must have STARTED while this one
+                // is still in flight — impossible under a serial scheduler.
+                let mut waited = 0;
+                while self.entered.load(Ordering::SeqCst) < self.expected && waited < 600 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    waited += 1;
+                }
+                assert!(waited < 600, "rendezvous timed out — branches did not run concurrently");
+            } else {
+                // Give siblings a chance to overlap if the scheduler lets them.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(StageOutcome {
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.01,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn authored_read_only_branches_run_concurrently() {
+        // C10 Phase 1: plan(0, writer) → two READ-ONLY critique branches that
+        // both depend only on the plan. They must execute in the SAME batch,
+        // concurrently — the rendezvous inside the runner fails on a serial
+        // scheduler.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("critique", vec![0], ro_tools(), false),
+            draft_with("critique", vec![0], ro_tools(), false),
+        ];
+        let pid = db.lock().save_pipeline(None, "Parallel RO", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink,
+            Box::new(ConcurrencyRunner {
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_seen: Arc::clone(&max_seen),
+                rendezvous_role: "critique",
+                expected: 2,
+            }),
+        );
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the two read-only branches overlapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_writer_branches_never_run_concurrently() {
+        // Write-set gating: two WRITER branches (implement) off one plan must
+        // serialize — the worktree is a shared blackboard. Both still complete.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("implement", vec![0], None, false),
+            draft_with("implement", vec![0], None, false),
+        ];
+        let pid = db.lock().save_pipeline(None, "Parallel W", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink,
+            Box::new(ConcurrencyRunner {
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_seen: Arc::clone(&max_seen),
+                rendezvous_role: "never",
+                expected: 0,
+            }),
+        );
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "writers serialize: at most one in flight"
+        );
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        assert!(rows.iter().all(|s| s.status == "done"), "both writers still completed");
+    }
+
+    #[tokio::test]
+    async fn parked_branch_does_not_prevent_its_batch_sibling_from_running() {
+        // A gated review branch and an independent read-only sibling are ready
+        // together: BOTH run in the batch; the gate then pauses the run with
+        // the sibling's work already done — a park no longer starves an
+        // independent branch that was ready alongside it.
+        let (db, ws) = db_with_workspace();
+        let stages = vec![
+            draft_with("plan", vec![], None, false),
+            draft_with("plan_review", vec![0], ro_tools(), true), // gated review branch
+            draft_with("critique", vec![0], ro_tools(), false),   // independent sibling
+        ];
+        let pid = db.lock().save_pipeline(None, "Park+Sibling", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(rows[1].status, "awaiting_checkpoint", "the gated branch parked");
+        assert_eq!(rows[2].status, "done", "the independent sibling ran in the same batch");
+        // Resolving the gate completes the run.
+        let status = orch.resolve_checkpoint(&run_id, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn same_batch_sibling_reviews_merge_their_loop_feedback() {
+        // Two auto-loop reviews off one implement, ready in one batch, both
+        // requesting changes: the FIRST loop-back resets the window; the
+        // SECOND must MERGE its findings into the target's feedback instead
+        // of re-resetting (which would overwrite the first review's findings).
+        let (db, ws) = db_with_workspace();
+        let mut rev_a = draft_with("code_review", vec![0], ro_tools(), false);
+        rev_a.loop_target_position = Some(0);
+        rev_a.loop_max_iterations = 1;
+        rev_a.loop_mode = Some("auto".into());
+        let mut rev_b = draft_with("verify", vec![0], ro_tools(), false);
+        rev_b.loop_target_position = Some(0);
+        rev_b.loop_max_iterations = 1;
+        rev_b.loop_mode = Some("auto".into());
+        let stages = vec![draft_with("implement", vec![], None, false), rev_a, rev_b];
+        let pid = db.lock().save_pipeline(None, "TwinReviews", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(VerdictRunner { verdict: "CHANGES_REQUESTED" }));
+
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused, "both reviews eventually gate at their caps");
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        let fb = rows[0].feedback.as_deref().unwrap_or("");
+        assert!(
+            fb.contains("additional findings from the verify stage"),
+            "the second review's findings were merged, not dropped: {fb}"
+        );
+        // Both reviews consumed their loop iteration (the merge still counts).
+        assert_eq!(rows[1].loop_iterations, 1);
+        assert_eq!(rows[2].loop_iterations, 1);
+    }
+
     #[tokio::test]
     async fn gated_loop_review_stage_pauses_for_checkpoint() {
         let (orch, run_id, db) = looped_run(2);
@@ -7351,6 +7544,133 @@ mod cli_args_tests {
         let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50, false);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
         assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
+    }
+}
+
+#[cfg(test)]
+mod cli_dialect_tests {
+    use crate::orchestrator::cli_runner::{
+        build_codex_outcome, codex_fold_event, codex_usage_from_event, dialect_for_model,
+        CliDialect, CodexAccum,
+    };
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
+    use serde_json::json;
+
+    #[test]
+    fn dialect_derives_from_the_model_id() {
+        assert_eq!(dialect_for_model("claude-sonnet-4-6"), CliDialect::Claude);
+        assert_eq!(dialect_for_model("claude-haiku-4-5"), CliDialect::Claude);
+        assert_eq!(dialect_for_model("gpt-5"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("gpt-5-codex"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("o3-mini"), CliDialect::Codex);
+        assert_eq!(dialect_for_model("codex-mini-latest"), CliDialect::Codex);
+        // Unknown/proxy ids keep the historical claude behavior.
+        assert_eq!(dialect_for_model("my-proxy-model"), CliDialect::Claude);
+    }
+
+    #[test]
+    fn codex_argv_maps_read_only_to_its_native_sandbox() {
+        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false);
+        assert_eq!(rw[0], "exec");
+        assert!(rw.contains(&"--json".to_string()));
+        assert!(rw.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(rw.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"), "{rw:?}");
+        assert_eq!(rw.last().map(String::as_str), Some("-"), "prompt rides stdin");
+        // System prompt never appears in argv (codex has no flag for it).
+        assert!(!rw.iter().any(|a| a.contains("system prompt")));
+
+        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true);
+        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+
+        // Codex has no confirmed resume contract → fresh-run fallback.
+        assert!(CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false).is_none());
+        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false).is_some());
+
+        // Stdin payload: claude = user only; codex = system + user joined.
+        assert_eq!(CliDialect::Claude.stdin_payload("SYS", "USER"), "USER");
+        let codex = CliDialect::Codex.stdin_payload("SYS", "USER");
+        assert!(codex.contains("SYS") && codex.contains("USER"));
+    }
+
+    #[test]
+    fn codex_modern_stream_accumulates_message_session_and_error() {
+        let mut a = CodexAccum::default();
+        codex_fold_event(&mut a, &json!({"type":"thread.started","thread_id":"th_1"}));
+        assert_eq!(a.session_id.as_deref(), Some("th_1"));
+
+        // Command execution → tool + tool_result journal entries.
+        let started = codex_fold_event(&mut a, &json!({"type":"item.started",
+            "item":{"item_type":"command_execution","command":"cargo test"}}));
+        assert_eq!(started[0]["kind"], "tool");
+        assert_eq!(started[0]["tool"], "run_command");
+        let done = codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"command_execution","command":"cargo test","exit_code":0,"aggregated_output":"ok"}}));
+        assert_eq!(done[0]["kind"], "tool_result");
+        assert_eq!(done[0]["ok"], true);
+
+        // The LAST assistant message wins as the artifact.
+        codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"assistant_message","text":"first draft"}}));
+        codex_fold_event(&mut a, &json!({"type":"item.completed",
+            "item":{"item_type":"assistant_message","text":"final answer"}}));
+        assert_eq!(a.final_message.as_deref(), Some("final answer"));
+
+        let mut b = CodexAccum::default();
+        let errs = codex_fold_event(&mut b, &json!({"type":"turn.failed","error":{"message":"boom"}}));
+        assert_eq!(b.error.as_deref(), Some("boom"));
+        assert_eq!(errs[0]["kind"], "notice");
+    }
+
+    #[test]
+    fn codex_legacy_stream_shape_still_parses() {
+        let mut a = CodexAccum::default();
+        codex_fold_event(&mut a, &json!({"id":"0","msg":{"type":"session_configured","session_id":"s9"}}));
+        codex_fold_event(&mut a, &json!({"id":"1","msg":{"type":"agent_message","message":"hello"}}));
+        codex_fold_event(&mut a, &json!({"id":"2","msg":{"type":"task_complete","last_agent_message":"done!"}}));
+        assert_eq!(a.session_id.as_deref(), Some("s9"));
+        assert_eq!(a.final_message.as_deref(), Some("done!"));
+    }
+
+    #[test]
+    fn codex_usage_splits_cached_input_and_keys_turns_distinctly() {
+        // Modern per-turn usage: distinct events, cached input split out.
+        let (key, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}})).unwrap();
+        assert!(key.is_none(), "each turn is its own entry");
+        assert_eq!(u.input_tokens, 400, "billable fresh input excludes cached");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.output_tokens, 50);
+        // Non-usage events report nothing.
+        assert!(codex_usage_from_event(&json!({"type":"turn.started"})).is_none());
+    }
+
+    #[test]
+    fn codex_outcome_is_the_last_message_or_an_honest_failure() {
+        let usage = Default::default();
+        // Final message → Done, with the verdict sentinel still parsed.
+        let ok = build_codex_outcome(
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()) },
+            usage, true, ArtifactKind::Review, "gpt-5", "",
+        );
+        assert!(matches!(ok.status, StageStatus::Done));
+        assert_eq!(ok.artifact.text, "findings\nVERDICT: PASS");
+        assert!(ok.verdict.is_some(), "the text verdict sentinel works across dialects");
+        assert_eq!(ok.session_id.as_deref(), Some("th"));
+
+        // turn.failed → Failed, last message preserved as context.
+        let failed = build_codex_outcome(
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None },
+            usage, true, ArtifactKind::Diff, "gpt-5", "",
+        );
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let msg = failed.error.as_deref().unwrap();
+        assert!(msg.contains("rate limited") && msg.contains("partial"), "{msg}");
+
+        // No message at all → honest no-result failure.
+        let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
+        assert!(matches!(empty.status, StageStatus::Failed));
+        assert!(empty.error.as_deref().unwrap().contains("no final message"));
     }
 }
 

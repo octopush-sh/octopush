@@ -166,9 +166,10 @@ pub struct Orchestrator {
     client: reqwest::Client,
     /// Set of run_ids with an in-flight drive (enforces one active drive per run).
     active: Mutex<std::collections::HashSet<String>>,
-    /// Per-run cancel flags for the stage currently in flight. A FRESH flag is
-    /// installed by `run_stage_once` before each stage and removed after it, so
-    /// a stop only ever lands on the stage the director is watching.
+    /// Per-run cancel flags for the batch currently in flight. A FRESH flag
+    /// is installed by the drive loop before each BATCH of concurrent stages
+    /// and removed after it, so a stop lands on everything the run currently
+    /// has in flight — and never on a later batch.
     cancels: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     /// Run ids the director asked to pause. Consumed at the next stage boundary:
     /// the next pending stage is parked (awaiting_checkpoint) exactly like the
@@ -724,6 +725,13 @@ impl Orchestrator {
         &self,
         run: &crate::db::RunRow,
         stage: &RunStageRow,
+        // The BATCH's shared cancel flag, installed by the drive loop —
+        // `stop_current_stage`/`abort_run` raise it to interrupt everything
+        // the run currently has in flight.
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        // This stage's share of the remaining run budget (already divided
+        // across the batch by the drive). `None` ⇒ unmetered.
+        spend_limit: Option<f64>,
     ) -> AppResult<(StageStatus, Option<ReviewVerdict>)> {
         let substrate = match AgentSubstrate::from_db(&stage.substrate) {
             Some(s) => s,
@@ -870,11 +878,6 @@ impl Orchestrator {
             }
         }
 
-        // Install a FRESH cancel flag for this run before the stage starts —
-        // `stop_current_stage`/`abort_run` set it to interrupt in-flight work.
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.cancels.lock().insert(run.id.clone(), Arc::clone(&cancel));
-
         // Build the context and run the agent. ANY hard error here (missing worktree,
         // unresolved provider, unavailable CLI substrate) is converted into a failed
         // stage so the run converges to a clean paused/recoverable state instead of
@@ -914,18 +917,6 @@ impl Orchestrator {
                 reference_text.push_str(extra);
             }
             let skills = crate::skills::referenced_skills(&workspace_path, &reference_text);
-            // Intra-stage budget: the headroom left under the run's own cap
-            // when this stage starts. The between-stage gate already blocked
-            // a start at/over budget, so this is the amount ONE stage may
-            // spend before the loop stops opening new tool turns. A stage
-            // that starts with NO headroom can only be the director's
-            // conscious budget override — that runs unmetered (None), as the
-            // override intends.
-            let spend_limit = run
-                .budget_usd
-                .filter(|b| *b > 0.0)
-                .map(|b| b - run.cost_usd)
-                .filter(|r| *r > 0.0);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -946,9 +937,6 @@ impl Orchestrator {
             }
         }
         .await;
-
-        // The stage is no longer in flight — a stop after this point is a no-op.
-        self.cancels.lock().remove(&run.id);
 
         // Mid-pipeline commit detector: a WORKTREE stage that moved HEAD
         // ignored the never-commit contract. The committed work is still
@@ -1455,36 +1443,68 @@ impl Orchestrator {
                 return Ok(RunStatus::Aborted);
             }
             let stages = self.db.lock().list_run_stages(run_id)?;
-            let next = stages.iter().find(|s| s.status != "done");
-            let Some(stage) = next else {
+            if stages.iter().all(|s| s.status == "done") {
                 self.db.lock().set_run_status(run_id, "completed", true)?;
                 self.emit_run_update(run_id);
                 self.sync_run_history(run_id);
                 return Ok(RunStatus::Completed);
+            }
+
+            // ── The ready set (C10 Phase 1) ─────────────────────────────
+            // Authored graph: every pending stage whose parents are ALL done
+            // is ready — independent branches no longer wait on each other.
+            // Legacy linear run (no recorded parents): strictly serial, the
+            // first non-done stage only — byte-for-byte the old behavior.
+            let authored = stages.iter().any(|s| !s.parents.is_empty());
+            let done_positions: std::collections::HashSet<i64> = stages
+                .iter()
+                .filter(|s| s.status == "done")
+                .map(|s| s.position)
+                .collect();
+            let ready: Vec<crate::db::RunStageRow> = if authored {
+                stages
+                    .iter()
+                    .filter(|s| {
+                        s.status == "pending"
+                            && s.parents.iter().all(|p| done_positions.contains(p))
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                match stages.iter().find(|s| s.status != "done") {
+                    Some(s) if s.status == "pending" => vec![s.clone()],
+                    _ => Vec::new(),
+                }
             };
-            // Only "pending" stages run; anything else (awaiting_checkpoint / failed)
-            // means we're already blocked — restore the persisted paused status, since
-            // entry set it to "running".
-            if stage.status != "pending" {
+            // Nothing ready but the run isn't complete: some stage is parked
+            // awaiting a checkpoint / failed (or every pending stage waits on
+            // one) — restore the persisted paused status, since entry set it
+            // to "running".
+            if ready.is_empty() {
                 self.db.lock().set_run_status(run_id, "paused", false)?;
                 self.emit_run_update(run_id);
                 return Ok(RunStatus::Paused);
             }
+            // The batch's checkpoint CARRIER for boundary gates (budget /
+            // director pause): the earliest ready stage, as before.
+            let carrier_id = ready[0].id.clone();
 
             // Budget gate: a pending stage must not START once spend has
             // reached the run's budget (stages are atomic — no mid-stage
             // interruption). Approving the resulting checkpoint releases the
-            // parked stage past the gate once; it re-arms for the next stage.
-            if let Some(budget) = run.budget_usd {
-                if !skip_budget_once && budget > 0.0 && run.cost_usd >= budget {
-                    self.pause_for_budget(run_id, &stage.id, run.cost_usd, budget)?;
-                    return Ok(RunStatus::Paused);
-                }
+            // parked stage past the gate once; it re-arms for the next batch.
+            let budget_exhausted = run
+                .budget_usd
+                .map(|b| b > 0.0 && run.cost_usd >= b)
+                .unwrap_or(false);
+            if !skip_budget_once && budget_exhausted {
+                self.pause_for_budget(run_id, &carrier_id, run.cost_usd, run.budget_usd.unwrap_or(0.0))?;
+                return Ok(RunStatus::Paused);
             }
             // Phase 3 — also honor the global/project/workspace USD budgets so a
             // DIRECT run can't silently blow through them (it now counts against
             // them via the spend ledger; here it also blocks). Same park + approve
-            // path as the run's own cap. Skipped on the post-approval first stage.
+            // path as the run's own cap. Skipped on the post-approval first batch.
             if !skip_budget_once {
                 // Bind the verdict to a `let` FIRST so the `db.lock()` guard drops
                 // before `pause_for_scope_budget` re-acquires it. Holding it across
@@ -1493,25 +1513,71 @@ impl Orchestrator {
                 // → deadlock.
                 let verdict = self.db.lock().check_budget(Some(&run.workspace_id))?;
                 if let crate::db::BudgetVerdict::Block { scope, spent, limit } = verdict {
-                    self.pause_for_scope_budget(run_id, &stage.id, &scope, spent, limit)?;
+                    self.pause_for_scope_budget(run_id, &carrier_id, &scope, spent, limit)?;
                     return Ok(RunStatus::Paused);
                 }
             }
-            skip_budget_once = false; // only the drive's first stage may bypass
 
-            // Director pause: park this next pending stage at the boundary (same
-            // mechanism as the budget gate). Approving the parked stage resumes.
+            // Director pause: park at the boundary (same mechanism as the
+            // budget gate). Approving the parked stage resumes.
             if self.pause_requests.lock().remove(run_id) {
-                self.pause_for_director(run_id, &stage.id)?;
+                self.pause_for_director(run_id, &carrier_id)?;
                 return Ok(RunStatus::Paused);
             }
 
-            let stage = stage.clone();
-            let (status, verdict) = self.run_stage_once(&run, &stage).await?;
+            // ── Write-set gating ────────────────────────────────────────
+            // The worktree is the run's shared blackboard: two concurrent
+            // WRITER stages on one checkout is silent corruption. Every ready
+            // read-only stage runs concurrently, plus at most ONE writer
+            // (position order keeps it deterministic). The rest of the ready
+            // set simply lands in the next batch.
+            let mut batch: Vec<crate::db::RunStageRow> = Vec::new();
+            let mut writer_taken = false;
+            for s in ready {
+                if self.stage_is_read_only(&s) {
+                    batch.push(s);
+                } else if !writer_taken {
+                    writer_taken = true;
+                    batch.push(s);
+                }
+            }
+            // A conscious override of ANY boundary park (run budget, scope
+            // budget, director pause — all resolve through the same approve
+            // path) releases exactly ONE stage past the gates — never a whole
+            // batch of siblings.
+            if skip_budget_once {
+                batch.truncate(1);
+            }
+            skip_budget_once = false; // only the drive's first batch may bypass
+
+            // Intra-stage budget headroom, SHARED across the batch: the
+            // remaining run budget divided by the batch size, so N concurrent
+            // stages can't each spend the whole remainder (the serial drive
+            // re-read spend before every stage; a batch can't). No headroom
+            // means the director's conscious override — unmetered, as the
+            // override intends.
+            let spend_limit = run
+                .budget_usd
+                .filter(|b| *b > 0.0)
+                .map(|b| b - run.cost_usd)
+                .filter(|r| *r > 0.0)
+                .map(|r| r / batch.len() as f64);
+
+            // ONE cancel flag for the whole batch: "Stop" stops everything the
+            // run currently has in flight.
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.cancels.lock().insert(run_id.to_string(), Arc::clone(&cancel));
+            let results = futures_util::future::join_all(
+                batch
+                    .iter()
+                    .map(|s| self.run_stage_once(&run, s, Arc::clone(&cancel), spend_limit)),
+            )
+            .await;
+            self.cancels.lock().remove(run_id);
             self.emit_run_update(run_id);
 
-            // An abort issued WHILE the stage was in flight wins over whatever
-            // the stage produced — never downgrade the terminal aborted status
+            // An abort issued WHILE the batch was in flight wins over whatever
+            // the stages produced — never downgrade the terminal aborted status
             // back to paused-for-recovery.
             let aborted_mid_stage = self
                 .db
@@ -1523,105 +1589,236 @@ impl Orchestrator {
                 return Ok(RunStatus::Aborted);
             }
 
-            match status {
-                StageStatus::Failed => {
-                    // Automatic escalation: a stage with an escalation policy
-                    // retries ONCE at the strong tier before halting. When it
-                    // escalates, the stage is reset to pending and the drive
-                    // loop re-runs it (now with `escalated` set). Only a hard
-                    // failure reaches here — a block (AwaitingCheckpoint) and
-                    // an aborted run never escalate.
-                    if self.try_escalate(run_id, &stage)? {
-                        self.emit_run_update(run_id);
-                        continue;
-                    }
-                    self.db.lock().set_run_status(run_id, "paused", false)?;
-                    self.emit_checkpoint(run_id, &stage.id, "decision");
-                    return Ok(RunStatus::Paused);
-                }
-                StageStatus::AwaitingCheckpoint => {
-                    // Escape valve: the stage parked itself asking the director.
-                    // `run_stage_once` already persisted the questions + the
-                    // awaiting_checkpoint status; pause the run and fire the same
-                    // "decision" checkpoint a gate uses (needs-you + beacon).
-                    self.db.lock().set_run_status(run_id, "paused", false)?;
-                    self.emit_checkpoint(run_id, &stage.id, "decision");
-                    return Ok(RunStatus::Paused);
-                }
-                StageStatus::Done => {
-                    // Auto-loop verdict decision runs BEFORE gated/checkpoint pause.
-                    if Self::stage_has_auto_loop(&stage) {
-                        let remaining = stage.loop_iterations < stage.loop_max_iterations;
-                        // The review's findings, read from the freshly-persisted
-                        // row — used by both the normal loop-back and the
-                        // quality-escalation loop-back below.
-                        let read_findings = || -> AppResult<Option<String>> {
-                            let fresh_stages = self.db.lock().list_run_stages(run_id)?;
-                            Ok(fresh_stages
-                                .iter()
-                                .find(|s| s.id == stage.id)
-                                .and_then(|s| s.artifact.as_deref())
-                                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string)))
-                        };
-                        match verdict {
-                            Some(ReviewVerdict::Pass) => {
-                                // Fall through to checkpoint/continue below.
-                            }
-                            Some(ReviewVerdict::ChangesRequested) if remaining => {
-                                let findings = read_findings()?;
-                                self.loop_back(run_id, &stage, findings.as_deref())?;
-                                self.emit_run_update(run_id);
-                                continue;
-                            }
-                            Some(ReviewVerdict::ChangesRequested) => {
-                                // Loop cap reached on quality grounds. Before
-                                // surrendering to a human gate, try the loop
-                                // target's escalation policy: this is exactly
-                                // the case escalation exists for (the cheap
-                                // tier couldn't satisfy the reviewer), yet it
-                                // historically only fired on hard failures.
-                                if self.try_escalate_loop_target(run_id, &stage)? {
-                                    let findings = read_findings()?;
-                                    self.loop_back(run_id, &stage, findings.as_deref())?;
-                                    self.emit_run_update(run_id);
-                                    continue;
+            // Process outcomes in position order. EVERY outcome is handled
+            // before any error propagates — a hard error in one branch must
+            // not swallow a sibling's checkpoint event or loop-back — and the
+            // run pauses once at the end if ANY outcome demands it.
+            // `looped_targets` guards two same-batch reviews looping back to
+            // one shared target (see `handle_stage_outcome`).
+            let mut must_pause = false;
+            let mut first_err: Option<AppError> = None;
+            let mut looped_targets: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for (stage, result) in batch.iter().zip(results) {
+                match result {
+                    Ok((status, verdict)) => {
+                        match self.handle_stage_outcome(run_id, stage, status, verdict, &mut looped_targets) {
+                            Ok(pause) => must_pause |= pause,
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
                                 }
-                                self.journal_notice(run_id, &stage.id, &format!(
-                                    "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
-                                    stage.loop_iterations, stage.loop_max_iterations
-                                ));
-                                self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
-                                self.db.lock().set_run_status(run_id, "paused", false)?;
-                                self.emit_checkpoint(run_id, &stage.id, "decision");
-                                return Ok(RunStatus::Paused);
-                            }
-                            None => {
-                                // Unparseable verdict → gate. Say WHY in the
-                                // journal — a silent downgrade from autonomous
-                                // to gated reads as a hang to the director.
-                                self.journal_notice(run_id, &stage.id,
-                                    "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision");
-                                self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
-                                self.db.lock().set_run_status(run_id, "paused", false)?;
-                                self.emit_checkpoint(run_id, &stage.id, "decision");
-                                return Ok(RunStatus::Paused);
+                                must_pause = true;
                             }
                         }
                     }
-                    // Existing gated/checkpoint handling (also handles auto Pass fall-through).
-                    if stage.checkpoint || Self::stage_has_gated_loop(&stage) {
-                        self.db
-                            .lock()
-                            .set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
-                        self.db.lock().set_run_status(run_id, "paused", false)?;
-                        self.emit_checkpoint(run_id, &stage.id, "decision");
-                        return Ok(RunStatus::Paused);
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                        must_pause = true;
                     }
-                    // else continue to next stage
                 }
-                _ => { /* other statuses — continue to next stage */ }
             }
+            if let Some(e) = first_err {
+                // Leave the run visibly paused (a stage may be parked) before
+                // surfacing the error — a run stranded as "running" has no
+                // affordance.
+                let _ = self.db.lock().set_run_status(run_id, "paused", false);
+                self.emit_run_update(run_id);
+                return Err(e);
+            }
+            if must_pause {
+                self.db.lock().set_run_status(run_id, "paused", false)?;
+                self.emit_run_update(run_id);
+                return Ok(RunStatus::Paused);
+            }
+        }
+    }
+
+    /// True when a stage CANNOT mutate the worktree — the bar for running it
+    /// concurrently with a writer. API: the tool allowlist grants no
+    /// write/edit/run. CLI: only a CODEX worktree review counts — codex's
+    /// `--sandbox read-only` is kernel-enforced; a Claude CLI review keeps
+    /// Bash (reviewers run builds/tests), and a Bash that can `git stash` or
+    /// `npm install` into the shared checkout is a writer for scheduling
+    /// purposes, whatever the edit-tool denial says. Writers — including any
+    /// stage whose tools are unknown — serialize.
+    fn stage_is_read_only(&self, s: &crate::db::RunStageRow) -> bool {
+        use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+        match AgentSubstrate::from_db(&s.substrate) {
+            Some(AgentSubstrate::Api) => s
+                .tools
+                .as_ref()
+                .map(|t| {
+                    !t.iter()
+                        .any(|x| matches!(x.as_str(), "write_file" | "edit_file" | "run_command"))
+                })
+                .unwrap_or(false),
+            Some(AgentSubstrate::Cli) => {
+                matches!(dialect_for_model(&s.agent_model), CliDialect::Codex)
+                    && self
+                        .db
+                        .lock()
+                        .get_role(&s.role)
+                        .ok()
+                        .flatten()
+                        .map(|rd| {
+                            matches!(rd.artifact_kind, ArtifactKind::Review)
+                                && matches!(
+                                    rd.environment,
+                                    crate::orchestrator::types::RoleEnvironment::Worktree
+                                )
+                        })
+                        .unwrap_or(false)
+            }
+            None => false,
+        }
+    }
+
+    /// The freshly-persisted artifact text of `stage` (its review findings).
+    fn fresh_artifact_text(&self, run_id: &str, stage_id: &str) -> AppResult<Option<String>> {
+        let fresh_stages = self.db.lock().list_run_stages(run_id)?;
+        Ok(fresh_stages
+            .iter()
+            .find(|s| s.id == stage_id)
+            .and_then(|s| s.artifact.as_deref())
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string)))
+    }
+
+    /// Loop a review back to its target — or, when a SIBLING review in the
+    /// same batch already reset that target, MERGE instead: append this
+    /// review's findings to the target's pending feedback (a second
+    /// `loop_back` would overwrite the sibling's findings and re-reset the
+    /// window) and rewind just this review so it re-reviews after the target
+    /// re-runs. `looped` is the batch-scoped set of already-reset targets.
+    fn loop_back_or_merge(
+        &self,
+        run_id: &str,
+        review: &RunStageRow,
+        looped: &mut std::collections::HashSet<i64>,
+    ) -> AppResult<()> {
+        let findings = self.fresh_artifact_text(run_id, &review.id)?;
+        let target_pos = review
+            .loop_target_position
+            .expect("loop_back_or_merge requires a loop target");
+        if looped.insert(target_pos) {
+            self.loop_back(run_id, review, findings.as_deref())?;
+            return Ok(());
+        }
+        // Merge path: the window is already reset this batch.
+        if let Some(f) = findings.as_deref().filter(|f| !f.trim().is_empty()) {
+            let fresh = self.db.lock().list_run_stages(run_id)?;
+            if let Some(target) = fresh.iter().find(|s| s.position == target_pos) {
+                let merged = match target.feedback.as_deref().filter(|p| !p.trim().is_empty()) {
+                    Some(prev) => format!(
+                        "{prev}\n\n— additional findings from the {} stage —\n{f}",
+                        review.role.replace('_', " ")
+                    ),
+                    None => f.to_string(),
+                };
+                self.db.lock().set_stage_feedback(&target.id, Some(&merged))?;
+            }
+        }
+        self.archive_and_reset_stage(run_id, review, findings.as_deref(), None)?;
+        self.db.lock().increment_loop_iteration(&review.id)?;
+        self.recompute_run_cost(run_id)?;
+        Ok(())
+    }
+
+    /// Handle one finished stage's outcome: escalations and loop-backs mutate
+    /// rows and let the drive continue; parks (gate, block, halt, verdict
+    /// fallback) mark the STAGE and fire its checkpoint, returning `true` so
+    /// the caller pauses the RUN once the whole batch is processed.
+    /// `looped_targets` tracks loop targets already reset in THIS batch (two
+    /// sibling reviews sharing a target merge instead of double-resetting).
+    fn handle_stage_outcome(
+        &self,
+        run_id: &str,
+        stage: &RunStageRow,
+        status: StageStatus,
+        verdict: Option<ReviewVerdict>,
+        looped_targets: &mut std::collections::HashSet<i64>,
+    ) -> AppResult<bool> {
+        match status {
+            StageStatus::Failed => {
+                // Automatic escalation: a stage with an escalation policy
+                // retries ONCE at the strong tier before halting. When it
+                // escalates, the stage is reset to pending and a later batch
+                // re-runs it (now with `escalated` set). Only a hard failure
+                // reaches here — a block (AwaitingCheckpoint) and an aborted
+                // run never escalate.
+                if self.try_escalate(run_id, stage)? {
+                    self.emit_run_update(run_id);
+                    return Ok(false);
+                }
+                self.emit_checkpoint(run_id, &stage.id, "decision");
+                Ok(true)
+            }
+            StageStatus::AwaitingCheckpoint => {
+                // Escape valve: the stage parked itself asking the director.
+                // `run_stage_once` already persisted the questions + the
+                // awaiting_checkpoint status; fire the same "decision"
+                // checkpoint a gate uses (needs-you + beacon).
+                self.emit_checkpoint(run_id, &stage.id, "decision");
+                Ok(true)
+            }
+            StageStatus::Done => {
+                // Auto-loop verdict decision runs BEFORE gated/checkpoint pause.
+                if Self::stage_has_auto_loop(stage) {
+                    let remaining = stage.loop_iterations < stage.loop_max_iterations;
+                    match verdict {
+                        Some(ReviewVerdict::Pass) => {
+                            // Fall through to checkpoint/continue below.
+                        }
+                        Some(ReviewVerdict::ChangesRequested) if remaining => {
+                            self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                            self.emit_run_update(run_id);
+                            return Ok(false);
+                        }
+                        Some(ReviewVerdict::ChangesRequested) => {
+                            // Loop cap reached on quality grounds. Before
+                            // surrendering to a human gate, try the loop
+                            // target's escalation policy: this is exactly
+                            // the case escalation exists for (the cheap
+                            // tier couldn't satisfy the reviewer), yet it
+                            // historically only fired on hard failures.
+                            if self.try_escalate_loop_target(run_id, stage)? {
+                                self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                                self.emit_run_update(run_id);
+                                return Ok(false);
+                            }
+                            self.journal_notice(run_id, &stage.id, &format!(
+                                "auto loop: changes requested but the loop cap is reached ({} of {} iterations used) — pausing at a gate for your decision",
+                                stage.loop_iterations, stage.loop_max_iterations
+                            ));
+                            self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+                            self.emit_checkpoint(run_id, &stage.id, "decision");
+                            return Ok(true);
+                        }
+                        None => {
+                            // Unparseable verdict → gate. Say WHY in the
+                            // journal — a silent downgrade from autonomous
+                            // to gated reads as a hang to the director.
+                            self.journal_notice(run_id, &stage.id,
+                                "auto loop: the review produced no machine-readable verdict (no submit_verdict call or VERDICT line) — pausing at a gate for your decision");
+                            self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+                            self.emit_checkpoint(run_id, &stage.id, "decision");
+                            return Ok(true);
+                        }
+                    }
+                }
+                // Existing gated/checkpoint handling (also handles auto Pass fall-through).
+                if stage.checkpoint || Self::stage_has_gated_loop(stage) {
+                    self.db
+                        .lock()
+                        .set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+                    self.emit_checkpoint(run_id, &stage.id, "decision");
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -1762,7 +1959,17 @@ impl Orchestrator {
                             // the answers reach the SAME conversation via the
                             // resume nudge (the CLI counterpart of the API's
                             // transcript continuation).
-                            let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                            // Resume only when the stage's CLI DIALECT can actually
+                            // continue a session — codex can't (no stable resume
+                            // contract), and setting resume_pending there would
+                            // skip the dossier's worktree-diff capture for a run
+                            // that then starts fresh and NEEDS the dossier.
+                            let can_resume = s.substrate == "cli"
+                                && s.session_id.is_some()
+                                && matches!(
+                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
+                                    crate::orchestrator::cli_runner::CliDialect::Claude
+                                );
                             if can_resume {
                                 self.db.lock().set_stage_resume_pending(&s.id, true)?;
                             }
@@ -1885,7 +2092,17 @@ impl Orchestrator {
                         if let Some(mt) = max_turns_override {
                             self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                         }
-                        let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                        // Resume only when the stage's CLI DIALECT can actually
+                            // continue a session — codex can't (no stable resume
+                            // contract), and setting resume_pending there would
+                            // skip the dossier's worktree-diff capture for a run
+                            // that then starts fresh and NEEDS the dossier.
+                            let can_resume = s.substrate == "cli"
+                                && s.session_id.is_some()
+                                && matches!(
+                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
+                                    crate::orchestrator::cli_runner::CliDialect::Claude
+                                );
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
@@ -2134,9 +2351,9 @@ impl Orchestrator {
         self.director_pauses.lock().insert(run_id.to_string());
     }
 
-    /// Signal the run's in-flight stage (if any) to stop. The substrate halts
-    /// at its next cancel check; the stage lands as failed in the existing
-    /// halt-recovery flow. No-op when nothing is in flight.
+    /// Signal the run's in-flight stages (if any) to stop. Each substrate
+    /// halts at its next cancel check; the stages land as failed in the
+    /// existing halt-recovery flow. No-op when nothing is in flight.
     pub fn stop_current_stage(&self, run_id: &str) -> AppResult<()> {
         if let Some(flag) = self.cancels.lock().get(run_id) {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);

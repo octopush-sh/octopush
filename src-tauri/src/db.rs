@@ -4735,6 +4735,17 @@ impl Db {
     /// preserved — the UPDATE below does not list them. `resume_pending` is cleared
     /// separately by the Resume action handler after it sets it, and `session_id` /
     /// `baseline_commit` carry forward for the next run's `--resume` / Discard path.
+    /// Replace a stage's pending re-run feedback in place (no reset). Used by
+    /// the same-batch loop-back merge: a sibling review appends its findings
+    /// to a target another review already reset.
+    pub fn set_stage_feedback(&self, stage_id: &str, feedback: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET feedback = ?2 WHERE id = ?1",
+            params![stage_id, feedback],
+        )?;
+        Ok(())
+    }
+
     pub fn reset_run_stage(
         &self,
         stage_id: &str,

@@ -152,7 +152,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
             <ModelPicker
               activeModel={data.agentModel}
               onSelectModel={(m) => onPatch({ agentModel: m })}
-              allowedProviders={isCli ? ["anthropic"] : undefined}
+              allowedProviders={isCli ? ["anthropic", "openai"] : undefined}
             />
           </div>
 
@@ -207,7 +207,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
                   <ModelPicker
                     activeModel={data.escalateModel ?? ""}
                     onSelectModel={(m) => onPatch({ escalateModel: m })}
-                    allowedProviders={isCli ? ["anthropic"] : undefined}
+                    allowedProviders={isCli ? ["anthropic", "openai"] : undefined}
                   />
                   {data.escalateModel ? (
                     <button
