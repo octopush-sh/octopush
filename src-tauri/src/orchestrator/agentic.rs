@@ -275,7 +275,18 @@ pub async fn run_agentic_loop(
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
-        tools.retain(|t| allowed.iter().any(|a| a == &t.name));
+        // Implied grants keep allowlists saved before a tool existed working:
+        // read access (read_file/list_files) implies the read-only search
+        // tools (grep/glob), and write_file implies the safer edit_file. An
+        // explicit grant of the new names works too.
+        let has = |name: &str| allowed.iter().any(|a| a == name);
+        tools.retain(|t| match t.name.as_str() {
+            "grep" | "glob" => {
+                has(&t.name) || has("read_file") || has("list_files")
+            }
+            "edit_file" => has(&t.name) || has("write_file"),
+            other => has(other),
+        });
     }
     // The escape valve is appended AFTER the allowlist filter so it is always
     // available to a DIRECT stage — even a review stage whose allowlist is

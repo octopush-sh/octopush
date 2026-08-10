@@ -93,9 +93,9 @@ pub fn compose_system_prompt(
     s
 }
 
-fn ro() -> Vec<String> { vec!["read_file".into(), "list_files".into()] }
-fn run_() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "run_command".into()] }
-fn full() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "write_file".into(), "run_command".into()] }
+fn ro() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into()] }
+fn run_() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into(), "run_command".into()] }
+fn full() -> Vec<String> { vec!["read_file".into(), "list_files".into(), "grep".into(), "glob".into(), "write_file".into(), "edit_file".into(), "run_command".into()] }
 
 /// All 15 built-in roles. Keys, prompts, artifact kinds, loop eligibility,
 /// default tools and token estimates here are the single source of truth

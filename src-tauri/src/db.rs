@@ -5455,7 +5455,18 @@ const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 
 /// The workspace tools a stage's agent may be granted. Keep in sync with
 /// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.
-pub const KNOWN_TOOLS: &[&str] = &["read_file", "list_files", "write_file", "run_command"];
+/// `grep`/`glob` are implied by read access and `edit_file` by `write_file`
+/// (see the allowlist expansion in orchestrator/agentic.rs), so allowlists
+/// saved before these tools existed keep working unchanged.
+pub const KNOWN_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "grep",
+    "glob",
+    "write_file",
+    "edit_file",
+    "run_command",
+];
 
 
 /// Transitive flow-ancestors of stage `idx`, following `parents` (positions).

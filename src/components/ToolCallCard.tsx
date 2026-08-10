@@ -20,7 +20,10 @@ export const TOOL_LABELS: Record<string, string> = {
   run_command: "RUN",
   read_file: "READ",
   write_file: "WRITE",
+  edit_file: "EDIT",
   list_files: "LIST",
+  grep: "GREP",
+  glob: "GLOB",
 };
 
 /** The card header label for a tool name (e.g. `write_file` → `WRITE`,
@@ -49,9 +52,16 @@ export function summarizeTool(
     }
     case "write_file":
     case "read_file":
+    case "edit_file":
       return String(toolInput?.path ?? "");
     case "list_files":
       return String(toolInput?.path ?? ".");
+    case "grep": {
+      const pat = String(toolInput?.pattern ?? "");
+      return pat.length > 60 ? pat.slice(0, 57) + "..." : pat;
+    }
+    case "glob":
+      return String(toolInput?.pattern ?? "");
     default:
       return toolName;
   }

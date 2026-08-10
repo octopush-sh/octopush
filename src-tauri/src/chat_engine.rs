@@ -467,6 +467,76 @@ fn tool_definitions() -> serde_json::Value {
                 },
                 "required": ["path"]
             }
+        },
+        {
+            "name": "grep",
+            "description": "Search file contents with a regex, recursively, respecting .gitignore. Returns path:line:text matches. Far cheaper than reading files one by one — use this to locate code before reading.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regular expression to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative directory (or file) to search under. Defaults to the workspace root."
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional filename filter, e.g. '*.rs' or 'src/**/*.ts'"
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "Case-insensitive matching (default false)"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum matches to return (default 200, max 1000)"
+                    }
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "glob",
+            "description": "Find files by glob pattern (e.g. 'src/**/*.ts', '**/Cargo.toml'), recursively, respecting .gitignore. Returns matching paths.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern relative to the workspace root"
+                    }
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "edit_file",
+            "description": "Replace an exact string in a file. The old_string must match exactly (including whitespace) and be unique in the file unless replace_all is true. Prefer this over write_file for changes to existing files — it cannot accidentally drop the rest of the file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from workspace root"
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to replace"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement text"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of requiring uniqueness (default false)"
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
         }
     ])
 }
@@ -843,6 +913,198 @@ pub(crate) fn execute_tool_cancellable(
                     }
                 }
                 Err(e) => (format!("Error listing {path}: {e}"), false),
+            }
+        }
+        "grep" => {
+            let pattern = input.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+            if pattern.is_empty() {
+                return ("grep needs a non-empty `pattern`".to_string(), false);
+            }
+            let path = input.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+            let case_insensitive = input
+                .get("case_insensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let max_results = input
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200)
+                .clamp(1, 1000) as usize;
+            let re = match regex::RegexBuilder::new(pattern)
+                .case_insensitive(case_insensitive)
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => return (format!("Invalid regex: {e}"), false),
+            };
+            let file_matcher = match input.get("glob").and_then(|g| g.as_str()) {
+                Some(g) => match globset::GlobBuilder::new(g).literal_separator(false).build() {
+                    Ok(gl) => Some(gl.compile_matcher()),
+                    Err(e) => return (format!("Invalid glob: {e}"), false),
+                },
+                None => None,
+            };
+            let root = workspace_path.join(path);
+            let mut out: Vec<String> = Vec::new();
+            let mut hit_cap = false;
+            let walker = ignore::WalkBuilder::new(&root)
+                .hidden(false)
+                .git_global(false)
+                .require_git(false)
+                .build();
+            'files: for entry in walker.flatten() {
+                let p = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let rel = p.strip_prefix(workspace_path).unwrap_or(p);
+                // `.git` internals are never useful matches; gitignored files
+                // are already skipped by the walker.
+                if rel.components().any(|c| c.as_os_str() == ".git") {
+                    continue;
+                }
+                if let Some(m) = &file_matcher {
+                    if !m.is_match(rel) && !m.is_match(p.file_name().map(std::path::Path::new).unwrap_or(rel)) {
+                        continue;
+                    }
+                }
+                // Skip huge and binary-looking files — a match inside them is
+                // noise the model can't act on anyway.
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.len() > 2_000_000 {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(p) else { continue };
+                if bytes[..bytes.len().min(4096)].contains(&0) {
+                    continue;
+                }
+                let content = String::from_utf8_lossy(&bytes);
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let shown = truncate_char_safe(line.trim_end(), 400);
+                        out.push(format!("{}:{}:{}", rel.display(), i + 1, shown));
+                        if out.len() >= max_results {
+                            hit_cap = true;
+                            break 'files;
+                        }
+                    }
+                }
+            }
+            if out.is_empty() {
+                (format!("No matches for /{pattern}/ under {path}"), true)
+            } else {
+                let mut s = out.join("\n");
+                if hit_cap {
+                    s.push_str(&format!(
+                        "\n… (stopped at {max_results} matches — narrow the pattern, path, or glob)"
+                    ));
+                }
+                (s, true)
+            }
+        }
+        "glob" => {
+            let pattern = input.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+            if pattern.is_empty() {
+                return ("glob needs a non-empty `pattern`".to_string(), false);
+            }
+            let matcher = match globset::GlobBuilder::new(pattern)
+                .literal_separator(false)
+                .build()
+            {
+                Ok(g) => g.compile_matcher(),
+                Err(e) => return (format!("Invalid glob: {e}"), false),
+            };
+            let mut out: Vec<String> = Vec::new();
+            let mut hit_cap = false;
+            let walker = ignore::WalkBuilder::new(workspace_path)
+                .hidden(false)
+                .git_global(false)
+                .require_git(false)
+                .build();
+            for entry in walker.flatten() {
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let p = entry.path();
+                let rel = p.strip_prefix(workspace_path).unwrap_or(p);
+                if rel.components().any(|c| c.as_os_str() == ".git") {
+                    continue;
+                }
+                if matcher.is_match(rel) {
+                    out.push(rel.display().to_string());
+                    if out.len() >= 500 {
+                        hit_cap = true;
+                        break;
+                    }
+                }
+            }
+            out.sort();
+            if out.is_empty() {
+                (format!("No files match {pattern}"), true)
+            } else {
+                let mut s = out.join("\n");
+                if hit_cap {
+                    s.push_str("\n… (stopped at 500 files — narrow the pattern)");
+                }
+                (s, true)
+            }
+        }
+        "edit_file" => {
+            let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            if old_string.is_empty() {
+                return ("edit_file needs a non-empty `old_string`".to_string(), false);
+            }
+            if old_string == new_string {
+                return ("`old_string` and `new_string` are identical — nothing to change".to_string(), false);
+            }
+            let full = workspace_path.join(path);
+            let content = match std::fs::read_to_string(&full) {
+                Ok(c) => c,
+                Err(e) => return (format!("Error reading {path}: {e}"), false),
+            };
+            let count = content.matches(old_string).count();
+            if count == 0 {
+                return (
+                    format!(
+                        "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
+                    ),
+                    false,
+                );
+            }
+            if count > 1 && !replace_all {
+                return (
+                    format!(
+                        "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
+                    ),
+                    false,
+                );
+            }
+            let (updated, replaced) = if replace_all {
+                (content.replace(old_string, new_string), count)
+            } else {
+                (content.replacen(old_string, new_string, 1), 1)
+            };
+            // Same containment story as write_file: lexical pre-check plus the
+            // kernel-enforced sandboxed write when the mission is sandboxed.
+            if let Some(roots) = sandbox_roots {
+                if !crate::orchestrator::sandbox::is_write_allowed(&full, roots) {
+                    return (
+                        format!("Sandboxed: refusing to edit outside the mission workspace ({path})"),
+                        false,
+                    );
+                }
+                let (msg, ok) = sandboxed_write(roots, &full, &updated, path);
+                if !ok {
+                    return (msg, false);
+                }
+                return (format!("Edited {path}: replaced {replaced} occurrence(s)"), true);
+            }
+            match std::fs::write(&full, updated) {
+                Ok(()) => (format!("Edited {path}: replaced {replaced} occurrence(s)"), true),
+                Err(e) => (format!("Error writing {path}: {e}"), false),
             }
         }
         _ => (format!("Unknown tool: {name}"), false),
@@ -2076,16 +2338,16 @@ impl ChatEngine {
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
-                if u.name == "write_file" {
+                if u.name == "write_file" || u.name == "edit_file" {
                     if let Some(path) = u.input.get("path").and_then(|p| p.as_str()) {
                         let msg_id = if assistant_msg_id >= 0 { Some(assistant_msg_id) } else { None };
                         if let Err(e) = self.db.lock().insert_file_edit(
                             &request.workspace_id,
                             path,
-                            "write_file",
+                            &u.name,
                             msg_id,
                         ) {
-                            tracing::warn!(tool = "write_file", path = path, error = %e, "failed to record file edit");
+                            tracing::warn!(tool = %u.name, path = path, error = %e, "failed to record file edit");
                         } else if assistant_msg_id >= 0 {
                             attributed.insert((path.to_string(), assistant_msg_id));
                         }
@@ -2275,6 +2537,104 @@ mod tests {
         // Unknown tool → failure.
         let (_, ok) = execute_tool(wp, "frobnicate", &serde_json::json!({}), None);
         assert!(!ok);
+    }
+
+    #[test]
+    fn grep_finds_matches_and_respects_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::create_dir_all(wp.join("src")).unwrap();
+        std::fs::write(wp.join("src/main.rs"), "fn main() {\n    let needle_alpha = 1;\n}\n").unwrap();
+        std::fs::write(wp.join("notes.md"), "needle_alpha in prose\n").unwrap();
+        std::fs::write(wp.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir_all(wp.join("ignored")).unwrap();
+        std::fs::write(wp.join("ignored/x.txt"), "needle_alpha hidden\n").unwrap();
+
+        let (out, ok) = execute_tool(wp, "grep", &serde_json::json!({"pattern": "needle_alpha"}), None);
+        assert!(ok);
+        assert!(out.contains("src/main.rs:2:"), "path:line match: {out}");
+        assert!(out.contains("notes.md:1:"), "{out}");
+        assert!(!out.contains("ignored/x.txt"), "gitignored files are skipped: {out}");
+
+        // Glob filter narrows to one file.
+        let (out, ok) = execute_tool(
+            wp,
+            "grep",
+            &serde_json::json!({"pattern": "needle_alpha", "glob": "*.rs"}),
+            None,
+        );
+        assert!(ok);
+        assert!(out.contains("src/main.rs") && !out.contains("notes.md"), "{out}");
+
+        // No matches is a successful (informative) result.
+        let (out, ok) = execute_tool(wp, "grep", &serde_json::json!({"pattern": "zzz_none"}), None);
+        assert!(ok);
+        assert!(out.contains("No matches"), "{out}");
+
+        // A bad regex fails structurally.
+        let (_, ok) = execute_tool(wp, "grep", &serde_json::json!({"pattern": "("}), None);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn glob_lists_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::create_dir_all(wp.join("src/deep")).unwrap();
+        std::fs::write(wp.join("src/a.ts"), "x").unwrap();
+        std::fs::write(wp.join("src/deep/b.ts"), "x").unwrap();
+        std::fs::write(wp.join("src/c.rs"), "x").unwrap();
+        let (out, ok) = execute_tool(wp, "glob", &serde_json::json!({"pattern": "src/**/*.ts"}), None);
+        assert!(ok);
+        assert!(out.contains("src/a.ts") && out.contains("src/deep/b.ts") && !out.contains("c.rs"), "{out}");
+    }
+
+    #[test]
+    fn edit_file_replaces_exactly_and_guards_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("f.txt"), "alpha beta alpha").unwrap();
+
+        // Ambiguous without replace_all → refused, file untouched.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({"path": "f.txt", "old_string": "alpha", "new_string": "gamma"}),
+            None,
+        );
+        assert!(!ok);
+        assert!(msg.contains("2 times"), "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("f.txt")).unwrap(), "alpha beta alpha");
+
+        // Unique match → replaced.
+        let (_, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({"path": "f.txt", "old_string": "beta", "new_string": "delta"}),
+            None,
+        );
+        assert!(ok);
+        assert_eq!(std::fs::read_to_string(wp.join("f.txt")).unwrap(), "alpha delta alpha");
+
+        // replace_all handles multiplicity.
+        let (_, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({"path": "f.txt", "old_string": "alpha", "new_string": "omega", "replace_all": true}),
+            None,
+        );
+        assert!(ok);
+        assert_eq!(std::fs::read_to_string(wp.join("f.txt")).unwrap(), "omega delta omega");
+
+        // Missing old_string → structural failure with guidance.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({"path": "f.txt", "old_string": "never-there", "new_string": "x"}),
+            None,
+        );
+        assert!(!ok);
+        assert!(msg.contains("not found"), "{msg}");
     }
 
     #[test]
