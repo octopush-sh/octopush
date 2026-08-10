@@ -184,6 +184,51 @@ fn resolved_cli_path() -> String {
     merge_path_dirs(&[login_path, &inherited, &defaults])
 }
 
+/// Markers that make a trailing question read as ADDRESSED TO A PERSON (the
+/// conservative half of the question-as-result detector below).
+const QUESTION_MARKERS: &[&str] = &[
+    "should i",
+    "shall i",
+    "do you want",
+    "would you like",
+    "do you prefer",
+    "which of",
+    "which one",
+    "let me know",
+    "please confirm",
+    "can you confirm",
+    "could you clarify",
+];
+
+/// Detect a CLI stage that finished by ASKING A QUESTION instead of doing the
+/// work. The CLI has no `ask_director` tool and its preamble forbids asking —
+/// but a genuinely blocked model asks anyway, in prose, and that question then
+/// flowed downstream as if it were a result ("¿Postgres or SQLite?" handed to
+/// the reviewer as a plan). Deliberately conservative — BOTH must hold:
+/// the final non-empty line ends with '?', AND that line (or the one before
+/// it) carries a person-addressed marker. Returns the synthesized ask;
+/// `None` for ordinary results (including rhetorical trailing questions).
+pub fn detect_trailing_question(text: &str) -> Option<crate::orchestrator::types::BlockedAsk> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let last = *lines.last()?;
+    if !last.ends_with('?') {
+        return None;
+    }
+    let window = lines[lines.len().saturating_sub(2)..].join(" ").to_lowercase();
+    if !QUESTION_MARKERS.iter().any(|m| window.contains(m)) {
+        return None;
+    }
+    Some(crate::orchestrator::types::BlockedAsk {
+        summary: "The stage stopped to ask a question instead of finishing.".to_string(),
+        questions: vec![crate::orchestrator::types::BlockedQuestion {
+            question: last.to_string(),
+            why_blocked: "The agent ended its work with this question — it needs an answer to proceed."
+                .to_string(),
+            recommended_default: String::new(),
+        }],
+    })
+}
+
 /// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
 /// A non-zero exit OR `is_error: true` produces a Failed outcome. `stderr_text`
 /// is appended to the failure message when the result itself gives no detail.
@@ -606,7 +651,24 @@ impl AgentRunner for CliRunner {
 
         match result_line {
             Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                Ok(outcome) => Ok(outcome),
+                Ok(mut outcome) => {
+                    // Question-as-result guard: a Done outcome whose text is
+                    // a person-addressed question becomes a director block —
+                    // the question must reach the human, not the next stage's
+                    // prompt disguised as a result. Verdict-bearing reviews
+                    // are exempt (they finished; the verdict drives the loop).
+                    if matches!(outcome.status, StageStatus::Done) && outcome.verdict.is_none() {
+                        if let Some(ask) = detect_trailing_question(&outcome.artifact.text) {
+                            emitter.notice(&format!(
+                                "the agent ended with a question — pausing for the director: {}",
+                                ask.questions[0].question
+                            ));
+                            outcome.status = StageStatus::AwaitingCheckpoint;
+                            outcome.blocked = Some(ask);
+                        }
+                    }
+                    Ok(outcome)
+                }
                 Err(_) => Ok(failed_stage(&format!(
                     "claude produced no parseable result: {}",
                     failure_detail(&stderr_out, &line)

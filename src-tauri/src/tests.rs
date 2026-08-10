@@ -7355,6 +7355,37 @@ mod cli_args_tests {
 }
 
 #[cfg(test)]
+mod cli_question_tests {
+    use crate::orchestrator::cli_runner::detect_trailing_question;
+
+    #[test]
+    fn person_addressed_trailing_question_becomes_a_block() {
+        let ask = detect_trailing_question(
+            "I explored the schema options.\n\nShould I use Postgres or SQLite for this?",
+        )
+        .expect("a person-addressed trailing question is detected");
+        assert!(ask.questions[0].question.contains("Postgres or SQLite"));
+
+        // Marker on the second-to-last line still counts.
+        assert!(detect_trailing_question(
+            "Two options exist. Do you want me to proceed with option A,\nor with option B instead?"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn ordinary_results_and_rhetorical_questions_pass_through() {
+        // Real work summaries don't convert.
+        assert!(detect_trailing_question("Implemented the feature.\nAll tests pass.").is_none());
+        // A trailing '?' without a person-addressed marker is rhetorical.
+        assert!(detect_trailing_question("Fixed the bug. What a strange edge case that was?").is_none());
+        // A marker WITHOUT a trailing '?' doesn't convert either.
+        assert!(detect_trailing_question("Let me know if anything breaks. Done.").is_none());
+        assert!(detect_trailing_question("").is_none());
+    }
+}
+
+#[cfg(test)]
 mod cli_stream_tests {
     use crate::orchestrator::cli_runner::is_result_event;
     use serde_json::json;
