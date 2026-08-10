@@ -7272,8 +7272,22 @@ mod cli_args_tests {
     use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume};
 
     #[test]
+    fn read_only_review_stages_disallow_write_tools() {
+        // B9: a worktree review stage must not be able to edit files — the API
+        // substrate enforces this via its allowlist; the CLI does it with
+        // --disallowedTools. Non-review stages carry no denial.
+        let ro = build_cli_args("m", "sys", 10, true);
+        let i = ro.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+        assert!(ro[i + 1].contains("Write") && ro[i + 1].contains("Edit"), "{ro:?}");
+        let rw = build_cli_args("m", "sys", 10, false);
+        assert!(!rw.contains(&"--disallowedTools".to_string()));
+        let ro_resume = build_cli_args_resume("m", "sess", 10, true);
+        assert!(ro_resume.contains(&"--disallowedTools".to_string()));
+    }
+
+    #[test]
     fn args_include_model_format_and_permission() {
-        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40);
+        let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40, false);
         assert!(args.contains(&"-p".to_string()));
         let i = args.iter().position(|a| a == "--output-format").unwrap();
         assert_eq!(args[i + 1], "stream-json");
@@ -7292,7 +7306,7 @@ mod cli_args_tests {
 
     #[test]
     fn build_cli_args_resume_uses_resume_flag() {
-        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50);
+        let args = build_cli_args_resume("claude-opus-4-6", "sess-9", 50, false);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
         assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
     }
@@ -7530,6 +7544,24 @@ mod g4_staging_tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         git(dir, &["add", "."]);
         git(dir, &["commit", "-qm", "first"]);
+    }
+
+    #[test]
+    fn head_sha_and_range_diff_expose_mid_run_commits() {
+        // F22: a stage that commits mid-pipeline moves HEAD; head_sha detects
+        // it and range_diff_text recovers the committed work for the run diff.
+        let dir = tempdir().unwrap();
+        init_with_commit(dir.path());
+        let before = crate::git_ops::head_sha(dir.path()).expect("repo has a HEAD");
+        std::fs::write(dir.path().join("rogue.txt"), "committed by a stage\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "rogue commit"]);
+        let after = crate::git_ops::head_sha(dir.path()).unwrap();
+        assert_ne!(before, after, "a mid-stage commit moves HEAD");
+        let diff = crate::git_ops::range_diff_text(dir.path(), &before, &after).unwrap();
+        assert!(diff.contains("rogue.txt"), "committed work is recoverable: {diff}");
+        // Identical endpoints → empty diff (the no-commit fast path).
+        assert!(crate::git_ops::range_diff_text(dir.path(), &after, &after).unwrap().trim().is_empty());
     }
 
     #[test]

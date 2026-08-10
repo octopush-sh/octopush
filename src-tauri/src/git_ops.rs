@@ -701,6 +701,33 @@ pub fn get_staged_diff_text(path: &Path) -> AppResult<String> {
     diff_to_text(&diff)
 }
 
+/// Current HEAD commit sha, or `None` when the repo has no commits / isn't a
+/// repo. Used by DIRECT to detect mid-pipeline commits a stage made despite
+/// the never-commit preamble.
+pub fn head_sha(path: &Path) -> Option<String> {
+    let repo = open_repo(path).ok()?;
+    let id = repo.head().ok()?.peel_to_commit().ok()?.id();
+    Some(id.to_string())
+}
+
+/// Unified diff between two commits' trees (`git diff from..to`). Empty when
+/// the trees are identical; `Err` when either sha doesn't resolve.
+pub fn range_diff_text(path: &Path, from: &str, to: &str) -> AppResult<String> {
+    let repo = open_repo(path)?;
+    let tree_of = |sha: &str| -> AppResult<git2::Tree<'_>> {
+        repo.revparse_single(sha)
+            .and_then(|o| o.peel_to_commit())
+            .and_then(|c| c.tree())
+            .map_err(|e| AppError::Other(format!("resolve {sha}: {e}")))
+    };
+    let from_tree = tree_of(from)?;
+    let to_tree = tree_of(to)?;
+    let diff = repo
+        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+        .map_err(|e| AppError::Other(format!("range diff: {e}")))?;
+    diff_to_text(&diff)
+}
+
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
 pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     let repo = open_repo(path)?;

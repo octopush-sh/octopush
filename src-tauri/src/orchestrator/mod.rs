@@ -485,14 +485,15 @@ impl Orchestrator {
             .ok_or_else(|| AppError::Other("workspace has no worktree_path".into()))
     }
 
-    /// The COMPLETE uncommitted picture of a run's worktree: staged (HEAD→index)
-    /// plus unstaged/untracked (index→workdir) diffs concatenated. Staged
-    /// changes matter — a CLI-substrate agent habitually `git add`s part of its
-    /// edits despite the preamble, and an index-only diff would silently hide
-    /// them from the reviewer certifying "the actual code changes". Best-effort:
-    /// every capture failure is LOGGED; `None` when the workspace/unstaged side
-    /// fails, and a staged-side failure degrades to unstaged-only (warned).
-    /// Emptiness is the CALLER's concern.
+    /// The COMPLETE picture of a run's changes: any commits made during the
+    /// run (a stage that `git commit`ed despite the preamble — without this
+    /// segment that work silently VANISHED from the diff the reviewer
+    /// certifies), plus staged (HEAD→index) and unstaged/untracked
+    /// (index→workdir) diffs, concatenated. Staged changes matter — a
+    /// CLI-substrate agent habitually `git add`s part of its edits.
+    /// Best-effort: every capture failure is LOGGED; `None` when the
+    /// workspace/unstaged side fails; the committed/staged segments degrade
+    /// to absent (warned). Emptiness is the CALLER's concern.
     fn full_worktree_diff(&self, run: &crate::db::RunRow) -> Option<String> {
         let path = match self.workspace_path(run) {
             Ok(p) => p,
@@ -501,6 +502,31 @@ impl Orchestrator {
                 return None;
             }
         };
+        // Committed-during-run segment: the run's start HEAD is the parent of
+        // the earliest stage baseline (a dangling commit whose parent was
+        // HEAD at capture time). HEAD unchanged ⇒ empty diff ⇒ skipped.
+        let committed = self
+            .db
+            .lock()
+            .list_run_stages(&run.id)
+            .ok()
+            .and_then(|ss| {
+                ss.into_iter()
+                    .filter(|s| s.baseline_commit.is_some())
+                    .min_by_key(|s| s.position)
+                    .and_then(|s| s.baseline_commit)
+            })
+            .and_then(|baseline| {
+                let head = crate::git_ops::head_sha(&path)?;
+                match crate::git_ops::range_diff_text(&path, &format!("{baseline}^"), &head) {
+                    Ok(d) if !d.trim().is_empty() => Some(d),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(run_id = %run.id, "worktree diff: committed segment failed: {e}");
+                        None
+                    }
+                }
+            });
         let staged = crate::git_ops::get_staged_diff_text(&path).unwrap_or_else(|e| {
             tracing::warn!(run_id = %run.id, "worktree diff: staged capture failed: {e}");
             String::new()
@@ -512,11 +538,12 @@ impl Orchestrator {
                 return None;
             }
         };
-        Some(match (staged.trim().is_empty(), unstaged.trim().is_empty()) {
-            (true, _) => unstaged,
-            (false, true) => staged,
-            (false, false) => format!("{staged}\n{unstaged}"),
-        })
+        let parts: Vec<String> = [committed, Some(staged), Some(unstaged)]
+            .into_iter()
+            .flatten()
+            .filter(|d| !d.trim().is_empty())
+            .collect();
+        Some(parts.join("\n"))
     }
 
     /// Best-effort: persist the worktree diff onto a just-finished stage, so the
@@ -782,7 +809,10 @@ impl Orchestrator {
 
         // Snapshot the worktree NOW so a later Discard reverts only this stage's
         // edits. Best-effort & forensic: a capture failure never blocks the run.
+        // `head_before` feeds the mid-pipeline commit detector below.
+        let mut head_before: Option<String> = None;
         if let Ok(ws) = self.workspace_path(run) {
+            head_before = crate::git_ops::head_sha(&ws);
             match crate::orchestrator::git_baseline::capture_baseline(&ws) {
                 Ok(Some(sha)) => { let _ = self.db.lock().set_stage_baseline(&stage.id, Some(&sha)); }
                 Ok(None) => {}
@@ -868,6 +898,22 @@ impl Orchestrator {
 
         // The stage is no longer in flight — a stop after this point is a no-op.
         self.cancels.lock().remove(&run.id);
+
+        // Mid-pipeline commit detector: a worktree stage that moved HEAD
+        // ignored the never-commit contract. The committed work is still
+        // carried into the run diff (see `full_worktree_diff`), but say so in
+        // the journal — silently, the baseline/Discard assumptions degrade.
+        if let (Some(before), Ok(ws)) = (&head_before, self.workspace_path(run)) {
+            if let Some(after) = crate::git_ops::head_sha(&ws) {
+                if *before != after {
+                    let b = &before[..before.len().min(8)];
+                    let a = &after[..after.len().min(8)];
+                    self.journal_notice(&run.id, &stage.id, &format!(
+                        "⚠ this stage created git commit(s) ({b}…{a}) — pipeline stages should leave work uncommitted; the committed changes remain part of the run's diff"
+                    ));
+                }
+            }
+        }
 
         let outcome = match run_result {
             Ok(o) => o,

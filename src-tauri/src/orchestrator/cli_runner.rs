@@ -254,13 +254,22 @@ pub fn parse_cli_result(
     })
 }
 
+/// File-mutating Claude Code tools denied to a read-only (review) CLI stage.
+/// The API substrate enforces read-only reviewers through its tool allowlist;
+/// the CLI ran with `bypassPermissions` and nothing but a "Do not modify
+/// files" prompt — a reviewer that "fixes" what it reviews corrupts the very
+/// diff the gate then approves. `Bash` stays allowed (reviewers must run
+/// builds/tests), so this is a guardrail, not a sandbox.
+pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
+
 /// Build the argv (after the program name) for a headless `claude -p` run.
 /// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
-/// independently and non-JSON log lines are simply skipped.
-pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<String> {
-    vec![
+/// independently and non-JSON log lines are simply skipped. `read_only` adds
+/// the review-stage tool denial (see [`REVIEW_DISALLOWED_TOOLS`]).
+pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -273,14 +282,19 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64) -> Vec<S
         "bypassPermissions".to_string(),
         "--max-turns".to_string(),
         max_turns.max(1).to_string(),
-    ]
+    ];
+    if read_only {
+        args.push("--disallowedTools".to_string());
+        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
+    }
+    args
 }
 
 /// Argv for resuming an existing headless session: continue the same
 /// conversation (`--resume <id>`) with a fresh turn budget. The continuation
 /// nudge is supplied via stdin by the caller.
-pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> Vec<String> {
-    vec![
+pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         "--output-format".to_string(), "stream-json".to_string(),
         "--verbose".to_string(),
@@ -288,7 +302,12 @@ pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64) -> V
         "--resume".to_string(), session_id.to_string(),
         "--permission-mode".to_string(), "bypassPermissions".to_string(),
         "--max-turns".to_string(), max_turns.max(1).to_string(),
-    ]
+    ];
+    if read_only {
+        args.push("--disallowedTools".to_string());
+        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
+    }
+    args
 }
 
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
@@ -326,14 +345,19 @@ impl AgentRunner for CliRunner {
         // not that, so the body is inlined here rather than hoping the CLI
         // reads the token out of the brief.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
+        // A worktree review stage runs read-only: its whole contract is to
+        // judge the diff, not to change it (Action-environment roles keep
+        // their write access — committing/pushing IS their job).
+        let read_only = matches!(stage.artifact_kind, ArtifactKind::Review)
+            && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree);
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
-                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations),
+                build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations, read_only),
                 "Continue the task from where you left off. You have a fresh turn budget; \
                  finish the remaining work, then stop.".to_string(),
             ),
             None => (
-                build_cli_args(&stage.agent_model, &system, stage.max_iterations),
+                build_cli_args(&stage.agent_model, &system, stage.max_iterations, read_only),
                 user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
             ),
         };
