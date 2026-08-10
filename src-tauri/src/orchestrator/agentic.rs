@@ -438,8 +438,16 @@ fn message_chars(m: &LlmMessage) -> usize {
                 crate::providers::LlmBlock::Image { data, .. } => data.len() / 2,
             })
             .sum(),
-        LlmContent::AssistantWithTools { text, tool_uses, .. } => {
-            text.len() + tool_uses.iter().map(|u| u.input.to_string().len()).sum::<usize>()
+        LlmContent::AssistantWithTools { raw, text, tool_uses } => {
+            // With thinking enabled, `raw` (replayed verbatim, thinking blocks
+            // included) is what actually rides the wire and can dwarf the
+            // visible text — counting only text+tools undercounts exactly
+            // when the guard matters most.
+            if raw.is_empty() {
+                text.len() + tool_uses.iter().map(|u| u.input.to_string().len()).sum::<usize>()
+            } else {
+                raw.iter().map(|v| v.to_string().len()).sum()
+            }
         }
         LlmContent::ToolResults(rs) => rs.iter().map(|r| r.content.len()).sum(),
     }
@@ -995,26 +1003,45 @@ pub async fn run_agentic_loop(
     }
     if !cancel.load(Ordering::Relaxed) {
         // The budget-stop path already closed with a user turn (the voided
-        // tool results carry the close instruction); pushing another user
-        // message would break role alternation on strict providers.
+        // tool results carry the close instruction). For the cap path, the
+        // instruction is APPENDED to the last tool-result message — the loop
+        // always ends one after executing tools — because a separate
+        // consecutive user turn breaks role alternation on strict providers.
+        // Defensive fallback: a tail that isn't tool results (shouldn't
+        // happen) takes the instruction as its own user turn.
+        const CLOSE_INSTRUCTION: &str =
+            "Your tool budget for this stage is exhausted — you cannot call any more tools. \
+             Write your final answer NOW with what you already know: what you accomplished, \
+             what remains undone, and anything the next stage must know to continue. \
+             If you were reviewing, state your findings so far.";
         if !budget_stopped {
-            messages.push(LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Text(
-                    "Your tool budget for this stage is exhausted — you cannot call any more tools. \
-                     Write your final answer NOW with what you already know: what you accomplished, \
-                     what remains undone, and anything the next stage must know to continue. \
-                     If you were reviewing, state your findings so far."
-                        .to_string(),
-                ),
-            });
+            match messages.last_mut() {
+                Some(LlmMessage { content: LlmContent::ToolResults(results), .. })
+                    if !results.is_empty() =>
+                {
+                    if let Some(last) = results.last_mut() {
+                        last.content.push_str("\n\n[system] ");
+                        last.content.push_str(CLOSE_INSTRUCTION);
+                    }
+                }
+                _ => messages.push(LlmMessage {
+                    role: LlmRole::User,
+                    content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
+                }),
+            }
         }
+        // The SAME tool list rides along: a history containing tool_use /
+        // tool_result blocks with an empty `tools` array is a hard 400 on
+        // Anthropic ("requests which include tool_use … must define tools"),
+        // and keeping the list intact preserves the prompt-cache prefix. The
+        // instruction (not a schema change) is what forbids more tool calls;
+        // a response that calls tools anyway still yields its text below.
         let req = LlmRequest {
             model: model.to_string(),
             max_tokens: max_tokens_for(effort),
             system: system.to_string(),
             messages: messages.clone(),
-            tools: vec![],
+            tools: tools.clone(),
             tool_choice: None,
             effort,
             cache: true,

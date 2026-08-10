@@ -660,28 +660,36 @@ fn wait_command_bounded(
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let drain = |pipe: Option<std::process::ChildStdout>| {
+    // Drain into SHARED buffers (not thread return values): if a killed
+    // command's grandchild escaped the process group and still holds a pipe
+    // write-end, `read_to_end` never returns — a blocking `join()` would then
+    // hang this function forever. With shared buffers we can snapshot what
+    // arrived and DETACH a stuck drain thread after a bounded wait.
+    let out_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+    let err_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+    let drain_into = |buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+                      mut pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
+            if let Some(p) = pipe.as_mut() {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match p.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    }
+                }
             }
-            buf
         })
     };
-    let drain_err = |pipe: Option<std::process::ChildStderr>| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let out_task = drain(stdout);
-    let err_task = drain_err(stderr);
+    let out_task = drain_into(
+        std::sync::Arc::clone(&out_buf),
+        stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let err_task = drain_into(
+        std::sync::Arc::clone(&err_buf),
+        stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
     let started = std::time::Instant::now();
     let ended = loop {
         match child.try_wait() {
@@ -706,10 +714,20 @@ fn wait_command_bounded(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let stdout_buf = out_task.join().unwrap_or_default();
-    let stderr_buf = err_task.join().unwrap_or_default();
+    // Bounded join: give the drain threads a moment to see EOF, then take the
+    // buffer snapshots regardless — a stuck thread (escaped grandchild holding
+    // the pipe) is detached, never waited on.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for task in [&out_task, &err_task] {
+        while !task.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let stdout_buf = out_buf.lock().unwrap().clone();
+    let stderr_buf = err_buf.lock().unwrap().clone();
     let stdout = String::from_utf8_lossy(&stdout_buf);
     let stderr = String::from_utf8_lossy(&stderr_buf);
+    drop((out_task, err_task)); // detach — a live thread only appends to buffers we've copied
     let mut result = String::new();
     if !stdout.is_empty() {
         result.push_str(&stdout);

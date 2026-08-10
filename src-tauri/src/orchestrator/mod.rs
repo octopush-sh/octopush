@@ -803,7 +803,11 @@ impl Orchestrator {
         // stages (same ancestry rule as the dossier) with their archived
         // artifact + journal digest and the model that did the work — the
         // asking stage consults that model, not just its paper trail.
-        let peers: Vec<crate::orchestrator::agentic::PeerStage> = {
+        // API-substrate only: CliRunner never reads `ctx.peers`, and building
+        // the digests is O(prior stages) of journal reads per stage start.
+        let peers: Vec<crate::orchestrator::agentic::PeerStage> = if !matches!(spec.substrate, AgentSubstrate::Api) {
+            Vec::new()
+        } else {
             let all = self.db.lock().list_run_stages(&run.id)?;
             let authored = all.iter().any(|s| !s.parents.is_empty());
             let anc = if authored { Some(ancestors_of(&all, stage.position)) } else { None };
@@ -946,11 +950,17 @@ impl Orchestrator {
         // The stage is no longer in flight — a stop after this point is a no-op.
         self.cancels.lock().remove(&run.id);
 
-        // Mid-pipeline commit detector: a worktree stage that moved HEAD
+        // Mid-pipeline commit detector: a WORKTREE stage that moved HEAD
         // ignored the never-commit contract. The committed work is still
         // carried into the run diff (see `full_worktree_diff`), but say so in
         // the journal — silently, the baseline/Discard assumptions degrade.
-        if let (Some(before), Ok(ws)) = (&head_before, self.workspace_path(run)) {
+        // Action-environment stages (commit/PR/merge/release) are exempt:
+        // moving HEAD is their documented job.
+        let worktree_env = matches!(
+            spec.role_environment,
+            crate::orchestrator::types::RoleEnvironment::Worktree
+        );
+        if let (true, Some(before), Ok(ws)) = (worktree_env, &head_before, self.workspace_path(run)) {
             if let Some(after) = crate::git_ops::head_sha(&ws) {
                 if *before != after {
                     let b = &before[..before.len().min(8)];
@@ -998,6 +1008,13 @@ impl Orchestrator {
                 if let Err(e) = self.db.lock().set_stage_blocked_transcript(&stage.id, Some(t)) {
                     tracing::warn!(stage_id = %stage.id, "blocked transcript persist failed: {e}");
                 }
+            }
+            // A CLI question-block carries the session id of the run that
+            // asked — persist it so the answered re-run `--resume`s that
+            // session (the CLI's own continuation channel) instead of
+            // re-paying the whole exploration.
+            if outcome.session_id.is_some() {
+                self.db.lock().set_stage_session(&stage.id, outcome.session_id.as_deref())?;
             }
             self.recompute_run_cost(&run.id)?;
             return Ok((StageStatus::AwaitingCheckpoint, None));
@@ -1741,6 +1758,14 @@ impl Orchestrator {
                             .ok();
                             let feedback = format_blocker_feedback(ask.as_ref(), &answers);
                             self.archive_and_reset_stage(run_id, s, None, Some(&feedback))?;
+                            // A blocked CLI stage with a session resumes it —
+                            // the answers reach the SAME conversation via the
+                            // resume nudge (the CLI counterpart of the API's
+                            // transcript continuation).
+                            let can_resume = s.substrate == "cli" && s.session_id.is_some();
+                            if can_resume {
+                                self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                            }
                             self.recompute_run_cost(run_id)?;
                         }
                     }

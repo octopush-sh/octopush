@@ -7987,17 +7987,30 @@ mod live_tests {
     }
 
     #[test]
-    fn cli_usage_from_stream_events_sums_assistant_turns() {
+    fn cli_usage_from_stream_events_dedupes_by_message_id() {
         use crate::orchestrator::cli_runner::usage_from_stream_event;
-        let ev = serde_json::json!({
+        // The CLI emits one assistant event PER CONTENT BLOCK, each repeating
+        // the same message's usage — keying by id must collapse them to one.
+        let mk = |id: &str, input: u64| serde_json::json!({
             "type": "assistant",
-            "message": { "usage": { "input_tokens": 100, "output_tokens": 7,
+            "message": { "id": id, "usage": { "input_tokens": input, "output_tokens": 7,
                                      "cache_read_input_tokens": 50, "cache_creation_input_tokens": 3 } }
         });
-        assert_eq!(usage_from_stream_event(&ev), Some((100, 7, 50, 3)));
+        let (id1, u1) = usage_from_stream_event(&mk("msg_1", 100)).unwrap();
+        assert_eq!(id1.as_deref(), Some("msg_1"));
+        assert_eq!(u1.input_tokens, 100);
+        assert_eq!(u1.output_tokens, 7);
+        // Two blocks of the same message: latest-per-id keeps ONE entry.
+        let mut map = std::collections::HashMap::new();
+        for ev in [mk("msg_1", 100), mk("msg_1", 100), mk("msg_2", 40)] {
+            let (id, u) = usage_from_stream_event(&ev).unwrap();
+            map.insert(id.unwrap(), u);
+        }
+        let total: u64 = map.values().map(|u| u.input_tokens).sum();
+        assert_eq!(total, 140, "duplicate blocks of one message count once");
         // Non-assistant events report nothing.
         let other = serde_json::json!({ "type": "user", "message": { "usage": { "input_tokens": 9 } } });
-        assert_eq!(usage_from_stream_event(&other), None);
+        assert!(usage_from_stream_event(&other).is_none());
     }
 
     #[tokio::test]

@@ -41,16 +41,16 @@ struct CliResult {
     session_id: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default, Clone, Copy)]
-struct CliUsage {
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct CliUsage {
     #[serde(default)]
-    input_tokens: u64,
+    pub(crate) input_tokens: u64,
     #[serde(default)]
-    output_tokens: u64,
+    pub(crate) output_tokens: u64,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
 }
 
 impl CliUsage {
@@ -62,22 +62,29 @@ impl CliUsage {
     }
 }
 
-/// Per-turn usage from an `assistant` NDJSON stream event (`message.usage`).
-/// Summed while streaming so a stop/timeout that never sees the terminal
-/// `result` event can still report an ESTIMATE of the burned spend instead of
-/// zero — every provider call bills its own input, so summing is the right
-/// accounting.
-pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(u64, u64, u64, u64)> {
+/// Per-message usage from an `assistant` NDJSON stream event: the message id
+/// (the CLI emits ONE assistant event per content block, each repeating the
+/// same message's usage — summing raw events double/triple-counts multi-block
+/// turns) plus the usage tuple. Callers keep the LATEST usage per id and sum
+/// across ids, so a stop/timeout that never sees the terminal `result` event
+/// still reports an honest ESTIMATE of the burned spend instead of zero.
+/// A missing id yields `None` for the id — the caller keys it uniquely.
+pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
-    let u = v.get("message")?.get("usage")?;
+    let msg = v.get("message")?;
+    let u = msg.get("usage")?;
     let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let id = msg.get("id").and_then(Value::as_str).map(str::to_string);
     Some((
-        g("input_tokens"),
-        g("output_tokens"),
-        g("cache_read_input_tokens"),
-        g("cache_creation_input_tokens"),
+        id,
+        CliUsage {
+            input_tokens: g("input_tokens"),
+            output_tokens: g("output_tokens"),
+            cache_read_input_tokens: g("cache_read_input_tokens"),
+            cache_creation_input_tokens: g("cache_creation_input_tokens"),
+        },
     ))
 }
 
@@ -398,8 +405,18 @@ impl AgentRunner for CliRunner {
         let (args, user) = match stage.resume_session.as_deref() {
             Some(sid) => (
                 build_cli_args_resume(&stage.agent_model, sid, stage.max_iterations, read_only),
-                "Continue the task from where you left off. You have a fresh turn budget; \
-                 finish the remaining work, then stop.".to_string(),
+                // An answered question-block resumes with the director's
+                // decisions in the nudge — the CLI counterpart of the API
+                // substrate's transcript continuation. A plain halt-recovery
+                // resume has no feedback and keeps the generic nudge.
+                match stage.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
+                    Some(fb) => format!(
+                        "{fb}\n\nContinue the task from where you left off with these decisions. \
+                         You have a fresh turn budget; finish the remaining work, then stop."
+                    ),
+                    None => "Continue the task from where you left off. You have a fresh turn budget; \
+                             finish the remaining work, then stop.".to_string(),
+                },
             ),
             None => (
                 build_cli_args(&stage.agent_model, &system, stage.max_iterations, read_only),
@@ -514,9 +531,11 @@ impl AgentRunner for CliRunner {
         // Running usage estimate from streamed assistant events, readable from
         // the cancel branch too — a stop/timeout used to record ZERO usage
         // ("unknowable mid-flight"), silently understating real spend against
-        // the budget.
-        let streamed_usage: std::sync::Arc<parking_lot::Mutex<CliUsage>> =
-            std::sync::Arc::new(parking_lot::Mutex::new(CliUsage::default()));
+        // the budget. Keyed by message id (latest usage per message wins) so
+        // the CLI's one-event-per-content-block stream never double-counts a
+        // multi-block turn; id-less events get a unique synthetic key.
+        let streamed_usage: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, CliUsage>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let usage_in_loop = std::sync::Arc::clone(&streamed_usage);
         let read_loop = async {
             let mut reader = tokio::io::BufReader::new(stdout);
@@ -564,13 +583,10 @@ impl AgentRunner for CliRunner {
                 if is_result_event(&value) {
                     result_line = Some(trimmed.to_string());
                 }
-                if let Some((i, o, cr, cc)) = usage_from_stream_event(&value) {
-                    usage_in_loop.lock().add(&CliUsage {
-                        input_tokens: i,
-                        output_tokens: o,
-                        cache_read_input_tokens: cr,
-                        cache_creation_input_tokens: cc,
-                    });
+                if let Some((id, u)) = usage_from_stream_event(&value) {
+                    let mut map = usage_in_loop.lock();
+                    let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                    map.insert(key, u);
                 }
                 for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
                     emitter.emit_raw_entry(entry);
@@ -599,7 +615,7 @@ impl AgentRunner for CliRunner {
                 let _ = child.kill().await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
-                let u = *streamed_usage.lock();
+                let u = sum_usage(&streamed_usage.lock());
                 return Ok(failed_stage_with_usage(
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
@@ -612,7 +628,7 @@ impl AgentRunner for CliRunner {
             ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
             ReadEnd::Idle(None, _) => {
                 stderr_task.abort();
-                let u = *streamed_usage.lock();
+                let u = sum_usage(&streamed_usage.lock());
                 return Ok(failed_stage_with_usage(
                     "claude timed out — no output for 5 minutes",
                     &stage.agent_model,
@@ -621,7 +637,7 @@ impl AgentRunner for CliRunner {
             }
             ReadEnd::AbsCap(None, _) => {
                 stderr_task.abort();
-                let u = *streamed_usage.lock();
+                let u = sum_usage(&streamed_usage.lock());
                 return Ok(failed_stage_with_usage(
                     "claude exceeded the 60-minute cap",
                     &stage.agent_model,
@@ -702,6 +718,15 @@ fn failure_detail(stderr: &str, fallback: &str) -> String {
 fn stderr_tail(stderr: &str, n: usize) -> String {
     let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Sum the per-message usage map into one total (see `usage_from_stream_event`).
+fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
+    let mut total = CliUsage::default();
+    for u in map.values() {
+        total.add(u);
+    }
+    total
 }
 
 /// A failed outcome carrying the ESTIMATED usage summed from the streamed
