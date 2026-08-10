@@ -6289,6 +6289,41 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn same_batch_sibling_reviews_merge_their_loop_feedback() {
+        // Two auto-loop reviews off one implement, ready in one batch, both
+        // requesting changes: the FIRST loop-back resets the window; the
+        // SECOND must MERGE its findings into the target's feedback instead
+        // of re-resetting (which would overwrite the first review's findings).
+        let (db, ws) = db_with_workspace();
+        let mut rev_a = draft_with("code_review", vec![0], ro_tools(), false);
+        rev_a.loop_target_position = Some(0);
+        rev_a.loop_max_iterations = 1;
+        rev_a.loop_mode = Some("auto".into());
+        let mut rev_b = draft_with("verify", vec![0], ro_tools(), false);
+        rev_b.loop_target_position = Some(0);
+        rev_b.loop_max_iterations = 1;
+        rev_b.loop_mode = Some("auto".into());
+        let stages = vec![draft_with("implement", vec![], None, false), rev_a, rev_b];
+        let pid = db.lock().save_pipeline(None, "TwinReviews", "d", &stages).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(VerdictRunner { verdict: "CHANGES_REQUESTED" }));
+
+        let status = orch.run_to_pause(&run_id).await.unwrap();
+        assert_eq!(status, RunStatus::Paused, "both reviews eventually gate at their caps");
+        let rows = db.lock().list_run_stages(&run_id).unwrap();
+        let fb = rows[0].feedback.as_deref().unwrap_or("");
+        assert!(
+            fb.contains("additional findings from the verify stage"),
+            "the second review's findings were merged, not dropped: {fb}"
+        );
+        // Both reviews consumed their loop iteration (the merge still counts).
+        assert_eq!(rows[1].loop_iterations, 1);
+        assert_eq!(rows[2].loop_iterations, 1);
+    }
+
+    #[tokio::test]
     async fn gated_loop_review_stage_pauses_for_checkpoint() {
         let (orch, run_id, db) = looped_run(2);
         let status = orch.run_to_pause(&run_id).await.unwrap();

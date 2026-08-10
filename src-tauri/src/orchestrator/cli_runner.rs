@@ -554,6 +554,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                                 if let Some(text) = item.get("text").and_then(Value::as_str) {
                                     if !text.trim().is_empty() {
                                         accum.final_message = Some(text.to_string());
+                                        // A message AFTER an error means the CLI
+                                        // recovered (retried the turn) — a stale
+                                        // sticky error must not outrank the
+                                        // eventual real answer.
+                                        accum.error = None;
                                         entries.push(json!({ "kind": "text", "text": text.trim() }));
                                     }
                                 }
@@ -614,6 +619,7 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                 if let Some(text) = msg.get("message").and_then(Value::as_str) {
                     if !text.trim().is_empty() {
                         accum.final_message = Some(text.to_string());
+                        accum.error = None; // recovered — see the modern arm
                         entries.push(json!({ "kind": "text", "text": text.trim() }));
                     }
                 }
@@ -622,6 +628,7 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                 if let Some(text) = msg.get("last_agent_message").and_then(Value::as_str) {
                     if !text.trim().is_empty() {
                         accum.final_message = Some(text.to_string());
+                        accum.error = None; // recovered — see the modern arm
                     }
                 }
             }
@@ -1048,10 +1055,15 @@ impl AgentRunner for CliRunner {
             ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap")),
         };
         // Is there a salvageable terminal state? Claude: a captured `result`
-        // line. Codex: an accumulated final assistant message.
+        // line (authoritative — the CLI declared itself finished). Codex has
+        // NO terminal event: an accumulated assistant message on a TIMEOUT is
+        // just the last narration of a stalled run, not proof of completion —
+        // promoting it to a Done artifact would hand half-finished work
+        // downstream unmarked. A stalled codex stage therefore fails honestly
+        // (the journal keeps its messages; Accept-partial salvages them).
         let has_terminal = match dialect {
             CliDialect::Claude => result_line.is_some(),
-            CliDialect::Codex => codex_accum.lock().final_message.is_some(),
+            CliDialect::Codex => false,
         };
         if let (Some(kind), false) = (timeout_kind, has_terminal) {
             stderr_task.abort();
