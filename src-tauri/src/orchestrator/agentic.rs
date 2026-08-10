@@ -414,6 +414,92 @@ async fn answer_ask_stage(
     }
 }
 
+/// Fraction of the model's context window the request may fill before old
+/// tool results start being compacted.
+const CONTEXT_FILL_RATIO_PCT: usize = 70;
+/// Context-window guess (tokens) for models the catalog doesn't know. Small
+/// local models are exactly the ones that die on an overgrown history, so the
+/// guess is deliberately conservative.
+const DEFAULT_CONTEXT_TOKENS: usize = 100_000;
+/// What a compacted tool result is truncated to.
+const COMPACTED_RESULT_CHARS: usize = 500;
+/// The newest messages are never compacted — the model needs its recent
+/// working set intact.
+const COMPACTION_KEEP_TAIL: usize = 4;
+
+/// Rough size (chars) of one message's model-visible content.
+fn message_chars(m: &LlmMessage) -> usize {
+    match &m.content {
+        LlmContent::Text(t) => t.len(),
+        LlmContent::Multimodal(blocks) => blocks
+            .iter()
+            .map(|b| match b {
+                crate::providers::LlmBlock::Text(t) => t.len(),
+                crate::providers::LlmBlock::Image { data, .. } => data.len() / 2,
+            })
+            .sum(),
+        LlmContent::AssistantWithTools { text, tool_uses, .. } => {
+            text.len() + tool_uses.iter().map(|u| u.input.to_string().len()).sum::<usize>()
+        }
+        LlmContent::ToolResults(rs) => rs.iter().map(|r| r.content.len()).sum(),
+    }
+}
+
+/// Compact the OLDEST tool results (never the last [`COMPACTION_KEEP_TAIL`]
+/// messages) until the history estimate fits `target_chars`. Returns how many
+/// results were compacted. Old tool output is the safest thing to shrink: the
+/// model has already acted on it, and the marker says how to get it back.
+fn compact_history(messages: &mut [LlmMessage], system_chars: usize, target_chars: usize) -> usize {
+    let mut total: usize = system_chars + messages.iter().map(message_chars).sum::<usize>();
+    if total <= target_chars {
+        return 0;
+    }
+    let mut compacted = 0usize;
+    let end = messages.len().saturating_sub(COMPACTION_KEEP_TAIL);
+    for m in messages[..end].iter_mut() {
+        if total <= target_chars {
+            break;
+        }
+        if let LlmContent::ToolResults(results) = &mut m.content {
+            for r in results.iter_mut() {
+                if r.content.len() > COMPACTED_RESULT_CHARS + 200 {
+                    let keep = crate::chat_engine::truncate_char_safe(&r.content, COMPACTED_RESULT_CHARS);
+                    let new = format!(
+                        "{keep}\n… [older tool output compacted to keep the conversation inside the model's context window — re-run the tool if you need it again]"
+                    );
+                    total -= r.content.len().saturating_sub(new.len());
+                    r.content = new;
+                    compacted += 1;
+                    if total <= target_chars {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    compacted
+}
+
+/// Test-only re-export of [`compact_history`] (the fn itself stays private).
+#[cfg(test)]
+pub fn compact_history_for_tests(
+    messages: &mut [LlmMessage],
+    system_chars: usize,
+    target_chars: usize,
+) -> usize {
+    compact_history(messages, system_chars, target_chars)
+}
+
+/// The model's context window (tokens) from the provider catalog, or the
+/// conservative default when unknown.
+fn model_context_tokens(model: &str) -> usize {
+    crate::provider_router::ProviderRouter::load()
+        .ok()
+        .and_then(|r| r.find_model(model).map(|(_, mi)| mi.max_context as usize))
+        .filter(|c| *c > 0)
+        .unwrap_or(DEFAULT_CONTEXT_TOKENS)
+}
+
 /// The last-resort question text when a block carries no usable summary either.
 const BLOCK_FALLBACK_QUESTION: &str = "The stage needs a decision to proceed.";
 
@@ -601,6 +687,11 @@ pub async fn run_agentic_loop(
     // Why the loop left its turn budget: the iteration cap (default) or a
     // mid-stage budget stop. Drives the forced-close notice below.
     let mut budget_stopped = false;
+    // Context-window guard: chars ≈ 4×tokens; compaction starts at 70% fill.
+    // Small-window models (locals, some OpenAI-compat) used to die mid-stage
+    // with a context 400 the retry could never fix.
+    let context_char_budget =
+        model_context_tokens(model) * 4 * CONTEXT_FILL_RATIO_PCT / 100;
     // How long to pace before the next call, set from the previous response's
     // reported rate-limit headroom (see `compute_throttle`). Applied at the top
     // of the loop so it covers every path that issues another call.
@@ -624,6 +715,17 @@ pub async fn run_agentic_loop(
                 out.text = "(stopped by the director)".to_string();
                 return Ok(out);
             }
+        }
+
+        // Keep the request inside the model's window: compact the oldest tool
+        // results once the estimate crosses the fill threshold. (This breaks
+        // the prompt-cache prefix for the turn it fires on — acceptable, it
+        // only happens when the alternative is a hard context 400.)
+        let n = compact_history(&mut messages, system.len(), context_char_budget);
+        if n > 0 {
+            emitter.notice(&format!(
+                "context window filling — compacted {n} older tool result(s) to stay under the model's limit"
+            ));
         }
 
         let req = LlmRequest {

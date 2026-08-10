@@ -7850,6 +7850,44 @@ mod live_tests {
             "case-tolerant retry lands the verdict");
     }
 
+    #[test]
+    fn compact_history_shrinks_old_tool_results_not_the_tail() {
+        use crate::orchestrator::agentic::compact_history_for_tests as compact;
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
+        let big = "x".repeat(20_000);
+        let mk_results = |id: &str| LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult {
+                tool_use_id: id.into(),
+                content: big.clone(),
+                is_error: false,
+            }]),
+        };
+        let mut messages = vec![
+            mk_results("old1"),
+            mk_results("old2"),
+            mk_results("t1"),
+            mk_results("t2"),
+            mk_results("t3"),
+            mk_results("t4"),
+        ];
+        // Budget forces compaction of the two oldest; the 4-message tail is
+        // protected even though shrinking it would fit the budget better.
+        let n = compact(&mut messages, 0, 90_000);
+        assert!(n >= 1, "compacted something");
+        let text_of = |m: &LlmMessage| match &m.content {
+            LlmContent::ToolResults(rs) => rs[0].content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(text_of(&messages[0]).contains("compacted"), "oldest shrank");
+        for m in &messages[2..] {
+            assert!(!text_of(m).contains("compacted"), "the tail is untouched");
+        }
+        // Already under budget → untouched.
+        let mut small = vec![mk_results("a")];
+        assert_eq!(compact(&mut small, 0, 1_000_000), 0);
+    }
+
     #[tokio::test]
     async fn agentic_loop_ask_stage_unknown_step_errors_and_continues() {
         use crate::orchestrator::agentic::PeerStage;
