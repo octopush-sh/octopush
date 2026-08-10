@@ -405,6 +405,12 @@ pub async fn run_agentic_loop(
     // Auto-loop review stage: expose `submit_verdict` so the verdict arrives
     // as a structured tool call instead of a fragile text sentinel.
     verdict_tool: bool,
+    // Remaining run-budget headroom (USD) when the stage started. The old
+    // budget gate only checked BETWEEN stages, so one 100-turn stage could
+    // blow through the whole budget unchecked; with a limit set, the loop
+    // stops opening new tool turns once the stage's own spend crosses it and
+    // closes with what it has (same forced-close path as the iteration cap).
+    spend_limit: Option<f64>,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -433,6 +439,9 @@ pub async fn run_agentic_loop(
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
+    // Why the loop left its turn budget: the iteration cap (default) or a
+    // mid-stage budget stop. Drives the forced-close notice below.
+    let mut budget_stopped = false;
     // How long to pace before the next call, set from the previous response's
     // reported rate-limit headroom (see `compute_throttle`). Applied at the top
     // of the loop so it covers every path that issues another call.
@@ -595,6 +604,39 @@ pub async fn run_agentic_loop(
             },
         });
 
+        // Mid-stage budget stop: the stage's own spend crossed the remaining
+        // run-budget headroom. Void this turn's tool calls (a result per
+        // tool_use is required) and fall through to the forced close — the
+        // stage ends with a real summary instead of ploughing further past
+        // the cap. Final answers and blocks above are never disturbed.
+        if let Some(limit) = spend_limit {
+            let spent = crate::orchestrator::cost::stage_cost(
+                model,
+                out.input_tokens,
+                out.output_tokens,
+                out.cache_read_tokens,
+                out.cache_creation_tokens,
+            );
+            if spent >= limit {
+                emitter.notice(&format!(
+                    "run budget reached mid-stage (${spent:.2} spent by this stage) — closing with what it has"
+                ));
+                let voided: Vec<LlmToolResult> = resp
+                    .tool_uses
+                    .iter()
+                    .map(|u| LlmToolResult {
+                        tool_use_id: u.id.clone(),
+                        content: "not executed — the run's budget was reached; write your final answer now"
+                            .into(),
+                        is_error: true,
+                    })
+                    .collect();
+                messages.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(voided) });
+                budget_stopped = true;
+                break;
+            }
+        }
+
         // Execute each tool, collect results + log.
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
@@ -653,26 +695,34 @@ pub async fn run_agentic_loop(
         });
     }
 
-    // Exhaustion: the cap landed mid-work. Before declaring the stage lost,
-    // force a close — ONE more request with NO tools ("write your final
-    // answer with what you have"). 24 turns of good work used to be thrown
-    // away because the model never got to write its closing summary; a
-    // possibly-incomplete but real handoff beats an empty failure, and the
-    // caller annotates it so a downstream review judges it accordingly.
-    emitter.notice(&format!(
-        "iteration cap reached — {max_iterations} of {max_iterations} tool turns used; asking the model to close with what it has"
-    ));
+    // Exhaustion (or a mid-stage budget stop): the limit landed mid-work.
+    // Before declaring the stage lost, force a close — ONE more request with
+    // NO tools ("write your final answer with what you have"). 24 turns of
+    // good work used to be thrown away because the model never got to write
+    // its closing summary; a possibly-incomplete but real handoff beats an
+    // empty failure, and the caller annotates it so a downstream review
+    // judges it accordingly.
+    if !budget_stopped {
+        emitter.notice(&format!(
+            "iteration cap reached — {max_iterations} of {max_iterations} tool turns used; asking the model to close with what it has"
+        ));
+    }
     if !cancel.load(Ordering::Relaxed) {
-        messages.push(LlmMessage {
-            role: LlmRole::User,
-            content: LlmContent::Text(
-                "Your tool budget for this stage is exhausted — you cannot call any more tools. \
-                 Write your final answer NOW with what you already know: what you accomplished, \
-                 what remains undone, and anything the next stage must know to continue. \
-                 If you were reviewing, state your findings so far."
-                    .to_string(),
-            ),
-        });
+        // The budget-stop path already closed with a user turn (the voided
+        // tool results carry the close instruction); pushing another user
+        // message would break role alternation on strict providers.
+        if !budget_stopped {
+            messages.push(LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text(
+                    "Your tool budget for this stage is exhausted — you cannot call any more tools. \
+                     Write your final answer NOW with what you already know: what you accomplished, \
+                     what remains undone, and anything the next stage must know to continue. \
+                     If you were reviewing, state your findings so far."
+                        .to_string(),
+                ),
+            });
+        }
         let req = LlmRequest {
             model: model.to_string(),
             max_tokens: max_tokens_for(effort),

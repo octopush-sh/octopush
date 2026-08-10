@@ -38,6 +38,12 @@ pub struct StageContext {
     /// when the stage starts. Both substrates append their instructions to the
     /// stage's system prompt.
     pub skills: Vec<crate::skills::Skill>,
+    /// Remaining run-budget headroom (USD) when this stage started, when the
+    /// run has a budget. The API substrate stops opening new tool turns once
+    /// the stage's own spend crosses it (see `run_agentic_loop`); the CLI
+    /// substrate cannot be metered mid-flight and relies on the between-stage
+    /// gate plus `--max-turns`.
+    pub spend_limit: Option<f64>,
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -309,6 +315,7 @@ impl AgentRunner for ApiRunner {
                 None
             },
             matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
+            ctx.spend_limit,
         )
         .await;
 

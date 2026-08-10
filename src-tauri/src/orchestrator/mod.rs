@@ -834,6 +834,18 @@ impl Orchestrator {
                 reference_text.push_str(extra);
             }
             let skills = crate::skills::referenced_skills(&workspace_path, &reference_text);
+            // Intra-stage budget: the headroom left under the run's own cap
+            // when this stage starts. The between-stage gate already blocked
+            // a start at/over budget, so this is the amount ONE stage may
+            // spend before the loop stops opening new tool turns. A stage
+            // that starts with NO headroom can only be the director's
+            // conscious budget override — that runs unmetered (None), as the
+            // override intends.
+            let spend_limit = run
+                .budget_usd
+                .filter(|b| *b > 0.0)
+                .map(|b| b - run.cost_usd)
+                .filter(|r| *r > 0.0);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -845,6 +857,7 @@ impl Orchestrator {
                 exec_isolation,
                 allowed_write_roots,
                 skills,
+                spend_limit,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

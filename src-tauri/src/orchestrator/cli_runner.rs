@@ -41,7 +41,7 @@ struct CliResult {
     session_id: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone, Copy)]
 struct CliUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -51,6 +51,34 @@ struct CliUsage {
     cache_read_input_tokens: u64,
     #[serde(default)]
     cache_creation_input_tokens: u64,
+}
+
+impl CliUsage {
+    fn add(&mut self, other: &CliUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+}
+
+/// Per-turn usage from an `assistant` NDJSON stream event (`message.usage`).
+/// Summed while streaming so a stop/timeout that never sees the terminal
+/// `result` event can still report an ESTIMATE of the burned spend instead of
+/// zero — every provider call bills its own input, so summing is the right
+/// accounting.
+pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(u64, u64, u64, u64)> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let u = v.get("message")?.get("usage")?;
+    let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    Some((
+        g("input_tokens"),
+        g("output_tokens"),
+        g("cache_read_input_tokens"),
+        g("cache_creation_input_tokens"),
+    ))
 }
 
 /// Merge PATH-like dir lists into one, de-duplicating while preserving
@@ -414,6 +442,13 @@ impl AgentRunner for CliRunner {
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
         );
+        // Running usage estimate from streamed assistant events, readable from
+        // the cancel branch too — a stop/timeout used to record ZERO usage
+        // ("unknowable mid-flight"), silently understating real spend against
+        // the budget.
+        let streamed_usage: std::sync::Arc<parking_lot::Mutex<CliUsage>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(CliUsage::default()));
+        let usage_in_loop = std::sync::Arc::clone(&streamed_usage);
         let read_loop = async {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut result_line: Option<String> = None;
@@ -460,6 +495,14 @@ impl AgentRunner for CliRunner {
                 if is_result_event(&value) {
                     result_line = Some(trimmed.to_string());
                 }
+                if let Some((i, o, cr, cc)) = usage_from_stream_event(&value) {
+                    usage_in_loop.lock().add(&CliUsage {
+                        input_tokens: i,
+                        output_tokens: o,
+                        cache_read_input_tokens: cr,
+                        cache_creation_input_tokens: cc,
+                    });
+                }
                 for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
                     emitter.emit_raw_entry(entry);
                 }
@@ -485,8 +528,13 @@ impl AgentRunner for CliRunner {
             end = read_loop => end,
             _ = cancel_watch => {
                 let _ = child.kill().await;
-                return Ok(failed_stage(
+                // Estimated spend from the streamed assistant events — a stop
+                // used to record zero and silently understate the budget.
+                let u = *streamed_usage.lock();
+                return Ok(failed_stage_with_usage(
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
+                    &stage.agent_model,
+                    u,
                 ));
             }
         };
@@ -495,11 +543,21 @@ impl AgentRunner for CliRunner {
             ReadEnd::Idle(Some(line), t) | ReadEnd::AbsCap(Some(line), t) => (Some(line), t, true),
             ReadEnd::Idle(None, _) => {
                 stderr_task.abort();
-                return Ok(failed_stage("claude timed out — no output for 5 minutes"));
+                let u = *streamed_usage.lock();
+                return Ok(failed_stage_with_usage(
+                    "claude timed out — no output for 5 minutes",
+                    &stage.agent_model,
+                    u,
+                ));
             }
             ReadEnd::AbsCap(None, _) => {
                 stderr_task.abort();
-                return Ok(failed_stage("claude exceeded the 60-minute cap"));
+                let u = *streamed_usage.lock();
+                return Ok(failed_stage_with_usage(
+                    "claude exceeded the 60-minute cap",
+                    &stage.agent_model,
+                    u,
+                ));
             }
         };
 
@@ -558,6 +616,24 @@ fn failure_detail(stderr: &str, fallback: &str) -> String {
 fn stderr_tail(stderr: &str, n: usize) -> String {
     let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// A failed outcome carrying the ESTIMATED usage summed from the streamed
+/// assistant events (no terminal `result` event arrived to be authoritative).
+/// Cost is priced through the normal catalog so the run meter and budget see
+/// the burned spend instead of zero.
+fn failed_stage_with_usage(msg: &str, model: &str, u: CliUsage) -> StageOutcome {
+    let mut out = failed_stage(msg);
+    out.input_tokens = u.input_tokens;
+    out.output_tokens = u.output_tokens;
+    out.cost_usd = crate::orchestrator::cost::stage_cost(
+        model,
+        u.input_tokens,
+        u.output_tokens,
+        u.cache_read_input_tokens,
+        u.cache_creation_input_tokens,
+    );
+    out
 }
 
 fn failed_stage(msg: &str) -> StageOutcome {
