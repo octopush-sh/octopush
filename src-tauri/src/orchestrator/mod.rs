@@ -390,6 +390,7 @@ impl Orchestrator {
         stage: &crate::db::RunStageRow,
         closing_feedback: Option<&str>,
         reset_feedback: Option<&str>,
+        preserve_transcript: bool,
     ) -> AppResult<()> {
         if stage.artifact.is_some() || stage.error.is_some() {
             self.db.lock().archive_stage_attempt(stage, closing_feedback)?;
@@ -398,6 +399,15 @@ impl Orchestrator {
             .lock()
             .retire_stage_cost(run_id, stage.cost_usd, stage.input_tokens, stage.output_tokens)?;
         self.db.lock().reset_run_stage(&stage.id, None, reset_feedback)?;
+        // A fresh-attempt reset (loop-back, escalation, re-run, send-back) must
+        // not leave a stale conversation behind — the consume-once in
+        // `run_stage_once` would silently CONTINUE the erased attempt (worst
+        // case across a model swap, where replayed signed thinking blocks are
+        // rejected). Only the answered-`ask_director` path preserves it: that
+        // re-run is DEFINED as a continuation (D18).
+        if !preserve_transcript && stage.blocked_transcript.is_some() {
+            self.db.lock().set_stage_blocked_transcript(&stage.id, None)?;
+        }
         Ok(())
     }
 
@@ -433,7 +443,7 @@ impl Orchestrator {
                 // this very reset.
                 let cf = if s.id == review.id { feedback } else { None };
                 let fb = if s.id == review.id { None } else { feedback };
-                self.archive_and_reset_stage(run_id, s, cf, fb)?;
+                self.archive_and_reset_stage(run_id, s, cf, fb, false)?;
                 // An INNER review inside the window gets a fresh loop budget
                 // for each outer iteration — without this, its counter
                 // persisted across outer loops and the inner loop arrived
@@ -506,11 +516,13 @@ impl Orchestrator {
         // Committed-during-run segment: the run's start HEAD is the parent of
         // the earliest stage baseline (a dangling commit whose parent was
         // HEAD at capture time). HEAD unchanged ⇒ empty diff ⇒ skipped.
-        let committed = self
-            .db
-            .lock()
-            .list_run_stages(&run.id)
-            .ok()
+        // The row read stays its own statement so the db guard drops BEFORE
+        // the libgit2 work below — chaining `.and_then(git…)` off the locked
+        // read keeps the guard (a statement temporary) alive across an
+        // unbounded repo diff, starving every concurrent journal emit and,
+        // in the worker, the lease heartbeat (persist.rs's lock contract).
+        let stage_rows = self.db.lock().list_run_stages(&run.id).ok();
+        let committed = stage_rows
             .and_then(|ss| {
                 ss.into_iter()
                     .filter(|s| s.baseline_commit.is_some())
@@ -650,7 +662,7 @@ impl Orchestrator {
         // retry. `archive_and_reset_stage` resets with model_override `None`, so
         // the sticky `escalated` flag set below survives, and `recompute_run_cost`
         // folds the retired spend back into the run total.
-        self.archive_and_reset_stage(run_id, &fresh, None, fresh.feedback.as_deref())?;
+        self.archive_and_reset_stage(run_id, &fresh, None, fresh.feedback.as_deref(), false)?;
         self.db.lock().set_run_stage_escalated(&fresh.id, true)?;
         self.recompute_run_cost(run_id)?;
         // Narrate it in the stage journal (persisted + live), like `record_halt`.
@@ -744,7 +756,12 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
-        let role_def = match self.db.lock().get_role(&stage.role) {
+        // Bind the lookup so the guard drops before the match arms run — a
+        // match scrutinee's temporary lives for the whole match, and the
+        // error arms re-lock (`fail_run_stage`), which would deadlock the
+        // drive task on this non-reentrant mutex.
+        let role_lookup = self.db.lock().get_role(&stage.role);
+        let role_def = match role_lookup {
             Ok(Some(rd)) => rd,
             Ok(None) => {
                 let msg = format!("unknown role '{}'", stage.role);
@@ -1059,6 +1076,16 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // An unfinished failure (turn cap, budget stop, cancel) carries
+                // its conversation — persist it so a director Resume CONTINUES
+                // the work instead of starting over (the API-substrate analogue
+                // of the CLI's `--resume`). Best-effort: without it, Resume
+                // falls back to a fresh attempt.
+                if let Some(t) = outcome.blocked_transcript.as_deref() {
+                    if let Err(e) = self.db.lock().set_stage_blocked_transcript(&stage.id, Some(t)) {
+                        tracing::warn!(stage_id = %stage.id, "failed-stage transcript persist failed: {e}");
+                    }
+                }
                 // A resume attempt that produced no new session likely hit a
                 // dead/expired session — clear it so the next recovery re-runs
                 // fresh instead of looping on `--resume <dead id>`.
@@ -1720,7 +1747,7 @@ impl Orchestrator {
                 self.db.lock().set_stage_feedback(&target.id, Some(&merged))?;
             }
         }
-        self.archive_and_reset_stage(run_id, review, findings.as_deref(), None)?;
+        self.archive_and_reset_stage(run_id, review, findings.as_deref(), None, false)?;
         self.db.lock().increment_loop_iteration(&review.id)?;
         self.recompute_run_cost(run_id)?;
         Ok(())
@@ -1954,7 +1981,9 @@ impl Orchestrator {
                             >(json)
                             .ok();
                             let feedback = format_blocker_feedback(ask.as_ref(), &answers);
-                            self.archive_and_reset_stage(run_id, s, None, Some(&feedback))?;
+                            // preserve_transcript: the answered re-run CONTINUES
+                            // the asking conversation (D18).
+                            self.archive_and_reset_stage(run_id, s, None, Some(&feedback), true)?;
                             // A blocked CLI stage with a session resumes it —
                             // the answers reach the SAME conversation via the
                             // resume nudge (the CLI counterpart of the API's
@@ -2060,6 +2089,10 @@ impl Orchestrator {
                         self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                     }
                     self.db.lock().set_stage_resume_pending(&s.id, false)?;
+                    // Reject means "start over with feedback" — never continue
+                    // the rejected attempt's conversation (and a model override
+                    // would replay another model's transcript).
+                    self.db.lock().set_stage_blocked_transcript(&s.id, None)?;
                     self.db.lock().reset_run_stage(
                         &s.id,
                         model_override.as_deref(),
@@ -2078,6 +2111,10 @@ impl Orchestrator {
                 // so a code stage picks up from the files already on disk.
                 // For a CLI stage with a session id, resume_pending is set so the
                 // next run uses `--resume` to continue the same Claude session.
+                // An API stage that failed UNFINISHED left its conversation in
+                // `blocked_transcript` (which this reset deliberately preserves;
+                // consume-once in `run_stage_once` clears it) — the re-run
+                // CONTINUES that conversation instead of starting over.
                 if let Some(s) = &blocked {
                     if s.status == "failed" {
                         if s.artifact.is_some() || s.error.is_some() {
@@ -2261,7 +2298,7 @@ impl Orchestrator {
         // it re-gates on its own `checkpoint`/loop config when re-reached.
         let range = downstream_of(&stages, target.position);
         for s in &range {
-            self.archive_and_reset_stage(run_id, s, None, None)?;
+            self.archive_and_reset_stage(run_id, s, None, None, false)?;
             // `reset_run_stage` deliberately preserves session/resume/loop
             // state (loop-back relies on that) — a re-run wants the opposite:
             // never resume the old CLI session, start the loop fresh, and

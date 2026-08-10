@@ -125,6 +125,32 @@ pub struct BlockedTranscript {
     pub ask_tool_use_id: String,
 }
 
+/// Build the resume message list for a CONTINUATION (a stage that failed at
+/// the iteration cap or was stopped, now Resumed with a fresh turn budget):
+/// the saved transcript plus the continuation note — appended INTO the
+/// trailing tool-result when the tail is one (a separate consecutive user
+/// turn breaks role alternation on strict providers), else as its own user
+/// turn.
+pub fn resume_messages_for_continuation(
+    transcript: &BlockedTranscript,
+    note: &str,
+) -> Vec<LlmMessage> {
+    let mut messages = transcript.messages.clone();
+    match messages.last_mut() {
+        Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
+            if let Some(last) = results.last_mut() {
+                last.content.push_str("\n\n[system] ");
+                last.content.push_str(note);
+            }
+        }
+        _ => messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(note.to_string()),
+        }),
+    }
+    messages
+}
+
 /// Build the resume message list for an answered `ask_director` block: the
 /// saved transcript plus a tool-result turn answering the ask (and an
 /// explicit not-executed error for any sibling tool calls from that turn —
@@ -709,6 +735,10 @@ pub async fn run_agentic_loop(
         if cancel.load(Ordering::Relaxed) {
             emitter.notice("stopped by the director");
             out.text = "(stopped by the director)".to_string();
+            // Keep the conversation so a Resume CONTINUES instead of re-paying
+            // the whole exploration (same mechanism as an answered block).
+            out.blocked_transcript =
+                Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
             return Ok(out);
         }
 
@@ -721,6 +751,8 @@ pub async fn run_agentic_loop(
             if !interruptible_sleep(wait, cancel).await {
                 emitter.notice("stopped by the director");
                 out.text = "(stopped by the director)".to_string();
+                out.blocked_transcript =
+                    Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
                 return Ok(out);
             }
         }
@@ -1083,5 +1115,8 @@ pub async fn run_agentic_loop(
         }
     }
     out.text = format!("(agentic loop hit {max_iterations} iterations without finishing)");
+    // The turns are spent but the conversation is real work — persist it so a
+    // Resume with a fresh turn budget CONTINUES here instead of starting over.
+    out.blocked_transcript = Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
     Ok(out)
 }
