@@ -2759,6 +2759,7 @@ mod runner_helpers_tests {
             }],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         }
     }
 
@@ -2896,6 +2897,7 @@ mod runner_helpers_tests {
             ],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -3045,6 +3047,7 @@ mod runner_helpers_tests {
             }],
             refs_worktree: false,
             worktree_diff: None,
+            history: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -6001,6 +6004,85 @@ mod orchestrator_tests {
         );
         let spent_after = db.lock().get_run(&run_id).unwrap().unwrap().cost_usd;
         assert!(spent_after + 1e-9 >= spent_before);
+    }
+
+    /// Records every (position, StageInput) the orchestrator hands a runner,
+    /// then completes the stage. For loop-memory assertions.
+    struct InputRecordingRunner {
+        seen: Arc<Mutex<Vec<(i64, StageInput)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for InputRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push((stage.position, input.clone()));
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_usd: 0.01,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: None,
+                session_id: None,
+                blocked: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_back_feeds_every_stage_in_the_window_and_carries_history() {
+        // implement(0) → test(1) → code_review(2, gated loop → 0, cap 2).
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Window", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "test", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("gated"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(vec![]));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(InputRecordingRunner { seen: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        // Send the work back: the review's findings must land as feedback on
+        // EVERY stage in the reset window (D15), not just the loop target —
+        // the review artifact itself is nulled by the reset, so an
+        // intermediate stage would otherwise re-run blind.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::SendBack { feedback: None })
+            .await
+            .unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].feedback.as_deref(), Some("did code_review"), "target gets findings");
+        assert_eq!(stages[1].feedback.as_deref(), Some("did code_review"), "intermediate stage gets findings too");
+
+        // Loop memory (A3): the SECOND run of the target carries a history
+        // digest of its archived first attempt.
+        let inputs = seen.lock();
+        let second_impl = inputs
+            .iter()
+            .filter(|(p, _)| *p == 0)
+            .nth(1)
+            .expect("the loop re-ran the target");
+        let hist = second_impl.1.history.as_deref().expect("re-run carries attempt history");
+        assert!(hist.contains("Attempt 1"), "{hist}");
+        // The reviewer's own re-run knows its previous verdict as well.
+        let second_review = inputs.iter().filter(|(p, _)| *p == 2).nth(1)
+            .expect("the review re-ran");
+        assert!(second_review.1.history.is_some(), "reviewer carries its own attempt history");
     }
 
     #[tokio::test]

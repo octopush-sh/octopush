@@ -188,6 +188,16 @@ pub fn user_input_for(
     } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
     }
+    // Attempt history BEFORE the current feedback: the history is context,
+    // the feedback below is the binding directive for THIS attempt.
+    if let Some(h) = input.history.as_deref().filter(|h| !h.trim().is_empty()) {
+        s.push_str(&format!(
+            "This stage has run before in this run. History of its previous attempts:\n{h}\n"
+        ));
+        s.push_str(
+            "Do not repeat an approach that was already rejected, and do not undo a fix that earlier feedback demanded — that causes the loop to oscillate.\n\n",
+        );
+    }
     if let Some(fb) = feedback {
         s.push_str(&format!("Reviewer feedback to address this time:\n{fb}\n\n"));
         s.push_str(

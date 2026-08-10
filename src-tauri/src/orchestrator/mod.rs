@@ -424,9 +424,14 @@ impl Orchestrator {
             };
             if in_window && feeds_review {
                 // The feedback that closed the iteration is recorded on the
-                // review row only.
+                // review row only. Every OTHER stage in the reset window gets
+                // the review's findings as re-run feedback — not just the
+                // target: an intermediate stage (e.g. test between implement
+                // and review) used to re-run blind to why the loop happened,
+                // because the review artifact it might have read is nulled by
+                // this very reset.
                 let cf = if s.id == review.id { feedback } else { None };
-                let fb = if s.position == target_pos { feedback } else { None };
+                let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb)?;
             }
         }
@@ -1003,7 +1008,65 @@ impl Orchestrator {
             None
         };
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff })
+        // Loop memory: what this stage's earlier attempts were and why they
+        // were closed — so iteration N stops re-trying what iteration N-1
+        // already had rejected (and a reviewer can spot a regression to a
+        // finding it already reported).
+        let history = stages
+            .iter()
+            .find(|s| s.position == position)
+            .and_then(|s| self.attempt_history_digest(&s.id));
+
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history })
+    }
+
+    /// Compact digest of a stage's archived attempts (`stage_iterations`),
+    /// oldest→newest, for the re-run prompt: what each attempt was and what
+    /// closed it (review feedback / rejection / failure). Bounded: the last
+    /// [`HISTORY_MAX_ATTEMPTS`] attempts, each field snipped. `None` when the
+    /// stage has no archived attempts (the common first run).
+    fn attempt_history_digest(&self, stage_id: &str) -> Option<String> {
+        const HISTORY_MAX_ATTEMPTS: usize = 5;
+        const FEEDBACK_SNIP: usize = 700;
+        const ERROR_SNIP: usize = 300;
+        let snip = |s: &str, max: usize| -> String {
+            let t = s.trim();
+            let cut = crate::chat_engine::truncate_char_safe(t, max);
+            if cut.len() < t.len() { format!("{cut}…") } else { cut.to_string() }
+        };
+        let iters = self.db.lock().list_stage_iterations(stage_id).ok()?;
+        if iters.is_empty() {
+            return None;
+        }
+        let total = iters.len();
+        let skip = total.saturating_sub(HISTORY_MAX_ATTEMPTS);
+        let mut lines: Vec<String> = Vec::new();
+        if skip > 0 {
+            lines.push(format!("(showing the last {HISTORY_MAX_ATTEMPTS} of {total} attempts)"));
+        }
+        for it in iters.iter().skip(skip) {
+            let mut line = format!("Attempt {} ({}, {})", it.iteration, it.agent_model, it.status);
+            if let Some(fb) = it
+                .closing_feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                line.push_str(&format!(" — closed with feedback: {}", snip(fb, FEEDBACK_SNIP)));
+            } else if let Some(err) = it.error.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" — failed: {}", snip(err, ERROR_SNIP)));
+            } else if let Some(text) = it
+                .artifact
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<StageArtifact>(j).ok())
+                .map(|a| a.text)
+                .filter(|t| !t.trim().is_empty())
+            {
+                line.push_str(&format!(" — produced: {}", snip(&text, ERROR_SNIP)));
+            }
+            lines.push(line);
+        }
+        Some(lines.join("\n"))
     }
 
     /// Sum stage costs; recompute the baseline by re-pricing each stage's tokens

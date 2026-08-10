@@ -240,6 +240,11 @@ pub struct StageInput {
     /// of it. Best-effort (`None` on capture failure or an empty diff; the
     /// prompt then falls back to "inspect with your tools"). Capped at render.
     pub worktree_diff: Option<String>,
+    /// Compact digest of THIS stage's archived attempts (loop-backs, rejects,
+    /// escalations — from `stage_iterations`). Without it, iteration N ran
+    /// blind to what iterations 1..N-1 tried and why they were closed — the
+    /// setup for the classic review-loop oscillation between two answers.
+    pub history: Option<String>,
 }
 
 /// A director's hot-edit riding along with a re-run: validated BEFORE any
