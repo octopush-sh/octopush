@@ -97,6 +97,36 @@ fn role_words(role: &str) -> String {
     role.replace('_', " ")
 }
 
+/// Repo agent-convention files surfaced to API-substrate stages, in priority
+/// order. The Claude CLI reads these itself; an API-substrate agent (any
+/// OpenAI-compat model) never saw them — so it wrote code ignoring the
+/// project's own rules and the next reviewer bounced it for that. Mirrored
+/// files (CLAUDE.md and AGENTS.md are often identical) dedupe by content.
+const CONVENTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md", "CONVENTIONS.md"];
+
+/// The project-conventions section appended to an API-substrate stage's system
+/// prompt: each convention file found at the workspace root, capped, deduped.
+/// Empty string when none exist.
+pub(crate) fn repo_conventions_section(workspace_path: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for name in CONVENTION_FILES {
+        let Ok(content) = std::fs::read_to_string(workspace_path.join(name)) else {
+            continue;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() || seen.iter().any(|s| s == trimmed) {
+            continue;
+        }
+        seen.push(trimmed.to_string());
+        out.push_str(&format!(
+            "\n\nProject conventions from {name} — follow these while working in this repository:\n{}",
+            cap_section(trimmed),
+        ));
+    }
+    out
+}
+
 /// The dossier label for a section of the given kind.
 fn section_label(kind: &ArtifactKind) -> &'static str {
     match kind {
@@ -207,6 +237,10 @@ impl AgentRunner for ApiRunner {
         // API substrate: the `ask_director` escape valve is available, so the
         // carve-out is included (`can_ask_director = true`).
         let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        // Repo conventions (CLAUDE.md/AGENTS.md/…): the CLI substrate reads
+        // them itself; the API substrate must be handed them explicitly or a
+        // non-Claude implementer works blind to the project's rules.
+        system.push_str(&repo_conventions_section(&ctx.workspace_path));
         // Skills the brief named reach the stage as instructions, not as a
         // literal `/slug` the agent would have to guess at — resolved here, at
         // the moment this role actually runs.

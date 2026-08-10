@@ -2727,6 +2727,24 @@ mod runner_helpers_tests {
     use crate::orchestrator::runner::user_input_for;
     use crate::orchestrator::types::{ArtifactKind, InputSection, StageInput};
 
+    #[test]
+    fn repo_conventions_section_reads_and_dedupes() {
+        use crate::orchestrator::runner::repo_conventions_section;
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing there → empty.
+        assert_eq!(repo_conventions_section(dir.path()), "");
+        // CLAUDE.md + a mirrored AGENTS.md → included ONCE.
+        std::fs::write(dir.path().join("CLAUDE.md"), "Use tabs.\n").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Use tabs.\n").unwrap();
+        let s = repo_conventions_section(dir.path());
+        assert_eq!(s.matches("Use tabs.").count(), 1, "mirrored files dedupe: {s}");
+        assert!(s.contains("from CLAUDE.md"));
+        // A distinct AGENTS.md adds its own section.
+        std::fs::write(dir.path().join("AGENTS.md"), "Never use tabs.\n").unwrap();
+        let s = repo_conventions_section(dir.path());
+        assert!(s.contains("from CLAUDE.md") && s.contains("from AGENTS.md"), "{s}");
+    }
+
     /// Dossier with one Plan section, for the single-section tests.
     fn plan_input(text: &str) -> StageInput {
         StageInput {
