@@ -105,15 +105,22 @@ impl Orchestrator {
 
         // 3. Leases that ENDED since the last tick: the worker exited — flush
         //    the journal, emit the final state, announce the park/finish.
+        //    Per-run errors are logged, never propagated: one broken run must
+        //    not silence the live relay of every OTHER run for this tick and
+        //    all future ones.
         for run_id in &watched {
             if !leased.contains(run_id) && !repaired.contains(run_id) {
-                self.finish_watch(run_id)?;
+                if let Err(e) = self.finish_watch(run_id) {
+                    tracing::warn!(run_id = %run_id, error = %e, "bridge finish failed");
+                }
             }
         }
 
-        // 4. Live diff for every still-leased run.
+        // 4. Live diff for every still-leased run (same per-run isolation).
         for run_id in &leased {
-            self.tick_watch(run_id)?;
+            if let Err(e) = self.tick_watch(run_id) {
+                tracing::warn!(run_id = %run_id, error = %e, "bridge tick failed for run");
+            }
         }
         Ok(())
     }

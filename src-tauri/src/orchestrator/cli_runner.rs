@@ -807,6 +807,7 @@ impl AgentRunner for CliRunner {
             .resume_session
             .as_deref()
             .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only));
+        let resuming = resume_args.is_some();
         let (args, user) = match resume_args {
             Some(argv) => (
                 argv,
@@ -898,6 +899,13 @@ impl AgentRunner for CliRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Created before the spawn so the journal can name the substrate the
+        // moment it launches — the model id silently selects the dialect (B6),
+        // and a stage quietly running `codex` instead of `claude` is exactly
+        // the kind of surprise the journal exists to surface.
+        let emitter = crate::orchestrator::live::LiveEmitter::new(
+            ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
+        );
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -905,6 +913,12 @@ impl AgentRunner for CliRunner {
             }
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
+        emitter.notice(&format!(
+            "launching {} · {}{}",
+            dialect.binary(),
+            stage.agent_model,
+            if resuming { " · resuming session" } else { "" },
+        ));
 
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(user.as_bytes()).await;
@@ -929,9 +943,6 @@ impl AgentRunner for CliRunner {
         // UTF-8-only line reader would abort the whole stream on the first bad
         // byte (losing the result event). A bounded tail of recent lines is kept
         // for diagnostics when no result event ever arrives.
-        let emitter = crate::orchestrator::live::LiveEmitter::new(
-            ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
-        );
         // Running usage estimate from streamed assistant events, readable from
         // the cancel branch too — a stop/timeout used to record ZERO usage
         // ("unknowable mid-flight"), silently understating real spend against
@@ -953,6 +964,15 @@ impl AgentRunner for CliRunner {
             let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
             let mut raw: Vec<u8> = Vec::new();
             let started = std::time::Instant::now();
+            // Codex stream-schema tripwire: the codex CLI's JSON contract has
+            // drifted across versions and `codex_fold_event` skips unknown
+            // events — parsing many JSON lines while journaling NONE of them
+            // means the installed CLI speaks a schema we don't, and the live
+            // pane would sit silently empty until the stage settles. Say so
+            // once instead.
+            let mut codex_json_lines: u32 = 0;
+            let mut codex_journaled = false;
+            let mut codex_schema_warned = false;
             loop {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= ABS_CAP_SECS {
@@ -1005,7 +1025,9 @@ impl AgentRunner for CliRunner {
                         }
                     }
                     CliDialect::Codex => {
+                        codex_json_lines += 1;
                         let entries = codex_fold_event(&mut codex_in_loop.lock(), &value);
+                        codex_journaled |= !entries.is_empty();
                         for entry in entries {
                             emitter.emit_raw_entry(entry);
                         }
@@ -1013,6 +1035,14 @@ impl AgentRunner for CliRunner {
                             let mut map = usage_in_loop.lock();
                             let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
                             map.insert(key, u);
+                        }
+                        if !codex_journaled && !codex_schema_warned && codex_json_lines >= 10 {
+                            codex_schema_warned = true;
+                            emitter.notice(
+                                "codex is streaming events this version of Octopush doesn't \
+                                 recognize — the live journal may stay quiet until the stage \
+                                 finishes (the work itself is unaffected)",
+                            );
                         }
                     }
                 }

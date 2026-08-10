@@ -516,11 +516,13 @@ impl Orchestrator {
         // Committed-during-run segment: the run's start HEAD is the parent of
         // the earliest stage baseline (a dangling commit whose parent was
         // HEAD at capture time). HEAD unchanged ⇒ empty diff ⇒ skipped.
-        let committed = self
-            .db
-            .lock()
-            .list_run_stages(&run.id)
-            .ok()
+        // The row read stays its own statement so the db guard drops BEFORE
+        // the libgit2 work below — chaining `.and_then(git…)` off the locked
+        // read keeps the guard (a statement temporary) alive across an
+        // unbounded repo diff, starving every concurrent journal emit and,
+        // in the worker, the lease heartbeat (persist.rs's lock contract).
+        let stage_rows = self.db.lock().list_run_stages(&run.id).ok();
+        let committed = stage_rows
             .and_then(|ss| {
                 ss.into_iter()
                     .filter(|s| s.baseline_commit.is_some())
@@ -754,7 +756,12 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
-        let role_def = match self.db.lock().get_role(&stage.role) {
+        // Bind the lookup so the guard drops before the match arms run — a
+        // match scrutinee's temporary lives for the whole match, and the
+        // error arms re-lock (`fail_run_stage`), which would deadlock the
+        // drive task on this non-reentrant mutex.
+        let role_lookup = self.db.lock().get_role(&stage.role);
+        let role_def = match role_lookup {
             Ok(Some(rd)) => rd,
             Ok(None) => {
                 let msg = format!("unknown role '{}'", stage.role);
