@@ -1,7 +1,7 @@
 # Run mode · terminal navigation — three arrangements
 
-**Status:** design exploration, awaiting a decision. Nothing shipped.
-**Live mockups:** [`../mockups/2026-08-15-run-terminal-navigation.html`](../mockups/2026-08-15-run-terminal-navigation.html) — open in a browser; all four states (Today · A · B · C) are interactive.
+**Status:** **decided** — the session rail (A) plus the `⌘⌥K` switcher (C), with the icon layer below. Nothing shipped yet.
+**Live mockups:** [`../mockups/2026-08-15-run-terminal-navigation.html`](../mockups/2026-08-15-run-terminal-navigation.html) — open in a browser. Four interactive states (Today · the chosen rail + switcher · B · C), a mode-band style toggle (words · icons + words · icons), and bell/build simulation. Hold ⌥ or ⌘ to see the rail's number peek.
 
 ---
 
@@ -85,14 +85,20 @@ Canvas is 100% terminal; the Companion defaults collapsed in Run.
 | Teaches the keyboard path | no | numbers *are* the shortcut | numbers shown | hint on the anchor |
 | Distinctly Octopush | neutral | rail grammar | generic tabs | opinionated |
 
-## Recommendation
+## Decision
 
-**Ship A, and take C's switcher with it.** The rail is the only arrangement that is both
+**A + C: the session rail ships, and takes the switcher with it.** The rail is the only arrangement that is both
 always-present and native to this app's grammar — the workspace rail's sibling, one level
 down — and it costs the terminal no rows. Its single weakness is hidden names, which is
 exactly what `⌘⌥K` answers. B is the safe answer and the fastest to build, but it spends
 terminal height forever on a problem a hover solves, and it makes Run mode look like every
 other terminal app.
+
+The band anchor comes along for one reason: a keyboard-only switcher is a switcher nobody
+finds. The tail already existed and already talked about terminals; turning it into
+`⌘⌥K · dev · npm run dev` makes the palette discoverable by mouse and names the shortcut in
+passing, without adding new chrome. With the rail on screen the anchor drops the redundant
+parts (count, idle state) and shows only identity, a running command, and any waiting session.
 
 Independent of the layout choice, three fixes stand on their own:
 
@@ -103,5 +109,73 @@ Independent of the layout choice, three fixes stand on their own:
 
 Design-system notes: no new tokens, no new motion primitives, no fourth font. The one rule
 worth naming explicitly is §7's "no new tab system" — A and C sidestep it by reusing rail
-and palette grammar; B is defensible only as an *extension of `EditorTabs`*, not as a new
-tab paradigm. Whichever wins, `docs/FEATURES.md` is part of the change.
+and palette grammar. `docs/FEATURES.md` is part of the change.
+
+---
+
+## The icon layer
+
+Two separate questions, and conflating them is the usual icon mistake.
+
+### 1 · Mode icons — because "Run" is a word, and words carry culture
+
+`Run` reads as *execute something* to one developer and *where my shells are* to another. The
+fix is an icon on **all four** segments (icon-only on Run would read as a special case, not a
+mode), keeping the labels — mode navigation is where a wrong guess costs the most, so it is not
+where we spend a tooltip.
+
+| Mode | lucide | Why |
+|---|---|---|
+| Run | `SquareTerminal` | A window with a prompt inside — the room, not the verb |
+| Talk | `MessageSquare` | Conversation, unmistakable at 13px |
+| Review | `GitCompare` | Two branches meeting — the diff, not a generic eye |
+| Direct | `Waypoints` | The pipeline's own shape: nodes on a track |
+
+13px, stroke 1.75, colour inherited from the segment (brass active, mute otherwise) — the pill's
+geometry is unchanged. The mockup ships a toggle (words · icons + words · icons) to compare.
+
+**Considered and rejected:** renaming Run to "Terminal". It clarifies one segment at the cost of
+the set — Talk / Run / Review / Direct are four things you *do*, and one noun among three verbs
+reads as an accident.
+
+### 2 · Session icons — only if they encode difference
+
+A terminal glyph on every rail cell says "this is a terminal" four times over. The session icon
+therefore answers the one question the label cannot: **what is running in there right now.**
+
+| Role | lucide | Recognised from |
+|---|---|---|
+| Shell at the prompt | `ChevronRight` | foreground pgroup is the shell itself |
+| Dev server | `Globe` | vite · next · serve · `npm run dev` · *watch |
+| Building | `Hammer` | cargo build · tsc · make · vite build |
+| Test run | `FlaskConical` | vitest · jest · cargo test · pytest |
+| Installing packages | `Package` | npm · pnpm · yarn · cargo add · pip |
+| Git | `GitBranch` | git |
+| Agent CLI | `Sparkles` | claude · codex (the substrates Direct already knows) |
+| Editor · TUI | `PenLine` | vim · nvim · htop · lazygit |
+| Unclassified | `Terminal` | anything else — the honest fallback |
+
+Three rules govern it:
+
+1. **The icon is the identity; the number is the address.** A 32px cell holds one glyph well and
+   two badly, so the rail shows the icon at rest and flips every cell to its `⌘⌥N` number while
+   ⌥/⌘ is held. Nothing lives only behind that gesture — the number stays permanently visible in
+   the flyout, the Companion inspector and the switcher.
+2. **Roles are sticky.** The icon follows the last *significant* foreground command, not the
+   instantaneous one; a dev server that finishes a rebuild is still the dev server (S1).
+3. **One glyph, two facts.** The icon carries identity, its colour carries state — verdigris idle,
+   brass while busy or ringing. No icon-plus-status-dot pairs; brass stays surgical.
+
+### What this asks of the backend
+
+One bounded change. The daemon already resolves each session's foreground process group every
+tick (`Session::check_attention` / `check_foreground` take the `tcgetpgrp` result and sample that
+pid's CPU), but the `foreground` event only carries `{ sessionId, busy }`. Widen it to
+`{ sessionId, busy, command? }` by reading the pid's name (`/proc/<pid>/comm` on Linux,
+`proc_pidpath` on macOS). Classification then lives in the frontend as a pure, unit-testable
+`lib/sessionRole.ts`. No new IPC command, no new table, no polling.
+
+**Deliberately not in v1:** user-assigned icons or emoji per session. The label already carries
+user intent; a picker is a preference to maintain and a decoration when unused. If auto
+classification proves ambiguous in daily use, the override belongs in the flyout — added later,
+against real evidence.

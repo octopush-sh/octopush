@@ -283,6 +283,7 @@ section { padding: 44px 0; border-top: 1px solid var(--hairline); }
 /* Option C's anchor — the tail becomes the one control. */
 button.anchor {
   appearance: none; background: transparent; cursor: pointer;
+  white-space: nowrap;
   border: 1px solid transparent;
   border-radius: 6px;
   padding: 4px 8px;
@@ -373,6 +374,19 @@ button.anchor .cnt { font-variant-numeric: tabular-nums; }
    must never re-render on hover, or the terminal's entrance animation
    restarts under the pointer. */
 .scellwrap { position: relative; display: block; width: 32px; }
+
+/* Icon plumbing — lucide at 1.75 stroke, inheriting the element's colour. */
+.ico { display: inline-flex; line-height: 0; flex: none; }
+/* The number is the address, the icon is the identity: cells show the icon
+   at rest and flip to their ⌘⌥N number while a modifier is held. */
+.scell .num { display: none; font-variant-numeric: tabular-nums; }
+body.peek .scell .num { display: block; }
+body.peek .scell .ic { display: none; }
+.modes span { display: inline-flex; align-items: center; gap: 6px; }
+.chip .ico { opacity: 0.9; }
+.flyout .fl-name { display: flex; align-items: center; gap: 7px; }
+.prow .pname { display: flex; align-items: center; gap: 7px; }
+.detail .dname { display: flex; align-items: center; gap: 8px; }
 .flyout {
   position: absolute; left: 40px; top: -2px; z-index: 30;
   min-width: 216px;
@@ -628,6 +642,41 @@ td.mid { color: var(--warning); }
 td.bad { color: var(--rouge); }
 
 /* ── Recommendation ──────────────────────────────────────────────── */
+.iconsec { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 30px; }
+.icard { min-width: 0; }
+.icard p { font-size: 13.5px; }
+.modegrid { display: grid; gap: 0; margin-top: 14px; }
+.mrow {
+  display: grid; grid-template-columns: 22px 62px 116px 1fr; gap: 12px; align-items: center;
+  padding: 9px 0; border-top: 1px solid var(--hairline); font-size: 12.5px;
+}
+.mrow:last-child { border-bottom: 1px solid var(--hairline); }
+.mrow b { color: var(--ivory); font-weight: 600; }
+.mrow .ico { color: var(--brass); }
+.mrow span:last-child { color: var(--mute); }
+table.ivocab { min-width: 420px; margin-top: 14px; }
+table.ivocab td:first-child { width: 34px; }
+table.ivocab .ico { color: var(--brass); }
+table.ivocab td { color: var(--sage); }
+table.ivocab td:nth-child(2) { color: var(--ivory); }
+
+.rules { display: grid; gap: 0; margin-top: 38px; max-width: 900px; }
+.rule {
+  display: grid; grid-template-columns: 74px 1fr; gap: 20px;
+  padding: 18px 0; border-top: 1px solid var(--hairline); font-size: 13.5px;
+}
+.rule:last-child { border-bottom: 1px solid var(--hairline); }
+.rk { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--brass); padding-top: 4px; }
+.rule b { color: var(--ivory); }
+
+.backend {
+  margin-top: 34px; max-width: 900px;
+  border: 1px solid var(--hairline); border-radius: 10px;
+  background: var(--panel); padding: 22px 24px;
+}
+.backend p { font-size: 13px; margin: 0; }
+.backend .eyebrow { margin-bottom: 8px; }
+
 .rec {
   border: 1px solid var(--brass-dim);
   background: var(--brass-faint);
@@ -654,7 +703,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
 <div class="page">
 
 <header class="masthead">
-  <p class="eyebrow">Octopush · Run mode · Terminal navigation</p>
+  <p class="eyebrow">Octopush · Run mode · Terminal navigation · Decided</p>
   <h1>Where terminals live</h1>
   <p class="lede">
     Today every mode parks its list in the Companion: Talk keeps its chats there, Direct its runs,
@@ -664,8 +713,9 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     standing in. Three ways to move that navigation next to the work, all three live below.
   </p>
   <div class="meta-line">
+    <span>Decision: the session rail (A) + the ⌘⌥K switcher (C), with an icon layer</span>
     <span>Audited: CompanionTerminals · terminalsStore · TerminalPane · App.tsx Run panel · ModeBand</span>
-    <span>Palette: real tokens from src/styles.css</span>
+    <span>Palette and icons: real tokens from src/styles.css, real lucide geometry</span>
   </div>
 </header>
 
@@ -696,19 +746,27 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     <p class="eyebrow quiet">The prototype</p>
     <h2>Three arrangements, live</h2>
     <p class="col" style="margin-top:2px">
-      Switch between them below. Everything inside the frame works: click a session, add one, close one,
-      press <span class="m">⌥1…9</span> to jump, <span class="m">⌥K</span> to open the switcher. Use the
-      simulation controls to fire a bell or start a long-running command in a session you are not watching —
-      that is the moment each design is really being judged on.
+      <strong>Chosen: the rail plus the switcher</strong> — the first tab is the shipping design;
+      B and C stay for comparison. Everything inside the frame works: click a session, add one, close one,
+      press <span class="m">⌥1…9</span> to jump, <span class="m">⌥K</span> for the switcher, and
+      <strong>hold ⌥ or ⌘</strong> to watch the rail flip from icons to jump numbers. The second control
+      switches the mode band between words, icons + words, and icons alone. Use the simulation buttons to
+      fire a bell or start a build in a session you are not watching — that is the moment each design is
+      really being judged on.
     </p>
   </div>
 
   <div class="proto-controls">
     <div class="segmented" role="group" aria-label="Arrangement">
       <button type="button" data-variant="today" aria-pressed="true">Today</button>
-      <button type="button" data-variant="a" aria-pressed="false">A · Session rail</button>
-      <button type="button" data-variant="b" aria-pressed="false">B · Session ribbon</button>
-      <button type="button" data-variant="c" aria-pressed="false">C · Anchor &amp; switcher</button>
+      <button type="button" data-variant="a" aria-pressed="false">Chosen · rail + switcher</button>
+      <button type="button" data-variant="b" aria-pressed="false">B · Ribbon</button>
+      <button type="button" data-variant="c" aria-pressed="false">C · Switcher only</button>
+    </div>
+    <div class="segmented" role="group" aria-label="Mode band style">
+      <button type="button" data-band="word" aria-pressed="false">Words</button>
+      <button type="button" data-band="both" aria-pressed="true">Icons + words</button>
+      <button type="button" data-band="icon" aria-pressed="false">Icons</button>
     </div>
     <div class="sim">
       <span class="lbl">Simulate</span>
@@ -727,6 +785,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     <span><b>Marching segments</b> = a command is running (the workspace rail's own idiom)</span>
     <span><b>Single brass dot</b> = this session rang while hidden</span>
     <span><b>Verdigris</b> = shell alive, idle</span>
+    <span><b>The icon</b> is what the session is doing, not that it is a terminal</span>
   </div>
 </section>
 
@@ -903,8 +962,8 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
 
 <section>
   <div class="rec">
-    <p class="eyebrow">The recommendation</p>
-    <h2>Ship A, and take C's switcher with it</h2>
+    <p class="eyebrow">The decision</p>
+    <h2>The rail ships, and takes the switcher with it</h2>
     <p>
       The rail is the one arrangement that is both always-present and native to this app's grammar —
       it is the workspace rail's sibling, one level down, and it costs the terminal no rows. Its single
@@ -917,12 +976,134 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       problem a hover already solves, and it makes Run mode look like every other terminal app — which
       the product's own positioning treats as a negative signal.
     </p>
+    <p>
+      The anchor in the band comes along for one specific reason: a keyboard-only switcher is a
+      switcher nobody finds. The tail already existed and already talked about terminals — turning it
+      into <span class="m">⌘⌥K · dev · npm run dev</span> makes the palette discoverable by mouse and
+      names the shortcut in passing, without adding a single new piece of chrome.
+    </p>
     <div class="steps">
-      <div class="step"><span class="k">1</span><span>Render <span class="m">TerminalState.busy</span> everywhere a session appears — that signal is already in the store and is the single biggest legibility win, whichever layout wins.</span></div>
-      <div class="step"><span class="k">2</span><span>Give <span class="m">attentionStore</span> a terminal id alongside the workspace id, so a bell can point at one session instead of a whole workspace.</span></div>
-      <div class="step"><span class="k">3</span><span>Move navigation into the canvas; let Run's Companion become the session inspector — path, pid, uptime, restore state, rename, close. No capability is lost, only relocated.</span></div>
-      <div class="step"><span class="k">4</span><span>Keep <span class="m">⌘⌥1..9</span>, add <span class="m">⌘⌥←/→</span> and <span class="m">⌘⌥K</span>, and update the feature map in the same change.</span></div>
+      <div class="step"><span class="k">1</span><span>Render <span class="m">TerminalState.busy</span> everywhere a session appears — that signal is already in the store and is the single biggest legibility win.</span></div>
+      <div class="step"><span class="k">2</span><span>Give <span class="m">attentionStore</span> a terminal id alongside the workspace id, so a bell points at one session instead of a whole workspace.</span></div>
+      <div class="step"><span class="k">3</span><span>Ship <span class="m">SessionRail.tsx</span> in the Run canvas and <span class="m">SessionSwitcher.tsx</span> behind <span class="m">⌘⌥K</span> and the band anchor; Run's Companion becomes the session inspector — role, path, pid, uptime, restore state, rename, close. No capability is lost, only relocated.</span></div>
+      <div class="step"><span class="k">4</span><span>Add the icon layer below: four mode icons, and one session icon derived from what is running.</span></div>
+      <div class="step"><span class="k">5</span><span>Keep <span class="m">⌘⌥1..9</span>, add <span class="m">⌘⌥←/→</span>, and update <span class="m">docs/FEATURES.md</span> in the same change.</span></div>
     </div>
+  </div>
+</section>
+
+
+<section>
+  <div class="sec-head">
+    <p class="eyebrow quiet">The icon layer</p>
+    <h2>Two icon questions, and they are not the same question</h2>
+    <p class="col" style="margin-top:2px">
+      "Run" is a word, and words carry culture: it reads as <em>execute something</em> to one developer
+      and as <em>where my shells are</em> to another. That is a mode-level problem. Whether each session
+      deserves its own icon is a different problem with a different answer — and the wrong answer to the
+      second one is the most common icon mistake there is.
+    </p>
+  </div>
+
+  <div class="iconsec">
+    <div class="icard">
+      <h3>1 · The mode needs an icon because the word is ambiguous</h3>
+      <p>
+        Icons go on all four segments — icon-only on Run would read as a special case rather than a mode.
+        The label stays: mode navigation is the one place in the app where a wrong guess costs the most,
+        so this is not where we spend a tooltip. Toggle the band control above the frame to compare
+        words, icons + words, and icons alone.
+      </p>
+      <div class="modegrid">
+        <div class="mrow"><span data-icon="square-terminal" data-size="16"></span><b>Run</b><span class="m">SquareTerminal</span><span>A window with a prompt inside — the room, not the verb.</span></div>
+        <div class="mrow"><span data-icon="message-square" data-size="16"></span><b>Talk</b><span class="m">MessageSquare</span><span>Conversation, unmistakable at 13px.</span></div>
+        <div class="mrow"><span data-icon="git-compare" data-size="16"></span><b>Review</b><span class="m">GitCompare</span><span>Two branches meeting — the diff, not a generic eye.</span></div>
+        <div class="mrow"><span data-icon="waypoints" data-size="16"></span><b>Direct</b><span class="m">Waypoints</span><span>The pipeline's own shape: nodes on a track.</span></div>
+      </div>
+      <p style="margin-top:16px">
+        <b>Considered and rejected:</b> renaming Run to "Terminal". It clarifies one segment at the cost of
+        the set — Talk / Run / Review / Direct are four things you <em>do</em>, and one noun among three
+        verbs reads as an accident. The icon buys the same clarity without breaking the grammar.
+      </p>
+    </div>
+
+    <div class="icard">
+      <h3>2 · The session icon must encode difference, or it is decoration</h3>
+      <p>
+        A terminal glyph on every cell says "this is a terminal" four times over — information the user
+        already has. So the session icon answers the only question the label cannot: <b>what is running
+        in there right now.</b> That is derivable, not invented — the daemon already samples each PTY's
+        foreground process every tick.
+      </p>
+      <div class="tablewrap">
+        <table class="ivocab">
+          <thead><tr><th>Icon</th><th>Role</th><th>Recognised from</th></tr></thead>
+          <tbody>
+            <tr><td><span data-icon="chevron-right" data-size="15"></span></td><td>Shell at the prompt</td><td class="m">foreground pgroup is the shell itself</td></tr>
+            <tr><td><span data-icon="globe" data-size="15"></span></td><td>Dev server</td><td class="m">vite · next · serve · npm run dev · *watch</td></tr>
+            <tr><td><span data-icon="hammer" data-size="15"></span></td><td>Building</td><td class="m">cargo build · tsc · make · vite build</td></tr>
+            <tr><td><span data-icon="flask-conical" data-size="15"></span></td><td>Test run</td><td class="m">vitest · jest · cargo test · pytest</td></tr>
+            <tr><td><span data-icon="package" data-size="15"></span></td><td>Installing packages</td><td class="m">npm · pnpm · yarn · cargo add · pip</td></tr>
+            <tr><td><span data-icon="git-branch" data-size="15"></span></td><td>Git</td><td class="m">git</td></tr>
+            <tr><td><span data-icon="sparkles" data-size="15"></span></td><td>Agent CLI</td><td class="m">claude · codex — the substrates Direct already knows</td></tr>
+            <tr><td><span data-icon="pen-line" data-size="15"></span></td><td>Editor · TUI</td><td class="m">vim · nvim · htop · lazygit</td></tr>
+            <tr><td><span data-icon="terminal" data-size="15"></span></td><td>Unclassified</td><td class="m">anything else — the honest fallback</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="rules">
+    <div class="rule">
+      <div class="rk">Rule 1</div>
+      <div>
+        <b>The icon is the identity; the number is the address.</b>
+        A 32px cell holds one glyph well and two badly, so the rail shows the icon at rest and flips
+        every cell to its <span class="m">⌘⌥N</span> number while ⌥ or ⌘ is held — the hint arrives
+        exactly when the hand is already on the modifier. Nothing lives only behind that gesture: the
+        number is permanently visible in the hover flyout, the Companion inspector and the switcher.
+      </div>
+    </div>
+    <div class="rule">
+      <div class="rk">Rule 2</div>
+      <div>
+        <b>Roles are sticky.</b> The icon follows the last <em>significant</em> foreground command, not the
+        instantaneous one. A dev server that finishes a rebuild is still the dev server; a session whose
+        identity flickered every time a command exited would be worse than no icon at all (stability
+        doctrine S1 — slots hold their meaning while things run).
+      </div>
+    </div>
+    <div class="rule">
+      <div class="rk">Rule 3</div>
+      <div>
+        <b>One glyph, two facts.</b> The icon carries identity, its colour carries state: verdigris idle,
+        brass while busy or ringing. No icon-plus-status-dot pairs anywhere — that is the double encoding
+        the minimalism doctrine exists to prevent. Brass stays surgical: the active cell, and the one
+        session holding the beacon.
+      </div>
+    </div>
+  </div>
+
+  <div class="backend">
+    <p class="eyebrow quiet">What this asks of the backend</p>
+    <p>
+      One bounded change. The PTY daemon already resolves each session's foreground process group every
+      tick — <span class="m">Session::check_attention</span> and <span class="m">check_foreground</span>
+      take the <span class="m">tcgetpgrp</span> result and sample that pid's CPU — but the
+      <span class="m">foreground</span> event only carries <span class="m">{ sessionId, busy }</span>.
+      Widen it to <span class="m">{ sessionId, busy, command? }</span> by reading the pid's name
+      (<span class="m">/proc/&lt;pid&gt;/comm</span> on Linux, <span class="m">proc_pidpath</span> on
+      macOS). Classification then lives in the frontend as a pure, unit-testable
+      <span class="m">lib/sessionRole.ts</span> with an honest fallback — no new IPC command, no new
+      table, no polling.
+    </p>
+    <p style="margin-top:12px">
+      <b>Deliberately not in v1:</b> user-assigned icons or emoji per session. The label already carries
+      user intent, and a picker is a preference to maintain plus a decoration when nobody fills it in. If
+      auto-classification proves ambiguous in daily use, the override belongs in the flyout — one line,
+      added later, against real evidence.
+    </p>
   </div>
 </section>
 
@@ -938,7 +1119,58 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
   "use strict";
 
   const app = document.getElementById("app");
+
+  // Real lucide-static 0.460.0 geometry — the same icons the app already
+  // ships through lucide-react, so nothing here is a mockup-only drawing.
+  const ICONS = {
+    "square-terminal": "<path d=\"m7 11 2-2-2-2\" /> <path d=\"M11 13h4\" /> <rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\" />",
+    "message-square": "<path d=\"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z\" />",
+    "git-compare": "<circle cx=\"18\" cy=\"18\" r=\"3\" /> <circle cx=\"6\" cy=\"6\" r=\"3\" /> <path d=\"M13 6h3a2 2 0 0 1 2 2v7\" /> <path d=\"M11 18H8a2 2 0 0 1-2-2V9\" />",
+    "waypoints": "<circle cx=\"12\" cy=\"4.5\" r=\"2.5\" /> <path d=\"m10.2 6.3-3.9 3.9\" /> <circle cx=\"4.5\" cy=\"12\" r=\"2.5\" /> <path d=\"M7 12h10\" /> <circle cx=\"19.5\" cy=\"12\" r=\"2.5\" /> <path d=\"m13.8 17.7 3.9-3.9\" /> <circle cx=\"12\" cy=\"19.5\" r=\"2.5\" />",
+    "chevron-right": "<path d=\"m9 18 6-6-6-6\" />",
+    "globe": "<circle cx=\"12\" cy=\"12\" r=\"10\" /> <path d=\"M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20\" /> <path d=\"M2 12h20\" />",
+    "hammer": "<path d=\"m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9\" /> <path d=\"m18 15 4-4\" /> <path d=\"m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5\" />",
+    "flask-conical": "<path d=\"M10 2v7.527a2 2 0 0 1-.211.896L4.72 20.55a1 1 0 0 0 .9 1.45h12.76a1 1 0 0 0 .9-1.45l-5.069-10.127A2 2 0 0 1 14 9.527V2\" /> <path d=\"M8.5 2h7\" /> <path d=\"M7 16h10\" />",
+    "package": "<path d=\"M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z\" /> <path d=\"M12 22V12\" /> <path d=\"m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7\" /> <path d=\"m7.5 4.27 9 5.15\" />",
+    "git-branch": "<line x1=\"6\" x2=\"6\" y1=\"3\" y2=\"15\" /> <circle cx=\"18\" cy=\"6\" r=\"3\" /> <circle cx=\"6\" cy=\"18\" r=\"3\" /> <path d=\"M18 9a9 9 0 0 1-9 9\" />",
+    "sparkles": "<path d=\"M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z\" /> <path d=\"M20 3v4\" /> <path d=\"M22 5h-4\" /> <path d=\"M4 17v2\" /> <path d=\"M5 18H3\" />",
+    "terminal": "<polyline points=\"4 17 10 11 4 5\" /> <line x1=\"12\" x2=\"20\" y1=\"19\" y2=\"19\" />",
+    "pen-line": "<path d=\"M12 20h9\" /> <path d=\"M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z\" />"
+  };
+
+  function icon(name, size, cls) {
+    const span = el("span", "ico" + (cls ? " " + cls : ""));
+    span.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size +
+      '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      (ICONS[name] || ICONS["terminal"]) + "</svg>";
+    return span;
+  }
+
+  // A session's role — derived from the foreground command, and STICKY: it
+  // keeps the last significant role so a dev server that finishes a rebuild
+  // is still recognisably the dev server.
+  const ROLES = {
+    shell: { icon: "chevron-right", word: "shell at the prompt" },
+    dev:   { icon: "globe",         word: "dev server" },
+    build: { icon: "hammer",        word: "building" },
+    test:  { icon: "flask-conical", word: "test run" },
+    deps:  { icon: "package",       word: "installing packages" },
+    git:   { icon: "git-branch",    word: "git" },
+    agent: { icon: "sparkles",      word: "agent CLI" },
+    edit:  { icon: "pen-line",      word: "editor · TUI" },
+  };
+  const roleOf = (s) => ROLES[s.role] || ROLES.shell;
+
+  const MODE_ICONS = {
+    Run: "square-terminal",
+    Talk: "message-square",
+    Review: "git-compare",
+    Direct: "waypoints",
+  };
   let variant = "today";
+  let bandStyle = "both";
   let paletteOpen = false;
   let paletteQuery = "";
   let paletteSel = 0;
@@ -946,7 +1178,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
 
   const baseSessions = () => ([
     {
-      id: "t1", label: "main", cwd: "~/octopush", state: "idle",
+      id: "t1", label: "main", cwd: "~/octopush", state: "idle", role: "git",
       cmd: "git status -sb", uptime: "1h 12m", pid: "48213",
       lines: [
         ['dim', '~/octopush · claude/terminal-navigation'],
@@ -959,7 +1191,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       ],
     },
     {
-      id: "t2", label: "dev", cwd: "~/octopush", state: "idle",
+      id: "t2", label: "dev", cwd: "~/octopush", state: "idle", role: "dev",
       cmd: "npm run tauri:dev", uptime: "1h 09m", pid: "48377",
       lines: [
         ['p', '$ ', 'iv', 'npm run tauri:dev'],
@@ -973,7 +1205,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       ],
     },
     {
-      id: "t3", label: "tests", cwd: "~/octopush/src-tauri", state: "idle",
+      id: "t3", label: "tests", cwd: "~/octopush/src-tauri", state: "idle", role: "test",
       cmd: "cargo test", uptime: "24m", pid: "48590",
       lines: [
         ['p', '$ ', 'iv', 'cargo test'],
@@ -1062,21 +1294,30 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     band.appendChild(el("span"));
     const modes = el("div", "modes");
     ["Run", "Talk", "Review", "Direct"].forEach((m) => {
-      modes.appendChild(el("span", m === "Run" ? "on" : null, m));
+      const seg = el("span", m === "Run" ? "on" : null);
+      seg.title = m === "Run" ? "Run — terminals (⌘⇧2)" : m;
+      if (bandStyle !== "word") seg.appendChild(icon(MODE_ICONS[m], 13));
+      if (bandStyle !== "icon") seg.appendChild(el("span", null, m));
+      modes.appendChild(seg);
     });
     band.appendChild(modes);
     const tailslot = el("div", "tailslot");
-    if (variant === "c") {
+    if (variant === "c" || variant === "a") {
       const btn = el("button", "anchor");
       btn.type = "button";
       btn.title = "Switch session (⌘⌥K)";
-      const dot = el("span");
-      dot.style.cssText = "width:5px;height:5px;border-radius:50%;flex:none;background:" +
-        (s.state === "busy" ? "var(--brass)" : "var(--verdigris)");
-      btn.appendChild(dot);
-      btn.appendChild(el("span", "cnt", (idxOf(s.id) + 1) + "/" + sessions.length));
+      // The role icon carries identity; its colour carries state — one glyph,
+      // two facts, instead of an icon plus a dot.
+      const ic = icon(roleOf(s).icon, 13);
+      ic.style.color = s.state === "busy" ? "var(--brass)" : "var(--verdigris)";
+      btn.appendChild(ic);
+      if (variant === "c") {
+        btn.appendChild(el("span", "cnt", (idxOf(s.id) + 1) + "/" + sessions.length));
+      }
       btn.appendChild(el("span", "lab", s.label));
-      btn.appendChild(el("span", null, s.state === "busy" ? s.cmd : "idle"));
+      if (variant === "c" || s.state === "busy") {
+        btn.appendChild(el("span", null, s.state === "busy" ? s.cmd : "idle"));
+      }
       const others = sessions.filter((x) => x.id !== s.id && x.state === "bell").length;
       if (others > 0) {
         const b = el("span", null, "· " + others + " waiting");
@@ -1124,8 +1365,9 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       cell.type = "button";
       cell.setAttribute("role", "tab");
       cell.setAttribute("aria-selected", String(s.id === activeId));
-      cell.title = s.label + " — " + STATE_WORD[s.state] + " (⌘⌥" + (i + 1) + ")";
-      cell.textContent = String(i + 1);
+      cell.title = s.label + " · " + roleOf(s).word + " — " + STATE_WORD[s.state] + " (⌘⌥" + (i + 1) + ")";
+      cell.appendChild(icon(roleOf(s).icon, 15, "ic"));
+      cell.appendChild(el("span", "num", String(i + 1)));
 
       const edge = el("span", "edge" + (s.state === "busy" ? " march" : ""));
       cell.appendChild(edge);
@@ -1134,8 +1376,11 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       wrap.appendChild(cell);
 
       const fly = el("div", "flyout");
-      fly.appendChild(el("div", "fl-name", s.label));
-      fly.appendChild(el("div", "fl-meta", s.cwd + " · pid " + s.pid + " · " + s.uptime));
+      const fname = el("div", "fl-name");
+      fname.appendChild(icon(roleOf(s).icon, 14));
+      fname.appendChild(el("span", null, s.label));
+      fly.appendChild(fname);
+      fly.appendChild(el("div", "fl-meta", roleOf(s).word + " · pid " + s.pid + " · " + s.uptime));
       const cmd = el("div", "fl-cmd");
       cmd.appendChild(el("span", s.state === "busy" ? "warn" : "dim", s.state === "busy" ? "▸ " : "· "));
       cmd.appendChild(el("span", null, s.state === "busy" ? s.cmd : "shell idle"));
@@ -1174,11 +1419,12 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       chip.title = s.cwd + " · " + STATE_WORD[s.state] + " (⌘⌥" + (i + 1) + ")";
 
       chip.appendChild(el("span", "idx", String(i + 1)));
-      const dotCls =
-        s.state === "busy" ? "dot busy"
-        : s.state === "bell" && s.id !== activeId ? "dot bell"
-        : "dot run";
-      chip.appendChild(el("span", dotCls));
+      const ric = icon(roleOf(s).icon, 13);
+      ric.style.color =
+        s.state === "busy" ? "var(--brass)"
+        : s.state === "bell" && s.id !== activeId ? "var(--brass)"
+        : "var(--verdigris)";
+      chip.appendChild(ric);
       chip.appendChild(el("span", null, s.label));
 
       const x = el("span", "x", "×");
@@ -1255,12 +1501,16 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     comp.appendChild(bar);
 
     const d = el("div", "detail");
-    d.appendChild(el("div", "dname", s.label));
+    const dn = el("div", "dname");
+    dn.appendChild(icon(roleOf(s).icon, 15));
+    dn.appendChild(el("span", null, s.label));
+    d.appendChild(dn);
     const kv = el("dl", "kv");
     const pair = (k, v, cls) => {
       kv.appendChild(el("dt", null, k));
       kv.appendChild(el("dd", cls || null, v));
     };
+    pair("Doing", roleOf(s).word);
     pair("Path", s.cwd);
     pair("State", s.state === "busy" ? "running" : "shell idle", s.state === "busy" ? "brass" : "ok");
     pair("Command", s.state === "busy" ? s.cmd : "—");
@@ -1310,7 +1560,10 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       const row = el("div", "prow" + (i === paletteSel ? " sel" : ""));
       row.appendChild(el("div", "pn", String(idxOf(s.id) + 1)));
       const mid = el("div");
-      mid.appendChild(el("div", "pname", s.label));
+      const pn = el("div", "pname");
+      pn.appendChild(icon(roleOf(s).icon, 13));
+      pn.appendChild(el("span", null, s.label));
+      mid.appendChild(pn);
       mid.appendChild(el("div", "pcmd", s.cwd + (s.state === "busy" ? "  ▸ " + s.cmd : "  · " + s.cmd)));
       row.appendChild(mid);
       row.appendChild(el("div", "pstate " + s.state, STATE_WORD[s.state]));
@@ -1363,7 +1616,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
   function addSession() {
     const n = seq++;
     sessions.push({
-      id: "t" + n, label: "Terminal " + n, cwd: "~/octopush", state: "idle",
+      id: "t" + n, label: "Terminal " + n, cwd: "~/octopush", state: "idle", role: "shell",
       cmd: "zsh", uptime: "just now", pid: String(48000 + n * 37),
       lines: [['dim', '~/octopush'], ['p', '$ ', 'cursor', '']],
     });
@@ -1397,6 +1650,7 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     target.state = "busy";
     target.tick = 0;
     target.cmd = "cargo build --release";
+    target.role = "build"; // roles follow the foreground command
     if (busyTimer) clearInterval(busyTimer);
     busyTimer = setInterval(() => {
       const busy = sessions.filter((s) => s.state === "busy");
@@ -1415,6 +1669,25 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
     activeId = "t1"; seq = 4; paletteOpen = false;
     render();
   });
+
+  // ── mode-band style switch ──────────────────────────────────────
+  document.querySelectorAll("[data-band]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      bandStyle = btn.dataset.band;
+      document.querySelectorAll("[data-band]").forEach((b) => {
+        b.setAttribute("aria-pressed", String(b === btn));
+      });
+      render();
+    });
+  });
+
+  // ── the number peek ─────────────────────────────────────────────
+  // Holding ⌘ or ⌥ flips every rail cell from its icon to its jump number,
+  // at exactly the moment the hand is already on the modifier.
+  const setPeek = (on) => document.body.classList.toggle("peek", on);
+  document.addEventListener("keydown", (e) => { if (e.altKey || e.metaKey) setPeek(true); });
+  document.addEventListener("keyup", (e) => { if (!e.altKey && !e.metaKey) setPeek(false); });
+  window.addEventListener("blur", () => setPeek(false));
 
   // ── variant switch ──────────────────────────────────────────────
   document.querySelectorAll("[data-variant]").forEach((btn) => {
@@ -1467,6 +1740,11 @@ footer { padding: 40px 0 0; border-top: 1px solid var(--hairline); font-family: 
       const target = sessions[parseInt(m[1], 10) - 1];
       if (target) { e.preventDefault(); select(target.id); }
     }
+  });
+
+  // Static icon placeholders in the prose sections.
+  document.querySelectorAll("[data-icon]").forEach((slot) => {
+    slot.appendChild(icon(slot.dataset.icon, parseInt(slot.dataset.size || "14", 10)));
   });
 
   render();
