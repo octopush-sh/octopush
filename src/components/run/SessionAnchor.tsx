@@ -27,8 +27,11 @@ export function SessionAnchor({ workspaceId, onOpen }: Props) {
   if (!active) return null;
 
   const Icon = iconForSessionRole(active.role);
+  // `attentionStore` holds ONE flag per workspace (a newer ping replaces the
+  // older), so this is a boolean, not a count — printing "1 waiting" would
+  // promise a counter the store cannot keep.
   const waiting =
-    flag?.kind === "terminal" && flag.terminalId && flag.terminalId !== activeId ? 1 : 0;
+    flag?.kind === "terminal" && !!flag.terminalId && flag.terminalId !== activeId;
   const doing = active.busy ? (active.command ?? "running") : ROLE_WORD[active.role];
 
   return (
@@ -51,7 +54,7 @@ export function SessionAnchor({ workspaceId, onOpen }: Props) {
       {active.busy && active.command && (
         <span className="hidden min-w-0 truncate lg:inline">{active.command}</span>
       )}
-      {waiting > 0 && <span className="text-octo-brass">· 1 waiting</span>}
+      {waiting && <span className="text-octo-brass">· waiting</span>}
       <span className="rounded border border-octo-hairline px-1.5 py-px text-[9px] text-octo-mute">
         ⌘⌥K
       </span>

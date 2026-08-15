@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { roleForCommand, type SessionRole } from "../lib/sessionRole";
+import { useAttentionStore } from "./attentionStore";
 
 // ─── State shape ──────────────────────────────────────────────────
 
@@ -256,6 +257,11 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
 
     bumpLoadGen(workspaceId); // invalidate any in-flight loadTerminals snapshot
 
+    // An attention marker pointing at this session has nothing left to point
+    // at — without this it would keep the workspace in Mission Control's
+    // needs-you band and pulsing on the rail forever.
+    useAttentionStore.getState().clearForTerminal(workspaceId, id);
+
     const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const remaining = prev.filter((t) => t.id !== id);
 
@@ -306,7 +312,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
       const target = prev.find((t) => t.id === id);
       if (!target) return s;
-      const nextCommand = busy ? (command ?? null) : null;
+      // A later busy tick without a resolvable command (older daemon,
+      // unsupported platform) must not erase the command we already showed.
+      const nextCommand = busy ? (command ?? target.command) : null;
       // Sticky role: only a command we can actually place replaces the
       // session's identity. "shell" and "unknown" leave it alone, so a dev
       // server keeps its icon through every quiet moment between rebuilds.

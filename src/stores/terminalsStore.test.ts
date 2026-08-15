@@ -53,6 +53,7 @@ vi.mock("../components/Toasts", () => ({
 }));
 
 const { useTerminalsStore } = await import("./terminalsStore");
+const { useAttentionStore } = await import("./attentionStore");
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
@@ -610,5 +611,68 @@ describe("session roles", () => {
     expect(t.command).toBeNull();
     expect(t.role).toBe("test"); // identity outlives the process
   });
+
+  it("keeps the command it already knows when a later busy tick can't name one", () => {
+    seed();
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "npm run dev");
+    // An older daemon (or a platform that can't resolve argv) reports busy
+    // with no command; wiping the one we have would blank the Companion.
+    useTerminalsStore.getState().setBusy(ws, "t1", true, null);
+    const t = useTerminalsStore.getState().getTerminals(ws)[0];
+    expect(t.command).toBe("npm run dev");
+    expect(t.role).toBe("dev");
+  });
 });
 
+// ─── Attention markers can't outlive their session ────────────────
+
+describe("closing a session", () => {
+  const ws = "ws-attn";
+
+  it("clears an attention marker pointing at it", async () => {
+    useTerminalsStore.setState({
+      terminalsByWs: {
+        [ws]: [
+          {
+            id: "t1",
+            label: "dev",
+            position: 0,
+            running: true,
+            busy: false,
+            restored: false,
+            role: "shell" as const,
+            command: null,
+          },
+        ],
+      },
+      activeByWs: { [ws]: "t1" },
+    });
+    useAttentionStore.getState().ping(ws, "terminal", "t1");
+    expect(useAttentionStore.getState().flagsByWs[ws]).toBeTruthy();
+
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "t1");
+
+    // Nothing left to point at: without this the workspace would sit in
+    // Mission Control's needs-you band and pulse on the rail forever.
+    expect(useAttentionStore.getState().flagsByWs[ws]).toBeUndefined();
+  });
+
+  it("leaves a marker that points at a different session alone", async () => {
+    useTerminalsStore.setState({
+      terminalsByWs: {
+        [ws]: [
+          { id: "t1", label: "a", position: 0, running: true, busy: false, restored: false, role: "shell" as const, command: null },
+          { id: "t2", label: "b", position: 1, running: true, busy: false, restored: false, role: "shell" as const, command: null },
+        ],
+      },
+      activeByWs: { [ws]: "t1" },
+    });
+    useAttentionStore.getState().ping(ws, "terminal", "t2");
+
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "t1");
+
+    expect(useAttentionStore.getState().flagsByWs[ws]?.terminalId).toBe("t2");
+  });
+});

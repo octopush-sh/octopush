@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { ModalShell } from "../ModalShell";
 import { useTerminalsStore } from "../../stores/terminalsStore";
@@ -30,6 +30,11 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
 
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
+  // Ids whose delete is in flight. `deleteTerminal` awaits IPC before the list
+  // updates, so two fast ⌫ presses would fire the same delete twice and the
+  // loser would raise a "couldn't close terminal" toast for a session that
+  // closed perfectly well.
+  const deleting = useRef(new Set<string>());
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -70,9 +75,12 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
     } else if (e.key === "Backspace" && query === "") {
       // Only with an empty query — otherwise Backspace is still editing text.
       const row = matches[selected];
-      if (!row) return;
+      if (!row || deleting.current.has(row.t.id)) return;
       e.preventDefault();
-      void deleteTerminal(workspaceId, row.t.id);
+      deleting.current.add(row.t.id);
+      void deleteTerminal(workspaceId, row.t.id).finally(() => {
+        deleting.current.delete(row.t.id);
+      });
       setSel(0);
     }
   };
@@ -97,7 +105,7 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
           />
         </div>
 
-        <div className="max-h-[52vh] overflow-y-auto py-1">
+        <div role="listbox" aria-label="Open sessions" className="max-h-[52vh] overflow-y-auto py-1">
           {matches.length === 0 && query.trim() !== "" && (
             <div className="px-4 py-6 text-center font-serif text-[13px] text-octo-mute">
               No session matches that.
@@ -112,6 +120,7 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
               <button
                 key={t.id}
                 type="button"
+                role="option"
                 data-testid={`session-switcher-row-${t.id}`}
                 aria-selected={i === selected}
                 onMouseEnter={() => setSel(i)}
@@ -152,6 +161,7 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
 
           <button
             type="button"
+            role="option"
             data-testid="session-switcher-new"
             aria-selected={selected === maxSel}
             onMouseEnter={() => setSel(maxSel)}
@@ -169,11 +179,12 @@ export function SessionSwitcher({ workspaceId, onClose }: Props) {
           </button>
         </div>
 
-        <div className="flex gap-4 border-t border-octo-hairline px-4 py-2 font-mono text-[9px] tracking-[0.1em] text-octo-mute">
-          <span>↑↓ move</span>
-          <span>⏎ switch</span>
-          <span>⌫ close session</span>
-          <span>esc dismiss</span>
+        {/* The app's canonical key-hint voice: mono caps, `ESC · CLOSE`. */}
+        <div className="flex gap-4 border-t border-octo-hairline px-4 py-2 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+          <span>↑↓ · Move</span>
+          <span>⏎ · Switch</span>
+          <span>⌫ · Close</span>
+          <span>Esc · Dismiss</span>
         </div>
       </div>
     </ModalShell>

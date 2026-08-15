@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Plus, X } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
@@ -41,10 +41,45 @@ export function SessionRail({ workspaceId }: Props) {
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
 
-  const [hoverId, setHoverId] = useState<string | null>(null);
+  // The open flyout, with the viewport coordinates of the cell that owns it.
+  // The cell list scrolls (a workspace can hold any number of sessions), and an
+  // `overflow-y` box clips in BOTH axes — so the flyout is positioned `fixed`
+  // against the measured cell instead of `absolute` inside the scroller. It
+  // stays a DOM child of its cell, which is what keeps it in the tab order and
+  // keeps the pointer "inside" the cell while it is being used.
+  const [hover, setHover] = useState<{ id: string; top: number; left: number } | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const peek = useModifierPeek();
+
+  const openFlyout = useCallback((id: string, anchor: HTMLElement) => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = undefined;
+    }
+    const r = anchor.getBoundingClientRect();
+    setHover({ id, top: r.top - 2, left: r.right + 8 });
+  }, []);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = undefined;
+    }
+  }, []);
+
+  const closeFlyout = useCallback((id: string) => {
+    setHover((h) => (h?.id === id ? null : h));
+    setEditingId((e) => (e === id ? null : e));
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (closeTimer.current) clearTimeout(closeTimer.current);
+    },
+    [],
+  );
 
   const startEdit = useCallback((id: string, label: string) => {
     setEditingId(id);
@@ -82,43 +117,73 @@ export function SessionRail({ workspaceId }: Props) {
 
   return (
     <div
-      role="tablist"
-      aria-label="Terminal sessions"
-      aria-orientation="vertical"
       // Same geometry as Review's collapsed navigator rail (w-44px, one right
       // hairline, panel ground) — one canonical chrome per concept.
-      className="octo-fade-in flex w-[44px] shrink-0 flex-col items-center gap-1 border-r border-octo-hairline bg-octo-panel py-2"
+      className="octo-fade-in flex w-[44px] shrink-0 flex-col items-center border-r border-octo-hairline bg-octo-panel py-2"
       // Flex siblings paint as atomic units, so the rail needs its own
       // stacking context to keep the hover flyout above the terminal.
       style={{ position: "relative", zIndex: 2 }}
     >
+      {/* The cells scroll; the New control below never leaves the viewport,
+          however many sessions a workspace accumulates. */}
+      <div
+        role="tablist"
+        aria-label="Terminal sessions"
+        aria-orientation="vertical"
+        className="flex min-h-0 w-full flex-1 flex-col items-center gap-1 overflow-y-auto"
+        // Scrolling moves the cells out from under a measured flyout, so the
+        // flyout goes rather than drifting off its anchor.
+        onScroll={() => setHover(null)}
+      >
       {terminals.map((t, i) => {
         const active = t.id === activeId;
         const Icon = iconForSessionRole(t.role);
         const isEditing = t.id === editingId;
         const jump = i < 9 ? `⌘⌥${i + 1}` : null;
-        const doing = t.busy && t.command ? t.command : ROLE_WORD[t.role];
+        // A busy session always reports work, even when the platform could not
+        // resolve the command (older daemon, unsupported OS) — falling through
+        // to the role phrase would have the cell say "shell at the prompt"
+        // while a build runs. Same wording as the switcher and the anchor.
+        const doing = t.busy ? (t.command ?? "running") : ROLE_WORD[t.role];
 
         return (
           <div
             key={t.id}
-            className="relative w-8"
-            onMouseEnter={() => setHoverId(t.id)}
+            role="presentation"
+            className="octo-rise-in relative w-8"
+            onMouseEnter={(e) => openFlyout(t.id, e.currentTarget)}
             onMouseLeave={() => {
-              setHoverId((h) => (h === t.id ? null : h));
-              if (editingId === t.id) setEditingId(null);
+              // A rename in progress owns the flyout: closing it would unmount
+              // the input, and React fires no blur on unmount, so the typed
+              // label would vanish without ever being committed.
+              if (editingId === t.id) return;
+              // A short grace window otherwise: the pointer crosses 8px of
+              // canvas to reach the flyout, and re-entering cancels the close.
+              if (closeTimer.current) clearTimeout(closeTimer.current);
+              closeTimer.current = setTimeout(() => closeFlyout(t.id), 120);
+            }}
+            // Keyboard focus opens the flyout, so keyboard blur has to close
+            // it — otherwise tabbing out of the rail parks a popover over the
+            // terminal. `relatedTarget` inside this cell means focus only moved
+            // between the cell and its own flyout controls.
+            onBlur={(e) => {
+              if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+              closeFlyout(t.id);
             }}
           >
             <button
               type="button"
               role="tab"
               aria-selected={active}
-              tabIndex={active ? 0 : -1}
+              tabIndex={active || (activeId === null && i === 0) ? 0 : -1}
               data-testid={`session-cell-${t.id}`}
-              title={`${t.label} — ${doing}${jump ? ` (${jump})` : ""}`}
+              // No native `title`: the flyout opens on the same hover (and on
+              // focus) and already carries label, activity and jump key. The
+              // aria-label keeps the cell named for assistive tech.
+              aria-label={`${t.label} — ${doing}${jump ? ` (${jump})` : ""}`}
               onClick={() => setActive(workspaceId, t.id)}
               onKeyDown={(e) => onCellKeyDown(e, t.id)}
-              onFocus={() => setHoverId(t.id)}
+              onFocus={(e) => openFlyout(t.id, e.currentTarget)}
               className={`flex h-8 w-8 items-center justify-center rounded-md transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
                 active
                   ? "bg-[var(--brass-ghost)] text-octo-brass"
@@ -141,9 +206,13 @@ export function SessionRail({ workspaceId }: Props) {
                 className="rail-bar-running"
                 style={
                   {
+                    // Brass marks the ACTIVE session (design-system §7 keeps
+                    // brass off status); a command running in a session you are
+                    // not watching marches in sage, exactly as the workspace
+                    // rail tints a non-active row's activity bar.
                     ["--rail-bar" as string]: active
                       ? "var(--color-octo-brass)"
-                      : "var(--brass-line)",
+                      : "var(--color-octo-sage)",
                     top: 4,
                     bottom: 4,
                   } as React.CSSProperties
@@ -153,7 +222,7 @@ export function SessionRail({ workspaceId }: Props) {
             ) : (
               <span
                 aria-hidden
-                className="absolute bottom-1 left-[-3px] top-1 w-[2px] rounded-sm transition-colors duration-[180ms]"
+                className="absolute bottom-1 left-[-3px] top-1 w-[3px] rounded-sm transition-colors duration-[180ms]"
                 style={{ background: active ? "var(--color-octo-brass)" : "transparent" }}
               />
             )}
@@ -169,10 +238,13 @@ export function SessionRail({ workspaceId }: Props) {
               />
             )}
 
-            {hoverId === t.id && (
+            {hover?.id === t.id && (
               <div
                 data-testid={`session-flyout-${t.id}`}
-                className="octo-menu-enter absolute left-10 top-[-2px] z-30 min-w-[216px] rounded-lg border border-octo-hairline bg-octo-panel-2 px-3 py-2.5 shadow-[0_18px_40px_-22px_rgba(0,0,0,0.95)]"
+                className="octo-menu-enter fixed z-[60] min-w-[216px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2.5 shadow-2xl"
+                style={{ top: hover.top, left: hover.left }}
+                // The pointer made it across the gap — keep the flyout open.
+                onMouseEnter={cancelClose}
               >
                 {isEditing ? (
                   <input
@@ -194,7 +266,12 @@ export function SessionRail({ workspaceId }: Props) {
                   />
                 ) : (
                   <div className="flex items-center gap-2">
-                    <Icon size={14} strokeWidth={1.75} className="shrink-0 text-octo-brass" aria-hidden />
+                    <Icon
+                      size={14}
+                      strokeWidth={1.75}
+                      aria-hidden
+                      className={`shrink-0 ${t.busy ? "text-octo-brass" : "text-octo-verdigris"}`}
+                    />
                     <span className="min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory">
                       {t.label}
                     </span>
@@ -215,9 +292,9 @@ export function SessionRail({ workspaceId }: Props) {
                     type="button"
                     data-testid={`session-close-${t.id}`}
                     onClick={() => void deleteTerminal(workspaceId, t.id)}
-                    className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-octo-mute transition-colors hover:text-octo-rouge focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                    className="font-mono text-[9px] uppercase tracking-[0.14em] text-octo-mute transition-colors hover:text-octo-rouge focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
-                    <X size={10} strokeWidth={2} aria-hidden /> Close
+                    Close
                   </button>
                   {jump && (
                     <span className="ml-auto font-mono text-[9px] text-octo-mute">{jump}</span>
@@ -228,6 +305,7 @@ export function SessionRail({ workspaceId }: Props) {
           </div>
         );
       })}
+      </div>
 
       <button
         type="button"
@@ -235,7 +313,7 @@ export function SessionRail({ workspaceId }: Props) {
         aria-label="New session"
         title="New session"
         data-testid="session-new"
-        className="mt-auto flex h-7 w-7 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
         <Plus size={13} strokeWidth={1.75} aria-hidden />
       </button>
@@ -244,9 +322,12 @@ export function SessionRail({ workspaceId }: Props) {
 }
 
 /**
- * True while ⌥ or ⌘ is held — the moment the rail swaps icons for jump
- * numbers. The hint arrives exactly when the hand is already on the modifier,
- * and window blur resets it so a Cmd-Tab away can't leave the rail stuck.
+ * True while ⌥ is held — the moment the rail swaps icons for jump numbers. The
+ * hint arrives exactly when the hand is already on the modifier, and window
+ * blur resets it so a Cmd-Tab away can't leave the rail stuck.
+ *
+ * ⌥ only, not ⌘: the jump chord is ⌘⌥N, and every plain ⌘ shortcut (⌘C, ⌘S,
+ * ⌘K…) would otherwise flash the whole rail on its way past.
  */
 function useModifierPeek(): boolean {
   const [peek, setPeek] = useState(false);
@@ -255,7 +336,7 @@ function useModifierPeek(): boolean {
 
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      const next = e.altKey || e.metaKey;
+      const next = e.altKey;
       if (next !== peekRef.current) setPeek(next);
     };
     const off = () => {

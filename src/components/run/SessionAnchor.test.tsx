@@ -55,7 +55,13 @@ describe("SessionAnchor", () => {
     seed([{ id: "a", label: "dev", role: "dev", busy: true, command: "npm run dev" }]);
     render(<SessionAnchor workspaceId={WS} onOpen={() => {}} />);
 
-    expect(screen.getByTestId("session-anchor").textContent).toContain("npm run dev");
+    // Asserted on the title, not the text: the inline command span is
+    // width-gated (`hidden lg:inline`) and jsdom applies no CSS, so a
+    // textContent check would pass even if it never rendered anywhere.
+    expect(screen.getByTestId("session-anchor")).toHaveAttribute(
+      "title",
+      "dev — npm run dev. Switch session (⌘⌥K)",
+    );
   });
 
   it("reports another session waiting, but never itself", () => {
@@ -64,7 +70,8 @@ describe("SessionAnchor", () => {
       useAttentionStore.getState().ping(WS, "terminal", "b");
     });
     const { rerender } = render(<SessionAnchor workspaceId={WS} onOpen={() => {}} />);
-    expect(screen.getByTestId("session-anchor").textContent).toContain("1 waiting");
+    // One flag per workspace, so this is a boolean, not a counter.
+    expect(screen.getByTestId("session-anchor").textContent).toContain("waiting");
 
     act(() => {
       useAttentionStore.getState().ping(WS, "terminal", "a");

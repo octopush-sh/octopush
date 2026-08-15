@@ -110,6 +110,23 @@ describe("SessionSwitcher", () => {
     expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("a");
   });
 
+  it("does not fire the same close twice on a fast double ⌫", async () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    // A delete that hasn't resolved yet still holds the row in the list, so a
+    // second press would delete the same id and toast a failure for a session
+    // that closed perfectly well.
+    let resolve!: () => void;
+    mockIpc.deleteTerminal.mockReturnValue(new Promise<void>((r) => (resolve = r)));
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} />);
+
+    const input = screen.getByTestId("session-switcher-input");
+    fireEvent.keyDown(input, { key: "Backspace" });
+    fireEvent.keyDown(input, { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledTimes(1);
+
+    resolve();
+  });
+
   it("opens a new session from the last row", () => {
     seed([{ id: "a", label: "main" }]);
     mockIpc.createTerminal.mockResolvedValue({ id: "new", label: "Terminal 2", position: 1 });

@@ -282,6 +282,12 @@ impl Session {
             Some(Instant::now() + Duration::from_millis(ATTACH_GRACE_MS));
         self.attention_pending = false;
         self.reset_attention_baselines();
+        // Forget the foreground state too. `check_foreground` only speaks on a
+        // FLIP, so a client attaching to a session that is already mid-command
+        // (the normal case after an app restart) would never hear about it —
+        // the rail would show an idle shell while a build runs. Clearing the
+        // latch makes the next tick report the true state, with its command.
+        self.fg_busy = false;
     }
 
     /// Wipe the live attention baselines — byte counter, CPU sample,
@@ -556,8 +562,10 @@ fn platform_command(pid: i32) -> Option<String> {
     // re-export for apple targets.
     const CTL_KERN: libc::c_int = 1;
     const KERN_PROCARGS2: libc::c_int = 49;
-    // A process's argv+envp is capped near 1 MiB; refuse anything larger
-    // rather than allocating whatever the kernel claims.
+    // The probe returns the process's whole (page-rounded) argument space,
+    // not the argv length — Darwin's ARG_MAX is 256 KiB, so a sane answer is
+    // far below this. The cap is a sanity bound on what we will allocate for a
+    // kernel answer, not a promise about argv's size.
     const MAX_ARGS_BYTES: libc::size_t = 1 << 20;
 
     let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
@@ -597,6 +605,9 @@ fn platform_command(pid: i32) -> Option<String> {
     parse_procargs2(&buf)
 }
 
+// The daemon is macOS-only today (its CPU sampling uses `proc_pidinfo`
+// unconditionally), so this branch cannot be exercised yet. It is kept so the
+// day the daemon is ported the role vocabulary comes with it, not after it.
 #[cfg(target_os = "linux")]
 fn platform_command(pid: i32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
@@ -619,17 +630,34 @@ fn parse_procargs2(buf: &[u8]) -> Option<String> {
     if argc <= 0 {
         return None;
     }
-    // After the count comes the exec path, then NUL padding, then argc
-    // NUL-terminated argv entries. Dropping empty slices skips the padding,
-    // and the first survivor is the exec path itself.
-    let mut parts = buf[4..]
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(String::from_utf8_lossy);
-    let exec = parts.next()?;
+    // After the count comes the exec path, then NUL padding, then exactly
+    // `argc` NUL-terminated argv entries, then envp. Empties are only skipped
+    // while they ARE the padding: filtering them throughout would drop a
+    // legitimately empty argument (`mytool "" --x`) and slide the take-window
+    // one slot into the environment, leaking `KEY=value` into the UI.
+    let mut parts = buf[4..].split(|b| *b == 0);
+    let exec = loop {
+        let s = parts.next()?;
+        if !s.is_empty() {
+            break String::from_utf8_lossy(s);
+        }
+    };
+    let mut argv: Vec<std::borrow::Cow<'_, str>> = Vec::new();
+    let mut started = false;
+    for s in parts {
+        if !started {
+            if s.is_empty() {
+                continue; // still in the alignment padding
+            }
+            started = true;
+        }
+        if argv.len() == argc as usize {
+            break;
+        }
+        argv.push(String::from_utf8_lossy(s));
+    }
     // argv[0] is normally the same string as the exec path; prefer argv when
     // it is there, and fall back to the exec path for a bare process.
-    let argv: Vec<_> = parts.take(argc as usize).collect();
     if argv.is_empty() {
         summarise_argv(std::iter::once(exec))
     } else {
@@ -637,8 +665,13 @@ fn parse_procargs2(buf: &[u8]) -> Option<String> {
     }
 }
 
-/// Basename of argv[0] plus up to two arguments, capped so a pathological
-/// command line can never turn into a wall of text on the wire.
+/// Basename of argv[0] plus up to two **non-flag** arguments, capped so a
+/// pathological command line can never turn into a wall of text on the wire.
+///
+/// Flags are dropped here rather than downstream because the window is only
+/// three tokens wide: `npm --silent run dev` would otherwise arrive as
+/// "npm --silent run" and classify as nothing at all. The frontend
+/// (`lib/sessionRole.ts`) reads the subcommand, which is what survives.
 fn summarise_argv<'a>(args: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Option<String> {
     const MAX_LEN: usize = 96;
     let mut parts = args.filter(|s| !s.is_empty());
@@ -647,7 +680,7 @@ fn summarise_argv<'a>(args: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> 
     if out.is_empty() {
         return None;
     }
-    for arg in parts.take(2) {
+    for arg in parts.filter(|a| !a.starts_with('-')).take(2) {
         if out.len() + arg.len() + 1 > MAX_LEN {
             break;
         }
@@ -784,6 +817,32 @@ mod tests {
         assert_eq!(parse_procargs2(&buf).as_deref(), Some("zsh"));
     }
 
+    /// An empty argument must be counted, not skipped — skipping it would
+    /// slide the take-window one slot into envp and leak `KEY=value`.
+    #[test]
+    fn procargs2_does_not_leak_the_environment() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/bin/mytool");
+        buf.extend_from_slice(&[0, 0]);
+        for entry in ["mytool", "", "--x"] {
+            buf.extend_from_slice(entry.as_bytes());
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"SECRET=hunter2\0");
+        let out = parse_procargs2(&buf).unwrap();
+        assert!(!out.contains("SECRET"), "env leaked into: {out}");
+        assert_eq!(out, "mytool");
+    }
+
+    /// Flags are dropped so the three-token window carries the subcommand the
+    /// frontend classifies on.
+    #[test]
+    fn argv_summary_drops_flags_to_keep_the_subcommand() {
+        let args = ["/usr/local/bin/npm", "--silent", "run", "dev"];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("npm run dev"));
+    }
+
     #[test]
     fn procargs2_rejects_garbage() {
         assert_eq!(parse_procargs2(&[]), None);
@@ -795,7 +854,7 @@ mod tests {
     fn argv_summary_keeps_three_tokens_and_caps_length() {
         let args = ["/opt/homebrew/bin/cargo", "build", "--release", "--locked"];
         let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
-        assert_eq!(summary.as_deref(), Some("cargo build --release"));
+        assert_eq!(summary.as_deref(), Some("cargo build"), "flags are dropped");
 
         let long = "x".repeat(200);
         let args = ["git", long.as_str()];

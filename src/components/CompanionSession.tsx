@@ -50,11 +50,7 @@ export function CompanionSession({ workspaceId }: Props) {
     <section>
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4">
         <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Session</h3>
-        {session && (
-          <span className="octo-tabular font-mono text-[9px] text-octo-mute">
-            {terminals.findIndex((t) => t.id === session.id) + 1}/{terminals.length}
-          </span>
-        )}
+
       </div>
 
       {!session ? (
@@ -63,7 +59,10 @@ export function CompanionSession({ workspaceId }: Props) {
         <div className="flex flex-col gap-3 px-4 py-3">
           {/* Identity — the same role icon the rail and the switcher use. */}
           <div className="flex items-center gap-2">
-            <span className="flex shrink-0" title={ROLE_WORD[session.role]}>
+            {/* No `title` here: the Doing row below prints the same phrase,
+                and the doctrine says a state shown by a glyph isn't also
+                labelled twice. */}
+            <span className="flex shrink-0">
               {(() => {
                 const Icon = iconForSessionRole(session.role);
                 return (

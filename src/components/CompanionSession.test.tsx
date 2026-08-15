@@ -71,8 +71,7 @@ describe("CompanionSession", () => {
     expect(screen.getByText("dev server")).toBeTruthy();
     expect(screen.getByText("npm run dev")).toBeTruthy();
     expect(screen.getByText("running")).toBeTruthy();
-    // The position is shown as a count, not as a second list.
-    expect(screen.getByText("2/2")).toBeTruthy();
+    // The panel describes one session — the rail is the list.
     expect(screen.queryByText("main")).toBeNull();
   });
 

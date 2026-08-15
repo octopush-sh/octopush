@@ -49,6 +49,9 @@ interface AttentionState {
   ping: (workspaceId: string, kind: AttentionKind, terminalId?: string | null) => void;
   /** Clear the flag for a workspace (called when the user focuses it). */
   clear: (workspaceId: string) => void;
+  /** Clear the flag only if it points at this terminal — called when a session
+   *  is closed, so a marker can't outlive the thing that raised it. */
+  clearForTerminal: (workspaceId: string, terminalId: string) => void;
   /** Persisted toggle. */
   setSoundEnabled: (v: boolean) => void;
 }
@@ -89,6 +92,15 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
   clear: (workspaceId) =>
     set((s) => {
       if (!(workspaceId in s.flagsByWs)) return s;
+      const next = { ...s.flagsByWs };
+      delete next[workspaceId];
+      return { flagsByWs: next };
+    }),
+
+  clearForTerminal: (workspaceId, terminalId) =>
+    set((s) => {
+      const flag = s.flagsByWs[workspaceId];
+      if (!flag || flag.terminalId !== terminalId) return s;
       const next = { ...s.flagsByWs };
       delete next[workspaceId];
       return { flagsByWs: next };

@@ -389,7 +389,7 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
 | Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
-| Companion     | 280px | Per-mode panels: Context+History · Terminals+Quick · Changed+commit · Runs+Jira. |
+| Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Italic-serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
@@ -406,9 +406,11 @@ Terminal navigation lives on the canvas, never in the Companion: the Companion
 collapses, and a collapse must not remove the only way to change session. Three
 rules, reusable wherever a set of live things needs a compact switcher:
 
-- **The icon is the identity; the number is the address.** A 44px rail cell
-  holds one glyph well and two badly, so it carries the session's **role icon**
-  at rest and flips to its `⌘⌥N` number while ⌥/⌘ is held (`useModifierPeek`).
+- **The icon is the identity; the number is the address.** A 32px cell (in a
+  44px rail) holds one glyph well and two badly, so it carries the session's
+  **role icon** at rest and flips to its `⌘⌥N` number while **⌥** is held
+  (`useModifierPeek` — ⌥ only, or every plain ⌘ shortcut would flash the rail
+  on its way past).
   The hint arrives when the hand is already on the modifier — and nothing lives
   only behind the gesture: the number is permanent in the hover flyout, the
   Companion inspector and the `⌘⌥K` switcher.
@@ -423,10 +425,13 @@ rules, reusable wherever a set of live things needs a compact switcher:
 - **One glyph, two facts.** The icon carries identity, its colour carries state
   (verdigris idle, brass busy); the cell's reserved edge carries selection
   (solid brass) and activity (`.rail-bar-running` marching segments, the
-  workspace rail's own idiom). No icon-plus-status-dot pairs, and no second
-  pulse: the per-session "this one rang" marker is a **static** brass dot,
-  because the mode switcher's pulse already owns that signal at the scope above
-  (Law 2).
+  workspace rail's own idiom). §7's "no status in brass" holds: the marching
+  edge is **brass only on the active cell and sage everywhere else**, exactly
+  as the workspace rail tints a non-active row — five busy sessions must not
+  put five brass marks on screen. The one brass exception is *attention*, which
+  the app already spends brass on: the per-session "this one rang" marker. It
+  is a **static** dot, not a second pulse, because the mode switcher's pulse
+  owns that signal at the scope above (Law 2).
 
 The band's status tail may become a **control** when the mode has one worth
 having — in Run it is the session anchor (`ModeBand` takes a `ReactNode`), which

@@ -55,13 +55,21 @@ const DEV_BINS = new Set([
 /** Runners whose meaning lives entirely in their arguments. */
 const DELEGATORS = new Set(["npx", "bunx", "pnpx", "dlx", "sudo", "time", "env", "watch", "nohup"]);
 
-/** Script names, as passed to `npm run <name>` or invoked directly. */
+/** Script names, as passed to `npm run <name>` or invoked directly.
+ *
+ *  Tests are matched first and anywhere in the name: `watch:test` and
+ *  `test:watch` are both test runs, and a leading-`watch` rule would otherwise
+ *  claim the first one for "dev". */
 function roleForScript(name: string): SessionRole | null {
+  if (/(^|:)(test|tests|spec|e2e|coverage|vitest|jest)(:|$)/.test(name)) return "test";
   if (/^(dev|start|serve|preview|watch|storybook)(:|$)/.test(name)) return "dev";
   if (/^(build|compile|bundle|typecheck|tsc)(:|$)/.test(name)) return "build";
-  if (/^(test|tests|spec|e2e|coverage|vitest|jest)(:|$)/.test(name)) return "test";
   return null;
 }
+
+/** Build tools that also run the test suite — `make test`, `gradlew test`,
+ *  `mvn test`, `turbo test`. Their name alone is not the answer. */
+const MULTI_PURPOSE_BUILD = new Set(["make", "gmake", "gradle", "gradlew", "mvn", "turbo", "xcodebuild", "ninja"]);
 
 /**
  * Classify a foreground command summary ("npm run dev", "cargo build
@@ -103,7 +111,12 @@ function classify(tokens: string[], depth: number): SessionRole {
 
   // A dev-server binary asked to build is a build, not a server.
   if (DEV_BINS.has(bin)) return first === "build" ? "build" : "dev";
-  if (BUILD_BINS.has(bin)) return "build";
+  if (BUILD_BINS.has(bin)) {
+    // `make test` is a test run, not a build — these tools are only "build"
+    // by default, never by definition.
+    if (MULTI_PURPOSE_BUILD.has(bin) && roleForScript(first) === "test") return "test";
+    return "build";
+  }
 
   // ── Package managers: the subcommand carries the meaning ──────────
   if (["npm", "pnpm", "yarn", "bun", "deno"].includes(bin)) {
@@ -139,10 +152,13 @@ function classify(tokens: string[], depth: number): SessionRole {
   }
 
   if (bin === "docker" || bin === "docker-compose" || bin === "podman") {
-    // `docker compose up` puts the meaningful verb one token further along.
-    const verb = first === "compose" ? (args[1] ?? "") : first;
-    if (verb === "build") return "build";
-    if (verb === "up" || verb === "run" || verb === "start") return "dev";
+    // The verb can sit at any position — `docker compose up`, and a dropped
+    // flag's value (`-f dev.yml`) can shift it further still — so look for it
+    // rather than counting tokens.
+    if (args.includes("build")) return "build";
+    if (args.some((a) => a === "up" || a === "start")) return "dev";
+    // `docker run` is a container, not a dev server, unless it is composed.
+    if (args.includes("run")) return args.includes("compose") ? "dev" : "unknown";
     return "unknown";
   }
 

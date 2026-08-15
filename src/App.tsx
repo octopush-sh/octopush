@@ -16,7 +16,7 @@ import { RenameDialog } from "./components/RenameDialog";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
 import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
 import { ArchivedWorkspacesModal } from "./components/ArchivedWorkspacesModal";
-import { ModalShell } from "./components/ModalShell";
+import { ModalShell, isModalOpen } from "./components/ModalShell";
 import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -80,6 +80,7 @@ import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
+import { shouldClearAttention } from "./lib/attentionFocus";
 import { ipc } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
@@ -791,16 +792,13 @@ function App() {
     focusGlobal.workspaceId = activeWorkspaceId ?? null;
     focusGlobal.mode = activeMode;
     if (!activeWorkspaceId) return;
+    // A terminal ping now names the session that rang, so being in Run mode is
+    // no longer enough to clear it — see `lib/attentionFocus.ts` for the rule
+    // and why it is narrower than "same mode".
     const flag = useAttentionStore.getState().flagsByWs[activeWorkspaceId];
-    if (!flag) return;
-    const matchingMode = flag.kind === "chat" ? "talk" : "run";
-    if (activeMode !== matchingMode) return;
-    // A terminal ping now names the session that rang. Being in Run mode is no
-    // longer enough to clear it — the user has to actually be looking at THAT
-    // session, otherwise the rail's marker would vanish before it could point
-    // anywhere. Flags without a terminal id (older pings) clear as before.
-    if (flag.terminalId && flag.terminalId !== activeTerminalId) return;
-    useAttentionStore.getState().clear(activeWorkspaceId);
+    if (shouldClearAttention(flag, activeMode, activeTerminalId)) {
+      useAttentionStore.getState().clear(activeWorkspaceId);
+    }
   }, [activeWorkspaceId, activeMode, activeTerminalId]);
 
   // The switcher belongs to the Run canvas of one workspace; leaving either
@@ -902,8 +900,10 @@ function App() {
 
       const mod = e.metaKey || e.ctrlKey;
 
-      // ⌘1..⌘9 → switch workspace N
-      if (mod && !e.shiftKey && /^[1-9]$/.test(e.key)) {
+      // ⌘1..⌘9 → switch workspace N. `!e.altKey` so ⌘⌥N (jump to the Nth
+      // terminal session, below) is never eaten here on a layout where Option
+      // leaves `e.key` as the digit.
+      if (mod && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
         const idx = parseInt(e.key, 10) - 1;
         const ws = workspaces[idx];
         if (ws) {
@@ -967,8 +967,8 @@ function App() {
         return;
       }
 
-      // ⌘K → command palette
-      if (mod && !e.shiftKey && e.key === "k") {
+      // ⌘K → command palette. `!e.altKey` keeps ⌘⌥K (session switcher) out.
+      if (mod && !e.altKey && !e.shiftKey && e.key === "k") {
         e.preventDefault();
         setShowPalette((v) => !v);
         return;
@@ -1011,20 +1011,28 @@ function App() {
         return;
       }
 
-      // ⌘⌥K → the session switcher. Run mode only: it is the palette for
-      // terminals, and opening it anywhere else would offer nothing.
+      // ⌘⌥K → the session switcher. Run mode only, as the palette lists
+      // terminals and nothing else — in Talk it would silently switch a
+      // surface the user isn't looking at.
       // `e.code` as well as `e.key`: on some layouts Option remaps the printed
       // character, and the shortcut should follow the physical key.
       if (mod && e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K" || e.code === "KeyK")) {
+        if (!activeWorkspaceId || focusGlobal.mode !== "run") return;
         e.preventDefault();
-        if (activeWorkspaceId) setSessionSwitcherOpen(true);
+        // Toggle, like ⌘K does — pressing it again closes rather than
+        // stacking a second dialog under the same fingers. When some OTHER
+        // dialog owns the screen (Settings, the command palette) the switcher
+        // stays shut rather than opening underneath it: `isModalOpen()` is
+        // true for our own shell too, hence the open/closed split.
+        setSessionSwitcherOpen((v) => (v ? false : !isModalOpen()));
         return;
       }
 
       // ⌘⌥← / ⌘⌥→ → previous / next session, wrapping. The keyboard path that
-      // doesn't need you to know which number a session holds.
+      // doesn't need you to know which number a session holds. Run mode only,
+      // for the same reason.
       if (mod && e.altKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
-        if (!activeWorkspaceId) return;
+        if (!activeWorkspaceId || focusGlobal.mode !== "run") return;
         const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
         if (list.length < 2) return;
         e.preventDefault();
@@ -1036,13 +1044,19 @@ function App() {
         return;
       }
 
-      // ⌘⌥1..9 → cycle within-workspace terminals (must check altKey to avoid
-      // colliding with ⌘1..9 workspace shortcuts above).
-      if (mod && e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
+      // ⌘⌥1..9 → jump to the Nth terminal session (must check altKey to avoid
+      // colliding with ⌘1..9 workspace shortcuts above). Run mode only, like
+      // its siblings above.
+      // `e.code` first: on macOS Option rewrites the printed character even
+      // with Cmd held (⌥1 → "¡"), so matching on `e.key` alone made this
+      // shortcut dead on the platform it ships to.
+      const digit = /^Digit([1-9])$/.exec(e.code ?? "")?.[1] ?? (/^[1-9]$/.test(e.key) ? e.key : null);
+      if (mod && e.altKey && !e.shiftKey && digit) {
+        if (focusGlobal.mode !== "run") return;
         e.preventDefault();
         if (activeWorkspaceId) {
           const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
-          const idx = parseInt(e.key, 10) - 1;
+          const idx = parseInt(digit, 10) - 1;
           const target = list[idx];
           if (target) {
             setActiveTerminal(activeWorkspaceId, target.id);
@@ -2373,10 +2387,10 @@ function App() {
         </ModalShell>
       )}
 
-      {/* Session switcher (⌘⌥K / the band anchor). Mounted only with a
-          workspace and at least one session, so it can never open onto an
-          empty list. */}
-      {sessionSwitcherOpen && activeWorkspaceId && terminals.length > 0 && (
+      {/* Session switcher (⌘⌥K / the band anchor). Available with zero
+          sessions too — its last row opens one, which is exactly what an empty
+          workspace needs. */}
+      {sessionSwitcherOpen && activeWorkspaceId && (
         <SessionSwitcher
           workspaceId={activeWorkspaceId}
           onClose={() => setSessionSwitcherOpen(false)}

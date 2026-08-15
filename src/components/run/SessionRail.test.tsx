@@ -66,14 +66,28 @@ describe("SessionRail", () => {
     expect(screen.getByTestId("session-cell-b")).toHaveAttribute("aria-selected", "true");
   });
 
-  it("names the session and what it is doing in the cell's tooltip", () => {
+  it("names the session and what it is doing, without a second tooltip", () => {
     seed([{ id: "a", label: "dev", role: "dev", busy: true, command: "npm run dev" }]);
     render(<SessionRail workspaceId={WS} />);
 
     // Busy sessions report the live command; the jump shortcut rides along.
+    // The name lives on aria-label, not `title` — the flyout opens on the same
+    // hover and would otherwise be the second tooltip of one gesture.
+    const cell = screen.getByTestId("session-cell-a");
+    expect(cell).toHaveAttribute("aria-label", "dev — npm run dev (⌘⌥1)");
+    expect(cell).not.toHaveAttribute("title");
+  });
+
+  it("says a busy session is running even when the command is unknown", () => {
+    // An older daemon (or an unsupported platform) sends no command. Falling
+    // back to the role phrase would have the cell claim "shell at the prompt"
+    // while a build runs.
+    seed([{ id: "a", label: "dev", busy: true, command: null }]);
+    render(<SessionRail workspaceId={WS} />);
+
     expect(screen.getByTestId("session-cell-a")).toHaveAttribute(
-      "title",
-      "dev — npm run dev (⌘⌥1)",
+      "aria-label",
+      "dev — running (⌘⌥1)",
     );
   });
 
@@ -86,14 +100,24 @@ describe("SessionRail", () => {
     expect(cell.textContent).toBe("");
 
     act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt", altKey: true }));
     });
     expect(screen.getByTestId("session-cell-b").textContent).toBe("2");
 
     act(() => {
-      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Meta" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt" }));
     });
     expect(screen.getByTestId("session-cell-b").querySelector("svg")).toBeTruthy();
+  });
+
+  it("does not flash the numbers on a bare ⌘ — every ⌘ shortcut would", () => {
+    seed([{ id: "a", label: "main" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true }));
+    });
+    expect(screen.getByTestId("session-cell-a").textContent).toBe("");
   });
 
   it("drops the peek when the window loses focus, so the rail can't stick", () => {
@@ -138,6 +162,53 @@ describe("SessionRail", () => {
     render(<SessionRail workspaceId={WS} />);
 
     expect(screen.queryByTestId("session-bell-a")).toBeNull();
+  });
+
+  it("closes the flyout when focus leaves the cell", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    const cell = screen.getByTestId("session-cell-a");
+    fireEvent.focus(cell);
+    expect(screen.getByTestId("session-flyout-a")).toBeTruthy();
+
+    // Tab away: without this the popover stays parked over the terminal.
+    fireEvent.blur(cell.parentElement!, {
+      relatedTarget: screen.getByTestId("session-cell-b"),
+    });
+    expect(screen.queryByTestId("session-flyout-a")).toBeNull();
+  });
+
+  it("keeps a rename alive when the pointer wanders off the cell", () => {
+    seed([{ id: "a", label: "main" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    const wrapper = screen.getByTestId("session-cell-a").parentElement!;
+    fireEvent.mouseEnter(wrapper);
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByTestId("session-rename-a"), { target: { value: "logs" } });
+
+    // Unmounting the input here would discard the typed label silently:
+    // React fires no blur on unmount.
+    fireEvent.mouseLeave(wrapper);
+    expect(screen.getByTestId("session-rename-a")).toBeTruthy();
+  });
+
+  it("abandons a rename on Escape and rejects an empty one", () => {
+    seed([{ id: "a", label: "main" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    const wrapper = screen.getByTestId("session-cell-a").parentElement!;
+    fireEvent.mouseEnter(wrapper);
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByTestId("session-rename-a"), { target: { value: "nope" } });
+    fireEvent.keyDown(screen.getByTestId("session-rename-a"), { key: "Escape" });
+    expect(mockIpc.renameTerminal).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByTestId("session-rename-a"), { target: { value: "   " } });
+    fireEvent.keyDown(screen.getByTestId("session-rename-a"), { key: "Enter" });
+    expect(mockIpc.renameTerminal).not.toHaveBeenCalled();
   });
 
   it("switches session on click", () => {
@@ -191,5 +262,26 @@ describe("SessionRail", () => {
 
     fireEvent.keyDown(screen.getByTestId("session-cell-b"), { key: "Enter" });
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("b");
+  });
+
+  it("jumps focus to the ends with Home and End", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }], "a");
+    render(<SessionRail workspaceId={WS} />);
+
+    const first = screen.getByTestId("session-cell-a");
+    first.focus();
+    fireEvent.keyDown(first, { key: "End" });
+    expect(document.activeElement).toBe(screen.getByTestId("session-cell-c"));
+
+    fireEvent.keyDown(screen.getByTestId("session-cell-c"), { key: "Home" });
+    expect(document.activeElement).toBe(screen.getByTestId("session-cell-a"));
+  });
+
+  it("stays reachable by keyboard when no session is active", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    useTerminalsStore.setState((s) => ({ activeByWs: { ...s.activeByWs, [WS]: null } }));
+    render(<SessionRail workspaceId={WS} />);
+
+    expect(screen.getByTestId("session-cell-a")).toHaveAttribute("tabindex", "0");
   });
 });

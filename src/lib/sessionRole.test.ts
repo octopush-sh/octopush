@@ -84,6 +84,36 @@ describe("roleForCommand", () => {
     expect(roleForCommand("C:/tools/git.exe status")).toBe("git");
   });
 
+  it("reads the subcommand of a build tool that also runs tests", () => {
+    // `make`/`gradle`/`mvn`/`turbo` are only "build" by default, never by
+    // definition — claiming a Hammer for a test run also overwrites the
+    // session's sticky role with the wrong one.
+    expect(roleForCommand("make test")).toBe("test");
+    expect(roleForCommand("mvn test")).toBe("test");
+    expect(roleForCommand("gradlew test")).toBe("test");
+    expect(roleForCommand("turbo test")).toBe("test");
+    expect(roleForCommand("make")).toBe("build");
+    expect(roleForCommand("make build")).toBe("build");
+  });
+
+  it("finds a test anywhere in a script name, not only at the front", () => {
+    expect(roleForCommand("npm run watch:test")).toBe("test");
+    expect(roleForCommand("npm run test:watch")).toBe("test");
+  });
+
+  it("finds the docker verb wherever a dropped flag value left it", () => {
+    expect(roleForCommand("docker compose up")).toBe("dev");
+    expect(roleForCommand("docker compose dev.yml up")).toBe("dev");
+    expect(roleForCommand("docker compose build")).toBe("build");
+    // A bare container run is not a dev server.
+    expect(roleForCommand("docker run ubuntu")).toBe("unknown");
+  });
+
+  it("survives the flags the daemon could not strip", () => {
+    expect(roleForCommand("npm run dev")).toBe("dev");
+    expect(roleForCommand("cargo build")).toBe("build");
+  });
+
   it("stays honest about ambiguity instead of guessing", () => {
     // A bare launcher could be anything — the app shows the neutral icon
     // rather than pretending it knows.
