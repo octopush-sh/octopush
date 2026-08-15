@@ -339,9 +339,11 @@ export function TerminalPane({
     listen<PtyAttentionEvent>("pty://attention", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       if (visibleRef.current) return;
+      // Carry the terminal id so the Run rail can mark the session that rang
+      // rather than the whole workspace.
       useAttentionStore
         .getState()
-        .ping(workspaceIdRef.current, "terminal");
+        .ping(workspaceIdRef.current, "terminal", terminalId);
     }).then((u) => {
       unlistenAttention = u;
     });
@@ -364,7 +366,12 @@ export function TerminalPane({
       }
       const wsId = workspaceIdRef.current;
       if (ev.payload.busy) {
-        useTerminalsStore.getState().setBusy(wsId, ptyId, true);
+        // `command` is the daemon's argv summary; it feeds the session's role
+        // icon (lib/sessionRole.ts) and is absent when the platform can't
+        // resolve one, which the store treats as "leave the role alone".
+        useTerminalsStore
+          .getState()
+          .setBusy(wsId, ptyId, true, ev.payload.command ?? null);
       } else {
         busyOffTimerRef.current = setTimeout(() => {
           busyOffTimerRef.current = undefined;
@@ -415,7 +422,7 @@ export function TerminalPane({
     // looking at. xterm emits onBell for every \x07 it processes.
     const bellDisp = term.onBell(() => {
       if (visibleRef.current) return;
-      useAttentionStore.getState().ping(workspaceIdRef.current, "terminal");
+      useAttentionStore.getState().ping(workspaceIdRef.current, "terminal", terminalId);
     });
 
     // Attention detection lives in the Rust daemon (see
@@ -495,7 +502,8 @@ export function TerminalPane({
       // Note: we intentionally do NOT kill the PTY here — the daemon owns it
       // and it should survive this TerminalPane unmounting (e.g. workspace
       // switch, Octopush restart).  The user explicitly kills a terminal via
-      // the × button in CompanionTerminals, which calls ipc.deleteTerminal.
+      // Close action in the session rail's flyout / Companion, which calls
+      // ipc.deleteTerminal.
       ptySessionIdRef.current = null;
     };
     // terminalId is the React key — changes cause a full remount, not a re-run.

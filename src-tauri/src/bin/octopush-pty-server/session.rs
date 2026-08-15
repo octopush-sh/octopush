@@ -282,6 +282,12 @@ impl Session {
             Some(Instant::now() + Duration::from_millis(ATTACH_GRACE_MS));
         self.attention_pending = false;
         self.reset_attention_baselines();
+        // Forget the foreground state too. `check_foreground` only speaks on a
+        // FLIP, so a client attaching to a session that is already mid-command
+        // (the normal case after an app restart) would never hear about it —
+        // the rail would show an idle shell while a build runs. Clearing the
+        // latch makes the next tick report the true state, with its command.
+        self.fg_busy = false;
     }
 
     /// Wipe the live attention baselines — byte counter, CPU sample,
@@ -519,15 +525,169 @@ impl Session {
     }
 
     /// Emit an `Event::Foreground` to the attached client, if any.
-    pub fn emit_foreground(&self, busy: bool) {
+    ///
+    /// `command` is only meaningful on the transition into busy; the caller
+    /// resolves it (see `foreground_command`) so the syscall happens once per
+    /// state change rather than on every one-second tick.
+    pub fn emit_foreground(&self, busy: bool, command: Option<String>) {
         if let Some(ref tx) = self.attached {
             let event = Event::Foreground {
                 id: self.id.clone(),
                 busy,
+                command,
             };
             let _ = tx.send(event.to_line());
         }
     }
+}
+
+/// A short, human-readable summary of the command running as `pid` — the
+/// executable's basename plus up to two arguments ("npm run dev",
+/// "cargo build --release"). `None` whenever the platform can't answer, which
+/// callers treat as "unknown", never as an error.
+///
+/// The frontend needs argv, not just the executable name: every JS toolchain
+/// reports its leader as `node`, so `node` alone cannot tell a dev server from
+/// a test run.
+pub fn foreground_command(pid: i32) -> Option<String> {
+    platform_command(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_command(pid: i32) -> Option<String> {
+    // KERN_PROCARGS2 is the only route to another process's argv on
+    // Darwin. Layout: [argc: i32][exec path\0][NUL padding][argv0\0]…
+    // The constants are defined here rather than taken from libc so the
+    // build doesn't depend on which of them that version happens to
+    // re-export for apple targets.
+    const CTL_KERN: libc::c_int = 1;
+    const KERN_PROCARGS2: libc::c_int = 49;
+    // The probe returns the process's whole (page-rounded) argument space,
+    // not the argv length — Darwin's ARG_MAX is 256 KiB, so a sane answer is
+    // far below this. The cap is a sanity bound on what we will allocate for a
+    // kernel answer, not a promise about argv's size.
+    const MAX_ARGS_BYTES: libc::size_t = 1 << 20;
+
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: `sysctl` with a null oldp writes only `size`, telling us how
+    // big the buffer must be. `mib` is a 3-element array and we pass 3.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || size == 0 || size > MAX_ARGS_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: the buffer is exactly `size` bytes, which is what the probe
+    // above asked the kernel for; `size` is updated to the bytes written.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || size > buf.len() {
+        return None;
+    }
+    buf.truncate(size);
+    parse_procargs2(&buf)
+}
+
+// The daemon is macOS-only today (its CPU sampling uses `proc_pidinfo`
+// unconditionally), so this branch cannot be exercised yet. It is kept so the
+// day the daemon is ported the role vocabulary comes with it, not after it.
+#[cfg(target_os = "linux")]
+fn platform_command(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    summarise_argv(raw.split(|b| *b == 0).map(String::from_utf8_lossy))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_command(_pid: i32) -> Option<String> {
+    None
+}
+
+/// Pull argv out of a `KERN_PROCARGS2` blob and summarise it. Kept separate
+/// from the syscall so the parsing is unit-testable on any platform.
+#[allow(dead_code)] // only called on macOS; tested everywhere
+fn parse_procargs2(buf: &[u8]) -> Option<String> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc <= 0 {
+        return None;
+    }
+    // After the count comes the exec path, then NUL padding, then exactly
+    // `argc` NUL-terminated argv entries, then envp. Empties are only skipped
+    // while they ARE the padding: filtering them throughout would drop a
+    // legitimately empty argument (`mytool "" --x`) and slide the take-window
+    // one slot into the environment, leaking `KEY=value` into the UI.
+    let mut parts = buf[4..].split(|b| *b == 0);
+    let exec = loop {
+        let s = parts.next()?;
+        if !s.is_empty() {
+            break String::from_utf8_lossy(s);
+        }
+    };
+    let mut argv: Vec<std::borrow::Cow<'_, str>> = Vec::new();
+    let mut started = false;
+    for s in parts {
+        if !started {
+            if s.is_empty() {
+                continue; // still in the alignment padding
+            }
+            started = true;
+        }
+        if argv.len() == argc as usize {
+            break;
+        }
+        argv.push(String::from_utf8_lossy(s));
+    }
+    // argv[0] is normally the same string as the exec path; prefer argv when
+    // it is there, and fall back to the exec path for a bare process.
+    if argv.is_empty() {
+        summarise_argv(std::iter::once(exec))
+    } else {
+        summarise_argv(argv.into_iter())
+    }
+}
+
+/// Basename of argv[0] plus up to two **non-flag** arguments, capped so a
+/// pathological command line can never turn into a wall of text on the wire.
+///
+/// Flags are dropped here rather than downstream because the window is only
+/// three tokens wide: `npm --silent run dev` would otherwise arrive as
+/// "npm --silent run" and classify as nothing at all. The frontend
+/// (`lib/sessionRole.ts`) reads the subcommand, which is what survives.
+fn summarise_argv<'a>(args: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Option<String> {
+    const MAX_LEN: usize = 96;
+    let mut parts = args.filter(|s| !s.is_empty());
+    let first = parts.next()?;
+    let mut out = first.rsplit('/').next().unwrap_or(&first).to_string();
+    if out.is_empty() {
+        return None;
+    }
+    for arg in parts.filter(|a| !a.starts_with('-')).take(2) {
+        if out.len() + arg.len() + 1 > MAX_LEN {
+            break;
+        }
+        out.push(' ');
+        out.push_str(&arg);
+    }
+    Some(out)
 }
 
 /// Sum of user + system CPU time for `pid` in nanoseconds, as
@@ -627,6 +787,79 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         Session::new("attn-test".into(), "label".into(), "/tmp".into(), 0)
+    }
+
+    /// KERN_PROCARGS2 blob: argc, the exec path, NUL padding, then argv.
+    fn procargs2(argc: i32, exec: &str, argv: &[&str]) -> Vec<u8> {
+        let mut buf = argc.to_ne_bytes().to_vec();
+        buf.extend_from_slice(exec.as_bytes());
+        buf.extend_from_slice(&[0, 0, 0]); // terminator + alignment padding
+        for a in argv {
+            buf.extend_from_slice(a.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn procargs2_summarises_argv_not_the_exec_path() {
+        let blob = procargs2(3, "/usr/local/bin/node", &["/usr/local/bin/npm", "run", "dev"]);
+        assert_eq!(parse_procargs2(&blob).as_deref(), Some("npm run dev"));
+    }
+
+    /// A bare process (argv beyond the exec path never materialised) still
+    /// reports something useful rather than nothing.
+    #[test]
+    fn procargs2_falls_back_to_the_exec_path() {
+        let mut buf = 1i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/zsh");
+        buf.push(0);
+        assert_eq!(parse_procargs2(&buf).as_deref(), Some("zsh"));
+    }
+
+    /// An empty argument must be counted, not skipped — skipping it would
+    /// slide the take-window one slot into envp and leak `KEY=value`.
+    #[test]
+    fn procargs2_does_not_leak_the_environment() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/bin/mytool");
+        buf.extend_from_slice(&[0, 0]);
+        for entry in ["mytool", "", "--x"] {
+            buf.extend_from_slice(entry.as_bytes());
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"SECRET=hunter2\0");
+        let out = parse_procargs2(&buf).unwrap();
+        assert!(!out.contains("SECRET"), "env leaked into: {out}");
+        assert_eq!(out, "mytool");
+    }
+
+    /// Flags are dropped so the three-token window carries the subcommand the
+    /// frontend classifies on.
+    #[test]
+    fn argv_summary_drops_flags_to_keep_the_subcommand() {
+        let args = ["/usr/local/bin/npm", "--silent", "run", "dev"];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("npm run dev"));
+    }
+
+    #[test]
+    fn procargs2_rejects_garbage() {
+        assert_eq!(parse_procargs2(&[]), None);
+        assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None);
+        assert_eq!(parse_procargs2(&(-1i32).to_ne_bytes()), None);
+    }
+
+    #[test]
+    fn argv_summary_keeps_three_tokens_and_caps_length() {
+        let args = ["/opt/homebrew/bin/cargo", "build", "--release", "--locked"];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("cargo build"), "flags are dropped");
+
+        let long = "x".repeat(200);
+        let args = ["git", long.as_str()];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("git"), "an oversized arg is dropped whole");
     }
 
     /// Busy requires a non-shell child AND recent output; it flips only on a

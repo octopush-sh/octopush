@@ -8,9 +8,11 @@ interface Props {
   /** Forwarded to the switcher so an in-workspace attention flag can pulse the
    *  Run/Talk segment. */
   workspaceId?: string;
-  /** The active mode's status tail ("2 terminals", "7 files changed · +214 −61"),
-   *  or null when the mode has nothing worth reporting. */
-  meta?: string | null;
+  /** The active mode's status tail. A string is rendered as the canonical
+   *  mono status line; a node is rendered as-is, which is how Run mode puts a
+   *  live control there (the session anchor) instead of a read-out. Null when
+   *  the mode has nothing worth reporting. */
+  meta?: React.ReactNode;
 }
 
 /** The mode band — the switcher's own line, directly above the canvas and
@@ -31,13 +33,15 @@ export function ModeBand({ mode, onChange, workspaceId, meta }: Props) {
       {/* Keyed on the mode so the tail crossfades with the canvas instead of
           snapping to the new mode's numbers (motion rule S3). */}
       <FadeSwap swapKey={mode} className="min-w-0 justify-self-end">
-        {meta && (
+        {typeof meta === "string" ? (
           <span
             title={meta}
             className="block truncate font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute"
           >
             {meta}
           </span>
+        ) : (
+          meta
         )}
       </FadeSwap>
     </div>

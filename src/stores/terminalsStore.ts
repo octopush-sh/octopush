@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
+import { roleForCommand, type SessionRole } from "../lib/sessionRole";
+import { useAttentionStore } from "./attentionStore";
 
 // ─── State shape ──────────────────────────────────────────────────
 
@@ -22,6 +24,18 @@ export interface TerminalState {
    * not the Terminals panel is mounted.
    */
   restored: boolean;
+  /**
+   * What this session is *doing*, derived from the daemon's foreground command
+   * and rendered as the session's icon everywhere it appears.
+   *
+   * **Sticky by design:** it keeps the last *significant* role rather than
+   * following every transition back to the prompt, so a dev server that
+   * finishes a rebuild is still recognisably the dev server. Only a new
+   * meaningful command replaces it.
+   */
+  role: SessionRole;
+  /** The command currently running, or null at the prompt. */
+  command: string | null;
 }
 
 // Stable empty list — returning a new array per call would bust React memo.
@@ -58,8 +72,15 @@ interface TerminalsStore {
   setActive: (workspaceId: string, id: string | null) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Set whether a command is currently executing in a terminal (foreground
-   *  busy), from the daemon's `pty://foreground` events. */
-  setBusy: (workspaceId: string, id: string, busy: boolean) => void;
+   *  busy), from the daemon's `pty://foreground` events. `command` is the
+   *  daemon's argv summary when it could resolve one; it updates the session's
+   *  role (stickily) and the command shown while busy. */
+  setBusy: (
+    workspaceId: string,
+    id: string,
+    busy: boolean,
+    command?: string | null,
+  ) => void;
   /** Clear the transient `restored` badge for a given terminal. */
   clearRestored: (workspaceId: string, id: string) => void;
 }
@@ -109,6 +130,11 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const prevRunningById = new Map(
         (prev ?? []).map((t) => [t.id, t.running]),
       );
+      // Roles and running commands are live state, not DB state — a reload
+      // must not reset a session's identity to "shell".
+      const prevLiveById = new Map(
+        (prev ?? []).map((t) => [t.id, { role: t.role, command: t.command }]),
+      );
 
       const terminals: TerminalState[] = records.map((r) => {
         // A terminal is "running" if:
@@ -125,6 +151,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         // If it was already in the store as running, it's not a "new restore".
         const restored = daemonRunning && !wasRunningInStore;
 
+        const live = prevLiveById.get(r.id);
         return {
           id: r.id,
           label: r.label,
@@ -132,6 +159,8 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           running,
           busy: false,
           restored,
+          role: live?.role ?? ("shell" as SessionRole),
+          command: live?.command ?? null,
         };
       });
 
@@ -179,6 +208,8 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       running: false,
       busy: false,
       restored: false,
+      role: "shell",
+      command: null,
     };
 
     set((s) => {
@@ -226,6 +257,11 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
 
     bumpLoadGen(workspaceId); // invalidate any in-flight loadTerminals snapshot
 
+    // An attention marker pointing at this session has nothing left to point
+    // at — without this it would keep the workspace in Mission Control's
+    // needs-you band and pulsing on the rail forever.
+    useAttentionStore.getState().clearForTerminal(workspaceId, id);
+
     const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const remaining = prev.filter((t) => t.id !== id);
 
@@ -258,20 +294,42 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           ...s.terminalsByWs,
           // A dead session can't be busy — clear busy when the PTY stops.
           [workspaceId]: prev.map((t) =>
-            t.id === id ? { ...t, running, busy: running ? t.busy : false } : t,
+            t.id === id
+              ? {
+                  ...t,
+                  running,
+                  busy: running ? t.busy : false,
+                  command: running ? t.command : null,
+                }
+              : t,
           ),
         },
       };
     }),
 
-  setBusy: (workspaceId, id, busy) =>
+  setBusy: (workspaceId, id, busy, command) =>
     set((s) => {
       const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
-      if (!prev.some((t) => t.id === id && t.busy !== busy)) return s;
+      const target = prev.find((t) => t.id === id);
+      if (!target) return s;
+      // A later busy tick without a resolvable command (older daemon,
+      // unsupported platform) must not erase the command we already showed.
+      const nextCommand = busy ? (command ?? target.command) : null;
+      // Sticky role: only a command we can actually place replaces the
+      // session's identity. "shell" and "unknown" leave it alone, so a dev
+      // server keeps its icon through every quiet moment between rebuilds.
+      const derived = busy && command ? roleForCommand(command) : null;
+      const nextRole =
+        derived && derived !== "shell" && derived !== "unknown" ? derived : target.role;
+      if (target.busy === busy && target.command === nextCommand && target.role === nextRole) {
+        return s;
+      }
       return {
         terminalsByWs: {
           ...s.terminalsByWs,
-          [workspaceId]: prev.map((t) => (t.id === id ? { ...t, busy } : t)),
+          [workspaceId]: prev.map((t) =>
+            t.id === id ? { ...t, busy, command: nextCommand, role: nextRole } : t,
+          ),
         },
       };
     }),

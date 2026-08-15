@@ -123,8 +123,19 @@ pub fn run_accept_loop(
                             sess.emit_attention();
                         }
                         // Continuous "a command is running" signal for the rail.
+                        // The argv lookup happens only on the transition into
+                        // busy — once per command, not once per tick. `fg` is a
+                        // process GROUP id, read here as a pid: the shell makes
+                        // each job's leader its own group, so they coincide —
+                        // the same assumption `proc_total_cpu_ns(fg)` above
+                        // already relies on.
                         if let Some(busy) = sess.check_foreground(fg) {
-                            sess.emit_foreground(busy);
+                            let command = if busy {
+                                fg.and_then(crate::session::foreground_command)
+                            } else {
+                                None
+                            };
+                            sess.emit_foreground(busy, command);
                         }
                     }
                 }

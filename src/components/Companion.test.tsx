@@ -5,7 +5,7 @@ import { Companion } from "./Companion";
 // Minimal stubs for child components so the test focuses on structure.
 vi.mock("./CompanionContext",   () => ({ CompanionContext:   () => <div data-testid="ctx" />   }));
 vi.mock("./CompanionHistory",   () => ({ CompanionHistory:   () => <div data-testid="hist" />  }));
-vi.mock("./CompanionTerminals", () => ({ CompanionTerminals: () => <div data-testid="term" />  }));
+vi.mock("./CompanionSession", () => ({ CompanionSession: () => <div data-testid="term" />  }));
 vi.mock("./CompanionFileTree",  () => ({ CompanionFileTree:  () => <div data-testid="tree" />  }));
 vi.mock("./review/AiReviewPanel", () => ({ AiReviewPanel: () => <div data-testid="ai-review" /> }));
 vi.mock("./WorkContextPanel",   () => ({ WorkContextPanel:   () => <div data-testid="backlog" /> }));
