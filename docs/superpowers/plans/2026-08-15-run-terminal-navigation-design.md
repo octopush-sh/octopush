@@ -1,6 +1,10 @@
 # Run mode · terminal navigation — three arrangements
 
-**Status:** **decided** — the session rail (A) plus the `⌘⌥K` switcher (C), with the icon layer below. Nothing shipped yet.
+**Status:** **shipped** — the session rail (A) plus the `⌘⌥K` switcher (C), with the icon layer below.
+Implemented in `components/run/{SessionRail,SessionSwitcher,SessionAnchor}.tsx`, `CompanionSession.tsx`,
+`lib/sessionRole.ts`, `roleIcons.iconForSessionRole`, `terminalsStore` (`role`/`command`),
+`attentionStore` (per-terminal flags), `ModeSwitcher` (mode icons), and the daemon's `foreground`
+event (`{id, busy, command?}`). `docs/FEATURES.md` carries the feature entries.
 **Live mockups:** [`../mockups/2026-08-15-run-terminal-navigation.html`](../mockups/2026-08-15-run-terminal-navigation.html) — open in a browser. Four interactive states (Today · the chosen rail + switcher · B · C), a mode-band style toggle (words · icons + words · icons), and bell/build simulation. Hold ⌥ or ⌘ to see the rail's number peek.
 
 ---
@@ -166,14 +170,20 @@ Three rules govern it:
 3. **One glyph, two facts.** The icon carries identity, its colour carries state — verdigris idle,
    brass while busy or ringing. No icon-plus-status-dot pairs; brass stays surgical.
 
-### What this asks of the backend
+### What this asked of the backend (implemented)
 
 One bounded change. The daemon already resolves each session's foreground process group every
 tick (`Session::check_attention` / `check_foreground` take the `tcgetpgrp` result and sample that
-pid's CPU), but the `foreground` event only carries `{ sessionId, busy }`. Widen it to
-`{ sessionId, busy, command? }` by reading the pid's name (`/proc/<pid>/comm` on Linux,
-`proc_pidpath` on macOS). Classification then lives in the frontend as a pure, unit-testable
-`lib/sessionRole.ts`. No new IPC command, no new table, no polling.
+pid's CPU), but the `foreground` event only carried `{ sessionId, busy }`. It now carries
+`{ sessionId, busy, command? }`.
+
+The lookup returns **argv**, not just the executable name: every JS toolchain reports its leader as
+`node`, so the exec name alone cannot tell a dev server from a test run. `KERN_PROCARGS2` on macOS,
+`/proc/<pid>/cmdline` on Linux, summarised to basename + up to two args capped at 96 chars
+(`session.rs::foreground_command` / `parse_procargs2` / `summarise_argv`, the two parsers unit-tested).
+Resolved once per busy transition, never per tick; omitted from the wire when the platform can't
+answer, which the frontend treats as "unknown role", never as an error. Classification lives in the
+frontend as the pure, unit-tested `lib/sessionRole.ts`. No new IPC command, no new table, no polling.
 
 **Deliberately not in v1:** user-assigned icons or emoji per session. The label already carries
 user intent; a picker is a preference to maintain and a decoration when unused. If auto

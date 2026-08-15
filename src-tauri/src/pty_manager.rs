@@ -59,6 +59,10 @@ struct PtyForegroundEvent {
     #[serde(rename = "sessionId")]
     session_id: String,
     busy: bool,
+    /// Short argv summary of the command that just took the foreground
+    /// ("npm run dev"). `None` on the way back to idle, and wherever the
+    /// platform can't resolve it.
+    command: Option<String>,
 }
 
 /// Event payload for `pty://reattached` — emitted once when a PTY is
@@ -321,12 +325,13 @@ fn start_reader_thread(
                             },
                         );
                     }
-                    Ok(TermEvent::Foreground { busy }) => {
+                    Ok(TermEvent::Foreground { busy, command }) => {
                         let _ = app.emit(
                             "pty://foreground",
                             PtyForegroundEvent {
                                 session_id: id.clone(),
                                 busy,
+                                command,
                             },
                         );
                     }

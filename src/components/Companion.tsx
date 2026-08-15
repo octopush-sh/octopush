@@ -6,7 +6,7 @@ import { CompanionContext } from "./CompanionContext";
 import { SavingsLedger } from "./chat/SavingsLedger";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
-import { CompanionTerminals } from "./CompanionTerminals";
+import { CompanionSession } from "./CompanionSession";
 import { CompanionRuns } from "./CompanionRuns";
 import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
@@ -204,7 +204,7 @@ export function Companion({
           </div>
         )}
         {mode === "run" && workspaceId && (
-          <CompanionTerminals workspaceId={workspaceId} />
+          <CompanionSession workspaceId={workspaceId} />
         )}
         {mode === "review" && workspaceId && reviewProps && (
           <CompanionReview

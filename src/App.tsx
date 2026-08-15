@@ -40,6 +40,9 @@ import { useEditorStore } from "./stores/editorStore";
 import { useAttentionStore } from "./stores/attentionStore";
 import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
+import { SessionRail } from "./components/run/SessionRail";
+import { SessionSwitcher } from "./components/run/SessionSwitcher";
+import { SessionAnchor } from "./components/run/SessionAnchor";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
@@ -791,9 +794,19 @@ function App() {
     const flag = useAttentionStore.getState().flagsByWs[activeWorkspaceId];
     if (!flag) return;
     const matchingMode = flag.kind === "chat" ? "talk" : "run";
-    if (activeMode === matchingMode) {
-      useAttentionStore.getState().clear(activeWorkspaceId);
-    }
+    if (activeMode !== matchingMode) return;
+    // A terminal ping now names the session that rang. Being in Run mode is no
+    // longer enough to clear it — the user has to actually be looking at THAT
+    // session, otherwise the rail's marker would vanish before it could point
+    // anywhere. Flags without a terminal id (older pings) clear as before.
+    if (flag.terminalId && flag.terminalId !== activeTerminalId) return;
+    useAttentionStore.getState().clear(activeWorkspaceId);
+  }, [activeWorkspaceId, activeMode, activeTerminalId]);
+
+  // The switcher belongs to the Run canvas of one workspace; leaving either
+  // takes it with us rather than leaving a stale palette floating.
+  useEffect(() => {
+    setSessionSwitcherOpen(false);
   }, [activeWorkspaceId, activeMode]);
 
   const setMode = useCallback(
@@ -998,6 +1011,31 @@ function App() {
         return;
       }
 
+      // ⌘⌥K → the session switcher. Run mode only: it is the palette for
+      // terminals, and opening it anywhere else would offer nothing.
+      // `e.code` as well as `e.key`: on some layouts Option remaps the printed
+      // character, and the shortcut should follow the physical key.
+      if (mod && e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K" || e.code === "KeyK")) {
+        e.preventDefault();
+        if (activeWorkspaceId) setSessionSwitcherOpen(true);
+        return;
+      }
+
+      // ⌘⌥← / ⌘⌥→ → previous / next session, wrapping. The keyboard path that
+      // doesn't need you to know which number a session holds.
+      if (mod && e.altKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        if (!activeWorkspaceId) return;
+        const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
+        if (list.length < 2) return;
+        e.preventDefault();
+        const current = useTerminalsStore.getState().getActiveId(activeWorkspaceId);
+        const at = list.findIndex((t) => t.id === current);
+        const step = e.key === "ArrowRight" ? 1 : -1;
+        const next = list[(at + step + list.length) % list.length];
+        if (next) setActiveTerminal(activeWorkspaceId, next.id);
+        return;
+      }
+
       // ⌘⌥1..9 → cycle within-workspace terminals (must check altKey to avoid
       // colliding with ⌘1..9 workspace shortcuts above).
       if (mod && e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
@@ -1188,9 +1226,11 @@ function App() {
   // band costs no extra IPC. The diff stat is only non-zero in review mode —
   // that is the only mode this component fetches `gitDiff` for — which is
   // also the only mode whose tail reads it.
+  // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too.
+  const [sessionSwitcherOpen, setSessionSwitcherOpen] = useState(false);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
   const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
-  const modeMeta = useMemo(
+  const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
         terminalCount: terminals.length,
@@ -1210,6 +1250,20 @@ function App() {
       activeRuns,
     ],
   );
+
+  // In Run mode the tail stops reporting and starts working: the session
+  // anchor names the active session and opens the ⌘⌥K switcher, which is what
+  // makes a keyboard-only palette discoverable. With no sessions open there is
+  // nothing to anchor, so the plain "No terminals" reading stands.
+  const modeMeta: React.ReactNode =
+    activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
+      <SessionAnchor
+        workspaceId={activeWorkspaceId}
+        onOpen={() => setSessionSwitcherOpen(true)}
+      />
+    ) : (
+      modeMetaText
+    );
 
   // Re-derive titles whenever new messages arrive — title comes from the
   // first user message, meta comes from the relative time of the latest.
@@ -2022,7 +2076,14 @@ function App() {
                   container itself is never gated by activeWorkspace, so PTYs
                   survive project switches and new-project creation. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "run"}>
-                <div className="relative h-full w-full">
+                {/* Session rail + terminal. The rail lives INSIDE the canvas
+                    (not the Companion) so collapsing the Companion no longer
+                    removes the only way to change session. */}
+                <div className="flex h-full w-full min-h-0">
+                  {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
+                    <SessionRail workspaceId={activeWorkspaceId} />
+                  )}
+                  <div className="relative min-w-0 flex-1">
                   {allTerminalRefs.map((t) => {
                     const ws = workspaces.find((w) => w.id === t.workspaceId);
                     const wsPath = ws?.worktreePath || project.path;
@@ -2057,6 +2118,7 @@ function App() {
                       }}
                     />
                   )}
+                  </div>
                 </div>
               </ModeOverlay>
 
@@ -2309,6 +2371,16 @@ function App() {
             onCancel={() => setRenamingWorkspace(null)}
           />
         </ModalShell>
+      )}
+
+      {/* Session switcher (⌘⌥K / the band anchor). Mounted only with a
+          workspace and at least one session, so it can never open onto an
+          empty list. */}
+      {sessionSwitcherOpen && activeWorkspaceId && terminals.length > 0 && (
+        <SessionSwitcher
+          workspaceId={activeWorkspaceId}
+          onClose={() => setSessionSwitcherOpen(false)}
+        />
       )}
 
       <CommandPalette

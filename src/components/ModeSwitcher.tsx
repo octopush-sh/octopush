@@ -1,7 +1,20 @@
 import { clsx } from "clsx";
 import { useLayoutEffect, useRef, useState } from "react";
+import { GitCompare, MessageSquare, SquareTerminal, Waypoints, type LucideIcon } from "lucide-react";
 import { MODES, MODE_LABELS, MODE_SHORTCUTS, type WorkspaceMode } from "../lib/modes";
 import { useAttentionStore } from "../stores/attentionStore";
+
+/** One glyph per mode, because the words alone carry culture: "Run" reads as
+ *  *execute something* to one developer and *where my shells are* to another.
+ *  Icons go on all four segments — iconising only Run would read as a special
+ *  case rather than a mode — and the labels stay, because mode navigation is
+ *  where a wrong guess costs the most. */
+const MODE_ICON: Record<WorkspaceMode, LucideIcon> = {
+  run: SquareTerminal,
+  talk: MessageSquare,
+  review: GitCompare,
+  direct: Waypoints,
+};
 
 interface Props {
   mode: WorkspaceMode;
@@ -109,11 +122,15 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
               // Roomier than the old companion-header tabs (px-2.5 py-1): the
               // band gives the control a line of its own, and the space it
               // buys goes into hit targets rather than point size.
-              "relative z-10 whitespace-nowrap rounded-md px-3.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass",
+              "relative z-10 inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass",
               active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage",
               pulse && "animate-attention-pulse !text-octo-brass",
             )}
           >
+            {(() => {
+              const Icon = MODE_ICON[m];
+              return <Icon size={13} strokeWidth={1.75} aria-hidden />;
+            })()}
             {MODE_LABELS[m]}
           </button>
         );

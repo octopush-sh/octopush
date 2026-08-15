@@ -4,10 +4,11 @@
 // Spec: docs/superpowers/specs/2026-07-11-direct-beauty-redesign-design.md §4.3
 
 import {
-  BadgeCheck, CircleDashed, ClipboardList, Compass, Eye, FlaskConical,
-  GitMerge, GitPullRequest, Globe, Hammer, PenLine, Pencil, Rocket, Search,
-  Shield, SquareTerminal, Wrench, type LucideIcon,
+  BadgeCheck, ChevronRight, CircleDashed, ClipboardList, Compass, Eye, FlaskConical,
+  GitBranch, GitMerge, GitPullRequest, Globe, Hammer, Package, PenLine, Pencil,
+  Rocket, Search, Shield, Sparkles, SquareTerminal, Terminal, Wrench, type LucideIcon,
 } from "lucide-react";
+import type { SessionRole } from "./sessionRole";
 
 const ROLE_ICON: Record<string, LucideIcon> = {
   plan: ClipboardList,
@@ -43,4 +44,26 @@ export function iconForTool(tool: string): LucideIcon {
   if (t.includes("web") || t.includes("fetch") || t.includes("http")) return Globe;
   if (t.includes("grep") || t.includes("glob") || t.includes("search") || t.includes("find")) return Search;
   return CircleDashed;
+}
+
+// ── Run mode · terminal sessions ──────────────────────────────────
+// One glyph per session role. A terminal icon on every session would say
+// "this is a terminal" once per session — information the user already has —
+// so the icon names what is *running* instead. `unknown` keeps the neutral
+// terminal glyph: an honest "something is running that we can't place".
+const SESSION_ROLE_ICON: Record<SessionRole, LucideIcon> = {
+  shell: ChevronRight,
+  dev: Globe,
+  build: Hammer,
+  test: FlaskConical,
+  deps: Package,
+  git: GitBranch,
+  agent: Sparkles,
+  edit: PenLine,
+  unknown: Terminal,
+};
+
+/** Icon for a terminal session's role (see `lib/sessionRole.ts`). */
+export function iconForSessionRole(role: SessionRole): LucideIcon {
+  return SESSION_ROLE_ICON[role] ?? Terminal;
 }

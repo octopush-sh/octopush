@@ -248,6 +248,11 @@ export interface PtyAttentionEvent {
 export interface PtyForegroundEvent {
   sessionId: string;
   busy: boolean;
+  /** Short argv summary of the command that took the foreground ("npm run
+   *  dev"). Present only on the transition into busy, and only where the
+   *  platform could resolve it — `lib/sessionRole.ts` turns it into the
+   *  session's role, and its absence simply means "unknown". */
+  command?: string | null;
 }
 
 // ─── Chat ─────────────────────────────────────────────────────────

@@ -519,15 +519,142 @@ impl Session {
     }
 
     /// Emit an `Event::Foreground` to the attached client, if any.
-    pub fn emit_foreground(&self, busy: bool) {
+    ///
+    /// `command` is only meaningful on the transition into busy; the caller
+    /// resolves it (see `foreground_command`) so the syscall happens once per
+    /// state change rather than on every one-second tick.
+    pub fn emit_foreground(&self, busy: bool, command: Option<String>) {
         if let Some(ref tx) = self.attached {
             let event = Event::Foreground {
                 id: self.id.clone(),
                 busy,
+                command,
             };
             let _ = tx.send(event.to_line());
         }
     }
+}
+
+/// A short, human-readable summary of the command running as `pid` — the
+/// executable's basename plus up to two arguments ("npm run dev",
+/// "cargo build --release"). `None` whenever the platform can't answer, which
+/// callers treat as "unknown", never as an error.
+///
+/// The frontend needs argv, not just the executable name: every JS toolchain
+/// reports its leader as `node`, so `node` alone cannot tell a dev server from
+/// a test run.
+pub fn foreground_command(pid: i32) -> Option<String> {
+    platform_command(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_command(pid: i32) -> Option<String> {
+    // KERN_PROCARGS2 is the only route to another process's argv on
+    // Darwin. Layout: [argc: i32][exec path\0][NUL padding][argv0\0]…
+    // The constants are defined here rather than taken from libc so the
+    // build doesn't depend on which of them that version happens to
+    // re-export for apple targets.
+    const CTL_KERN: libc::c_int = 1;
+    const KERN_PROCARGS2: libc::c_int = 49;
+    // A process's argv+envp is capped near 1 MiB; refuse anything larger
+    // rather than allocating whatever the kernel claims.
+    const MAX_ARGS_BYTES: libc::size_t = 1 << 20;
+
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: `sysctl` with a null oldp writes only `size`, telling us how
+    // big the buffer must be. `mib` is a 3-element array and we pass 3.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || size == 0 || size > MAX_ARGS_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: the buffer is exactly `size` bytes, which is what the probe
+    // above asked the kernel for; `size` is updated to the bytes written.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || size > buf.len() {
+        return None;
+    }
+    buf.truncate(size);
+    parse_procargs2(&buf)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_command(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    summarise_argv(raw.split(|b| *b == 0).map(String::from_utf8_lossy))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_command(_pid: i32) -> Option<String> {
+    None
+}
+
+/// Pull argv out of a `KERN_PROCARGS2` blob and summarise it. Kept separate
+/// from the syscall so the parsing is unit-testable on any platform.
+#[allow(dead_code)] // only called on macOS; tested everywhere
+fn parse_procargs2(buf: &[u8]) -> Option<String> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc <= 0 {
+        return None;
+    }
+    // After the count comes the exec path, then NUL padding, then argc
+    // NUL-terminated argv entries. Dropping empty slices skips the padding,
+    // and the first survivor is the exec path itself.
+    let mut parts = buf[4..]
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf8_lossy);
+    let exec = parts.next()?;
+    // argv[0] is normally the same string as the exec path; prefer argv when
+    // it is there, and fall back to the exec path for a bare process.
+    let argv: Vec<_> = parts.take(argc as usize).collect();
+    if argv.is_empty() {
+        summarise_argv(std::iter::once(exec))
+    } else {
+        summarise_argv(argv.into_iter())
+    }
+}
+
+/// Basename of argv[0] plus up to two arguments, capped so a pathological
+/// command line can never turn into a wall of text on the wire.
+fn summarise_argv<'a>(args: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Option<String> {
+    const MAX_LEN: usize = 96;
+    let mut parts = args.filter(|s| !s.is_empty());
+    let first = parts.next()?;
+    let mut out = first.rsplit('/').next().unwrap_or(&first).to_string();
+    if out.is_empty() {
+        return None;
+    }
+    for arg in parts.take(2) {
+        if out.len() + arg.len() + 1 > MAX_LEN {
+            break;
+        }
+        out.push(' ');
+        out.push_str(&arg);
+    }
+    Some(out)
 }
 
 /// Sum of user + system CPU time for `pid` in nanoseconds, as
@@ -627,6 +754,53 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         Session::new("attn-test".into(), "label".into(), "/tmp".into(), 0)
+    }
+
+    /// KERN_PROCARGS2 blob: argc, the exec path, NUL padding, then argv.
+    fn procargs2(argc: i32, exec: &str, argv: &[&str]) -> Vec<u8> {
+        let mut buf = argc.to_ne_bytes().to_vec();
+        buf.extend_from_slice(exec.as_bytes());
+        buf.extend_from_slice(&[0, 0, 0]); // terminator + alignment padding
+        for a in argv {
+            buf.extend_from_slice(a.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn procargs2_summarises_argv_not_the_exec_path() {
+        let blob = procargs2(3, "/usr/local/bin/node", &["/usr/local/bin/npm", "run", "dev"]);
+        assert_eq!(parse_procargs2(&blob).as_deref(), Some("npm run dev"));
+    }
+
+    /// A bare process (argv beyond the exec path never materialised) still
+    /// reports something useful rather than nothing.
+    #[test]
+    fn procargs2_falls_back_to_the_exec_path() {
+        let mut buf = 1i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/zsh");
+        buf.push(0);
+        assert_eq!(parse_procargs2(&buf).as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn procargs2_rejects_garbage() {
+        assert_eq!(parse_procargs2(&[]), None);
+        assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None);
+        assert_eq!(parse_procargs2(&(-1i32).to_ne_bytes()), None);
+    }
+
+    #[test]
+    fn argv_summary_keeps_three_tokens_and_caps_length() {
+        let args = ["/opt/homebrew/bin/cargo", "build", "--release", "--locked"];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("cargo build --release"));
+
+        let long = "x".repeat(200);
+        let args = ["git", long.as_str()];
+        let summary = summarise_argv(args.iter().map(|s| std::borrow::Cow::Borrowed(*s)));
+        assert_eq!(summary.as_deref(), Some("git"), "an oversized arg is dropped whole");
     }
 
     /// Busy requires a non-shell child AND recent output; it flips only on a

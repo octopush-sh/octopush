@@ -38,7 +38,14 @@ pub enum TermEvent {
     /// Emitted on a foreground-process state change: `busy` is true when a
     /// non-shell child owns the PTY (a command is running), false when the
     /// shell is back at its prompt. Drives the rail's processing bar.
-    Foreground { busy: bool },
+    ///
+    /// `command` is a short summary of that child's argv ("npm run dev"),
+    /// present only on the transition into busy and only where the platform
+    /// can answer. The frontend turns it into the session's role icon.
+    Foreground {
+        busy: bool,
+        command: Option<String>,
+    },
 }
 
 /// Minimal terminal descriptor returned by `list_terminals`.
@@ -498,7 +505,8 @@ fn run_reader(
                 Some("attention") => TermEvent::Attention,
                 Some("foreground") => {
                     let busy = v["busy"].as_bool().unwrap_or(false);
-                    TermEvent::Foreground { busy }
+                    let command = v["command"].as_str().map(str::to_string);
+                    TermEvent::Foreground { busy, command }
                 }
                 _ => continue,
             };

@@ -26,6 +26,13 @@ export type AttentionKind = "chat" | "terminal";
 export interface AttentionFlag {
   kind: AttentionKind;
   at: number; // ms timestamp of the most recent ping
+  /**
+   * For terminal pings, WHICH session rang — so the Run rail can mark the one
+   * session that wants the user instead of the whole workspace. Null for chat
+   * pings and for any caller that doesn't know (the flag then behaves exactly
+   * as it did before).
+   */
+  terminalId?: string | null;
 }
 
 interface AttentionState {
@@ -37,8 +44,9 @@ interface AttentionState {
   lastChimeAt: number;
 
   /** Flag `workspaceId` and (if enabled) play the chime. Idempotent
-   *  within the rate-limit window. */
-  ping: (workspaceId: string, kind: AttentionKind) => void;
+   *  within the rate-limit window. `terminalId` narrows a terminal ping to the
+   *  session that rang. */
+  ping: (workspaceId: string, kind: AttentionKind, terminalId?: string | null) => void;
   /** Clear the flag for a workspace (called when the user focuses it). */
   clear: (workspaceId: string) => void;
   /** Persisted toggle. */
@@ -59,10 +67,13 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
   soundEnabled: readSoundPref(),
   lastChimeAt: 0,
 
-  ping: (workspaceId, kind) => {
+  ping: (workspaceId, kind, terminalId) => {
     const now = Date.now();
     set((s) => ({
-      flagsByWs: { ...s.flagsByWs, [workspaceId]: { kind, at: now } },
+      flagsByWs: {
+        ...s.flagsByWs,
+        [workspaceId]: { kind, at: now, terminalId: terminalId ?? null },
+      },
     }));
     // Sound, with cooldown so paired chat+terminal completions don't
     // produce a double-chime within the same second.

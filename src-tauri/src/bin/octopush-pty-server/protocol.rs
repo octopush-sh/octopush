@@ -202,7 +202,19 @@ pub enum Event {
     /// `Attention`, which fires once a *running* command goes idle: this
     /// is a plain ownership signal (`fg != shell`) with no latch or grace
     /// window, emitted only on a state change.
-    Foreground { id: String, busy: bool },
+    ///
+    /// `command` is a short summary of the foreground process's argv
+    /// ("npm run dev", "cargo build --release") resolved only on the
+    /// transition into busy — the frontend classifies it into a session role
+    /// (`lib/sessionRole.ts`) to pick the session's icon. Absent whenever the
+    /// platform can't answer, which the frontend treats as "unknown role"
+    /// rather than as an error.
+    Foreground {
+        id: String,
+        busy: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -259,12 +271,28 @@ mod tests {
         let line = Event::Foreground {
             id: "term-1".into(),
             busy: true,
+            command: Some("npm run dev".into()),
         }
         .to_line();
         let s = String::from_utf8(line).unwrap();
         assert!(s.contains("\"event\":\"foreground\""), "got: {s}");
         assert!(s.contains("\"id\":\"term-1\""), "got: {s}");
         assert!(s.contains("\"busy\":true"), "got: {s}");
+        assert!(s.contains("\"command\":\"npm run dev\""), "got: {s}");
         assert!(s.ends_with('\n'), "expected newline-terminated line");
+    }
+
+    /// An unresolvable command is omitted from the wire rather than sent as
+    /// null — older clients keep parsing the event unchanged.
+    #[test]
+    fn foreground_event_omits_absent_command() {
+        let line = Event::Foreground {
+            id: "term-1".into(),
+            busy: false,
+            command: None,
+        }
+        .to_line();
+        let s = String::from_utf8(line).unwrap();
+        assert!(!s.contains("command"), "got: {s}");
     }
 }
