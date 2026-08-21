@@ -53,7 +53,10 @@ function Sep() {
   );
 }
 
-/** One clickable ticket key, type-tinted, opening that issue in the tracker. */
+/** One clickable ticket key, type-tinted, opening that issue in the tracker.
+ *  Its focus ring and hover wash are drawn outside its border box, and a chain
+ *  key sits inside a demotion rung that must clip — `.octo-demote` reserves the
+ *  padding for both (styles.css). */
 function IssueKey({ issue }: { issue: Issue }) {
   return (
     <button
@@ -225,8 +228,9 @@ export function ContextHeader({
           <Sep />
 
           {/* Branch — middle-truncated chip, full provenance one hover (or one
-              Tab) away. Right-anchored: the chip sits in the band's right half,
-              so a left-anchored panel would reach past the canvas. */}
+              Tab) away. The panel anchors to the header rather than to the
+              chip, so the ladder can move the chip freely without ever pushing
+              the panel past the canvas (see `.octo-prov` in styles.css). */}
           <span className="octo-prov min-w-0">
             <button
               type="button"
@@ -242,7 +246,7 @@ export function ContextHeader({
             <span
               id="octo-branch-provenance"
               role="tooltip"
-              className="octo-prov-pop octo-prov-pop--end"
+              className="octo-prov-pop"
             >
               <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1.5">
                 <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
@@ -272,16 +276,10 @@ export function ContextHeader({
                     </dd>
                   </>
                 )}
-                <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                  Working tree
-                </dt>
-                <dd
-                  className={`octo-tabular font-mono text-[11px] normal-case tracking-normal ${
-                    unstaged > 0 ? "text-octo-verdigris" : "text-octo-sage"
-                  }`}
-                >
-                  {unstaged > 0 ? `${unstaged} changed` : "clean"}
-                </dd>
+                {/* Deliberately no working-tree row: the count is permanently
+                    visible in the tail a few inches away, and a panel that
+                    repeats what the band already states earns nothing. This
+                    holds only what the ladder SHEDS. */}
               </dl>
             </span>
           </span>

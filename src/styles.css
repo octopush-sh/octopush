@@ -346,7 +346,7 @@
    middle. Pure CSS: the head ellipsizes into whatever space is left, the tail
    is pinned. Always pair with a `title` carrying the full string.
    Consumers build the two spans via <MidTruncate> (components/primitives). */
-.octo-midtrunc      { display: inline-flex; align-items: baseline; min-width: 0; max-width: 100%; }
+.octo-midtrunc      { display: inline-flex; align-items: baseline; min-width: 0; max-width: 100%; overflow: hidden; }
 .octo-midtrunc-head { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .octo-midtrunc-tail { flex: none; white-space: nowrap; }
 
@@ -367,27 +367,56 @@
    the provenance popover, or in the tracker. The header itself is the query
    container, so the ladder reads the canvas column's width — not the
    window's, which says nothing about how much room this band actually has. */
-.octo-header { container-type: inline-size; container-name: octo-header; }
+/* `container-type` implies layout containment, which makes this a stacking
+   context AND the containing block for its absolute descendants. Both matter:
+   the provenance popover positions against THIS box (never the chip, so it can
+   never reach past the header into <main>'s `overflow-hidden`), and without a
+   z-index the whole header — popover included — would paint under the canvas
+   column that follows it in <main>. 20 sits above the canvas and its `relative`
+   children, well below dialogs (50) and the command palette (60). */
+.octo-header { container-type: inline-size; container-name: octo-header; position: relative; z-index: 20; }
 
 /* `flex: none` on purpose: a rung is either fully present or collapsed BY the
    ladder — never squeezed into an unreadable stub. All of the deficit goes to
    the one elastic atom in the band, the branch chip. */
 .octo-demote {
   display: inline-flex; align-items: center; gap: 8px; flex: none;
-  white-space: nowrap;
+  white-space: nowrap; text-overflow: ellipsis;
   min-width: 0; max-width: 40ch; opacity: 1; overflow: hidden;
+  /* Room for a focused child's ring and its hover wash, which are drawn
+     outside the child's border box and would otherwise be clipped by the
+     `overflow: hidden` the collapse needs. `border-box` folds it away at
+     max-width 0, and only the left side is padded so the collapse's own
+     `margin-right` stays the single authority on the gap. */
+  padding: 2px 0 2px 4px; margin-left: -4px;
+  visibility: visible;
   transition: max-width var(--dur-standard) var(--ease-octo),
               opacity var(--dur-quick) var(--ease-octo),
-              margin-right var(--dur-standard) var(--ease-octo);
+              margin-right var(--dur-standard) var(--ease-octo),
+              visibility 0s linear var(--demote-vis-delay, 0s);
 }
+/* A shed rung is not just invisible — it leaves the tab order too, so a
+   keyboard user at 780px can't land on a parent-ticket button they cannot
+   see. `visibility` flips only once the width animation has finished (and
+   flips back instantly on the way in), hence the delay variable. */
 /* The negative margin eats the flex `gap` the collapsed item would otherwise
    still reserve — a 0-width element between two gaps reads as a double gap. */
 @container octo-header (max-width: 900px) {
-  .octo-demote-base  { max-width: 0; opacity: 0; margin-right: -8px; }
+  .octo-demote-base  {
+    max-width: 0; opacity: 0; margin-right: -8px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
 }
 @container octo-header (max-width: 780px) {
-  .octo-demote-chain { max-width: 0; opacity: 0; margin-right: -8px; }
+  .octo-demote-chain {
+    max-width: 0; opacity: 0; margin-right: -8px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
 }
+/* F5: the base branch is the one rung that is plain text rather than chips,
+   so it needs a block container to elide into — an inline-flex would hard-cut
+   it mid-word with no ellipsis. */
+.octo-demote-base { display: inline-block; }
 
 .octo-status { display: inline-flex; align-items: center; }
 .octo-status-dot {
@@ -412,10 +441,16 @@
    working-tree state live one hover — or one Tab — away. Kept mounted and
    faded rather than conditionally rendered, so it never mounts abruptly and
    the trigger's own `focus-within` is enough to open it without state. */
-.octo-prov { position: relative; display: inline-flex; min-width: 0; }
+/* Deliberately NOT positioned: the popover's containing block is then the
+   header itself (layout containment, above), so the panel is laid out against
+   a box whose width it can be clamped to — anchoring it to the chip would put
+   it wherever the ladder happened to leave the chip, and <main> clips with
+   `overflow-hidden`, so a panel that reached past the header's edge would be
+   cut in half. */
+.octo-prov { display: inline-flex; min-width: 0; }
 .octo-prov-pop {
-  position: absolute; top: calc(100% + 8px); left: 0; z-index: 30;
-  width: max-content; max-width: min(420px, 78cqw);
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
+  width: max-content; max-width: min(420px, 100%);
   background: var(--color-octo-panel-2, #1a160f);
   border: 1px solid var(--color-octo-hairline, #2a2419);
   border-radius: 10px; padding: 10px 12px;
@@ -425,17 +460,19 @@
               transform var(--dur-quick) var(--ease-octo),
               visibility 0s linear var(--dur-quick);
 }
-/* Bridges the 8px gap so the pointer can travel from the chip into the
-   popover (to reach the copy button) without crossing un-hovered ground. */
+/* Bridges the gap so the pointer can travel from the chip down into the
+   popover (to reach the copy button) without crossing un-hovered ground. It
+   reaches back up to the chip's own row, and it is only ever live while the
+   popover is open — a hidden popover has `visibility: hidden`, which its
+   pseudo-element inherits, so this strip cannot swallow hovers over the name
+   line while the panel is closed. */
 .octo-prov-pop::before {
-  content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px;
+  content: ""; position: absolute; left: 0; right: 0; top: -28px; height: 28px;
 }
 .octo-prov:hover > .octo-prov-pop,
 .octo-prov:focus-within > .octo-prov-pop {
   opacity: 1; visibility: visible; transform: scale(1); transition-delay: 0s;
 }
-/* Anchored to the right edge when the chip sits in the header's right half. */
-.octo-prov-pop--end { left: auto; right: 0; transform-origin: top right; }
 
 /* Hides scrollbar chrome on rails whose own affordance (chevron nav) signals
    overflow — the element stays keyboard/trackpad scrollable. */

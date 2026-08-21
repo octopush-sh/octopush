@@ -155,18 +155,16 @@ describe("ContextHeader", () => {
   });
 
   describe("branch provenance popover", () => {
-    it("lists the branch, the base and the working-tree state", () => {
+    it("holds exactly what the ladder sheds — the branch and the base", () => {
       renderHeader({ workspace: makeWorkspace({ branch: "feat-x", fromBranch: "develop" }) });
       const pop = document.querySelector(".octo-prov-pop");
       expect(pop).toBeTruthy();
       expect(pop).toHaveTextContent("Branch");
       expect(pop).toHaveTextContent("Base");
       expect(pop).toHaveTextContent("develop");
-      expect(pop).toHaveTextContent("Working tree");
-      expect(pop).toHaveTextContent("clean");
     });
 
-    it("reports the changed-file count when the tree is dirty", () => {
+    it("does not repeat the changed-file count the tail already states", () => {
       render(
         <ContextHeader
           {...baseProps}
@@ -186,7 +184,10 @@ describe("ContextHeader", () => {
           }}
         />,
       );
-      expect(document.querySelector(".octo-prov-pop")).toHaveTextContent("1 changed");
+      // One number, stated once. The popover carries only what the header
+      // folds away, never a second copy of what it still shows.
+      expect(screen.getAllByText(/1 unstaged/)).toHaveLength(1);
+      expect(document.querySelector(".octo-prov-pop")).not.toHaveTextContent(/unstaged|changed/);
     });
 
     it("copies the branch name without opening anything", async () => {
