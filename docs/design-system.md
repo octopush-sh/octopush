@@ -231,6 +231,7 @@ Four rules:
 | `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass. |
 | Substrate pills | Active | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
 | `✦` flourish  | **RETIRED** | Never use. Not in any existing surface; do not introduce. |
+| `◈`           | **RETIRED (2026-08-21)** | Was: the ContextHeader's active-ticket marker. Dropped with the eyebrow-and-name redesign — the type-tinted ticket key already marks the ticket, so the diamond was a second badge for one fact. `grep -rn "◈" src` should only match tests asserting its absence. |
 
 ---
 
@@ -304,8 +305,35 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
 | `.octo-rise-in` | list rows appearing | fade+rise 4px · --dur-standard |
 | `<FadeSwap swapKey>` | mutually exclusive view swaps (canvas states, pane modes) | exit fade 120ms → `.octo-fade-in` (`src/components/primitives/FadeSwap.tsx`) |
 | `<Reveal open>` | expanding/collapsing regions (decision strips, sub-panels) | grid-rows 0fr↔1fr · --dur-standard (`src/components/primitives/Reveal.tsx`) |
+| `<MidTruncate text tail>` | identifiers whose head AND tail disambiguate (branch names, paths) | CSS `.octo-midtrunc` — head ellipsizes, tail pinned (`src/components/primitives/MidTruncate.tsx`) |
+| `.octo-demote*` / `.octo-status-*` | the demotion ladder — shedding meta as a band narrows | `@container` + animated `max-width`/`opacity` |
+| `.octo-prov-pop` | hover/focus disclosure anchored to a chip (branch provenance) | fade+scale, kept mounted, `:focus-within` |
 | `.octo-tabular` | every live numeric value (cost, %, mm:ss, counters) | `font-variant-numeric: tabular-nums` |
 | `.octo-sweep` | one-shot **solid** brass line sweep (Direct run-completion moment only; no gradient) | width 0→100% · --dur-reveal |
+
+### Elision doctrine — middle truncation and the demotion ladder (2026-08-21; born in ContextHeader)
+
+Two mechanics for any band that mixes elastic text with atoms that must stay whole. Reach for them before inventing a one-off.
+
+**E1 — Middle truncation for identifiers.** `truncate` keeps the head and throws away exactly the part that tells two similar strings apart: `…-per-shard-copy` and `…-per-shard-guard` both render as `intermittent-component-not-…`. `<MidTruncate>` keeps both ends and elides the middle instead. It is pure CSS (`.octo-midtrunc`) — the head ellipsizes into whatever room is left and the tail is pinned — so the elision point tracks the container with no measurement and no resize listener, and the full string stays in the DOM (selectable, copyable). **Always pair it with a `title`.** Use it for branch names, file paths, run ids; NOT for prose, where the head is the meaning and plain `truncate` is right.
+
+**E2 — Truncation is not enough; shed on a stated ladder.** Below a certain width the *fixed* atoms stop fitting and start overlapping — no amount of truncating the elastic ones saves the row. So declare an order in which meta is shed, and animate each step's width instead of unmounting it (§6: nothing appears or disappears abruptly). The ContextHeader's ladder, and the shape to copy:
+
+| Rung | Sheds | Where it survives |
+|------|-------|-------------------|
+| ≤ 900px | base branch (`from main`) | branch tooltip + provenance popover |
+| ≤ 780px | parent/grandparent ticket chain | one click away in the tracker |
+| ≤ 640px | the status **name** → the category **dot** it already implies | the element's `title` |
+| floor | *nothing* — the active ticket key and the name line never demote | — |
+
+Four rules generalise:
+
+1. **The band is its own `@container`**, never a media query. The window's width says nothing about how much room a column between a rail and a companion actually has.
+2. **Nothing is deleted at any rung.** Every shed item stays reachable — a tooltip, the popover, the tracker. A ladder that loses information is just a smaller bug.
+3. **A rung is `flex: none`.** It is either fully present or collapsed by the ladder — never squeezed into an unreadable stub. All of the deficit goes to the one deliberately elastic atom in the band.
+4. **Declare the floor.** Name the thing that never demotes (here: the identity — the key and the name). Without a floor, every atom is negotiable and the row eventually clips something load-bearing.
+
+The dot-for-label swap at the last rung is §9's "a state shown by a dot does not also get a label" applied to width rather than to taste: both are mounted, and the ladder animates their widths so exactly one is visible.
 
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
@@ -385,7 +413,7 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | Surface       | Width | Notes |
 |---------------|-------|-------|
 | Rail          | 48px  | Workspace monograms (italic serif, brass on active), brass vertical indicator. |
-| ContextHeader | flex  | Floating card. Workspace name in italic serif + branch in mono. Identity only — never the modes. |
+| ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. |
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
 | Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
