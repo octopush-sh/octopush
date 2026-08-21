@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { Reveal } from "./Reveal";
 import { FadeSwap } from "./FadeSwap";
+import { MidTruncate } from "./MidTruncate";
 
 describe("Reveal", () => {
   it("renders children and reflects open state via grid-template-rows + aria-hidden", () => {
@@ -54,5 +55,28 @@ describe("FadeSwap", () => {
     rerender(<FadeSwap swapKey="c"><p>C</p></FadeSwap>);
     act(() => { vi.advanceTimersByTime(300); });
     expect(screen.getByText("C")).toBeInTheDocument();
+  });
+});
+
+describe("MidTruncate", () => {
+  it("renders a short string whole — eliding it would cost more than it buys", () => {
+    const { container } = render(<MidTruncate text="feat/auth" />);
+    expect(container.textContent).toBe("feat/auth");
+    expect(container.querySelector(".octo-midtrunc-head")).toBeNull();
+  });
+
+  it("splits a long string into an ellipsizing head and a pinned tail", () => {
+    const text = "a".repeat(40) + "-tail-marker";
+    const { container } = render(<MidTruncate text={text} tail={12} />);
+    expect(container.querySelector(".octo-midtrunc-head")).toHaveTextContent("a".repeat(40));
+    expect(container.querySelector(".octo-midtrunc-tail")).toHaveTextContent("-tail-marker");
+    // Nothing is dropped from the DOM — the elision is CSS, so the full string
+    // is still selectable and still what a copy would yield.
+    expect(container.textContent).toBe(text);
+  });
+
+  it("honours a custom tail length", () => {
+    const { container } = render(<MidTruncate text="0123456789abcdef" tail={4} />);
+    expect(container.querySelector(".octo-midtrunc-tail")).toHaveTextContent("cdef");
   });
 });

@@ -112,11 +112,91 @@ describe("ContextHeader", () => {
     expect(screen.queryByTitle(/sandboxed execution/i)).not.toBeInTheDocument();
   });
 
-  it("renders the branch", () => {
+  it("renders the branch on the chip and again in its provenance popover", () => {
     render(
       <ContextHeader {...baseProps} workspaceName="X" branch="feat/auth" gitStatus={null} />,
     );
-    expect(screen.getByText(/feat\/auth/)).toBeInTheDocument();
+    // The chip carries the (possibly elided) name; the popover carries the
+    // full string, selectable. Short names appear whole in both.
+    expect(screen.getByRole("button", { name: "Branch feat/auth" })).toHaveAttribute(
+      "title",
+      "feat/auth",
+    );
+    expect(screen.getAllByText("feat/auth")).toHaveLength(2);
+  });
+
+  describe("long branch names", () => {
+    const LONG =
+      "intermittent-component-not-found-detail-lookup-returns-a-hard-404-on-a-false-negative-empty-result-per-shard-copy-cached-empty-stale-replica-no-shard-failure-guard";
+
+    it("middle-truncates the chip so the head AND the tail both survive", () => {
+      render(<ContextHeader {...baseProps} workspaceName="X" branch={LONG} gitStatus={null} />);
+      const chip = screen.getByRole("button", { name: `Branch ${LONG}` });
+      // Head ellipsizes into whatever room is left; the last 12 chars are pinned.
+      expect(chip.querySelector(".octo-midtrunc-head")).toHaveTextContent(LONG.slice(0, -12));
+      expect(chip.querySelector(".octo-midtrunc-tail")).toHaveTextContent(LONG.slice(-12));
+      // Nothing is lost: the whole string is one hover away, and in the title.
+      expect(chip).toHaveAttribute("title", LONG);
+    });
+
+    it("never lets the branch displace the name line", () => {
+      render(
+        <ContextHeader
+          {...baseProps}
+          workspaceName="a-workspace"
+          branch={LONG}
+          gitStatus={null}
+        />,
+      );
+      // The name owns its own row, so it is present and titled whatever the
+      // branch does beside it.
+      expect(screen.getByText("a-workspace")).toHaveAttribute("title", "a-workspace");
+    });
+  });
+
+  describe("branch provenance popover", () => {
+    it("lists the branch, the base and the working-tree state", () => {
+      renderHeader({ workspace: makeWorkspace({ branch: "feat-x", fromBranch: "develop" }) });
+      const pop = document.querySelector(".octo-prov-pop");
+      expect(pop).toBeTruthy();
+      expect(pop).toHaveTextContent("Branch");
+      expect(pop).toHaveTextContent("Base");
+      expect(pop).toHaveTextContent("develop");
+      expect(pop).toHaveTextContent("Working tree");
+      expect(pop).toHaveTextContent("clean");
+    });
+
+    it("reports the changed-file count when the tree is dirty", () => {
+      render(
+        <ContextHeader
+          {...baseProps}
+          workspaceName="X"
+          branch="main"
+          gitStatus={{
+            branch: "main",
+            changedFiles: [
+              { path: "a.ts", status: "modified", staged: false, unstaged: true, conflicted: false },
+            ],
+            ahead: 0,
+            behind: 0,
+            hasUpstream: false,
+            conflicted: 0,
+            aheadBehindKnown: true,
+            operation: null,
+          }}
+        />,
+      );
+      expect(document.querySelector(".octo-prov-pop")).toHaveTextContent("1 changed");
+    });
+
+    it("copies the branch name without opening anything", async () => {
+      render(
+        <ContextHeader {...baseProps} workspaceName="X" branch="feat/auth" gitStatus={null} />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: /copy branch name/i }));
+      expect(copyMock).toHaveBeenCalledWith("feat/auth", "Branch name copied");
+      expect(vi.mocked(ipc.openFileInSystem)).not.toHaveBeenCalled();
+    });
   });
 
   it("renders the unstaged count when git status is provided", () => {
@@ -174,6 +254,78 @@ describe("ContextHeader", () => {
     it("omits the segment when fromBranch equals the branch itself", () => {
       renderHeader({ workspace: makeWorkspace({ branch: "main", fromBranch: "main" }) });
       expect(screen.queryByText(/from main/)).toBeNull();
+    });
+  });
+
+  describe("the demotion ladder", () => {
+    const issue = {
+      key: "PROJ-7",
+      summary: "Fix login",
+      statusName: "In Progress",
+      statusCategory: "inProgress" as const,
+      issueType: "Story",
+      priority: null,
+      url: "u",
+      parentKey: "EPIC-1",
+      subtask: false,
+      hierarchyLevel: 0,
+    };
+
+    it("makes the header its own query container, so the ladder reads the canvas width", () => {
+      const { container } = render(
+        <ContextHeader {...baseProps} workspaceName="X" branch="main" gitStatus={null} />,
+      );
+      expect(container.querySelector(".octo-header")).toBeTruthy();
+    });
+
+    it("carries the status as BOTH a dot and a name, so the rung can swap them", async () => {
+      useIssuesStore.setState({ issues: [issue], loading: false, error: null });
+      useParentIssuesStore.setState({
+        parents: {
+          "EPIC-1": {
+            key: "EPIC-1", summary: "Epic", statusName: "In Progress",
+            statusCategory: "inProgress", issueType: "Epic", priority: null,
+            url: "u", parentKey: null, subtask: false, hierarchyLevel: 1,
+          },
+        },
+        loading: {},
+      });
+      renderHeader({
+        workspace: makeWorkspace({ branch: "feat/PROJ-7" }),
+        issueTrackerConfigured: true,
+        jiraProjectKey: "PROJ",
+      });
+
+      const status = (await screen.findByText("In Progress")).closest(".octo-status");
+      expect(status).toBeTruthy();
+      // Only one is ever visible at a time — CSS swaps their widths at ≤640px.
+      expect(status?.querySelector(".octo-status-dot")).toBeTruthy();
+      expect(status?.querySelector(".octo-status-text")).toHaveTextContent("In Progress");
+      expect(status).toHaveAttribute("title", "In Progress");
+    });
+
+    it("wraps the parent chain and the base branch in their demotion rungs", async () => {
+      useIssuesStore.setState({ issues: [issue], loading: false, error: null });
+      useParentIssuesStore.setState({
+        parents: {
+          "EPIC-1": {
+            key: "EPIC-1", summary: "Epic", statusName: "In Progress",
+            statusCategory: "inProgress", issueType: "Epic", priority: null,
+            url: "u", parentKey: null, subtask: false, hierarchyLevel: 1,
+          },
+        },
+        loading: {},
+      });
+      renderHeader({
+        workspace: makeWorkspace({ branch: "feat/PROJ-7", fromBranch: "develop" }),
+        issueTrackerConfigured: true,
+        jiraProjectKey: "PROJ",
+      });
+
+      expect((await screen.findByText("EPIC-1")).closest(".octo-demote-chain")).toBeTruthy();
+      expect(screen.getByText(/from develop/)).toHaveClass("octo-demote-base");
+      // The active key never demotes — it is the floor.
+      expect(screen.getByText("PROJ-7").closest(".octo-demote")).toBeNull();
     });
   });
 
@@ -255,11 +407,12 @@ describe("ContextHeader", () => {
         fromBranch: null,
       });
       renderHeader({ workspace, issueTrackerConfigured: true });
-      expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
+      // The ◈ diamond is retired app-wide — the type-tinted key marks the ticket.
+    expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
     });
   });
 
-  it("with activeIssue, renders the ticket layout (KEY, status, summary, ◈) and no WORKSPACE block", async () => {
+  it("with activeIssue, renders the ticket grammar (KEY, status, summary) and no WORKSPACE label", async () => {
     const workspace = {
       id: "w1", projectId: "p1", name: "ws-name", task: "",
       branch: "feat/CLPNSNS-92",
@@ -305,6 +458,7 @@ describe("ContextHeader", () => {
 
     expect(screen.getByText(/^Workspace$/i)).toBeInTheDocument();
     expect(screen.getByText("ws-degraded")).toBeInTheDocument();
+    // The ◈ diamond is retired app-wide — the type-tinted key marks the ticket.
     expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
   });
 
@@ -324,6 +478,7 @@ describe("ContextHeader", () => {
 
     expect(screen.getByText(/^Workspace$/i)).toBeInTheDocument();
     expect(screen.getByText("ws-main")).toBeInTheDocument();
+    // The ◈ diamond is retired app-wide — the type-tinted key marks the ticket.
     expect(screen.queryByText(/◈/)).not.toBeInTheDocument();
   });
 

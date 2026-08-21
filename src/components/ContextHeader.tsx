@@ -1,13 +1,14 @@
 import { useEffect } from "react";
-import { Copy, Hammer, Shield } from "lucide-react";
+import { Copy, GitBranch, Hammer, Shield } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
-import type { GitStatus, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
+import type { GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { copyToClipboard } from "../lib/clipboard";
+import { MidTruncate } from "./primitives/MidTruncate";
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -43,6 +44,36 @@ const PR_STATE_STYLE: Record<PrState, { color: string; bg: string; border: strin
   },
 };
 
+/** Mute `·` between eyebrow atoms. Never a connector glyph — `⟶` is retired. */
+function Sep() {
+  return (
+    <span className="flex-none text-octo-mute" aria-hidden>
+      ·
+    </span>
+  );
+}
+
+/** One clickable ticket key, type-tinted, opening that issue in the tracker. */
+function IssueKey({ issue }: { issue: Issue }) {
+  return (
+    <button
+      type="button"
+      aria-label={`Open ${issue.key} in Jira`}
+      title={
+        `${issue.issueType.toUpperCase()}` +
+        (issue.priority ? ` · ${issue.priority.toUpperCase()}` : "") +
+        ` — ${issue.summary}`
+      }
+      onClick={() => {
+        void ipc.openFileInSystem(issue.url).catch(() => {});
+      }}
+      className={`-mx-0.5 flex-none rounded px-0.5 tracking-[0.14em] ${issueTypeToken(issue)} transition hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`}
+    >
+      {issue.key}
+    </button>
+  );
+}
+
 interface Props {
   workspaceName: string;
   branch: string;
@@ -56,20 +87,38 @@ interface Props {
    *  (detectIssueKeyForProject). */
   workspace?: Workspace | null;
   /** Whether the issue tracker is configured. When false, no ticket is
-   *  shown even if a key is present — the degraded WORKSPACE block renders. */
+   *  shown even if a key is present — the eyebrow reads "Workspace" and the
+   *  name line falls back to the workspace name. */
   issueTrackerConfigured?: boolean;
   /** The active project's configured Jira key. A branch-DETECTED key must
    *  match this prefix to surface a ticket (C5); a manual link still wins
    *  regardless. */
   jiraProjectKey?: string | null;
-  /** The active mission's intent (build/fix/…). Renders a small mute glyph +
-   *  label eyebrow above the workspace name; null falls back to "Workspace". */
+  /** The active mission's intent (build/fix/…). Opens the eyebrow with a small
+   *  mute glyph + label; null falls back to "Workspace". */
   missionIntent?: string | null;
   /** The active mission's execution isolation. `sandbox` adds a mute Shield glyph
    *  to the intent eyebrow. */
   missionExecIsolation?: string | null;
 }
 
+/**
+ * The workspace identity band — one grammar in both states.
+ *
+ * A mono EYEBROW carries every piece of meta (mission intent, sandbox posture,
+ * the ticket chain, the ticket's status, the branch), and a serif NAME line
+ * below carries the single thing you are looking at: the ticket summary, or
+ * the workspace name when no ticket resolves. Splitting the band this way is
+ * what fixes long branch names: the name line owns the full width and can
+ * never be squeezed out by a 160-character branch sitting beside it.
+ *
+ * Two mechanics keep it honest at any canvas width (design-system §6):
+ *   · the branch is MIDDLE-truncated (<MidTruncate>) so its head and its
+ *     disambiguating tail both survive, with the full string in a popover;
+ *   · the demotion ladder (`.octo-demote*`, `.octo-status-*`) sheds meta in a
+ *     fixed order as the header narrows, animating each step's width rather
+ *     than unmounting it. The active key and the name line never demote.
+ */
 export function ContextHeader({
   workspaceName,
   branch,
@@ -106,118 +155,167 @@ export function ContextHeader({
       ? parents[parentIssue.parentKey]
       : undefined;
 
-  return (
-    <div className="my-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
-      {activeIssue ? (
-        <div className="-mx-1 flex min-w-0 flex-1 items-center gap-2.5 rounded px-1">
-          <span className="text-octo-brass" aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>◈</span>
-          {grandparentIssue && (
-            <>
-              <button
-                type="button"
-                aria-label={`Open ${grandparentIssue.key} in Jira`}
-                title={`${grandparentIssue.issueType}: ${grandparentIssue.summary}`}
-                onClick={() => { void ipc.openFileInSystem(grandparentIssue.url).catch(() => {}); }}
-                className={`-mx-0.5 rounded px-0.5 font-mono text-[12px] ${issueTypeToken(grandparentIssue)} transition hover:bg-[var(--brass-ghost)]`}
-              >
-                {grandparentIssue.key}
-              </button>
-              <span className="font-mono text-[12px] text-octo-mute" aria-hidden>·</span>
-            </>
-          )}
-          {parentIssue && (
-            <>
-              <button
-                type="button"
-                aria-label={`Open ${parentIssue.key} in Jira`}
-                title={`${parentIssue.issueType}: ${parentIssue.summary}`}
-                onClick={() => { void ipc.openFileInSystem(parentIssue.url).catch(() => {}); }}
-                className={`-mx-0.5 rounded px-0.5 font-mono text-[12px] ${issueTypeToken(parentIssue)} transition hover:bg-[var(--brass-ghost)]`}
-              >
-                {parentIssue.key}
-              </button>
-              <span className="font-mono text-[12px] text-octo-mute" aria-hidden>·</span>
-            </>
-          )}
-          <button
-            type="button"
-            aria-label={`Open ${activeIssue.key} in Jira`}
-            title={
-              `${activeIssue.issueType.toUpperCase()}` +
-              (activeIssue.priority ? ` · ${activeIssue.priority.toUpperCase()}` : "") +
-              ` — ${activeIssue.summary}`
-            }
-            onClick={() => { void ipc.openFileInSystem(activeIssue.url).catch(() => {}); }}
-            className={`-mx-0.5 rounded px-0.5 font-mono text-[12px] ${issueTypeToken(activeIssue)} transition hover:bg-[var(--brass-ghost)]`}
-          >
-            {activeIssue.key}
-          </button>
-          <span className={`font-mono text-[10px] uppercase tracking-[0.15em] ${STATUS_TOKEN[activeIssue.statusCategory]}`}>
-            {activeIssue.statusName}
-          </span>
-          <span aria-hidden className="h-[14px] w-px bg-octo-hairline" />
-          <span className="min-w-0 truncate font-serif text-[15px] leading-tight text-octo-ivory">
-            {activeIssue.summary}
-          </span>
-        </div>
-      ) : (
-        <div className="flex min-w-0 flex-col gap-0.5">
-          {/* Intent eyebrow. The slot height is reserved in BOTH states so
-              nothing shifts while missions load, and the chip reveals with
-              `.octo-pop-in` once resolved — no brass→mute flip. Every code
-              workspace has a mission, so the empty state is a sub-second load
-              artifact, never a resting state. */}
-          {missionIntent ? (
-            (() => {
-              const Icon = INTENT_ICON[missionIntent] ?? Hammer;
-              return (
-                <div
-                  className="octo-pop-in flex h-[14px] items-center gap-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute"
-                  title="Mission intent"
-                >
-                  <Icon size={10} aria-hidden />
-                  <span>{missionIntent}</span>
-                  {missionExecIsolation === "sandbox" && (
-                    <span
-                      title="Sandboxed execution — this mission's agents run write-confined to the workspace"
-                      className="flex items-center"
-                    >
-                      <Shield size={10} aria-hidden />
-                    </span>
-                  )}
-                </div>
-              );
-            })()
-          ) : (
-            <div className="flex h-[14px] items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
-              Workspace
-            </div>
-          )}
-          <div
-            key={workspaceName}
-            className="animate-name-in font-serif text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"
-          >
-            {workspaceName}
-          </div>
-        </div>
-      )}
+  const base =
+    workspace?.fromBranch && workspace.fromBranch !== branch ? workspace.fromBranch : null;
+  const IntentIcon = missionIntent ? INTENT_ICON[missionIntent] ?? Hammer : null;
+  // The name line: the ticket's summary when one resolves, else the workspace's
+  // own name. Keyed so a workspace switch re-runs the entrance.
+  const name = activeIssue ? activeIssue.summary : workspaceName;
 
-      <div className="ml-auto flex flex-shrink-0 items-center gap-4">
-        <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
-          <span className="inline-block h-1.5 w-1.5 rounded-full bg-octo-verdigris" aria-hidden />
-          <span>
-            ↳ {branch}
-            {workspace?.fromBranch && workspace.fromBranch !== branch && (
+  return (
+    <div className="octo-header my-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
+      <div className="flex min-w-0 flex-1 flex-col gap-[3px]">
+        {/* Eyebrow — all meta, mono, one line. The height is reserved in every
+            state so nothing shifts while missions and issues load. */}
+        <div className="flex h-[14px] min-w-0 items-center gap-2 font-mono text-[9px] uppercase tracking-[0.22em] text-octo-mute">
+          {IntentIcon ? (
+            <span
+              className="octo-pop-in flex flex-none items-center gap-1"
+              title="Mission intent"
+            >
+              <IntentIcon size={10} aria-hidden />
+              <span>{missionIntent}</span>
+            </span>
+          ) : (
+            // Only when nothing else leads the line. With a ticket resolved the
+            // chain leads and a "Workspace" label would just be noise.
+            !activeIssue && <span className="flex-none">Workspace</span>
+          )}
+
+          {missionExecIsolation === "sandbox" && (
+            <span
+              title="Sandboxed execution — this mission's agents run write-confined to the workspace"
+              className="octo-pop-in flex flex-none items-center"
+            >
+              <Shield size={10} aria-hidden />
+            </span>
+          )}
+
+          {activeIssue && (
+            <>
+              {IntentIcon && <Sep />}
+              {grandparentIssue && (
+                <span className="octo-demote octo-demote-chain">
+                  <IssueKey issue={grandparentIssue} />
+                  <Sep />
+                </span>
+              )}
+              {parentIssue && (
+                <span className="octo-demote octo-demote-chain">
+                  <IssueKey issue={parentIssue} />
+                  <Sep />
+                </span>
+              )}
+              <IssueKey issue={activeIssue} />
+              <Sep />
+              {/* Wide: the status name. Narrow: the category dot it already
+                  implies — never both (design-system §9). */}
               <span
-                title="Base branch this workspace was created from"
-                className="opacity-70"
+                className={`octo-status flex-none ${STATUS_TOKEN[activeIssue.statusCategory]}`}
+                title={activeIssue.statusName}
               >
-                {" "}from {workspace.fromBranch}
+                <span className="octo-status-dot" aria-hidden />
+                <span className={`octo-status-text ${STATUS_TOKEN[activeIssue.statusCategory]}`}>
+                  {activeIssue.statusName}
+                </span>
               </span>
-            )}
+            </>
+          )}
+
+          <Sep />
+
+          {/* Branch — middle-truncated chip, full provenance one hover (or one
+              Tab) away. Right-anchored: the chip sits in the band's right half,
+              so a left-anchored panel would reach past the canvas. */}
+          <span className="octo-prov min-w-0">
+            <button
+              type="button"
+              title={branch}
+              aria-label={`Branch ${branch}`}
+              aria-describedby="octo-branch-provenance"
+              className="-mx-1 flex min-w-0 max-w-full items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <GitBranch size={11} className="flex-none" aria-hidden />
+              <MidTruncate text={branch} tail={12} className="text-[10px]" />
+            </button>
+
+            <span
+              id="octo-branch-provenance"
+              role="tooltip"
+              className="octo-prov-pop octo-prov-pop--end"
+            >
+              <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1.5">
+                <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                  Branch
+                </dt>
+                <dd className="flex items-start gap-1.5 font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
+                  <span className="octo-selectable break-words">{branch}</span>
+                  <button
+                    type="button"
+                    aria-label="Copy branch name"
+                    title="Copy branch name"
+                    onClick={() => {
+                      void copyToClipboard(branch, "Branch name copied");
+                    }}
+                    className="mt-px flex flex-none items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                  >
+                    <Copy size={11} />
+                  </button>
+                </dd>
+                {base && (
+                  <>
+                    <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                      Base
+                    </dt>
+                    <dd className="font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
+                      <span className="octo-selectable break-words">{base}</span>
+                    </dd>
+                  </>
+                )}
+                <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                  Working tree
+                </dt>
+                <dd
+                  className={`octo-tabular font-mono text-[11px] normal-case tracking-normal ${
+                    unstaged > 0 ? "text-octo-verdigris" : "text-octo-sage"
+                  }`}
+                >
+                  {unstaged > 0 ? `${unstaged} changed` : "clean"}
+                </dd>
+              </dl>
+            </span>
           </span>
-          {unstaged > 0 && <span>· {unstaged} unstaged</span>}
+
+          {base && (
+            <span
+              className="octo-demote octo-demote-base normal-case tracking-normal text-[10px] opacity-70"
+              title="Base branch this workspace was created from"
+            >
+              from {base}
+            </span>
+          )}
         </div>
+
+        {/* Name — the one thing you are looking at. Owns the full width in
+            both states; a long branch can no longer squeeze it out. */}
+        <div
+          key={activeIssue?.key ?? workspaceName}
+          title={name}
+          className="animate-name-in truncate font-serif text-[15px] leading-tight tracking-[-0.005em] text-octo-ivory"
+        >
+          {name}
+        </div>
+      </div>
+
+      <div className="ml-auto flex flex-shrink-0 items-center gap-3">
+        <span className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full bg-octo-verdigris"
+            title={unstaged > 0 ? `${unstaged} files changed in the working tree` : "Working tree clean"}
+            aria-hidden
+          />
+          {unstaged > 0 && <span className="octo-tabular octo-fade-in">{unstaged} unstaged</span>}
+        </span>
 
         {pr && (() => {
           const style = PR_STATE_STYLE[pr.state];
