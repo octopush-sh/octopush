@@ -317,6 +317,11 @@ Two mechanics for any band that mixes elastic text with atoms that must stay who
 
 **E1 — Middle truncation for identifiers.** `truncate` keeps the head and throws away exactly the part that tells two similar strings apart: `…-per-shard-copy` and `…-per-shard-guard` both render as `intermittent-component-not-…`. `<MidTruncate>` keeps both ends and elides the middle instead. It is pure CSS (`.octo-midtrunc`) — the head ellipsizes into whatever room is left and the tail is pinned — so the elision point tracks the container with no measurement and no resize listener, and the full string stays in the DOM (selectable, copyable). **Always pair it with a `title`.** Use it for branch names, file paths, run ids; NOT for prose, where the head is the meaning and plain `truncate` is right.
 
+Two traps, both paid for once already:
+
+- **A bare string inside a flex box is an anonymous flex item, and it wraps.** The short-name path renders through `.octo-midtrunc-whole` — a plain block with `white-space: nowrap` and a real `text-overflow: ellipsis` — never the flex box the split path uses. When the short path shared `.octo-midtrunc`, `check-in` broke at its hyphen into two lines inside a 14px row, and `main`, having no break opportunity at all, was hard-cut to `mai`.
+- **Never give one of these boxes a percentage `max-width`.** Inside a shrink-to-fit chain that is a cyclic reference, and it resolved *below the text's own width* with 1200px of room to spare. Flex-shrink already keeps the box inside its container; the percentage only adds a second, wrong opinion.
+
 **E2 — Truncation is not enough; shed on a stated ladder.** Below a certain width the *fixed* atoms stop fitting and start overlapping — no amount of truncating the elastic ones saves the row. So declare an order in which meta is shed, and animate each step's width instead of unmounting it (§6: nothing appears or disappears abruptly). The ContextHeader's ladder, and the shape to copy:
 
 | Rung | Sheds | Where it survives |

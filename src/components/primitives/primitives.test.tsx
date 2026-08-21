@@ -65,6 +65,29 @@ describe("MidTruncate", () => {
     expect(container.querySelector(".octo-midtrunc-head")).toBeNull();
   });
 
+  it("gives the whole path its own non-flex box, so a hyphenated name can't wrap", () => {
+    // Regression: the short path used to reuse `.octo-midtrunc`, whose bare
+    // text became an anonymous flex item. `check-in` then broke at the hyphen
+    // into two lines inside a 14px row, and `main` — with no break
+    // opportunity at all — was hard-cut to `mai` instead.
+    for (const text of ["main", "check-in", "post-app-release"]) {
+      const { container, unmount } = render(<MidTruncate text={text} />);
+      const el = container.firstElementChild!;
+      expect(el).toHaveClass("octo-midtrunc-whole");
+      expect(el).not.toHaveClass("octo-midtrunc");
+      expect(el.textContent).toBe(text);
+      unmount();
+    }
+  });
+
+  it("keeps the caller's className on both paths", () => {
+    const short = render(<MidTruncate text="main" className="text-[10px]" />);
+    expect(short.container.firstElementChild).toHaveClass("text-[10px]");
+    short.unmount();
+    const long = render(<MidTruncate text={"x".repeat(40)} className="text-[10px]" />);
+    expect(long.container.firstElementChild).toHaveClass("octo-midtrunc", "text-[10px]");
+  });
+
   it("splits a long string into an ellipsizing head and a pinned tail", () => {
     const text = "a".repeat(40) + "-tail-marker";
     const { container } = render(<MidTruncate text={text} tail={12} />);
