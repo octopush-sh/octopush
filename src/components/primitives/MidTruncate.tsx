@@ -19,10 +19,14 @@ interface Props {
  *  whatever space is left over and the tail is pinned, so the elision point
  *  tracks the container's width with no measurement and no resize listener. */
 export function MidTruncate({ text, tail = 12, className = "" }: Props) {
-  const cls = `octo-midtrunc ${className}`.trim();
-  if (text.length <= tail + 4) return <span className={cls}>{text}</span>;
+  // The short path is a plain truncating line, NOT the flex box — a bare
+  // string inside a flex container is an anonymous flex item that wraps at
+  // every hyphen and slash. See `.octo-midtrunc-whole` in styles.css.
+  if (text.length <= tail + 4) {
+    return <span className={`octo-midtrunc-whole ${className}`.trim()}>{text}</span>;
+  }
   return (
-    <span className={cls}>
+    <span className={`octo-midtrunc ${className}`.trim()}>
       <span className="octo-midtrunc-head">{text.slice(0, text.length - tail)}</span>
       <span className="octo-midtrunc-tail">{text.slice(text.length - tail)}</span>
     </span>

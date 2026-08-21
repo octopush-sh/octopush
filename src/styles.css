@@ -346,9 +346,26 @@
    middle. Pure CSS: the head ellipsizes into whatever space is left, the tail
    is pinned. Always pair with a `title` carrying the full string.
    Consumers build the two spans via <MidTruncate> (components/primitives). */
-.octo-midtrunc      { display: inline-flex; align-items: baseline; min-width: 0; max-width: 100%; overflow: hidden; }
-.octo-midtrunc-head { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.octo-midtrunc-tail { flex: none; white-space: nowrap; }
+/* Two boxes, because the two paths are different problems.
+
+   `--whole` is the short-name path: a plain truncating line. It must never be
+   a flex box — a bare string inside one becomes an anonymous flex item that
+   wraps at every `-` and `/` (so `check-in` became two lines in a 14px row),
+   and with no `white-space` of its own it had no way not to. It gets a real
+   ellipsis, so if it ever IS squeezed the elision is visible rather than a
+   silent hard cut.
+
+   `--split` is the elided path: head ellipsizes, tail pinned.
+
+   NEITHER carries `max-width: 100%`. A percentage max-width on a flex item
+   inside a shrink-to-fit chain is a cyclic reference, and it resolved to less
+   than the text's own width even with 1200px to spare — which is what cut
+   `main` down to `mai`. Flex-shrink already keeps these inside their
+   container; the percentage only added a second, wrong opinion. */
+.octo-midtrunc-whole { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.octo-midtrunc       { display: inline-flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
+.octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.octo-midtrunc-tail  { flex: none; white-space: nowrap; }
 
 /* ── The demotion ladder (ContextHeader) ─────────────────────────
    Truncation alone can't save a band that mixes elastic text with atoms that

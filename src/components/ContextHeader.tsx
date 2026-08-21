@@ -237,7 +237,7 @@ export function ContextHeader({
               title={branch}
               aria-label={`Branch ${branch}`}
               aria-describedby="octo-branch-provenance"
-              className="-mx-1 flex min-w-0 max-w-full items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              className="-mx-1 flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
               <GitBranch size={11} className="flex-none" aria-hidden />
               <MidTruncate text={branch} tail={12} className="text-[10px]" />
