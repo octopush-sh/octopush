@@ -2,10 +2,10 @@
 
 Octopush ships as a **universal macOS `.dmg`** (Apple Silicon + Intel in one file)
 with a signed **Tauri auto-updater** artifact. This document is the source of
-truth for cutting a release. The Apple signing/notarization layer is **optional
-and env-gated** — the pipeline produces a working (unsigned) build today and
-becomes Gatekeeper-clean the moment the Apple Developer secrets are filled in,
-with no code changes.
+truth for cutting a release. Since **v0.4.63** every release is also signed with
+an Apple Developer ID certificate and **notarized by Apple**, so it installs with
+a plain double-click. That layer stays env-gated: without the `APPLE_*` secrets
+the pipeline still produces a working (unsigned) build, with no code changes.
 
 There are two ways to cut a release, sharing one build+publish implementation
 (`scripts/release.mjs`):
@@ -95,13 +95,17 @@ sidecars are bundled → generate `latest.json` → commit, tag `v0.4.51`, push 
 
 ## Apple signing & notarization (env-gated)
 
-**The Apple Developer account does not exist yet.** Until it does, releases build
-**unsigned** and the release notes include the one-time `xattr -cr` unblock.
-`scripts/release.mjs` prints a loud warning on every unsigned build. Nothing
-fails.
+**Active since v0.4.63.** Releases are signed with a Developer ID certificate and
+notarized by Apple, and install with a plain double-click. The six `APPLE_*`
+secrets are set in the repo, so CI releases are Gatekeeper-clean by default.
 
-To flip to Gatekeeper-clean, provide these as environment variables (locally) or
-repo secrets (CI). No code changes are needed.
+The mechanism stays env-gated: if these are ever absent (a fork, a local build
+without them), the release builds **unsigned**, `scripts/release.mjs` prints a
+loud warning, and the notes fall back to the one-time `xattr -cr` unblock.
+Nothing fails.
+
+The credentials, for reference — as environment variables locally or repo
+secrets in CI:
 
 **Signing** (one of):
 - `APPLE_SIGNING_IDENTITY` — e.g. `"Developer ID Application: Your Name (TEAMID)"` (identity already in the keychain), **or**
@@ -126,20 +130,30 @@ When both signing and notarization creds are present, Tauri 2 signs, submits to
 (the assessment a user's Mac performs on first launch). See
 [`gtm-legitimacy.md`](gtm-legitimacy.md) for the enrollment runbook.
 
-### Blocked-on-Apple checklist
+### How this was set up (done — v0.4.63)
 
-When the Developer account lands:
+1. ✅ Enrolled; created a **Developer ID Application** certificate under the
+   **G2** Sub-CA. *(Pick G2, not "Previous Sub-CA" — the latter's certificates
+   expire 2027-02-01 regardless of when you create them.)*
+2. ✅ Exported as `.p12`, base64-encoded into `APPLE_CERTIFICATE`, with
+   `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID`.
+3. ✅ Notarization creds: `APPLE_ID` + app-specific `APPLE_PASSWORD` +
+   `APPLE_TEAM_ID`.
+4. ✅ v0.4.63 cut; `spctl -a -vv` reports **accepted**.
+5. ✅ The `xattr` note removed from the docs install page (`octopush-web`).
+6. ⏳ Homebrew cask — cleared to publish, needs the tap repo created. See
+   [`DISTRIBUTION.md`](DISTRIBUTION.md).
 
-1. Enroll; create a **Developer ID Application** certificate.
-2. Export it as `.p12`, base64-encode it, add `APPLE_CERTIFICATE` +
-   `APPLE_CERTIFICATE_PASSWORD` (or set `APPLE_SIGNING_IDENTITY` on a Mac that
-   holds the cert). Add `APPLE_TEAM_ID`.
-3. Add notarization creds (`APPLE_ID` + app-specific `APPLE_PASSWORD`, or the API
-   key trio).
-4. Cut a release; confirm `spctl -a -vv` reports **accepted**.
-5. Remove the `xattr` note from the docs install page
-   (`octopush-web`: search `REMOVE-AFTER-NOTARIZATION`).
-6. Publish the Homebrew cask (see [`DISTRIBUTION.md`](DISTRIBUTION.md)).
+**Certificate renewal:** the Developer ID Application certificate expires in
+2031. Renewing means repeating steps 1–2 and refreshing the two certificate
+secrets; nothing else changes.
+
+**Validating notarization creds without burning a build** — worth doing before
+any credential change:
+
+```sh
+xcrun notarytool history --apple-id "<apple-id>" --team-id "<team-id>" --password "<app-specific>"
+```
 
 ---
 

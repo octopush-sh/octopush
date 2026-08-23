@@ -9,7 +9,7 @@ How Octopush reaches users, and how each channel activates. For the mechanics of
 |---|---|---|
 | Direct download (`octopush.sh/download` → GitHub release `Octopush.dmg`) | **Live path, needs first release** | Publish `v<version>` |
 | In-app auto-update (Tauri updater) | **Live path, needs first release** | Publish `latest.json` |
-| Homebrew cask (`brew install --cask octopush-sh/tap/octopush`) | **Staged, gated on notarization** | Notarize + create tap repo |
+| Homebrew cask (`brew install --cask octopush-sh/tap/octopush`) | **Cleared to publish** | Create the `octopush-sh/homebrew-tap` repo |
 
 ### 1. Direct download
 
@@ -26,21 +26,20 @@ Installed apps check `octopush.sh/update/latest.json` (redirect → the GitHub
 release `latest.json`), verify the Ed25519 signature, and update in place. See
 [`RELEASING.md`](RELEASING.md) → "The updater endpoint".
 
-### 3. Homebrew cask — **do not publish until notarized**
+### 3. Homebrew cask — cleared to publish
 
-A ready-to-publish tap is staged at
-[`packaging/homebrew-tap/`](../packaging/homebrew-tap/) (cask +
-publishing instructions). `brew install --cask` respects Gatekeeper, so shipping
-an un-notarized cask lands a quarantined app and users hit an "Apple could not
-verify" wall on first launch. Publish the tap only after a released build passes
-`spctl -a -vv` (accepted).
+The notarization gate is cleared (v0.4.63 onward is signed + notarized), so a
+cask install now lands an app that opens cleanly. A ready-to-publish tap is
+staged at [`packaging/homebrew-tap/`](../packaging/homebrew-tap/), with a real
+`version` and `sha256` already filled in.
 
-**Activation, when the Apple Developer account lands:**
-1. Notarize a release (fill the `APPLE_*` secrets — see `RELEASING.md`).
-2. Create the public repo `octopush-sh/homebrew-tap`.
-3. Copy `packaging/homebrew-tap/Casks/octopush.rb` into it; set the real
-   `version` + `sha256` (`shasum -a 256 Octopush.dmg`).
-4. Announce `brew install --cask octopush-sh/tap/octopush`.
+**To ship it:**
+1. Create the public repo `octopush-sh/homebrew-tap` (the `homebrew-` prefix is
+   required for `brew tap octopush-sh/tap` to resolve).
+2. Copy `packaging/homebrew-tap/Casks/octopush.rb` to `Casks/octopush.rb` at its
+   root.
+3. Announce `brew install --cask octopush-sh/tap/octopush`.
+4. On each later release, refresh the cask's `version` + `sha256`.
 
 ## Platform scope
 
@@ -49,7 +48,7 @@ is published today despite `bundle.targets: "all"` in `tauri.conf.json`.
 
 ## First-launch experience by signing state
 
-| State | What the user sees | Mitigation |
+| State | What the user sees | Status |
 |---|---|---|
-| Unsigned (today) | "Apple could not verify… " on first open | Docs `xattr -cr` step + `<!-- REMOVE-AFTER-NOTARIZATION -->` note on the install page |
-| Signed + notarized (goal) | Opens cleanly | Remove the `xattr` note; publish the cask |
+| Unsigned (up to v0.4.62) | "Apple could not verify…" on first open | Historical — those builds needed a one-time `xattr -cr` |
+| **Signed + notarized (v0.4.63 onward)** | **Opens cleanly on a plain double-click** | **Current.** Verified per release with `codesign --verify`, `xcrun stapler validate` and `spctl -a -vv` |
