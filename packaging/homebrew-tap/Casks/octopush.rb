@@ -1,25 +1,22 @@
 # Octopush — Homebrew cask.
 #
-# ⚠️ DO NOT PUBLISH THIS TAP UNTIL THE APP IS NOTARIZED.
-# An unsigned/un-notarized cask makes `brew install --cask octopush` drop a
-# Gatekeeper-quarantined app on the user's disk — the first-launch experience is
-# a scary "Apple could not verify" dialog, which is a terrible first impression
-# and reads as broken. Ship the cask only once `spctl -a -vv` reports "accepted"
-# on a released build (see docs/RELEASING.md → Blocked-on-Apple checklist).
+# ✅ READY TO PUBLISH. As of v0.4.63 Octopush is signed with an Apple Developer ID
+# certificate and notarized by Apple (verified with `spctl -a -vv` on every
+# release build), so a cask install lands an app that opens cleanly — the
+# notarization gate that previously blocked this tap is cleared.
 #
-# When ready, this file lives at Casks/octopush.rb in the repo
+# This file lives at Casks/octopush.rb in the repo
 # github.com/octopush-sh/homebrew-tap, and users install with:
 #     brew install --cask octopush-sh/tap/octopush
 #
-# Before publishing each release, set `version` to the release and replace the
-# `sha256` with the real digest of that release's Octopush.dmg:
+# On each release, bump `version` and refresh `sha256` with the digest of that
+# release's Octopush.dmg:
 #     shasum -a 256 Octopush.dmg
-# (Do not ship `sha256 :no_check` in a public tap — it disables integrity
-# verification. It's only a stand-in here because no release exists yet.)
+# (GitHub also reports it: the release asset's `digest` field.)
 
 cask "octopush" do
-  version "0.4.50"
-  sha256 :no_check # TODO(before publish): replace with `shasum -a 256 Octopush.dmg`
+  version "0.4.63"
+  sha256 "50d989d10c934fea87ce50e68336ed047e99d826570414791e1a8eef8a415f91"
 
   # Stable permalink asset published by scripts/release.mjs. `Octopush.dmg` is a
   # byte-copy of the versioned universal DMG, so this URL is arch-agnostic.

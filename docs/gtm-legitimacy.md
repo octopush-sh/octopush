@@ -1,11 +1,11 @@
 # GTM legitimacy — Apple signing + GitHub/Google login
 
-Two things stand between "deep product" and "installs without friction / signs in like a real app":
+Two things stood between "deep product" and "installs without friction / signs in like a real app":
 
-1. **macOS Developer-ID signing + notarization** — kills the "unidentified developer / app is damaged" Gatekeeper warning and the `xattr -cr` workaround.
-2. **GitHub / Google login** — one-click social sign-in instead of only email.
+1. ✅ **macOS Developer-ID signing + notarization** — **DONE as of v0.4.63.** Releases are signed and notarized, so the "unidentified developer" warning and the `xattr -cr` workaround are gone. Verified per release with `spctl -a -vv`. The operational runbook now lives in [`RELEASING.md`](RELEASING.md); the section below is kept for background.
+2. **GitHub / Google login** — one-click social sign-in instead of only email. Still credential-gated on your OAuth accounts.
 
-Both are **credential-gated**: the *code/config side is already wired* — what remains needs **your own Apple and OAuth accounts**. This doc is the runbook. Where a step needs you, it's marked **⛳ you**.
+This doc is the runbook. Where a step needs you, it's marked **⛳ you**.
 
 ---
 
@@ -62,9 +62,11 @@ The script prints `Apple Developer-ID signing + notarization: ON` at the top and
 
 > **Tip:** put the `export` lines in a private, git-ignored file (e.g. `~/.octopush-keys/apple.env`) and `source` it before releasing — never commit them.
 
-### Known risk (first notarized build only)
+### Resolved: the sidecar-signing risk
 
-Notarization requires **every** Mach-O in the bundle to be Developer-ID-signed with hardened runtime — that includes the three Rust sidecars (`octopush-pty-server`, `octopush-mcp`, `octopush-run-worker`). Tauri 2 signs bundled `externalBin` sidecars as part of the app signing, so this should just work. If notarization rejects with a "not signed with a valid Developer ID" / "hardened runtime" error naming a sidecar, the fix is to sign the sidecars explicitly before bundling; tell me and I'll add that step to the release script (it's a known, small addition — deferred only because it's untestable without the cert).
+Notarization requires **every** Mach-O in the bundle to be Developer-ID-signed with hardened runtime — including the three Rust sidecars (`octopush-pty-server`, `octopush-mcp`, `octopush-run-worker`). This was flagged as the main unknown for the first notarized build.
+
+**It was a non-issue.** Tauri 2 signs bundled `externalBin` sidecars as part of app signing, and v0.4.63 notarized on the first attempt with all three present (the release script verifies each one is bundled and non-empty before publishing). No explicit sidecar-signing step was needed.
 
 ---
 
@@ -94,7 +96,7 @@ Today sign-in is a single **"Sign in"** button that opens the browser (`AccountP
 
 | Task | Code/config (done) | Needs your account |
 | --- | --- | --- |
-| Apple signing + notarization | release.mjs env-driven, verify + conditional notes ✅ | Developer Program, Developer-ID cert, Team ID, notarization cred |
+| Apple signing + notarization | ✅ **live since v0.4.63** — signed, notarized, stapled, `spctl`-verified per release | ✅ done (Team `VHWQJTL7LV`, cert valid to 2031) |
 | GitHub login | nothing (Clerk hosted) ✅ | GitHub OAuth App → Clerk |
 | Google login | nothing (Clerk hosted) ✅ | Google OAuth client → Clerk |
 | Native provider buttons (optional) | not started | — (custom URL scheme; ask if wanted) |

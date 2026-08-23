@@ -5,23 +5,23 @@ here in the app repo; when the app is notarized, copy it into a new public repo
 named **`octopush-sh/homebrew-tap`** (the `homebrew-` prefix is required — it's
 what lets `brew tap octopush-sh/tap` resolve).
 
-## ⚠️ Do not publish until the app is notarized
+## ✅ Cleared to publish
 
-`brew install --cask` respects Gatekeeper. Installing an un-notarized app via a
-cask lands a quarantined `Octopush.app` and the user hits an "Apple could not
-verify" wall on first launch — a worse first impression than a manual download
-with documented `xattr` steps. Publish this tap only after a released build
-passes `spctl -a -vv` (see [`docs/RELEASING.md`](../../docs/RELEASING.md)).
+The notarization gate is cleared. As of **v0.4.63** Octopush is signed with an
+Apple Developer ID certificate and notarized by Apple, verified with
+`spctl -a -vv` on every release build, so a cask install lands an app that opens
+cleanly.
 
-## Publishing steps (when notarized)
+## Publishing steps
 
 1. Create the public repo `octopush-sh/homebrew-tap`.
 2. Copy `Casks/octopush.rb` into it at the repo root path `Casks/octopush.rb`.
-3. For the release you're publishing, set `version` and the real `sha256`:
+3. The cask already carries a real `version` and `sha256` (v0.4.63). On each
+   later release, refresh both:
    ```
    shasum -a 256 Octopush.dmg
    ```
-   (Replace `sha256 :no_check` — a public tap must verify integrity.)
+   (GitHub also reports it as the release asset's `digest` field.)
 4. Commit and push. Users then install with:
    ```
    brew install --cask octopush-sh/tap/octopush
