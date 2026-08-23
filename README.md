@@ -206,6 +206,18 @@ Entitlements are enforced against the signed‑in plan; same‑workspace concurr
 
 ---
 
+## License
+
+Octopush is **source-available** under the **[Elastic License 2.0](LICENSE)** — not open source, and deliberately so.
+
+**What you can do:** read the source, build it, fork it, modify it, and run your own build for yourself or your team. Being able to audit the code is the point: the "local-first, zero telemetry" promise is only worth as much as your ability to verify it.
+
+**What you can't do:** offer Octopush to third parties as a hosted or managed service, or **circumvent the license-key functionality** that separates Free from Pro. Removing or obscuring the licensing notices isn't permitted either.
+
+If you're unsure whether your use is covered, ask — [support@octopush.sh](mailto:support@octopush.sh).
+
+---
+
 <div align="center">
 
 **Octopush** · an atelier for agentic developers
