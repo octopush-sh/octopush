@@ -11,6 +11,7 @@ pub mod context_guard;
 // read-and-author surface over the same SQLite store the desktop app uses.
 pub mod db;
 pub mod entitlement;
+pub mod entitlement_token;
 pub mod error;
 pub mod git_ops;
 pub mod git_url;
@@ -414,6 +415,33 @@ pub fn run() {
                 // the same guarded launch path as a user's Begin.
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
+            }
+
+            // License-key layer: publish this machine's id so the synchronous
+            // entitlement path can check a token's `mid` binding, then refresh
+            // the token in the background. Both are no-ops on a build with no
+            // public key compiled in.
+            {
+                let st = app.state::<AppState>();
+                let machine_id = match st.db.lock().get_or_create_machine_id() {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not resolve the machine id");
+                        None
+                    }
+                };
+                if let Some(id) = machine_id {
+                    entitlement_token::set_machine_id(id.clone());
+                    if entitlement_token::provisioned() {
+                        // Fire-and-forget: offline start-up must not block, and a
+                        // failed refresh keeps the cached token rather than
+                        // downgrading anyone.
+                        tauri::async_runtime::spawn(async move {
+                            let client = reqwest::Client::new();
+                            sync::refresh_entitlement_token(&client, &id).await;
+                        });
+                    }
+                }
             }
 
             Ok(())

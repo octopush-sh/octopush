@@ -2069,9 +2069,21 @@ pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
 /// Force a token refresh and return the current plan. Called right after the user
 /// returns from checkout so a freshly-minted access token reflects the new plan —
 /// lets Pro appear without a manual sign-out / sign-in.
+///
+/// Also re-mints the **signed entitlement token**: since `Entitlement::current`
+/// trusts that token over the cached plan string, a fresh subscriber would
+/// otherwise stay on Free until the next launch.
 #[tauri::command]
-pub async fn auth_sync_plan() -> AppResult<Option<String>> {
-    crate::auth::sync_plan().await
+pub async fn auth_sync_plan(state: State<'_, AppState>) -> AppResult<Option<String>> {
+    let plan = crate::auth::sync_plan().await?;
+    if crate::entitlement_token::provisioned() {
+        let machine_id = state.db.lock().get_or_create_machine_id().ok();
+        if let Some(id) = machine_id {
+            let client = reqwest::Client::new();
+            crate::sync::refresh_entitlement_token(&client, &id).await;
+        }
+    }
+    Ok(plan)
 }
 
 /// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend

@@ -68,8 +68,61 @@ impl Entitlement {
     /// (`public_metadata.plan` via Clerk). A "pro" plan gets [`Entitlement::pro`]
     /// (uncapped); **everyone else (Free / signed-out / unknown) gets
     /// [`Entitlement::free_restricted`]** — the monthly Direct-run cap is live.
+    /// What this install is allowed to do, right now.
+    ///
+    /// The plan comes from a **server-signed entitlement token** whenever the
+    /// license-key layer is provisioned (see `entitlement_token`). Before that
+    /// existed, the plan was a plain string cached in the keychain — anyone able
+    /// to write that entry granted themselves Pro without touching code. A
+    /// signed claim can't be forged that way.
+    ///
+    /// Resolution order:
+    /// 1. **Not provisioned** (no public key compiled in) → legacy keychain
+    ///    plan, byte-identical to the old behaviour. Keeps builds cut before key
+    ///    deployment working.
+    /// 2. **Valid token** → its claims, verbatim.
+    /// 3. **Anything else** (absent, expired, forged, wrong user, wrong machine)
+    ///    → **Free**. This is the whole point: an unverifiable claim grants
+    ///    nothing. For a Pro user it means ~30 consecutive days offline, and one
+    ///    reconnection restores it.
     pub fn current() -> Self {
-        Self::for_plan(crate::auth::current_plan().as_deref())
+        use crate::entitlement_token::{self as tok, TokenRejection};
+
+        if !tok::provisioned() {
+            return Self::for_plan(crate::auth::current_plan().as_deref());
+        }
+        // Signed out → Free. No session, no subject to bind a token to.
+        let Some((sub, _)) = crate::auth::current_identity() else {
+            return Self::free_restricted();
+        };
+        match tok::verified(&sub) {
+            Ok(claims) => Self::from_claims(&claims),
+            // Belt and braces: `provisioned()` was true a moment ago, so this
+            // arm is unreachable in practice — but fall back rather than
+            // silently downgrade if it ever isn't.
+            Err(TokenRejection::NotProvisioned) => {
+                Self::for_plan(crate::auth::current_plan().as_deref())
+            }
+            Err(_) => Self::free_restricted(),
+        }
+    }
+
+    /// Build an entitlement from verified claims. The server is authoritative
+    /// about the feature list, so it is taken as given rather than re-derived —
+    /// that way a server-side change to what Pro includes reaches clients
+    /// without a release. The plan string is still normalised through the same
+    /// tolerant comparison used everywhere else.
+    fn from_claims(claims: &crate::entitlement_token::EntitlementClaims) -> Self {
+        let plan = if claims.plan.trim().eq_ignore_ascii_case("pro") {
+            Plan::Pro
+        } else {
+            Plan::Free
+        };
+        Self {
+            plan,
+            features: claims.features.clone(),
+            direct_runs_per_month: claims.direct_runs_per_month,
+        }
     }
 
     /// Map a plan claim to an entitlement. Pure (the keyring read lives in
