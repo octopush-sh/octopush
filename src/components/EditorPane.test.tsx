@@ -652,7 +652,11 @@ describe("EditorPane · go to definition", () => {
     // lookup for `type`, `get`, `use`, `record` — all perfectly normal names.
     const onRequest = definitionHandler();
     onRequest({ name: "type", from: 0, to: 4 }, navView());
-    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "type", true));
+    // Whole-word (the 4th argument): a symbol lookup must not burn the
+    // backend's hit cap on substring noise before reaching the declaration.
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "type", true, true),
+    );
   });
 
   it("lets an in-file jump supersede a workspace scan still in flight", async () => {

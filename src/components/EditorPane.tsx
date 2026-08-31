@@ -364,7 +364,9 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
 
       setDefinitionSearching(req.name);
       try {
-        const hits = await ipc.searchWorkspaceText(workspacePath, req.name, true);
+        // Whole-word: a symbol lookup for `run` must not spend the backend's
+        // 500-hit cap on `running` and `rerun` before reaching `fn run`.
+        const hits = await ipc.searchWorkspaceText(workspacePath, req.name, true, true);
         if (!current()) return;
         const choice = chooseDefinition(
           rankDefinitionHits(hits, req.name, { fromFile, fromLine }),

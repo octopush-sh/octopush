@@ -10826,3 +10826,61 @@ mod mission_tests {
         assert_eq!(db.list_missions("p1").unwrap().len(), 2, "two readonly missions share fine");
     }
 }
+
+// ─── Workspace text search — whole-word matching ──────────────────
+//
+// Go-to-definition rides on `search_workspace_text`. As a plain substring scan
+// it spent the 500-hit cap on `running`/`runtime`/`rerun` before ever reaching
+// `fn run`, and reported that nothing declared the symbol.
+#[cfg(test)]
+mod search_word_boundary {
+    use crate::commands::find_match;
+
+    #[test]
+    fn substring_mode_is_unchanged() {
+        assert_eq!(find_match("rerunning", "run", 0, false), Some(2));
+        assert_eq!(find_match("no match here", "run", 0, false), None);
+    }
+
+    #[test]
+    fn whole_word_rejects_a_match_glued_to_an_identifier() {
+        assert_eq!(find_match("rerunning", "run", 0, true), None);
+        assert_eq!(find_match("runtime", "run", 0, true), None);
+        assert_eq!(find_match("prerun", "run", 0, true), None);
+        assert_eq!(find_match("run_id", "run", 0, true), None);
+        assert_eq!(find_match("run$x", "run", 0, true), None);
+    }
+
+    #[test]
+    fn whole_word_accepts_a_standalone_identifier() {
+        assert_eq!(find_match("run", "run", 0, true), Some(0));
+        assert_eq!(find_match("fn run(x) {", "run", 0, true), Some(3));
+        assert_eq!(find_match("  let y = run;", "run", 0, true), Some(10));
+        assert_eq!(find_match("call(run)", "run", 0, true), Some(5));
+    }
+
+    #[test]
+    fn whole_word_keeps_scanning_past_a_false_match() {
+        // The reason this can't just test the first substring hit and give up.
+        assert_eq!(find_match("rerun(run)", "run", 0, true), Some(6));
+        assert_eq!(find_match("runtime; run", "run", 0, true), Some(9));
+    }
+
+    #[test]
+    fn scanning_survives_a_non_ascii_line() {
+        // Advancing byte-by-byte past a false match would land mid-character
+        // and end the scan early — or panic on the slice.
+        // Byte offsets, not char offsets: the em dash is 3 bytes and é is 2, so
+        // the standalone `run` starts at 18 rather than at its 16th character.
+        assert_eq!(find_match("runtime — café run", "run", 0, true), Some(18));
+        assert_eq!(find_match("ñruna ñ run", "run", 0, true), Some(10));
+        assert_eq!(find_match("ñrunañ", "run", 0, true), None);
+    }
+
+    #[test]
+    fn honours_the_start_offset_and_empty_needle() {
+        assert_eq!(find_match("run run", "run", 1, true), Some(4));
+        assert_eq!(find_match("run", "", 0, true), None);
+        assert_eq!(find_match("run", "run", 99, true), None);
+    }
+}

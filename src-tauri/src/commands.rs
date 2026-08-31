@@ -4633,16 +4633,87 @@ pub async fn list_workspace_files(workspace_path: String) -> AppResult<Vec<Strin
     Ok(result)
 }
 
+/// Is this byte part of an identifier, for whole-word matching?
+///
+/// ASCII on purpose: the frontend's own word scan (`wordOccurrences` in
+/// `components/editor/symbolIndex.ts`) uses `[A-Za-z0-9_$]`, and a boundary
+/// rule that disagreed with it would let go-to-definition rank a hit the
+/// editor then refuses to recognise as the same symbol.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// First occurrence of `needle` in `haystack` at or after `from`, honouring
+/// identifier boundaries when `whole_word` is set.
+///
+/// Substring search is right for a human typing into ⌘⇧F, and wrong for
+/// go-to-definition: looking up `run` would spend the result cap on `running`,
+/// `runtime` and `rerun` long before reaching the declaration. So the caller
+/// picks. Note this keeps scanning past a boundary-failing match rather than
+/// giving up on the line — `rerun(run)` has a real match after a false one.
+pub fn find_match(haystack: &str, needle: &str, from: usize, whole_word: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let bytes = haystack.as_bytes();
+    let mut start = from;
+    loop {
+        let rest = haystack.get(start..)?;
+        let at = start + rest.find(needle)?;
+        if !whole_word {
+            return Some(at);
+        }
+        let before_ok = at == 0 || !is_word_byte(bytes[at - 1]);
+        let after = at + needle.len();
+        let after_ok = after >= bytes.len() || !is_word_byte(bytes[after]);
+        if before_ok && after_ok {
+            return Some(at);
+        }
+        // Advance one char, not one byte: `get(start..)` yields None off a
+        // boundary, which would end the scan early on a non-ASCII line.
+        start = at + 1;
+        while start < haystack.len() && !haystack.is_char_boundary(start) {
+            start += 1;
+        }
+        if start >= haystack.len() {
+            return None;
+        }
+    }
+}
+
+/// Widen `[start, end)` outwards to the nearest char boundaries of `s`.
+///
+/// The match column is found in a lowercased copy of the line, whose byte
+/// length can differ from the original, so an index derived from it is not
+/// guaranteed to land on a boundary of the line being sliced for the preview.
+/// Slicing off one panics — this is what keeps a single non-ASCII source line
+/// from taking down the search.
+fn char_boundary_range(s: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut start = start.min(s.len());
+    let mut end = end.clamp(start, s.len());
+    while start > 0 && !s.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < s.len() && !s.is_char_boundary(end) {
+        end += 1;
+    }
+    (start, end)
+}
+
 /// Search every non-ignored text file for `query`. Always literal (not
-/// regex); case-insensitive when `case_sensitive` is false. Skips binary
-/// files (defined as files containing a NUL in the first 8 KiB) and any
-/// file larger than 1 MB. Returns up to 500 hits.
+/// regex); case-insensitive when `case_sensitive` is false, and matching only
+/// on identifier boundaries when `whole_word` is set (go-to-definition asks for
+/// this; the ⌘⇧F palette does not). Skips binary files (defined as files
+/// containing a NUL in the first 8 KiB) and any file larger than 1 MB. Returns
+/// up to 500 hits.
 #[tauri::command]
 pub async fn search_workspace_text(
     workspace_path: String,
     query: String,
     case_sensitive: bool,
+    whole_word: Option<bool>,
 ) -> AppResult<Vec<SearchHit>> {
+    let whole_word = whole_word.unwrap_or(false);
     let workspace_path = expand_tilde(&workspace_path);
     let base = std::path::PathBuf::from(&workspace_path);
     if !base.is_dir() {
@@ -4709,11 +4780,14 @@ pub async fn search_workspace_text(
                 } else {
                     line.to_lowercase()
                 };
-                if let Some(col) = haystack.find(&needle_owned) {
+                if let Some(col) = find_match(&haystack, &needle_owned, 0, whole_word) {
                     // Trim very long lines for transport.
                     let preview = if line.len() > PREVIEW_LEN_CAP {
-                        let start = col.saturating_sub(40);
-                        let end = (col + needle_owned.len() + 60).min(line.len());
+                        let (start, end) = char_boundary_range(
+                            line,
+                            col.saturating_sub(40),
+                            col + needle_owned.len() + 60,
+                        );
                         let snippet = &line[start..end];
                         if start > 0 {
                             format!("…{snippet}")
