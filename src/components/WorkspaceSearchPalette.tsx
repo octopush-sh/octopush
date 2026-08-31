@@ -29,8 +29,10 @@ interface Props {
   open: boolean;
   onClose: () => void;
   /** Called when the user selects a result. The path is relative to the
-   *  workspace root; the parent typically routes through Review → Editor. */
-  onOpenFile: (relativePath: string) => void;
+   *  workspace root; the parent typically routes through Review → Editor.
+   *  `line` (1-based) is set for text hits, so the editor opens ON the match
+   *  rather than at the top of the file — the whole point of picking a hit. */
+  onOpenFile: (relativePath: string, line?: number) => void;
 }
 
 export function WorkspaceSearchPalette({
@@ -204,7 +206,7 @@ export function WorkspaceSearchPalette({
                 }
                 onSelect={(hit) => {
                   onClose();
-                  onOpenFile(hit.file);
+                  onOpenFile(hit.file, hit.line);
                 }}
               />
             )}

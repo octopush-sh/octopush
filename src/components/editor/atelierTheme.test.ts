@@ -27,6 +27,10 @@ const TOKENS: EditorTokens = {
   matchInk: "#fefefe",
   matchCurrent: "#010203",
   matchCurrentInk: "#040506",
+  symbol: "rgba(7,8,9,0.1)",
+  symbolDef: "rgba(10,11,12,0.1)",
+  symbolDefRing: "rgba(10,11,12,0.5)",
+  symbolLink: "#0a0b0c",
 };
 
 describe("atelierTheme", () => {

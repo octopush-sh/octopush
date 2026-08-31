@@ -126,6 +126,28 @@
   --octo-match-current:     #d4a574;
   --octo-match-current-ink: #0c0a08;
 
+  /* ── Symbol-occurrence tokens (caret resting on an identifier) ──────
+     The ambient sibling of the find-match tokens above, and deliberately
+     much quieter: this layer paints itself every time the caret lands on a
+     word, so it is a neutral wash derived from the theme's TEXT colour, not
+     from the accent — brass appearing that often stops reading as brass.
+     It also leaves the foreground alone: unlike a search hit, the reader is
+     still reading this code, and syntax colour is worth more than a
+     guaranteed contrast step against a 10% wash.
+
+     The definition is the exception worth an accent: at most one occurrence
+     in a file is one, so `--octo-symbol-def*` spends brass on it, and
+     `--octo-symbol-link` underlines the ⌘/Ctrl-hover target.
+
+     Read by components/editor/atelierTheme.ts (CodeMirror's theme() takes
+     plain values and can't read var(--…)); solved per theme in
+     stores/themeStore.ts. The values here are the atelier answer, used as
+     the first-paint fallback. */
+  --octo-symbol:         rgba(244, 236, 219, 0.1);
+  --octo-symbol-def:     rgba(212, 165, 116, 0.1);
+  --octo-symbol-def-ring: rgba(212, 165, 116, 0.5);
+  --octo-symbol-link:    #d4a574;
+
   /* Provider identity dots — decorative, ModelPicker + Direct only. */
   --provider-anthropic: #cc785c;
   --provider-openai:    #74aa9c;

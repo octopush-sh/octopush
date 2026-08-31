@@ -23,6 +23,17 @@ import { searchMatchHighlight } from "./editor/searchHighlight";
 import { blameGutter } from "./editor/blameGutter";
 import { diffGutter } from "./editor/diffGutter";
 import { selectAllOccurrences } from "./editor/multiCursor";
+import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
+import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
+import { findDefinitions } from "./editor/symbolIndex";
+import { DefinitionPicker } from "./editor/DefinitionPicker";
+import {
+  chooseDefinition,
+  rankDefinitionHits,
+  type DefinitionCandidate,
+} from "../lib/definitionSearch";
+import { ipc } from "../lib/ipc";
+import { pushToast } from "./Toasts";
 import { parseDiffForFile } from "../lib/diffParser";
 import { useEditorStore } from "../stores/editorStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
@@ -73,9 +84,10 @@ const fontValue = (p: Prefs) =>
 function buildState(opts: {
   doc: string; lang: string; markers: ReturnType<typeof parseDiffForFile>;
   prefs: Prefs; onSave: () => void; onOpenSearch: () => void;
+  onGoToDefinition: (req: DefinitionRequest, view: EditorView) => void;
   onUpdate: (u: { docChanged: boolean; doc: string; line: number; col: number; selections: number }) => void;
 }) {
-  const { doc, lang, markers, prefs, onSave, onOpenSearch, onUpdate } = opts;
+  const { doc, lang, markers, prefs, onSave, onOpenSearch, onGoToDefinition, onUpdate } = opts;
   return EditorState.create({
     doc,
     extensions: [
@@ -98,6 +110,10 @@ function buildState(opts: {
       // come from our own plugin instead.
       search({ top: true }),
       searchMatchHighlight,
+      // Ambient occurrence highlighting + the ⌘/Ctrl-click gesture. Both are
+      // heuristic (no language server): see editor/symbolIndex.ts.
+      symbolOccurrenceHighlight,
+      symbolNav(onGoToDefinition),
       keymap.of([
         { key: "Mod-s", run: () => { onSave(); return true; } },
         // Our Octopush-native find overlay owns ⌘F. Listed BEFORE searchKeymap
@@ -108,6 +124,7 @@ function buildState(opts: {
         // set. searchHighlight stands down when it does, so nothing double-paints.
         { key: "Mod-f", run: () => { onOpenSearch(); return true; } },
         { key: "Mod-Shift-l", run: selectAllOccurrences },
+        { key: "F12", run: goToDefinitionCommand(onGoToDefinition) },
         { key: "Alt-z", run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },
         { key: "Mod-=", run: () => { useEditorPrefs.getState().bumpFontSize(1); return true; } },
         { key: "Mod--", run: () => { useEditorPrefs.getState().bumpFontSize(-1); return true; } },
@@ -185,6 +202,114 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     setSearchNonce((n) => n + 1);
   }, []);
 
+  // ── Go to definition ────────────────────────────────────────────
+  // Ambiguous cross-file results, and the "still looking" note for the
+  // workspace scan (a literal search over every text file is fast, but not
+  // instant, and a ⌘-click that shows nothing reads as a dead click).
+  const [definitionPicker, setDefinitionPicker] =
+    useState<{ symbol: string; candidates: DefinitionCandidate[] } | null>(null);
+  const [definitionSearching, setDefinitionSearching] = useState<string | null>(null);
+
+  const openFile = useEditorStore((s) => s.openFile);
+
+  const toRelative = useCallback(
+    (path: string) =>
+      path.startsWith(workspacePath + "/") ? path.slice(workspacePath.length + 1) : path,
+    [workspacePath],
+  );
+
+  const openAtLine = useCallback(
+    async (relativePath: string, line: number) => {
+      const absolute = relativePath.startsWith("/")
+        ? relativePath
+        : `${workspacePath}/${relativePath}`;
+      try {
+        await openFile(workspaceId, absolute, undefined, line);
+      } catch (e) {
+        pushToast({ level: "error", title: "Could not open file", body: String(e) });
+        return;
+      }
+      // `openFile` declines an oversized file when no confirm handler is passed,
+      // and it declines silently. EditorPane has no dialog of its own to offer
+      // (the large-file confirm lives in App, above the Review canvas), so say
+      // what happened rather than letting the jump look like a dead click.
+      const opened = useEditorStore
+        .getState()
+        .getFiles(workspaceId)
+        .some((f) => f.path === absolute);
+      if (!opened) {
+        pushToast({
+          level: "info",
+          title: "File too large to open here",
+          body: `${relativePath}:${line} — open it from the file tree to confirm.`,
+        });
+      }
+    },
+    [openFile, workspaceId, workspacePath],
+  );
+
+  /**
+   * Resolve `req` to a declaration, nearest scope first: the open document,
+   * then the workspace. The in-file answer is synchronous and exact enough to
+   * feel instant; the workspace answer goes through the ranking in
+   * `lib/definitionSearch.ts`, which either jumps or asks.
+   */
+  const goToDefinition = useCallback(
+    async (req: DefinitionRequest, view: EditorView) => {
+      const doc = view.state.doc.toString();
+      // Skip the occurrence that was clicked: standing on a use of `foo` must
+      // not "jump" to that same use and look like nothing happened.
+      const inFile = findDefinitions(doc, req.name).filter((d) => d.from !== req.from);
+      if (inFile.length > 0) {
+        const site = inFile[0];
+        view.dispatch({
+          selection: { anchor: site.from, head: site.to },
+          effects: EditorView.scrollIntoView(site.from, { y: "center" }),
+        });
+        view.focus();
+        return;
+      }
+
+      const fromFile = activePath ? toRelative(activePath) : undefined;
+      const fromLine = view.state.doc.lineAt(req.from).number;
+      setDefinitionSearching(req.name);
+      try {
+        const hits = await ipc.searchWorkspaceText(workspacePath, req.name, true);
+        const choice = chooseDefinition(
+          rankDefinitionHits(hits, req.name, { fromFile, fromLine }),
+        );
+        if (choice.kind === "jump") {
+          await openAtLine(choice.candidate.file, choice.candidate.line);
+        } else if (choice.kind === "choose") {
+          setDefinitionPicker({ symbol: req.name, candidates: choice.candidates });
+        } else {
+          pushToast({
+            level: "info",
+            title: "No definition found",
+            body: `Nothing in this workspace declares ${req.name}.`,
+          });
+        }
+      } catch (e) {
+        pushToast({ level: "error", title: "Definition search failed", body: String(e) });
+      } finally {
+        setDefinitionSearching(null);
+      }
+    },
+    [activePath, openAtLine, toRelative, workspacePath],
+  );
+
+  // Cached editor states hold whatever handler they were built with, so the
+  // one handed to CodeMirror has to be stable and read the latest through a
+  // ref — otherwise a tab restored from cache would call a stale closure.
+  const goToDefinitionRef = useRef(goToDefinition);
+  goToDefinitionRef.current = goToDefinition;
+  const requestDefinition = useCallback(
+    (req: DefinitionRequest, view: EditorView) => {
+      void goToDefinitionRef.current(req, view);
+    },
+    [],
+  );
+
   const freshState = (file: { path: string; content: string; lang: string }) => {
     const relPath = file.path.startsWith(workspacePath + "/")
       ? file.path.slice(workspacePath.length + 1) : file.path;
@@ -193,6 +318,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       doc: file.content, lang: file.lang, markers, prefs: prefsRef.current,
       onSave: () => saveActive(workspaceId).catch(console.error),
       onOpenSearch: openSearch,
+      onGoToDefinition: requestDefinition,
       onUpdate: (u) => {
         if (u.docChanged) setContent(workspaceId, file.path, u.doc);
         setPos({ line: u.line, col: u.col, selections: u.selections });
@@ -395,6 +521,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
             onClose={() => setSearchOpen(false)}
           />
         )}
+        {definitionSearching && (
+          <div
+            className="octo-fade-in pointer-events-none absolute bottom-3 right-3 rounded-md px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass"
+            style={{
+              background: "var(--color-octo-panel)",
+              border: "1px solid var(--brass-dim)",
+            }}
+          >
+            Looking for {definitionSearching}…
+          </div>
+        )}
       </div>
       {activeFile?.kind === "text" && (
         <EditorStatusBar
@@ -404,6 +541,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           lang={activeFile.lang}
           diskStale={activeFile.diskStale}
           blameSavedNote={blameEnabled && activeFile.content !== activeFile.savedContent}
+        />
+      )}
+      {definitionPicker && (
+        <DefinitionPicker
+          symbol={definitionPicker.symbol}
+          candidates={definitionPicker.candidates}
+          onPick={(c) => {
+            setDefinitionPicker(null);
+            void openAtLine(c.file, c.line);
+          }}
+          onClose={() => setDefinitionPicker(null)}
         />
       )}
       {conflict && (

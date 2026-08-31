@@ -42,6 +42,11 @@ const FALLBACK = {
   matchInk:        "#f4ecdb",
   matchCurrent:    "#d4a574",
   matchCurrentInk: "#0c0a08",
+  // Symbol-occurrence tokens — see the block comment in styles.css.
+  symbol:        "rgba(244, 236, 219, 0.10)",
+  symbolDef:     "rgba(212, 165, 116, 0.10)",
+  symbolDefRing: "rgba(212, 165, 116, 0.5)",
+  symbolLink:    "#d4a574",
 } as const;
 
 export interface EditorTokens {
@@ -68,6 +73,16 @@ export interface EditorTokens {
   matchCurrent: string;
   /** Foreground on top of `matchCurrent` (the theme's own background). */
   matchCurrentInk: string;
+  /** Neutral wash behind every occurrence of the symbol under the caret.
+   *  Deliberately NOT brass: it appears constantly, and an accent that common
+   *  stops reading as an accent. */
+  symbol: string;
+  /** Wash behind the occurrence that is the symbol's definition. */
+  symbolDef: string;
+  /** Underline that separates the definition from a plain occurrence. */
+  symbolDefRing: string;
+  /** Underline on the identifier under the pointer while ⌘/Ctrl is held. */
+  symbolLink: string;
 }
 
 /** Read one CSS custom property off :root, falling back when it's empty
@@ -98,6 +113,10 @@ export function resolveEditorTokens(): EditorTokens {
     matchInk:        readVar("--octo-match-ink", FALLBACK.matchInk),
     matchCurrent:    readVar("--octo-match-current", FALLBACK.matchCurrent),
     matchCurrentInk: readVar("--octo-match-current-ink", FALLBACK.matchCurrentInk),
+    symbol:        readVar("--octo-symbol", FALLBACK.symbol),
+    symbolDef:     readVar("--octo-symbol-def", FALLBACK.symbolDef),
+    symbolDefRing: readVar("--octo-symbol-def-ring", FALLBACK.symbolDefRing),
+    symbolLink:    readVar("--octo-symbol-link", FALLBACK.symbolLink),
   };
 }
 
@@ -260,6 +279,29 @@ export function makeEditorThemeSpec(t: EditorTokens): Record<string, Record<stri
     ".cm-searchMatch-selected, .cm-searchMatch-selected span": {
       color: t.matchCurrentInk,
     },
+    // ── Symbol occurrences (caret resting on an identifier) ─────────
+    // Quieter than a search match by design: this layer appears without being
+    // asked for, so it gets a neutral wash and no ring, and does NOT repaint
+    // the foreground — syntax colour is the more useful signal while reading.
+    // The definition is the one occurrence worth an accent, and there is at
+    // most one of it, so brass stays surgical.
+    ".cm-symbolOccurrence": {
+      backgroundColor: t.symbol,
+      borderRadius: "2px",
+    },
+    // Must stay after the rule above: equal specificity, later wins.
+    ".cm-symbolDefinition": {
+      backgroundColor: t.symbolDef,
+      boxShadow: `inset 0 -1px 0 0 ${t.symbolDefRing}`,
+    },
+    // ⌘/Ctrl-hover affordance for go-to-definition.
+    ".cm-symbolLink": {
+      textDecoration: "underline",
+      textDecorationColor: t.symbolLink,
+      textUnderlineOffset: "2px",
+      cursor: "pointer",
+    },
+
     ".cm-panel button[name=close]": {
       color: t.mute,
     },

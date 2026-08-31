@@ -124,6 +124,20 @@ vi.mock("./editor/blameGutter", () => ({ blameGutter: blameGutterMock }));
 vi.mock("./editor/searchHighlight", () => ({
   searchMatchHighlight: { __searchMatchHighlight: true },
 }));
+// Same story for the symbol layer: both build decorations at import time
+// against the real @codemirror/view this file stubs out. Behaviour is covered
+// by symbolIndex.test.ts / definitionSearch.test.ts; the markers let us assert
+// they stay wired into the editor's extensions.
+vi.mock("./editor/symbolHighlight", () => ({
+  symbolOccurrenceHighlight: { __symbolOccurrenceHighlight: true },
+}));
+const { symbolNavMock } = vi.hoisted(() => ({
+  symbolNavMock: vi.fn(() => ({ __symbolNav: true })),
+}));
+vi.mock("./editor/symbolNav", () => ({
+  symbolNav: symbolNavMock,
+  goToDefinitionCommand: vi.fn(() => () => true),
+}));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.
@@ -442,5 +456,19 @@ describe("EditorPane · search highlighting", () => {
     const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
     expect(lastCall).toBeDefined();
     expect(lastCall![0].extensions).toContainEqual({ __searchMatchHighlight: true });
+  });
+});
+
+describe("EditorPane · symbol navigation", () => {
+  it("registers the occurrence highlighter and the ⌘-click plugin", async () => {
+    // Same contract as the search highlighter above: the behaviour is covered
+    // by symbolIndex.test.ts, this guards the wiring nothing else would miss.
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    const create = vi.mocked(EditorState.create);
+    const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
+    expect(lastCall).toBeDefined();
+    expect(lastCall![0].extensions).toContainEqual({ __symbolOccurrenceHighlight: true });
+    expect(lastCall![0].extensions).toContainEqual({ __symbolNav: true });
+    expect(symbolNavMock).toHaveBeenCalledWith(expect.any(Function));
   });
 });

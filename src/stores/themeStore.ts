@@ -233,6 +233,17 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
     root.style.setProperty("--octo-match-ink", t.text);
     root.style.setProperty("--octo-match-current", t.accent);
     root.style.setProperty("--octo-match-current-ink", t.bg);
+
+    // Symbol occurrences ride on the same guard: they mix `text` and `accent`
+    // with `rgba`, so a short hex would slip through as an opaque slab exactly
+    // the way the match tokens would. The wash is a fixed low alpha rather than
+    // a solved one — it must stay BELOW the find-match wash on every theme (it
+    // paints unbidden, and it never repaints the foreground it sits under), so
+    // pinning it low is the requirement, not a compromise.
+    root.style.setProperty("--octo-symbol", rgba(t.text, 0.1));
+    root.style.setProperty("--octo-symbol-def", rgba(t.accent, 0.1));
+    root.style.setProperty("--octo-symbol-def-ring", rgba(t.accent, 0.5));
+    root.style.setProperty("--octo-symbol-link", t.accent);
   } else {
     for (const token of [
       "--octo-match",
@@ -240,6 +251,10 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
       "--octo-match-ink",
       "--octo-match-current",
       "--octo-match-current-ink",
+      "--octo-symbol",
+      "--octo-symbol-def",
+      "--octo-symbol-def-ring",
+      "--octo-symbol-link",
     ]) {
       root.style.removeProperty(token);
     }
