@@ -376,10 +376,10 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         } else if (choice.kind === "choose") {
           setDefinitionPicker({ symbol: req.name, candidates: choice.candidates });
         } else if (searchSaturated(hits)) {
-          // The scan is a substring match that stops at its own ceiling, so for
-          // a short or common name the cap can fill with noise before reaching
-          // the declaration. Saying "nothing declares it" here would be a claim
-          // the search never actually made.
+          // The scan stops at its own ceiling, and even whole-word a genuinely
+          // common symbol (`id`, `value`) can fill it with real uses before
+          // reaching the declaration. Saying "nothing declares it" here would be
+          // a claim the search never actually made.
           pushToast({
             level: "info",
             title: "Too many matches to narrow",

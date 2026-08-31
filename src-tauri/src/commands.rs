@@ -4800,7 +4800,16 @@ pub async fn search_workspace_text(
                     hits.push(SearchHit {
                         file: rel.clone(),
                         line: (idx as u32) + 1,
-                        col: (col as u32) + 1,
+                        // A CHARACTER column, not a byte one: `col` indexes
+                        // `haystack`, which on the case-insensitive path is a
+                        // lowercased copy whose byte length can differ from the
+                        // line. Shipping the byte offset would put any consumer
+                        // that placed a cursor from it mid-line on the first
+                        // accented source line. (Residual: a character whose
+                        // lowercase form is a different NUMBER of characters —
+                        // `İ` → `i̇` — still shifts this by one; no consumer
+                        // reads `col` today, and `line` is what navigation uses.)
+                        col: (haystack[..col].chars().count() as u32) + 1,
                         preview,
                     });
                     if hits.len() >= SEARCH_RESULT_CAP {

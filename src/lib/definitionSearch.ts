@@ -3,11 +3,12 @@
  * ⌘⇧F palette already uses.
  *
  * When a symbol isn't declared in the open file, the only index Octopush has
- * is `search_workspace_text` — a literal, case-insensitive line scan. That
- * returns every mention of the name, so the work here is turning mentions into
- * candidates: keep the lines that read as a *definition* (same heuristic the
- * in-file jump uses, so the two agree), then rank what survives by how likely
- * it is to be the one the reader meant.
+ * is `search_workspace_text` — a literal line scan, asked here for a
+ * case-SENSITIVE, WHOLE-WORD match (`Parse` is not `parse`, and `run` is not
+ * `rerun`). That still returns every *mention* of the name, so the work here is
+ * turning mentions into candidates: keep the lines that read as a *definition*
+ * (same heuristic the in-file jump uses, so the two agree), then rank what
+ * survives by how likely it is to be the one the reader meant.
  *
  * The ranking is honest about its own uncertainty. `chooseDefinition` only
  * jumps straight to a candidate when it beats the runner-up by a full
@@ -47,12 +48,13 @@ const DEFAULT_LIMIT = 25;
  * The backend's own hit ceiling, mirrored from `SEARCH_RESULT_CAP` in
  * `src-tauri/src/commands.rs` (a drift test keeps the two honest).
  *
- * It matters here because the search is a SUBSTRING scan: for a short or common
- * name (`run`, `id`, `Props`) the 500 slots can fill with noise — `running`,
- * `runtime`, `rerun` — that the definition filter then discards, leaving zero
- * candidates even though the declaration exists somewhere past the cap. A
- * saturated result is therefore "couldn't narrow it down", not "doesn't exist",
- * and the two must not be reported the same way.
+ * The whole-word flag removed the worst of the pressure on it — the cap used to
+ * fill with `running`/`runtime`/`rerun` long before reaching `fn run` — but the
+ * cap still binds for a genuinely common whole-word symbol (`id`, `value`,
+ * `Props`), where the 500 slots fill with real uses that the definition filter
+ * then discards, leaving zero candidates even though the declaration exists
+ * somewhere past the cap. A saturated result is therefore "couldn't narrow it
+ * down", not "doesn't exist", and the two must not be reported the same way.
  */
 export const SEARCH_RESULT_CAP = 500;
 
