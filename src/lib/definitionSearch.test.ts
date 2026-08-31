@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   chooseDefinition,
+  searchSaturated,
+  SEARCH_RESULT_CAP,
   extensionOf,
   isTestPath,
   isVendorPath,
@@ -8,6 +10,8 @@ import {
   type DefinitionCandidate,
 } from "./definitionSearch";
 import type { SearchHit } from "./types";
+// `?raw` keeps this on the frontend module graph, like themePalette.drift.test.
+import commandsRs from "../../src-tauri/src/commands.rs?raw";
 
 const hit = (file: string, line: number, preview: string): SearchHit => ({
   file,
@@ -136,5 +140,28 @@ describe("chooseDefinition", () => {
       kind: "choose",
       candidates: [c("a.ts", 112), c("b.ts", 100)],
     });
+  });
+});
+
+describe("search saturation", () => {
+  it("mirrors the backend's own hit ceiling", () => {
+    // A silent desync here is nasty and quiet: the frontend would keep
+    // promising "nothing declares X" for results the backend had truncated.
+    const m = commandsRs.match(/const SEARCH_RESULT_CAP: usize = (\d+);/);
+    expect(m, "SEARCH_RESULT_CAP must exist in commands.rs").not.toBeNull();
+    expect(Number(m![1])).toBe(SEARCH_RESULT_CAP);
+  });
+
+  it("treats a full result set as inconclusive, not as an absence", () => {
+    const hit = (i: number): SearchHit => ({
+      file: `src/f${i}.ts`,
+      line: 1,
+      col: 1,
+      preview: "  rerun(x);",
+    });
+    expect(searchSaturated([hit(1)])).toBe(false);
+    expect(
+      searchSaturated(Array.from({ length: SEARCH_RESULT_CAP }, (_, i) => hit(i))),
+    ).toBe(true);
   });
 });

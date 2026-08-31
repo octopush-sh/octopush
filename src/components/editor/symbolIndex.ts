@@ -164,6 +164,37 @@ export const NON_SYMBOL_WORDS = new Set([
   "usize", "isize", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64",
 ]);
 
+/**
+ * Is this a name worth painting the ambient occurrence wash for?
+ *
+ * The AMBIENT layer only — deliberately not the ⌘-click gate. Over-blocking is
+ * free here (a keyword simply goes unwashed) and expensive there: every attempt
+ * to reuse this pool for navigation silently killed the jump for ordinary
+ * identifiers named `use`, `get`, `type` or `record`. Navigation screens on the
+ * far narrower `NEVER_DEFINED_WORDS` instead.
+ */
+export function isNavigableSymbol(name: string): boolean {
+  return isIdentifier(name) && !NON_SYMBOL_WORDS.has(name);
+}
+
+/**
+ * Statement heads that take a parenthesised condition and a block — the only
+ * words the `signature` tier below can still mistake for a declaration once the
+ * balanced-parenthesis rule has done its work (`if (ready) {` is shaped exactly
+ * like `render(props) {`).
+ *
+ * Kept as small as it can possibly be, and applied only AFTER the `declaration`
+ * tier, because every wider version of this list has cost real behaviour:
+ * `NON_SYMBOL_WORDS` (the ambient-noise pool, where over-blocking is free) also
+ * killed `use`, `get`, `type` and `record`; adding `new`/`delete` killed
+ * `pub fn new(…)` and `delete(id) {`. A word here is refused as a SIGNATURE
+ * name only — `fn new` still resolves through the declaring keyword in front
+ * of it.
+ */
+export const NEVER_DEFINED_WORDS = new Set([
+  "if", "elif", "else", "for", "while", "do", "switch", "case", "catch", "except",
+]);
+
 /** Control keywords that can precede a `(` — the reason `if (ok) {` must not
  *  read as a definition of `ok`. */
 const CONTROL_BEFORE_PAREN = new Set([
@@ -220,6 +251,42 @@ export function isSignaturePrefix(prefix: string): boolean {
 }
 
 /**
+ * Does `suffix` open a parameter list that CLOSES on this line, followed by
+ * nothing but a return type before the body opens?
+ *
+ * This is what separates a declaration from a call that happens to end in a
+ * brace. `render(props) {` closes its parentheses and then opens a body;
+ * `defineConfig({`, `describe("suite", {` and `register(name, {` never close
+ * theirs — the brace belongs to an argument. Testing only for "a `(` after the
+ * name and a `{` at the end of the line" read all three as declarations, which
+ * is how ⌘-click came to answer "declared here" for a plain call.
+ */
+export function isParameterList(suffix: string): boolean {
+  // An optional generic parameter list may sit between the name and the parens.
+  const open = suffix.replace(/^\s*(<[^<>]*>)?\s*/, "");
+  if (!open.startsWith("(")) return false;
+  const offset = suffix.length - open.length;
+
+  let depth = 0;
+  let close = -1;
+  for (let i = 0; i < open.length; i++) {
+    const ch = open[i];
+    if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0) {
+      close = offset + i;
+      break;
+    }
+  }
+  if (close === -1) return false; // never closes on this line → an argument list
+
+  // Between `)` and the body opener: a return type, a throws clause, a Rust
+  // `-> T`, a Python `-> T:` — but no second call, no assignment, no literal.
+  const tail = suffix.slice(close + 1).replace(/<[^<>]*>/g, "").trim();
+  if (!/[{:]$/.test(tail)) return false;
+  return !/[()=,;"'`]/.test(tail);
+}
+
+/**
  * Score the identifier that starts at `index` on the single line `line`.
  * Returns 0 when the line does not read as a definition of it.
  */
@@ -240,17 +307,24 @@ export function scoreDefinitionAt(line: string, index: number, name: string): nu
   // 1 — a declaring keyword immediately in front.
   if (DECLARING_KEYWORDS.has(trailingWord(prefix))) return DEFINITION_SCORE.declaration;
 
-  // 2 — a signature that opens a body. The `=>` veto is what stops a callback
-  // (`describe("x", () => {`) from reading as a definition of `describe`.
-  const opensBody = /[{:]$/.test(trimmedLine);
-  const paramList = /^\s*(<[^<>]*>)?\s*\(/.test(suffix);
-  if (opensBody && paramList && !trimmedLine.includes("=>") && isSignaturePrefix(prefix)) {
+  // 2 — a signature that opens a body. Checked AFTER the declaration tier, so a
+  // statement head is only ever refused here, never in front of a declaring
+  // keyword (`pub fn new(…)` must still resolve).
+  if (
+    !NEVER_DEFINED_WORDS.has(name) &&
+    /[{:]$/.test(trimmedLine) &&
+    !trimmedLine.includes("=>") &&
+    isSignaturePrefix(prefix) &&
+    isParameterList(suffix)
+  ) {
     return DEFINITION_SCORE.signature;
   }
 
   // 3 — a bare binding: `foo = …` / `foo := …`, never `foo == …` or `foo => …`.
   const assigns = /^\s*:?=(?![=>])/.test(suffix);
-  if (assigns && isSignaturePrefix(prefix)) return DEFINITION_SCORE.assignment;
+  if (assigns && !NEVER_DEFINED_WORDS.has(name) && isSignaturePrefix(prefix)) {
+    return DEFINITION_SCORE.assignment;
+  }
 
   return 0;
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFINITION_SCORE,
+  isNavigableSymbol,
   findDefinitions,
   identifierAt,
   identifierNear,
@@ -8,6 +9,7 @@ import {
   isSignaturePrefix,
   scoreDefinitionAt,
   scoreDefinitionLine,
+  isParameterList,
   wordOccurrences,
   NON_SYMBOL_WORDS,
 } from "./symbolIndex";
@@ -243,6 +245,124 @@ describe("findDefinitions", () => {
 
   it("returns nothing for a non-identifier", () => {
     expect(findDefinitions(doc, "not an identifier")).toEqual([]);
+  });
+});
+
+describe("keywords are never definitions of themselves", () => {
+  // The `signature` tier reads "name, parameter list, line opens a body" — which
+  // `if (ready) {` matches exactly. Scoring it 70 meant ⌘-click on `if` jumped
+  // to another `if`, or escalated to a workspace-wide search for the word.
+  const keywordLines: [string, string][] = [
+    ["if (ready) {", "if"],
+    ["for (const x of xs) {", "for"],
+    ["while (next()) {", "while"],
+    ["switch (kind) {", "switch"],
+    ["catch (e) {", "catch"],
+  ];
+  for (const [line, name] of keywordLines) {
+    it(`scores \`${name}\` on "${line}" as nothing`, () => {
+      expect(scoreDefinitionAt(line, line.indexOf(name), name)).toBe(0);
+      expect(scoreDefinitionLine(line, name)).toBe(0);
+    });
+  }
+});
+
+describe("a call that ends in a brace is not a declaration", () => {
+  // The `signature` tier used to test only for "a `(` after the name and a `{`
+  // at the end of the line", which every one of these matches — so ⌘-click
+  // answered "already at the definition" for a plain call and never searched.
+  const calls: [string, string][] = [
+    ["export default defineConfig({", "defineConfig"],
+    ['describe("suite", {', "describe"],
+    ["register(name, {", "register"],
+    ["  app.use(cors({", "use"],
+  ];
+  for (const [line, name] of calls) {
+    it(`refuses "${line.trim()}"`, () => {
+      expect(scoreDefinitionAt(line, line.indexOf(name), name)).toBe(0);
+    });
+  }
+
+  const declarations: [string, string][] = [
+    ["  render(props) {", "render"],
+    ["  public static void main(String[] args) {", "main"],
+    ["func (r *Repo) Save(x int) error {", "Save"],
+    ["  def parse(self, input):", "parse"],
+    ["fn build(&self) -> Result<Widget, Error> {", "build"],
+  ];
+  for (const [line, name] of declarations) {
+    it(`still accepts "${line.trim()}"`, () => {
+      expect(scoreDefinitionAt(line, line.indexOf(name), name)).toBeGreaterThan(0);
+    });
+  }
+});
+
+describe("isParameterList", () => {
+  it("requires the parentheses to close before the body opens", () => {
+    expect(isParameterList("(props) {")).toBe(true);
+    expect(isParameterList("(a, b) -> Result<T, E> {")).toBe(true);
+    expect(isParameterList("(self, input):")).toBe(true);
+    expect(isParameterList("<T>(value: T) {")).toBe(true);
+    expect(isParameterList("({")).toBe(false);
+    expect(isParameterList('("suite", {')).toBe(false);
+    expect(isParameterList("(x);")).toBe(false);
+    expect(isParameterList(" = 5")).toBe(false);
+  });
+});
+
+describe("statement heads are refused, but only as signature names", () => {
+  it("refuses a condition that is shaped like a signature", () => {
+    for (const [line, name] of [
+      ["if (ready) {", "if"],
+      ["for (const x of xs) {", "for"],
+      ["while (next()) {", "while"],
+      ["switch (kind) {", "switch"],
+      ["catch (e) {", "catch"],
+    ] as [string, string][]) {
+      expect(scoreDefinitionAt(line, line.indexOf(name), name)).toBe(0);
+    }
+  });
+
+  it("still resolves a declaring keyword in front of one", () => {
+    // The regression a wider list caused: `new` and `delete` are ordinary
+    // method names, and `fn new` is the single most common one in Rust.
+    const rust = "    pub fn new(path: PathBuf) -> Self {";
+    expect(scoreDefinitionAt(rust, rust.indexOf("new"), "new")).toBe(
+      DEFINITION_SCORE.declaration,
+    );
+    const js = "  delete(id) {";
+    expect(scoreDefinitionAt(js, js.indexOf("delete"), "delete")).toBe(
+      DEFINITION_SCORE.signature,
+    );
+  });
+});
+
+describe("ordinary identifiers that happen to be pooled keywords", () => {
+  // The guard above must be the NARROW control set. Using the broad
+  // `NON_SYMBOL_WORDS` pool here silently killed the in-file jump for names
+  // like these, which are entirely ordinary in real code.
+  const ordinary: [string, string][] = [
+    ["export function use(hook) {", "use"],
+    ["  get(key) {", "get"],
+    ["const type = kind();", "type"],
+    ["let record = {};", "record"],
+    ["def match(self, x):", "match"],
+  ];
+  for (const [line, name] of ordinary) {
+    it(`still scores \`${name}\` on "${line.trim()}"`, () => {
+      expect(scoreDefinitionAt(line, line.indexOf(name), name)).toBeGreaterThan(0);
+      expect(findDefinitions(line, name)).toHaveLength(1);
+    });
+  }
+});
+
+describe("isNavigableSymbol", () => {
+  it("is the one gate both the highlighter and ⌘-click go through", () => {
+    expect(isNavigableSymbol("parse")).toBe(true);
+    expect(isNavigableSymbol("if")).toBe(false);
+    expect(isNavigableSymbol("return")).toBe(false);
+    expect(isNavigableSymbol("1foo")).toBe(false);
+    expect(isNavigableSymbol("")).toBe(false);
   });
 });
 

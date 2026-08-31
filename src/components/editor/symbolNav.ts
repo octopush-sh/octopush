@@ -43,6 +43,73 @@ export interface DefinitionRequest {
 
 const LINK = Decoration.mark({ class: "cm-symbolLink" });
 
+/** The slice of EditorView this module needs, so the pointer maths can be
+ *  tested against a stub instead of a laid-out browser. */
+export interface PointerTarget {
+  posAtCoords(coords: { x: number; y: number }): number | null;
+  coordsAtPos(pos: number): Rect | null;
+  state: { sliceDoc(from: number, to: number): string; doc: { length: number } };
+}
+
+interface Rect {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+/** How far outside an identifier's own box a click still counts, in px. */
+const EDGE_SLOP = 2;
+
+/**
+ * The identifier the pointer is actually over, or null.
+ *
+ * `posAtCoords` answers with the nearest text position, which is not the same
+ * question: clicking the empty space to the right of a line returns that line's
+ * end, and the caret-adjacency rule then resolves the line's LAST identifier.
+ * The same happens BELOW the text — `.cm-content` is at least as tall as its
+ * scroller, so any y past the last line answers `doc.length`. So the position is
+ * checked against the identifier's own box on BOTH axes before it counts;
+ * without the vertical half, clicking empty space under the document still
+ * navigated whenever the pointer's column happened to overlap the last
+ * identifier's.
+ */
+export function resolvePointerTarget(
+  view: PointerTarget,
+  coords: { x: number; y: number },
+): DefinitionRequest | null {
+  const pos = view.posAtCoords(coords);
+  if (pos == null) return null;
+  const hit = identifierNear(
+    (from, to) => view.state.sliceDoc(from, to),
+    view.state.doc.length,
+    pos,
+  );
+  if (!hit) return null;
+
+  // No layout to check against (jsdom, or a position CodeMirror can't measure):
+  // trust the position rather than refusing to navigate at all.
+  const start = view.coordsAtPos(hit.from);
+  const end = view.coordsAtPos(hit.to);
+
+  // Vertical: an identifier can wrap across visual lines, so the band runs from
+  // the top of its first box to the bottom of its last.
+  const top = Math.min(start?.top ?? Infinity, end?.top ?? Infinity);
+  const bottom = Math.max(start?.bottom ?? -Infinity, end?.bottom ?? -Infinity);
+  if (Number.isFinite(top) && coords.y < top - EDGE_SLOP) return null;
+  if (Number.isFinite(bottom) && coords.y > bottom + EDGE_SLOP) return null;
+
+  // Horizontal: only meaningful while both ends sit on ONE visual line. A
+  // wrapped identifier's first glyph is at the right of one line and its last
+  // at the left of the next, so [left, right] is not an interval at all there —
+  // testing it anyway refused both halves. The vertical band still bounds it.
+  if (start && end && start.top === end.top) {
+    if (coords.x < start.left - EDGE_SLOP) return null;
+    if (coords.x > end.right + EDGE_SLOP) return null;
+  }
+  return hit;
+}
+
 /** macOS uses ⌘ where every other platform uses Ctrl. Guarded for jsdom and
  *  for the pre-hydration window where `navigator` may be absent. */
 function isMac(): boolean {
@@ -102,6 +169,17 @@ export function symbolNav(
         window.addEventListener("blur", this.onBlur);
       }
 
+      update(update: { docChanged: boolean }) {
+        // `hovered` is a pair of absolute offsets, and the pointer hasn't moved
+        // — but the text under it has. Undo or a cut with the modifier still
+        // held would otherwise leave the underline stranded over unrelated (or
+        // past-the-end) text until the next mousemove. Dropping it is honest:
+        // the next pointer move re-establishes it.
+        if (!update.docChanged || !this.hovered) return;
+        this.hovered = null;
+        this.decorations = Decoration.none;
+      }
+
       destroy() {
         window.removeEventListener("keydown", this.onKey);
         window.removeEventListener("keyup", this.onKey);
@@ -138,14 +216,7 @@ export function symbolNav(
       }
 
       identifierAtEvent(e: MouseEvent): DefinitionRequest | null {
-        const pos = this.view.posAtCoords({ x: e.clientX, y: e.clientY });
-        if (pos == null) return null;
-        const { state } = this.view;
-        return identifierNear(
-          (from, to) => state.sliceDoc(from, to),
-          state.doc.length,
-          pos,
-        );
+        return resolvePointerTarget(this.view, { x: e.clientX, y: e.clientY });
       }
 
       request(req: DefinitionRequest) {

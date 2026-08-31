@@ -36,8 +36,8 @@ import {
   findDefinitions,
   identifierNear,
   isIdentifier,
+  isNavigableSymbol,
   wordOccurrences,
-  NON_SYMBOL_WORDS,
   type SymbolRange,
 } from "./symbolIndex";
 
@@ -48,16 +48,40 @@ const DEFINITION = Decoration.mark({ class: "cm-symbolOccurrence cm-symbolDefini
  *  against a very tall viewport over minified source. */
 const MAX_MARKS = 1000;
 
-/** Longest document we will walk for a definition. Past this the whole-doc scan
- *  stops being free on every symbol change, and ⌘-click (which scans on demand,
- *  once) remains the way to find it. */
-const MAX_DEF_SCAN_BYTES = 2_000_000;
+/**
+ * Longest document we will walk for a definition at all.
+ *
+ * The walk is linear over the text — ~3 ms at 128 KB, ~6 ms here, but ~50 ms at
+ * 1.8 MB, which is where an earlier 2 MB ceiling turned typing in a large file
+ * into roughly 20 fps. It has to be a hard ceiling rather than an
+ * "only re-scan small documents on edit" rule, because TYPING an identifier
+ * changes the symbol on every keystroke, and a symbol change always re-scans:
+ * the edit path and the symbol path are the same path in practice.
+ *
+ * Past the ceiling the definition simply isn't marked. Occurrence highlighting
+ * still works, and ⌘-click still finds the definition — it scans on demand,
+ * once, rather than on every keystroke.
+ */
+const MAX_DEF_SCAN_BYTES = 256 * 1024;
+
+/**
+ * Is a find query painting right now?
+ *
+ * Exactly the condition `searchMatchHighlight` paints under, so the two layers
+ * are never on screen together. It has to be watched as its own signal: a
+ * `setSearchQuery` transaction changes neither the doc, the selection nor the
+ * viewport, so a plugin that only wakes for those three would keep painting
+ * under a live query — and, worse, stay dark after the query is cleared.
+ */
+export function searchQueryLive(state: EditorState): boolean {
+  const query = getSearchQuery(state);
+  return !!query.search && query.valid;
+}
 
 /** The symbol the caret is resting on, or null when nothing should highlight. */
 export function symbolUnderCursor(state: EditorState): string | null {
   // A live find query owns the highlight layer — see the header.
-  const query = getSearchQuery(state);
-  if (query.search && query.valid) return null;
+  if (searchQueryLive(state)) return null;
 
   const main = state.selection.main;
   if (state.selection.ranges.length > 1) return null; // multi-caret: no ambient layer
@@ -82,9 +106,7 @@ export function symbolUnderCursor(state: EditorState): string | null {
     }
   }
 
-  if (!name) return null;
-  if (NON_SYMBOL_WORDS.has(name)) return null;
-  return name;
+  return name && isNavigableSymbol(name) ? name : null;
 }
 
 /** Is `pos` in code, rather than inside a comment or a string literal?
@@ -123,6 +145,12 @@ function scanVisible(view: EditorView, name: string): SymbolRange[] {
   return out;
 }
 
+/** Offset of `symbol`'s best definition in the whole document, or null. */
+function scanDefinition(state: EditorState, symbol: string): number | null {
+  if (state.doc.length > MAX_DEF_SCAN_BYTES) return null;
+  return findDefinitions(state.doc.toString(), symbol)[0]?.from ?? null;
+}
+
 function paint(ranges: readonly SymbolRange[], defFrom: number | null): DecorationSet {
   if (!ranges.length) return Decoration.none;
   const builder = new RangeSetBuilder<Decoration>();
@@ -143,29 +171,39 @@ export const symbolOccurrenceHighlight = Prec.lowest(
       private symbol: string | null = null;
       /** Offset of the symbol's best definition, cached per symbol + doc. */
       private defFrom: number | null = null;
+      private queryLive: boolean;
 
       constructor(view: EditorView) {
-        this.decorations = this.compute(view);
+        this.queryLive = searchQueryLive(view.state);
+        this.decorations = this.compute(view, true);
       }
 
       update(update: ViewUpdate) {
-        if (!update.docChanged && !update.selectionSet && !update.viewportChanged) return;
+        // `queryLive` is the fourth signal, and it is not optional: a find
+        // query changes none of the other three.
+        const queryLive = searchQueryLive(update.state);
+        const wake =
+          update.docChanged ||
+          update.selectionSet ||
+          update.viewportChanged ||
+          queryLive !== this.queryLive;
+        this.queryLive = queryLive;
+        if (!wake) return;
         this.decorations = this.compute(update.view, update.docChanged);
       }
 
-      private compute(view: EditorView, docChanged = true): DecorationSet {
+      private compute(view: EditorView, docChanged: boolean): DecorationSet {
         const symbol = symbolUnderCursor(view.state);
         if (!symbol) {
           this.symbol = null;
           this.defFrom = null;
           return Decoration.none;
         }
+        // Re-scan when the symbol changes or the text under it did; a bare
+        // caret move or a scroll repaints from the cached offset.
         if (symbol !== this.symbol || docChanged) {
           this.symbol = symbol;
-          this.defFrom =
-            view.state.doc.length <= MAX_DEF_SCAN_BYTES
-              ? findDefinitions(view.state.doc.toString(), symbol)[0]?.from ?? null
-              : null;
+          this.defFrom = scanDefinition(view.state, symbol);
         }
         return paint(scanVisible(view, symbol), this.defFrom);
       }

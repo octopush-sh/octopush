@@ -43,6 +43,24 @@ const DECISIVE_GAP = 30;
 
 const DEFAULT_LIMIT = 25;
 
+/**
+ * The backend's own hit ceiling, mirrored from `SEARCH_RESULT_CAP` in
+ * `src-tauri/src/commands.rs` (a drift test keeps the two honest).
+ *
+ * It matters here because the search is a SUBSTRING scan: for a short or common
+ * name (`run`, `id`, `Props`) the 500 slots can fill with noise — `running`,
+ * `runtime`, `rerun` — that the definition filter then discards, leaving zero
+ * candidates even though the declaration exists somewhere past the cap. A
+ * saturated result is therefore "couldn't narrow it down", not "doesn't exist",
+ * and the two must not be reported the same way.
+ */
+export const SEARCH_RESULT_CAP = 500;
+
+/** Did the backend stop at its ceiling, making an empty result inconclusive? */
+export function searchSaturated(hits: readonly SearchHit[]): boolean {
+  return hits.length >= SEARCH_RESULT_CAP;
+}
+
 export function extensionOf(path: string): string {
   const base = path.slice(path.lastIndexOf("/") + 1);
   const dot = base.lastIndexOf(".");

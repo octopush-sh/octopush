@@ -25,11 +25,12 @@ import { diffGutter } from "./editor/diffGutter";
 import { selectAllOccurrences } from "./editor/multiCursor";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
-import { findDefinitions } from "./editor/symbolIndex";
+import { findDefinitions, DEFINITION_SCORE, NEVER_DEFINED_WORDS } from "./editor/symbolIndex";
 import { DefinitionPicker } from "./editor/DefinitionPicker";
 import {
   chooseDefinition,
   rankDefinitionHits,
+  searchSaturated,
   type DefinitionCandidate,
 } from "../lib/definitionSearch";
 import { ipc } from "../lib/ipc";
@@ -74,6 +75,20 @@ const themeComp = new Compartment();
 
 interface Prefs { wrap: boolean; fontSize: number; tabWidth: number; lineNumbers: boolean; }
 
+/** How often to re-check whether a held reveal can land, and how long to hold
+ *  it before dropping it. See the polling effect for why this isn't an
+ *  observer. */
+const REVEAL_POLL_MS = 120;
+const REVEAL_HOLD_MS = 10_000;
+
+/** Is the editor column actually on screen? False only when something has
+ *  deliberately hidden it (reading mode collapses it rather than unmounting).
+ *  Environments with no layout engine report "visible" — see the reveal effect. */
+function isHostVisible(host: HTMLElement | null): boolean {
+  if (!host || typeof host.checkVisibility !== "function") return true;
+  return host.checkVisibility({ visibilityProperty: true });
+}
+
 const wrapValue = (p: Prefs) => (p.wrap ? EditorView.lineWrapping : []);
 const lineNumValue = (p: Prefs) =>
   p.lineNumbers ? [lineNumbers(), foldGutter(), highlightActiveLineGutter()] : [];
@@ -85,7 +100,7 @@ function buildState(opts: {
   doc: string; lang: string; markers: ReturnType<typeof parseDiffForFile>;
   prefs: Prefs; onSave: () => void; onOpenSearch: () => void;
   onGoToDefinition: (req: DefinitionRequest, view: EditorView) => void;
-  onUpdate: (u: { docChanged: boolean; doc: string; line: number; col: number; selections: number }) => void;
+  onUpdate: (u: { doc: string | null; line: number; col: number; selections: number }) => void;
 }) {
   const { doc, lang, markers, prefs, onSave, onOpenSearch, onGoToDefinition, onUpdate } = opts;
   return EditorState.create({
@@ -140,8 +155,11 @@ function buildState(opts: {
         const head = update.state.selection.main.head;
         const lineObj = update.state.doc.lineAt(head);
         onUpdate({
-          docChanged: update.docChanged,
-          doc: update.state.doc.toString(),
+          // Serialising the whole document costs the same as the edit that
+          // caused it, and this listener runs on EVERY update — every cursor
+          // move, and every transaction the ⌘-hover plugin dispatches to
+          // repaint its underline. Only an actual edit needs the text.
+          doc: update.docChanged ? update.state.doc.toString() : null,
           line: lineObj.number,
           col: head - lineObj.from + 1,
           selections: update.state.selection.ranges.length,
@@ -193,6 +211,34 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
 
   const [pos, setPos] = useState({ line: 1, col: 1, selections: 1 });
 
+  // Re-runs the reveal effect while a reveal is being held for a hidden column.
+  //
+  // A ResizeObserver is not enough: `ModeOverlay` hides the whole Review canvas
+  // with `visibility: hidden` at UNCHANGED width, so nothing resizes and the
+  // held reveal would never be released — it would instead ambush the reader
+  // later, when the active path next cycled. Polling covers every way the
+  // column can come back, and it only runs while something is actually held.
+  const [hostVisibleTick, setHostVisibleTick] = useState(0);
+  useEffect(() => {
+    if (!pendingReveal) return;
+    // Only a HIDDEN column is worth polling for. A reveal that the effect above
+    // declined for any other reason (the active file is binary, or isn't the
+    // revealed one) would otherwise tick — and re-render the pane — every
+    // 120 ms forever, since the drop below can only fire while hidden.
+    if (isHostVisible(hostRef.current)) return;
+    const started = Date.now();
+    const id = window.setInterval(() => {
+      if (isHostVisible(hostRef.current)) {
+        setHostVisibleTick((n) => n + 1);
+      } else if (Date.now() - started > REVEAL_HOLD_MS) {
+        // Drop it rather than let it fire minutes later into a context the
+        // reader has long left — the same rule the Markdown jump follows.
+        clearPendingReveal(workspaceId);
+      }
+    }, REVEAL_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [pendingReveal, hostVisibleTick, workspaceId, clearPendingReveal]);
+
   // Find/replace overlay. searchNonce is bumped on every ⌘F so an already-open
   // overlay refocuses and selects its query instead of silently no-op'ing.
   const [searchOpen, setSearchOpen] = useState(false);
@@ -209,6 +255,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const [definitionPicker, setDefinitionPicker] =
     useState<{ symbol: string; candidates: DefinitionCandidate[] } | null>(null);
   const [definitionSearching, setDefinitionSearching] = useState<string | null>(null);
+  /** Bumped per request so a superseded workspace scan lands nowhere. */
+  const definitionGenerationRef = useRef(0);
 
   const openFile = useEditorStore((s) => s.openFile);
 
@@ -256,12 +304,24 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
    */
   const goToDefinition = useCallback(
     async (req: DefinitionRequest, view: EditorView) => {
+      // Bumped FIRST, before any branch returns: an in-file jump (or a refusal)
+      // also supersedes a workspace scan still in flight, which would otherwise
+      // land later and drag the reader out of the file they just jumped to.
+      const generation = ++definitionGenerationRef.current;
+      const current = () => generation === definitionGenerationRef.current;
+      // Retire the previous request's chip here rather than in its own
+      // `finally`: a superseded scan's `finally` is guarded by `current()` and
+      // so declines to touch the state, which left the chip on screen forever
+      // whenever the newer request answered without searching.
+      setDefinitionSearching(null);
+
       const doc = view.state.doc.toString();
+      const sites = findDefinitions(doc, req.name);
       // Skip the occurrence that was clicked: standing on a use of `foo` must
       // not "jump" to that same use and look like nothing happened.
-      const inFile = findDefinitions(doc, req.name).filter((d) => d.from !== req.from);
-      if (inFile.length > 0) {
-        const site = inFile[0];
+      const elsewhere = sites.filter((d) => d.from !== req.from);
+      if (elsewhere.length > 0) {
+        const site = elsewhere[0];
         view.dispatch({
           selection: { anchor: site.from, head: site.to },
           effects: EditorView.scrollIntoView(site.from, { y: "center" }),
@@ -270,11 +330,42 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         return;
       }
 
+      // The clicked occurrence IS the declaration and there is no other in this
+      // file. Escalating to a workspace search here would drop the reader into
+      // an unrelated same-named declaration somewhere else — or, worse, report
+      // that nothing declares `parse` while they sit on `function parse`. Only
+      // the two confident tiers short-circuit; a bare `foo = …` binding is weak
+      // enough that the real declaration may well be in another file.
+      const clicked = sites.find((d) => d.from === req.from);
+      if (clicked && clicked.score >= DEFINITION_SCORE.signature) {
+        pushToast({
+          level: "info",
+          title: "Already at the definition",
+          body: `${req.name} is declared here.`,
+        });
+        return;
+      }
+
       const fromFile = activePath ? toRelative(activePath) : undefined;
       const fromLine = view.state.doc.lineAt(req.from).number;
+      // Statement heads stop here rather than at the gesture: escalating `if`
+      // to a workspace-wide literal search is a hunt for a word, not a symbol.
+      // Deliberately the NARROW set — gating this on the ambient-noise pool
+      // silently refused cross-file lookup for `get`, `type`, `use`, `record`
+      // and friends, which are ordinary names.
+      if (NEVER_DEFINED_WORDS.has(req.name)) {
+        pushToast({
+          level: "info",
+          title: "No definition found",
+          body: `Nothing in this file declares ${req.name}.`,
+        });
+        return;
+      }
+
       setDefinitionSearching(req.name);
       try {
         const hits = await ipc.searchWorkspaceText(workspacePath, req.name, true);
+        if (!current()) return;
         const choice = chooseDefinition(
           rankDefinitionHits(hits, req.name, { fromFile, fromLine }),
         );
@@ -282,6 +373,16 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           await openAtLine(choice.candidate.file, choice.candidate.line);
         } else if (choice.kind === "choose") {
           setDefinitionPicker({ symbol: req.name, candidates: choice.candidates });
+        } else if (searchSaturated(hits)) {
+          // The scan is a substring match that stops at its own ceiling, so for
+          // a short or common name the cap can fill with noise before reaching
+          // the declaration. Saying "nothing declares it" here would be a claim
+          // the search never actually made.
+          pushToast({
+            level: "info",
+            title: "Too many matches to narrow",
+            body: `${req.name} appears too often for the search to find its declaration. Try ⌘⇧F.`,
+          });
         } else {
           pushToast({
             level: "info",
@@ -290,9 +391,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           });
         }
       } catch (e) {
-        pushToast({ level: "error", title: "Definition search failed", body: String(e) });
+        if (current()) {
+          pushToast({ level: "error", title: "Definition search failed", body: String(e) });
+        }
       } finally {
-        setDefinitionSearching(null);
+        if (current()) setDefinitionSearching(null);
       }
     },
     [activePath, openAtLine, toRelative, workspacePath],
@@ -320,8 +423,14 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       onOpenSearch: openSearch,
       onGoToDefinition: requestDefinition,
       onUpdate: (u) => {
-        if (u.docChanged) setContent(workspaceId, file.path, u.doc);
-        setPos({ line: u.line, col: u.col, selections: u.selections });
+        if (u.doc !== null) setContent(workspaceId, file.path, u.doc);
+        // Same values → same object, so React bails out instead of re-rendering
+        // the pane for every transaction that left the caret where it was.
+        setPos((prev) =>
+          prev.line === u.line && prev.col === u.col && prev.selections === u.selections
+            ? prev
+            : { line: u.line, col: u.col, selections: u.selections },
+        );
       },
     });
   };
@@ -380,6 +489,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     if (!view || !pendingReveal) return;
     if (!activeFile || activeFile.kind !== "text") return;
     if (activeFile.path !== pendingReveal.path) return;
+    // In Markdown "reading" mode `EditorWithPreview` collapses this column to
+    // `width: 0; visibility: hidden` rather than unmounting it. Scrolling a
+    // zero-width viewport does nothing, and consuming the reveal here would
+    // throw the request away — so hold it instead. `hostVisibleTick` re-runs
+    // this effect the moment the column is laid out again.
+    //
+    // `checkVisibility` rather than a zero-width test on purpose: a width of 0
+    // is also what any environment without layout reports (jsdom included), and
+    // holding every reveal there would be far worse than the bug. Where the API
+    // is missing, treat the column as visible.
+    if (!isHostVisible(hostRef.current)) return;
 
     const doc = view.state.doc;
     const lineNo = Math.max(1, Math.min(pendingReveal.line, doc.lines));
@@ -391,7 +511,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     view.focus?.();
     clearPendingReveal(workspaceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingReveal, activePath, workspaceId]);
+  }, [pendingReveal, activePath, workspaceId, hostVisibleTick]);
 
   // Replace the document when the active buffer was reloaded from disk
   // (version bump): the swap effect only fires on path changes, so an
