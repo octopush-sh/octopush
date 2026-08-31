@@ -2413,7 +2413,9 @@ function App() {
           initialMode={searchMode}
           workspacePath={activeWorkspace.worktreePath || project!.path}
           onClose={() => setShowSearch(false)}
-          onOpenFile={(relativePath) => navigateToFile(relativePath, "editor")}
+          onOpenFile={(relativePath, line) =>
+            navigateToFile(relativePath, "editor", line)
+          }
         />
       )}
 

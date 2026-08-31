@@ -100,6 +100,11 @@ vi.mock("./editor/atelierTheme", () => ({
 vi.mock("./editor/searchHighlight", () => ({
   searchMatchHighlight: { __searchMatchHighlight: true },
 }));
+// Builds decorations at import time against the real @codemirror/view this
+// file stubs out — same reason as searchHighlight above.
+vi.mock("./editor/symbolHighlight", () => ({
+  symbolOccurrenceHighlight: { __symbolOccurrenceHighlight: true },
+}));
 
 // The overlay is only mounted after ⌘F; these tests don't open it.
 vi.mock("./editor/EditorSearch", () => ({

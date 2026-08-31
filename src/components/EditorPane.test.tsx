@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
 // Shared ref so tests can reach the live EditorView mock instance.
 const hoisted = vi.hoisted(() => ({ lastView: null as unknown as { setState: ReturnType<typeof vi.fn> } | null }));
@@ -124,6 +124,33 @@ vi.mock("./editor/blameGutter", () => ({ blameGutter: blameGutterMock }));
 vi.mock("./editor/searchHighlight", () => ({
   searchMatchHighlight: { __searchMatchHighlight: true },
 }));
+// Same story for the symbol layer: both build decorations at import time
+// against the real @codemirror/view this file stubs out. Behaviour is covered
+// by symbolIndex.test.ts / definitionSearch.test.ts; the markers let us assert
+// they stay wired into the editor's extensions.
+const { searchWorkspaceTextMock, pushToastMock, mockOpenFile } = vi.hoisted(() => ({
+  searchWorkspaceTextMock: vi.fn(),
+  pushToastMock: vi.fn(),
+  mockOpenFile: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../lib/ipc", () => ({
+  ipc: { searchWorkspaceText: searchWorkspaceTextMock },
+}));
+vi.mock("./Toasts", () => ({ pushToast: pushToastMock }));
+
+vi.mock("./editor/symbolHighlight", () => ({
+  symbolOccurrenceHighlight: { __symbolOccurrenceHighlight: true },
+}));
+type NavRequest = { name: string; from: number; to: number };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type NavHandler = (req: NavRequest, view: any) => void;
+const { symbolNavMock } = vi.hoisted(() => ({
+  symbolNavMock: vi.fn((_onRequest: unknown) => ({ __symbolNav: true })),
+}));
+vi.mock("./editor/symbolNav", () => ({
+  symbolNav: symbolNavMock,
+  goToDefinitionCommand: vi.fn(() => () => true),
+}));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.
@@ -180,30 +207,33 @@ const mockStore = {
   pendingReveal: null as { path: string; line: number } | null,
 };
 
+const buildEditorState = () => ({
+    getActivePath: (wsId: string) =>
+      wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
+    getFiles: (wsId: string) =>
+      wsId === "ws-active"
+        ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
+        : wsId === "ws-binary"
+        ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048, version: 0, diskStale: false }]
+        : [],
+    setContent: vi.fn(),
+    saveActive: mockSaveActive,
+    closeFile: mockCloseFile,
+    reloadFromDisk: mockReloadFromDisk,
+    checkActiveAgainstDisk: mockCheckActiveAgainstDisk,
+    saveConflict: mockStore.saveConflict,
+    clearSaveConflict: mockClearSaveConflict,
+    getPendingReveal: (wsId: string) =>
+      wsId === "ws-active" ? mockStore.pendingReveal : null,
+    clearPendingReveal: mockClearPendingReveal,
+    openFile: mockOpenFile,
+});
+
 vi.mock("../stores/editorStore", () => ({
-  useEditorStore: vi.fn((selector: (s: unknown) => unknown) => {
-    const state = {
-      getActivePath: (wsId: string) =>
-        wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
-      getFiles: (wsId: string) =>
-        wsId === "ws-active"
-          ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
-          : wsId === "ws-binary"
-          ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048, version: 0, diskStale: false }]
-          : [],
-      setContent: vi.fn(),
-      saveActive: mockSaveActive,
-      closeFile: mockCloseFile,
-      reloadFromDisk: mockReloadFromDisk,
-      checkActiveAgainstDisk: mockCheckActiveAgainstDisk,
-      saveConflict: mockStore.saveConflict,
-      clearSaveConflict: mockClearSaveConflict,
-      getPendingReveal: (wsId: string) =>
-        wsId === "ws-active" ? mockStore.pendingReveal : null,
-      clearPendingReveal: mockClearPendingReveal,
-    };
-    return selector(state);
-  }),
+  useEditorStore: Object.assign(
+    vi.fn((selector: (s: unknown) => unknown) => selector(buildEditorState())),
+    { getState: () => buildEditorState() },
+  ),
 }));
 
 import { EditorState } from "@codemirror/state";
@@ -214,6 +244,8 @@ beforeEach(() => {
   mockSaveActive.mockResolvedValue(undefined);
   mockReloadFromDisk.mockResolvedValue(true);
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
+  mockOpenFile.mockResolvedValue(undefined);
+  searchWorkspaceTextMock.mockResolvedValue([]);
   mockStore.saveConflict = null;
   mockStore.pendingReveal = null;
   mockBlameState.enabled = false;
@@ -383,6 +415,55 @@ describe("EditorPane — open at line (pending reveal)", () => {
     expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active");
   });
 
+  it("releases a held reveal as soon as the column comes back", async () => {
+    const proto = HTMLElement.prototype as unknown as { checkVisibility?: () => boolean };
+    let visible = false;
+    proto.checkVisibility = () => visible;
+    try {
+      mockStore.pendingReveal = { path: "/repo/file.ts", line: 4 };
+      render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+      expect(mockClearPendingReveal).not.toHaveBeenCalled();
+      // ModeOverlay hides the canvas at unchanged width, so nothing resizes —
+      // the hold has to be released by polling, not by an observer.
+      visible = true;
+      await waitFor(() => expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active"));
+    } finally {
+      delete proto.checkVisibility;
+    }
+  });
+
+  it("drops a reveal that stays unlandable, so it can't ambush later", async () => {
+    vi.useFakeTimers();
+    const proto = HTMLElement.prototype as unknown as { checkVisibility?: () => boolean };
+    proto.checkVisibility = () => false;
+    try {
+      mockStore.pendingReveal = { path: "/repo/file.ts", line: 4 };
+      render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(mockClearPendingReveal).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active");
+    } finally {
+      delete proto.checkVisibility;
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds the reveal while the editor column is hidden, instead of spending it", () => {
+    // Markdown "reading" mode collapses this column to zero width rather than
+    // unmounting it. Scrolling a hidden viewport does nothing, so consuming the
+    // reveal there would silently throw a ⌘⇧F hit away.
+    const proto = HTMLElement.prototype as unknown as { checkVisibility?: () => boolean };
+    proto.checkVisibility = () => false;
+    try {
+      mockStore.pendingReveal = { path: "/repo/file.ts", line: 4 };
+      render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+      expect(mockClearPendingReveal).not.toHaveBeenCalled();
+    } finally {
+      delete proto.checkVisibility;
+    }
+  });
+
   it("clamps an out-of-range line to the end of the document", () => {
     mockStore.pendingReveal = { path: "/repo/file.ts", line: 9999 };
     render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
@@ -442,5 +523,226 @@ describe("EditorPane · search highlighting", () => {
     const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
     expect(lastCall).toBeDefined();
     expect(lastCall![0].extensions).toContainEqual({ __searchMatchHighlight: true });
+  });
+});
+
+describe("EditorPane · symbol navigation", () => {
+  it("registers the occurrence highlighter and the ⌘-click plugin", async () => {
+    // Same contract as the search highlighter above: the behaviour is covered
+    // by symbolIndex.test.ts, this guards the wiring nothing else would miss.
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    const create = vi.mocked(EditorState.create);
+    const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
+    expect(lastCall).toBeDefined();
+    expect(lastCall![0].extensions).toContainEqual({ __symbolOccurrenceHighlight: true });
+    expect(lastCall![0].extensions).toContainEqual({ __symbolNav: true });
+    expect(symbolNavMock).toHaveBeenCalledWith(expect.any(Function));
+  });
+});
+
+// ─── Go to definition ─────────────────────────────────────────────
+//
+// `symbolNav` is mocked, so the plugin's own gesture handling is covered in
+// symbolNav.test.ts. What is exercised here is the RESOLUTION handler EditorPane
+// hands it: which of the open document and the workspace gets asked, and in
+// what order.
+
+const NAV_DOC = [
+  "function run(input) {",   // 1
+  "  return parse(input);",  // 2
+  "}",                       // 3
+  "run(1);",                 // 4
+].join("\n");
+
+/** A stand-in for the live EditorView the gesture would pass in. */
+function navView(doc = NAV_DOC) {
+  return {
+    state: {
+      doc: {
+        toString: () => doc,
+        lineAt: (pos: number) => ({ number: doc.slice(0, pos).split("\n").length }),
+      },
+    },
+    dispatch: vi.fn(),
+    focus: vi.fn(),
+  };
+}
+
+/** The handler EditorPane gave to symbolNav, after rendering the pane. */
+function definitionHandler() {
+  render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+  const onRequest = symbolNavMock.mock.calls.at(-1)?.[0] as NavHandler | undefined;
+  expect(onRequest).toBeTypeOf("function");
+  return onRequest!;
+}
+
+const at = (needle: string, doc = NAV_DOC) => {
+  const from = doc.indexOf(needle);
+  return { name: needle.replace(/\W.*$/, ""), from, to: from + needle.length };
+};
+
+describe("EditorPane · go to definition", () => {
+  it("jumps within the open document without touching the workspace", async () => {
+    const onRequest = definitionHandler();
+    const view = navView();
+    // `run` at the call on line 4 — its declaration is line 1.
+    onRequest({ name: "run", from: NAV_DOC.lastIndexOf("run"), to: NAV_DOC.lastIndexOf("run") + 3 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    const spec = view.dispatch.mock.calls[0][0];
+    expect(spec.selection).toEqual({ anchor: NAV_DOC.indexOf("run"), head: NAV_DOC.indexOf("run") + 3 });
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("says so when the reader is already standing on the declaration", async () => {
+    // The regression: the clicked site was filtered out locally AND dropped
+    // from the workspace hits, so ⌘-clicking `function run` threw the reader
+    // into an unrelated `run` in another file — or claimed nothing declared it.
+    const onRequest = definitionHandler();
+    const view = navView();
+    onRequest(at("run(input)"), view);
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Already at the definition" }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+    expect(view.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("falls through to the workspace and opens the single candidate", async () => {
+    searchWorkspaceTextMock.mockResolvedValue([
+      { file: "src/parser.ts", line: 12, col: 17, preview: "export function parse(x) {" },
+    ]);
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() =>
+      expect(mockOpenFile).toHaveBeenCalledWith("ws-active", "/repo/src/parser.ts", undefined, 12),
+    );
+  });
+
+  it("reports when the workspace declares nothing", async () => {
+    searchWorkspaceTextMock.mockResolvedValue([
+      { file: "src/other.ts", line: 3, col: 10, preview: "  return parse(x);" },
+    ]);
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found" }),
+      ),
+    );
+  });
+
+  it("refuses to escalate a statement head to a workspace-wide search", async () => {
+    // `F12` on `if` must not become a literal hunt for the word. The refusal
+    // lives here rather than at the gesture, so ⌘-click still works normally
+    // for identifiers that merely resemble a keyword.
+    const onRequest = definitionHandler();
+    onRequest({ name: "if", from: 0, to: 2 }, navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found" }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("still escalates ordinary names that only look like keywords", async () => {
+    // Gating this on the broad ambient-noise pool silently refused cross-file
+    // lookup for `type`, `get`, `use`, `record` — all perfectly normal names.
+    const onRequest = definitionHandler();
+    onRequest({ name: "type", from: 0, to: 4 }, navView());
+    // Whole-word (the 4th argument): a symbol lookup must not burn the
+    // backend's hit cap on substring noise before reaching the declaration.
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "type", true, true),
+    );
+  });
+
+  it("lets an in-file jump supersede a workspace scan still in flight", async () => {
+    // The generation is bumped for EVERY request, not just the ones that
+    // search: otherwise the earlier scan lands afterwards and yanks the reader
+    // out of the file they just jumped to.
+    let resolveScan: (hits: unknown[]) => void = () => {};
+    searchWorkspaceTextMock.mockImplementationOnce(
+      () => new Promise((r) => { resolveScan = r as typeof resolveScan; }),
+    );
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalled());
+
+    const view = navView();
+    onRequest({ name: "run", from: NAV_DOC.lastIndexOf("run"), to: NAV_DOC.lastIndexOf("run") + 3 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+
+    resolveScan([{ file: "src/parser.ts", line: 12, col: 17, preview: "function parse(x) {" }]);
+    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalledTimes(1));
+    expect(mockOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("retires the chip when a later request answers without searching", async () => {
+    // A superseded scan's own `finally` is generation-guarded and declines to
+    // touch the state, so the newer request has to clear the chip — otherwise
+    // "Looking for …" stays on screen for the rest of the session.
+    let resolveScan: (hits: unknown[]) => void = () => {};
+    searchWorkspaceTextMock.mockImplementationOnce(
+      () => new Promise((r) => { resolveScan = r as typeof resolveScan; }),
+    );
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() => expect(screen.getByText(/Looking for/)).toBeTruthy());
+
+    const view = navView();
+    onRequest({ name: "run", from: NAV_DOC.lastIndexOf("run"), to: NAV_DOC.lastIndexOf("run") + 3 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(screen.queryByText(/Looking for/)).toBeNull();
+
+    resolveScan([]);
+    await waitFor(() => expect(screen.queryByText(/Looking for/)).toBeNull());
+  });
+
+  it("says the search could not narrow down, rather than that nothing declares it", async () => {
+    // A saturated substring scan is "too many matches", not "no such symbol";
+    // reporting the second would be a claim the search never made.
+    searchWorkspaceTextMock.mockResolvedValue(
+      Array.from({ length: 500 }, (_, i) => ({
+        file: `src/f${i}.ts`,
+        line: 1,
+        col: 1,
+        preview: "  rerun(parse);",
+      })),
+    );
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Too many matches to narrow" }),
+      ),
+    );
+  });
+
+  it("lets a second request supersede the first, whichever resolves last", async () => {
+    // Without a generation guard a slow first scan still opens its answer, on
+    // top of the second one's — and its `finally` clears the "Looking for …"
+    // chip while the second search is still running.
+    let resolveFirst: (hits: unknown[]) => void = () => {};
+    searchWorkspaceTextMock
+      .mockImplementationOnce(() => new Promise((r) => { resolveFirst = r as typeof resolveFirst; }))
+      .mockResolvedValueOnce([
+        { file: "src/second.ts", line: 5, col: 1, preview: "function parse(x) {" },
+      ]);
+
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    onRequest(at("parse(input)"), navView());
+
+    await waitFor(() =>
+      expect(mockOpenFile).toHaveBeenCalledWith("ws-active", "/repo/src/second.ts", undefined, 5),
+    );
+
+    // The stale first scan lands afterwards and must change nothing.
+    resolveFirst([{ file: "src/first.ts", line: 99, col: 1, preview: "function parse(x) {" }]);
+    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalledTimes(2));
+    expect(mockOpenFile).toHaveBeenCalledTimes(1);
   });
 });

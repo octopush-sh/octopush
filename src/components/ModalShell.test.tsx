@@ -152,3 +152,27 @@ describe("ModalShell focus management", () => {
     expect(onClose).toHaveBeenCalled();
   });
 });
+
+describe("ModalShell — focus restore must not scroll", () => {
+  it("hands focus back without scrolling the opener into view", () => {
+    // The editor's `.cm-content` is one contenteditable spanning the whole
+    // document, so a plain focus() scrolls it to its top — i.e. closing a
+    // dialog opened from the editor jumped the file back to line 1.
+    const opener = document.createElement("div");
+    opener.tabIndex = 0;
+    document.body.appendChild(opener);
+    opener.focus();
+    const spy = vi.spyOn(opener, "focus");
+
+    const { unmount } = render(
+      <ModalShell onClose={() => {}}>
+        <div>body</div>
+      </ModalShell>,
+    );
+    unmount();
+
+    expect(spy).toHaveBeenCalledWith({ preventScroll: true });
+    spy.mockRestore();
+    opener.remove();
+  });
+});

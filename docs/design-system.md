@@ -178,6 +178,30 @@ Three rules make this work, and they generalise:
 
 Tokens live in `styles.css` (atelier fallbacks) and are written per theme by `themeStore`. They are the only **opaque** colours derived there, so they are the only ones gated on the theme's hex actually parsing — a malformed value would be a solid slab over the content rather than a faint tint.
 
+### Ambient occurrence wash (the symbol under the caret)
+
+The quiet sibling of the found-match wash above, and the rule it teaches is when *not* to reach for the accent. A search hit was asked for; an occurrence highlight paints itself every time the caret lands on a word. A layer that appears unbidden gets a **neutral** wash derived from the theme's text colour, no ring, and no foreground repaint — the reader is still reading this code, and syntax colour is worth more than a guaranteed step against a 10% tint.
+
+```css
+/* every use of the symbol under the caret */
+background: var(--octo-symbol);                       /* text colour @ 10% — neutral */
+border-radius: 2px;
+
+/* the one that is its definition — at most one per file, so brass is earned */
+background: var(--octo-symbol-def);                   /* accent @ 10% */
+box-shadow: inset 0 -1px 0 0 var(--octo-symbol-def-ring);
+
+/* ⌘/Ctrl-hover target for go-to-definition */
+text-decoration: underline var(--octo-symbol-link);   /* accent */
+text-underline-offset: 2px;
+cursor: pointer;
+```
+
+1. **Frequency decides the palette.** Brass is surgical because it is rare. An accent spent on something that fires on every cursor move stops reading as an accent everywhere else in the app. Spend it on the *one* occurrence that is the definition instead.
+2. **Unbidden layers don't repaint text.** The rule above ("a wash must own its foreground") applies to a wash the user asked for. This one is pinned low enough — a fixed 10%, deliberately *not* solved — that the syntax colour underneath survives it intact.
+3. **Two ambient layers never share a screen.** The occurrence highlighter stands down whenever a find query is live, because two washes over the same text read as one broken one.
+
+
 ### Margin marker (a rendered block pointing back at its source)
 
 For any surface where a *derived* view needs to point at the *authored* thing behind it — today the REVIEW Markdown preview naming the source line of the block under the pointer. One marker exists per pane, not one per block: a single absolutely-positioned button, moved to the hovered element's offset inside the document wrapper.

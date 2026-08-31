@@ -31,6 +31,7 @@ import type { Extension } from "@codemirror/state";
 import { buildEditorTheme } from "./editor/atelierTheme";
 import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
+import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { useScratchpadStore } from "../stores/scratchpadStore";
 
 /**
@@ -151,6 +152,10 @@ export function ScratchpadCodeEditor() {
         // keeps closed. See editor/searchHighlight.ts.
         search({ top: true }),
         searchMatchHighlight,
+        // Same ambient occurrence highlighting as the REVIEW editor. Only the
+        // highlight, not ⌘-click: a scratchpad tab has no workspace to resolve
+        // a definition against.
+        symbolOccurrenceHighlight,
         keymap.of([
           // Before searchKeymap so ⌘F opens the Atelier overlay rather than
           // CodeMirror's docked panel, while ⌘G/F3 still find next/prev.

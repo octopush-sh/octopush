@@ -928,17 +928,26 @@ export const ipc = {
   listWorkspaceFiles: (workspacePath: string) =>
     invoke<string[]>("list_workspace_files", { workspacePath }),
 
-  /** Workspace-wide text search. Literal substring match (not regex);
-   *  case-insensitive when `caseSensitive` is false. Capped at 500 hits. */
+  /** Workspace-wide text search. Literal (not regex); case-insensitive when
+   *  `caseSensitive` is false. Capped at 500 hits.
+   *
+   *  `wholeWord` matches only on identifier boundaries (`[A-Za-z0-9_$]`, the
+   *  same rule the editor's own word scan uses). Go-to-definition needs it:
+   *  as a plain substring scan, looking up `run` spent the whole 500-hit cap
+   *  on `running`/`runtime`/`rerun` and reported that nothing declared it. The
+   *  ⌘⇧F palette deliberately stays substring — a human typing a fragment
+   *  expects fragments back. */
   searchWorkspaceText: (
     workspacePath: string,
     query: string,
     caseSensitive = false,
+    wholeWord = false,
   ) =>
     invoke<SearchHit[]>("search_workspace_text", {
       workspacePath,
       query,
       caseSensitive,
+      wholeWord,
     }),
 
   /** Look up a pull request on GitHub for the current branch (any state).

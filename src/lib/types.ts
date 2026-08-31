@@ -409,7 +409,9 @@ export interface SearchHit {
   file: string;
   /** 1-based line number. */
   line: number;
-  /** 1-based column where the match starts. */
+  /** 1-based CHARACTER column where the match starts (not a byte offset —
+   *  see `search_workspace_text`). Navigation uses `line`; nothing reads this
+   *  yet. */
   col: number;
   /** The full or partially-snipped source line for preview. */
   preview: string;
