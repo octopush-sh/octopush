@@ -75,11 +75,20 @@ export function ModalShell({
   // already claimed it (e.g. an `autoFocus` input, which React focuses before
   // this effect runs) — and hand it back to the opener on unmount (if that
   // element is still in the DOM).
+  //
+  // `preventScroll` on the restore is load-bearing, not a nicety. Handing focus
+  // back to a tall element scrolls it into view, and the editor's `.cm-content`
+  // is exactly that: one contenteditable spanning the whole document, whose
+  // "into view" is its TOP. So closing any dialog opened from the editor threw
+  // the reader back to line 1 of the file they were reading — reported against
+  // the go-to-definition picker, but every modal in the app did it.
   useEffect(() => {
     const root = dialogRef.current;
-    if (root && !root.contains(document.activeElement)) root.focus();
+    if (root && !root.contains(document.activeElement)) root.focus({ preventScroll: true });
     return () => {
-      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+      if (opener instanceof HTMLElement && opener.isConnected) {
+        opener.focus({ preventScroll: true });
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
