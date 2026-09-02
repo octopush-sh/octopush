@@ -1,0 +1,288 @@
+@import "tailwindcss";
+
+/* Fuentes autoalojadas: sin petición a un tercero, sin depender de que un
+   CDN esté arriba, y sin filtrar la IP de cada visitante a otro dominio.
+   `full` trae los ejes opsz, SOFT y WONK — el carácter de Fraunces vive ahí. */
+@import "@fontsource-variable/fraunces/full.css";
+@import "@fontsource-variable/archivo/wght.css";
+
+/* ===================================================================
+   MOMPOSINA · sistema visual
+   -------------------------------------------------------------------
+   Una sola regla de oro, valga la redundancia: el amarillo del oro lo
+   pone la fotografía y el producto, no la interfaz. La interfaz es
+   hueso, tinta y carbón, y deja que el metal sea el color.
+
+   Nada de literales de color, tipografía ni motion fuera de este
+   archivo: todo pasa por tokens.
+   =================================================================== */
+
+@theme {
+  /* — Fondo claro: la mayor parte de la página respira acá — */
+  --color-m-crudo: #e9e2d5; /* hueso, fondo principal */
+  --color-m-papel: #f4efe6; /* superficie elevada sobre el hueso */
+  --color-m-tinta: #1e1813; /* texto principal sobre claro — 14:1 */
+  --color-m-humo: #5b5245; /* texto secundario sobre claro — 5.6:1 */
+  --color-m-piedra: #8b8175; /* solo decorativo: filetes, marcas */
+  --color-m-linea: #cfc5b3; /* filete sobre claro */
+
+  /* — Fondo oscuro: hero, transformación, manifiesto — */
+  --color-m-carbon: #14100d; /* negro cálido, nunca azulado */
+  --color-m-carbon-2: #1e1913; /* superficie elevada sobre carbón */
+  --color-m-crema: #ede5d6; /* texto principal sobre oscuro */
+  --color-m-ceniza: #a3998a; /* texto secundario sobre oscuro — 6:1 */
+  --color-m-linea-oscura: #352d24; /* filete sobre oscuro */
+
+  /* — Oro: quirúrgico. Tres valores, tres trabajos distintos — */
+  --color-m-oro: #c08a2e; /* oro sobre oscuro (texto y filete) */
+  --color-m-oro-alto: #e3b45b; /* hover sobre oscuro */
+  --color-m-oro-tierra: #8a5a17; /* oro legible sobre claro — 4.9:1 */
+
+  /* — Minerales: fondos de los slots de fotografía — */
+  --color-m-mineral: #4a5148;
+  --color-m-tierra: #6b4a33;
+
+  --font-display: "Fraunces Variable", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --font-body: "Archivo Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+:root {
+  /* Movimiento: una curva, tres duraciones. No hay más. */
+  --m-ease: cubic-bezier(0.2, 0.8, 0.3, 1);
+  --m-dur-fast: 220ms;
+  --m-dur: 320ms;
+  --m-dur-slow: 700ms;
+  /* Grano: SVG inline, sin petición de red y sin imagen que cargar. */
+  --m-grain-url: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)'/%3E%3C/svg%3E");
+  color-scheme: light;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-m-crudo);
+  color: var(--color-m-tinta);
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: var(--color-m-oro-tierra);
+  color: var(--color-m-papel);
+}
+
+/* Anclas: el header flotante no debe tapar el título al saltar. */
+[id] {
+  scroll-margin-top: 5rem;
+}
+
+/* — Foco visible, en todas partes, sin excepción — */
+:focus-visible {
+  outline: 2px solid var(--color-m-oro-tierra);
+  outline-offset: 3px;
+  border-radius: 1px;
+}
+
+.on-dark :focus-visible,
+.on-dark:focus-visible {
+  outline-color: var(--color-m-oro-alto);
+}
+
+/* ===================================================================
+   1 · Tipografía
+   =================================================================== */
+
+/* Fraunces con WONK y SOFT: le da el carácter que separa esto de una
+   serif de catálogo. Es el rasgo tipográfico de la marca. */
+.m-display {
+  font-family: var(--font-display);
+  font-variation-settings: "SOFT" 30, "WONK" 1;
+  font-weight: 300;
+  line-height: 1.02;
+  letter-spacing: -0.015em;
+}
+
+/* Bloques largos en serif: menos wonk, más legibilidad. */
+.m-serif {
+  font-family: var(--font-display);
+  font-variation-settings: "SOFT" 20, "WONK" 0;
+  font-weight: 300;
+  line-height: 1.35;
+}
+
+/* El logotipo. Tracking abierto: la palabra tiene que respirar. */
+.m-wordmark {
+  font-family: var(--font-display);
+  font-variation-settings: "SOFT" 0, "WONK" 0;
+  font-weight: 300;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+/* Versalitas espaciadas: etiquetas, meta, numeración. La voz de la
+   página que "anota" — hereda del libro de ley y peso del oro. */
+.m-eyebrow {
+  font-family: var(--font-body);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  line-height: 1.4;
+}
+
+/* Cifras alineadas: pesos, leyes, precios, numeración de fichas. */
+.m-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: 0.06em;
+}
+
+/* Un valor pendiente de suministrar. Se lee como una casilla vacía,
+   no como contenido. */
+.m-pendiente {
+  color: var(--color-m-humo);
+  border-bottom: 1px dashed var(--color-m-linea);
+  padding-bottom: 0.05em;
+  font-style: normal;
+}
+
+.on-dark .m-pendiente {
+  color: var(--color-m-ceniza);
+  border-bottom-color: var(--color-m-linea-oscura);
+}
+
+/* ===================================================================
+   2 · Materialidad — grano
+   =================================================================== */
+
+/* Grano de papel mineral sobre toda la página. Es una sola capa fija,
+   sin coste de repintado: da materia donde todavía no hay fotografía. */
+.m-grain::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0.45;
+  mix-blend-mode: overlay;
+  background-image: var(--m-grain-url);
+  background-size: 180px 180px;
+}
+
+/* ===================================================================
+   3 · Movimiento
+   -------------------------------------------------------------------
+   Tres primitivas. Nada aparece de golpe y nada rebota.
+   =================================================================== */
+
+/* Entrada editorial: sube y se revela al entrar en pantalla. */
+.m-reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity var(--m-dur-slow) var(--m-ease),
+    transform var(--m-dur-slow) var(--m-ease);
+}
+
+.m-reveal.is-in {
+  opacity: 1;
+  transform: none;
+}
+
+/* Filete que crece desde el borde de origen. Línea sólida, jamás un
+   degradado: un degradado usado como regla es un adorno, no una regla. */
+.m-rule {
+  display: block;
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform var(--m-dur-slow) var(--m-ease);
+}
+
+.m-rule.is-in {
+  transform: scaleX(1);
+}
+
+/* Enlace de texto: el subrayado crece, no parpadea. */
+.m-link {
+  position: relative;
+  text-decoration: none;
+  padding-bottom: 0.1em;
+}
+
+.m-link::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: currentColor;
+  opacity: 0.35;
+  transform: scaleX(1);
+  transform-origin: left center;
+  transition:
+    opacity var(--m-dur-fast) var(--m-ease),
+    transform var(--m-dur) var(--m-ease);
+}
+
+.m-link:hover::after {
+  opacity: 1;
+}
+
+/* Escalonado de listas: cada hijo entra un poco después del anterior. */
+.m-stagger > * {
+  transition-delay: calc(var(--m-i, 0) * 90ms);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .m-reveal,
+  .m-rule,
+  .m-link::after,
+  .m-stagger > * {
+    transition: none !important;
+    transition-delay: 0ms !important;
+  }
+
+  .m-reveal {
+    opacity: 1;
+    transform: none;
+  }
+
+  .m-rule {
+    transform: scaleX(1);
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+/* Hoja de navegación en móvil: entra desde el borde, no aparece de golpe. */
+@keyframes m-sheet {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

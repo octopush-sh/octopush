@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Momposina">
+  <rect width="32" height="32" fill="#14100d"/>
+  <!-- Pepita: pentágono irregular. No es un diamante ni una corona:
+       es la forma en que el oro aparece antes de que alguien lo trabaje. -->
+  <path d="M16 4 L26 11 L22.5 24 L10 27 L4.5 14 Z" fill="#c08a2e"/>
+  <path d="M16 4 L13 17 L22.5 24" fill="none" stroke="#14100d" stroke-width="1.1" stroke-linejoin="round" opacity="0.85"/>
+</svg>

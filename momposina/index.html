@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="es-CO">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Espejo de --color-m-carbon: pinta la barra del navegador en movil. -->
+    <meta name="theme-color" content="#14100d" />
+
+    <!-- Título y metadatos definitivos los inyecta el build desde
+         src/content/brand.ts (ver scripts/prerender.mjs). Lo de acá abajo es
+         el respaldo que se ve en desarrollo. -->
+    <title>Momposina · Joyería en Zaragoza, Antioquia</title>
+    <!--seo-->
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
+
+  </head>
+  <body class="m-grain">
+    <!-- Sin JavaScript el revelado nunca llega a dispararse: el contenido
+         tiene que verse igual. Nada de información escondida tras una
+         animación. -->
+    <noscript>
+      <style>
+        .m-reveal { opacity: 1 !important; transform: none !important; }
+        .m-rule { transform: scaleX(1) !important; }
+      </style>
+    </noscript>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
