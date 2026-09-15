@@ -68,16 +68,28 @@ function isSshKeyMissing(err: unknown): { host: string } | null {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /** Convert an SSH remote URL to its HTTPS equivalent.
- *  git@github.com:owner/repo.git      → https://github.com/owner/repo.git
- *  ssh://git@github.com/owner/repo.git → https://github.com/owner/repo.git
+ *  git@github.com:owner/repo.git              → https://github.com/owner/repo.git
+ *  ssh://git@github.com/owner/repo.git        → https://github.com/owner/repo.git
+ *  git@ssh.dev.azure.com:v3/org/project/repo  → https://dev.azure.com/org/project/_git/repo
  *  Already-HTTPS URLs are returned unchanged.
  */
 export function sshToHttps(url: string): string {
+  // Azure DevOps uses a dedicated SSH host and a `v3/` path that has no HTTPS
+  // counterpart; the HTTPS form lives on dev.azure.com under `_git`.
+  const azure = url.match(
+    /^(?:ssh:\/\/)?[^@/]+@ssh\.dev\.azure\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)\/?$/,
+  );
+  if (azure) return `https://dev.azure.com/${azure[1]}/${azure[2]}/_git/${azure[3]}`;
+  // Legacy visualstudio.com organisations: org@vs-ssh.visualstudio.com:v3/org/project/repo
+  const vsts = url.match(
+    /^(?:ssh:\/\/)?[^@/]+@vs-ssh\.visualstudio\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)\/?$/,
+  );
+  if (vsts) return `https://${vsts[1]}.visualstudio.com/${vsts[2]}/_git/${vsts[3]}`;
   // SCP style: git@github.com:owner/repo.git
-  const sshScp = url.match(/^git@([^:]+):(.+)$/);
+  const sshScp = url.match(/^[^@/]+@([^:/]+):(.+)$/);
   if (sshScp) return `https://${sshScp[1]}/${sshScp[2]}`;
-  // ssh:// scheme: ssh://git@github.com/owner/repo.git
-  const sshProto = url.match(/^ssh:\/\/git@([^/]+)\/(.+)$/);
+  // ssh:// scheme: ssh://git@github.com/owner/repo.git (a custom port has no HTTPS meaning)
+  const sshProto = url.match(/^ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/);
   if (sshProto) return `https://${sshProto[1]}/${sshProto[2]}`;
   return url; // already HTTPS or unknown
 }
@@ -485,7 +497,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     autoFocus
                     value={cloneUrl}
                     onChange={(e) => setCloneUrl(e.target.value)}
-                    placeholder="*Paste a git remote URL…*"
+                    placeholder="Paste a git remote URL…"
                     className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
                   {parsedCloneUrl && (
@@ -506,7 +518,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     setCloneName(e.target.value);
                     setCloneNameManual(true);
                   }}
-                  placeholder="*auto-detected from URL*"
+                  placeholder="auto-detected from URL"
                   className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
@@ -563,7 +575,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     <input
                       value={authUsername}
                       onChange={(e) => setAuthUsername(e.target.value)}
-                      placeholder="*your username*"
+                      placeholder="your username"
                       className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>
@@ -573,7 +585,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                       type="password"
                       value={authToken}
                       onChange={(e) => setAuthToken(e.target.value)}
-                      placeholder="ghp_…"
+                      placeholder={authHost === "github.com" ? "ghp_…" : "your token"}
                       className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                     />
                   </Field>

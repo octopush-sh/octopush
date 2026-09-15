@@ -33,6 +33,8 @@ pub struct ParsedGitUrl {
 /// | ssh:// | `ssh://git@github.com/owner/repo.git` |
 /// | Multi-level GitLab | `https://gitlab.com/group/sub/repo.git` |
 /// | Custom host | `https://gitea.example.com/owner/repo.git` |
+/// | Azure DevOps HTTPS | `https://org@dev.azure.com/org/project/_git/repo` |
+/// | Azure DevOps SSH | `git@ssh.dev.azure.com:v3/org/project/repo` |
 pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
     let url = url.trim();
     if url.is_empty() {
@@ -118,20 +120,42 @@ fn split_owner_repo(path: &str) -> Option<(String, String)> {
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
 
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Azure DevOps (dev.azure.com, *.visualstudio.com, on-prem Server) puts a
+    // literal `_git` between the project and the repository:
+    //   https://dev.azure.com/org/project/_git/repo
+    // Drop the marker so the owner is the project, not `_git`.
+    if segments.len() >= 3 && segments[segments.len() - 2] == "_git" {
+        segments.remove(segments.len() - 2);
+    }
+
     if segments.len() < 2 {
         return None;
     }
 
-    let repo = segments.last()?.to_string();
+    let repo = decode_segment(segments.last()?);
     // For multi-level GitLab paths, owner is the segment before the repo.
-    let owner = segments[segments.len() - 2].to_string();
+    let owner = decode_segment(segments[segments.len() - 2]);
 
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
 
     Some((owner, repo))
+}
+
+/// Undo `%20`-style escapes so a repository called "My Repo" (Azure DevOps
+/// allows spaces and encodes them in its clone URLs) lands in `My Repo` — the
+/// directory `git clone` itself would pick. A segment that decodes to
+/// something that can't be a single directory name is kept as written.
+fn decode_segment(segment: &str) -> String {
+    match urlencoding::decode(segment) {
+        Ok(decoded) if !decoded.contains(|c| matches!(c, '/' | '\\' | '\0')) => {
+            decoded.into_owned()
+        }
+        _ => segment.to_string(),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -231,6 +255,65 @@ mod tests {
         assert_eq!(r.host, "gitea.internal.company.com");
         assert_eq!(r.repo, "project");
         assert!(!r.is_ssh);
+    }
+
+    // ── Azure DevOps ──────────────────────────────────────────────────
+
+    #[test]
+    fn azure_devops_https() {
+        let r = p("https://dev.azure.com/org/project/_git/repo");
+        assert_eq!(r.host, "dev.azure.com");
+        assert_eq!(r.owner, "project");
+        assert_eq!(r.repo, "repo");
+        assert!(!r.is_ssh);
+    }
+
+    #[test]
+    fn azure_devops_https_with_org_user_prefix() {
+        // The URL Azure's "Clone" button hands out carries `org@`.
+        let r = p("https://org@dev.azure.com/org/project/_git/repo");
+        assert_eq!(r.host, "dev.azure.com");
+        assert_eq!(r.owner, "project");
+        assert_eq!(r.repo, "repo");
+        assert!(!r.is_ssh);
+    }
+
+    #[test]
+    fn azure_devops_ssh_v3() {
+        let r = p("git@ssh.dev.azure.com:v3/org/project/repo");
+        assert_eq!(r.host, "ssh.dev.azure.com");
+        assert_eq!(r.owner, "project");
+        assert_eq!(r.repo, "repo");
+        assert!(r.is_ssh);
+    }
+
+    #[test]
+    fn azure_devops_legacy_visualstudio_host() {
+        let r = p("https://org.visualstudio.com/DefaultCollection/project/_git/repo");
+        assert_eq!(r.host, "org.visualstudio.com");
+        assert_eq!(r.owner, "project");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn percent_encoded_names_decode_to_the_directory_git_would_pick() {
+        let r = p("https://dev.azure.com/org/My%20Project/_git/My%20Repo");
+        assert_eq!(r.owner, "My Project");
+        assert_eq!(r.repo, "My Repo");
+    }
+
+    #[test]
+    fn a_leading_git_marker_is_an_ordinary_owner() {
+        // Only a `_git` *between* two segments is the Azure marker.
+        let r = p("https://gitea.example.com/_git/repo");
+        assert_eq!(r.owner, "_git");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn a_segment_that_decodes_to_a_path_is_kept_as_written() {
+        let r = p("https://example.com/owner/..%2F..%2Fescape");
+        assert_eq!(r.repo, "..%2F..%2Fescape");
     }
 
     // ── Rejection tests ───────────────────────────────────────────────

@@ -10884,3 +10884,60 @@ mod search_word_boundary {
         assert_eq!(find_match("run", "run", 99, true), None);
     }
 }
+
+#[cfg(test)]
+mod clone_askpass_tests {
+    //! The askpass helper turns the credentials typed into the Add Project
+    //! panel into answers for git's Username/Password prompts. Run it exactly
+    //! as git does — as an executable, one prompt per invocation — so the test
+    //! fails on anything that changes what the server actually receives.
+    use crate::commands::ASKPASS_SCRIPT;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn ask(prompt: &str, username: &str, token: &str) -> String {
+        let mut tmp = tempfile::Builder::new()
+            .prefix("octopush-askpass-test-")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap();
+        std::io::Write::write_all(&mut tmp, ASKPASS_SCRIPT.as_bytes()).unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new(tmp.path())
+            .arg(prompt)
+            .env("OCTOPUSH_GIT_USERNAME", username)
+            .env("OCTOPUSH_GIT_TOKEN", token)
+            .output()
+            .expect("askpass script must be directly executable");
+        assert!(
+            out.status.success(),
+            "askpass exited {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn answers_the_username_prompt_with_the_typed_username() {
+        assert_eq!(ask("Username for 'https://dev.azure.com': ", "jane", "pat-1"), "jane");
+    }
+
+    #[test]
+    fn answers_the_password_prompt_with_the_typed_token() {
+        // A URL that already carries `user@` (Azure DevOps' default clone URL)
+        // skips the username prompt and asks for the password straight away.
+        assert_eq!(ask("Password for 'https://org@dev.azure.com': ", "jane", "pat-1"), "pat-1");
+    }
+
+    #[test]
+    fn passes_awkward_token_characters_through_verbatim() {
+        let token = "a%sb $HOME 'q' \"dq\" \\n 100%";
+        assert_eq!(ask("Password for 'https://github.com': ", "jane", token), token);
+    }
+
+    #[test]
+    fn stays_silent_for_prompts_it_does_not_understand() {
+        // Never leak the token into an unrelated prompt.
+        assert_eq!(ask("Passphrase for key '/Users/jane/.ssh/id_ed25519': ", "jane", "pat-1"), "");
+    }
+}

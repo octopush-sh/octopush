@@ -2704,6 +2704,14 @@ pub struct CloneCredentials {
     pub token: String,
 }
 
+/// The `GIT_ASKPASS` helper handed to `git clone` when the user typed
+/// credentials into the Add Project panel. Git runs it once per prompt with
+/// the prompt text as `$1` — `Username for 'https://host': ` or, when the URL
+/// already carries `user@` (Azure DevOps does this), straight to
+/// `Password for 'https://user@host': ` — and reads the answer from stdout.
+/// The values travel through env vars so no secret is written to disk.
+pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+
 /// Parse a single stderr line from `git clone --progress` into structured
 /// progress data.  Returns `None` for lines that don't match.
 ///
@@ -2778,10 +2786,6 @@ async fn clone_via_shell(
     let _askpass_tmp: Option<tempfile::NamedTempFile>;
 
     if let Some(creds) = credentials {
-        let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n"
-        );
-
         let mut tmp = tempfile::Builder::new()
             .prefix("octopush-askpass-")
             .suffix(".sh")
@@ -2789,7 +2793,7 @@ async fn clone_via_shell(
             .map_err(|e| AppError::Other(format!("failed to create askpass tempfile: {e}")))?;
 
         use std::io::Write as _;
-        tmp.write_all(script.as_bytes())
+        tmp.write_all(ASKPASS_SCRIPT.as_bytes())
             .map_err(|e| AppError::Other(format!("failed to write askpass script: {e}")))?;
 
         // Make executable.

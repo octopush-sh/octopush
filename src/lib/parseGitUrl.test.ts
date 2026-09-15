@@ -56,6 +56,43 @@ describe("parseGitUrl", () => {
     expect(r).toMatchObject({ host: "gitlab.com", owner: "owner", repo: "repo" });
   });
 
+  // ── Azure DevOps ────────────────────────────────────────────────────
+
+  it("parses Azure DevOps HTTPS (the `_git` marker is not the owner)", () => {
+    const r = parseGitUrl("https://dev.azure.com/org/project/_git/repo");
+    expect(r).toMatchObject({ host: "dev.azure.com", owner: "project", repo: "repo", isSsh: false });
+  });
+
+  it("parses the `org@` HTTPS URL Azure's Clone button hands out", () => {
+    const r = parseGitUrl("https://org@dev.azure.com/org/project/_git/repo");
+    expect(r).toMatchObject({ host: "dev.azure.com", owner: "project", repo: "repo", isSsh: false });
+  });
+
+  it("parses Azure DevOps SSH (v3)", () => {
+    const r = parseGitUrl("git@ssh.dev.azure.com:v3/org/project/repo");
+    expect(r).toMatchObject({ host: "ssh.dev.azure.com", owner: "project", repo: "repo", isSsh: true });
+  });
+
+  it("parses the legacy visualstudio.com host", () => {
+    const r = parseGitUrl("https://org.visualstudio.com/DefaultCollection/project/_git/repo");
+    expect(r).toMatchObject({ host: "org.visualstudio.com", owner: "project", repo: "repo" });
+  });
+
+  it("decodes percent-encoded names to the directory git would pick", () => {
+    const r = parseGitUrl("https://dev.azure.com/org/My%20Project/_git/My%20Repo");
+    expect(r).toMatchObject({ owner: "My Project", repo: "My Repo" });
+  });
+
+  it("treats a leading `_git` as an ordinary owner", () => {
+    const r = parseGitUrl("https://gitea.example.com/_git/repo");
+    expect(r).toMatchObject({ owner: "_git", repo: "repo" });
+  });
+
+  it("keeps a segment as written when it would decode to a path", () => {
+    const r = parseGitUrl("https://example.com/owner/..%2F..%2Fescape");
+    expect(r?.repo).toBe("..%2F..%2Fescape");
+  });
+
   // ── Rejection ───────────────────────────────────────────────────────
 
   it("returns null for empty string", () => {
@@ -109,6 +146,30 @@ describe("sshToHttps", () => {
   it("converts Bitbucket SCP-style SSH to HTTPS", () => {
     expect(sshToHttps("git@bitbucket.org:owner/repo.git")).toBe(
       "https://bitbucket.org/owner/repo.git",
+    );
+  });
+
+  it("converts Azure DevOps SSH (v3) to its dev.azure.com HTTPS form", () => {
+    expect(sshToHttps("git@ssh.dev.azure.com:v3/org/project/repo")).toBe(
+      "https://dev.azure.com/org/project/_git/repo",
+    );
+  });
+
+  it("converts Azure DevOps ssh:// (v3) to its dev.azure.com HTTPS form", () => {
+    expect(sshToHttps("ssh://git@ssh.dev.azure.com/v3/org/project/repo")).toBe(
+      "https://dev.azure.com/org/project/_git/repo",
+    );
+  });
+
+  it("converts legacy visualstudio.com SSH to its HTTPS form", () => {
+    expect(sshToHttps("org@vs-ssh.visualstudio.com:v3/org/project/repo")).toBe(
+      "https://org.visualstudio.com/project/_git/repo",
+    );
+  });
+
+  it("drops a custom ssh:// port, which has no HTTPS meaning", () => {
+    expect(sshToHttps("ssh://git@gitea.example.com:2222/owner/repo.git")).toBe(
+      "https://gitea.example.com/owner/repo.git",
     );
   });
 });

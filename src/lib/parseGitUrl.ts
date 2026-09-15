@@ -10,6 +10,8 @@
  *   https://gitlab.com/group/sub/repo.git  (multi-level)
  *   https://bitbucket.org/owner/repo.git
  *   https://gitea.example.com/owner/repo   (custom host)
+ *   https://org@dev.azure.com/org/project/_git/repo  (Azure DevOps)
+ *   git@ssh.dev.azure.com:v3/org/project/repo        (Azure DevOps SSH)
  */
 
 export interface ParsedGitUrl {
@@ -19,15 +21,35 @@ export interface ParsedGitUrl {
   isSsh: boolean;
 }
 
+/** Undo `%20`-style escapes so a repo called "My Repo" (Azure DevOps allows
+ *  spaces and encodes them in its clone URLs) lands in `My Repo` — the
+ *  directory `git clone` itself would pick. A segment that decodes to
+ *  something that can't be a single directory name is kept as written. */
+function decodeSegment(segment: string): string {
+  try {
+    const decoded = decodeURIComponent(segment);
+    return /[/\\\0]/.test(decoded) ? segment : decoded;
+  } catch {
+    return segment;
+  }
+}
+
 /** Strip trailing `.git` suffix and split `path` into [owner, repo]. */
 function splitOwnerRepo(path: string): [string, string] | null {
   const stripped = path
     .replace(/\/$/, "")
     .replace(/\.git$/, "");
   const segments = stripped.split("/").filter(Boolean);
+  // Azure DevOps (dev.azure.com, *.visualstudio.com, on-prem Server) puts a
+  // literal `_git` between the project and the repository:
+  //   https://dev.azure.com/org/project/_git/repo
+  // Drop the marker so the owner is the project, not `_git`.
+  if (segments.length >= 3 && segments[segments.length - 2] === "_git") {
+    segments.splice(segments.length - 2, 1);
+  }
   if (segments.length < 2) return null;
-  const repo = segments[segments.length - 1];
-  const owner = segments[segments.length - 2];
+  const repo = decodeSegment(segments[segments.length - 1]);
+  const owner = decodeSegment(segments[segments.length - 2]);
   if (!repo || !owner) return null;
   return [owner, repo];
 }
