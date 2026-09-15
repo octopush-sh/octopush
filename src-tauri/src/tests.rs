@@ -10968,6 +10968,12 @@ mod clone_askpass_tests {
     }
 
     #[test]
+    fn an_unwritable_marker_never_costs_git_the_password() {
+        let env = [("OCTOPUSH_GIT_ASKPASS_USED", "/nonexistent-dir/askpass.used")];
+        assert_eq!(ask_env("Password for 'https://jane@h': ", "jane", "pat-1", &env), "pat-1");
+    }
+
+    #[test]
     fn stays_silent_for_prompts_it_does_not_understand() {
         // Never leak the token into a prompt that isn't one of git's two.
         assert_eq!(ask("Passphrase for key '/Users/jane/.ssh/id_ed25519': ", "jane", "pat-1"), "");
@@ -11084,6 +11090,17 @@ mod clone_stderr_stream_tests {
             ]
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_held_back_redraw_is_still_shown_as_progress() {
+        use crate::commands::held_back_redraw;
+        let mut buf = b"Receiving objects:  46% (6/13)\r".to_vec();
+        assert!(take_terminal_segments(&mut buf).is_empty());
+        let fragment = held_back_redraw(&buf).unwrap();
+        assert_eq!(parse_clone_progress(&fragment).unwrap()["percent"], 46);
+        assert_eq!(held_back_redraw(b"Receiving obj"), None);
+        assert_eq!(held_back_redraw(b""), None);
     }
 
     #[test]

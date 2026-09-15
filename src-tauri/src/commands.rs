@@ -2722,8 +2722,10 @@ fn default_remember() -> bool {
 /// the username, which may itself contain "username". The values travel
 /// through env vars so no secret is written to disk. Answering the password
 /// prompt also creates the file named by `OCTOPUSH_GIT_ASKPASS_USED`, so the
-/// caller stores the credential only if git actually used it.
-pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) : > \"${OCTOPUSH_GIT_ASKPASS_USED:-/dev/null}\" 2>/dev/null; printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+/// caller stores the credential only if git actually used it. The marker
+/// write sits in a subshell: `:` is a special builtin, and a failed
+/// redirection on one would end the script before the token is printed.
+pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) ( : > \"${OCTOPUSH_GIT_ASKPASS_USED:-/dev/null}\" ) 2>/dev/null; printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
 
 /// `url` with `username@` inserted in front of the host, for an HTTP(S) URL
 /// that names no user. The origin remote of a clone made this way carries the
@@ -2828,6 +2830,18 @@ pub fn take_terminal_segments(buf: &mut Vec<u8>) -> Vec<(String, bool)> {
     out
 }
 
+/// The progress redraw `take_terminal_segments` is still holding back: git
+/// writes each redraw as one chunk ending in `\r`, so without this the bar
+/// would show each percentage only when the next one arrived. The bytes stay
+/// in `buf`; the same fragment is surfaced again once its terminator is
+/// known, which the progress bar doesn't mind.
+pub fn held_back_redraw(buf: &[u8]) -> Option<String> {
+    match buf.split_last() {
+        Some((b'\r', fragment)) => Some(String::from_utf8_lossy(fragment).into_owned()),
+        _ => None,
+    }
+}
+
 /// Turn a failed `git clone`'s stderr into the error the Add Project panel
 /// keys on: `SshKeyMissing` when the agent has no key for the host,
 /// `AuthRequired` for anything git would have asked credentials for — a 401
@@ -2928,7 +2942,7 @@ async fn clone_via_shell(
     // for the password, and the account is on record in the origin remote.
     let clone_url: String = match (credentials, url_user) {
         (Some(creds), None) => {
-            url_with_user(url, &creds.username).unwrap_or_else(|| url.to_string())
+            url_with_user(url, creds.username.trim()).unwrap_or_else(|| url.to_string())
         }
         _ => url.to_string(),
     };
@@ -2968,7 +2982,7 @@ async fn clone_via_shell(
         let tmp = tmp.into_temp_path();
         let askpass_path = tmp.to_string_lossy().to_string();
         let marker = std::path::PathBuf::from(format!("{askpass_path}.used"));
-        env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.clone()));
+        env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.trim().to_string()));
         env_overrides.push(("OCTOPUSH_GIT_TOKEN".into(), creds.token.clone()));
         env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
         env_overrides.push((
@@ -3019,6 +3033,11 @@ async fn clone_via_shell(
                 stderr_lines.push(segment);
             }
         }
+        if let Some(fragment) = held_back_redraw(&pending) {
+            if let Some(payload) = parse_clone_progress(&fragment) {
+                let _ = app.emit("clone://progress", payload);
+            }
+        }
     }
     if !pending.is_empty() {
         let tail = String::from_utf8_lossy(&pending);
@@ -3043,7 +3062,7 @@ async fn clone_via_shell(
         if let Some(creds) = credentials {
             if creds.remember && askpass_answered {
                 let protocol = if url.to_ascii_lowercase().starts_with("http://") { "http" } else { "https" };
-                let username = url_user.unwrap_or(&creds.username);
+                let username = url_user.unwrap_or(creds.username.trim());
                 if let Some(payload) = credential_approve_payload(protocol, host, username, &creds.token) {
                     approve_credentials_via_shell(&shell, &payload).await;
                 }

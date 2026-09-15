@@ -153,7 +153,11 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
   // ── Pre-fill credentials from settings when auth panel appears ──────
   useEffect(() => {
     if (!authHost) return;
+    // A settings read that lands after the panel moved on to another host
+    // must not fill that host's panel with this one's credentials.
+    let stale = false;
     ipc.getSettings().then((settings) => {
+      if (stale) return;
       const saved = settings.gitCredentials?.[authHost];
       if (saved) {
         setAuthUsername(saved.username);
@@ -165,6 +169,9 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
       const urlUser = parseGitUrl(cloneUrl)?.user;
       if (urlUser) setAuthUsername((current) => current || urlUser);
     }).catch(() => {});
+    return () => {
+      stale = true;
+    };
   }, [authHost, cloneUrl]);
 
   // ── Subscribe to clone progress events ─────────────────────────────
@@ -279,10 +286,12 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
     if (!authHost) return;
     // The panel stays mounted through the retry, so a rejected token keeps
     // what was typed instead of re-running the saved-credentials prefill.
-    const outcome = await runClone({ username: authUsername, token: authToken, remember: authRemember });
+    // The username ends up in the origin remote and the keychain: no stray spaces.
+    const username = authUsername.trim();
+    const outcome = await runClone({ username, token: authToken, remember: authRemember });
     if (outcome.kind === "ok") {
       if (authRemember) {
-        await ipc.saveGitCredentials(authHost, authUsername, authToken).catch(() => {});
+        await ipc.saveGitCredentials(authHost, username, authToken).catch(() => {});
       }
       setAuthHost(null);
       // Open the project last: this view unmounts once a project is current.
@@ -602,6 +611,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   <Field label="USERNAME">
                     <input
                       value={authUsername}
+                      disabled={cloning}
                       onChange={(e) => setAuthUsername(e.target.value)}
                       placeholder="your username"
                       className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
@@ -612,6 +622,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     <input
                       type="password"
                       value={authToken}
+                      disabled={cloning}
                       onChange={(e) => setAuthToken(e.target.value)}
                       placeholder={authHost === "github.com" ? "ghp_…" : "your token"}
                       className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
@@ -623,6 +634,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   <input
                     type="checkbox"
                     checked={authRemember}
+                    disabled={cloning}
                     onChange={(e) => setAuthRemember(e.target.checked)}
                     className="rounded border-octo-border-strong"
                   />
@@ -634,7 +646,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                 <button
                   type="button"
                   onClick={handleAuthRetry}
-                  disabled={cloning || !authUsername || !authToken}
+                  disabled={cloning || !authUsername.trim() || !authToken}
                   className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                   style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                 >

@@ -405,6 +405,8 @@ describe("NewProjectFlow — credentialed retry behaves like a clone", () => {
     expect(screen.getByRole("button", { name: /cloning…/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /trying…/i })).toBeDisabled();
     expect(screen.getByPlaceholderText(/paste a git remote url/i)).toBeDisabled();
+    expect(screen.getByLabelText(/username/i)).toBeDisabled();
+    expect(screen.getByLabelText(/personal access token/i)).toBeDisabled();
     await waitFor(() => expect(registeredListeners.has("clone://progress")).toBe(true));
     await act(async () => {
       registeredListeners.get("clone://progress")!({
