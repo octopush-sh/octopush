@@ -16,6 +16,9 @@
 
 export interface ParsedGitUrl {
   host: string;
+  /** The `user@` in front of the host, when the URL carries one (Azure DevOps
+   *  and Bitbucket clone URLs do). Git then never asks for a username. */
+  user?: string;
   owner: string;
   repo: string;
   isSsh: boolean;
@@ -58,7 +61,8 @@ function splitOwnerRepo(path: string): [string, string] | null {
 }
 
 export function parseGitUrl(raw: string): ParsedGitUrl | null {
-  const url = raw.trim();
+  // Same edges as Rust's `str::trim` (which also drops U+0085), plus the BOM.
+  const url = raw.replace(/^[\s\u0085]+|[\s\u0085]+$/g, "");
   if (!url) return null;
 
   // ── SCP-style: git@github.com:owner/repo.git ──────────────────────
@@ -73,7 +77,8 @@ export function parseGitUrl(raw: string): ParsedGitUrl | null {
     if (!host || !path) return null;
     const parts = splitOwnerRepo(path);
     if (!parts) return null;
-    return { host, owner: parts[0], repo: parts[1], isSsh: true };
+    const user = url.slice(0, atIdx);
+    return { host, ...(user ? { user } : {}), owner: parts[0], repo: parts[1], isSsh: true };
   }
 
   // ── URL-scheme forms ───────────────────────────────────────────────
@@ -85,10 +90,13 @@ export function parseGitUrl(raw: string): ParsedGitUrl | null {
 
   let rest = url.slice(schemeEnd + 3);
 
-  // Strip optional user@ prefix (only if @ is before the first /)
+  // Strip optional user@ (or user:password@) prefix (only if @ is before the first /)
+  let user: string | undefined;
   const atIdx = rest.indexOf("@");
   const slashIdx = rest.indexOf("/");
   if (atIdx !== -1 && (slashIdx === -1 || atIdx < slashIdx)) {
+    const name = decodeSegment(rest.slice(0, atIdx).split(":")[0]);
+    if (name) user = name;
     rest = rest.slice(atIdx + 1);
   }
 
@@ -102,5 +110,5 @@ export function parseGitUrl(raw: string): ParsedGitUrl | null {
   const parts = splitOwnerRepo(path);
   if (!parts) return null;
 
-  return { host, owner: parts[0], repo: parts[1], isSsh };
+  return { host, ...(user ? { user } : {}), owner: parts[0], repo: parts[1], isSsh };
 }

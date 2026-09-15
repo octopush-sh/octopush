@@ -10,6 +10,10 @@ pub struct ParsedGitUrl {
     pub raw: String,
     /// Host name, e.g. `github.com`, `gitlab.com`, `gitea.example.com`.
     pub host: String,
+    /// The `user@` in front of the host, when the URL carries one — Azure
+    /// DevOps and Bitbucket clone URLs do. Git then never asks for a
+    /// username, and stores the credential under this one.
+    pub user: Option<String>,
     /// User or organisation, e.g. `octocat`.
     pub owner: String,
     /// Repository name **without** any trailing `.git`, e.g. `Hello-World`.
@@ -36,7 +40,8 @@ pub struct ParsedGitUrl {
 /// | Azure DevOps HTTPS | `https://org@dev.azure.com/org/project/_git/repo` |
 /// | Azure DevOps SSH | `git@ssh.dev.azure.com:v3/org/project/repo` |
 pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
-    let url = url.trim();
+    // A pasted URL may carry a BOM; the frontend mirror's `trim` drops it too.
+    let url = url.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
     if url.is_empty() {
         return None;
     }
@@ -55,6 +60,7 @@ pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
                 return Some(ParsedGitUrl {
                     raw: url.to_string(),
                     host,
+                    user: Some(url[..at_pos].to_string()).filter(|u| !u.is_empty()),
                     owner,
                     repo,
                     is_ssh: true,
@@ -72,11 +78,15 @@ pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
 
     let is_ssh = matches!(scheme, "ssh" | "git");
 
-    // Strip optional `user@` prefix from the authority.
+    // Strip optional `user@` (or `user:password@`) prefix from the authority.
+    let mut user = None;
     let rest = if let Some(at) = rest.find('@') {
         // Only strip user@ if @ appears before the first /
         let slash_pos = rest.find('/').unwrap_or(usize::MAX);
         if at < slash_pos {
+            let userinfo = &rest[..at];
+            let name = userinfo.split(':').next().unwrap_or("");
+            user = Some(decode_segment(name)).filter(|u| !u.is_empty());
             &rest[at + 1..]
         } else {
             rest
@@ -105,6 +115,7 @@ pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
     Some(ParsedGitUrl {
         raw: url.to_string(),
         host,
+        user,
         owner,
         repo,
         is_ssh,
@@ -289,9 +300,18 @@ mod tests {
         // The URL Azure's "Clone" button hands out carries `org@`.
         let r = p("https://org@dev.azure.com/org/project/_git/repo");
         assert_eq!(r.host, "dev.azure.com");
+        assert_eq!(r.user.as_deref(), Some("org"));
         assert_eq!(r.owner, "project");
         assert_eq!(r.repo, "repo");
         assert!(!r.is_ssh);
+    }
+
+    #[test]
+    fn the_url_user_is_exposed_only_when_present() {
+        assert_eq!(p("https://github.com/owner/repo").user, None);
+        assert_eq!(p("https://jane%40corp@bitbucket.org/ws/repo.git").user.as_deref(), Some("jane@corp"));
+        assert_eq!(p("https://jane:secret@gitea.example.com/o/r").user.as_deref(), Some("jane"));
+        assert_eq!(p("git@github.com:owner/repo.git").user.as_deref(), Some("git"));
     }
 
     #[test]
@@ -338,6 +358,11 @@ mod tests {
     fn a_repo_that_decodes_to_a_dot_directory_is_rejected() {
         assert!(parse_git_url("https://example.com/owner/%2e%2e").is_none());
         assert!(parse_git_url("https://example.com/owner/..").is_none());
+    }
+
+    #[test]
+    fn a_pasted_bom_or_nel_around_the_url_is_ignored() {
+        assert_eq!(p("\u{feff}https://github.com/owner/repo\u{85}").repo, "repo");
     }
 
     #[test]

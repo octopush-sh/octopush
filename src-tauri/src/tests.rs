@@ -10966,7 +10966,7 @@ mod clone_command_tests {
     fn first_attempt_uses_the_users_helpers_in_a_fixed_locale() {
         assert_eq!(
             build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false),
-            "LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
+            "env LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
         );
     }
 
@@ -10974,7 +10974,7 @@ mod clone_command_tests {
     fn a_retry_with_typed_credentials_bypasses_stored_helpers() {
         assert_eq!(
             build_clone_command("https://github.com/o/r", "/tmp/r", true),
-            "LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
+            "env LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
         );
     }
 
@@ -10982,8 +10982,68 @@ mod clone_command_tests {
     fn single_quotes_in_url_or_path_are_escaped() {
         assert_eq!(
             build_clone_command("https://h/o/it's", "/tmp/o'k", false),
-            "LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
+            "env LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
         );
+    }
+}
+
+#[cfg(test)]
+mod clone_credential_store_tests {
+    use crate::commands::credential_approve_payload;
+
+    #[test]
+    fn writes_the_line_based_credential_format() {
+        assert_eq!(
+            credential_approve_payload("https", "dev.azure.com", "org", "pat-1").as_deref(),
+            Some("protocol=https\nhost=dev.azure.com\nusername=org\npassword=pat-1\n")
+        );
+    }
+
+    #[test]
+    fn refuses_values_the_format_cannot_carry() {
+        assert_eq!(credential_approve_payload("https", "h", "u", "bad\nline"), None);
+        assert_eq!(credential_approve_payload("https", "h", "", "pat"), None);
+        assert_eq!(credential_approve_payload("https", "h", "u", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod clone_stderr_stream_tests {
+    //! Byte-for-byte shape of `git clone --progress` on a non-tty: progress
+    //! redraws end in `\r`, the final state of each phase and every message
+    //! end in `\n`.
+    use crate::commands::{parse_clone_progress, take_terminal_segments};
+
+    #[test]
+    fn progress_redraws_are_surfaced_before_the_line_completes() {
+        let mut buf = b"Cloning into 'r'...\nReceiving objects:   7% (1/13)\rReceiving objects:  15% (2/13)\rReceiving obj".to_vec();
+        let segs = take_terminal_segments(&mut buf);
+        assert_eq!(
+            segs,
+            vec![
+                ("Cloning into 'r'...".to_string(), true),
+                ("Receiving objects:   7% (1/13)".to_string(), false),
+                ("Receiving objects:  15% (2/13)".to_string(), false),
+            ]
+        );
+        assert_eq!(buf, b"Receiving obj".to_vec());
+        assert_eq!(parse_clone_progress(&segs[2].0).unwrap()["percent"], 15);
+
+        buf.extend_from_slice(b"ects: 100% (13/13), done.\n");
+        assert_eq!(
+            take_terminal_segments(&mut buf),
+            vec![("Receiving objects: 100% (13/13), done.".to_string(), true)]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_do_not_end_the_stream() {
+        let mut buf = b"fatal: bad path '\xff\xfe'\nfatal: Authentication failed for 'https://h/'\n".to_vec();
+        let segs = take_terminal_segments(&mut buf);
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].0.starts_with("fatal: bad path"));
+        assert_eq!(segs[1].0, "fatal: Authentication failed for 'https://h/'");
     }
 }
 

@@ -2714,20 +2714,64 @@ pub struct CloneCredentials {
 /// through env vars so no secret is written to disk.
 pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
 
-/// The shell command `clone_via_shell` runs. `LC_ALL=C` keeps git's messages
-/// in English so `classify_clone_failure` can read them whatever the user's
-/// locale; `-c credential.helper=` makes a retry with typed credentials use
-/// exactly those instead of whatever a keychain helper still holds for the
-/// host (a valid token for the wrong account is never rejected by the server,
-/// so the askpass would otherwise never be consulted).
+/// The shell command `clone_via_shell` runs. `env LC_ALL=C` keeps git's
+/// messages in English so `classify_clone_failure` can read them whatever the
+/// user's locale (`env` rather than a bare `VAR=… cmd` prefix so it also
+/// works under older fish); `-c credential.helper=` makes a retry with typed
+/// credentials use exactly those instead of whatever a keychain helper still
+/// holds for the host (a valid token for the wrong account is never rejected
+/// by the server, so the askpass would otherwise never be consulted). The
+/// success path then stores the credentials itself — see
+/// `credential_approve_payload`.
 pub fn build_clone_command(url: &str, target: &str, with_typed_credentials: bool) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let helper = if with_typed_credentials { " -c credential.helper=" } else { "" };
     format!(
-        "LC_ALL=C git{helper} clone --progress -- {} {}",
+        "env LC_ALL=C git{helper} clone --progress -- {} {}",
         quote(url),
         quote(target)
     )
+}
+
+/// What `git credential approve` reads on stdin after a clone that used typed
+/// credentials succeeded. Bypassing the helpers for the clone also skipped
+/// git's own store step, so without this the keychain stays in the state that
+/// made the first attempt fail and the new project can't fetch or push.
+/// `username` must be the one later lookups will carry — the URL's `user@`
+/// when it has one, else what was typed — or the stored entry is never found.
+/// `None` when a value can't travel in the line-based credential format.
+pub fn credential_approve_payload(
+    protocol: &str,
+    host: &str,
+    username: &str,
+    token: &str,
+) -> Option<String> {
+    let fields = [protocol, host, username, token];
+    if fields.iter().any(|f| f.is_empty() || f.contains(['\n', '\r', '\0'])) {
+        return None;
+    }
+    Some(format!(
+        "protocol={protocol}\nhost={host}\nusername={username}\npassword={token}\n"
+    ))
+}
+
+/// Split off the parts of git's stderr stream it has finished writing. A
+/// progress update ends in `\r` (git redraws one line in place); everything
+/// else ends in `\n`. Both count as a boundary so the progress bar moves
+/// while a phase is still in flight. Returns `(segment, ended_with_newline)`
+/// and leaves the unfinished tail in `buf`. Bytes that aren't UTF-8 are
+/// replaced rather than ending the read.
+pub fn take_terminal_segments(buf: &mut Vec<u8>) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\r' || b == b'\n' {
+            out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), b == b'\n'));
+            start = i + 1;
+        }
+    }
+    buf.drain(..start);
+    out
 }
 
 /// Turn a failed `git clone`'s stderr into the error the Add Project panel
@@ -2810,15 +2854,20 @@ async fn clone_via_shell(
     url: &str,
     target: &std::path::Path,
     host: &str,
+    url_user: Option<&str>,
     is_ssh: bool,
     credentials: Option<&CloneCredentials>,
 ) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
     use std::process::Stdio;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+
+    // Typed credentials only mean something over HTTP(S); the UI never offers
+    // them for SSH, but don't let a stray pair disturb an SSH clone.
+    let credentials = if is_ssh { None } else { credentials };
 
     let git_cmd = build_clone_command(url, &target.to_string_lossy(), credentials.is_some());
 
@@ -2877,14 +2926,30 @@ async fn clone_via_shell(
         .take()
         .ok_or_else(|| AppError::Other("no stderr handle".into()))?;
 
-    let mut lines = tokio::io::BufReader::new(stderr_handle).lines();
+    let mut stderr = stderr_handle;
+    let mut chunk = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(payload) = parse_clone_progress(&line) {
-            let _ = app.emit("clone://progress", payload);
+    loop {
+        let n = match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&chunk[..n]);
+        for (segment, ended_line) in take_terminal_segments(&mut pending) {
+            if let Some(payload) = parse_clone_progress(&segment) {
+                let _ = app.emit("clone://progress", payload);
+            }
+            // Keep whole lines for the failure classifier; the `\r`-redrawn
+            // progress fragments would only bury the message that matters.
+            if ended_line {
+                stderr_lines.push(segment);
+            }
         }
-        stderr_lines.push(line);
+    }
+    if !pending.is_empty() {
+        stderr_lines.push(String::from_utf8_lossy(&pending).into_owned());
     }
 
     let status = child
@@ -2893,11 +2958,45 @@ async fn clone_via_shell(
         .map_err(|e| AppError::Other(format!("git clone wait failed: {e}")))?;
 
     if status.success() {
+        if let Some(creds) = credentials {
+            let protocol = if url.to_ascii_lowercase().starts_with("http://") { "http" } else { "https" };
+            let username = url_user.unwrap_or(&creds.username);
+            if let Some(payload) = credential_approve_payload(protocol, host, username, &creds.token) {
+                approve_credentials_via_shell(&shell, &payload).await;
+            }
+        }
         return Ok(());
     }
 
     // Classify the error so the frontend can show the right panel.
     Err(classify_clone_failure(&stderr_lines, host, is_ssh))
+}
+
+/// Hand credentials to the user's own git helpers (the keychain on macOS)
+/// through the login shell, exactly as git does after a clone that prompted.
+/// Best effort: git itself ignores a helper that fails to store.
+async fn approve_credentials_via_shell(shell: &str, payload: &str) {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let mut child = match Command::new(shell)
+        .arg("-l")
+        .arg("-c")
+        .arg("git credential approve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+    let _ = child.wait().await;
 }
 
 #[tauri::command]
@@ -2934,6 +3033,7 @@ pub async fn clone_project(
         &url,
         &target_path,
         &parsed.host,
+        parsed.user.as_deref(),
         parsed.is_ssh,
         credentials.as_ref(),
     )

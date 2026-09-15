@@ -78,14 +78,17 @@ export function sshToHttps(url: string): string {
   // counterpart; the HTTPS form lives on dev.azure.com under `_git`, and Azure
   // would read a `.git` suffix as part of the repository name.
   const azure = url.match(
-    /^(?:ssh:\/\/)?[^@/]+@ssh\.dev\.azure\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/,
+    /^(?:ssh:\/\/)?[^@/]+@ssh\.dev\.azure\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/*$/,
   );
   if (azure) return `https://dev.azure.com/${azure[1]}/${azure[2]}/_git/${azure[3]}`;
   // Legacy visualstudio.com organisations: org@vs-ssh.visualstudio.com:v3/org/project/repo
   const vsts = url.match(
-    /^(?:ssh:\/\/)?[^@/]+@vs-ssh\.visualstudio\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/,
+    /^(?:ssh:\/\/)?[^@/]+@vs-ssh\.visualstudio\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/*$/,
   );
   if (vsts) return `https://${vsts[1]}.visualstudio.com/${vsts[2]}/_git/${vsts[3]}`;
+  // Anything else on Azure's SSH hosts has no HTTPS twin: leave it alone
+  // rather than hand back a URL on a host that serves no HTTPS at all.
+  if (/^(?:ssh:\/\/)?[^@/]+@(?:ssh\.dev\.azure\.com|vs-ssh\.visualstudio\.com)(?::|\/)/.test(url)) return url;
   // SCP style: git@github.com:owner/repo.git
   const sshScp = url.match(/^[^@/]+@([^:/]+):(.+)$/);
   if (sshScp) return `https://${sshScp[1]}/${sshScp[2]}`;
@@ -128,7 +131,6 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
   const [authUsername, setAuthUsername] = useState("");
   const [authToken, setAuthToken] = useState("");
   const [authRemember, setAuthRemember] = useState(true);
-  const [authLoading, setAuthLoading] = useState(false);
 
   // SSH key missing panel
   const [sshKeyMissingHost, setSshKeyMissingHost] = useState<string | null>(null);
@@ -155,9 +157,14 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
       if (saved) {
         setAuthUsername(saved.username);
         setAuthToken(saved.token);
+        return;
       }
+      // A URL that already names its user (Azure DevOps and Bitbucket clone
+      // URLs do) is what git will send, whatever is typed — show it.
+      const urlUser = parseGitUrl(cloneUrl)?.user;
+      if (urlUser) setAuthUsername((current) => current || urlUser);
     }).catch(() => {});
-  }, [authHost]);
+  }, [authHost, cloneUrl]);
 
   // ── Subscribe to clone progress events ─────────────────────────────
   useEffect(() => {
@@ -218,13 +225,18 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
     }
   }
 
-  async function handleClone(credentials?: { username: string; token: string }) {
+  type CloneOutcome =
+    | { kind: "ok" }
+    | { kind: "auth"; host: string }
+    | { kind: "ssh"; host: string }
+    | { kind: "error"; message: string };
+
+  /** The one clone call every path goes through, so the progress bar and the
+   *  disabled primary button cover a credentialed retry as much as a first try. */
+  async function runClone(credentials?: { username: string; token: string }): Promise<CloneOutcome> {
     setCloning(true);
     setCloneError(null);
     setCloneProgress(null);
-    setAuthHost(null);
-    setSshKeyMissingHost(null);
-
     try {
       const project = await ipc.cloneProject({
         path: cloneLocation.trim(),
@@ -233,19 +245,25 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
         credentials,
       });
       useProjectStore.setState({ current: project, loading: false });
+      return { kind: "ok" };
     } catch (err: unknown) {
       const auth = isAuthRequired(err);
+      if (auth) return { kind: "auth", host: auth.host };
       const ssh = isSshKeyMissing(err);
-      if (auth) {
-        setAuthHost(auth.host);
-      } else if (ssh) {
-        setSshKeyMissingHost(ssh.host);
-      } else {
-        setCloneError(String(err));
-      }
+      if (ssh) return { kind: "ssh", host: ssh.host };
+      return { kind: "error", message: String(err) };
     } finally {
       setCloning(false);
     }
+  }
+
+  async function handleClone() {
+    setAuthHost(null);
+    setSshKeyMissingHost(null);
+    const outcome = await runClone();
+    if (outcome.kind === "auth") setAuthHost(outcome.host);
+    else if (outcome.kind === "ssh") setSshKeyMissingHost(outcome.host);
+    else if (outcome.kind === "error") setCloneError(outcome.message);
   }
 
   function switchToHttps() {
@@ -256,30 +274,21 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
 
   async function handleAuthRetry() {
     if (!authHost) return;
-    const creds = { username: authUsername, token: authToken };
-    setAuthLoading(true);
-    setCloneError(null);
-    try {
-      const project = await ipc.cloneProject({
-        path: cloneLocation.trim(),
-        url: cloneUrl.trim(),
-        nameOverride: cloneName.trim() || undefined,
-        credentials: creds,
-      });
+    // The panel stays mounted through the retry, so a rejected token keeps
+    // what was typed instead of re-running the saved-credentials prefill.
+    const outcome = await runClone({ username: authUsername, token: authToken });
+    if (outcome.kind === "ok") {
       if (authRemember) {
         await ipc.saveGitCredentials(authHost, authUsername, authToken).catch(() => {});
       }
       setAuthHost(null);
-      useProjectStore.setState({ current: project, loading: false });
-    } catch (err: unknown) {
-      const auth = isAuthRequired(err);
-      if (auth) {
-        setCloneError("Authentication failed — check your credentials.");
-      } else {
-        setCloneError(String(err));
-      }
-    } finally {
-      setAuthLoading(false);
+    } else if (outcome.kind === "auth") {
+      setCloneError("Authentication failed — check your credentials.");
+    } else if (outcome.kind === "ssh") {
+      setAuthHost(null);
+      setSshKeyMissingHost(outcome.host);
+    } else {
+      setCloneError(outcome.message);
     }
   }
 
@@ -497,7 +506,14 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     ref={urlInputRef}
                     autoFocus
                     value={cloneUrl}
-                    onChange={(e) => setCloneUrl(e.target.value)}
+                    onChange={(e) => {
+                      setCloneUrl(e.target.value);
+                      // A different URL may mean a different host: the panels
+                      // and errors of the previous one no longer apply.
+                      setAuthHost(null);
+                      setSshKeyMissingHost(null);
+                      setCloneError(null);
+                    }}
                     placeholder="Paste a git remote URL…"
                     className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                   />
@@ -607,11 +623,11 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                 <button
                   type="button"
                   onClick={handleAuthRetry}
-                  disabled={authLoading || !authUsername || !authToken}
+                  disabled={cloning || !authUsername || !authToken}
                   className="rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition disabled:cursor-not-allowed disabled:opacity-40"
                   style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                 >
-                  {authLoading ? "Trying…" : "Try again"}
+                  {cloning ? "Trying…" : "Try again"}
                 </button>
               </div>
             )}

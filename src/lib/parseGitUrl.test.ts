@@ -109,6 +109,18 @@ describe("parseGitUrl", () => {
     expect(parseGitUrl("https://example.com/owner/..")).toBeNull();
   });
 
+  it("exposes the URL's user only when present", () => {
+    expect(parseGitUrl("https://github.com/owner/repo")?.user).toBeUndefined();
+    expect(parseGitUrl("https://org@dev.azure.com/org/project/_git/repo")?.user).toBe("org");
+    expect(parseGitUrl("https://jane%40corp@bitbucket.org/ws/repo.git")?.user).toBe("jane@corp");
+    expect(parseGitUrl("https://jane:secret@gitea.example.com/o/r")?.user).toBe("jane");
+    expect(parseGitUrl("git@github.com:owner/repo.git")?.user).toBe("git");
+  });
+
+  it("ignores a pasted BOM or NEL around the URL, as the Rust parser does", () => {
+    expect(parseGitUrl("\ufeffhttps://github.com/owner/repo\u0085")?.repo).toBe("repo");
+  });
+
   it("parses the Azure DevOps URL with the project omitted", () => {
     const r = parseGitUrl("https://dev.azure.com/org/_git/repo");
     expect(r).toMatchObject({ owner: "org", repo: "repo" });
@@ -201,6 +213,19 @@ describe("sshToHttps", () => {
   it("converts legacy visualstudio.com SSH to its HTTPS form", () => {
     expect(sshToHttps("org@vs-ssh.visualstudio.com:v3/org/project/repo")).toBe(
       "https://org.visualstudio.com/project/_git/repo",
+    );
+  });
+
+  it("tolerates trailing slashes on an Azure SSH URL", () => {
+    expect(sshToHttps("git@ssh.dev.azure.com:v3/org/project/repo//")).toBe(
+      "https://dev.azure.com/org/project/_git/repo",
+    );
+  });
+
+  it("leaves an unrecognised Azure SSH path alone rather than invent a dead HTTPS URL", () => {
+    expect(sshToHttps("git@ssh.dev.azure.com:v3/org/repo")).toBe("git@ssh.dev.azure.com:v3/org/repo");
+    expect(sshToHttps("git@ssh.dev.azure.com:v3/org/project/repo/extra")).toBe(
+      "git@ssh.dev.azure.com:v3/org/project/repo/extra",
     );
   });
 
