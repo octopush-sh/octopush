@@ -9,7 +9,7 @@
  *  - Progress bar updates with new { phase, percent, current, total } payload shape
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, cleanup } from "@testing-library/react";
 
 // ─── Mocks — must be declared before the component is imported ───────────────
 
@@ -297,7 +297,7 @@ describe("NewProjectFlow — AuthRequired error flow", () => {
     await waitFor(() => {
       expect(cloneProjectMock).toHaveBeenCalledTimes(2);
       const secondCall = cloneProjectMock.mock.calls[1][0];
-      expect(secondCall.credentials).toEqual({ username: "octocat", token: "ghp_secret" });
+      expect(secondCall.credentials).toEqual({ username: "octocat", token: "ghp_secret", remember: true });
     });
   });
 
@@ -359,6 +359,152 @@ describe("NewProjectFlow — AuthRequired error flow", () => {
       expect(cloneProjectMock).toHaveBeenCalledTimes(2);
     });
     expect(saveGitCredentialsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("NewProjectFlow — credentialed retry behaves like a clone", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cloneProjectMock.mockReset();
+    saveGitCredentialsMock.mockReset();
+    getSettingsMock.mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} });
+    saveGitCredentialsMock.mockResolvedValue(undefined);
+  });
+
+  async function cloneUrl(url: string) {
+    render_flow();
+    fireEvent.click(screen.getByRole("button", { name: /clone/i }));
+    const urlInput = await screen.findByPlaceholderText(/paste a git remote url/i);
+    fireEvent.change(urlInput, { target: { value: url } });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /clone & open/i })).not.toBeDisabled();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+  }
+
+  async function typeCredentials(username: string, token: string) {
+    await waitFor(() => screen.getByText(/USERNAME/));
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: username } });
+    fireEvent.change(screen.getByLabelText(/personal access token/i), { target: { value: token } });
+  }
+
+  it("disables the primary button and streams progress while the retry clones", async () => {
+    let finishClone: (project: unknown) => void = () => {};
+    cloneProjectMock
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishClone = resolve; }));
+
+    await cloneUrl("https://github.com/octocat/private.git");
+    await typeCredentials("octocat", "ghp_secret");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    });
+
+    expect(screen.getByRole("button", { name: /cloning…/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /trying…/i })).toBeDisabled();
+    expect(screen.getByPlaceholderText(/paste a git remote url/i)).toBeDisabled();
+    expect(screen.getByLabelText(/username/i)).toBeDisabled();
+    expect(screen.getByLabelText(/personal access token/i)).toBeDisabled();
+    await waitFor(() => expect(registeredListeners.has("clone://progress")).toBe(true));
+    await act(async () => {
+      registeredListeners.get("clone://progress")!({
+        payload: { phase: "Receiving objects", percent: 42, current: 42, total: 100 },
+      });
+    });
+    expect(screen.getByText(/Receiving objects · 42\/100 · 42%/)).toBeInTheDocument();
+
+    await act(async () => {
+      finishClone({ id: "proj-1", name: "private", path: "/tmp/private" });
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/private repository/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it("a rejected retry keeps the typed credentials and the panel", async () => {
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: { "github.com": { username: "saved", token: "saved-token" } },
+    });
+    cloneProjectMock
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }))
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }));
+
+    await cloneUrl("https://github.com/octocat/private.git");
+    await waitFor(() => {
+      expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("saved");
+    });
+    fireEvent.change(screen.getByLabelText(/personal access token/i), { target: { value: "corrected" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    });
+
+    await waitFor(() => screen.getByText(/authentication failed — check your credentials/i));
+    expect((screen.getByLabelText(/personal access token/i) as HTMLInputElement).value).toBe("corrected");
+    expect(screen.getByText(/private repository/i)).toBeInTheDocument();
+  });
+
+  it("editing the URL dismisses the credential panel", async () => {
+    cloneProjectMock.mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }));
+    await cloneUrl("https://github.com/octocat/private.git");
+    await waitFor(() => screen.getByText(/private repository/i));
+
+    fireEvent.change(screen.getByPlaceholderText(/paste a git remote url/i), {
+      target: { value: "https://gitlab.com/octocat/private.git" },
+    });
+    expect(screen.queryByText(/private repository/i)).not.toBeInTheDocument();
+  });
+
+  it("switching hosts never offers the previous host's credentials", async () => {
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: { "github.com": { username: "alice", token: "ghp_alice" } },
+    });
+    cloneProjectMock
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }))
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "dev.azure.com" }));
+
+    await cloneUrl("https://github.com/alice/private.git");
+    await waitFor(() => {
+      expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("alice");
+    });
+
+    fireEvent.change(screen.getByPlaceholderText(/paste a git remote url/i), {
+      target: { value: "https://org@dev.azure.com/org/project/_git/repo" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+
+    await waitFor(() => screen.getByText(/sign in to dev\.azure\.com/i));
+    expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("org");
+    expect((screen.getByLabelText(/personal access token/i) as HTMLInputElement).value).toBe("");
+    expect(screen.getByRole("button", { name: /try again/i })).toBeDisabled();
+  });
+
+  it("prefills the username from the URL's user@ when nothing is saved", async () => {
+    cloneProjectMock.mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "dev.azure.com" }));
+    await cloneUrl("https://org@dev.azure.com/org/project/_git/repo");
+    await waitFor(() => {
+      expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("org");
+    });
+  });
+
+  it("hints the GitHub token shape only on github.com", async () => {
+    cloneProjectMock.mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "dev.azure.com" }));
+    await cloneUrl("https://dev.azure.com/org/project/_git/repo");
+    await waitFor(() => screen.getByText(/USERNAME/));
+    expect((screen.getByLabelText(/personal access token/i) as HTMLInputElement).placeholder).toBe("your token");
+
+    cleanup();
+    cloneProjectMock.mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }));
+    await cloneUrl("https://github.com/octocat/private.git");
+    await waitFor(() => screen.getByText(/USERNAME/));
+    expect((screen.getByLabelText(/personal access token/i) as HTMLInputElement).placeholder).toBe("ghp_…");
   });
 });
 

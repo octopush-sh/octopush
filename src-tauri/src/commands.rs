@@ -2702,6 +2702,185 @@ pub async fn delete_terminal(
 pub struct CloneCredentials {
     pub username: String,
     pub token: String,
+    /// The panel's "Remember for {host}": when set, a successful clone hands
+    /// the credential to git's own helpers (the keychain) as well as to
+    /// Octopush's settings. Unset, nothing is persisted anywhere.
+    #[serde(default = "default_remember")]
+    pub remember: bool,
+}
+
+fn default_remember() -> bool {
+    true
+}
+
+/// The `GIT_ASKPASS` helper handed to `git clone` when the user typed
+/// credentials into the Add Project panel. Git runs it once per prompt with
+/// the prompt text as `$1` — `Username for 'https://host': ` or, when the URL
+/// already carries `user@` (Azure DevOps does this), straight to
+/// `Password for 'https://user@host': ` — and reads the answer from stdout.
+/// The patterns are anchored to the start because the password prompt embeds
+/// the username, which may itself contain "username". The values travel
+/// through env vars so no secret is written to disk. Answering the password
+/// prompt also creates the file named by `OCTOPUSH_GIT_ASKPASS_USED`, so the
+/// caller stores the credential only if git actually used it. The marker
+/// write sits in a subshell: `:` is a special builtin, and a failed
+/// redirection on one would end the script before the token is printed.
+pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) ( : > \"${OCTOPUSH_GIT_ASKPASS_USED:-/dev/null}\" ) 2>/dev/null; printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+
+/// `url` with `username@` inserted in front of the host, for an HTTP(S) URL
+/// that names no user. The origin remote of a clone made this way carries the
+/// account, so every later credential lookup is exact even when the keychain
+/// holds another account for the same host — the multi-account case the
+/// helper bypass in `build_clone_command` exists for. `None` when the URL
+/// already has a user or isn't HTTP(S).
+pub fn url_with_user(url: &str, username: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    if !matches!(url[..scheme_end].to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|i| authority_start + i)
+        .unwrap_or(url.len());
+    if url[authority_start..authority_end].contains('@') || username.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{}@{}",
+        &url[..authority_start],
+        urlencoding::encode(username),
+        &url[authority_start..]
+    ))
+}
+
+/// The shell command `clone_via_shell` runs. `env LC_ALL=C` keeps git's
+/// messages in English so `classify_clone_failure` can read them whatever the
+/// user's locale (`env` rather than a bare `VAR=… cmd` prefix so it also
+/// works under older fish); `-c credential.helper=` makes a retry with typed
+/// credentials use exactly those instead of whatever a keychain helper still
+/// holds for the host (a valid token for the wrong account is never rejected
+/// by the server, so the askpass would otherwise never be consulted). The
+/// success path then stores the credentials itself — see
+/// `credential_approve_payload`.
+pub fn build_clone_command(url: &str, target: &str, with_typed_credentials: bool) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let helper = if with_typed_credentials { " -c credential.helper=" } else { "" };
+    format!(
+        "env LC_ALL=C git{helper} clone --progress -- {} {}",
+        quote(url),
+        quote(target)
+    )
+}
+
+/// What `git credential approve` reads on stdin after a clone that used typed
+/// credentials succeeded. Bypassing the helpers for the clone also skipped
+/// git's own store step, so without this the keychain stays in the state that
+/// made the first attempt fail and the new project can't fetch or push.
+/// `username` must be the one later lookups will carry — the URL's `user@`
+/// when it has one, else what was typed — or the stored entry is never found.
+/// `None` when a value can't travel in the line-based credential format.
+pub fn credential_approve_payload(
+    protocol: &str,
+    host: &str,
+    username: &str,
+    token: &str,
+) -> Option<String> {
+    let fields = [protocol, host, username, token];
+    if fields.iter().any(|f| f.is_empty() || f.contains(['\n', '\r', '\0'])) {
+        return None;
+    }
+    Some(format!(
+        "protocol={protocol}\nhost={host}\nusername={username}\npassword={token}\n"
+    ))
+}
+
+/// Split off the parts of git's stderr stream it has finished writing. A
+/// progress update ends in `\r` (git redraws one line in place); everything
+/// else ends in `\n`. Both count as a boundary so the progress bar moves
+/// while a phase is still in flight. Returns `(segment, ended_with_newline)`
+/// and leaves the unfinished tail in `buf`. Bytes that aren't UTF-8 are
+/// replaced rather than ending the read.
+pub fn take_terminal_segments(buf: &mut Vec<u8>) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        match buf[i] {
+            b'\n' => {
+                out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), true));
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                // `\r\n` (ssh writes its lines that way) is one line ending;
+                // a `\r` at the very end can't be told apart yet — keep it.
+                if i + 1 == buf.len() {
+                    break;
+                }
+                let crlf = buf[i + 1] == b'\n';
+                out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), crlf));
+                i += if crlf { 2 } else { 1 };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    buf.drain(..start);
+    out
+}
+
+/// The progress redraw `take_terminal_segments` is still holding back: git
+/// writes each redraw as one chunk ending in `\r`, so without this the bar
+/// would show each percentage only when the next one arrived. The bytes stay
+/// in `buf`; the same fragment is surfaced again once its terminator is
+/// known, which the progress bar doesn't mind.
+pub fn held_back_redraw(buf: &[u8]) -> Option<String> {
+    match buf.split_last() {
+        Some((b'\r', fragment)) => Some(String::from_utf8_lossy(fragment).into_owned()),
+        _ => None,
+    }
+}
+
+/// Turn a failed `git clone`'s stderr into the error the Add Project panel
+/// keys on: `SshKeyMissing` when the agent has no key for the host,
+/// `AuthRequired` for anything git would have asked credentials for — a 401
+/// after credentials surfaces as git's own `Authentication failed for` on
+/// GitHub, GitLab, Bitbucket, Azure DevOps and the Gitea family alike — and
+/// otherwise the last few lines verbatim.
+pub fn classify_clone_failure(stderr_lines: &[String], host: &str, is_ssh: bool) -> AppError {
+    let full_stderr = stderr_lines.join("\n");
+
+    if full_stderr.contains("Permission denied (publickey)")
+        || full_stderr.contains("Could not read from remote repository")
+        || (full_stderr.contains("Permission denied") && is_ssh)
+    {
+        return AppError::SshKeyMissing { host: host.to_string() };
+    }
+
+    if full_stderr.contains("Authentication failed")
+        || full_stderr.contains("terminal prompts disabled")
+        || full_stderr.contains("could not read Username")
+        || full_stderr.contains("could not read Password")
+        || (full_stderr.contains("Repository not found") && !is_ssh)
+    {
+        return AppError::AuthRequired { host: host.to_string() };
+    }
+
+    // Build a context string from the last few non-empty stderr lines.
+    let context: String = stderr_lines
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    AppError::Other(format!("git clone failed:\n{context}"))
 }
 
 /// Parse a single stderr line from `git clone --progress` into structured
@@ -2743,28 +2922,31 @@ async fn clone_via_shell(
     url: &str,
     target: &std::path::Path,
     host: &str,
+    url_user: Option<&str>,
     is_ssh: bool,
     credentials: Option<&CloneCredentials>,
 ) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
     use std::process::Stdio;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
 
-    // Escape target path for use in the shell command.
-    let target_str = target.to_string_lossy();
-    // Use printf '%s' style quoting — single-quote the path, escaping any
-    // single quotes within by ending the quoted string, adding an escaped
-    // single quote, then reopening.
-    let target_escaped = target_str.replace('\'', "'\\''");
-    let url_escaped = url.replace('\'', "'\\''");
+    // Typed credentials only mean something over HTTP(S); the UI never offers
+    // them for SSH, but don't let a stray pair disturb an SSH clone.
+    let credentials = if is_ssh { None } else { credentials };
 
-    let git_cmd = format!(
-        "git clone --progress -- '{}' '{}'",
-        url_escaped, target_escaped
-    );
+    // With typed credentials and a URL that names no user, clone from the URL
+    // with the username embedded (see `url_with_user`); git then asks only
+    // for the password, and the account is on record in the origin remote.
+    let clone_url: String = match (credentials, url_user) {
+        (Some(creds), None) => {
+            url_with_user(url, creds.username.trim()).unwrap_or_else(|| url.to_string())
+        }
+        _ => url.to_string(),
+    };
+    let git_cmd = build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
 
     // Build environment overrides.
     let mut env_overrides: Vec<(String, String)> = vec![
@@ -2773,15 +2955,16 @@ async fn clone_via_shell(
     ];
 
     // Askpass script path — only created when credentials are provided.
-    // We hold an `Option<tempfile::NamedTempFile>` so the file lives until
-    // after `child.wait()` completes, then is auto-deleted on drop.
-    let _askpass_tmp: Option<tempfile::NamedTempFile>;
+    // We hold an `Option<tempfile::TempPath>` so the file lives until after
+    // `child.wait()` completes, then is auto-deleted on drop. The write
+    // handle is closed first: Linux refuses to exec a file that is still open
+    // for writing (ETXTBSY).
+    let _askpass_tmp: Option<tempfile::TempPath>;
+    // Created by the askpass script when git actually asked it for the
+    // password — the only case in which storing the credential makes sense.
+    let mut askpass_marker: Option<std::path::PathBuf> = None;
 
     if let Some(creds) = credentials {
-        let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n"
-        );
-
         let mut tmp = tempfile::Builder::new()
             .prefix("octopush-askpass-")
             .suffix(".sh")
@@ -2789,18 +2972,25 @@ async fn clone_via_shell(
             .map_err(|e| AppError::Other(format!("failed to create askpass tempfile: {e}")))?;
 
         use std::io::Write as _;
-        tmp.write_all(script.as_bytes())
+        tmp.write_all(ASKPASS_SCRIPT.as_bytes())
             .map_err(|e| AppError::Other(format!("failed to write askpass script: {e}")))?;
 
         // Make executable.
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
             .map_err(|e| AppError::Other(format!("failed to chmod askpass: {e}")))?;
 
-        let askpass_path = tmp.path().to_string_lossy().to_string();
-        env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.clone()));
+        let tmp = tmp.into_temp_path();
+        let askpass_path = tmp.to_string_lossy().to_string();
+        let marker = std::path::PathBuf::from(format!("{askpass_path}.used"));
+        env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.trim().to_string()));
         env_overrides.push(("OCTOPUSH_GIT_TOKEN".into(), creds.token.clone()));
         env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
+        env_overrides.push((
+            "OCTOPUSH_GIT_ASKPASS_USED".into(),
+            marker.to_string_lossy().to_string(),
+        ));
 
+        askpass_marker = Some(marker);
         _askpass_tmp = Some(tmp);
     } else {
         _askpass_tmp = None;
@@ -2822,14 +3012,36 @@ async fn clone_via_shell(
         .take()
         .ok_or_else(|| AppError::Other("no stderr handle".into()))?;
 
-    let mut lines = tokio::io::BufReader::new(stderr_handle).lines();
+    let mut stderr = stderr_handle;
+    let mut chunk = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(payload) = parse_clone_progress(&line) {
-            let _ = app.emit("clone://progress", payload);
+    loop {
+        let n = match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&chunk[..n]);
+        for (segment, ended_line) in take_terminal_segments(&mut pending) {
+            if let Some(payload) = parse_clone_progress(&segment) {
+                let _ = app.emit("clone://progress", payload);
+            }
+            // Keep whole lines for the failure classifier; the `\r`-redrawn
+            // progress fragments would only bury the message that matters.
+            if ended_line {
+                stderr_lines.push(segment);
+            }
         }
-        stderr_lines.push(line);
+        if let Some(fragment) = held_back_redraw(&pending) {
+            if let Some(payload) = parse_clone_progress(&fragment) {
+                let _ = app.emit("clone://progress", payload);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let tail = String::from_utf8_lossy(&pending);
+        stderr_lines.push(tail.trim_end_matches('\r').to_string());
     }
 
     let status = child
@@ -2837,45 +3049,63 @@ async fn clone_via_shell(
         .await
         .map_err(|e| AppError::Other(format!("git clone wait failed: {e}")))?;
 
+    let askpass_answered = askpass_marker
+        .as_deref()
+        .map(|m| {
+            let used = m.exists();
+            let _ = std::fs::remove_file(m);
+            used
+        })
+        .unwrap_or(false);
+
     if status.success() {
+        if let Some(creds) = credentials {
+            if creds.remember && askpass_answered {
+                let protocol = if url.to_ascii_lowercase().starts_with("http://") { "http" } else { "https" };
+                let username = url_user.unwrap_or(creds.username.trim());
+                if let Some(payload) = credential_approve_payload(protocol, host, username, &creds.token) {
+                    approve_credentials_via_shell(&shell, &payload).await;
+                }
+            }
+        }
         return Ok(());
     }
 
-    // Build a context string from the last few non-empty stderr lines.
-    let context: String = stderr_lines
-        .iter()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let full_stderr = stderr_lines.join("\n");
-
     // Classify the error so the frontend can show the right panel.
-    if full_stderr.contains("Permission denied (publickey)")
-        || full_stderr.contains("Could not read from remote repository")
-        || (full_stderr.contains("Permission denied") && is_ssh)
-    {
-        return Err(AppError::SshKeyMissing { host: host.to_string() });
-    }
+    Err(classify_clone_failure(&stderr_lines, host, is_ssh))
+}
 
-    if full_stderr.contains("Authentication failed")
-        || full_stderr.contains("terminal prompts disabled")
-        || full_stderr.contains("could not read Username")
-        || full_stderr.contains("could not read Password")
-        || (full_stderr.contains("Repository not found") && !is_ssh)
-    {
-        return Err(AppError::AuthRequired { host: host.to_string() });
-    }
+/// Hand credentials to the user's own git helpers (the keychain on macOS)
+/// through the login shell, exactly as git does after a clone that prompted.
+/// Best effort, as git's own store step is: a helper that fails or hangs
+/// (a locked keychain dialog, say) must not hold the finished clone hostage.
+async fn approve_credentials_via_shell(shell: &str, payload: &str) {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
 
-    Err(AppError::Other(format!(
-        "git clone failed:\n{context}"
-    )))
+    let run = async {
+        let mut child = Command::new(shell)
+            .arg("-l")
+            .arg("-c")
+            .arg("git credential approve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.as_bytes()).await?;
+            stdin.shutdown().await?;
+        }
+        child.wait().await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), run).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => tracing::warn!("git credential approve exited with {status}"),
+        Ok(Err(e)) => tracing::warn!("git credential approve could not run: {e}"),
+        Err(_) => tracing::warn!("git credential approve timed out; credential not stored"),
+    }
 }
 
 #[tauri::command]
@@ -2912,6 +3142,7 @@ pub async fn clone_project(
         &url,
         &target_path,
         &parsed.host,
+        parsed.user.as_deref(),
         parsed.is_ssh,
         credentials.as_ref(),
     )

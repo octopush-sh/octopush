@@ -10884,3 +10884,332 @@ mod search_word_boundary {
         assert_eq!(find_match("run", "run", 99, true), None);
     }
 }
+
+#[cfg(test)]
+mod clone_askpass_tests {
+    //! The askpass helper turns the credentials typed into the Add Project
+    //! panel into answers for git's Username/Password prompts. Run it exactly
+    //! as git does — as an executable, one prompt per invocation — so the test
+    //! fails on anything that changes what the server actually receives.
+    use crate::commands::ASKPASS_SCRIPT;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn ask(prompt: &str, username: &str, token: &str) -> String {
+        ask_env(prompt, username, token, &[])
+    }
+
+    fn ask_env(prompt: &str, username: &str, token: &str, extra: &[(&str, &str)]) -> String {
+        let mut tmp = tempfile::Builder::new()
+            .prefix("octopush-askpass-test-")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap();
+        std::io::Write::write_all(&mut tmp, ASKPASS_SCRIPT.as_bytes()).unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Same as production: close the write handle before exec (Linux ETXTBSY).
+        let tmp = tmp.into_temp_path();
+        let out = std::process::Command::new(&tmp)
+            .arg(prompt)
+            .env("OCTOPUSH_GIT_USERNAME", username)
+            .env("OCTOPUSH_GIT_TOKEN", token)
+            .envs(extra.iter().copied())
+            .output()
+            .expect("askpass script must be directly executable");
+        assert!(
+            out.status.success(),
+            "askpass exited {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn answers_the_username_prompt_with_the_typed_username() {
+        assert_eq!(ask("Username for 'https://dev.azure.com': ", "jane", "pat-1"), "jane");
+    }
+
+    #[test]
+    fn answers_the_password_prompt_with_the_typed_token() {
+        // A URL that already carries `user@` (Azure DevOps' default clone URL)
+        // skips the username prompt and asks for the password straight away.
+        assert_eq!(ask("Password for 'https://org@dev.azure.com': ", "jane", "pat-1"), "pat-1");
+    }
+
+    #[test]
+    fn a_username_containing_username_does_not_hijack_the_password_prompt() {
+        // The password prompt embeds the username, so the match must be
+        // anchored to the prompt's own first word.
+        assert_eq!(
+            ask("Password for 'https://myusername@github.com': ", "myusername", "pat-1"),
+            "pat-1"
+        );
+        assert_eq!(
+            ask("Username for 'https://git.password.dev': ", "jane", "pat-1"),
+            "jane"
+        );
+    }
+
+    #[test]
+    fn passes_awkward_token_characters_through_verbatim() {
+        let token = "a%sb $HOME 'q' \"dq\" \\n 100%";
+        assert_eq!(ask("Password for 'https://github.com': ", "jane", token), token);
+    }
+
+    #[test]
+    fn records_that_the_password_prompt_was_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("askpass.used");
+        let env = [("OCTOPUSH_GIT_ASKPASS_USED", marker.to_str().unwrap())];
+        assert_eq!(ask_env("Username for 'https://h': ", "jane", "pat-1", &env), "jane");
+        assert!(!marker.exists(), "the username prompt alone proves nothing");
+        assert_eq!(ask_env("Password for 'https://jane@h': ", "jane", "pat-1", &env), "pat-1");
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn an_unwritable_marker_never_costs_git_the_password() {
+        let env = [("OCTOPUSH_GIT_ASKPASS_USED", "/nonexistent-dir/askpass.used")];
+        assert_eq!(ask_env("Password for 'https://jane@h': ", "jane", "pat-1", &env), "pat-1");
+    }
+
+    #[test]
+    fn stays_silent_for_prompts_it_does_not_understand() {
+        // Never leak the token into a prompt that isn't one of git's two.
+        assert_eq!(ask("Passphrase for key '/Users/jane/.ssh/id_ed25519': ", "jane", "pat-1"), "");
+    }
+}
+
+#[cfg(test)]
+mod clone_command_tests {
+    use crate::commands::build_clone_command;
+
+    #[test]
+    fn first_attempt_uses_the_users_helpers_in_a_fixed_locale() {
+        assert_eq!(
+            build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false),
+            "env LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
+        );
+    }
+
+    #[test]
+    fn a_retry_with_typed_credentials_bypasses_stored_helpers() {
+        assert_eq!(
+            build_clone_command("https://github.com/o/r", "/tmp/r", true),
+            "env LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
+        );
+    }
+
+    #[test]
+    fn a_typed_username_is_embedded_in_a_url_that_names_none() {
+        use crate::commands::url_with_user;
+        assert_eq!(
+            url_with_user("https://github.com/o/r.git", "alice").as_deref(),
+            Some("https://alice@github.com/o/r.git")
+        );
+        assert_eq!(
+            url_with_user("http://gitea.corp:3000/o/r", "jane@corp").as_deref(),
+            Some("http://jane%40corp@gitea.corp:3000/o/r")
+        );
+        assert_eq!(url_with_user("https://org@dev.azure.com/o/p/_git/r", "x"), None);
+        assert_eq!(url_with_user("git@github.com:o/r.git", "alice"), None);
+        assert_eq!(url_with_user("ssh://git@github.com/o/r", "alice"), None);
+        assert_eq!(url_with_user("https://github.com/o/r", ""), None);
+    }
+
+    #[test]
+    fn single_quotes_in_url_or_path_are_escaped() {
+        assert_eq!(
+            build_clone_command("https://h/o/it's", "/tmp/o'k", false),
+            "env LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clone_credential_store_tests {
+    use crate::commands::credential_approve_payload;
+
+    #[test]
+    fn writes_the_line_based_credential_format() {
+        assert_eq!(
+            credential_approve_payload("https", "dev.azure.com", "org", "pat-1").as_deref(),
+            Some("protocol=https\nhost=dev.azure.com\nusername=org\npassword=pat-1\n")
+        );
+    }
+
+    #[test]
+    fn refuses_values_the_format_cannot_carry() {
+        assert_eq!(credential_approve_payload("https", "h", "u", "bad\nline"), None);
+        assert_eq!(credential_approve_payload("https", "h", "", "pat"), None);
+        assert_eq!(credential_approve_payload("https", "h", "u", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod clone_stderr_stream_tests {
+    //! Byte-for-byte shape of `git clone --progress` on a non-tty: progress
+    //! redraws end in `\r`, the final state of each phase and every message
+    //! end in `\n`.
+    use crate::commands::{parse_clone_progress, take_terminal_segments};
+
+    #[test]
+    fn progress_redraws_are_surfaced_before_the_line_completes() {
+        let mut buf = b"Cloning into 'r'...\nReceiving objects:   7% (1/13)\rReceiving objects:  15% (2/13)\rReceiving obj".to_vec();
+        let segs = take_terminal_segments(&mut buf);
+        assert_eq!(
+            segs,
+            vec![
+                ("Cloning into 'r'...".to_string(), true),
+                ("Receiving objects:   7% (1/13)".to_string(), false),
+                ("Receiving objects:  15% (2/13)".to_string(), false),
+            ]
+        );
+        assert_eq!(buf, b"Receiving obj".to_vec());
+        assert_eq!(parse_clone_progress(&segs[2].0).unwrap()["percent"], 15);
+
+        buf.extend_from_slice(b"ects: 100% (13/13), done.\n");
+        assert_eq!(
+            take_terminal_segments(&mut buf),
+            vec![("Receiving objects: 100% (13/13), done.".to_string(), true)]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn crlf_lines_are_whole_lines_even_across_a_chunk_boundary() {
+        // ssh writes `\r\n`; the classifier must still see those lines.
+        let mut buf = b"git@github.com: Permission denied (publickey).\r".to_vec();
+        assert!(take_terminal_segments(&mut buf).is_empty(), "a trailing CR waits for the next byte");
+        buf.extend_from_slice(b"\nfatal: Could not read from remote repository.\r\n");
+        assert_eq!(
+            take_terminal_segments(&mut buf),
+            vec![
+                ("git@github.com: Permission denied (publickey).".to_string(), true),
+                ("fatal: Could not read from remote repository.".to_string(), true),
+            ]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_held_back_redraw_is_still_shown_as_progress() {
+        use crate::commands::held_back_redraw;
+        let mut buf = b"Receiving objects:  46% (6/13)\r".to_vec();
+        assert!(take_terminal_segments(&mut buf).is_empty());
+        let fragment = held_back_redraw(&buf).unwrap();
+        assert_eq!(parse_clone_progress(&fragment).unwrap()["percent"], 46);
+        assert_eq!(held_back_redraw(b"Receiving obj"), None);
+        assert_eq!(held_back_redraw(b""), None);
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_do_not_end_the_stream() {
+        let mut buf = b"fatal: bad path '\xff\xfe'\nfatal: Authentication failed for 'https://h/'\n".to_vec();
+        let segs = take_terminal_segments(&mut buf);
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].0.starts_with("fatal: bad path"));
+        assert_eq!(segs[1].0, "fatal: Authentication failed for 'https://h/'");
+    }
+}
+
+#[cfg(test)]
+mod clone_failure_classification_tests {
+    //! stderr shapes observed live (English locale, wrong or missing PAT)
+    //! against github.com, dev.azure.com, gitlab.com, bitbucket.org and
+    //! codeberg.org — the decisive `fatal: Authentication failed for` line is
+    //! git's own, so it does not depend on the host.
+    use crate::commands::classify_clone_failure;
+    use crate::error::AppError;
+
+    fn classify(lines: &[&str], host: &str, is_ssh: bool) -> AppError {
+        let owned: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        classify_clone_failure(&owned, host, is_ssh)
+    }
+
+    fn is_auth_required(e: &AppError, host: &str) -> bool {
+        matches!(e, AppError::AuthRequired { host: h } if h == host)
+    }
+
+    #[test]
+    fn a_rejected_token_asks_for_credentials_on_every_host() {
+        let cases: &[(&str, &[&str])] = &[
+            ("github.com", &[
+                "remote: Invalid username or token. Password authentication is not supported for Git operations.",
+                "fatal: Authentication failed for 'https://github.com/o/r/'",
+            ]),
+            ("dev.azure.com", &["fatal: Authentication failed for 'https://dev.azure.com/org/project/_git/repo/'"]),
+            ("gitlab.com", &[
+                "remote: HTTP Basic: Access denied. The provided password or token is incorrect or your account has 2FA enabled and you must use a personal access token instead of a password.",
+                "fatal: Authentication failed for 'https://gitlab.com/o/r.git/'",
+            ]),
+            ("bitbucket.org", &[
+                "remote: You may not have access to this repository or it no longer exists in this workspace.",
+                "fatal: Authentication failed for 'https://bitbucket.org/o/r.git/'",
+            ]),
+            ("codeberg.org", &[
+                "remote: Credentials are incorrect or have expired.",
+                "fatal: Authentication failed for 'https://codeberg.org/o/r/'",
+            ]),
+        ];
+        for (host, lines) in cases {
+            assert!(is_auth_required(&classify(lines, host, false), host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_missing_credential_asks_for_credentials_for_both_prompt_shapes() {
+        let e = classify(
+            &["fatal: could not read Username for 'https://dev.azure.com': terminal prompts disabled"],
+            "dev.azure.com", false,
+        );
+        assert!(is_auth_required(&e, "dev.azure.com"));
+        // The `org@` clone URL Azure hands out goes straight to the password.
+        let e = classify(
+            &["fatal: could not read Password for 'https://org@dev.azure.com': terminal prompts disabled"],
+            "dev.azure.com", false,
+        );
+        assert!(is_auth_required(&e, "dev.azure.com"));
+    }
+
+    #[test]
+    fn a_private_github_repo_reads_as_not_found_and_still_asks() {
+        let e = classify(
+            &["remote: Repository not found.", "fatal: repository 'https://github.com/o/secret/' not found"],
+            "github.com", false,
+        );
+        assert!(is_auth_required(&e, "github.com"));
+    }
+
+    #[test]
+    fn a_missing_ssh_key_gets_the_ssh_panel() {
+        let e = classify(
+            &[
+                "git@ssh.dev.azure.com: Permission denied (publickey).",
+                "fatal: Could not read from remote repository.",
+                "",
+                "Please make sure you have the correct access rights",
+            ],
+            "ssh.dev.azure.com", true,
+        );
+        assert!(matches!(e, AppError::SshKeyMissing { host } if host == "ssh.dev.azure.com"));
+    }
+
+    #[test]
+    fn anything_else_surfaces_the_last_lines_verbatim() {
+        let e = classify(
+            &[
+                "Cloning into 'r'...",
+                "fatal: repository 'https://dev.azure.com/no-such-org/p/_git/r/' not found",
+            ],
+            "dev.azure.com", false,
+        );
+        match e {
+            AppError::Other(msg) => {
+                assert!(msg.starts_with("git clone failed:\n"), "{msg}");
+                assert!(msg.contains("no-such-org"), "{msg}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}
