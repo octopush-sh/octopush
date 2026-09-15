@@ -75,14 +75,15 @@ function isSshKeyMissing(err: unknown): { host: string } | null {
  */
 export function sshToHttps(url: string): string {
   // Azure DevOps uses a dedicated SSH host and a `v3/` path that has no HTTPS
-  // counterpart; the HTTPS form lives on dev.azure.com under `_git`.
+  // counterpart; the HTTPS form lives on dev.azure.com under `_git`, and Azure
+  // would read a `.git` suffix as part of the repository name.
   const azure = url.match(
-    /^(?:ssh:\/\/)?[^@/]+@ssh\.dev\.azure\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)\/?$/,
+    /^(?:ssh:\/\/)?[^@/]+@ssh\.dev\.azure\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/,
   );
   if (azure) return `https://dev.azure.com/${azure[1]}/${azure[2]}/_git/${azure[3]}`;
   // Legacy visualstudio.com organisations: org@vs-ssh.visualstudio.com:v3/org/project/repo
   const vsts = url.match(
-    /^(?:ssh:\/\/)?[^@/]+@vs-ssh\.visualstudio\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)\/?$/,
+    /^(?:ssh:\/\/)?[^@/]+@vs-ssh\.visualstudio\.com(?::\d+)?[:/]v3\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/,
   );
   if (vsts) return `https://${vsts[1]}.visualstudio.com/${vsts[2]}/_git/${vsts[3]}`;
   // SCP style: git@github.com:owner/repo.git

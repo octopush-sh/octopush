@@ -2709,8 +2709,67 @@ pub struct CloneCredentials {
 /// the prompt text as `$1` — `Username for 'https://host': ` or, when the URL
 /// already carries `user@` (Azure DevOps does this), straight to
 /// `Password for 'https://user@host': ` — and reads the answer from stdout.
-/// The values travel through env vars so no secret is written to disk.
-pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  *[Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  *[Pp]assword*) printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+/// The patterns are anchored to the start because the password prompt embeds
+/// the username, which may itself contain "username". The values travel
+/// through env vars so no secret is written to disk.
+pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+
+/// The shell command `clone_via_shell` runs. `LC_ALL=C` keeps git's messages
+/// in English so `classify_clone_failure` can read them whatever the user's
+/// locale; `-c credential.helper=` makes a retry with typed credentials use
+/// exactly those instead of whatever a keychain helper still holds for the
+/// host (a valid token for the wrong account is never rejected by the server,
+/// so the askpass would otherwise never be consulted).
+pub fn build_clone_command(url: &str, target: &str, with_typed_credentials: bool) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let helper = if with_typed_credentials { " -c credential.helper=" } else { "" };
+    format!(
+        "LC_ALL=C git{helper} clone --progress -- {} {}",
+        quote(url),
+        quote(target)
+    )
+}
+
+/// Turn a failed `git clone`'s stderr into the error the Add Project panel
+/// keys on: `SshKeyMissing` when the agent has no key for the host,
+/// `AuthRequired` for anything git would have asked credentials for — a 401
+/// after credentials surfaces as git's own `Authentication failed for` on
+/// GitHub, GitLab, Bitbucket, Azure DevOps and the Gitea family alike — and
+/// otherwise the last few lines verbatim.
+pub fn classify_clone_failure(stderr_lines: &[String], host: &str, is_ssh: bool) -> AppError {
+    let full_stderr = stderr_lines.join("\n");
+
+    if full_stderr.contains("Permission denied (publickey)")
+        || full_stderr.contains("Could not read from remote repository")
+        || (full_stderr.contains("Permission denied") && is_ssh)
+    {
+        return AppError::SshKeyMissing { host: host.to_string() };
+    }
+
+    if full_stderr.contains("Authentication failed")
+        || full_stderr.contains("terminal prompts disabled")
+        || full_stderr.contains("could not read Username")
+        || full_stderr.contains("could not read Password")
+        || (full_stderr.contains("Repository not found") && !is_ssh)
+    {
+        return AppError::AuthRequired { host: host.to_string() };
+    }
+
+    // Build a context string from the last few non-empty stderr lines.
+    let context: String = stderr_lines
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    AppError::Other(format!("git clone failed:\n{context}"))
+}
 
 /// Parse a single stderr line from `git clone --progress` into structured
 /// progress data.  Returns `None` for lines that don't match.
@@ -2761,18 +2820,7 @@ async fn clone_via_shell(
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
 
-    // Escape target path for use in the shell command.
-    let target_str = target.to_string_lossy();
-    // Use printf '%s' style quoting — single-quote the path, escaping any
-    // single quotes within by ending the quoted string, adding an escaped
-    // single quote, then reopening.
-    let target_escaped = target_str.replace('\'', "'\\''");
-    let url_escaped = url.replace('\'', "'\\''");
-
-    let git_cmd = format!(
-        "git clone --progress -- '{}' '{}'",
-        url_escaped, target_escaped
-    );
+    let git_cmd = build_clone_command(url, &target.to_string_lossy(), credentials.is_some());
 
     // Build environment overrides.
     let mut env_overrides: Vec<(String, String)> = vec![
@@ -2781,9 +2829,11 @@ async fn clone_via_shell(
     ];
 
     // Askpass script path — only created when credentials are provided.
-    // We hold an `Option<tempfile::NamedTempFile>` so the file lives until
-    // after `child.wait()` completes, then is auto-deleted on drop.
-    let _askpass_tmp: Option<tempfile::NamedTempFile>;
+    // We hold an `Option<tempfile::TempPath>` so the file lives until after
+    // `child.wait()` completes, then is auto-deleted on drop. The write
+    // handle is closed first: Linux refuses to exec a file that is still open
+    // for writing (ETXTBSY).
+    let _askpass_tmp: Option<tempfile::TempPath>;
 
     if let Some(creds) = credentials {
         let mut tmp = tempfile::Builder::new()
@@ -2800,7 +2850,8 @@ async fn clone_via_shell(
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
             .map_err(|e| AppError::Other(format!("failed to chmod askpass: {e}")))?;
 
-        let askpass_path = tmp.path().to_string_lossy().to_string();
+        let tmp = tmp.into_temp_path();
+        let askpass_path = tmp.to_string_lossy().to_string();
         env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.clone()));
         env_overrides.push(("OCTOPUSH_GIT_TOKEN".into(), creds.token.clone()));
         env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
@@ -2845,41 +2896,8 @@ async fn clone_via_shell(
         return Ok(());
     }
 
-    // Build a context string from the last few non-empty stderr lines.
-    let context: String = stderr_lines
-        .iter()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let full_stderr = stderr_lines.join("\n");
-
     // Classify the error so the frontend can show the right panel.
-    if full_stderr.contains("Permission denied (publickey)")
-        || full_stderr.contains("Could not read from remote repository")
-        || (full_stderr.contains("Permission denied") && is_ssh)
-    {
-        return Err(AppError::SshKeyMissing { host: host.to_string() });
-    }
-
-    if full_stderr.contains("Authentication failed")
-        || full_stderr.contains("terminal prompts disabled")
-        || full_stderr.contains("could not read Username")
-        || full_stderr.contains("could not read Password")
-        || (full_stderr.contains("Repository not found") && !is_ssh)
-    {
-        return Err(AppError::AuthRequired { host: host.to_string() });
-    }
-
-    Err(AppError::Other(format!(
-        "git clone failed:\n{context}"
-    )))
+    Err(classify_clone_failure(&stderr_lines, host, is_ssh))
 }
 
 #[tauri::command]

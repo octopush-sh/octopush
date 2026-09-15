@@ -10902,7 +10902,9 @@ mod clone_askpass_tests {
             .unwrap();
         std::io::Write::write_all(&mut tmp, ASKPASS_SCRIPT.as_bytes()).unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let out = std::process::Command::new(tmp.path())
+        // Same as production: close the write handle before exec (Linux ETXTBSY).
+        let tmp = tmp.into_temp_path();
+        let out = std::process::Command::new(&tmp)
             .arg(prompt)
             .env("OCTOPUSH_GIT_USERNAME", username)
             .env("OCTOPUSH_GIT_TOKEN", token)
@@ -10930,6 +10932,20 @@ mod clone_askpass_tests {
     }
 
     #[test]
+    fn a_username_containing_username_does_not_hijack_the_password_prompt() {
+        // The password prompt embeds the username, so the match must be
+        // anchored to the prompt's own first word.
+        assert_eq!(
+            ask("Password for 'https://myusername@github.com': ", "myusername", "pat-1"),
+            "pat-1"
+        );
+        assert_eq!(
+            ask("Username for 'https://git.password.dev': ", "jane", "pat-1"),
+            "jane"
+        );
+    }
+
+    #[test]
     fn passes_awkward_token_characters_through_verbatim() {
         let token = "a%sb $HOME 'q' \"dq\" \\n 100%";
         assert_eq!(ask("Password for 'https://github.com': ", "jane", token), token);
@@ -10937,7 +10953,137 @@ mod clone_askpass_tests {
 
     #[test]
     fn stays_silent_for_prompts_it_does_not_understand() {
-        // Never leak the token into an unrelated prompt.
+        // Never leak the token into a prompt that isn't one of git's two.
         assert_eq!(ask("Passphrase for key '/Users/jane/.ssh/id_ed25519': ", "jane", "pat-1"), "");
+    }
+}
+
+#[cfg(test)]
+mod clone_command_tests {
+    use crate::commands::build_clone_command;
+
+    #[test]
+    fn first_attempt_uses_the_users_helpers_in_a_fixed_locale() {
+        assert_eq!(
+            build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false),
+            "LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
+        );
+    }
+
+    #[test]
+    fn a_retry_with_typed_credentials_bypasses_stored_helpers() {
+        assert_eq!(
+            build_clone_command("https://github.com/o/r", "/tmp/r", true),
+            "LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
+        );
+    }
+
+    #[test]
+    fn single_quotes_in_url_or_path_are_escaped() {
+        assert_eq!(
+            build_clone_command("https://h/o/it's", "/tmp/o'k", false),
+            "LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clone_failure_classification_tests {
+    //! stderr shapes observed live (English locale, wrong or missing PAT)
+    //! against github.com, dev.azure.com, gitlab.com, bitbucket.org and
+    //! codeberg.org — the decisive `fatal: Authentication failed for` line is
+    //! git's own, so it does not depend on the host.
+    use crate::commands::classify_clone_failure;
+    use crate::error::AppError;
+
+    fn classify(lines: &[&str], host: &str, is_ssh: bool) -> AppError {
+        let owned: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        classify_clone_failure(&owned, host, is_ssh)
+    }
+
+    fn is_auth_required(e: &AppError, host: &str) -> bool {
+        matches!(e, AppError::AuthRequired { host: h } if h == host)
+    }
+
+    #[test]
+    fn a_rejected_token_asks_for_credentials_on_every_host() {
+        let cases: &[(&str, &[&str])] = &[
+            ("github.com", &[
+                "remote: Invalid username or token. Password authentication is not supported for Git operations.",
+                "fatal: Authentication failed for 'https://github.com/o/r/'",
+            ]),
+            ("dev.azure.com", &["fatal: Authentication failed for 'https://dev.azure.com/org/project/_git/repo/'"]),
+            ("gitlab.com", &[
+                "remote: HTTP Basic: Access denied. The provided password or token is incorrect or your account has 2FA enabled and you must use a personal access token instead of a password.",
+                "fatal: Authentication failed for 'https://gitlab.com/o/r.git/'",
+            ]),
+            ("bitbucket.org", &[
+                "remote: You may not have access to this repository or it no longer exists in this workspace.",
+                "fatal: Authentication failed for 'https://bitbucket.org/o/r.git/'",
+            ]),
+            ("codeberg.org", &[
+                "remote: Credentials are incorrect or have expired.",
+                "fatal: Authentication failed for 'https://codeberg.org/o/r/'",
+            ]),
+        ];
+        for (host, lines) in cases {
+            assert!(is_auth_required(&classify(lines, host, false), host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_missing_credential_asks_for_credentials_for_both_prompt_shapes() {
+        let e = classify(
+            &["fatal: could not read Username for 'https://dev.azure.com': terminal prompts disabled"],
+            "dev.azure.com", false,
+        );
+        assert!(is_auth_required(&e, "dev.azure.com"));
+        // The `org@` clone URL Azure hands out goes straight to the password.
+        let e = classify(
+            &["fatal: could not read Password for 'https://org@dev.azure.com': terminal prompts disabled"],
+            "dev.azure.com", false,
+        );
+        assert!(is_auth_required(&e, "dev.azure.com"));
+    }
+
+    #[test]
+    fn a_private_github_repo_reads_as_not_found_and_still_asks() {
+        let e = classify(
+            &["remote: Repository not found.", "fatal: repository 'https://github.com/o/secret/' not found"],
+            "github.com", false,
+        );
+        assert!(is_auth_required(&e, "github.com"));
+    }
+
+    #[test]
+    fn a_missing_ssh_key_gets_the_ssh_panel() {
+        let e = classify(
+            &[
+                "git@ssh.dev.azure.com: Permission denied (publickey).",
+                "fatal: Could not read from remote repository.",
+                "",
+                "Please make sure you have the correct access rights",
+            ],
+            "ssh.dev.azure.com", true,
+        );
+        assert!(matches!(e, AppError::SshKeyMissing { host } if host == "ssh.dev.azure.com"));
+    }
+
+    #[test]
+    fn anything_else_surfaces_the_last_lines_verbatim() {
+        let e = classify(
+            &[
+                "Cloning into 'r'...",
+                "fatal: repository 'https://dev.azure.com/no-such-org/p/_git/r/' not found",
+            ],
+            "dev.azure.com", false,
+        );
+        match e {
+            AppError::Other(msg) => {
+                assert!(msg.starts_with("git clone failed:\n"), "{msg}");
+                assert!(msg.contains("no-such-org"), "{msg}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 }

@@ -66,7 +66,8 @@ pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
 
     // ── URL-scheme forms ───────────────────────────────────────────────
     let scheme_end = url.find("://")?;
-    let scheme = &url[..scheme_end];
+    let scheme = url[..scheme_end].to_ascii_lowercase();
+    let scheme = scheme.as_str();
     let rest = &url[scheme_end + 3..]; // everything after "://"
 
     let is_ssh = matches!(scheme, "ssh" | "git");
@@ -138,7 +139,8 @@ fn split_owner_repo(path: &str) -> Option<(String, String)> {
     // For multi-level GitLab paths, owner is the segment before the repo.
     let owner = decode_segment(segments[segments.len() - 2]);
 
-    if owner.is_empty() || repo.is_empty() {
+    // The repo becomes a directory name; `.`/`..` would point elsewhere.
+    if [&owner, &repo].iter().any(|s| matches!(s.as_str(), "" | "." | "..")) {
         return None;
     }
 
@@ -146,12 +148,26 @@ fn split_owner_repo(path: &str) -> Option<(String, String)> {
 }
 
 /// Undo `%20`-style escapes so a repository called "My Repo" (Azure DevOps
-/// allows spaces and encodes them in its clone URLs) lands in `My Repo` — the
-/// directory `git clone` itself would pick. A segment that decodes to
-/// something that can't be a single directory name is kept as written.
+/// allows spaces and encodes them in its clone URLs) gets a readable folder
+/// name, `My Repo` (a terminal `git clone` would create `My%20Repo`). A
+/// segment that decodes to something that can't be a single directory name,
+/// or carries a malformed escape, is kept as written — the same cases the
+/// frontend's `decodeURIComponent` mirror refuses.
 fn decode_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let well_formed = bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || (i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit())
+    });
+    if !well_formed {
+        return segment.to_string();
+    }
     match urlencoding::decode(segment) {
-        Ok(decoded) if !decoded.contains(|c| matches!(c, '/' | '\\' | '\0')) => {
+        Ok(decoded)
+            if !decoded.contains(|c: char| matches!(c, '/' | '\\') || c.is_control()) =>
+        {
             decoded.into_owned()
         }
         _ => segment.to_string(),
@@ -296,10 +312,39 @@ mod tests {
     }
 
     #[test]
-    fn percent_encoded_names_decode_to_the_directory_git_would_pick() {
+    fn azure_devops_https_with_the_project_omitted() {
+        // Allowed when the repository is named after the project.
+        let r = p("https://dev.azure.com/org/_git/repo");
+        assert_eq!(r.owner, "org");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn percent_encoded_names_decode_into_a_readable_folder_name() {
         let r = p("https://dev.azure.com/org/My%20Project/_git/My%20Repo");
         assert_eq!(r.owner, "My Project");
         assert_eq!(r.repo, "My Repo");
+    }
+
+    #[test]
+    fn decoding_keeps_plus_and_refuses_malformed_or_non_utf8_escapes() {
+        assert_eq!(p("https://github.com/owner/c++").repo, "c++");
+        assert_eq!(p("https://example.com/owner/50%off%20sale").repo, "50%off%20sale");
+        assert_eq!(p("https://example.com/owner/bad%C3%28").repo, "bad%C3%28");
+        assert_eq!(p("https://example.com/owner/line%0Abreak").repo, "line%0Abreak");
+    }
+
+    #[test]
+    fn a_repo_that_decodes_to_a_dot_directory_is_rejected() {
+        assert!(parse_git_url("https://example.com/owner/%2e%2e").is_none());
+        assert!(parse_git_url("https://example.com/owner/..").is_none());
+    }
+
+    #[test]
+    fn scheme_is_case_insensitive() {
+        let r = p("HTTPS://github.com/owner/repo");
+        assert_eq!(r.host, "github.com");
+        assert!(!r.is_ssh);
     }
 
     #[test]

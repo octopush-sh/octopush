@@ -22,13 +22,15 @@ export interface ParsedGitUrl {
 }
 
 /** Undo `%20`-style escapes so a repo called "My Repo" (Azure DevOps allows
- *  spaces and encodes them in its clone URLs) lands in `My Repo` — the
- *  directory `git clone` itself would pick. A segment that decodes to
- *  something that can't be a single directory name is kept as written. */
+ *  spaces and encodes them in its clone URLs) gets a readable folder name,
+ *  `My Repo` (a terminal `git clone` would create `My%20Repo`). A segment
+ *  that decodes to something that can't be a single directory name, or
+ *  carries a malformed escape, is kept as written. */
 function decodeSegment(segment: string): string {
   try {
     const decoded = decodeURIComponent(segment);
-    return /[/\\\0]/.test(decoded) ? segment : decoded;
+    // eslint-disable-next-line no-control-regex
+    return /[/\\\u0000-\u001f\u007f-\u009f]/.test(decoded) ? segment : decoded;
   } catch {
     return segment;
   }
@@ -37,7 +39,7 @@ function decodeSegment(segment: string): string {
 /** Strip trailing `.git` suffix and split `path` into [owner, repo]. */
 function splitOwnerRepo(path: string): [string, string] | null {
   const stripped = path
-    .replace(/\/$/, "")
+    .replace(/\/+$/, "")
     .replace(/\.git$/, "");
   const segments = stripped.split("/").filter(Boolean);
   // Azure DevOps (dev.azure.com, *.visualstudio.com, on-prem Server) puts a
@@ -50,7 +52,8 @@ function splitOwnerRepo(path: string): [string, string] | null {
   if (segments.length < 2) return null;
   const repo = decodeSegment(segments[segments.length - 1]);
   const owner = decodeSegment(segments[segments.length - 2]);
-  if (!repo || !owner) return null;
+  // The repo becomes a directory name; `.`/`..` would point elsewhere.
+  if ([owner, repo].some((s) => s === "" || s === "." || s === "..")) return null;
   return [owner, repo];
 }
 

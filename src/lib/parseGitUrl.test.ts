@@ -78,7 +78,7 @@ describe("parseGitUrl", () => {
     expect(r).toMatchObject({ host: "org.visualstudio.com", owner: "project", repo: "repo" });
   });
 
-  it("decodes percent-encoded names to the directory git would pick", () => {
+  it("decodes percent-encoded names into a readable folder name", () => {
     const r = parseGitUrl("https://dev.azure.com/org/My%20Project/_git/My%20Repo");
     expect(r).toMatchObject({ owner: "My Project", repo: "My Repo" });
   });
@@ -91,6 +91,37 @@ describe("parseGitUrl", () => {
   it("keeps a segment as written when it would decode to a path", () => {
     const r = parseGitUrl("https://example.com/owner/..%2F..%2Fescape");
     expect(r?.repo).toBe("..%2F..%2Fescape");
+  });
+
+  it("keeps a segment as written when an escape is malformed", () => {
+    const r = parseGitUrl("https://example.com/owner/50%off%20sale");
+    expect(r?.repo).toBe("50%off%20sale");
+  });
+
+  it("keeps `+` and refuses control characters and non-UTF-8 escapes", () => {
+    expect(parseGitUrl("https://github.com/owner/c++")?.repo).toBe("c++");
+    expect(parseGitUrl("https://example.com/owner/line%0Abreak")?.repo).toBe("line%0Abreak");
+    expect(parseGitUrl("https://example.com/owner/bad%C3%28")?.repo).toBe("bad%C3%28");
+  });
+
+  it("rejects a repo that decodes to a dot directory", () => {
+    expect(parseGitUrl("https://example.com/owner/%2e%2e")).toBeNull();
+    expect(parseGitUrl("https://example.com/owner/..")).toBeNull();
+  });
+
+  it("parses the Azure DevOps URL with the project omitted", () => {
+    const r = parseGitUrl("https://dev.azure.com/org/_git/repo");
+    expect(r).toMatchObject({ owner: "org", repo: "repo" });
+  });
+
+  it("strips every trailing slash, as git does", () => {
+    const r = parseGitUrl("https://github.com/owner/repo.git//");
+    expect(r).toMatchObject({ owner: "owner", repo: "repo" });
+  });
+
+  it("accepts an upper-case scheme", () => {
+    const r = parseGitUrl("HTTPS://github.com/owner/repo");
+    expect(r).toMatchObject({ host: "github.com", repo: "repo", isSsh: false });
   });
 
   // ── Rejection ───────────────────────────────────────────────────────
@@ -157,6 +188,12 @@ describe("sshToHttps", () => {
 
   it("converts Azure DevOps ssh:// (v3) to its dev.azure.com HTTPS form", () => {
     expect(sshToHttps("ssh://git@ssh.dev.azure.com/v3/org/project/repo")).toBe(
+      "https://dev.azure.com/org/project/_git/repo",
+    );
+  });
+
+  it("does not forward a .git suffix into the Azure repository name", () => {
+    expect(sshToHttps("git@ssh.dev.azure.com:v3/org/project/repo.git")).toBe(
       "https://dev.azure.com/org/project/_git/repo",
     );
   });
