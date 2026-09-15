@@ -297,7 +297,7 @@ describe("NewProjectFlow — AuthRequired error flow", () => {
     await waitFor(() => {
       expect(cloneProjectMock).toHaveBeenCalledTimes(2);
       const secondCall = cloneProjectMock.mock.calls[1][0];
-      expect(secondCall.credentials).toEqual({ username: "octocat", token: "ghp_secret" });
+      expect(secondCall.credentials).toEqual({ username: "octocat", token: "ghp_secret", remember: true });
     });
   });
 
@@ -404,6 +404,7 @@ describe("NewProjectFlow — credentialed retry behaves like a clone", () => {
 
     expect(screen.getByRole("button", { name: /cloning…/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /trying…/i })).toBeDisabled();
+    expect(screen.getByPlaceholderText(/paste a git remote url/i)).toBeDisabled();
     await waitFor(() => expect(registeredListeners.has("clone://progress")).toBe(true));
     await act(async () => {
       registeredListeners.get("clone://progress")!({
@@ -453,6 +454,34 @@ describe("NewProjectFlow — credentialed retry behaves like a clone", () => {
       target: { value: "https://gitlab.com/octocat/private.git" },
     });
     expect(screen.queryByText(/private repository/i)).not.toBeInTheDocument();
+  });
+
+  it("switching hosts never offers the previous host's credentials", async () => {
+    getSettingsMock.mockResolvedValue({
+      providerKeys: {},
+      providerBaseUrls: {},
+      gitCredentials: { "github.com": { username: "alice", token: "ghp_alice" } },
+    });
+    cloneProjectMock
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "github.com" }))
+      .mockRejectedValueOnce(JSON.stringify({ kind: "AuthRequired", host: "dev.azure.com" }));
+
+    await cloneUrl("https://github.com/alice/private.git");
+    await waitFor(() => {
+      expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("alice");
+    });
+
+    fireEvent.change(screen.getByPlaceholderText(/paste a git remote url/i), {
+      target: { value: "https://org@dev.azure.com/org/project/_git/repo" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /clone & open/i }));
+    });
+
+    await waitFor(() => screen.getByText(/sign in to dev\.azure\.com/i));
+    expect((screen.getByLabelText(/username/i) as HTMLInputElement).value).toBe("org");
+    expect((screen.getByLabelText(/personal access token/i) as HTMLInputElement).value).toBe("");
+    expect(screen.getByRole("button", { name: /try again/i })).toBeDisabled();
   });
 
   it("prefills the username from the URL's user@ when nothing is saved", async () => {

@@ -2702,6 +2702,15 @@ pub async fn delete_terminal(
 pub struct CloneCredentials {
     pub username: String,
     pub token: String,
+    /// The panel's "Remember for {host}": when set, a successful clone hands
+    /// the credential to git's own helpers (the keychain) as well as to
+    /// Octopush's settings. Unset, nothing is persisted anywhere.
+    #[serde(default = "default_remember")]
+    pub remember: bool,
+}
+
+fn default_remember() -> bool {
+    true
 }
 
 /// The `GIT_ASKPASS` helper handed to `git clone` when the user typed
@@ -2711,8 +2720,37 @@ pub struct CloneCredentials {
 /// `Password for 'https://user@host': ` — and reads the answer from stdout.
 /// The patterns are anchored to the start because the password prompt embeds
 /// the username, which may itself contain "username". The values travel
-/// through env vars so no secret is written to disk.
-pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+/// through env vars so no secret is written to disk. Answering the password
+/// prompt also creates the file named by `OCTOPUSH_GIT_ASKPASS_USED`, so the
+/// caller stores the credential only if git actually used it.
+pub const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s' \"$OCTOPUSH_GIT_USERNAME\" ;;\n  [Pp]assword*) : > \"${OCTOPUSH_GIT_ASKPASS_USED:-/dev/null}\" 2>/dev/null; printf '%s' \"$OCTOPUSH_GIT_TOKEN\" ;;\nesac\n";
+
+/// `url` with `username@` inserted in front of the host, for an HTTP(S) URL
+/// that names no user. The origin remote of a clone made this way carries the
+/// account, so every later credential lookup is exact even when the keychain
+/// holds another account for the same host — the multi-account case the
+/// helper bypass in `build_clone_command` exists for. `None` when the URL
+/// already has a user or isn't HTTP(S).
+pub fn url_with_user(url: &str, username: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    if !matches!(url[..scheme_end].to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|i| authority_start + i)
+        .unwrap_or(url.len());
+    if url[authority_start..authority_end].contains('@') || username.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{}@{}",
+        &url[..authority_start],
+        urlencoding::encode(username),
+        &url[authority_start..]
+    ))
+}
 
 /// The shell command `clone_via_shell` runs. `env LC_ALL=C` keeps git's
 /// messages in English so `classify_clone_failure` can read them whatever the
@@ -2764,10 +2802,26 @@ pub fn credential_approve_payload(
 pub fn take_terminal_segments(buf: &mut Vec<u8>) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut start = 0;
-    for (i, &b) in buf.iter().enumerate() {
-        if b == b'\r' || b == b'\n' {
-            out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), b == b'\n'));
-            start = i + 1;
+    let mut i = 0;
+    while i < buf.len() {
+        match buf[i] {
+            b'\n' => {
+                out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), true));
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                // `\r\n` (ssh writes its lines that way) is one line ending;
+                // a `\r` at the very end can't be told apart yet — keep it.
+                if i + 1 == buf.len() {
+                    break;
+                }
+                let crlf = buf[i + 1] == b'\n';
+                out.push((String::from_utf8_lossy(&buf[start..i]).into_owned(), crlf));
+                i += if crlf { 2 } else { 1 };
+                start = i;
+            }
+            _ => i += 1,
         }
     }
     buf.drain(..start);
@@ -2869,7 +2923,16 @@ async fn clone_via_shell(
     // them for SSH, but don't let a stray pair disturb an SSH clone.
     let credentials = if is_ssh { None } else { credentials };
 
-    let git_cmd = build_clone_command(url, &target.to_string_lossy(), credentials.is_some());
+    // With typed credentials and a URL that names no user, clone from the URL
+    // with the username embedded (see `url_with_user`); git then asks only
+    // for the password, and the account is on record in the origin remote.
+    let clone_url: String = match (credentials, url_user) {
+        (Some(creds), None) => {
+            url_with_user(url, &creds.username).unwrap_or_else(|| url.to_string())
+        }
+        _ => url.to_string(),
+    };
+    let git_cmd = build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
 
     // Build environment overrides.
     let mut env_overrides: Vec<(String, String)> = vec![
@@ -2883,6 +2946,9 @@ async fn clone_via_shell(
     // handle is closed first: Linux refuses to exec a file that is still open
     // for writing (ETXTBSY).
     let _askpass_tmp: Option<tempfile::TempPath>;
+    // Created by the askpass script when git actually asked it for the
+    // password — the only case in which storing the credential makes sense.
+    let mut askpass_marker: Option<std::path::PathBuf> = None;
 
     if let Some(creds) = credentials {
         let mut tmp = tempfile::Builder::new()
@@ -2901,10 +2967,16 @@ async fn clone_via_shell(
 
         let tmp = tmp.into_temp_path();
         let askpass_path = tmp.to_string_lossy().to_string();
+        let marker = std::path::PathBuf::from(format!("{askpass_path}.used"));
         env_overrides.push(("OCTOPUSH_GIT_USERNAME".into(), creds.username.clone()));
         env_overrides.push(("OCTOPUSH_GIT_TOKEN".into(), creds.token.clone()));
         env_overrides.push(("GIT_ASKPASS".into(), askpass_path));
+        env_overrides.push((
+            "OCTOPUSH_GIT_ASKPASS_USED".into(),
+            marker.to_string_lossy().to_string(),
+        ));
 
+        askpass_marker = Some(marker);
         _askpass_tmp = Some(tmp);
     } else {
         _askpass_tmp = None;
@@ -2949,7 +3021,8 @@ async fn clone_via_shell(
         }
     }
     if !pending.is_empty() {
-        stderr_lines.push(String::from_utf8_lossy(&pending).into_owned());
+        let tail = String::from_utf8_lossy(&pending);
+        stderr_lines.push(tail.trim_end_matches('\r').to_string());
     }
 
     let status = child
@@ -2957,12 +3030,23 @@ async fn clone_via_shell(
         .await
         .map_err(|e| AppError::Other(format!("git clone wait failed: {e}")))?;
 
+    let askpass_answered = askpass_marker
+        .as_deref()
+        .map(|m| {
+            let used = m.exists();
+            let _ = std::fs::remove_file(m);
+            used
+        })
+        .unwrap_or(false);
+
     if status.success() {
         if let Some(creds) = credentials {
-            let protocol = if url.to_ascii_lowercase().starts_with("http://") { "http" } else { "https" };
-            let username = url_user.unwrap_or(&creds.username);
-            if let Some(payload) = credential_approve_payload(protocol, host, username, &creds.token) {
-                approve_credentials_via_shell(&shell, &payload).await;
+            if creds.remember && askpass_answered {
+                let protocol = if url.to_ascii_lowercase().starts_with("http://") { "http" } else { "https" };
+                let username = url_user.unwrap_or(&creds.username);
+                if let Some(payload) = credential_approve_payload(protocol, host, username, &creds.token) {
+                    approve_credentials_via_shell(&shell, &payload).await;
+                }
             }
         }
         return Ok(());
@@ -2974,29 +3058,35 @@ async fn clone_via_shell(
 
 /// Hand credentials to the user's own git helpers (the keychain on macOS)
 /// through the login shell, exactly as git does after a clone that prompted.
-/// Best effort: git itself ignores a helper that fails to store.
+/// Best effort, as git's own store step is: a helper that fails or hangs
+/// (a locked keychain dialog, say) must not hold the finished clone hostage.
 async fn approve_credentials_via_shell(shell: &str, payload: &str) {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let mut child = match Command::new(shell)
-        .arg("-l")
-        .arg("-c")
-        .arg("git credential approve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return,
+    let run = async {
+        let mut child = Command::new(shell)
+            .arg("-l")
+            .arg("-c")
+            .arg("git credential approve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.as_bytes()).await?;
+            stdin.shutdown().await?;
+        }
+        child.wait().await
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload.as_bytes()).await;
-        let _ = stdin.shutdown().await;
+    match tokio::time::timeout(std::time::Duration::from_secs(15), run).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => tracing::warn!("git credential approve exited with {status}"),
+        Ok(Err(e)) => tracing::warn!("git credential approve could not run: {e}"),
+        Err(_) => tracing::warn!("git credential approve timed out; credential not stored"),
     }
-    let _ = child.wait().await;
 }
 
 #[tauri::command]

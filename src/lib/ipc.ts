@@ -568,7 +568,7 @@ export const ipc = {
     path: string;
     url: string;
     nameOverride?: string;
-    credentials?: { username: string; token: string };
+    credentials?: { username: string; token: string; remember: boolean };
   }) =>
     invoke<ProjectInfo>("clone_project", {
       path: args.path,

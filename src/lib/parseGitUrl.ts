@@ -61,7 +61,7 @@ function splitOwnerRepo(path: string): [string, string] | null {
 }
 
 export function parseGitUrl(raw: string): ParsedGitUrl | null {
-  // Same edges as Rust's `str::trim` (which also drops U+0085), plus the BOM.
+  // `\s` already covers the BOM; U+0085 is what Rust's `str::trim` drops too.
   const url = raw.replace(/^[\s\u0085]+|[\s\u0085]+$/g, "");
   if (!url) return null;
 
@@ -95,7 +95,14 @@ export function parseGitUrl(raw: string): ParsedGitUrl | null {
   const atIdx = rest.indexOf("@");
   const slashIdx = rest.indexOf("/");
   if (atIdx !== -1 && (slashIdx === -1 || atIdx < slashIdx)) {
-    const name = decodeSegment(rest.slice(0, atIdx).split(":")[0]);
+    // Git percent-decodes userinfo unconditionally; match it.
+    const rawName = rest.slice(0, atIdx).split(":")[0];
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName);
+    } catch {
+      name = rawName;
+    }
     if (name) user = name;
     rest = rest.slice(atIdx + 1);
   }

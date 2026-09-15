@@ -86,7 +86,12 @@ pub fn parse_git_url(url: &str) -> Option<ParsedGitUrl> {
         if at < slash_pos {
             let userinfo = &rest[..at];
             let name = userinfo.split(':').next().unwrap_or("");
-            user = Some(decode_segment(name)).filter(|u| !u.is_empty());
+            // Git percent-decodes userinfo unconditionally; match it so the
+            // stored credential's username is the one git will look up.
+            let name = urlencoding::decode(name)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| name.to_string());
+            user = Some(name).filter(|u| !u.is_empty());
             &rest[at + 1..]
         } else {
             rest

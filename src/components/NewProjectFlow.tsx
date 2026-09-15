@@ -7,6 +7,7 @@ import { GenesisPrompt } from "./GenesisPrompt";
 import { useProjectStore } from "../stores/projectStore";
 import { ipc } from "../lib/ipc";
 import { parseGitUrl } from "../lib/parseGitUrl";
+import type { ProjectInfo } from "../lib/types";
 
 interface Props {
   onBack: () => void;
@@ -226,14 +227,16 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
   }
 
   type CloneOutcome =
-    | { kind: "ok" }
+    | { kind: "ok"; project: ProjectInfo }
     | { kind: "auth"; host: string }
     | { kind: "ssh"; host: string }
     | { kind: "error"; message: string };
 
   /** The one clone call every path goes through, so the progress bar and the
    *  disabled primary button cover a credentialed retry as much as a first try. */
-  async function runClone(credentials?: { username: string; token: string }): Promise<CloneOutcome> {
+  async function runClone(
+    credentials?: { username: string; token: string; remember: boolean },
+  ): Promise<CloneOutcome> {
     setCloning(true);
     setCloneError(null);
     setCloneProgress(null);
@@ -244,8 +247,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
         nameOverride: cloneName.trim() || undefined,
         credentials,
       });
-      useProjectStore.setState({ current: project, loading: false });
-      return { kind: "ok" };
+      return { kind: "ok", project };
     } catch (err: unknown) {
       const auth = isAuthRequired(err);
       if (auth) return { kind: "auth", host: auth.host };
@@ -261,9 +263,10 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
     setAuthHost(null);
     setSshKeyMissingHost(null);
     const outcome = await runClone();
-    if (outcome.kind === "auth") setAuthHost(outcome.host);
+    if (outcome.kind === "ok") useProjectStore.setState({ current: outcome.project, loading: false });
+    else if (outcome.kind === "auth") setAuthHost(outcome.host);
     else if (outcome.kind === "ssh") setSshKeyMissingHost(outcome.host);
-    else if (outcome.kind === "error") setCloneError(outcome.message);
+    else setCloneError(outcome.message);
   }
 
   function switchToHttps() {
@@ -276,12 +279,14 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
     if (!authHost) return;
     // The panel stays mounted through the retry, so a rejected token keeps
     // what was typed instead of re-running the saved-credentials prefill.
-    const outcome = await runClone({ username: authUsername, token: authToken });
+    const outcome = await runClone({ username: authUsername, token: authToken, remember: authRemember });
     if (outcome.kind === "ok") {
       if (authRemember) {
         await ipc.saveGitCredentials(authHost, authUsername, authToken).catch(() => {});
       }
       setAuthHost(null);
+      // Open the project last: this view unmounts once a project is current.
+      useProjectStore.setState({ current: outcome.project, loading: false });
     } else if (outcome.kind === "auth") {
       setCloneError("Authentication failed — check your credentials.");
     } else if (outcome.kind === "ssh") {
@@ -506,13 +511,17 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                     ref={urlInputRef}
                     autoFocus
                     value={cloneUrl}
+                    disabled={cloning}
                     onChange={(e) => {
                       setCloneUrl(e.target.value);
-                      // A different URL may mean a different host: the panels
-                      // and errors of the previous one no longer apply.
+                      // A different URL may mean a different host: the panels,
+                      // errors and credentials of the previous one no longer
+                      // apply — never offer one host's token to another.
                       setAuthHost(null);
                       setSshKeyMissingHost(null);
                       setCloneError(null);
+                      setAuthUsername("");
+                      setAuthToken("");
                     }}
                     placeholder="Paste a git remote URL…"
                     className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
@@ -531,6 +540,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
               <Field label="PROJECT NAME">
                 <input
                   value={cloneName}
+                  disabled={cloning}
                   onChange={(e) => {
                     setCloneName(e.target.value);
                     setCloneNameManual(true);
@@ -543,6 +553,7 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
               <Field label="LOCATION">
                 <input
                   value={cloneLocation}
+                  disabled={cloning}
                   onChange={(e) => setCloneLocation(e.target.value)}
                   placeholder="~/.octopush/projects"
                   className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass"

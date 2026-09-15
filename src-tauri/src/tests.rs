@@ -10895,6 +10895,10 @@ mod clone_askpass_tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn ask(prompt: &str, username: &str, token: &str) -> String {
+        ask_env(prompt, username, token, &[])
+    }
+
+    fn ask_env(prompt: &str, username: &str, token: &str, extra: &[(&str, &str)]) -> String {
         let mut tmp = tempfile::Builder::new()
             .prefix("octopush-askpass-test-")
             .suffix(".sh")
@@ -10908,6 +10912,7 @@ mod clone_askpass_tests {
             .arg(prompt)
             .env("OCTOPUSH_GIT_USERNAME", username)
             .env("OCTOPUSH_GIT_TOKEN", token)
+            .envs(extra.iter().copied())
             .output()
             .expect("askpass script must be directly executable");
         assert!(
@@ -10952,6 +10957,17 @@ mod clone_askpass_tests {
     }
 
     #[test]
+    fn records_that_the_password_prompt_was_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("askpass.used");
+        let env = [("OCTOPUSH_GIT_ASKPASS_USED", marker.to_str().unwrap())];
+        assert_eq!(ask_env("Username for 'https://h': ", "jane", "pat-1", &env), "jane");
+        assert!(!marker.exists(), "the username prompt alone proves nothing");
+        assert_eq!(ask_env("Password for 'https://jane@h': ", "jane", "pat-1", &env), "pat-1");
+        assert!(marker.exists());
+    }
+
+    #[test]
     fn stays_silent_for_prompts_it_does_not_understand() {
         // Never leak the token into a prompt that isn't one of git's two.
         assert_eq!(ask("Passphrase for key '/Users/jane/.ssh/id_ed25519': ", "jane", "pat-1"), "");
@@ -10976,6 +10992,23 @@ mod clone_command_tests {
             build_clone_command("https://github.com/o/r", "/tmp/r", true),
             "env LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
         );
+    }
+
+    #[test]
+    fn a_typed_username_is_embedded_in_a_url_that_names_none() {
+        use crate::commands::url_with_user;
+        assert_eq!(
+            url_with_user("https://github.com/o/r.git", "alice").as_deref(),
+            Some("https://alice@github.com/o/r.git")
+        );
+        assert_eq!(
+            url_with_user("http://gitea.corp:3000/o/r", "jane@corp").as_deref(),
+            Some("http://jane%40corp@gitea.corp:3000/o/r")
+        );
+        assert_eq!(url_with_user("https://org@dev.azure.com/o/p/_git/r", "x"), None);
+        assert_eq!(url_with_user("git@github.com:o/r.git", "alice"), None);
+        assert_eq!(url_with_user("ssh://git@github.com/o/r", "alice"), None);
+        assert_eq!(url_with_user("https://github.com/o/r", ""), None);
     }
 
     #[test]
@@ -11033,6 +11066,22 @@ mod clone_stderr_stream_tests {
         assert_eq!(
             take_terminal_segments(&mut buf),
             vec![("Receiving objects: 100% (13/13), done.".to_string(), true)]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn crlf_lines_are_whole_lines_even_across_a_chunk_boundary() {
+        // ssh writes `\r\n`; the classifier must still see those lines.
+        let mut buf = b"git@github.com: Permission denied (publickey).\r".to_vec();
+        assert!(take_terminal_segments(&mut buf).is_empty(), "a trailing CR waits for the next byte");
+        buf.extend_from_slice(b"\nfatal: Could not read from remote repository.\r\n");
+        assert_eq!(
+            take_terminal_segments(&mut buf),
+            vec![
+                ("git@github.com: Permission denied (publickey).".to_string(), true),
+                ("fatal: Could not read from remote repository.".to_string(), true),
+            ]
         );
         assert!(buf.is_empty());
     }
