@@ -592,6 +592,13 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
 }
 
 pub fn sign_out() -> AppResult<()> {
+    // Drop the entitlement token too, so the next user on a shared machine
+    // doesn't inherit the previous one's Pro. (Its `sub` binding would reject it
+    // anyway, but leaving a stale credential around is untidy.) A failure here
+    // must not block the sign-out the user asked for.
+    if let Err(e) = crate::entitlement_token::clear_token() {
+        tracing::warn!("could not clear the entitlement token on sign-out: {e}");
+    }
     clear_session()
 }
 
