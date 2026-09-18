@@ -291,12 +291,22 @@ export interface StageIteration {
   diffSnapshot: string | null;
 }
 
+/** Hierarchy tags a Claude Code (CLI-substrate) journal carries: an entry
+ *  produced inside a native sub-agent names its spawner (`parent` = the
+ *  `Agent`/`Task` tool_use id); the spawning tool entry carries `agentId`. */
+export interface LiveEntryHierarchy {
+  parent?: string;
+  agentId?: string;
+}
+
 /** One live-activity entry streamed on `run://log` (see RUN_EVENTS.log). */
-export type LiveEntry =
-  | { kind: "text"; text: string }
-  | { kind: "tool"; tool: string; hint: string }
-  | { kind: "tool_result"; ok: boolean; detail: string }
-  | { kind: "notice"; text: string };
+export type LiveEntry = LiveEntryHierarchy &
+  (
+    | { kind: "text"; text: string }
+    | { kind: "tool"; tool: string; hint: string }
+    | { kind: "tool_result"; ok: boolean; detail: string }
+    | { kind: "notice"; text: string }
+  );
 
 export type FileReadResult =
   | { kind: "text"; content: string; size: number; mtime: number }
