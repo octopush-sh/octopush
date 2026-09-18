@@ -6,6 +6,7 @@ import { CompanionContext } from "./CompanionContext";
 import { SavingsLedger } from "./chat/SavingsLedger";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
+import { CompanionCrewJournal } from "./CompanionCrewJournal";
 import { CompanionSession } from "./CompanionSession";
 import { CompanionRuns } from "./CompanionRuns";
 import { LogbookCard } from "./LogbookCard";
@@ -184,6 +185,9 @@ export function Companion({
       <FadeSwap swapKey={mode} className="flex min-h-0 flex-1 flex-col">
         {mode === "talk" && (
           <div className="flex flex-col">
+            {/* A chosen sub-agent's work journal leads the stack while open —
+                it is the one thing the user just asked to see. */}
+            {workspaceId && <CompanionCrewJournal workspaceId={workspaceId} />}
             <CompanionHistory {...historyProps} />
             <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
             {workspaceId && <SavingsLedger workspaceId={workspaceId} />}

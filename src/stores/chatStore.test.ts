@@ -259,7 +259,7 @@ describe("chatStore — single workspace tool-card persistence", () => {
 
     const timeline = useChatStore.getState().getTimeline("ws-1");
     const keys = timeline.map((it) =>
-      it.kind === "tool" ? `tool-${it.id}` : String(it.message.id),
+      it.kind === "tool" ? `tool-${it.id}` : it.kind === "crew" ? `crew-${it.id}` : String(it.message.id),
     );
     const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
     expect(dupes, `Duplicate React keys: ${JSON.stringify(keys)}`).toEqual([]);
@@ -736,5 +736,82 @@ describe("chatStore — failed turn surfaces exactly one error", () => {
     await useChatStore.getState().send("ws-1", "/tmp", "hola");
 
     expect(useChatStore.getState().getError("ws-1")).toBe(PROVIDER_ERR);
+  });
+});
+
+// ─── Sub-agents: crew grouping + live journal ────────────────────────
+// Same lazy import as the top of the file: a static import would hoist above
+// the `handlers` map the listen mock writes into.
+const { buildTimeline, appendAgentLog, AGENT_LOG_CAP } = await import("./chatStore");
+
+describe("chatStore — sub-agents", () => {
+  const agentRow = (id: number, callId: string, description: string, toolName = "Agent") =>
+    makeMsg({
+      id,
+      role: "tool",
+      content: JSON.stringify({
+        callId,
+        toolName,
+        toolInput: { description, subagentType: "reviewer", promptChars: 120 },
+        result: `report ${id}`,
+        agent: { ok: true, finished: true, closedAtCap: false, blocked: false, model: "m", inputTokens: 10, outputTokens: 5, costUsd: 0.01, durationMs: 1200, toolCalls: 2 },
+      }),
+    });
+
+  it("groups adjacent Agent/Task rows of one response into ONE crew item", () => {
+    const msgs = [
+      makeMsg({ id: 1, role: "user", content: "review it" }),
+      agentRow(2, "c1", "correctness"),
+      agentRow(3, "c2", "security", "Task"),
+      agentRow(4, "c3", "tests"),
+      makeMsg({ id: 5, role: "assistant", content: "synthesis" }),
+    ].map((e) => ({ ...e }) as unknown as import("../lib/types").ChatMessage);
+    const items = buildTimeline(msgs);
+    expect(items.map((i) => i.kind)).toEqual(["message", "crew", "message"]);
+    const crew = items[1];
+    if (crew.kind !== "crew") throw new Error("expected crew");
+    expect(crew.id).toBe(2);
+    expect(crew.agents.map((a) => a.tool.callId)).toEqual(["c1", "c2", "c3"]);
+    expect(crew.agents[1].tool.toolName).toBe("Task");
+  });
+
+  it("a non-agent tool row between fan-outs splits them into separate crews", () => {
+    const msgs = [
+      agentRow(1, "c1", "a"),
+      makeMsg({ id: 2, role: "tool", content: JSON.stringify({ toolName: "read_file", toolInput: { path: "x" }, result: "" }) }),
+      agentRow(3, "c2", "b"),
+    ].map((e) => ({ ...e }) as unknown as import("../lib/types").ChatMessage);
+    const items = buildTimeline(msgs);
+    expect(items.map((i) => i.kind)).toEqual(["crew", "tool", "crew"]);
+  });
+
+  it("chat://agent-log appends under the call id, bounded by the cap", () => {
+    emit("chat://agent-log", { workspaceId: "ws-1", threadId: "t", callId: "c1", entry: { kind: "text", text: "reading" } });
+    emit("chat://agent-log", { workspaceId: "ws-1", threadId: "t", callId: "c1", entry: { kind: "tool", tool: "read_file", hint: "a.rs" } });
+    emit("chat://agent-log", { workspaceId: "ws-1", threadId: "t", callId: "c2", entry: { kind: "text", text: "other" } });
+    // Malformed entries are ignored, never stored.
+    emit("chat://agent-log", { workspaceId: "ws-1", threadId: "t", callId: "c1", entry: { nope: true } });
+    const s = useChatStore.getState();
+    expect(s.getAgentLog("c1").map((e) => e.kind)).toEqual(["text", "tool"]);
+    expect(s.getAgentLog("c2")).toHaveLength(1);
+    expect(s.getAgentLog("missing")).toEqual([]);
+
+    let logs: Record<string, import("../lib/ipc").LiveEntry[]> = {};
+    for (let i = 0; i < AGENT_LOG_CAP + 25; i++) {
+      logs = appendAgentLog(logs, "big", { kind: "text", text: String(i) });
+    }
+    expect(logs.big).toHaveLength(AGENT_LOG_CAP);
+    expect(logs.big[0]).toEqual({ kind: "text", text: "25" });
+  });
+
+  it("focusCrewAgent is scoped per workspace and clears with null", () => {
+    const s = useChatStore.getState();
+    s.focusCrewAgent("ws-1", "c1");
+    s.focusCrewAgent("ws-2", "c9");
+    expect(useChatStore.getState().getCrewFocus("ws-1")).toBe("c1");
+    expect(useChatStore.getState().getCrewFocus("ws-2")).toBe("c9");
+    s.focusCrewAgent("ws-1", null);
+    expect(useChatStore.getState().getCrewFocus("ws-1")).toBeNull();
+    expect(useChatStore.getState().getCrewFocus("ws-2")).toBe("c9");
   });
 });
