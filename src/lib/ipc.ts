@@ -1259,9 +1259,7 @@ export interface McpConnectResult {
 }
 
 /** Tauri event names emitted by the orchestrator. */
-/** Live journal entry of a Talk sub-agent: `{ workspaceId, threadId, callId, entry }`
- *  where `entry` is the same `LiveEntry` shape a Direct stage emits on `run://log`. */
-export const CHAT_AGENT_LOG_EVENT = "chat://agent-log";
+export { CHAT_AGENT_LOG_EVENT } from "./agentTools";
 
 export const RUN_EVENTS = {
   stageUpdate: "run://stage-update",

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from "react";
 import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil } from "lucide-react";
-import { useChatStore, buildTimeline, type ConversationItem } from "../../stores/chatStore";
+import { useChatStore, buildTimeline, isAgentToolName, type ConversationItem } from "../../stores/chatStore";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
@@ -9,6 +9,7 @@ import { ChatMessage } from "../ChatMessage";
 import { OctoWatcher } from "./OctoWatcher";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
+import { CrewCard, crewAgentsFromLive, crewAgentsFromTools } from "./CrewCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { OctoStatus } from "./OctoStatus";
 
@@ -67,6 +68,8 @@ export function ChatCanvas({
     () => buildTimeline(messages),
     [messages],
   );
+  const liveAgents = useMemo(() => liveTools.filter((t) => isAgentToolName(t.toolName)), [liveTools]);
+  const liveOthers = useMemo(() => liveTools.filter((t) => !isAgentToolName(t.toolName)), [liveTools]);
 
   useEffect(() => {
     loadHistory(workspaceId);
@@ -176,6 +179,15 @@ export function ChatCanvas({
       ) : (
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
           {timeline.map((item) => {
+            if (item.kind === "crew") {
+              return (
+                <CrewCard
+                  key={`crew-${item.id}`}
+                  workspaceId={workspaceId}
+                  agents={crewAgentsFromTools(item.agents)}
+                />
+              );
+            }
             if (item.kind === "tool") {
               return (
                 <ToolCallCard
@@ -216,9 +228,16 @@ export function ChatCanvas({
             );
           })}
 
+          {/* Live sub-agents — every in-flight `Agent` call of the turn as ONE
+              crew card (they run concurrently); retires as the resolved rows
+              land and the timeline's crew item takes over. */}
+          {liveAgents.length > 0 && (
+            <CrewCard workspaceId={workspaceId} agents={crewAgentsFromLive(liveAgents)} />
+          )}
+
           {/* Live tool cards — one per in-flight tool, in call order. They
               retire as their resolved rows arrive (see chatStore). */}
-          {liveTools.map((t) => (
+          {liveOthers.map((t) => (
             <LiveToolCard key={`live-${t.callId}`} tool={t} />
           ))}
 
