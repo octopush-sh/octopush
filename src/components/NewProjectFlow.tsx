@@ -543,12 +543,12 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                   {parsedCloneUrl && (
                     <span
                       aria-hidden="true"
-                      className="octo-pop-in flex shrink-0 items-center gap-1 pr-3 font-mono text-[9px] tracking-[0.15em] text-octo-brass"
+                      className="octo-pop-in flex min-w-0 max-w-[45%] items-center gap-1 pr-3 font-mono text-[9px] tracking-[0.15em] text-octo-brass"
                     >
-                      <span title="Git host" className="flex items-center text-octo-mute">
+                      <span title="Git host" className="flex shrink-0 items-center text-octo-mute">
                         <Globe size={11} strokeWidth={1.75} />
                       </span>
-                      {parsedCloneUrl.host}
+                      <span className="truncate">{parsedCloneUrl.host}</span>
                     </span>
                   )}
                 </div>

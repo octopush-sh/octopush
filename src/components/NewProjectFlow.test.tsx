@@ -186,6 +186,9 @@ describe("NewProjectFlow — Step II Clone: URL auto-detection", () => {
       expect(screen.getByText(/github\.com/i)).toBeInTheDocument();
     });
     expect(screen.getByTitle("Git host")).toBeInTheDocument();
+    // The badge sits inside the field's label; it must not become part of
+    // the input's accessible name.
+    expect(screen.getByRole("textbox", { name: "REPOSITORY URL" })).toBe(urlInput);
   });
 
   it("manually editing name detaches it from URL parsing", async () => {
