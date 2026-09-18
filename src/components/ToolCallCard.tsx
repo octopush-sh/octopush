@@ -24,6 +24,9 @@ export const TOOL_LABELS: Record<string, string> = {
   list_files: "LIST",
   grep: "GREP",
   glob: "GLOB",
+  Agent: "AGENT",
+  Task: "AGENT",
+  recall_tool_output: "RECALL",
 };
 
 /** The card header label for a tool name (e.g. `write_file` → `WRITE`,
@@ -50,6 +53,16 @@ export function summarizeTool(
       const cmd = String(toolInput?.command ?? "");
       return cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
     }
+    case "Agent":
+    case "Task": {
+      // A sub-agent card reads as `description · role`; the prompt itself is
+      // the model's own words and never surfaces here.
+      const desc = String(toolInput?.description ?? "Sub-agent");
+      const role = toolInput?.subagentType ? String(toolInput.subagentType) : "";
+      return role ? `${desc} · ${role}` : desc;
+    }
+    case "recall_tool_output":
+      return `#${String(toolInput?.message_id ?? "")}`;
     case "write_file":
     case "read_file":
     case "edit_file":

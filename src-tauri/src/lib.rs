@@ -3,6 +3,7 @@
 pub mod agent_adapter;
 pub mod auth;
 pub mod billing;
+pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
 mod commands;
@@ -235,6 +236,7 @@ pub fn run() {
             commands::rerun_from_stage,
             commands::estimate_run_cost,
             commands::get_stage_log,
+            commands::get_chat_agent_log,
             commands::list_stage_iterations,
             // File operations
             commands::open_file_in_system,
