@@ -3058,6 +3058,20 @@ impl Db {
         Ok(row)
     }
 
+    /// The persisted content of one `role="tool"` row, scoped to `thread_id`
+    /// so the TALK `recall_tool_output` tool can only reach outputs of the
+    /// conversation it runs in. `None` when the id is unknown, belongs to
+    /// another thread, or isn't a tool row.
+    pub fn get_chat_tool_output(&self, thread_id: &str, message_id: i64) -> AppResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM chat_messages WHERE id = ?1 AND thread_id = ?2 AND role = 'tool'",
+        )?;
+        let content = stmt
+            .query_row(params![message_id, thread_id], |r| r.get::<_, String>(0))
+            .optional()?;
+        Ok(content)
+    }
+
     /// List a single thread's messages in chronological order. (Scoped by
     /// thread, not workspace — a workspace can hold several conversations.)
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {

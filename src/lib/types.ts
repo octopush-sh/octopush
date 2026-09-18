@@ -440,6 +440,9 @@ export interface AppSettings {
   lastPricingRefresh?: string | null;
   /** Optional "Open in editor" command override; empty/undefined → autodetect. */
   editorCommand?: string | null;
+  /** Tool-call rounds one Talk message may run before the model is asked to
+   *  answer with what it has. Unset → the backend default (25). */
+  talkMaxIterations?: number | null;
   /** Jira/issue-tracker connection config (preserved across saves). */
   issueTracker?: IssueTrackerConfig | null;
   /** @deprecated use providerKeys.anthropic */

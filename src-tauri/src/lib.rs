@@ -4,6 +4,7 @@ pub mod agent_adapter;
 pub mod auth;
 pub mod billing;
 pub mod chat_engine;
+pub mod chat_history;
 mod commands;
 pub mod context_guard;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in
