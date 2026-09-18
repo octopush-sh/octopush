@@ -6,6 +6,10 @@
 //! The loop is provider-agnostic: AnthropicProvider or OpenAICompatibleProvider
 //! is selected at runtime via `resolve_provider()`.
 
+use crate::chat_agents::{
+    agent_tool_definitions, is_agent_tool, parse_agent_call, run_subagents, AgentOutcome,
+    SubagentSpec,
+};
 use crate::chat_history::{
     build_history, effective_talk_max_iterations, window_text, HistoryRole, HistoryRow,
 };
@@ -67,6 +71,23 @@ fn recall_tool_definition() -> LlmTool {
             "required": ["message_id"]
         }),
     }
+}
+
+/// What an `Agent` call's card and persisted row show as the input: the
+/// short description, the role hint and the model override — never the raw
+/// multi-KB prompt (the model's own words, already in the assistant row).
+fn agent_input_for_display(call: &crate::chat_agents::AgentCall) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "description": call.description,
+        "promptChars": call.prompt.len(),
+    });
+    if let Some(t) = &call.subagent_type {
+        v["subagentType"] = serde_json::json!(t);
+    }
+    if let Some(m) = &call.model {
+        v["model"] = serde_json::json!(m);
+    }
+    v
 }
 
 /// Decides whether `send_agentic`'s per-iteration budget gate should stop the
@@ -1898,8 +1919,12 @@ impl ChatEngine {
                  the shell's current directory — pass a path relative to the root. Tool \
                  outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
                  need an omitted part, call recall_tool_output with that id rather than \
-                 re-running the tool. Use the tools to help the user; be concise and take \
-                 action rather than just explaining what to do.",
+                 re-running the tool. You can delegate independent, self-contained tasks \
+                 to sub-agents with the Agent tool — call it several times in ONE response \
+                 to run them in parallel; when a skill asks for parallel sub-agents, use \
+                 Agent, never emulate them one after another yourself. Use the tools to \
+                 help the user; be concise and take action rather than just explaining \
+                 what to do.",
                 request.workspace_path
             )
         });
@@ -1940,6 +1965,14 @@ impl ChatEngine {
         // allowed-tools list predates this tool, and recalling a stored
         // output is read-only — it can't widen what the skill permits.
         tools.push(recall_tool_definition());
+
+        // ── Sub-agents ────────────────────────────────────────────
+        // `Agent` (+ `Task` alias) — the fan-out tool Claude Code skills
+        // expect. Same placement rationale as recall: always offered in TALK,
+        // after the skill filter (skills written for Claude Code list `Agent`
+        // in their allowed-tools, older ones list `Task`; either way the
+        // filter must not strip it). Sub-agents themselves never get it.
+        tools.extend(agent_tool_definitions());
 
         // ── MCP tools ─────────────────────────────────────────────
         // Append tools exposed by configured MCP servers (namespaced
@@ -2193,6 +2226,91 @@ impl ChatEngine {
                 },
             });
 
+            // ── Sub-agents: fan out first ──────────────────────────
+            // Every `Agent` call in this response runs CONCURRENTLY (that is
+            // how a skill parallelizes: several tool_use blocks in one
+            // message). Their live cards open now; the sequential loop below
+            // only picks up the finished outcomes so tool_results keep the
+            // response's order. A malformed call fails fast with the parse
+            // error as its report instead of occupying a slot.
+            let mut agent_outcomes: HashMap<String, AgentOutcome> = HashMap::new();
+            {
+                let mut specs: Vec<SubagentSpec> = Vec::new();
+                for u in response.tool_uses.iter().filter(|u| is_agent_tool(&u.name)) {
+                    let parsed = parse_agent_call(&u.input);
+                    // The live card opens for every call, well-formed or not,
+                    // so a parse failure flips it to failed instead of leaving
+                    // a tool-end with no card to land on.
+                    let _ = app.emit("chat://tool-start", &ToolStartEvent {
+                        workspace_id: request.workspace_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        call_id: u.id.clone(),
+                        tool_name: u.name.clone(),
+                        tool_input: parsed
+                            .as_ref()
+                            .map(agent_input_for_display)
+                            .unwrap_or_else(|_| u.input.clone()),
+                        started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    });
+                    match parsed {
+                        Ok(call) => {
+                            specs.push(SubagentSpec {
+                                call_id: u.id.clone(),
+                                call,
+                                workspace_id: request.workspace_id.clone(),
+                                thread_id: request.thread_id.clone(),
+                                workspace_path: request.workspace_path.clone(),
+                                default_model: request.model.clone(),
+                                max_iterations,
+                                max_tokens: request.max_tokens,
+                                sandbox_roots: sandbox_roots.clone(),
+                            });
+                        }
+                        Err(msg) => {
+                            agent_outcomes.insert(
+                                u.id.clone(),
+                                AgentOutcome { report: msg, ok: false, ..AgentOutcome::default() },
+                            );
+                        }
+                    }
+                }
+                if !specs.is_empty() {
+                    tracing::info!(agents = specs.len(), "fanning out sub-agents");
+                    let done = run_subagents(
+                        app.clone(),
+                        Arc::clone(&self.db),
+                        self.client.clone(),
+                        specs,
+                        Arc::clone(&cancel),
+                    )
+                    .await;
+                    // Sub-agent spend goes to the ledger under ITS model (a
+                    // `model` override may differ from the thread's), so the
+                    // Companion CONTEXT card and Settings · Usage see the
+                    // fan-out. The parent's own totals stay parent-only: its
+                    // assistant row is priced at the parent model.
+                    for o in done.values() {
+                        if o.input_tokens > 0 || o.output_tokens > 0 {
+                            let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
+                            if let Err(e) = engine.record(token_engine::TokenEvent {
+                                id: None,
+                                session_id: request.workspace_id.clone(),
+                                timestamp: String::new(),
+                                input_tokens: o.input_tokens,
+                                output_tokens: o.output_tokens,
+                                cache_read_tokens: o.cache_read_tokens,
+                                cache_creation_tokens: o.cache_creation_tokens,
+                                model: o.model.clone(),
+                                cost_usd: 0.0,
+                            }, "talk") {
+                                tracing::warn!(error = %e, "failed to record sub-agent token event");
+                            }
+                        }
+                    }
+                    agent_outcomes.extend(done);
+                }
+            }
+
             // Execute each tool, persist to DB, and collect results.
             let mut tool_results: Vec<LlmToolResult> = Vec::new();
             for u in &response.tool_uses {
@@ -2208,7 +2326,12 @@ impl ChatEngine {
                 // write_file bodies (already destined for disk) so neither the
                 // live-card event nor the persisted record carries multi-KB
                 // JSON. Reused for tool-start, persistence, and the message.
-                let input_for_display = if u.name == "write_file" {
+                let is_agent = is_agent_tool(&u.name);
+                let input_for_display = if is_agent {
+                    parse_agent_call(&u.input)
+                        .map(|c| agent_input_for_display(&c))
+                        .unwrap_or_else(|_| u.input.clone())
+                } else if u.name == "write_file" {
                     let mut display = u.input.clone();
                     if let Some(content) = display.get("content").and_then(|c| c.as_str()) {
                         let len = content.len();
@@ -2251,15 +2374,18 @@ impl ChatEngine {
                 }
 
                 // ── Live card: announce the tool is starting ──────────
+                // (Sub-agent cards opened in the fan-out above.)
                 let call_started = std::time::Instant::now();
-                let _ = app.emit("chat://tool-start", &ToolStartEvent {
-                    workspace_id: request.workspace_id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    call_id: u.id.clone(),
-                    tool_name: u.name.clone(),
-                    tool_input: input_for_display.clone(),
-                    started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-                });
+                if !is_agent {
+                    let _ = app.emit("chat://tool-start", &ToolStartEvent {
+                        workspace_id: request.workspace_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        call_id: u.id.clone(),
+                        tool_name: u.name.clone(),
+                        tool_input: input_for_display.clone(),
+                        started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    });
+                }
 
                 // Absolute cwd a run_command executed in (shared shell), captured
                 // so its card can show the cwd badge. Empty for other tools.
@@ -2269,8 +2395,20 @@ impl ChatEngine {
                 // other names are built-in workspace tools. MCP calls run off
                 // the runtime thread with a timeout so a slow/hung server
                 // surfaces as a tool error instead of freezing the turn.
+                // A sub-agent's outcome was collected in the fan-out; its
+                // meta rides on the persisted tool row (`agent` key).
+                let mut agent_meta: Option<AgentOutcome> = None;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
+                } else if is_agent {
+                    let outcome = agent_outcomes.remove(&u.id).unwrap_or_else(|| AgentOutcome {
+                        report: "Sub-agent produced no outcome (internal error)".to_string(),
+                        ok: false,
+                        ..AgentOutcome::default()
+                    });
+                    let pair = (outcome.report.clone(), outcome.ok);
+                    agent_meta = Some(outcome);
+                    pair
                 } else if u.name == RECALL_TOOL_NAME {
                     self.recall_tool_output(&request.thread_id, &u.input)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
@@ -2385,7 +2523,10 @@ impl ChatEngine {
                     thread_id: request.thread_id.clone(),
                     call_id: u.id.clone(),
                     ok,
-                    duration_ms: call_started.elapsed().as_millis() as u64,
+                    duration_ms: agent_meta
+                        .as_ref()
+                        .map(|m| m.duration_ms)
+                        .unwrap_or_else(|| call_started.elapsed().as_millis() as u64),
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
@@ -2417,12 +2558,21 @@ impl ChatEngine {
                 } else {
                     input_for_display
                 };
-                let tool_record = serde_json::json!({
+                let mut tool_record = serde_json::json!({
                     "callId": u.id,
                     "toolName": u.name,
                     "toolInput": display_input,
                     "result": result,
                 });
+                if let Some(meta) = &agent_meta {
+                    // Report already sits in `result`; the meta is what the
+                    // card's collapsed summary shows (tokens, cost, ending).
+                    let mut m = serde_json::to_value(meta).unwrap_or_default();
+                    if let Some(obj) = m.as_object_mut() {
+                        obj.remove("report");
+                    }
+                    tool_record["agent"] = m;
+                }
                 // The thread may have been deleted while the turn was parked (a
                 // tool running, or an approval card awaiting the user). Skip the
                 // persist so we don't leave an orphaned tool row.

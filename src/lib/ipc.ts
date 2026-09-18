@@ -1131,6 +1131,11 @@ export const ipc = {
    *  the log into per-attempt segments. */
   getStageLog: (stageId: string) =>
     invoke<unknown[]>("get_stage_log", { stageId }),
+  /** Persisted live journal of one Talk sub-agent (`Agent` tool call), oldest
+   *  first — the crew card rehydrates from this after a reload. Live entries
+   *  arrive on `CHAT_AGENT_LOG_EVENT` while the sub-agent runs. */
+  getChatAgentLog: (callId: string) =>
+    invoke<LiveEntry[]>("get_chat_agent_log", { callId }),
 
   /** Archived attempts for a stage, oldest first (iteration ascending). */
   listStageIterations: (stageId: string) =>
@@ -1254,6 +1259,10 @@ export interface McpConnectResult {
 }
 
 /** Tauri event names emitted by the orchestrator. */
+/** Live journal entry of a Talk sub-agent: `{ workspaceId, threadId, callId, entry }`
+ *  where `entry` is the same `LiveEntry` shape a Direct stage emits on `run://log`. */
+export const CHAT_AGENT_LOG_EVENT = "chat://agent-log";
+
 export const RUN_EVENTS = {
   stageUpdate: "run://stage-update",
   cost: "run://cost",

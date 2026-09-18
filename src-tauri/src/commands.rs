@@ -2309,6 +2309,20 @@ pub async fn get_stage_log(
         .collect())
 }
 
+/// Persisted live journal of one TALK sub-agent (`Agent` tool call), oldest
+/// first — the crew card rehydrates from this after a reload.
+#[tauri::command]
+pub async fn get_chat_agent_log(
+    state: State<'_, AppState>,
+    call_id: String,
+) -> AppResult<Vec<serde_json::Value>> {
+    let rows = state.db.lock().list_chat_agent_log(&call_id)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| serde_json::from_str(r).ok())
+        .collect())
+}
+
 /// Archived attempts for a stage (snapshots taken before loop-back / reject
 /// resets), oldest first.
 #[tauri::command]

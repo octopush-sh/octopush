@@ -643,6 +643,22 @@ impl Db {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
+        // TALK sub-agents: the live journal of each `Agent` tool call, keyed by
+        // the tool call id so the crew card can be rehydrated after a reload.
+        // Thread-scoped so `delete_chat_thread` can cascade it.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_agent_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id  TEXT NOT NULL,
+                call_id    TEXT NOT NULL,
+                entry      TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_agent_log_call ON chat_agent_log(call_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chat_agent_log_thread ON chat_agent_log(thread_id);
+            "#,
+        )?;
 
         // Cross-machine run-history sync (Pro-real Part B / B1):
         //   • app_meta   — a tiny key/value store for app-global scalars (e.g. the
@@ -2571,6 +2587,7 @@ impl Db {
     /// Delete a thread and its messages (messages are removed explicitly since
     /// chat_messages has no FK to chat_threads).
     pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM chat_agent_log WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
         Ok(())
@@ -3070,6 +3087,24 @@ impl Db {
             .query_row(params![message_id, thread_id], |r| r.get::<_, String>(0))
             .optional()?;
         Ok(content)
+    }
+
+    /// Append one live-journal entry of a TALK sub-agent (`Agent` tool call).
+    pub fn append_chat_agent_log(&self, thread_id: &str, call_id: &str, entry_json: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO chat_agent_log (thread_id, call_id, entry) VALUES (?1, ?2, ?3)",
+            params![thread_id, call_id, entry_json],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted journal entries of one sub-agent call, oldest first.
+    pub fn list_chat_agent_log(&self, call_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry FROM chat_agent_log WHERE call_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![call_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// List a single thread's messages in chronological order. (Scoped by
