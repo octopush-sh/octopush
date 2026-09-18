@@ -185,6 +185,7 @@ describe("NewProjectFlow — Step II Clone: URL auto-detection", () => {
     await waitFor(() => {
       expect(screen.getByText(/github\.com/i)).toBeInTheDocument();
     });
+    expect(screen.getByTitle("Git host")).toBeInTheDocument();
   });
 
   it("manually editing name detaches it from URL parsing", async () => {
