@@ -19,6 +19,8 @@
 //! The frontmatter is parsed by hand (the three fields we use are simple
 //! `key: value` lines) so we don't pull in a YAML dependency.
 
+pub mod agents;
+
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -62,27 +64,31 @@ fn skill_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
     roots
 }
 
-/// Parse a SKILL.md's text into a Skill. Returns None when there's no usable
-/// frontmatter `name`. `source` labels the origin ("project"/"user").
-pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
-    // Frontmatter is a leading `---` … `---` block delimited by lines that are
-    // exactly `---`. Parsing line-by-line (rather than substring-searching for
-    // `\n---`) means a `---` horizontal rule or a leading `-` list item in the
-    // BODY is never mistaken for the fence or stripped.
+/// Split a Claude-Code-style markdown file into its frontmatter pairs and
+/// body. Frontmatter is a leading `---` … `---` block delimited by lines that
+/// are exactly `---`. Parsing line-by-line (rather than substring-searching
+/// for `\n---`) means a `---` horizontal rule or a leading `-` list item in
+/// the BODY is never mistaken for the fence or stripped. Keys are lowercased;
+/// values are trimmed and unquoted. `None` when the fence is missing or
+/// unclosed. Shared by SKILL.md and `.claude/agents/*.md`.
+pub(crate) fn split_frontmatter(content: &str) -> Option<(Vec<(String, String)>, String)> {
     let text = content.replace("\r\n", "\n");
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return None; // must open with a `---` fence line
     }
-    let mut front_lines: Vec<&str> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut body_lines: Vec<&str> = Vec::new();
     let mut closed = false;
     for line in lines {
         if !closed {
             if line.trim() == "---" {
                 closed = true;
-            } else {
-                front_lines.push(line);
+            } else if let Some((key, value)) = line.split_once(':') {
+                pairs.push((
+                    key.trim().to_ascii_lowercase(),
+                    value.trim().trim_matches(['"', '\'']).to_string(),
+                ));
             }
         } else {
             body_lines.push(line);
@@ -91,25 +97,32 @@ pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
     if !closed {
         return None; // no closing fence — malformed
     }
-    let body = body_lines.join("\n").trim().to_string();
+    Some((pairs, body_lines.join("\n").trim().to_string()))
+}
 
+/// A comma-separated (optionally bracketed) frontmatter list → items.
+pub(crate) fn split_list(value: &str) -> Vec<String> {
+    value
+        .trim_matches(['[', ']'])
+        .split(',')
+        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Parse a SKILL.md's text into a Skill. Returns None when there's no usable
+/// frontmatter `name`. `source` labels the origin ("project"/"user").
+pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
+    let (pairs, body) = split_frontmatter(content)?;
     let mut name = String::new();
     let mut description = String::new();
     let mut allowed_tools: Option<Vec<String>> = None;
-    for line in front_lines {
-        let Some((key, value)) = line.split_once(':') else { continue };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().trim_matches(['"', '\'']).to_string();
+    for (key, value) in pairs {
         match key.as_str() {
             "name" => name = value,
             "description" => description = value,
             "allowed-tools" | "allowed_tools" | "tools" => {
-                let list: Vec<String> = value
-                    .trim_matches(['[', ']'])
-                    .split(',')
-                    .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let list = split_list(&value);
                 if !list.is_empty() {
                     allowed_tools = Some(list);
                 }

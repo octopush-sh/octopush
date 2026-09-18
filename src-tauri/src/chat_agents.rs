@@ -25,6 +25,7 @@ use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResul
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{LlmProvider, LlmTool};
+use crate::skills::agents::{resolve_model, AgentDefinition};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -48,7 +49,15 @@ pub fn is_agent_tool(name: &str) -> bool {
     name == AGENT_TOOL_NAME || name == TASK_TOOL_ALIAS
 }
 
-fn agent_input_schema() -> serde_json::Value {
+fn agent_input_schema(defs: &[AgentDefinition]) -> serde_json::Value {
+    let type_hint = if defs.is_empty() {
+        "Optional role hint (e.g. \"reviewer\", \"Explore\"); shown on the card and given to the sub-agent as its role".to_string()
+    } else {
+        format!(
+            "Optional. One of the defined agent types — {} — runs the sub-agent under that definition (its instructions, tools and model); any other value is a plain role hint.",
+            defs.iter().map(|d| format!("`{}`", d.name)).collect::<Vec<_>>().join(", ")
+        )
+    };
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -62,7 +71,7 @@ fn agent_input_schema() -> serde_json::Value {
             },
             "subagent_type": {
                 "type": "string",
-                "description": "Optional role hint (e.g. \"reviewer\", \"Explore\"); shown on the card and given to the sub-agent as its role"
+                "description": type_hint
             },
             "model": {
                 "type": "string",
@@ -73,9 +82,12 @@ fn agent_input_schema() -> serde_json::Value {
     })
 }
 
-/// The `Agent` tool plus its `Task` alias, for the TALK tool list.
-pub fn agent_tool_definitions() -> Vec<LlmTool> {
-    let description = "Delegate a self-contained task to a sub-agent that works autonomously \
+/// The `Agent` tool plus its `Task` alias, for the TALK tool list. `defs` are
+/// the workspace's `.claude/agents/*.md` definitions: the description
+/// enumerates them (name — description) exactly as Claude Code's Agent tool
+/// does, so a skill that says "use the security-reviewer agent" finds it.
+pub fn agent_tool_definitions(defs: &[AgentDefinition]) -> Vec<LlmTool> {
+    let mut description = "Delegate a self-contained task to a sub-agent that works autonomously \
          in this workspace with the same tools you have (run_command, read/write/edit files, \
          grep, glob) and returns only its final report. Call Agent several times in ONE \
          response to run those tasks in parallel — the results come back together. The \
@@ -83,16 +95,22 @@ pub fn agent_tool_definitions() -> Vec<LlmTool> {
          put everything it needs in `prompt`. Use it for independent research, reviews or \
          analyses; do the work yourself when it is small or sequential."
         .to_string();
+    if !defs.is_empty() {
+        description.push_str("\n\nAvailable agent types (pass as subagent_type):");
+        for d in defs {
+            description.push_str(&format!("\n- {}: {}", d.name, d.description));
+        }
+    }
     vec![
         LlmTool {
             name: AGENT_TOOL_NAME.to_string(),
             description: description.clone(),
-            input_schema: agent_input_schema(),
+            input_schema: agent_input_schema(defs),
         },
         LlmTool {
             name: TASK_TOOL_ALIAS.to_string(),
             description: format!("Alias of Agent. {description}"),
-            input_schema: agent_input_schema(),
+            input_schema: agent_input_schema(defs),
         },
     ]
 }
@@ -132,14 +150,20 @@ pub fn parse_agent_call(input: &serde_json::Value) -> Result<AgentCall, String> 
 
 /// The system prompt a sub-agent runs under: the same workspace/tool
 /// guidance as TALK, minus the human — it must decide alone and hand back a
-/// report the parent can act on without reading its journal.
-pub fn subagent_system_prompt(workspace_path: &str, call: &AgentCall) -> String {
-    let role = call
-        .subagent_type
-        .as_deref()
+/// report the parent can act on without reading its journal. A matched
+/// `.claude/agents` definition appends its body as the agent's own
+/// instructions (the same way an active skill rides on the Talk prompt).
+pub fn subagent_system_prompt(
+    workspace_path: &str,
+    call: &AgentCall,
+    definition: Option<&AgentDefinition>,
+) -> String {
+    let role = definition
+        .map(|d| d.name.as_str())
+        .or(call.subagent_type.as_deref())
         .map(|t| format!(" Your role: {t}."))
         .unwrap_or_default();
-    format!(
+    let mut prompt = format!(
         "You are a sub-agent working in the project at {workspace_path}, spawned by the \
          main assistant to carry out one task: {description}.{role} You have tools to run \
          commands, read/write/edit files, list directories and search. run_command is a \
@@ -153,7 +177,13 @@ pub fn subagent_system_prompt(workspace_path: &str, call: &AgentCall) -> String 
          answer or findings, then the evidence (file paths, line numbers, commands run), \
          then anything left undone.",
         description = call.description,
-    )
+    );
+    if let Some(d) = definition {
+        if !d.body.is_empty() {
+            prompt.push_str(&format!("\n\n# Agent: {}\n{}", d.name, d.body));
+        }
+    }
+    prompt
 }
 
 /// What one sub-agent produced, in the shape the parent turn persists on the
@@ -233,6 +263,29 @@ pub struct SubagentSpec {
     pub max_iterations: usize,
     pub max_tokens: u32,
     pub sandbox_roots: Option<Vec<String>>,
+    /// The `.claude/agents` definition `subagent_type` matched, if any.
+    pub definition: Option<AgentDefinition>,
+}
+
+/// Which model a sub-agent runs on: the call's explicit `model` wins, then
+/// the definition's `model` when it resolves against the configured ids
+/// (an alias like `haiku` picks the first matching id), else the
+/// conversation's model. Pure so the precedence is tested.
+pub fn pick_subagent_model(spec: &SubagentSpec, known_models: &[String]) -> String {
+    if let Some(m) = &spec.call.model {
+        return m.clone();
+    }
+    if let Some(def_model) = spec.definition.as_ref().and_then(|d| d.model.as_deref()) {
+        if let Some(resolved) = resolve_model(def_model, known_models) {
+            return resolved.to_string();
+        }
+        tracing::warn!(
+            agent = %spec.definition.as_ref().map(|d| d.name.as_str()).unwrap_or(""),
+            model = def_model,
+            "agent definition's model matches no configured model; inheriting the conversation's"
+        );
+    }
+    spec.default_model.clone()
 }
 
 /// `EventSink` for one sub-agent: re-emits the `LiveEmitter`'s entries as
@@ -287,7 +340,8 @@ pub async fn run_subagent_core(
 ) -> AppResult<AgentOutcome> {
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
-    let system = subagent_system_prompt(&spec.workspace_path, &spec.call);
+    let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref());
+    let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let out = run_agentic_loop(
         provider,
         api_base,
@@ -300,7 +354,7 @@ pub async fn run_subagent_core(
         spec.max_iterations,
         cancel,
         &emitter,
-        None,
+        allowed_tools,
         None,
         spec.sandbox_roots.as_deref(),
         false,
@@ -345,16 +399,23 @@ pub async fn run_subagents(
 ) -> HashMap<String, AgentOutcome> {
     let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENTS));
     let mut set = tokio::task::JoinSet::new();
+    // Configured model ids, read once per fan-out, for definition aliases.
+    let known_models: Arc<Vec<String>> = Arc::new(
+        crate::provider_router::ProviderRouter::load()
+            .map(|r| r.list_models().into_iter().map(|m| m.model.id).collect())
+            .unwrap_or_default(),
+    );
     for spec in specs {
         let app = app.clone();
         let db = Arc::clone(&db);
         let client = client.clone();
         let cancel = Arc::clone(&cancel);
         let gate = Arc::clone(&gate);
+        let known_models = Arc::clone(&known_models);
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let started = std::time::Instant::now();
-            let model = spec.call.model.clone().unwrap_or_else(|| spec.default_model.clone());
+            let model = pick_subagent_model(&spec, &known_models);
             let sink = ChatAgentSink {
                 app,
                 db,
@@ -416,7 +477,7 @@ mod tests {
 
     #[test]
     fn agent_and_task_share_one_schema() {
-        let defs = agent_tool_definitions();
+        let defs = agent_tool_definitions(&[]);
         assert_eq!(defs.len(), 2);
         assert_eq!(defs[0].name, "Agent");
         assert_eq!(defs[1].name, "Task");
@@ -449,7 +510,7 @@ mod tests {
             subagent_type: Some("security-reviewer".into()),
             model: None,
         };
-        let p = subagent_system_prompt("/w", &call);
+        let p = subagent_system_prompt("/w", &call, None);
         assert!(p.contains("/w"));
         assert!(p.contains("Check security"));
         assert!(p.contains("Your role: security-reviewer."));
@@ -483,6 +544,59 @@ mod tests {
         };
         let (r, ok) = report_from_result(&blocked, 25);
         assert!(!ok && r.contains("Which branch?") && r.contains("- main or develop?"), "{r}");
+    }
+
+    fn def(name: &str, tools: Option<Vec<&str>>, model: Option<&str>) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            description: format!("{name} desc"),
+            body: format!("You are the {name}."),
+            tools: tools.map(|t| t.into_iter().map(String::from).collect()),
+            model: model.map(String::from),
+            source: "project".into(),
+        }
+    }
+
+    #[test]
+    fn tool_description_enumerates_defined_agent_types() {
+        let defs = agent_tool_definitions(&[def("security-reviewer", None, None), def("explore", None, None)]);
+        assert!(defs[0].description.contains("Available agent types"));
+        assert!(defs[0].description.contains("- security-reviewer: security-reviewer desc"));
+        let hint = defs[0].input_schema["properties"]["subagent_type"]["description"].as_str().unwrap();
+        assert!(hint.contains("`security-reviewer`") && hint.contains("`explore`"), "{hint}");
+        assert_eq!(defs[0].input_schema, defs[1].input_schema);
+    }
+
+    #[test]
+    fn a_matched_definition_appends_its_body_and_names_the_role() {
+        let call = AgentCall { description: "Audit".into(), prompt: "…".into(), subagent_type: Some("security-reviewer".into()), model: None };
+        let d = def("security-reviewer", None, None);
+        let p = subagent_system_prompt("/w", &call, Some(&d));
+        assert!(p.contains("Your role: security-reviewer."));
+        assert!(p.ends_with("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+    }
+
+    #[test]
+    fn model_precedence_is_call_then_definition_then_conversation() {
+        let known = vec!["claude-haiku-4-5-20251001".to_string(), "gpt-4o".to_string()];
+        let base = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
+            default_model: "conv-model".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            definition: None,
+        };
+        assert_eq!(pick_subagent_model(&base, &known), "conv-model");
+        let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
+        assert_eq!(pick_subagent_model(&with_def, &known), "claude-haiku-4-5-20251001");
+        let unresolvable = SubagentSpec { definition: Some(def("x", None, Some("sonnet"))), ..base.clone() };
+        assert_eq!(pick_subagent_model(&unresolvable, &known), "conv-model");
+        let explicit = SubagentSpec {
+            call: AgentCall { model: Some("gpt-4o".into()), ..base.call.clone() },
+            definition: Some(def("x", None, Some("haiku"))),
+            ..base.clone()
+        };
+        assert_eq!(pick_subagent_model(&explicit, &known), "gpt-4o");
     }
 
     struct ScriptedProvider {
@@ -524,6 +638,44 @@ mod tests {
         }
     }
 
+    struct ToolAssertingProvider {
+        allowed: Vec<&'static str>,
+        seen: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ToolAssertingProvider {
+        async fn complete(&self, _b: &str, _k: Option<&str>, req: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            *self.seen.lock() = req.tools.iter().map(|t| t.name.clone()).collect();
+            assert!(req.system.contains("# Agent: reader"), "definition body reaches the system prompt");
+            Ok(resp("done reading", vec![], LlmStopReason::EndTurn))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_definition_restricts_the_subagent_to_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ToolAssertingProvider { allowed: vec!["read_file", "grep", "glob"], seen: Mutex::new(vec![]) };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Read".into(), prompt: "read".into(), subagent_type: Some("reader".into()), model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
+            definition: Some(def("reader", Some(vec!["read_file", "grep"]), None)),
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec).await.unwrap();
+        assert!(out.ok);
+        let seen = provider.seen.lock().clone();
+        // read_file + grep granted; grep/glob are implied by read access; no
+        // write/run tool leaks through; the orchestrator's ask_director escape
+        // valve rides along (it is not a workspace tool).
+        for t in ["read_file", "grep", "glob"] { assert!(seen.contains(&t.to_string()), "{seen:?}"); }
+        for t in ["write_file", "edit_file", "run_command", "Agent", "Task"] { assert!(!seen.contains(&t.to_string()), "{seen:?}"); }
+        assert!(provider.allowed.iter().all(|a| seen.contains(&a.to_string())));
+    }
+
     #[tokio::test]
     async fn subagent_core_runs_the_loop_and_reports_the_final_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -552,6 +704,7 @@ mod tests {
             max_iterations: 5,
             max_tokens: 4096,
             sandbox_roots: None,
+            definition: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();

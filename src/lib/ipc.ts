@@ -707,6 +707,10 @@ export const ipc = {
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>
     invoke<SkillMeta[]>("list_skills", { workspacePath }),
+  /** The workspace's `.claude/agents/*.md` definitions — the `subagent_type`s
+   *  Talk's `Agent` tool can run under (project ∪ user, project shadows). */
+  listSubagentTypes: (workspacePath: string) =>
+    invoke<SubagentTypeMeta[]>("list_subagent_types", { workspacePath }),
 
   // ─── Attachments ─────────────────────────────────────────────────
   readAttachment: (path: string) => invoke<Attachment>("read_attachment", { path }),
@@ -1262,6 +1266,18 @@ export interface McpConnectResult {
 /** Live journal entry of a Talk sub-agent: `{ workspaceId, threadId, callId, entry }`
  *  where `entry` is the same `LiveEntry` shape a Direct stage emits on `run://log`. */
 export const CHAT_AGENT_LOG_EVENT = "chat://agent-log";
+
+/** Picker-sized view of a `.claude/agents/*.md` definition. */
+export interface SubagentTypeMeta {
+  name: string;
+  description: string;
+  /** "project" or "user". */
+  source: string;
+  /** Workspace tool names the sub-agent is limited to; null = the full set. */
+  tools: string[] | null;
+  /** The frontmatter `model` as written (an id or an alias like "haiku"). */
+  model: string | null;
+}
 
 export const RUN_EVENTS = {
   stageUpdate: "run://stage-update",
