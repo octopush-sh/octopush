@@ -1354,6 +1354,16 @@ pub async fn list_skills(workspace_path: String) -> AppResult<Vec<crate::skills:
     Ok(skills.iter().map(|s| s.meta()).collect())
 }
 
+/// The workspace's `.claude/agents/*.md` definitions (project ∪ user) — the
+/// `subagent_type`s Talk's `Agent` tool can run under.
+#[tauri::command]
+pub async fn list_subagent_types(
+    workspace_path: String,
+) -> AppResult<Vec<crate::skills::agents::AgentDefinitionMeta>> {
+    let defs = crate::skills::agents::scan_agent_definitions(std::path::Path::new(&workspace_path));
+    Ok(defs.iter().map(|d| d.meta()).collect())
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentData {

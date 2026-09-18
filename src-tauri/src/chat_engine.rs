@@ -1971,8 +1971,11 @@ impl ChatEngine {
         // expect. Same placement rationale as recall: always offered in TALK,
         // after the skill filter (skills written for Claude Code list `Agent`
         // in their allowed-tools, older ones list `Task`; either way the
-        // filter must not strip it). Sub-agents themselves never get it.
-        tools.extend(agent_tool_definitions());
+        // filter must not strip it). Sub-agents themselves never get it. The
+        // workspace's `.claude/agents/*.md` definitions are enumerated in the
+        // tool description so the model can name them as `subagent_type`.
+        let agent_defs = crate::skills::agents::scan_agent_definitions(&workspace_path);
+        tools.extend(agent_tool_definitions(&agent_defs));
 
         // ── MCP tools ─────────────────────────────────────────────
         // Append tools exposed by configured MCP servers (namespaced
@@ -2254,6 +2257,11 @@ impl ChatEngine {
                     });
                     match parsed {
                         Ok(call) => {
+                            let definition = call
+                                .subagent_type
+                                .as_deref()
+                                .and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, t))
+                                .cloned();
                             specs.push(SubagentSpec {
                                 call_id: u.id.clone(),
                                 call,
@@ -2264,6 +2272,7 @@ impl ChatEngine {
                                 max_iterations,
                                 max_tokens: request.max_tokens,
                                 sandbox_roots: sandbox_roots.clone(),
+                                definition,
                             });
                         }
                         Err(msg) => {
