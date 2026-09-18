@@ -6,6 +6,9 @@
 //! The loop is provider-agnostic: AnthropicProvider or OpenAICompatibleProvider
 //! is selected at runtime via `resolve_provider()`.
 
+use crate::chat_history::{
+    build_history, effective_talk_max_iterations, window_text, HistoryRole, HistoryRow,
+};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::providers::{
@@ -26,7 +29,45 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use chrono;
 
-const MAX_TOOL_ITERATIONS: usize = 25;
+/// TALK-only tool that pulls a stored tool output back into context. Earlier
+/// turns' tool results are re-sent abridged (see `chat_history`); this is the
+/// model's way to read the omitted part instead of re-running the tool.
+const RECALL_TOOL_NAME: &str = "recall_tool_output";
+/// Chars a single `recall_tool_output` call returns when no `limit` is given.
+const RECALL_DEFAULT_LIMIT: usize = 40_000;
+/// Hard ceiling on one `recall_tool_output` window.
+const RECALL_MAX_LIMIT: usize = 100_000;
+
+fn recall_tool_definition() -> LlmTool {
+    LlmTool {
+        name: RECALL_TOOL_NAME.to_string(),
+        description: "Fetch the full stored output of an earlier tool call in this \
+             conversation. Tool results from previous turns appear abridged in your \
+             context as `[Tool #<message_id>: …]`; when one says chars were omitted \
+             and you need that part, call this with its message_id instead of \
+             re-running the tool. Pass offset/limit (in characters) to page through \
+             a very long output."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "The #id shown on the abridged tool summary"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Optional 0-based character offset to start from"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional maximum characters to return (default 40000, max 100000)"
+                }
+            },
+            "required": ["message_id"]
+        }),
+    }
+}
 
 /// Decides whether `send_agentic`'s per-iteration budget gate should stop the
 /// turn. Split out as a free function so the exact boundary is unit-tested
@@ -1317,6 +1358,64 @@ impl ChatEngine {
         }
     }
 
+    /// Record one provider response's token usage: the canonical spend ledger
+    /// (so the Companion CONTEXT card and Settings · Usage see chat turns)
+    /// and the mission logbook. Shared by the loop and the forced close.
+    fn record_usage(&self, workspace_id: &str, model: &str, response: &crate::providers::LlmResponse) {
+        if response.input_tokens > 0 || response.output_tokens > 0 {
+            let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
+            if let Err(e) = engine.record(token_engine::TokenEvent {
+                id: None,
+                session_id: workspace_id.to_string(),
+                timestamp: String::new(),
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+                cache_read_tokens: response.cache_read_tokens,
+                cache_creation_tokens: response.cache_creation_tokens,
+                model: model.to_string(),
+                cost_usd: 0.0,
+            }, "talk") {
+                tracing::warn!(error = %e, "failed to record chat token event");
+            }
+        }
+        // Logbook: a completed chat turn is active TALK work on the mission.
+        let _ = self.db.lock().record_activity(workspace_id, "talk", "chat");
+    }
+
+    /// Execute `recall_tool_output`: the full stored result of an earlier
+    /// tool row in THIS thread, optionally windowed. Returns `(text, ok)` like
+    /// every other tool.
+    fn recall_tool_output(&self, thread_id: &str, input: &serde_json::Value) -> (String, bool) {
+        let Some(message_id) = input.get("message_id").and_then(|v| v.as_i64()) else {
+            return ("recall_tool_output needs an integer `message_id`".to_string(), false);
+        };
+        let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|l| l as usize)
+            .unwrap_or(RECALL_DEFAULT_LIMIT)
+            .clamp(1, RECALL_MAX_LIMIT);
+        let stored = match self.db.lock().get_chat_tool_output(thread_id, message_id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return (
+                    format!("No tool output with message_id {message_id} in this conversation"),
+                    false,
+                )
+            }
+            Err(e) => return (format!("Failed to load tool output: {e}"), false),
+        };
+        let result = serde_json::from_str::<serde_json::Value>(&stored)
+            .ok()
+            .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        if result.is_empty() {
+            return (format!("Tool output #{message_id} is empty"), true);
+        }
+        (window_text(&result, offset, limit), true)
+    }
+
     /// Persist a brief "stopped" marker and emit the done event so the frontend
     /// clears its streaming state when a turn is cancelled mid-flight.
     ///
@@ -1731,86 +1830,26 @@ impl ChatEngine {
         }
 
         // Build conversation history (this thread only) as normalized
-        // LlmMessage[]. Tool summaries are injected into assistant messages so
-        // the model remembers what it did.
+        // LlmMessage[]. `chat_history::build_history` owns the shape: the
+        // model's pre-tool narration and recency-weighted tool excerpts are
+        // folded into the assistant turns, orphans ride on the next user turn,
+        // same-role turns merge (Anthropic 400 guard), and `error`/`stopped`
+        // rows are never replayed.
         let history = self.db.lock().list_chat_messages(&request.thread_id)?;
-        let mut messages: Vec<LlmMessage> = Vec::new();
-        let mut pending_tool_summary = Vec::new();
-
-        for msg in &history {
-            if msg.role == "tool" {
-                // Accumulate tool summaries to inject into the next assistant message.
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                    let name = parsed.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool");
-                    let empty_obj = serde_json::json!({});
-                    let input = parsed.get("toolInput").unwrap_or(&empty_obj);
-                    let result = parsed.get("result").and_then(|r| r.as_str()).unwrap_or("");
-                    // Truncate long results for context efficiency, on a UTF-8
-                    // char boundary (shell output via `$`-direct is arbitrary
-                    // bytes, so a naive `&result[..500]` byte slice can panic).
-                    let short_result = if result.len() > 500 {
-                        let mut end = 500;
-                        while end > 0 && !result.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...(truncated)", &result[..end])
-                    } else {
-                        result.to_string()
-                    };
-                    pending_tool_summary.push(format!(
-                        "[Tool: {} | Input: {} | Result: {}]",
-                        name,
-                        serde_json::to_string(input).unwrap_or_default(),
-                        short_result,
-                    ));
-                }
-            } else if msg.role == "assistant" {
-                // Prepend any accumulated tool summaries to the assistant message
-                // so the model knows what actions it took.
-                let mut content = String::new();
-                if !pending_tool_summary.is_empty() {
-                    content.push_str(&pending_tool_summary.join("\n"));
-                    content.push_str("\n\n");
-                    pending_tool_summary.clear();
-                }
-                content.push_str(&msg.content);
-                messages.push(LlmMessage {
-                    role: LlmRole::Assistant,
-                    content: LlmContent::Text(content),
-                });
-            } else if msg.role == "user" {
-                // Prepend any orphaned tool summaries to the user turn. This is
-                // the path a `$`-direct command takes: its output (role="tool")
-                // isn't followed by an assistant message, so without this the
-                // command's output would be dropped from the model's context.
-                let mut content = String::new();
-                if !pending_tool_summary.is_empty() {
-                    content.push_str(&pending_tool_summary.join("\n"));
-                    content.push_str("\n\n");
-                    pending_tool_summary.clear();
-                }
-                content.push_str(&msg.content);
-                // Merge into a preceding user turn rather than pushing a second
-                // one. A `$`-direct command (user row `$ cmd` + tool row) before
-                // another user/`$` row would otherwise yield two consecutive
-                // User messages, which Anthropic rejects with a 400.
-                match messages.last_mut() {
-                    Some(last)
-                        if last.role == LlmRole::User
-                            && matches!(last.content, LlmContent::Text(_)) =>
-                    {
-                        if let LlmContent::Text(prev) = &mut last.content {
-                            prev.push_str("\n\n");
-                            prev.push_str(&content);
-                        }
-                    }
-                    _ => messages.push(LlmMessage {
-                        role: LlmRole::User,
-                        content: LlmContent::Text(content),
-                    }),
-                }
-            }
-        }
+        let rows: Vec<HistoryRow<'_>> = history
+            .iter()
+            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
+            .collect();
+        let mut messages: Vec<LlmMessage> = build_history(&rows)
+            .into_iter()
+            .map(|t| LlmMessage {
+                role: match t.role {
+                    HistoryRole::User => LlmRole::User,
+                    HistoryRole::Assistant => LlmRole::Assistant,
+                },
+                content: LlmContent::Text(t.text),
+            })
+            .collect();
 
         // Attach this turn's images: replace the current (last) user turn with a
         // multimodal block carrying the text + image blocks. Attachments aren't
@@ -1856,9 +1895,11 @@ impl ChatEngine {
                  is NON-interactive: don't run REPLs or commands that wait for stdin \
                  (pass input via flags or a heredoc instead). read_file/write_file/\
                  list_files paths are ALWAYS relative to the project root, regardless of \
-                 the shell's current directory — pass a path relative to the root. Use the \
-                 tools to help the user; be concise and take action rather than just \
-                 explaining what to do.",
+                 the shell's current directory — pass a path relative to the root. Tool \
+                 outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
+                 need an omitted part, call recall_tool_output with that id rather than \
+                 re-running the tool. Use the tools to help the user; be concise and take \
+                 action rather than just explaining what to do.",
                 request.workspace_path
             )
         });
@@ -1893,6 +1934,12 @@ impl ChatEngine {
                 }
             }
         }
+
+        // ── Recall tool ───────────────────────────────────────────
+        // Always available in TALK, after the skill filter: a skill's
+        // allowed-tools list predates this tool, and recalling a stored
+        // output is read-only — it can't widen what the skill permits.
+        tools.push(recall_tool_definition());
 
         // ── MCP tools ─────────────────────────────────────────────
         // Append tools exposed by configured MCP servers (namespaced
@@ -1935,8 +1982,14 @@ impl ChatEngine {
         let mut attributed: std::collections::HashSet<(String, i64)> =
             std::collections::HashSet::new();
 
+        // Tool-call rounds this turn may run: the saved "Tool turns per
+        // message" preference (Settings › General), clamped, or the default.
+        let max_iterations = effective_talk_max_iterations(
+            crate::settings::load_settings().ok().and_then(|s| s.talk_max_iterations),
+        );
+
         // ─── Agentic loop ─────────────────────────────────────────
-        for iteration in 0..MAX_TOOL_ITERATIONS {
+        for iteration in 0..max_iterations {
             // Stop cleanly if the user cancelled this turn (checked here and
             // after each tool — the in-flight request itself isn't aborted).
             if cancel.load(Ordering::Relaxed) {
@@ -1947,7 +2000,7 @@ impl ChatEngine {
             // Phase 3 — per-iteration budget enforcement. The entry gate in
             // `send_chat_message` authorized this turn's FIRST provider call;
             // this gate stops a runaway agentic loop that keeps accumulating
-            // spend across up to MAX_TOOL_ITERATIONS calls and crosses a
+            // spend across up to `max_iterations` calls and crosses a
             // configured budget mid-turn. The decision lives in the unit-tested
             // `should_stop_for_budget`; the outer guard only avoids the DB query
             // when the answer is trivially no (iteration 0 — owned by the entry
@@ -2009,29 +2062,7 @@ impl ChatEngine {
 
             total_input += response.input_tokens;
             total_output += response.output_tokens;
-
-            // Record a token usage event so the Companion CONTEXT card and
-            // Settings · Usage stats can read aggregate counts. Without this
-            // the `token_events` table never sees chat turns and the
-            // dashboards stay frozen at zero.
-            if response.input_tokens > 0 || response.output_tokens > 0 {
-                let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
-                if let Err(e) = engine.record(token_engine::TokenEvent {
-                    id: None,
-                    session_id: request.workspace_id.clone(),
-                    timestamp: String::new(),
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                    cache_read_tokens: response.cache_read_tokens,
-                    cache_creation_tokens: response.cache_creation_tokens,
-                    model: request.model.clone(),
-                    cost_usd: 0.0,
-                }, "talk") {
-                    tracing::warn!(error = %e, "failed to record chat token event");
-                }
-            }
-            // Logbook: a completed chat turn is active TALK work on the mission.
-            let _ = self.db.lock().record_activity(&request.workspace_id, "talk", "chat");
+            self.record_usage(&request.workspace_id, &request.model, &response);
 
             tracing::info!(
                 iteration = iteration,
@@ -2240,6 +2271,8 @@ impl ChatEngine {
                 // surfaces as a tool error instead of freezing the turn.
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
+                } else if u.name == RECALL_TOOL_NAME {
+                    self.recall_tool_output(&request.thread_id, &u.input)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     let mcp = Arc::clone(&self.mcp);
                     let wp = workspace_path.clone();
@@ -2475,8 +2508,111 @@ impl ChatEngine {
             );
         }
 
+        // ─── Cap reached: forced close ────────────────────────────
+        // The limit landed mid-work. Before declaring the turn lost, ask for
+        // ONE more response with the same tool list but an instruction not to
+        // call any tool ("write your final answer with what you have"). The
+        // rounds of good work used to be thrown away because the model never
+        // got to write its closing summary; a possibly-incomplete but real
+        // answer beats an empty failure. (Mirrors `orchestrator::agentic`.)
+        if cancel.load(Ordering::Relaxed) {
+            self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+            return Ok(());
+        }
+        const CLOSE_INSTRUCTION: &str =
+            "Your tool budget for this turn is exhausted — you cannot call any more tools. \
+             Write your final answer NOW with what you already know: what you found or \
+             accomplished, what remains undone, and what the user should do next. If you \
+             were reviewing, state your findings so far.";
+        // The loop always ends right after pushing tool results, so the
+        // instruction is APPENDED to the last tool result — a separate
+        // consecutive user turn breaks role alternation on strict providers.
+        // The tool list rides along unchanged: a history with tool_use blocks
+        // and an empty `tools` array is a hard 400 on Anthropic, and keeping it
+        // preserves the prompt-cache prefix.
+        match messages.last_mut() {
+            Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
+                if let Some(last) = results.last_mut() {
+                    last.content.push_str("\n\n[system] ");
+                    last.content.push_str(CLOSE_INSTRUCTION);
+                }
+            }
+            _ => messages.push(LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
+            }),
+        }
+        let close_req = LlmRequest {
+            model: request.model.clone(),
+            max_tokens: request.max_tokens.max(4096),
+            system: system_prompt.clone(),
+            messages: messages.clone(),
+            tools: tools.clone(),
+            tool_choice: None,
+            effort: None,
+            cache: true,
+        };
+        tracing::info!(
+            max_iterations,
+            "agentic loop: iteration cap reached — asking the model to close with what it has"
+        );
+        match provider
+            .complete(&api_base, api_key.as_deref(), &close_req, &self.client)
+            .await
+        {
+            Ok(response) => {
+                total_input += response.input_tokens;
+                total_output += response.output_tokens;
+                self.record_usage(&request.workspace_id, &request.model, &response);
+                let final_text = response.text.trim().to_string();
+                if !final_text.is_empty() {
+                    let _ = app.emit("chat://stream", &ChatStreamEvent {
+                        workspace_id: request.workspace_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        delta: final_text.clone(),
+                        done: false,
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    let cost = token_engine::cost_for(&request.model, total_input, total_output, 0, 0);
+                    self.insert_and_emit_message(
+                        &app,
+                        &request.workspace_id,
+                        &request.thread_id,
+                        "assistant",
+                        &final_text,
+                        Some(&request.model),
+                        Some(total_input as i64),
+                        Some(total_output as i64),
+                        Some(cost),
+                    )?;
+                    // The quiet note explains WHY the answer may be partial and
+                    // where the limit lives. Tokens/cost already sit on the
+                    // assistant row, so the note carries none.
+                    self.finish_with_note(
+                        &app,
+                        &request.workspace_id,
+                        &request.thread_id,
+                        &request.model,
+                        0,
+                        0,
+                        &format!(
+                            "Reached the {max_iterations}-turn tool limit — answered with what it had. \
+                             Say \"continue\" to pick up where it left off, or raise the limit in Settings › General."
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                tracing::warn!("forced close returned no text; surfacing the cap as an error");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "forced close failed; surfacing the cap as an error");
+            }
+        }
+
         let loop_err = AppError::Other(format!(
-            "Agentic loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
+            "Stopped at the {max_iterations}-turn tool limit before finishing. Say \"continue\" to \
+             pick up where it left off, or raise the limit in Settings › General."
         ));
         // Persist the error so it survives a relaunch.
         let error_text = format!("{loop_err}");

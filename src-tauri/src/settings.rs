@@ -39,6 +39,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub editor_command: Option<String>,
 
+    /// Tool-call rounds a single TALK turn may run before the engine asks the
+    /// model to close with what it has. `None` = the built-in default
+    /// (`chat_history::DEFAULT_TALK_MAX_ITERATIONS`); the engine clamps a set
+    /// value to the supported range.
+    #[serde(default)]
+    pub talk_max_iterations: Option<u32>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -194,6 +201,18 @@ mod tests {
             settings.provider_base_urls.get("ollama").map(String::as_str),
             Some("http://localhost:11434")
         );
+    }
+
+    #[test]
+    fn talk_max_iterations_round_trips_and_defaults_to_none() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.talk_max_iterations, None);
+
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"talkMaxIterations":60}"#).unwrap();
+        assert_eq!(settings.talk_max_iterations, Some(60));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""talkMaxIterations":60"#), "{json}");
     }
 
     #[test]
