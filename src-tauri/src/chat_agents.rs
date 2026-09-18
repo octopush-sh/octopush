@@ -26,7 +26,7 @@ use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResul
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{LlmProvider, LlmTool};
-use crate::skills::agents::{resolve_model, AgentDefinition};
+use crate::skills::agents::{resolve_model_with_tiers, AgentDefinition};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -76,7 +76,7 @@ fn agent_input_schema(defs: &[AgentDefinition]) -> serde_json::Value {
             },
             "model": {
                 "type": "string",
-                "description": "Optional model id to run this sub-agent on instead of the conversation's model"
+                "description": "Optional: a configured model id, or a provider-agnostic tier — \"fast\" (cheap, quick), \"balanced\", \"strong\" (deepest reasoning) — to run this sub-agent on instead of the conversation's model. Prefer a tier over an id."
             }
         },
         "required": ["description", "prompt"]
@@ -269,21 +269,29 @@ pub struct SubagentSpec {
 }
 
 /// Which model a sub-agent runs on: the call's explicit `model` wins, then
-/// the definition's `model` when it resolves against the configured ids
-/// (an alias like `haiku` picks the first matching id), else the
-/// conversation's model. Pure so the precedence is tested.
-pub fn pick_subagent_model(spec: &SubagentSpec, known_models: &[String]) -> String {
-    if let Some(m) = &spec.call.model {
-        return m.clone();
-    }
-    if let Some(def_model) = spec.definition.as_ref().and_then(|d| d.model.as_deref()) {
-        if let Some(resolved) = resolve_model(def_model, known_models) {
+/// the definition's `model`, each resolved against the configured ids and
+/// the user's tier map (`resolve_model_with_tiers`: exact id › mapped tier
+/// › substring alias); a spec that resolves to nothing is skipped with a
+/// warning rather than failing the sub-agent's start, and the conversation's
+/// model is the floor. Pure so the precedence is tested.
+pub fn pick_subagent_model(
+    spec: &SubagentSpec,
+    known_models: &[String],
+    tiers: &HashMap<String, String>,
+) -> String {
+    let candidates: [(&str, Option<&str>); 2] = [
+        ("call", spec.call.model.as_deref()),
+        ("definition", spec.definition.as_ref().and_then(|d| d.model.as_deref())),
+    ];
+    for (origin, wanted) in candidates {
+        let Some(wanted) = wanted else { continue };
+        if let Some(resolved) = resolve_model_with_tiers(wanted, known_models, tiers) {
             return resolved.to_string();
         }
         tracing::warn!(
-            agent = %spec.definition.as_ref().map(|d| d.name.as_str()).unwrap_or(""),
-            model = def_model,
-            "agent definition's model matches no configured model; inheriting the conversation's"
+            origin,
+            model = wanted,
+            "sub-agent model matches no configured model or tier; inheriting the conversation's"
         );
     }
     spec.default_model.clone()
@@ -468,11 +476,15 @@ pub async fn run_subagents(
 ) -> HashMap<String, AgentOutcome> {
     let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENTS));
     let mut set = tokio::task::JoinSet::new();
-    // Configured model ids, read once per fan-out, for definition aliases.
+    // Configured model ids + the user's tier map, read once per fan-out, for
+    // definition/call model specs (`haiku`, `fast`, an id…).
     let known_models: Arc<Vec<String>> = Arc::new(
         crate::provider_router::ProviderRouter::load()
             .map(|r| r.list_models().into_iter().map(|m| m.model.id).collect())
             .unwrap_or_default(),
+    );
+    let tiers: Arc<HashMap<String, String>> = Arc::new(
+        crate::settings::load_settings().map(|s| s.model_tiers).unwrap_or_default(),
     );
     for spec in specs {
         let app = app.clone();
@@ -481,11 +493,12 @@ pub async fn run_subagents(
         let cancel = Arc::clone(&cancel);
         let gate = Arc::clone(&gate);
         let known_models = Arc::clone(&known_models);
+        let tiers = Arc::clone(&tiers);
         let approvals = Arc::clone(&approvals);
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let started = std::time::Instant::now();
-            let model = pick_subagent_model(&spec, &known_models);
+            let model = pick_subagent_model(&spec, &known_models, &tiers);
             let approval_gate = SubagentGate::new(approvals, app.clone(), &spec);
             let sink = ChatAgentSink {
                 app,
@@ -650,6 +663,7 @@ mod tests {
 
     #[test]
     fn model_precedence_is_call_then_definition_then_conversation() {
+        let no_tiers: HashMap<String, String> = HashMap::new();
         let known = vec!["claude-haiku-4-5-20251001".to_string(), "gpt-4o".to_string()];
         let base = SubagentSpec {
             call_id: "c".into(),
@@ -658,17 +672,24 @@ mod tests {
             default_model: "conv-model".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
             definition: None,
         };
-        assert_eq!(pick_subagent_model(&base, &known), "conv-model");
+        assert_eq!(pick_subagent_model(&base, &known, &no_tiers), "conv-model");
         let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
-        assert_eq!(pick_subagent_model(&with_def, &known), "claude-haiku-4-5-20251001");
+        assert_eq!(pick_subagent_model(&with_def, &known, &no_tiers), "claude-haiku-4-5-20251001");
         let unresolvable = SubagentSpec { definition: Some(def("x", None, Some("sonnet"))), ..base.clone() };
-        assert_eq!(pick_subagent_model(&unresolvable, &known), "conv-model");
+        assert_eq!(pick_subagent_model(&unresolvable, &known, &no_tiers), "conv-model");
         let explicit = SubagentSpec {
             call: AgentCall { model: Some("gpt-4o".into()), ..base.call.clone() },
             definition: Some(def("x", None, Some("haiku"))),
             ..base.clone()
         };
-        assert_eq!(pick_subagent_model(&explicit, &known), "gpt-4o");
+        assert_eq!(pick_subagent_model(&explicit, &known, &no_tiers), "gpt-4o");
+        // A call asking for a tier resolves through the user's map — on any
+        // provider — and an unknown explicit id inherits instead of failing.
+        let tiers: HashMap<String, String> = [("fast".to_string(), "gpt-4o".to_string())].into_iter().collect();
+        let tiered = SubagentSpec { call: AgentCall { model: Some("fast".into()), ..base.call.clone() }, ..base.clone() };
+        assert_eq!(pick_subagent_model(&tiered, &known, &tiers), "gpt-4o");
+        let bogus = SubagentSpec { call: AgentCall { model: Some("no-such-model".into()), ..base.call.clone() }, ..base.clone() };
+        assert_eq!(pick_subagent_model(&bogus, &known, &tiers), "conv-model");
     }
 
     struct ScriptedProvider {

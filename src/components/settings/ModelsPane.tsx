@@ -14,6 +14,7 @@ import { pushToast } from "../Toasts";
 import { PaneHeader } from "./shared";
 import { ModelDialog } from "./ModelDialog";
 import { AddProviderDialog } from "./AddProviderDialog";
+import { ModelTiersSection } from "./ModelTiersSection";
 
 const BUILTIN_PROVIDER_NAMES = new Set(["anthropic", "openai", "deepseek", "ollama"]);
 
@@ -254,6 +255,8 @@ export function ModelsPane() {
           )}
         </div>
       </div>
+
+      <ModelTiersSection />
 
       {/* ── Unsaved-changes bar ── */}
       <div className="sticky bottom-0 mt-6 max-w-[860px]">

@@ -443,6 +443,10 @@ export interface AppSettings {
   /** Tool-call rounds one Talk message may run before the model is asked to
    *  answer with what it has. Unset → the backend default (25). */
   talkMaxIterations?: number | null;
+  /** Provider-agnostic model tiers (`fast` / `balanced` / `strong`) → a
+   *  configured model id. What a sub-agent's `model: haiku` or `model: "fast"`
+   *  resolves to on this machine. */
+  modelTiers?: Record<string, string> | null;
   /** Jira/issue-tracker connection config (preserved across saves). */
   issueTracker?: IssueTrackerConfig | null;
   /** @deprecated use providerKeys.anthropic */

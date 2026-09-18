@@ -46,6 +46,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub talk_max_iterations: Option<u32>,
 
+    /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
+    /// configured model id. What a sub-agent definition's `model: haiku`
+    /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
+    /// whatever provider the user runs. Unset tiers fall back to a
+    /// substring match over the configured ids.
+    #[serde(default)]
+    pub model_tiers: HashMap<String, String>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -213,6 +221,17 @@ mod tests {
         assert_eq!(settings.talk_max_iterations, Some(60));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""talkMaxIterations":60"#), "{json}");
+    }
+
+    #[test]
+    fn model_tiers_round_trip_and_default_empty() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(settings.model_tiers.is_empty());
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"modelTiers":{"fast":"gpt-4o-mini","strong":"claude-opus-5"}}"#).unwrap();
+        assert_eq!(settings.model_tiers.get("fast").map(String::as_str), Some("gpt-4o-mini"));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""modelTiers":{"#), "{json}");
     }
 
     #[test]
