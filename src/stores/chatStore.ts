@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
-import { ipc } from "../lib/ipc";
+import { ipc, type LiveEntry } from "../lib/ipc";
+import { isAgentToolName, CHAT_AGENT_LOG_EVENT } from "../lib/agentTools";
 import type { ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
@@ -15,6 +16,41 @@ export interface ToolExecution {
   result: string;
   /** Provider tool_use id — correlates the resolved card to its live card. */
   callId?: string;
+  /** Present on a resolved `Agent`/`Task` row: how the sub-agent ended and
+   *  what it cost (the report itself is `result`). */
+  agent?: AgentMeta;
+}
+
+/** The `agent` block the engine persists on a sub-agent's tool row. */
+export interface AgentMeta {
+  ok: boolean;
+  finished: boolean;
+  closedAtCap: boolean;
+  blocked: boolean;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  durationMs: number;
+  toolCalls: number;
+}
+
+export { isAgentToolName };
+
+/** Longest live journal kept in memory per sub-agent. Older entries fall off
+ *  the front; the persisted log (`getChatAgentLog`) stays complete. */
+export const AGENT_LOG_CAP = 400;
+
+/** Pure reducer for one `chat://agent-log` entry: append under its call id,
+ *  bounded by `AGENT_LOG_CAP`. Returns the same map when nothing changes. */
+export function appendAgentLog(
+  logs: Record<string, LiveEntry[]>,
+  callId: string,
+  entry: LiveEntry,
+): Record<string, LiveEntry[]> {
+  const prev = logs[callId] ?? [];
+  const next = prev.length >= AGENT_LOG_CAP ? [...prev.slice(prev.length - AGENT_LOG_CAP + 1), entry] : [...prev, entry];
+  return { ...logs, [callId]: next };
 }
 
 /** A tool currently executing (between `chat://tool-start` and the resolved
@@ -89,10 +125,12 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
   deep: 64000,
 };
 
-/** A display item in the conversation — either a regular message, tool execution, or persisted error. */
+/** A display item in the conversation — a regular message, a tool execution,
+ *  a crew (the `Agent` calls of one response, grouped), or a persisted error. */
 export type ConversationItem =
   | { kind: "message"; message: ChatMessage }
   | { kind: "tool"; tool: ToolExecution; id: number }
+  | { kind: "crew"; id: number; agents: Array<{ id: number; tool: ToolExecution }> }
   | { kind: "error"; message: ChatMessage };
 
 /** Strip the trailing `[tool_calls: …]` bookkeeping suffix the engine appends
@@ -113,7 +151,19 @@ export function buildTimeline(msgs: ChatMessage[]): ConversationItem[] {
     if (role === "tool") {
       try {
         const tool: ToolExecution = JSON.parse(msg.content);
-        items.push({ kind: "tool", tool, id: msg.id });
+        if (isAgentToolName(tool.toolName)) {
+          // The engine persists a response's sub-agents back to back, so
+          // adjacent Agent rows are one fan-out → one crew card. A tool row
+          // of any other kind (or a message) in between starts a new crew.
+          const last = items[items.length - 1];
+          if (last && last.kind === "crew") {
+            last.agents.push({ id: msg.id, tool });
+          } else {
+            items.push({ kind: "crew", id: msg.id, agents: [{ id: msg.id, tool }] });
+          }
+        } else {
+          items.push({ kind: "tool", tool, id: msg.id });
+        }
       } catch {
         items.push({ kind: "message", message: msg });
       }
@@ -150,6 +200,7 @@ export interface MessageAddedEvent {
 const EMPTY_MESSAGES: ChatMessage[] = [];
 const EMPTY_TIMELINE: ConversationItem[] = [];
 const EMPTY_LIVE_TOOLS: LiveTool[] = [];
+const EMPTY_AGENT_LOG: LiveEntry[] = [];
 const EMPTY_THREADS: ChatThread[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_HISTORY: string[] = [];
@@ -237,6 +288,13 @@ interface ChatState {
   /** Pending dangerous-command approval requests per workspace (inline cards).
    *  Present between chat://approval-request and approval-resolved. */
   pendingApprovalsByWs: Record<string, PendingApproval[]>;
+  /** Live journal of each sub-agent (`Agent` tool call), keyed by call id —
+   *  fed by `chat://agent-log` while it runs, or loaded from the persisted
+   *  log on demand (`ensureAgentLog`) after a reload. */
+  agentLogByCall: Record<string, LiveEntry[]>;
+  /** The sub-agent whose journal the Companion shows, per workspace (null =
+   *  none). Set by a crew-card row, cleared by the panel's close. */
+  crewFocusByWs: Record<string, string | null>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -266,6 +324,10 @@ interface ChatState {
   getShellHistory: (workspaceId: string) => string[];
   /** Pending dangerous-command approvals for the active thread. */
   getPendingApprovals: (workspaceId: string) => PendingApproval[];
+  /** A sub-agent's journal entries (empty until streamed or loaded). */
+  getAgentLog: (callId: string) => LiveEntry[];
+  /** The focused sub-agent call id for the Companion journal, or null. */
+  getCrewFocus: (workspaceId: string) => string | null;
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
@@ -349,6 +411,11 @@ interface ChatState {
   stop: (workspaceId: string) => void;
   clear: (workspaceId: string) => void;
   clearError: (workspaceId: string) => void;
+  /** Open (or close, with null) a sub-agent's journal in the Companion. */
+  focusCrewAgent: (workspaceId: string, callId: string | null) => void;
+  /** Load a finished sub-agent's persisted journal when nothing streamed into
+   *  memory (a reload, a thread switch). No-op when entries already exist. */
+  ensureAgentLog: (callId: string) => Promise<void>;
   // Thread actions
   /** Return the workspace's active thread id, creating+loading a default one
    *  if none is active yet (so a send can never orphan a message). */
@@ -538,6 +605,20 @@ export const useChatStore = create<ChatState>((set, get) => {
     });
   });
 
+  // ── chat://agent-log ──────────────────────────────────────────
+  // A sub-agent's journal entry — appended under its call id regardless of
+  // which thread is shown (the crew card of a background thread rehydrates
+  // from memory when the user switches back; the persisted log is the
+  // backstop after a reload).
+  listen<{ workspaceId: string; threadId: string; callId: string; entry: LiveEntry }>(
+    CHAT_AGENT_LOG_EVENT,
+    (ev) => {
+      const p = ev.payload;
+      if (!p.callId || !p.entry || typeof p.entry.kind !== "string") return;
+      set((s) => ({ agentLogByCall: appendAgentLog(s.agentLogByCall, p.callId, p.entry) }));
+    },
+  );
+
   // ── chat://shell-live-start ───────────────────────────────────
   // A `$`-direct command was promoted to a live process — open a pinned
   // mini-terminal for the thread. The `initial` output is painted on mount;
@@ -689,6 +770,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     liveOutputByCallId: {},
     shellHistoryByWs: {},
     pendingApprovalsByWs: {},
+    agentLogByCall: {},
+    crewFocusByWs: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -697,6 +780,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     getStreamBuffer: (workspaceId) => get().streamBufferByWs[workspaceId] ?? "",
     getError: (workspaceId) => get().errorByWs[workspaceId] ?? null,
     getLiveTools: (workspaceId) => get().liveToolsByWs[workspaceId] ?? EMPTY_LIVE_TOOLS,
+    getAgentLog: (callId) => get().agentLogByCall[callId] ?? EMPTY_AGENT_LOG,
+    getCrewFocus: (workspaceId) => get().crewFocusByWs[workspaceId] ?? null,
     getThreads: (workspaceId) => get().threadsByWs[workspaceId] ?? EMPTY_THREADS,
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
     getActiveSkill: (workspaceId) => get().activeSkillByWs[workspaceId] ?? null,
@@ -1120,6 +1205,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
       })),
+    focusCrewAgent: (workspaceId, callId) =>
+      set((s) => ({
+        crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: callId },
+      })),
+    ensureAgentLog: async (callId) => {
+      if ((get().agentLogByCall[callId] ?? EMPTY_AGENT_LOG).length > 0) return;
+      try {
+        const entries = await ipc.getChatAgentLog(callId);
+        if (!Array.isArray(entries) || entries.length === 0) return;
+        set((s) => {
+          // A live stream may have landed meanwhile — never clobber it.
+          if ((s.agentLogByCall[callId] ?? EMPTY_AGENT_LOG).length > 0) return {};
+          return { agentLogByCall: { ...s.agentLogByCall, [callId]: entries.slice(-AGENT_LOG_CAP) } };
+        });
+      } catch {
+        // Journal is a nicety; the report on the card stands on its own.
+      }
+    },
 
     // ── Thread actions ───────────────────────────────────────────
     ensureThread: async (workspaceId) => {

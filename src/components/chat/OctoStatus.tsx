@@ -1,5 +1,6 @@
 import { OctoPlayer, ROLES, roleForToolName, type OctoRole } from "../OctoPlayer";
 import type { LiveTool } from "../../stores/chatStore";
+import { isAgentToolName } from "../../lib/agentTools";
 
 export type { OctoRole };
 
@@ -12,6 +13,8 @@ export function roleForActivity(args: {
 }): OctoRole {
   if (args.approvals > 0) return ROLES.wait;
   const live = [...args.liveTools].reverse().find((t) => !t.done);
+  // A running crew reads as delegation, whatever the last card was.
+  if (live && isAgentToolName(live.toolName)) return ROLES.delegate;
   if (live) return roleForToolName(live.toolName) ?? ROLES.work;
   if (args.streamBuffer) return ROLES.write;
   return ROLES.think;

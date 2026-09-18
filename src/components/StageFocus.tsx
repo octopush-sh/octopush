@@ -4,12 +4,13 @@ import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "..
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
-import { iconForRole, iconForTool } from "../lib/roleIcons";
+import { iconForRole } from "../lib/roleIcons";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
 import { StageOctoStatus } from "./direct/StageOctoStatus";
+import { buildJournalItems } from "./direct/JournalItems";
 import { IconButton } from "./controls/IconButton";
 import { TogglePill } from "./controls/TogglePill";
 import { Stepper } from "./controls/Stepper";
@@ -46,56 +47,6 @@ function splitLogSegments(raw: unknown[]): LiveEntry[][] {
     else segments[segments.length - 1].push(item as LiveEntry);
   }
   return segments;
-}
-
-/** Render live-journal entries as elements — prose lines, brass notices, and
- *  flat tool lines with their paired results. Shared by the live view and the
- *  archived-attempt view so both journals read identically. */
-function buildJournalItems(entries: LiveEntry[]): ReactElement[] {
-  const items: ReactElement[] = [];
-  for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
-    if (e.kind === "text") {
-      items.push(<div key={i} className="octo-rise-in text-octo-sage">{e.text}</div>);
-    } else if (e.kind === "notice") {
-      items.push(<div key={i} className="octo-rise-in font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">{e.text}</div>);
-    } else if (e.kind === "tool") {
-      const next = entries[i + 1];
-      const res = next && next.kind === "tool_result" ? next : null;
-      if (res) i++; // consume the paired result
-      const ToolIcon = iconForTool(e.tool);
-      items.push(
-        <div key={i} className="octo-rise-in flex items-baseline gap-2 font-mono text-[12px]">
-          <span className="translate-y-[1px] shrink-0 text-octo-mute" title={e.tool}>
-            <ToolIcon size={11} strokeWidth={1.75} />
-          </span>
-          <span className="shrink-0 text-octo-ivory">{e.tool}</span>
-          {e.hint && (
-            <span className="min-w-0 truncate text-octo-sage" title={e.hint}>
-              {e.hint}
-            </span>
-          )}
-          {res && (
-            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px]">
-              <span className={res.ok ? "text-octo-verdigris" : "text-octo-rouge"}>{res.ok ? "✓" : "✕"}</span>
-              <span className="max-w-[28ch] truncate text-octo-mute" title={res.detail}>
-                {res.detail}
-              </span>
-            </span>
-          )}
-        </div>,
-      );
-    } else if (e.kind === "tool_result") {
-      // orphan result (no preceding tool in buffer) — render compactly
-      items.push(
-        <div key={i} className="octo-rise-in flex items-center gap-1.5 font-mono text-[11px] text-octo-mute">
-          <span className={e.ok ? "text-octo-verdigris" : "text-octo-rouge"}>{e.ok ? "✓" : "✕"}</span>
-          <span>{e.detail}</span>
-        </div>,
-      );
-    }
-  }
-  return items;
 }
 
 /** A finished stage's frozen worktree diff. The label is deliberately honest:
