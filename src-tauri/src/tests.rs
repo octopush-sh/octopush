@@ -8769,6 +8769,41 @@ mod live_tests {
     }
 
     #[test]
+    fn entries_from_stream_event_keeps_claude_code_subagent_hierarchy() {
+        // The parent spawns a sub-agent: the Agent tool_use carries its id and
+        // shows the description (not the prompt) as the hint.
+        let spawn = json!({"type":"assistant","parent_tool_use_id":null,"message":{"content":[
+            {"type":"tool_use","id":"toolu_agent_1","name":"Agent",
+             "input":{"description":"Check the tests","prompt":"Run the suite and…\nlong prompt","subagent_type":"tester"}}
+        ]}});
+        let es = entries_from_stream_event(&spawn);
+        assert_eq!(es, vec![json!({"kind":"tool","tool":"Agent","hint":"Check the tests","agentId":"toolu_agent_1"})]);
+        // Events inside the sub-agent's session carry parent_tool_use_id →
+        // every entry is tagged with it, text and tools alike.
+        let child = json!({"type":"assistant","parent_tool_use_id":"toolu_agent_1","message":{"content":[
+            {"type":"text","text":"running"},
+            {"type":"tool_use","name":"Bash","input":{"command":"npm test"}}
+        ]}});
+        let ce = entries_from_stream_event(&child);
+        assert_eq!(ce.len(), 2);
+        assert_eq!(ce[0], json!({"kind":"text","text":"running","parent":"toolu_agent_1"}));
+        assert_eq!(ce[1], json!({"kind":"tool","tool":"Bash","hint":"npm test","parent":"toolu_agent_1"}));
+        let child_result = json!({"type":"user","parent_tool_use_id":"toolu_agent_1","message":{"content":[
+            {"type":"tool_result","is_error":false,"content":"12 passed"}
+        ]}});
+        assert_eq!(entries_from_stream_event(&child_result), vec![json!({"kind":"tool_result","ok":true,"detail":"12 passed","parent":"toolu_agent_1"})]);
+        // The legacy `Task` name is treated the same; a main-session event
+        // (null / absent parent) carries no `parent` key — byte-identical to
+        // before.
+        let task = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"t9","name":"Task","input":{"description":"Explore","prompt":"…"}}
+        ]}});
+        assert_eq!(entries_from_stream_event(&task)[0]["agentId"], "t9");
+        let plain = json!({"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}});
+        assert_eq!(entries_from_stream_event(&plain), vec![json!({"kind":"text","text":"hi"})]);
+    }
+
+    #[test]
     fn cli_stream_tool_result_reflects_is_error() {
         let err = serde_json::json!({"type":"user","message":{"content":[
             {"type":"tool_result","is_error":true,"content":"boom: file not found"}

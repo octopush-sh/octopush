@@ -88,12 +88,32 @@ pub fn looks_like_error(result: &str) -> bool {
         || lower.starts_with("could not") || lower.starts_with("cannot")
 }
 
+/// Claude Code's sub-agent tool names in its own stream (`Agent`, formerly
+/// `Task`): a `tool_use` of one of these opens a nested session whose events
+/// carry `parent_tool_use_id` = that block's id.
+fn is_cli_subagent_tool(name: &str) -> bool {
+    name == "Agent" || name == "Task"
+}
+
 /// Map ONE claude `--output-format stream-json` event to zero or more entries
 /// (as the JSON values `LiveEmitter` would emit). `assistant` → text + tool
 /// entries; `user` tool_result → tool_result entries; everything else → none.
+///
+/// Sub-agent hierarchy: an event that belongs to a Claude Code sub-agent
+/// carries a top-level `parent_tool_use_id` (the `Agent`/`Task` block that
+/// spawned it); every entry from such an event gets `"parent": <that id>`
+/// so the journal can indent it under its spawner. The spawning `tool`
+/// entry itself carries `"agentId": <block id>` and shows the sub-agent's
+/// `description` as its hint (the input's first string would otherwise be
+/// the multi-line prompt).
 pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     let kind = v.get("type").and_then(Value::as_str);
+    let parent = v
+        .get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     let content = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_array);
     let Some(content) = content else { return out };
     match kind {
@@ -110,8 +130,25 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
                     }
                     Some("tool_use") => {
                         let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                        let hint = block.get("input").map(tool_hint).unwrap_or_default();
-                        out.push(json!({ "kind": "tool", "tool": name, "hint": hint }));
+                        let input = block.get("input");
+                        let mut entry = if is_cli_subagent_tool(name) {
+                            let hint = input
+                                .and_then(|i| i.get("description"))
+                                .and_then(Value::as_str)
+                                .map(|d| d.chars().take(120).collect::<String>())
+                                .or_else(|| input.map(tool_hint))
+                                .unwrap_or_default();
+                            json!({ "kind": "tool", "tool": name, "hint": hint })
+                        } else {
+                            let hint = input.map(tool_hint).unwrap_or_default();
+                            json!({ "kind": "tool", "tool": name, "hint": hint })
+                        };
+                        if is_cli_subagent_tool(name) {
+                            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                                entry["agentId"] = json!(id);
+                            }
+                        }
+                        out.push(entry);
                     }
                     _ => {}
                 }
@@ -127,6 +164,11 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
             }
         }
         _ => {}
+    }
+    if let Some(parent) = parent {
+        for entry in &mut out {
+            entry["parent"] = json!(parent);
+        }
     }
     out
 }
