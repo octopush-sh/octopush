@@ -186,7 +186,7 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
 /// for the approval card). Conservative + high-confidence: a safety net before
 /// the agent does something irreversible, not a sandbox. User-typed `$` commands
 /// are never passed here. Case-insensitive, matches anywhere in the command.
-fn dangerous_command(command: &str) -> Option<&'static str> {
+pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     let c = normalized.to_lowercase();
@@ -423,6 +423,87 @@ pub struct ApprovalRequestEvent {
     pub call_id: String,
     pub command: String,
     pub reason: String,
+}
+
+/// The one approval channel for dangerous agent commands in TALK: the parent
+/// loop and every sub-agent of the turn ask through it, the frontend answers
+/// by call id (`respond`), Stop denies a whole thread (`deny_thread`), and a
+/// "don't ask again" grant is per thread so a crew inherits it.
+#[derive(Default)]
+pub(crate) struct ApprovalBroker {
+    /// In-flight requests keyed by the tool call id; the value carries the
+    /// thread id (so a thread's pending approvals can be resolved together)
+    /// + the responder.
+    approvals: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<ApprovalDecision>)>>,
+    /// Threads where the user chose "don't ask again" — dangerous agent commands
+    /// run without prompting (in-memory; resets on restart, by design).
+    auto_approve: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ApprovalBroker {
+    pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
+        if let Some((_thread, tx)) = self.approvals.lock().remove(call_id) {
+            let _ = tx.send(decision);
+        }
+    }
+
+    pub fn deny_thread(&self, thread_id: &str) {
+        let mut approvals = self.approvals.lock();
+        let to_deny: Vec<String> = approvals
+            .iter()
+            .filter(|(_, (tid, _))| tid == thread_id)
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        for cid in to_deny {
+            if let Some((_, tx)) = approvals.remove(&cid) {
+                let _ = tx.send(ApprovalDecision::Deny);
+            }
+        }
+    }
+
+    /// Ask the user to approve a dangerous agent command and wait for the answer.
+    /// Auto-approved conversations skip the prompt. A forgotten card times out as
+    /// a denial (so a turn can't wedge forever).
+    pub async fn await_approval(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        command: &str,
+        reason: &str,
+    ) -> ApprovalDecision {
+        if self.auto_approve.lock().contains(thread_id) {
+            return ApprovalDecision::Approve;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.approvals
+            .lock()
+            .insert(call_id.to_string(), (thread_id.to_string(), tx));
+        let _ = app.emit("chat://approval-request", &ApprovalRequestEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            call_id: call_id.to_string(),
+            command: command.to_string(),
+            reason: reason.to_string(),
+        });
+        let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+            Ok(Ok(d)) => d,
+            _ => {
+                self.approvals.lock().remove(call_id);
+                ApprovalDecision::Deny
+            }
+        };
+        if decision == ApprovalDecision::ApproveAlways {
+            self.auto_approve.lock().insert(thread_id.to_string());
+        }
+        let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            call_id: call_id.to_string(),
+        });
+        decision
+    }
 }
 
 /// Emitted when an approval request is resolved (any decision) so the frontend
@@ -1276,14 +1357,10 @@ pub struct ChatEngine {
     /// Per-thread persistent bash PTYs backing `$`-direct execution. Shared so
     /// `run_shell_command` can reach the same sessions across turns.
     pub talk_shell: Arc<crate::talk_shell::TalkShell>,
-    /// In-flight approval requests for dangerous AGENT commands, keyed by the
-    /// tool call id; the value carries the thread id (so `cancel` can resolve a
-    /// thread's pending approval) + the responder. `respond_approval` resolves it.
-    approvals:
-        Arc<Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<ApprovalDecision>)>>>,
-    /// Threads where the user chose "don't ask again" — dangerous agent commands
-    /// run without prompting (in-memory; resets on restart, by design).
-    auto_approve: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Approval requests for dangerous AGENT commands — shared with the
+    /// sub-agents a turn spawns, so their `run_command`s go through the same
+    /// card and the same "don't ask again" grant.
+    approvals: Arc<ApprovalBroker>,
 }
 
 impl ChatEngine {
@@ -1297,22 +1374,22 @@ impl ChatEngine {
             cancels: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(crate::mcp::McpRegistry::new()),
             talk_shell,
-            approvals: Arc::new(Mutex::new(HashMap::new())),
-            auto_approve: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            approvals: Arc::new(ApprovalBroker::default()),
         }
+    }
+
+    /// The approval broker, for a sub-agent gate that outlives a `&self` borrow.
+    pub(crate) fn approvals(&self) -> Arc<ApprovalBroker> {
+        Arc::clone(&self.approvals)
     }
 
     /// Resolve a pending approval request (called by the `respond_approval`
     /// command when the user clicks the inline card).
     pub fn respond_approval(&self, call_id: &str, decision: ApprovalDecision) {
-        if let Some((_thread, tx)) = self.approvals.lock().remove(call_id) {
-            let _ = tx.send(decision);
-        }
+        self.approvals.respond(call_id, decision);
     }
 
     /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. A forgotten card times out as
-    /// a denial (so a turn can't wedge forever).
     #[allow(clippy::too_many_arguments)]
     async fn await_approval(
         &self,
@@ -1323,36 +1400,9 @@ impl ChatEngine {
         command: &str,
         reason: &str,
     ) -> ApprovalDecision {
-        if self.auto_approve.lock().contains(thread_id) {
-            return ApprovalDecision::Approve;
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
         self.approvals
-            .lock()
-            .insert(call_id.to_string(), (thread_id.to_string(), tx));
-        let _ = app.emit("chat://approval-request", &ApprovalRequestEvent {
-            workspace_id: workspace_id.to_string(),
-            thread_id: thread_id.to_string(),
-            call_id: call_id.to_string(),
-            command: command.to_string(),
-            reason: reason.to_string(),
-        });
-        let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-            Ok(Ok(d)) => d,
-            _ => {
-                self.approvals.lock().remove(call_id);
-                ApprovalDecision::Deny
-            }
-        };
-        if decision == ApprovalDecision::ApproveAlways {
-            self.auto_approve.lock().insert(thread_id.to_string());
-        }
-        let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
-            workspace_id: workspace_id.to_string(),
-            thread_id: thread_id.to_string(),
-            call_id: call_id.to_string(),
-        });
-        decision
+            .await_approval(app, workspace_id, thread_id, call_id, command, reason)
+            .await
     }
 
     /// Request cancellation of the in-flight turn for `thread_id`, if any.
@@ -1363,20 +1413,11 @@ impl ChatEngine {
         if let Some(flag) = self.cancels.lock().get(thread_id) {
             flag.store(true, Ordering::Relaxed);
         }
-        // Resolve a pending approval for this thread as Deny — otherwise Stop
-        // leaves the turn parked in await_approval (and a later Approve would run
-        // a destructive command on a turn the user already cancelled).
-        let mut approvals = self.approvals.lock();
-        let to_deny: Vec<String> = approvals
-            .iter()
-            .filter(|(_, (tid, _))| tid == thread_id)
-            .map(|(cid, _)| cid.clone())
-            .collect();
-        for cid in to_deny {
-            if let Some((_, tx)) = approvals.remove(&cid) {
-                let _ = tx.send(ApprovalDecision::Deny);
-            }
-        }
+        // Resolve every pending approval for this thread (the turn's own and
+        // its sub-agents') as Deny — otherwise Stop leaves a loop parked in
+        // await_approval (and a later Approve would run a destructive command
+        // on a turn the user already cancelled).
+        self.approvals.deny_thread(thread_id);
     }
 
     /// Record one provider response's token usage: the canonical spend ledger
@@ -2289,6 +2330,7 @@ impl ChatEngine {
                         app.clone(),
                         Arc::clone(&self.db),
                         self.client.clone(),
+                        self.approvals(),
                         specs,
                         Arc::clone(&cancel),
                     )

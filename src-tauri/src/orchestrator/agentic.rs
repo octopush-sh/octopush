@@ -640,6 +640,16 @@ pub(crate) fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
     normalize_blocked_ask(BlockedAsk { summary, questions })
 }
 
+/// Pre-execution hook for a tool call. `Some(denial)` skips the tool and
+/// feeds `denial` back to the model as an error tool_result; `None` lets it
+/// run. TALK sub-agents use it to route a dangerous `run_command` through
+/// the user's approval card; DIRECT stages (unattended by design) pass no
+/// gate.
+#[async_trait::async_trait]
+pub trait ToolGate: Send + Sync {
+    async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String>;
+}
+
 /// Run the tool-use loop against `provider` until it returns a final answer
 /// (or `max_iterations` is hit, or `cancel` is set). Tools execute in
 /// `workspace_path`. The cancel flag is checked at the top of each iteration:
@@ -685,6 +695,8 @@ pub async fn run_agentic_loop(
     // Completed earlier stages this stage may consult via `ask_stage`.
     // Empty ⇒ the tool is not offered.
     peers: &[PeerStage],
+    // Optional pre-execution gate (see [`ToolGate`]); `None` runs every tool.
+    gate: Option<&dyn ToolGate>,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -989,7 +1001,16 @@ pub async fn run_agentic_loop(
             // worker for its whole duration — one hung stage could starve
             // every other run in the process. The cancel flag rides along so
             // a director stop interrupts a long `run_command` mid-flight.
-            let (result, _) = {
+            // The gate (when present) may park here on a human decision; a
+            // denial never touches the workspace and reads as an error result.
+            let denial = match gate {
+                Some(g) => g.check(&u.name, &u.input).await,
+                None => None,
+            };
+            let denied = denial.is_some();
+            let (result, _) = if let Some(msg) = denial {
+                (msg, false)
+            } else {
                 let wp = workspace_path.to_path_buf();
                 let name = u.name.clone();
                 let input = u.input.clone();
@@ -1001,7 +1022,7 @@ pub async fn run_agentic_loop(
                 .await
                 .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
             };
-            emitter.tool_result(!crate::orchestrator::live::looks_like_error(&result), &crate::orchestrator::live::summarize(&result));
+            emitter.tool_result(!denied && !crate::orchestrator::live::looks_like_error(&result), &crate::orchestrator::live::summarize(&result));
             // The journal keeps the FULL result as evidence; only the copy fed
             // back to the model is capped, to bound input-token growth.
             out.tool_calls.push(ToolCallLog {
@@ -1012,7 +1033,7 @@ pub async fn run_agentic_loop(
             results.push(LlmToolResult {
                 tool_use_id: u.id.clone(),
                 content: cap_tool_result(&result),
-                is_error: false,
+                is_error: denied,
             });
         }
         messages.push(LlmMessage {

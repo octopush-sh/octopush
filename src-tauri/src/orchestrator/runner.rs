@@ -365,6 +365,7 @@ impl AgentRunner for ApiRunner {
             matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
             ctx.spend_limit,
             &ctx.peers,
+            None,
         )
         .await;
 
