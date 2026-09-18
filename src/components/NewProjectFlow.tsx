@@ -515,7 +515,12 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
 
             <div className="mt-8 max-w-[520px] space-y-5">
               <Field label="REPOSITORY URL">
-                <div className="relative">
+                {/* The field's border lives on the wrapper so the host badge
+                    sits beside the text instead of over it: a long URL scrolls
+                    inside the input and never runs under the badge. The badge
+                    is hidden from the accessibility tree: the label wraps it,
+                    and the host is already in the value. */}
+                <div className="flex items-center rounded-md border border-octo-border-strong bg-octo-onyx focus-within:border-octo-brass">
                   <input
                     ref={urlInputRef}
                     autoFocus
@@ -533,14 +538,17 @@ export function NewProjectFlow({ onBack, onGenesis, onSketch }: Props) {
                       setAuthToken("");
                     }}
                     placeholder="Paste a git remote URL…"
-                    className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
+                    className="min-w-0 flex-1 bg-transparent px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
                   />
                   {parsedCloneUrl && (
-                    <span className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1 font-mono text-[9px] tracking-[0.15em] text-octo-brass">
-                      <span title="Git host" className="flex items-center text-octo-mute">
+                    <span
+                      aria-hidden="true"
+                      className="octo-pop-in flex min-w-0 max-w-[45%] items-center gap-1 pr-3 font-mono text-[9px] tracking-[0.15em] text-octo-brass"
+                    >
+                      <span title="Git host" className="flex shrink-0 items-center text-octo-mute">
                         <Globe size={11} strokeWidth={1.75} />
                       </span>
-                      {parsedCloneUrl.host}
+                      <span className="truncate">{parsedCloneUrl.host}</span>
                     </span>
                   )}
                 </div>
