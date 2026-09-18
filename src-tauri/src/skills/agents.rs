@@ -103,18 +103,52 @@ pub fn map_tools(list: &[String]) -> Option<Vec<String>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Resolve a definition's `model` against the configured model ids: an exact
-/// id wins; an alias (`haiku`, `sonnet`, `opus`, or any substring) picks the
-/// first configured id containing it (case-insensitive); `inherit`/empty or
-/// no match → `None` (the conversation's model). Pure over the id list so
-/// the rule is testable without a provider config.
+/// The provider-agnostic tier names a definition or an `Agent` call may ask
+/// for, and the Claude Code aliases that map onto them.
+pub const MODEL_TIERS: [&str; 3] = ["fast", "balanced", "strong"];
+
+/// `haiku` → `fast`, `sonnet` → `balanced`, `opus` → `strong`; a tier name
+/// maps to itself; anything else is not a tier.
+pub fn tier_for_alias(spec: &str) -> Option<&'static str> {
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "fast" | "haiku" => Some("fast"),
+        "balanced" | "sonnet" => Some("balanced"),
+        "strong" | "opus" => Some("strong"),
+        _ => None,
+    }
+}
+
+/// Resolve a `model` spec against the configured model ids, with no tier
+/// mapping — see [`resolve_model_with_tiers`].
 pub fn resolve_model<'a>(spec: &str, known: &'a [String]) -> Option<&'a str> {
+    resolve_model_with_tiers(spec, known, &std::collections::HashMap::new())
+}
+
+/// Resolve a definition's (or a call's) `model` against the configured model
+/// ids: an exact id wins; a tier name or Claude Code alias (`fast`/`haiku`,
+/// `balanced`/`sonnet`, `strong`/`opus`) takes the tier the user mapped in
+/// Settings › Models when that id is configured; otherwise an alias picks the
+/// first configured id containing it (case-insensitive); `inherit`/empty or
+/// no match → `None` (the conversation's model). Pure over the id list and
+/// the tier map so the rule is testable without a provider config.
+pub fn resolve_model_with_tiers<'a>(
+    spec: &str,
+    known: &'a [String],
+    tiers: &std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("inherit") {
         return None;
     }
     if let Some(exact) = known.iter().find(|k| k.as_str() == spec) {
         return Some(exact.as_str());
+    }
+    if let Some(tier) = tier_for_alias(spec) {
+        if let Some(mapped) = tiers.get(tier) {
+            if let Some(exact) = known.iter().find(|k| k.as_str() == mapped) {
+                return Some(exact.as_str());
+            }
+        }
     }
     let needle = spec.to_ascii_lowercase();
     known
@@ -255,6 +289,38 @@ mod tests {
         assert_eq!(resolve_model("sonnet", &known), None);
         assert_eq!(resolve_model("inherit", &known), None);
         assert_eq!(resolve_model("", &known), None);
+    }
+
+    #[test]
+    fn tiers_take_precedence_over_substring_aliases_and_work_for_any_provider() {
+        use std::collections::HashMap;
+        let known = vec![
+            "claude-opus-5".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
+            "gpt-4o-mini".to_string(),
+            "deepseek-chat".to_string(),
+        ];
+        let tiers: HashMap<String, String> = [
+            ("fast".to_string(), "gpt-4o-mini".to_string()),
+            ("balanced".to_string(), "deepseek-chat".to_string()),
+            ("strong".to_string(), "not-configured".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // A mapped tier beats the substring alias: `haiku` → the fast tier.
+        assert_eq!(resolve_model_with_tiers("haiku", &known, &tiers), Some("gpt-4o-mini"));
+        assert_eq!(resolve_model_with_tiers("FAST", &known, &tiers), Some("gpt-4o-mini"));
+        // A provider-agnostic tier with no Anthropic-flavoured alias at all.
+        assert_eq!(resolve_model_with_tiers("balanced", &known, &tiers), Some("deepseek-chat"));
+        assert_eq!(resolve_model_with_tiers("sonnet", &known, &tiers), Some("deepseek-chat"));
+        // A tier mapped to an id that is no longer configured falls through to
+        // the substring alias (`opus` matches), then to inherit.
+        assert_eq!(resolve_model_with_tiers("opus", &known, &tiers), Some("claude-opus-5"));
+        assert_eq!(resolve_model_with_tiers("strong", &known, &tiers), None);
+        // Exact ids still win over everything.
+        assert_eq!(resolve_model_with_tiers("deepseek-chat", &known, &tiers), Some("deepseek-chat"));
+        assert_eq!(tier_for_alias("Opus"), Some("strong"));
+        assert_eq!(tier_for_alias("gpt-4o"), None);
     }
 
     #[test]
