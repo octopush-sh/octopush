@@ -21,7 +21,8 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult};
+use crate::chat_engine::{dangerous_command, ApprovalBroker, ApprovalDecision};
+use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{LlmProvider, LlmTool};
@@ -30,7 +31,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
@@ -324,6 +325,71 @@ impl EventSink for ChatAgentSink {
     }
 }
 
+/// The sub-agent's approval gate: a `run_command` that `dangerous_command`
+/// flags parks on the SAME approval card the parent turn uses (same thread,
+/// same "don't ask again" grant, same Stop-denies-all), labelled with the
+/// sub-agent so the user knows who is asking. Each request gets its own
+/// call id (`<agent call id>:<n>`) because one sub-agent may ask more than
+/// once. A denial is fed back as an error tool_result; nothing else is
+/// gated (reads, searches and edits stay ungated, as in the parent loop).
+pub struct SubagentGate {
+    pub broker: Arc<ApprovalBroker>,
+    pub app: AppHandle,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub call_id: String,
+    /// The sub-agent's description, shown on the approval card.
+    pub label: String,
+    seq: AtomicU64,
+}
+
+impl SubagentGate {
+    pub fn new(broker: Arc<ApprovalBroker>, app: AppHandle, spec: &SubagentSpec) -> Self {
+        Self {
+            broker,
+            app,
+            workspace_id: spec.workspace_id.clone(),
+            thread_id: spec.thread_id.clone(),
+            call_id: spec.call_id.clone(),
+            label: spec.call.description.clone(),
+            seq: AtomicU64::new(1),
+        }
+    }
+}
+
+/// The reason shown on the card and the denial fed back to the sub-agent —
+/// pure, so the wording is tested.
+pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
+    (
+        format!("Sub-agent \u{201c}{label}\u{201d}: {reason}"),
+        format!(
+            "Command not run — the user declined to approve it (flagged: {reason}). \
+             Continue without it or use a safer alternative; do not retry the same command."
+        ),
+    )
+}
+
+#[async_trait::async_trait]
+impl ToolGate for SubagentGate {
+    async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        if name != "run_command" {
+            return None;
+        }
+        let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+        let reason = dangerous_command(command)?;
+        let (card_reason, denial) = gate_texts(&self.label, reason);
+        let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        match self
+            .broker
+            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, command, &card_reason)
+            .await
+        {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => None,
+            ApprovalDecision::Deny => Some(denial),
+        }
+    }
+}
+
 /// Run one sub-agent to completion on an already-resolved provider. Split
 /// from the spawning wrapper so a scripted provider + recording sink can
 /// drive it in tests.
@@ -337,6 +403,7 @@ pub async fn run_subagent_core(
     spec: &SubagentSpec,
     cancel: &Arc<AtomicBool>,
     sink: &dyn EventSink,
+    gate: Option<&dyn ToolGate>,
 ) -> AppResult<AgentOutcome> {
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
@@ -360,6 +427,7 @@ pub async fn run_subagent_core(
         false,
         None,
         &[],
+        gate,
     )
     .await?;
     let (report, ok) = report_from_result(&out, spec.max_iterations);
@@ -394,6 +462,7 @@ pub async fn run_subagents(
     app: AppHandle,
     db: Arc<Mutex<Db>>,
     client: reqwest::Client,
+    approvals: Arc<ApprovalBroker>,
     specs: Vec<SubagentSpec>,
     cancel: Arc<AtomicBool>,
 ) -> HashMap<String, AgentOutcome> {
@@ -412,10 +481,12 @@ pub async fn run_subagents(
         let cancel = Arc::clone(&cancel);
         let gate = Arc::clone(&gate);
         let known_models = Arc::clone(&known_models);
+        let approvals = Arc::clone(&approvals);
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let started = std::time::Instant::now();
             let model = pick_subagent_model(&spec, &known_models);
+            let approval_gate = SubagentGate::new(approvals, app.clone(), &spec);
             let sink = ChatAgentSink {
                 app,
                 db,
@@ -434,6 +505,7 @@ pub async fn run_subagents(
                         &spec,
                         &cancel,
                         &sink,
+                        Some(&approval_gate),
                     )
                     .await
                     {
@@ -665,7 +737,7 @@ mod tests {
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
-            &Arc::new(AtomicBool::new(false)), &rec).await.unwrap();
+            &Arc::new(AtomicBool::new(false)), &rec, None).await.unwrap();
         assert!(out.ok);
         let seen = provider.seen.lock().clone();
         // read_file + grep granted; grep/glob are implied by read access; no
@@ -674,6 +746,65 @@ mod tests {
         for t in ["read_file", "grep", "glob"] { assert!(seen.contains(&t.to_string()), "{seen:?}"); }
         for t in ["write_file", "edit_file", "run_command", "Agent", "Task"] { assert!(!seen.contains(&t.to_string()), "{seen:?}"); }
         assert!(provider.allowed.iter().all(|a| seen.contains(&a.to_string())));
+    }
+
+    #[test]
+    fn gate_texts_name_the_agent_and_forbid_a_retry() {
+        let (card, denial) = gate_texts("Clean up", "recursive delete");
+        assert_eq!(card, "Sub-agent \u{201c}Clean up\u{201d}: recursive delete");
+        assert!(denial.contains("declined") && denial.contains("recursive delete") && denial.contains("do not retry"));
+    }
+
+    /// A gate that denies every `run_command` and records what it saw.
+    struct DenyRuns {
+        seen: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl ToolGate for DenyRuns {
+        async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+            self.seen.lock().push(name.to_string());
+            if name != "run_command" {
+                return None;
+            }
+            let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            dangerous_command(cmd).map(|r| gate_texts("x", r).1)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_dangerous_command_never_runs_and_reads_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("keep.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let cmd = format!("rm -rf {}", victim.display());
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp("cleaning", vec![LlmToolUse { id: "t1".into(), name: "run_command".into(), input: serde_json::json!({"command": cmd}) }], LlmStopReason::ToolUse),
+                resp("safe read", vec![LlmToolUse { id: "t2".into(), name: "read_file".into(), input: serde_json::json!({"path": "keep.txt"}) }], LlmStopReason::ToolUse),
+                resp("Report: could not delete; file still present.", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Clean up".into(), prompt: "rm it".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None, definition: None,
+        };
+        let gate = DenyRuns { seen: Mutex::new(vec![]) };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate)).await.unwrap();
+        assert!(out.ok && out.finished);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious", "the denied rm never ran");
+        assert_eq!(*gate.seen.lock(), vec!["run_command", "read_file"], "every tool is offered to the gate");
+        // The journal shows the denied call as a failed tool result, and the
+        // ungated read as a success.
+        let results: Vec<bool> = rec.entries.lock().iter()
+            .filter(|p| p["entry"]["kind"] == "tool_result")
+            .map(|p| p["entry"]["ok"].as_bool().unwrap()).collect();
+        assert_eq!(results, vec![false, true]);
+        assert_eq!(out.tool_calls, 2);
     }
 
     #[tokio::test]
@@ -709,7 +840,7 @@ mod tests {
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        let out = run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec)
+        let out = run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec, None)
             .await
             .unwrap();
         assert!(out.ok && out.finished && !out.closed_at_cap && !out.blocked);
