@@ -316,21 +316,30 @@ mod tests {
     }
 
     #[test]
-    fn plan_funds_newest_first_and_stubs_past_the_budget() {
-        // 30 old rows of 6k each would be 180k under a flat cut; the plan
-        // funds from the newest backwards and stubs the rest.
-        let rows: Vec<(usize, usize)> = (0..30).map(|i| (29 - i, 6_000)).collect();
-        let plan = plan_tool_history(&rows);
-        assert_eq!(plan.len(), 30);
-        // Newest row (turns_ago = 0) gets its full 6k.
-        assert_eq!(*plan.last().unwrap(), 6_000);
-        let total: usize = plan.iter().sum();
-        assert!(total <= TOOL_HISTORY_TOTAL_BUDGET + 30 * TOOL_HISTORY_STUB);
-        // Something in the oldest rows collapsed to the stub.
-        assert!(plan.iter().any(|&g| g == TOOL_HISTORY_STUB), "{plan:?}");
+    fn plan_fades_by_age_and_never_pads() {
+        let plan = plan_tool_history(&[(3, 6_000), (1, 6_000), (0, 6_000)]);
+        assert_eq!(plan, vec![500, 2_000, 6_000]);
         // A short result is never padded past its own length.
-        let plan = plan_tool_history(&[(0, 12)]);
-        assert_eq!(plan, vec![12]);
+        assert_eq!(plan_tool_history(&[(0, 12)]), vec![12]);
+    }
+
+    #[test]
+    fn plan_funds_newest_first_and_stubs_past_the_budget() {
+        // One turn that ran 20 big tools: 20 × 6k = 120k wants more than
+        // the 80k thread budget. The newest rows are funded in full; the
+        // oldest collapse to the stub instead of blowing the budget.
+        let rows: Vec<(usize, usize)> = vec![(0, 6_000); 20];
+        let plan = plan_tool_history(&rows);
+        assert_eq!(plan.len(), 20);
+        assert_eq!(*plan.last().unwrap(), 6_000);
+        assert_eq!(plan[0], TOOL_HISTORY_STUB, "{plan:?}");
+        let full = plan.iter().filter(|&&g| g == 6_000).count();
+        assert_eq!(full, TOOL_HISTORY_TOTAL_BUDGET / 6_000, "{plan:?}");
+        let total: usize = plan.iter().sum();
+        assert!(total <= TOOL_HISTORY_TOTAL_BUDGET, "{total}");
+        // Funding is monotone: once a row is stubbed, every older row is too.
+        let first_full = plan.iter().position(|&g| g == 6_000).unwrap();
+        assert!(plan[..first_full].iter().all(|&g| g == TOOL_HISTORY_STUB));
     }
 
     #[test]
