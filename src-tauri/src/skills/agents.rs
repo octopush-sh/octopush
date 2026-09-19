@@ -88,6 +88,8 @@ pub fn split_mcp_entries(list: &[String]) -> (Vec<String>, Vec<String>) {
     for t in list {
         let t = t.trim();
         if t == "mcp" || t.starts_with("mcp__") {
+            // `mcp__jira__*` is a common spelling of the server grant.
+            let t = t.strip_suffix("__*").filter(|b| b.len() > "mcp__".len()).unwrap_or(t);
             mcp.push(t.to_string());
         } else {
             rest.push(t.to_string());
@@ -241,9 +243,15 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
                 let raw = split_list(&value);
                 if !raw.is_empty() {
                     let (mcp_entries, rest) = split_mcp_entries(&raw);
+                    let has_mcp = !mcp_entries.is_empty();
                     mcp = McpGrant::Only(mcp_entries);
                     tools = map_tools(&rest);
-                    if tools.is_none() && !rest.is_empty() {
+                    if tools.is_none() && has_mcp {
+                        // `tools: mcp__jira` is a complete allowlist (Claude
+                        // Code semantics): MCP only, no workspace tools — never
+                        // the full set by accident.
+                        tools = Some(Vec::new());
+                    } else if tools.is_none() && !rest.is_empty() {
                         tracing::warn!(
                             agent = %name,
                             "agent definition names no tool this app has ({}); using the full set",
@@ -377,10 +385,15 @@ mod tests {
         assert!(!d.mcp.allows("mcp__githubx__list_prs"), "prefix must end at a separator");
         assert!(McpGrant::Only(vec!["mcp__*".into()]).allows("mcp__any__thing"));
         assert!(McpGrant::All.allows("mcp__any__thing"));
-        // An MCP-only list keeps the full workspace set (nothing to restrict to).
-        let only = parse_agent_definition("---\nname: t\ntools: mcp__jira\n---\nbody", "project").unwrap();
-        assert_eq!(only.tools, None);
-        assert_eq!(only.mcp, McpGrant::Only(vec!["mcp__jira".into()]));
+        // An MCP-only list is a complete allowlist: MCP tools, no workspace
+        // tools — never the full set by accident.
+        let only = parse_agent_definition("---\nname: t\ntools: mcp__jira__*\n---\nbody", "project").unwrap();
+        assert_eq!(only.tools, Some(vec![]));
+        assert_eq!(only.mcp, McpGrant::Only(vec!["mcp__jira".into()]), "`__*` spells the server grant");
+        assert!(only.mcp.allows("mcp__jira__get_issue"));
+        // Same when the non-MCP entries map to nothing this app has.
+        let unmappable = parse_agent_definition("---\nname: t\ntools: WebFetch, mcp__jira\n---\nbody", "project").unwrap();
+        assert_eq!(unmappable.tools, Some(vec![]));
     }
 
     #[test]

@@ -1013,9 +1013,17 @@ pub async fn run_agentic_loop(
             // by the workspace executor; an error is an error tool_result.
             if let Some(ext) = external.filter(|e| e.owns(&u.name)) {
                 emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
-                let (text, ok) = match ext.call(&u.name, &u.input).await {
-                    Ok(t) => (t, true),
-                    Err(e) => (e, false),
+                // Same gate as a workspace tool: a denial never reaches the server.
+                let denial = match gate {
+                    Some(g) => g.check(&u.name, &u.input).await,
+                    None => None,
+                };
+                let (text, ok) = match denial {
+                    Some(msg) => (msg, false),
+                    None => match ext.call(&u.name, &u.input).await {
+                        Ok(t) => (t, true),
+                        Err(e) => (e, false),
+                    },
                 };
                 emitter.tool_result(ok, &crate::orchestrator::live::summarize(&text));
                 out.tool_calls.push(ToolCallLog { name: u.name.clone(), input: u.input.clone(), result: text.clone() });

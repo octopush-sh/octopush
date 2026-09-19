@@ -46,6 +46,10 @@ pub struct McpToolInfo {
     pub namespaced: String,
     pub description: String,
     pub input_schema: Value,
+    /// The server marked the tool read-only (`annotations.readOnlyHint`).
+    /// Anything else is treated as a possible write when a sub-agent calls it.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Parse `.claude/mcp.json` content into a name→config map. Tolerant: a missing
@@ -269,6 +273,11 @@ impl McpRegistry {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or(json!({ "type": "object" })),
+                    read_only: t
+                        .get("annotations")
+                        .and_then(|a| a.get("readOnlyHint"))
+                        .and_then(|r| r.as_bool())
+                        .unwrap_or(false),
                 })
             })
             .collect();
