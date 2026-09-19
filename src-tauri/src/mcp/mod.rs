@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -142,6 +142,9 @@ struct Connection {
     reader: BufReader<ChildStdout>,
     next_id: i64,
     tools: Vec<McpToolInfo>,
+    /// Stderr drained by a background thread; included in "closed the connection"
+    /// errors so bridge tools (e.g. mcp-remote) can surface auth/network failures.
+    stderr_log: Arc<Mutex<String>>,
 }
 
 impl Connection {
@@ -156,7 +159,13 @@ impl Connection {
             let mut buf = String::new();
             let n = self.reader.read_line(&mut buf).map_err(|e| e.to_string())?;
             if n == 0 {
-                return Err("MCP server closed the connection".into());
+                let log = self.stderr_log.lock();
+                let detail = log.trim();
+                return Err(if detail.is_empty() {
+                    "MCP server closed the connection".into()
+                } else {
+                    format!("MCP server closed the connection\nstderr: {detail}")
+                });
             }
             let Ok(msg) = serde_json::from_str::<Value>(buf.trim()) else {
                 continue; // ignore non-JSON lines (some servers log to stdout)
@@ -237,6 +246,19 @@ impl Drop for Connection {
 struct Entry {
     conn: Arc<Mutex<Connection>>,
     child: ChildHandle,
+}
+
+/// Drain `stderr` into `log`, capped at 4 KiB. Runs on a dedicated thread per
+/// server so the child process is never blocked writing diagnostics.
+fn drain_stderr(stderr: ChildStderr, log: Arc<Mutex<String>>) {
+    let reader = BufReader::new(stderr);
+    for line in reader.lines().map_while(Result::ok) {
+        let mut buf = log.lock();
+        if buf.len() < 4096 {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
 }
 
 /// Holds live connections to MCP servers, keyed by server name.
@@ -350,7 +372,7 @@ impl McpRegistry {
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // Own process group, so an abort can take the wrapper AND the
         // server it spawned (see `kill_and_reap`).
         #[cfg(unix)]
@@ -365,16 +387,30 @@ impl McpRegistry {
     /// The MCP initialize handshake + `tools/list` over an already-spawned
     /// process. A failure drops the connection, which kills the process.
     fn handshake(name: &str, child: ChildHandle) -> Result<Connection, String> {
-        let (stdin, stdout) = {
+        let (stdin, stdout, stderr) = {
             let mut c = child.lock();
-            (c.stdin.take().ok_or("no stdin")?, c.stdout.take().ok_or("no stdout")?)
+            (
+                c.stdin.take().ok_or("no stdin")?,
+                c.stdout.take().ok_or("no stdout")?,
+                c.stderr.take(),
+            )
         };
+        // Drain stderr on a background thread so the process is never blocked
+        // writing diagnostics. The buffer is capped at 4 KiB; we include it in
+        // "closed the connection" errors so bridge tools (e.g. mcp-remote) can
+        // surface auth and network failures instead of silently exiting.
+        let stderr_log: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = stderr {
+            let log = Arc::clone(&stderr_log);
+            std::thread::spawn(move || drain_stderr(stderr, log));
+        }
         let mut conn = Connection {
             child,
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
             tools: Vec::new(),
+            stderr_log,
         };
         conn.request(
             "initialize",
