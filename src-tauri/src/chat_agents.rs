@@ -22,7 +22,7 @@
 use crate::db::Db;
 use crate::error::AppResult;
 use crate::chat_engine::{dangerous_command, ApprovalBroker, ApprovalDecision};
-use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, ToolGate};
+use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{LlmProvider, LlmTool};
@@ -622,6 +622,63 @@ impl ToolGate for SubagentGate {
     }
 }
 
+/// The workspace's MCP tools as a sub-agent sees them: the definition's
+/// grant (`McpGrant`) filters the discovered set once per fan-out, and each
+/// call runs off-thread with the same 60s bound Talk's own MCP calls have.
+pub struct McpSubagentTools {
+    pub registry: Arc<crate::mcp::McpRegistry>,
+    pub worktree: std::path::PathBuf,
+    pub tools: Vec<LlmTool>,
+}
+
+impl McpSubagentTools {
+    /// `discovered` is the workspace's full MCP tool list; keep what the
+    /// definition grants (everything for an untyped call).
+    pub fn granted(
+        registry: Arc<crate::mcp::McpRegistry>,
+        worktree: &Path,
+        discovered: &[crate::mcp::McpToolInfo],
+        definition: Option<&AgentDefinition>,
+    ) -> Option<Self> {
+        let tools: Vec<LlmTool> = discovered
+            .iter()
+            .filter(|t| definition.map(|d| d.mcp.allows(&t.namespaced)).unwrap_or(true))
+            .map(|t| LlmTool {
+                name: t.namespaced.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect();
+        (!tools.is_empty()).then(|| Self { registry, worktree: worktree.to_path_buf(), tools })
+    }
+}
+
+#[async_trait::async_trait]
+impl ExternalTools for McpSubagentTools {
+    fn definitions(&self) -> Vec<LlmTool> {
+        self.tools.clone()
+    }
+    fn owns(&self, name: &str) -> bool {
+        crate::mcp::is_mcp_tool(name) && self.tools.iter().any(|t| t.name == name)
+    }
+    async fn call(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        let registry = Arc::clone(&self.registry);
+        let wp = self.worktree.clone();
+        let name = name.to_string();
+        let input = input.clone();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::task::spawn_blocking(move || registry.call(&wp, &name, &input)),
+        )
+        .await
+        {
+            Ok(Ok(Ok(out))) => Ok(out),
+            Ok(Ok(Err(e))) => Err(format!("MCP error: {e}")),
+            _ => Err("MCP error: tool call timed out".to_string()),
+        }
+    }
+}
+
 /// Run one sub-agent to completion on an already-resolved provider. Split
 /// from the spawning wrapper so a scripted provider + recording sink can
 /// drive it in tests.
@@ -636,6 +693,7 @@ pub async fn run_subagent_core(
     cancel: &Arc<AtomicBool>,
     sink: &dyn EventSink,
     gate: Option<&dyn ToolGate>,
+    external: Option<&dyn ExternalTools>,
 ) -> AppResult<AgentOutcome> {
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
@@ -660,6 +718,7 @@ pub async fn run_subagent_core(
         None,
         &[],
         gate,
+        external,
     )
     .await?;
     let (report, ok) = report_from_result(&out, spec.max_iterations);
@@ -698,11 +757,30 @@ pub async fn run_subagents(
     db: Arc<Mutex<Db>>,
     client: reqwest::Client,
     approvals: Arc<ApprovalBroker>,
+    mcp: Arc<crate::mcp::McpRegistry>,
     specs: Vec<SubagentSpec>,
     cancel: Arc<AtomicBool>,
 ) -> HashMap<String, AgentOutcome> {
     let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENTS));
     let mut set = tokio::task::JoinSet::new();
+    // The workspace's MCP tools, discovered once per fan-out (off-thread,
+    // bounded — a hung server must not stall the crew); each sub-agent then
+    // sees the subset its definition grants.
+    let mcp_tools: Arc<Vec<crate::mcp::McpToolInfo>> = Arc::new(match specs.first() {
+        Some(first) => {
+            let reg = Arc::clone(&mcp);
+            let wp = std::path::PathBuf::from(&first.workspace_path);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                tokio::task::spawn_blocking(move || reg.list_tools(&wp)),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+        }
+        None => Vec::new(),
+    });
     // Configured model ids + the user's tier map, read once per fan-out, for
     // definition/call model specs (`haiku`, `fast`, an id…).
     let known_models: Arc<Vec<String>> = Arc::new(
@@ -722,11 +800,20 @@ pub async fn run_subagents(
         let known_models = Arc::clone(&known_models);
         let tiers = Arc::clone(&tiers);
         let approvals = Arc::clone(&approvals);
+        let mcp = Arc::clone(&mcp);
+        let mcp_tools = Arc::clone(&mcp_tools);
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let started = std::time::Instant::now();
             let model = pick_subagent_model(&spec, &known_models, &tiers);
             let approval_gate = SubagentGate::new(approvals, app.clone(), &spec);
+            let external = McpSubagentTools::granted(
+                mcp,
+                Path::new(&spec.workspace_path),
+                &mcp_tools,
+                spec.definition.as_ref(),
+            );
+            let external_ref: Option<&dyn ExternalTools> = external.as_ref().map(|e| e as &dyn ExternalTools);
             let sink = ChatAgentSink {
                 app,
                 db,
@@ -734,7 +821,7 @@ pub async fn run_subagents(
                 thread_id: spec.thread_id.clone(),
                 call_id: spec.call_id.clone(),
             };
-            let mut outcome = run_attempt(&model, &spec, &client, &cancel, &sink, &approval_gate, started).await;
+            let mut outcome = run_attempt(&model, &spec, &client, &cancel, &sink, &approval_gate, external_ref, started).await;
             // The definition's `escalate`: one retry on the stronger model
             // when the cheap attempt failed, blocked, or hit its turn cap —
             // unless the director stopped the turn.
@@ -747,7 +834,7 @@ pub async fn run_subagents(
                     ));
                     let mut retry = spec.clone();
                     retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(&spec));
-                    let second = run_attempt(&stronger, &retry, &client, &cancel, &sink, &approval_gate, std::time::Instant::now()).await;
+                    let second = run_attempt(&stronger, &retry, &client, &cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
                     outcome = merge_escalated(outcome, second);
                 }
             }
@@ -770,6 +857,7 @@ pub async fn run_subagents(
 /// One attempt of a sub-agent on `model`: resolve the provider, run the
 /// loop; any failure becomes a failed outcome carrying the error as its
 /// report.
+#[allow(clippy::too_many_arguments)]
 async fn run_attempt(
     model: &str,
     spec: &SubagentSpec,
@@ -777,6 +865,7 @@ async fn run_attempt(
     cancel: &Arc<AtomicBool>,
     sink: &ChatAgentSink,
     gate: &SubagentGate,
+    external: Option<&dyn ExternalTools>,
     started: std::time::Instant,
 ) -> AgentOutcome {
     match crate::chat_engine::resolve_provider(model) {
@@ -791,6 +880,7 @@ async fn run_attempt(
                 cancel,
                 sink,
                 Some(gate),
+                external,
             )
             .await
             {
@@ -896,6 +986,7 @@ mod tests {
             description: format!("{name} desc"),
             body: format!("You are the {name}."),
             tools: tools.map(|t| t.into_iter().map(String::from).collect()),
+            mcp: crate::skills::agents::McpGrant::All,
             model: model.map(String::from),
             escalate: None,
             source: "project".into(),
@@ -1123,6 +1214,89 @@ mod tests {
         }
     }
 
+    /// A stand-in for the workspace's MCP servers: records calls, answers
+    /// with a canned brief.
+    struct FakeMcp {
+        tools: Vec<LlmTool>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    #[async_trait::async_trait]
+    impl ExternalTools for FakeMcp {
+        fn definitions(&self) -> Vec<LlmTool> { self.tools.clone() }
+        fn owns(&self, name: &str) -> bool { self.tools.iter().any(|t| t.name == name) }
+        async fn call(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+            self.calls.lock().push((name.to_string(), input.clone()));
+            if name == "mcp__jira__get_issue" { Ok("PROJ-1: fix the billing rounding".into()) } else { Err("MCP error: boom".into()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_calls_the_mcp_tools_it_is_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = FakeMcp {
+            tools: vec![LlmTool {
+                name: "mcp__jira__get_issue".into(),
+                description: "Read a Jira issue".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            calls: Mutex::new(vec![]),
+        };
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp("", vec![LlmToolUse { id: "t1".into(), name: "mcp__jira__get_issue".into(), input: serde_json::json!({"key": "PROJ-1"}) }], LlmStopReason::ToolUse),
+                resp("Brief: fix the billing rounding.", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Read ticket".into(), prompt: "PROJ-1".into(), subagent_type: Some("ticket-reader".into()), model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
+            definition: Some(def("ticket-reader", Some(vec!["read_file"]), None)),
+            policy_auto: false,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, None, Some(&mcp)).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        assert_eq!(out.report, "Brief: fix the billing rounding.");
+        assert_eq!(out.tool_calls, 1);
+        let calls = mcp.calls.lock().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "mcp__jira__get_issue");
+        assert_eq!(calls[0].1["key"], "PROJ-1");
+        // The journal carries the MCP call like any tool.
+        let entries = rec.entries.lock().clone();
+        assert!(entries.iter().any(|e| e.to_string().contains("mcp__jira__get_issue")), "{entries:?}");
+    }
+
+    #[test]
+    fn mcp_tools_are_filtered_by_the_definition_grant() {
+        use crate::mcp::{McpRegistry, McpToolInfo};
+        let discovered = vec![
+            McpToolInfo { server: "jira".into(), name: "get_issue".into(), namespaced: "mcp__jira__get_issue".into(), description: String::new(), input_schema: serde_json::json!({}) },
+            McpToolInfo { server: "github".into(), name: "list_prs".into(), namespaced: "mcp__github__list_prs".into(), description: String::new(), input_schema: serde_json::json!({}) },
+        ];
+        let reg = Arc::new(McpRegistry::new());
+        let names = |d: Option<&AgentDefinition>| -> Vec<String> {
+            McpSubagentTools::granted(Arc::clone(&reg), Path::new("/w"), &discovered, d)
+                .map(|m| m.definitions().into_iter().map(|t| t.name).collect())
+                .unwrap_or_default()
+        };
+        // Untyped call: everything. A definition with a tools list but no
+        // MCP entries: nothing. A server grant: that server's tools.
+        assert_eq!(names(None).len(), 2);
+        let mut none = def("explorer", Some(vec!["read_file"]), None);
+        none.mcp = crate::skills::agents::McpGrant::Only(vec![]);
+        assert!(names(Some(&none)).is_empty());
+        let mut jira_only = def("ticket-reader", Some(vec!["read_file"]), None);
+        jira_only.mcp = crate::skills::agents::McpGrant::Only(vec!["mcp__jira".into()]);
+        assert_eq!(names(Some(&jira_only)), vec!["mcp__jira__get_issue".to_string()]);
+        let all = McpSubagentTools::granted(Arc::clone(&reg), Path::new("/w"), &discovered, None).unwrap();
+        assert!(all.owns("mcp__github__list_prs") && !all.owns("run_command") && !all.owns("mcp__other__x"));
+    }
+
     #[tokio::test]
     async fn a_definition_restricts_the_subagent_to_its_tools() {
         let dir = tempfile::tempdir().unwrap();
@@ -1138,7 +1312,7 @@ mod tests {
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
-            &Arc::new(AtomicBool::new(false)), &rec, None).await.unwrap();
+            &Arc::new(AtomicBool::new(false)), &rec, None, None).await.unwrap();
         assert!(out.ok);
         let seen = provider.seen.lock().clone();
         // read_file + grep granted; grep/glob are implied by read access; no
@@ -1196,7 +1370,7 @@ mod tests {
         let gate = DenyRuns { seen: Mutex::new(vec![]) };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
-            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate)).await.unwrap();
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
         assert!(out.ok && out.finished);
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious", "the denied rm never ran");
         assert_eq!(*gate.seen.lock(), vec!["run_command", "read_file"], "every tool is offered to the gate");
@@ -1243,7 +1417,7 @@ mod tests {
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        let out = run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec, None)
+        let out = run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec, None, None)
             .await
             .unwrap();
         assert!(out.ok && out.finished && !out.closed_at_cap && !out.blocked);

@@ -43,6 +43,8 @@ pub struct AgentDefinition {
     pub body: String,
     /// Workspace tool names the sub-agent is limited to; `None` = the full set.
     pub tools: Option<Vec<String>>,
+    /// Which of the workspace's MCP tools the sub-agent may call.
+    pub mcp: McpGrant,
     /// The frontmatter `model` as written (an id, or an alias like `haiku`);
     /// resolved against the configured models at run time.
     pub model: Option<String>,
@@ -51,6 +53,47 @@ pub struct AgentDefinition {
     pub escalate: Option<String>,
     /// "project", "user" or "builtin".
     pub source: String,
+}
+
+/// Which MCP tools (`mcp__server__tool`) a definition grants. A definition
+/// with no `tools` list gets every server the workspace configures; one with
+/// a list gets only the `mcp__…` entries it names — `mcp__server__tool` for
+/// one tool, `mcp__server` for a whole server, `mcp__*` (or `mcp`) for all —
+/// exactly as Claude Code reads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpGrant {
+    All,
+    Only(Vec<String>),
+}
+
+impl McpGrant {
+    /// Whether `namespaced` (`mcp__server__tool`) is granted.
+    pub fn allows(&self, namespaced: &str) -> bool {
+        match self {
+            McpGrant::All => true,
+            McpGrant::Only(patterns) => patterns.iter().any(|p| {
+                p == "mcp__*"
+                    || p == "mcp"
+                    || p == namespaced
+                    || (namespaced.starts_with(p.as_str()) && namespaced[p.len()..].starts_with("__"))
+            }),
+        }
+    }
+}
+
+/// Split a frontmatter `tools` list into MCP grants and the rest.
+pub fn split_mcp_entries(list: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut mcp = Vec::new();
+    let mut rest = Vec::new();
+    for t in list {
+        let t = t.trim();
+        if t == "mcp" || t.starts_with("mcp__") {
+            mcp.push(t.to_string());
+        } else {
+            rest.push(t.to_string());
+        }
+    }
+    (mcp, rest)
 }
 
 /// Picker-sized descriptor (no body).
@@ -187,6 +230,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     let mut name = String::new();
     let mut description = String::new();
     let mut tools: Option<Vec<String>> = None;
+    let mut mcp = McpGrant::All;
     let mut model: Option<String> = None;
     let mut escalate: Option<String> = None;
     for (key, value) in pairs {
@@ -196,12 +240,14 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
             "tools" | "allowed-tools" | "allowed_tools" => {
                 let raw = split_list(&value);
                 if !raw.is_empty() {
-                    tools = map_tools(&raw);
-                    if tools.is_none() {
+                    let (mcp_entries, rest) = split_mcp_entries(&raw);
+                    mcp = McpGrant::Only(mcp_entries);
+                    tools = map_tools(&rest);
+                    if tools.is_none() && !rest.is_empty() {
                         tracing::warn!(
                             agent = %name,
                             "agent definition names no tool this app has ({}); using the full set",
-                            raw.join(", ")
+                            rest.join(", ")
                         );
                     }
                 }
@@ -222,7 +268,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     if name.is_empty() {
         return None;
     }
-    Some(AgentDefinition { name, description, body, tools, model, escalate, source: source.to_string() })
+    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, source: source.to_string() })
 }
 
 fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -298,8 +344,11 @@ mod tests {
         );
         assert_eq!(d.model.as_deref(), Some("haiku"));
         assert_eq!(d.escalate, None);
+        // A tools list without MCP entries grants no MCP tool; no list grants all.
+        assert_eq!(d.mcp, McpGrant::Only(vec![]));
         let e = parse_agent_definition("---\nname: impl\nmodel: balanced\nescalate: strong\n---\nbody", "project").unwrap();
         assert_eq!(e.escalate.as_deref(), Some("strong"));
+        assert_eq!(e.mcp, McpGrant::All);
         // A `---` rule inside the body is body, not a fence.
         assert_eq!(d.body, "You hunt for injection and auth bugs.\n\n---\nStill body.");
         assert_eq!(d.source, "project");
@@ -312,6 +361,26 @@ mod tests {
         assert_eq!(map_tools(&["Edit".into(), "MultiEdit".into(), "edit_file".into()]), Some(vec!["edit_file".into()]));
         assert_eq!(map_tool_name("LS"), Some("list_files"));
         assert_eq!(map_tool_name("Task"), None);
+    }
+
+    #[test]
+    fn mcp_grants_follow_claude_code_patterns() {
+        let d = parse_agent_definition(
+            "---\nname: t\ntools: Read, mcp__jira__get_issue, mcp__github\n---\nbody",
+            "project",
+        )
+        .unwrap();
+        assert_eq!(d.tools.as_deref(), Some(&["read_file".to_string()][..]));
+        assert!(d.mcp.allows("mcp__jira__get_issue"));
+        assert!(!d.mcp.allows("mcp__jira__create_issue"));
+        assert!(d.mcp.allows("mcp__github__list_prs"), "a server grant covers its tools");
+        assert!(!d.mcp.allows("mcp__githubx__list_prs"), "prefix must end at a separator");
+        assert!(McpGrant::Only(vec!["mcp__*".into()]).allows("mcp__any__thing"));
+        assert!(McpGrant::All.allows("mcp__any__thing"));
+        // An MCP-only list keeps the full workspace set (nothing to restrict to).
+        let only = parse_agent_definition("---\nname: t\ntools: mcp__jira\n---\nbody", "project").unwrap();
+        assert_eq!(only.tools, None);
+        assert_eq!(only.mcp, McpGrant::Only(vec!["mcp__jira".into()]));
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub const BUILTIN_AGENT_FILES: &[(&str, &str)] = &[
     ),
     (
         "ticket-reader.md",
-        "---\nname: ticket-reader\ndescription: Reads a ticket, issue or spec that is available as a file, a URL, or through the gh CLI, and returns a compact brief. Fast tier, never edits files — keeps the raw ticket out of the director's context.\ntools: Bash, Read, Grep, Glob\nmodel: fast\n---\nYou read a ticket so the director does not have to. The raw text (JSON, comments, attachments) stays with you; only the brief comes back.\n\nWork: fetch what you were pointed at (`gh issue view`, a file, `curl` for a URL you were given). Read all of it, including comments and linked items you can reach. Do not edit anything in the repository.\n\nReport, under 300 words: the ask in one sentence; acceptance criteria as a list; constraints and decisions already made in the thread; open questions the ticket leaves; references (ids, URLs, file paths). No speculation about the implementation.\n",
+        "---\nname: ticket-reader\ndescription: Reads a ticket, issue or spec — through the workspace's MCP tools (Jira, Linear, GitHub…), the gh CLI, a file or a URL — and returns a compact brief. Fast tier, never edits files — keeps the raw ticket out of the director's context.\ntools: Bash, Read, Grep, Glob, mcp__*\nmodel: fast\n---\nYou read a ticket so the director does not have to. The raw text (JSON, comments, attachments) stays with you; only the brief comes back.\n\nWork: fetch what you were pointed at — an MCP tool of the tracker when you have one (Jira, Linear, GitHub), else `gh issue view`, a file, or `curl` for a URL you were given. Read all of it, including comments and linked items you can reach. Do not edit anything in the repository.\n\nReport, under 300 words: the ask in one sentence; acceptance criteria as a list; constraints and decisions already made in the thread; open questions the ticket leaves; references (ids, URLs, file paths). No speculation about the implementation.\n",
     ),
 ];
 
@@ -94,5 +94,12 @@ mod tests {
             assert_eq!(d.escalate.as_deref(), Some("strong"), "{esc}");
         }
         assert!(defs.iter().find(|d| d.name == "explorer").unwrap().escalate.is_none());
+        // Only the ticket reader reaches the workspace's MCP servers.
+        use crate::skills::agents::McpGrant;
+        for d in &defs {
+            let expect_all = d.name == "ticket-reader";
+            assert_eq!(d.mcp.allows("mcp__jira__get_issue"), expect_all, "{}", d.name);
+            assert!(matches!(d.mcp, McpGrant::Only(_)), "{} lists its tools", d.name);
+        }
     }
 }

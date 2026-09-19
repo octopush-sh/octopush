@@ -2364,6 +2364,7 @@ impl ChatEngine {
                         Arc::clone(&self.db),
                         self.client.clone(),
                         self.approvals(),
+                        Arc::clone(&self.mcp),
                         specs,
                         Arc::clone(&cancel),
                     )
