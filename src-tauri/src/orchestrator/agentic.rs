@@ -650,6 +650,18 @@ pub trait ToolGate: Send + Sync {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String>;
 }
 
+/// Tools the loop offers and executes on the caller's behalf, beyond the
+/// workspace set — TALK sub-agents use it for the workspace's MCP servers
+/// (`mcp__server__tool`). The caller decides which tools to offer (its own
+/// allowlist); the loop only asks `owns` to route a call and `call` to run
+/// it. An `Err` comes back to the model as an error tool_result.
+#[async_trait::async_trait]
+pub trait ExternalTools: Send + Sync {
+    fn definitions(&self) -> Vec<LlmTool>;
+    fn owns(&self, name: &str) -> bool;
+    async fn call(&self, name: &str, input: &serde_json::Value) -> Result<String, String>;
+}
+
 /// Run the tool-use loop against `provider` until it returns a final answer
 /// (or `max_iterations` is hit, or `cancel` is set). Tools execute in
 /// `workspace_path`. The cancel flag is checked at the top of each iteration:
@@ -697,6 +709,9 @@ pub async fn run_agentic_loop(
     peers: &[PeerStage],
     // Optional pre-execution gate (see [`ToolGate`]); `None` runs every tool.
     gate: Option<&dyn ToolGate>,
+    // Optional caller-owned tools (see [`ExternalTools`]) — offered as given,
+    // outside the workspace allowlist, executed by the caller.
+    external: Option<&dyn ExternalTools>,
 ) -> AppResult<AgenticResult> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
@@ -727,6 +742,9 @@ pub async fn run_agentic_loop(
     // earlier stage is not a workspace mutation).
     if !peers.is_empty() {
         tools.push(ask_stage_tool(peers));
+    }
+    if let Some(ext) = external {
+        tools.extend(ext.definitions());
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
@@ -989,6 +1007,27 @@ pub async fn run_agentic_loop(
                         .into(),
                     is_error: true,
                 });
+                continue;
+            }
+            // Caller-owned tools (MCP servers): executed by the caller, never
+            // by the workspace executor; an error is an error tool_result.
+            if let Some(ext) = external.filter(|e| e.owns(&u.name)) {
+                emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
+                // Same gate as a workspace tool: a denial never reaches the server.
+                let denial = match gate {
+                    Some(g) => g.check(&u.name, &u.input).await,
+                    None => None,
+                };
+                let (text, ok) = match denial {
+                    Some(msg) => (msg, false),
+                    None => match ext.call(&u.name, &u.input).await {
+                        Ok(t) => (t, true),
+                        Err(e) => (e, false),
+                    },
+                };
+                emitter.tool_result(ok, &crate::orchestrator::live::summarize(&text));
+                out.tool_calls.push(ToolCallLog { name: u.name.clone(), input: u.input.clone(), result: text.clone() });
+                results.push(LlmToolResult { tool_use_id: u.id.clone(), content: cap_tool_result(&text), is_error: !ok });
                 continue;
             }
             emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));

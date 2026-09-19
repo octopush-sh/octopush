@@ -366,6 +366,7 @@ impl AgentRunner for ApiRunner {
             ctx.spend_limit,
             &ctx.peers,
             None,
+            None,
         )
         .await;
 
