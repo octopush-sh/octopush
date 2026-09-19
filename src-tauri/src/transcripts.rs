@@ -416,7 +416,7 @@ impl TranscriptIngestor {
         let db = self.db.lock();
         // One transaction per file: thousands of historical rows would
         // otherwise each pay a journal sync. A savepoint nests safely.
-        db.conn_ref().execute_batch("SAVEPOINT cc_ingest")?;
+        db.execute_batch("SAVEPOINT cc_ingest")?;
         let result = (|| -> AppResult<()> {
             for u in entries {
                 let cost = prices
@@ -473,11 +473,11 @@ impl TranscriptIngestor {
         })();
         match result {
             Ok(()) => {
-                db.conn_ref().execute_batch("RELEASE cc_ingest")?;
+                db.execute_batch("RELEASE cc_ingest")?;
                 Ok((inserted, earliest))
             }
             Err(e) => {
-                let _ = db.conn_ref().execute_batch("ROLLBACK TO cc_ingest; RELEASE cc_ingest");
+                let _ = db.execute_batch("ROLLBACK TO cc_ingest; RELEASE cc_ingest");
                 Err(e)
             }
         }

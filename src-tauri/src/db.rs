@@ -4164,6 +4164,13 @@ impl Db {
     // ── app_meta: tiny key/value store for app-global scalars ────────────────
 
     /// Read a scalar from `app_meta`; `None` if the key was never set.
+    /// Run one or more SQL statements with no parameters (savepoints,
+    /// pragmas). For callers outside this module that need a transaction
+    /// bracket around several `Db` calls.
+    pub fn execute_batch(&self, sql: &str) -> AppResult<()> {
+        self.conn.execute_batch(sql).map_err(Into::into)
+    }
+
     pub fn meta_get(&self, key: &str) -> AppResult<Option<String>> {
         self.conn
             .query_row("SELECT value FROM app_meta WHERE key = ?1", params![key], |r| r.get(0))
