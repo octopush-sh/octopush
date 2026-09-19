@@ -19,6 +19,7 @@ import { fmtTokens } from "../../lib/stageMeta";
 import { prefersReducedMotion } from "../../lib/motion";
 import { StageDots } from "../direct/StageDots";
 import { Reveal } from "../primitives/Reveal";
+import { ChatMarkdown } from "./ChatMarkdown";
 
 export type CrewAgentStatus = "running" | "done" | "failed";
 
@@ -287,12 +288,15 @@ function CrewRow({
       </div>
       {agent.report != null && (
         <Reveal open={reportOpen}>
-          <pre
-            className="octo-selectable max-h-[256px] overflow-auto whitespace-pre-wrap border-t border-octo-hairline px-3 py-2 font-mono text-[11px] leading-[1.5] text-octo-sage"
+          {/* The report is the sub-agent's prose, so it reads as Markdown
+              (tables, lists, code) — unlike a tool's raw output. */}
+          <div
+            data-testid="crew-report-inline"
+            className="octo-selectable max-h-[256px] overflow-auto border-t border-octo-hairline px-3 py-2 text-[12px] leading-[1.6] text-octo-sage"
             style={{ background: "var(--color-octo-onyx)" }}
           >
-            {agent.report}
-          </pre>
+            <ChatMarkdown text={agent.report} />
+          </div>
         </Reveal>
       )}
     </div>

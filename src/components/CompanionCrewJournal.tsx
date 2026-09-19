@@ -11,6 +11,7 @@ import { fmtTokens } from "../lib/stageMeta";
 import { formatDuration } from "../lib/duration";
 import { buildJournalItems } from "./direct/JournalItems";
 import { crewAgentsFromLive, crewAgentsFromTools, type CrewAgent } from "./chat/CrewCard";
+import { ChatMarkdown } from "./chat/ChatMarkdown";
 
 /** Locate the focused sub-agent: a resolved tool row by call id, else a live
  *  tool. Null when the thread no longer holds it (switched, deleted). */
@@ -101,13 +102,13 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
         {agent.report != null && agent.report.length > 0 && (
           <>
             <div className="mt-3 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">report</div>
-            <pre
+            <div
               data-testid="crew-report"
-              className="octo-selectable mt-1 max-h-[40vh] overflow-auto whitespace-pre-wrap rounded-md px-3 py-2 font-mono text-[11px] leading-[1.5] text-octo-sage"
+              className="octo-selectable mt-1 max-h-[40vh] overflow-auto rounded-md px-3 py-2 text-[12px] leading-[1.6] text-octo-sage"
               style={{ background: "var(--color-octo-onyx)", border: "1px solid var(--color-octo-hairline)" }}
             >
-              {agent.report}
-            </pre>
+              <ChatMarkdown text={agent.report} />
+            </div>
           </>
         )}
 
