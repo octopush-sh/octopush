@@ -204,12 +204,18 @@ impl Connection {
 /// blocked — for as long as the grandchild lives.
 fn kill_and_reap(child: &ChildHandle) {
     let mut c = child.lock();
+    // Only while the child is unreaped: a reaped pid is free for reuse, and
+    // the group signal is raw (std's `kill` guards itself, this must too).
+    // The handle is shared, so a second caller after the reap is normal.
+    if !matches!(c.try_wait(), Ok(None)) {
+        return;
+    }
     #[cfg(unix)]
     {
         let pgid = c.id() as libc::pid_t;
         if pgid > 0 {
-            // SAFETY: plain syscall on a pid we own; a stale pid is harmless
-            // (ESRCH) because we reap right after.
+            // SAFETY: plain syscall on a pid that is still ours — the child is
+            // unreaped (checked above), so the number cannot have been reused.
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
@@ -225,12 +231,21 @@ impl Drop for Connection {
     }
 }
 
+/// A live server: the connection (locked for the length of a request) and
+/// its process handle (reachable without that lock — what an abort kills).
+/// Kept together so the two can never describe different processes.
+struct Entry {
+    conn: Arc<Mutex<Connection>>,
+    child: ChildHandle,
+}
+
 /// Holds live connections to MCP servers, keyed by server name.
 pub struct McpRegistry {
-    conns: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
-    /// The process behind each live connection, reachable without the
-    /// connection lock — what `abort_server` kills.
-    children: Mutex<HashMap<String, ChildHandle>>,
+    conns: Mutex<HashMap<String, Entry>>,
+    /// Processes spawned whose handshake has not finished yet — abortable
+    /// while `connect` is still reading, which would otherwise hang the
+    /// per-server connect lock for every later caller.
+    pending: Mutex<HashMap<String, ChildHandle>>,
     /// One lock per server around spawn + handshake, so two callers racing to
     /// a not-yet-connected server spawn it once, not twice.
     connecting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -269,7 +284,9 @@ pub async fn call_bounded(
         Ok(Err(e)) => Err(format!("MCP error: call task failed: {e}")),
         Err(_) => {
             if let Some(server) = server_of(&namespaced) {
-                registry.abort_server(&server);
+                // Kill + reap off the runtime thread.
+                let reg = Arc::clone(&registry);
+                let _ = tokio::task::spawn_blocking(move || reg.abort_server(&server)).await;
             }
             Err(format!(
                 "MCP error: `{namespaced}` timed out after {}s. The server was stopped, so this call \
@@ -285,34 +302,49 @@ impl McpRegistry {
     pub fn new() -> Self {
         Self {
             conns: Mutex::new(HashMap::new()),
-            children: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
             failed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    /// Drop a server's cached connection (e.g. after it errored) so the next
-    /// use re-spawns it. The process itself is killed when the last holder
-    /// of the connection lets go (`Connection::drop`).
-    fn evict(&self, name: &str) {
-        self.conns.lock().remove(name);
-        self.children.lock().remove(name);
+    /// Drop a server's cached connection after IT errored — only when the
+    /// cached one is still `conn` (a sibling may have re-spawned the server
+    /// in the meantime; that fresh connection must not be thrown away). The
+    /// process itself is killed when the last holder lets go
+    /// (`Connection::drop`).
+    fn evict_if_current(&self, name: &str, conn: &Arc<Mutex<Connection>>) {
+        let mut conns = self.conns.lock();
+        if conns.get(name).is_some_and(|e| Arc::ptr_eq(&e.conn, conn)) {
+            conns.remove(name);
+        }
     }
 
     /// Stop a server now — kill its process and forget the connection — even
-    /// while a request on it is blocked reading. That reader gets EOF and
-    /// returns an error; the next call re-spawns the server.
+    /// while a request on it is blocked reading, or while its handshake is
+    /// still in flight. That reader gets EOF and returns an error; the next
+    /// call re-spawns the server.
     pub fn abort_server(&self, name: &str) {
-        let child = self.children.lock().remove(name);
-        self.conns.lock().remove(name);
-        if let Some(child) = child {
+        let live = self.conns.lock().remove(name);
+        let pending = self.pending.lock().get(name).cloned();
+        for child in live.iter().map(|e| &e.child).chain(pending.iter()) {
             tracing::warn!(server = %name, "stopping MCP server after a timed-out call");
-            kill_and_reap(&child);
+            kill_and_reap(child);
         }
     }
 
     /// Spawn a server, run the MCP initialize handshake, and fetch its tools.
-    fn connect(name: &str, cfg: &McpServerConfig) -> Result<Connection, String> {
+    /// The process is registered as `pending` for the length of the
+    /// handshake so an abort can reach it.
+    fn connect(&self, name: &str, cfg: &McpServerConfig) -> Result<Connection, String> {
+        let child = Self::spawn(cfg)?;
+        self.pending.lock().insert(name.to_string(), Arc::clone(&child));
+        let result = Self::handshake(name, child);
+        self.pending.lock().remove(name);
+        result
+    }
+
+    fn spawn(cfg: &McpServerConfig) -> Result<ChildHandle, String> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .envs(&cfg.env)
@@ -326,11 +358,19 @@ impl McpRegistry {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", cfg.command))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", cfg.command))?;
+        Ok(Arc::new(Mutex::new(child)))
+    }
+
+    /// The MCP initialize handshake + `tools/list` over an already-spawned
+    /// process. A failure drops the connection, which kills the process.
+    fn handshake(name: &str, child: ChildHandle) -> Result<Connection, String> {
+        let (stdin, stdout) = {
+            let mut c = child.lock();
+            (c.stdin.take().ok_or("no stdin")?, c.stdout.take().ok_or("no stdout")?)
+        };
         let mut conn = Connection {
-            child: Arc::new(Mutex::new(child)),
+            child,
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
@@ -385,7 +425,7 @@ impl McpRegistry {
     /// touch the cache or the failed-set, so testing a broken config doesn't
     /// poison a real session.
     pub fn test_connect(name: &str, cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let conn = Self::connect(name, cfg)?;
+        let conn = Self::handshake(name, Self::spawn(cfg)?)?;
         Ok(conn.tools.clone())
     }
 
@@ -393,25 +433,24 @@ impl McpRegistry {
     /// run under a per-server lock: concurrent first callers (a sub-agent
     /// fan-out) wait for one connection instead of each spawning their own.
     fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<Arc<Mutex<Connection>>, String> {
-        if let Some(c) = self.conns.lock().get(name) {
-            return Ok(Arc::clone(c));
+        if let Some(e) = self.conns.lock().get(name) {
+            return Ok(Arc::clone(&e.conn));
         }
         let spawn_lock = Arc::clone(
             self.connecting.lock().entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))),
         );
         let _spawning = spawn_lock.lock();
-        if let Some(c) = self.conns.lock().get(name) {
-            return Ok(Arc::clone(c));
+        if let Some(e) = self.conns.lock().get(name) {
+            return Ok(Arc::clone(&e.conn));
         }
         if self.failed.lock().contains(name) {
             return Err(format!("MCP server '{name}' previously failed; skipping"));
         }
-        match Self::connect(name, cfg) {
+        match self.connect(name, cfg) {
             Ok(conn) => {
                 let child = Arc::clone(&conn.child);
                 let arc = Arc::new(Mutex::new(conn));
-                self.conns.lock().insert(name.to_string(), Arc::clone(&arc));
-                self.children.lock().insert(name.to_string(), child);
+                self.conns.lock().insert(name.to_string(), Entry { conn: Arc::clone(&arc), child });
                 Ok(arc)
             }
             Err(e) => {
@@ -455,7 +494,7 @@ impl McpRegistry {
                 // The connection is likely dead (broken pipe / closed) — evict
                 // it so the next call re-spawns a fresh server instead of
                 // reusing a corpse forever.
-                self.evict(&server);
+                self.evict_if_current(&server, &conn);
                 return Err(e);
             }
         };
@@ -568,17 +607,42 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"slow","description":"never answers","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id" ;;
     *'"method":"tools/call"'*)
-      sleep 30 ;;
+      echo call >> "$SPAWN_LOG"; sleep 30 ;;
   esac
 done
 "#;
 
+    // A fixture that never answers `initialize` at all.
+    const MUTE_FIXTURE: &str = r#"#!/usr/bin/env bash
+echo start >> "$SPAWN_LOG"
+sleep 30
+"#;
+
+    #[cfg(unix)]
+    fn log_lines(log: &std::path::Path, word: &str) -> usize {
+        std::fs::read_to_string(log).unwrap_or_default().lines().filter(|l| *l == word).count()
+    }
+
+    #[cfg(unix)]
+    fn wait_for(log: &std::path::Path, word: &str, n: usize) {
+        let started = std::time::Instant::now();
+        while log_lines(log, word) < n {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "fixture never wrote {word}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[cfg(unix)]
     fn hanging_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        fixture_worktree(HANGING_FIXTURE)
+    }
+
+    #[cfg(unix)]
+    fn fixture_worktree(fixture: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hang.sh");
-        std::fs::write(&script, HANGING_FIXTURE).unwrap();
+        std::fs::write(&script, fixture).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = dir.path().join("spawns.log");
         let claude = dir.path().join(".claude");
@@ -606,7 +670,7 @@ done
         // A call that the server never answers, on its own thread.
         let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
         let worker = std::thread::spawn(move || r2.call(&wt, "mcp__hang__slow", &json!({})));
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        wait_for(&log, "call", 1);
         assert!(!worker.is_finished(), "the call is blocked on the server");
         let started = std::time::Instant::now();
         reg.abort_server("hang");
@@ -615,8 +679,28 @@ done
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         // The next use re-spawns the server (a second start line) and works.
         assert_eq!(reg.list_tools(dir.path()).len(), 1);
-        let starts = std::fs::read_to_string(&log).unwrap().lines().count();
-        assert_eq!(starts, 2, "one spawn before the abort, one after");
+        assert_eq!(log_lines(&log, "start"), 2, "one spawn before the abort, one after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_reaches_a_server_stuck_in_its_handshake() {
+        let (dir, log) = fixture_worktree(MUTE_FIXTURE);
+        let reg = Arc::new(McpRegistry::new());
+        let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
+        let worker = std::thread::spawn(move || r2.list_tools(&wt).len());
+        wait_for(&log, "start", 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!worker.is_finished(), "the handshake is hung");
+        let started = std::time::Instant::now();
+        reg.abort_server("hang");
+        assert_eq!(worker.join().unwrap(), 0, "the hung connect fails instead of blocking forever");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(reg.pending.lock().is_empty() && reg.conns.lock().is_empty());
+        // A second caller is not blocked behind the dead handshake.
+        let started = std::time::Instant::now();
+        let _ = reg.list_tools(dir.path());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[cfg(unix)]
@@ -629,18 +713,18 @@ done
             dir.path().to_path_buf(),
             "mcp__hang__slow".into(),
             json!({}),
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(3),
         )
         .await
         .unwrap_err();
         assert!(err.contains("timed out") && err.contains("server was stopped"), "{err}");
         // Stopped: the connection is gone and the process was reaped; a
         // later discovery spawns a fresh one.
-        assert!(reg.conns.lock().is_empty() && reg.children.lock().is_empty());
+        assert!(reg.conns.lock().is_empty() && reg.pending.lock().is_empty());
         let wt = dir.path().to_path_buf();
         let tools = tokio::task::spawn_blocking(move || reg.list_tools(&wt)).await.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        assert_eq!(log_lines(&log, "start"), 2);
     }
 
     #[cfg(unix)]
@@ -657,7 +741,7 @@ done
         for h in handles {
             assert_eq!(h.join().unwrap(), 1);
         }
-        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1, "one process for four callers");
+        assert_eq!(log_lines(&log, "start"), 1, "one process for four callers");
     }
 
     #[test]
