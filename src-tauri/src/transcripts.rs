@@ -21,13 +21,20 @@
 //! - Files are read incrementally: a per-file byte offset in `app_meta`
 //!   (`cc_transcript:<path>`) advances past every complete line consumed, so
 //!   a poll costs one `stat` per file when nothing changed.
-//! - Every billed message is keyed `cc:<claude session>:<request id>` in the
-//!   ledger's `idempotency_key`; several transcript lines for one message
-//!   (one per content block) collapse to one row, and a re-read (offset
-//!   reset after a file was truncated) can't double-count.
-//! - Once a transcript has been seen for an Octopush session, that session's
-//!   PTY scraping is switched off (`transcript_seen:<session>`), so the two
-//!   paths never both count the same run.
+//! - Every billed message is keyed `cc:<request id>` in the ledger's
+//!   `idempotency_key` (request ids are globally unique, so a `--resume`d
+//!   session that rewrites old turns into a new file adds nothing); several
+//!   transcript lines for one message (one per content block) collapse to
+//!   one row, a block that lands after the next poll updates that row, and
+//!   a re-read (offset reset after a file was truncated) can't double-count.
+//! - PTY scraping and transcripts never both count a run: the scanner skips
+//!   any source whose cwd has a transcript directory, every session on the
+//!   root and every terminal of the workspace is flagged
+//!   (`transcript_seen:<id>`), and the first time a target's transcripts
+//!   are read its already-scraped rows from that point on are removed.
+//! - Side effects that describe *now* (a session's live counters, the
+//!   Logbook activity span) fire only for messages minutes old; historical
+//!   rows are attributed to the mission that existed at their timestamp.
 
 use crate::db::{Db, SpendEvent};
 use crate::error::AppResult;
@@ -45,12 +52,37 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// session file sits at depth 1; sub-agent transcripts may nest one deeper).
 const MAX_DEPTH: usize = 3;
 
+/// A message counts as live (session counters, Logbook activity) within
+/// this many seconds of its timestamp.
+const LIVE_WINDOW_SECS: i64 = 10 * 60;
+
+/// The directory Claude Code keeps transcripts in.
+pub fn projects_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects")
+}
+
+/// Whether Claude Code has a transcript directory for `cwd` (created the
+/// moment `claude` first runs there). Checked by the PTY scanner before it
+/// records a screen-scraped summary.
+pub fn has_transcript_dir(cwd: &str) -> bool {
+    let root = projects_root();
+    root.join(project_dir_name(cwd)).is_dir()
+        || std::fs::canonicalize(cwd)
+            .ok()
+            .map(|c| root.join(project_dir_name(&c.to_string_lossy())).is_dir())
+            .unwrap_or(false)
+}
+
 /// One ledger-ready message pulled from a transcript line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranscriptUsage {
     /// Claude Code's own session id (the file stem).
     pub session_id: String,
-    /// `requestId`, else the message id — one per billed API call.
+    /// The ledger idempotency key: `cc:<requestId>`, else `cc:msg:<message id>`
+    /// — one per billed API call, unique across sessions and files.
     pub key: String,
     /// RFC3339 UTC.
     pub ts_utc: String,
@@ -105,12 +137,10 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
     if model.starts_with('<') {
         return None;
     }
-    let key = v
-        .get("requestId")
-        .and_then(|r| r.as_str())
-        .or_else(|| message.get("id").and_then(|i| i.as_str()))
-        .filter(|k| !k.is_empty())?
-        .to_string();
+    let key = match v.get("requestId").and_then(|r| r.as_str()).filter(|k| !k.is_empty()) {
+        Some(req) => format!("cc:{req}"),
+        None => format!("cc:msg:{}", message.get("id").and_then(|i| i.as_str()).filter(|k| !k.is_empty())?),
+    };
     let session_id = v
         .get("sessionId")
         .and_then(|s| s.as_str())
@@ -155,23 +185,28 @@ pub fn read_new_entries(path: &Path, offset: u64) -> std::io::Result<(Vec<Transc
     let mut consumed = start;
     let mut order: Vec<TranscriptUsage> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
             break;
         }
-        if !line.ends_with('\n') {
+        if buf.last() != Some(&b'\n') {
             break; // partial trailing line: not consumed
         }
         consumed += n as u64;
+        // Cheap pre-filter: user turns (which can carry multi-MB images)
+        // and summaries never mention an assistant.
+        if !buf.windows(11).any(|w| w == b"\"assistant\"") {
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buf);
         if let Some(u) = parse_transcript_line(&line, &file_session) {
-            let k = format!("{}:{}", u.session_id, u.key);
-            match index.get(&k) {
+            match index.get(&u.key) {
                 Some(&i) => order[i] = u,
                 None => {
-                    index.insert(k, order.len());
+                    index.insert(u.key.clone(), order.len());
                     order.push(u);
                 }
             }
@@ -181,18 +216,19 @@ pub fn read_new_entries(path: &Path, offset: u64) -> std::io::Result<(Vec<Transc
 }
 
 /// Where a transcript's spend is attributed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Target {
-    /// An Octopush RUN session with this cwd as its project root, if any.
-    session_id: Option<String>,
+    /// The cwd this target's transcripts were written from.
+    cwd: String,
+    /// Octopush RUN sessions opened on this cwd, most recently active first.
+    /// The first one receives the spend's `source_id` and live counters.
+    session_ids: Vec<String>,
     workspace_id: Option<String>,
     project_id: Option<String>,
 }
 
 fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -214,19 +250,11 @@ pub struct TranscriptIngestor {
 impl TranscriptIngestor {
     /// Reads `~/.claude/projects`.
     pub fn new(db: Arc<Mutex<Db>>) -> Self {
-        let root = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claude")
-            .join("projects");
-        Self::with_root(db, root)
+        Self::with_root(db, projects_root())
     }
 
     pub fn with_root(db: Arc<Mutex<Db>>, root: PathBuf) -> Self {
-        Self {
-            db,
-            root,
-            last_run: Mutex::new(None),
-        }
+        Self { db, root, last_run: Mutex::new(None) }
     }
 
     /// Ingest unless a pass ran within the last [`MIN_POLL_INTERVAL`].
@@ -247,38 +275,41 @@ impl TranscriptIngestor {
         }
     }
 
-    /// One full pass over every transcript that belongs to an Octopush
-    /// session or workspace.
-    pub fn ingest(&self) -> AppResult<IngestSummary> {
-        let mut summary = IngestSummary::default();
-        if !self.root.is_dir() {
-            return Ok(summary);
-        }
-        // Attribution map: Claude Code project dir → where the spend goes.
+    /// Attribution map: Claude Code project dir name → where the spend goes.
+    /// A path is keyed both as written and canonicalized (Claude Code records
+    /// the physical cwd, so a symlinked root would otherwise never match).
+    fn targets(&self) -> AppResult<HashMap<String, Target>> {
         let mut targets: HashMap<String, Target> = HashMap::new();
-        {
-            let db = self.db.lock();
-            for (id, project_id, path) in db.list_workspace_paths()? {
-                targets.insert(
-                    project_dir_name(&path),
-                    Target {
-                        session_id: None,
-                        workspace_id: Some(id),
-                        project_id: Some(project_id),
-                    },
-                );
+        let keys_for = |path: &str| -> Vec<String> {
+            let mut keys = vec![project_dir_name(path)];
+            if let Ok(c) = std::fs::canonicalize(path) {
+                let k = project_dir_name(&c.to_string_lossy());
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
             }
-            // Sessions are listed most-recently-active first; the first one
-            // per root wins, so spend follows the session the user is in.
-            for s in db.list_sessions()? {
-                let key = project_dir_name(&s.project_root);
-                let entry = targets.entry(key).or_insert(Target {
-                    session_id: None,
-                    workspace_id: None,
-                    project_id: None,
+            keys
+        };
+        let db = self.db.lock();
+        for (id, project_id, path) in db.list_workspace_paths()? {
+            for key in keys_for(&path) {
+                targets.entry(key).or_insert_with(|| Target {
+                    cwd: path.clone(),
+                    session_ids: Vec::new(),
+                    workspace_id: Some(id.clone()),
+                    project_id: Some(project_id.clone()),
                 });
-                if entry.session_id.is_none() {
-                    entry.session_id = Some(s.id.clone());
+            }
+        }
+        // Sessions are listed most-recently-active first.
+        for s in db.list_sessions()? {
+            for key in keys_for(&s.project_root) {
+                let entry = targets.entry(key).or_insert_with(|| Target {
+                    cwd: s.project_root.clone(),
+                    ..Target::default()
+                });
+                if !entry.session_ids.contains(&s.id) {
+                    entry.session_ids.push(s.id.clone());
                 }
                 if entry.workspace_id.is_none() {
                     // A session opened on a workspace's worktree: attribute to it.
@@ -289,22 +320,80 @@ impl TranscriptIngestor {
                 }
             }
         }
-        for (dir_name, target) in &targets {
-            let dir = self.root.join(dir_name);
+        Ok(targets)
+    }
+
+    /// One full pass over every transcript that belongs to an Octopush
+    /// session or workspace. A file that cannot be read is logged and
+    /// skipped; it never stops the other targets from being metered.
+    pub fn ingest(&self) -> AppResult<IngestSummary> {
+        let mut summary = IngestSummary::default();
+        if !self.root.is_dir() {
+            return Ok(summary);
+        }
+        for (dir_name, target) in self.targets()? {
+            let dir = self.root.join(&dir_name);
             if !dir.is_dir() {
                 continue;
             }
             let mut files = Vec::new();
             jsonl_files(&dir, 0, &mut files);
+            if files.is_empty() {
+                continue;
+            }
+            // Every source that could scrape this cwd is now transcript-metered.
+            let scrape_sources = {
+                let db = self.db.lock();
+                let mut ids = target.session_ids.clone();
+                if let Some(ws) = &target.workspace_id {
+                    ids.extend(db.terminal_ids_for_workspace(ws)?);
+                }
+                for id in &ids {
+                    db.meta_set(&format!("transcript_seen:{id}"), "1")?;
+                }
+                ids
+            };
+            let first_pass = self
+                .db
+                .lock()
+                .meta_get(&format!("transcript_target_seen:{dir_name}"))?
+                .is_none();
+            let mut earliest: Option<String> = None;
             for file in files {
                 summary.files_scanned += 1;
-                summary.rows_inserted += self.ingest_file(&file, target)?;
+                match self.ingest_file(&file, &target) {
+                    Ok((inserted, first_ts)) => {
+                        summary.rows_inserted += inserted;
+                        if let Some(ts) = first_ts {
+                            if earliest.as_deref().is_none_or(|e| ts.as_str() < e) {
+                                earliest = Some(ts);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = %file.display(), error = %e, "skipping claude transcript");
+                    }
+                }
+            }
+            // First time this cwd's transcripts are read: the runs they cover
+            // were scraped from the screen until now — those rows are
+            // superseded by the exact ones just recorded.
+            if first_pass {
+                let db = self.db.lock();
+                if let Some(since) = &earliest {
+                    let removed = db.delete_scraped_run_spend(&scrape_sources, since)?;
+                    if removed > 0 {
+                        tracing::info!(cwd = %target.cwd, removed, "replaced scraped RUN spend with transcript rows");
+                    }
+                }
+                db.meta_set(&format!("transcript_target_seen:{dir_name}"), "1")?;
             }
         }
         Ok(summary)
     }
 
-    fn ingest_file(&self, path: &Path, target: &Target) -> AppResult<usize> {
+    /// Ingest one file: `(rows inserted, earliest timestamp seen)`.
+    fn ingest_file(&self, path: &Path, target: &Target) -> AppResult<(usize, Option<String>)> {
         let meta_key = format!("cc_transcript:{}", path.display());
         let offset = self
             .db
@@ -314,20 +403,17 @@ impl TranscriptIngestor {
             .unwrap_or(0);
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if len == offset {
-            return Ok(0);
+            return Ok((0, None));
         }
         // Parse without the DB lock (a first pass over a long transcript is
         // the slow part); price each distinct model once (`prices_for`
         // reloads the catalog from disk).
         let (entries, consumed) = read_new_entries(path, offset)?;
+        let earliest = entries.iter().map(|u| u.ts_utc.clone()).min();
         let mut prices: HashMap<String, Option<ModelPrices>> = HashMap::new();
         let mut inserted = 0usize;
+        let now = chrono::Utc::now();
         let db = self.db.lock();
-        if let Some(sid) = &target.session_id {
-            // From now on this session is metered from its transcript, not
-            // from its screen — the PTY scanner checks this flag.
-            db.meta_set(&format!("transcript_seen:{sid}"), "1")?;
-        }
         // One transaction per file: thousands of historical rows would
         // otherwise each pay a journal sync. A savepoint nests safely.
         db.conn_ref().execute_batch("SAVEPOINT cc_ingest")?;
@@ -337,23 +423,17 @@ impl TranscriptIngestor {
                     .entry(u.model.clone())
                     .or_insert_with(|| prices_for(&u.model))
                     .as_ref()
-                    .map(|p| {
-                        p.cost(
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_read_tokens,
-                            u.cache_creation_tokens,
-                        )
-                    })
+                    .map(|p| p.cost(u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens))
                     .unwrap_or(0.0);
+                let live = chrono::DateTime::parse_from_rfc3339(&u.ts_utc)
+                    .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().abs() <= LIVE_WINDOW_SECS)
+                    .unwrap_or(false);
                 let mission_id = match &target.workspace_id {
-                    Some(ws) => db.active_mission_for_workspace(ws)?.map(|m| m.id),
+                    Some(ws) => db.mission_for_workspace_at(ws, &u.ts_utc)?,
                     None => None,
                 };
-                let source_id = target
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| format!("cc:{}", u.session_id));
+                let session_id = target.session_ids.first().cloned();
+                let source_id = session_id.clone().unwrap_or_else(|| format!("cc:{}", u.session_id));
                 let ev = SpendEvent {
                     ts_utc: u.ts_utc.clone(),
                     surface: "run".into(),
@@ -372,15 +452,19 @@ impl TranscriptIngestor {
                     computed_cost_usd: Some(cost),
                     cost_usd: cost,
                     cost_basis: "computed".into(),
-                    idempotency_key: Some(format!("cc:{}:{}", u.session_id, u.key)),
+                    idempotency_key: Some(u.key.clone()),
                 };
-                if db.insert_spend_event_if_new(&ev)? {
+                if db.upsert_spend_event_by_key(&ev)? {
                     inserted += 1;
-                    if let Some(sid) = &target.session_id {
-                        db.increment_session_tokens(sid, u.input_tokens, u.output_tokens)?;
-                    }
-                    if let Some(ws) = &target.workspace_id {
-                        let _ = db.record_activity(ws, "run", "transcript");
+                    // Only a message from the last few minutes says anything
+                    // about the session or the mission *now*.
+                    if live {
+                        if let Some(sid) = &session_id {
+                            db.increment_session_tokens(sid, u.input_tokens, u.output_tokens)?;
+                        }
+                        if let Some(ws) = &target.workspace_id {
+                            let _ = db.record_activity(ws, "run", "transcript");
+                        }
                     }
                 }
             }
@@ -390,12 +474,10 @@ impl TranscriptIngestor {
         match result {
             Ok(()) => {
                 db.conn_ref().execute_batch("RELEASE cc_ingest")?;
-                Ok(inserted)
+                Ok((inserted, earliest))
             }
             Err(e) => {
-                let _ = db
-                    .conn_ref()
-                    .execute_batch("ROLLBACK TO cc_ingest; RELEASE cc_ingest");
+                let _ = db.conn_ref().execute_batch("ROLLBACK TO cc_ingest; RELEASE cc_ingest");
                 Err(e)
             }
         }

@@ -11456,6 +11456,8 @@ mod transcript_tests {
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempDir};
 
+    const ALL: (&str, &str) = ("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00");
+
     fn test_db() -> Db {
         let tmp = NamedTempFile::new().unwrap();
         Db::open(tmp.path()).unwrap()
@@ -11483,6 +11485,27 @@ mod transcript_tests {
         .to_string()
     }
 
+    fn now_iso() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn session_on(db: &Db, id: &str, root: &str) {
+        let sess = Session::from_args(
+            id.into(),
+            CreateSessionArgs {
+                name: id.into(),
+                project_root: root.into(),
+                color: None,
+                icon: None,
+                agent: None,
+                token_budget: None,
+                tags: vec![],
+                context_files: vec![],
+            },
+        );
+        db.upsert_session(&sess).unwrap();
+    }
+
     #[test]
     fn project_dir_name_matches_claude_code() {
         assert_eq!(project_dir_name("/home/user/octopush"), "-home-user-octopush");
@@ -11493,11 +11516,14 @@ mod transcript_tests {
     fn parses_only_billed_assistant_lines() {
         let l = line("assistant", "req_1", "us.anthropic.claude-opus-5", 2, 38_271, 31_477, 201, "2026-09-18T20:50:46.418Z", "/w");
         let u = parse_transcript_line(&l, "file-sess").unwrap();
-        assert_eq!(u.key, "req_1");
+        assert_eq!(u.key, "cc:req_1", "keyed by the globally unique request id");
         assert_eq!(u.session_id, "cc-sess");
         assert_eq!(u.model, "us.anthropic.claude-opus-5");
         assert_eq!((u.input_tokens, u.cache_read_tokens, u.cache_creation_tokens, u.output_tokens), (2, 38_271, 31_477, 201));
         assert_eq!(u.ts_utc, "2026-09-18T20:50:46.418+00:00", "normalised to the ledger's RFC3339 form");
+        // No request id → the message id.
+        let no_req = l.replace("\"requestId\":\"req_1\",", "");
+        assert_eq!(parse_transcript_line(&no_req, "f").unwrap().key, "cc:msg:msg_req_1");
         assert!(parse_transcript_line(&line("user", "r", "m", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
         assert!(parse_transcript_line("not json", "f").is_none());
         assert!(parse_transcript_line(&line("assistant", "r", "<synthetic>", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
@@ -11511,18 +11537,24 @@ mod transcript_tests {
         let a = line("assistant", "req_a", "m", 10, 0, 0, 5, "2026-09-18T20:50:46Z", "/w");
         let a2 = line("assistant", "req_a", "m", 10, 0, 0, 9, "2026-09-18T20:50:47Z", "/w"); // second block, final usage
         let b = line("assistant", "req_b", "m", 20, 0, 0, 1, "2026-09-18T20:51:00Z", "/w");
-        std::fs::write(&path, format!("{a}\n{a2}\n{b}\n{{\"type\":\"assist")).unwrap();
+        // A user line with invalid UTF-8 must not abort the read.
+        let mut bytes = format!("{a}\n{a2}\n").into_bytes();
+        bytes.extend(b"{\"type\":\"user\",\"x\":\"\xff\xfe\"}\n");
+        bytes.extend(format!("{b}\n{{\"type\":\"assist").into_bytes());
+        std::fs::write(&path, &bytes).unwrap();
         let (entries, consumed) = read_new_entries(&path, 0).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].output_tokens, 9, "last block's usage wins");
-        assert_eq!(entries[1].key, "req_b");
-        let complete = format!("{a}\n{a2}\n{b}\n").len() as u64;
-        assert_eq!(consumed, complete);
+        assert_eq!(entries[1].key, "cc:req_b");
+        let complete = bytes.len() - "{\"type\":\"assist".len();
+        assert_eq!(consumed, complete as u64);
         // The partial tail completes later and is read from the offset.
-        std::fs::write(&path, format!("{a}\n{a2}\n{b}\n{}\n", line("assistant", "req_c", "m", 1, 0, 0, 1, "2026-09-18T20:52:00Z", "/w"))).unwrap();
+        bytes.truncate(complete);
+        bytes.extend(format!("{}\n", line("assistant", "req_c", "m", 1, 0, 0, 1, "2026-09-18T20:52:00Z", "/w")).into_bytes());
+        std::fs::write(&path, &bytes).unwrap();
         let (entries, _) = read_new_entries(&path, consumed).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "req_c");
+        assert_eq!(entries[0].key, "cc:req_c");
     }
 
     #[test]
@@ -11530,29 +11562,19 @@ mod transcript_tests {
         let db = Arc::new(Mutex::new(test_db()));
         let root = TempDir::new().unwrap();
         let cwd = "/tmp/proj/run-here";
-        let sess = Session::from_args(
-            "sess-run".into(),
-            CreateSessionArgs {
-                name: "run".into(),
-                project_root: cwd.into(),
-                color: None,
-                icon: None,
-                agent: None,
-                token_budget: None,
-                tags: vec![],
-                context_files: vec![],
-            },
-        );
-        db.lock().upsert_session(&sess).unwrap();
+        session_on(&db.lock(), "sess-run", cwd);
+        session_on(&db.lock(), "sess-run-2", cwd);
         let pdir = root.path().join(project_dir_name(cwd));
         std::fs::create_dir_all(&pdir).unwrap();
         let f = pdir.join("cc-sess.jsonl");
+        let live = now_iso();
         std::fs::write(
             &f,
             format!(
-                "{}\n{}\n",
-                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, "2026-09-18T20:50:46Z", cwd),
-                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, "2026-09-18T20:50:47Z", cwd),
+                "{}\n{}\n{}\n",
+                line("assistant", "req_old", "claude-sonnet-5", 500, 0, 0, 50, "2026-01-05T10:00:00Z", cwd),
+                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, &live, cwd),
+                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, &live, cwd),
             ),
         )
         .unwrap();
@@ -11563,46 +11585,105 @@ mod transcript_tests {
 
         let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
         let s = ing.ingest().unwrap();
-        assert_eq!(s.rows_inserted, 1, "{s:?}");
-        let rep = db.lock().usage_report("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00", Some("run"), 0).unwrap();
-        assert_eq!(rep.totals.calls, 1);
+        assert_eq!(s.rows_inserted, 2, "{s:?}");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 2);
         assert_eq!(rep.totals.cache_read_tokens, 40_000);
         assert_eq!(rep.by_model[0].model, "claude-sonnet-5");
         assert!(rep.totals.cost_usd > 0.0, "priced through the catalog");
-        assert!((rep.totals.cache_hit_pct.unwrap() - 40_000.0 / 45_100.0 * 100.0).abs() < 1e-9);
-        // The session's own counters moved and it is now transcript-metered.
-        let row = db.lock().get_session("sess-run").unwrap().unwrap();
-        assert_eq!(row.tokens_input, 100);
+        // Only the live message moved the session's own counters — the
+        // January row is history, not activity now — and every session on
+        // that root is transcript-metered.
+        let counted: u64 = ["sess-run", "sess-run-2"]
+            .iter()
+            .map(|id| db.lock().get_session(id).unwrap().unwrap().tokens_input)
+            .sum();
+        assert_eq!(counted, 100, "credited to the most recently active session on the root, once");
         assert!(db.lock().meta_get("transcript_seen:sess-run").unwrap().is_some());
+        assert!(db.lock().meta_get("transcript_seen:sess-run-2").unwrap().is_some());
         // Re-running is a no-op; appending one message adds exactly one row.
         assert_eq!(ing.ingest().unwrap().rows_inserted, 0);
         let mut fh = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
         use std::io::Write;
-        writeln!(fh, "{}", line("assistant", "req_2", "claude-sonnet-5", 10, 0, 0, 10, "2026-09-18T20:55:00Z", cwd)).unwrap();
+        writeln!(fh, "{}", line("assistant", "req_2", "claude-sonnet-5", 10, 0, 0, 10, &now_iso(), cwd)).unwrap();
         assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
 
-        // PTY scraping for that session now drops its events.
+        // PTY scraping for those sessions now drops its events.
         let engine = crate::token_engine::TokenEngine::new(Arc::clone(&db));
-        engine.scan_and_record("sess-run", 50, b"Total cost: $9.99 | Input: 1K | Output: 1K");
-        let rep = db.lock().usage_report("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00", Some("run"), 0).unwrap();
-        assert_eq!(rep.totals.calls, 2, "no PTY row added");
-        assert_eq!(db.lock().meta_get("pty_scan_seq:sess-run").unwrap().as_deref(), Some("50"));
+        engine.scan_and_record("sess-run-2", 50, b"Total cost: $9.99 | Input: 1K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 3, "no PTY row added");
+        assert_eq!(db.lock().meta_get("pty_scan_seq:sess-run-2").unwrap().as_deref(), Some("50"));
     }
 
     #[test]
-    fn ingests_a_workspace_worktree_transcript_under_the_workspace() {
+    fn a_block_that_lands_after_the_poll_updates_the_row() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/split";
+        session_on(&db.lock(), "s1", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let f = pdir.join("cc-sess.jsonl");
+        // Poll 1 sees the first block (partial usage) …
+        std::fs::write(&f, format!("{}\n", line("assistant", "req_1", "claude-sonnet-5", 10, 0, 0, 5, "2026-09-18T20:50:46Z", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        // … poll 2 sees the message's final block: same key, updated usage.
+        let mut fh = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        use std::io::Write;
+        writeln!(fh, "{}", line("assistant", "req_1", "claude-sonnet-5", 10, 0, 0, 9, "2026-09-18T20:50:47Z", cwd)).unwrap();
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 0);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 1);
+        assert_eq!(rep.totals.output_tokens, 9);
+    }
+
+    #[test]
+    fn workspace_terminal_scrapes_are_superseded_and_then_silenced() {
         let db = Arc::new(Mutex::new(test_db()));
         db.lock().insert_project("p1", "Atlas", "/tmp/atlas").unwrap();
         db.lock().insert_workspace("w1", "p1", "ws", "", "main", Some("/tmp/atlas/wt/one"), "", None).unwrap();
+        db.lock()
+            .conn_ref()
+            .execute(
+                "INSERT INTO terminals (id, workspace_id, label, position, created_at) VALUES ('term-1','w1','Terminal',0,0)",
+                [],
+            )
+            .unwrap();
+        // Before this change: the terminal's `Total cost:` line was scraped
+        // under the terminal id (now attributed to the workspace at write time).
+        let engine = crate::token_engine::TokenEngine::new(Arc::clone(&db));
+        engine.scan_and_record("term-1", 1, b"Total cost: $2.00 | Input: 10K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 1);
+        assert_eq!(rep.by_source[0].id, "w1", "terminal spend lands under its workspace");
+
+        // The transcript for that run shows up: its exact rows replace the scrape.
         let root = TempDir::new().unwrap();
         let pdir = root.path().join(project_dir_name("/tmp/atlas/wt/one"));
         std::fs::create_dir_all(&pdir).unwrap();
-        std::fs::write(pdir.join("s.jsonl"), format!("{}\n", line("assistant", "req_1", "claude-sonnet-5", 100, 0, 0, 10, "2026-09-18T20:50:46Z", "/tmp/atlas/wt/one"))).unwrap();
+        std::fs::write(
+            pdir.join("s.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line("assistant", "req_1", "claude-sonnet-5", 100, 0, 0, 10, "2000-01-02T00:00:00Z", "/tmp/atlas/wt/one"),
+                line("assistant", "req_2", "claude-sonnet-5", 100, 0, 0, 10, "2000-01-02T00:01:00Z", "/tmp/atlas/wt/one"),
+            ),
+        )
+        .unwrap();
         let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
-        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
-        let rep = db.lock().usage_report("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00", None, 0).unwrap();
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 2);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 2, "the scraped row is gone, the two exact rows remain");
+        assert_eq!(rep.by_source.len(), 1);
         assert_eq!(rep.by_source[0].id, "w1");
         assert_eq!(rep.by_source[0].kind, "workspace");
         assert_eq!(rep.by_source[0].surfaces[0].surface, "run");
+        assert!(rep.totals.cost_usd < 2.0);
+        // A later scrape from the same terminal is dropped.
+        engine.scan_and_record("term-1", 2, b"Total cost: $5.00 | Input: 10K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 2);
     }
 }

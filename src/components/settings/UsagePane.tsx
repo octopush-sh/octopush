@@ -139,9 +139,11 @@ export function UsagePane() {
   const [error, setError] = useState<string | null>(null);
   const [breakdown, setBreakdown] = useState<UsageBreakdown | null>(null);
 
-  const range = useMemo(() => periodRange(period, custom), [period, custom]);
-
+  // The range is computed on every load, never memoised: a preset ends
+  // *now*, so each 10s poll must move its end (and "today" must roll over
+  // at midnight) or new spend would never appear.
   const load = useCallback(async () => {
+    const range = periodRange(period, custom);
     try {
       const r = await ipc.getUsageReport(
         range.start,
@@ -156,7 +158,7 @@ export function UsagePane() {
     }
     // Cloud vs local is a side figure; a failure just hides it.
     ipc.getUsageBreakdown(range.start, range.end).then(setBreakdown).catch(() => {});
-  }, [range, mode]);
+  }, [period, custom, mode]);
 
   useEffect(() => {
     void load();
@@ -188,6 +190,7 @@ export function UsagePane() {
   async function handleExport() {
     setExporting(true);
     try {
+      const range = periodRange(period, custom);
       const csv = await ipc.exportTokenEventsCsv(range.start, range.end);
       const { save } = await import("@tauri-apps/plugin-dialog");
       const dateStr = range.end.slice(0, 10).replace(/-/g, "");
@@ -266,6 +269,9 @@ export function UsagePane() {
       {!report ? (
         <div className="mt-8 font-serif text-[13px] text-octo-mute">Reading the ledger…</div>
       ) : (
+        <>
+        {/* Analytics crossfade on a period/mode change; budgets and export
+            sit outside the keyed subtree so an open budget dialog survives. */}
         <div key={`${period}-${mode}`} className="octo-fade-in">
           {/* ── Pricing freshness ── */}
           {pricingStale && (
@@ -476,6 +482,8 @@ export function UsagePane() {
             </div>
           )}
 
+        </div>
+
           {/* ── Budgets ── */}
           <div className="mt-8 max-w-[860px]">
             <BudgetsSection budgets={budgets} spend={spend} onRefresh={refreshAllSpend} />
@@ -499,7 +507,7 @@ export function UsagePane() {
               </button>
             </div>
           </div>
-        </div>
+        </>
       )}
     </>
   );

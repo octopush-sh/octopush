@@ -62,10 +62,17 @@ pub const TOOL_RESULT_FRESH: usize = 6_000;
 /// of the thread (until the thread-wide budget collapses it to a stub).
 pub const TOOL_RESULT_SETTLED: usize = 1_500;
 
-/// Thread-wide cap on tool-output chars re-sent per turn. A long-lived thread
-/// with hundreds of tool rows can't grow past this no matter how generous the
-/// per-row allowances are; rows beyond it collapse to [`TOOL_HISTORY_STUB`].
+/// Thread-wide cap on the SETTLED tool-output chars re-sent per turn. A
+/// long-lived thread with hundreds of tool rows can't grow past this no
+/// matter how many rows it holds; rows beyond it collapse to
+/// [`TOOL_HISTORY_STUB`]. Counted over every row's settled size — never the
+/// fresh size — so the figure only ever grows as rows are appended, and the
+/// collapse boundary it drives only ever moves forward.
 pub const TOOL_HISTORY_TOTAL_BUDGET: usize = 80_000;
+/// Extra chars the fresh (age 0) rows may add on top of their settled size,
+/// funded newest-first. Bounds a tool-heavy turn without touching any
+/// older row's rendering.
+pub const TOOL_HISTORY_FRESH_EXTRA: usize = 40_000;
 /// Excerpt size for a tool row once the thread-wide budget is spent.
 pub const TOOL_HISTORY_STUB: usize = 200;
 /// Granularity of the budget collapse. When the thread outgrows the budget,
@@ -81,32 +88,49 @@ const TOOL_INPUT_MAX: usize = 600;
 /// chronological order; the result is one allowance per row in the same
 /// order.
 ///
-/// Every row wants its age allowance (see [`tool_result_allowance`]). When the
-/// wants exceed the thread-wide budget, the OLDEST rows collapse to the stub
-/// first — never the ones the user is most likely asking about — and the
-/// amount shed is rounded up to a whole [`TOOL_HISTORY_COLLAPSE_BLOCK`], so
-/// the boundary between stubbed and kept rows stays put for several turns
-/// at a time. The plan is a pure function of the rows, so the same thread
-/// state always renders the same prefix.
+/// The plan is monotone across turns, which is what keeps the provider's
+/// prompt cache warm:
+/// 1. Every row's baseline is its settled size. The sum of baselines only
+///    grows as rows are appended, so the block-quantized collapse of the
+///    OLDEST rows to the stub (see [`TOOL_HISTORY_COLLAPSE_BLOCK`]) only ever
+///    moves forward — a row that was stubbed stays stubbed, and a settled
+///    row is never rewritten until the boundary reaches it.
+/// 2. Fresh rows (age 0) are then raised to their fresh size, newest-first,
+///    within [`TOOL_HISTORY_FRESH_EXTRA`]; when they settle next turn they
+///    shrink once, at the tail of the prefix, where the cache loss is small.
+///
+/// A pure function of the rows, so the same thread state always renders the
+/// same prefix.
 pub fn plan_tool_history(rows: &[(usize, usize)]) -> Vec<usize> {
     let mut plan: Vec<usize> = rows
         .iter()
-        .map(|&(turns_ago, len)| len.min(tool_result_allowance(turns_ago)))
+        .map(|&(_, len)| len.min(TOOL_RESULT_SETTLED))
         .collect();
-    let total: usize = plan.iter().sum();
-    if total <= TOOL_HISTORY_TOTAL_BUDGET {
-        return plan;
-    }
-    let overflow = total - TOOL_HISTORY_TOTAL_BUDGET;
-    let target = overflow.div_ceil(TOOL_HISTORY_COLLAPSE_BLOCK) * TOOL_HISTORY_COLLAPSE_BLOCK;
-    let mut shed = 0usize;
-    for (i, &(_, len)) in rows.iter().enumerate() {
-        if shed >= target {
-            break;
+    let settled_total: usize = plan.iter().sum();
+    if settled_total > TOOL_HISTORY_TOTAL_BUDGET {
+        let overflow = settled_total - TOOL_HISTORY_TOTAL_BUDGET;
+        let target = overflow.div_ceil(TOOL_HISTORY_COLLAPSE_BLOCK) * TOOL_HISTORY_COLLAPSE_BLOCK;
+        let mut shed = 0usize;
+        for (i, &(_, len)) in rows.iter().enumerate() {
+            if shed >= target {
+                break;
+            }
+            let stub = len.min(TOOL_HISTORY_STUB);
+            shed += plan[i].saturating_sub(stub);
+            plan[i] = stub;
         }
-        let stub = len.min(TOOL_HISTORY_STUB);
-        shed += plan[i].saturating_sub(stub);
-        plan[i] = stub;
+    }
+    let mut extra = TOOL_HISTORY_FRESH_EXTRA;
+    for (i, &(turns_ago, len)) in rows.iter().enumerate().rev() {
+        if turns_ago != 0 {
+            continue;
+        }
+        let want = len.min(TOOL_RESULT_FRESH);
+        let raise = want.saturating_sub(plan[i]);
+        if raise <= extra {
+            extra -= raise;
+            plan[i] = want;
+        }
     }
     plan
 }
@@ -382,6 +406,35 @@ mod tests {
     }
 
     #[test]
+    fn plan_never_unstubs_when_a_tool_heavy_turn_settles() {
+        // 50 settled rows + a turn of 8 big tools. Next turn those 8 settle
+        // (+1 fresh). The collapse boundary is driven by settled sizes only,
+        // so it cannot move backwards: every old row renders exactly as it
+        // did — the prompt-cache prefix survives the turn.
+        let mut rows: Vec<(usize, usize)> = vec![(5, 5_000); 50];
+        rows.extend([(0, 8_000); 8]);
+        let before = plan_tool_history(&rows);
+        let mut later: Vec<(usize, usize)> = rows.iter().map(|&(a, l)| (a + 1, l)).collect();
+        later.push((0, 8_000));
+        let after = plan_tool_history(&later);
+        assert_eq!(&after[..50], &before[..50]);
+        // The settled turn shrank once, in place; the new row is fresh.
+        assert_eq!(&before[50..], &[TOOL_RESULT_FRESH; 8]);
+        assert_eq!(&after[50..58], &[TOOL_RESULT_SETTLED; 8]);
+        assert_eq!(after[58], TOOL_RESULT_FRESH);
+        // And with a boundary already past the budget, the same holds.
+        let mut big: Vec<(usize, usize)> = vec![(5, 5_000); 70];
+        big.extend([(0, 8_000); 8]);
+        let b1 = plan_tool_history(&big);
+        let mut big2: Vec<(usize, usize)> = big.iter().map(|&(a, l)| (a + 1, l)).collect();
+        big2.push((0, 8_000));
+        let b2 = plan_tool_history(&big2);
+        assert_eq!(&b2[..70], &b1[..70]);
+        let stubbed = b1.iter().take_while(|&&g| g == TOOL_HISTORY_STUB).count();
+        assert!(stubbed > 0);
+    }
+
+    #[test]
     fn plan_collapses_the_oldest_rows_in_blocks() {
         // 70 settled rows × 1.5k = 105k wants 25k over the 80k budget. The
         // collapse rounds up to two 20k blocks: the oldest rows are stubbed
@@ -402,22 +455,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_funds_newest_first_and_stubs_past_the_budget() {
-        // One turn that ran 20 big tools: 20 × 6k = 120k wants more than
-        // the 80k thread budget. The newest rows are funded in full; the
-        // oldest collapse to the stub instead of blowing the budget.
+    fn plan_funds_fresh_rows_newest_first_within_their_extra() {
+        // One turn that ran 20 big tools. Their settled sizes (20 × 1.5k)
+        // fit the thread budget, so nothing is stubbed; the fresh raise
+        // (4.5k each) is funded newest-first within the fresh allowance,
+        // and the older rows of the same turn stay at their settled size.
         let rows: Vec<(usize, usize)> = vec![(0, 6_000); 20];
         let plan = plan_tool_history(&rows);
         assert_eq!(plan.len(), 20);
-        assert_eq!(*plan.last().unwrap(), 6_000);
-        assert_eq!(plan[0], TOOL_HISTORY_STUB, "{plan:?}");
-        let full = plan.iter().filter(|&&g| g == 6_000).count();
-        assert_eq!(full, TOOL_HISTORY_TOTAL_BUDGET / 6_000, "{plan:?}");
+        assert_eq!(*plan.last().unwrap(), TOOL_RESULT_FRESH);
+        let full = plan.iter().filter(|&&g| g == TOOL_RESULT_FRESH).count();
+        assert_eq!(full, TOOL_HISTORY_FRESH_EXTRA / (TOOL_RESULT_FRESH - TOOL_RESULT_SETTLED), "{plan:?}");
+        assert!(plan[..20 - full].iter().all(|&g| g == TOOL_RESULT_SETTLED), "{plan:?}");
         let total: usize = plan.iter().sum();
-        assert!(total <= TOOL_HISTORY_TOTAL_BUDGET, "{total}");
-        // Funding is monotone: once a row is stubbed, every older row is too.
-        let first_full = plan.iter().position(|&g| g == 6_000).unwrap();
-        assert!(plan[..first_full].iter().all(|&g| g == TOOL_HISTORY_STUB));
+        assert!(total <= TOOL_HISTORY_TOTAL_BUDGET + TOOL_HISTORY_FRESH_EXTRA, "{total}");
+        // Funding is monotone: once a row is fresh, every newer row is too.
+        let first_full = plan.iter().position(|&g| g == TOOL_RESULT_FRESH).unwrap();
+        assert!(plan[first_full..].iter().all(|&g| g == TOOL_RESULT_FRESH));
     }
 
     #[test]

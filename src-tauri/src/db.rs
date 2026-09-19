@@ -1394,6 +1394,128 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Every RUN session opened on `project_root`.
+    pub fn session_ids_for_root(&self, project_root: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM sessions WHERE project_root = ?1")?;
+        let rows = stmt.query_map(params![project_root], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every terminal of a workspace (the ids the PTY hook scans under).
+    pub fn terminal_ids_for_workspace(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM terminals WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The working directory a PTY source id runs in: a RUN session's
+    /// project root, or a workspace terminal's worktree.
+    pub fn run_cwd_for_source(&self, id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT project_root FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT w.worktree_path FROM terminals t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1 AND w.worktree_path IS NOT NULL
+                 LIMIT 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The mission a workspace was on at `ts_utc`: the one whose lifetime
+    /// brackets the timestamp, else the earliest non-archived one (the same
+    /// rule the mission backfill uses), so historical spend is never stamped
+    /// with a mission that did not exist yet.
+    pub fn mission_for_workspace_at(&self, workspace_id: &str, ts_utc: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM missions
+                 WHERE workspace_id = ?1 AND created_at <= ?2
+                   AND (archived_at IS NULL OR archived_at > ?2)
+                 ORDER BY created_at DESC LIMIT 1",
+                params![workspace_id, ts_utc],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map_or_else(
+                || {
+                    self.conn
+                        .query_row(
+                            "SELECT id FROM missions WHERE workspace_id = ?1
+                             ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
+                            params![workspace_id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(Into::into)
+                },
+                |m| Ok(Some(m)),
+            )
+    }
+
+    /// Insert a keyed spend event, or bring the existing row with that key up
+    /// to date (tokens, cost, model). Returns whether the row was new. Used
+    /// by transcript ingestion, where one API message is written as several
+    /// lines that may straddle two polls — the later line carries the final
+    /// usage and must win.
+    pub fn upsert_spend_event_by_key(&self, ev: &SpendEvent) -> AppResult<bool> {
+        let Some(key) = ev.idempotency_key.as_deref() else {
+            return self.insert_spend_event_if_new(ev);
+        };
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM spend_events WHERE idempotency_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match exists {
+            None => self.insert_spend_event_if_new(ev),
+            Some(id) => {
+                self.conn.execute(
+                    "UPDATE spend_events
+                     SET model_raw = ?2, model = ?3, input_tokens = ?4, output_tokens = ?5,
+                         cache_read_tokens = ?6, cache_creation_tokens = ?7,
+                         computed_cost_usd = ?8, cost_usd = ?9
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        ev.model_raw,
+                        ev.model,
+                        ev.input_tokens,
+                        ev.output_tokens,
+                        ev.cache_read_tokens,
+                        ev.cache_creation_tokens,
+                        ev.computed_cost_usd,
+                        ev.cost_usd,
+                    ],
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Drop the screen-scraped RUN rows (`surface = 'run'`, no idempotency
+    /// key — the PTY scanner's `Total cost:` summaries) of the given sources
+    /// from `since_ts_utc` on: a transcript now meters those runs exactly,
+    /// so the scrape would count them twice. Returns rows removed.
+    pub fn delete_scraped_run_spend(&self, source_ids: &[String], since_ts_utc: &str) -> AppResult<usize> {
+        let mut n = 0usize;
+        for sid in source_ids {
+            n += self.conn.execute(
+                "DELETE FROM spend_events
+                 WHERE surface = 'run' AND idempotency_key IS NULL
+                   AND source_id = ?1 AND ts_utc >= ?2",
+                params![sid, since_ts_utc],
+            )?;
+        }
+        Ok(n)
+    }
+
     /// One reconciliation row per run for the gap between its retire-inclusive
     /// meter (`runs.cost_usd`) and the DIRECT spend already in the ledger for its
     /// stages — i.e. retired/looped attempts that predate the live-capture path.
@@ -1439,10 +1561,17 @@ impl Db {
     /// the original id (for RUN session recap / scope), while `workspace_id` /
     /// `project_id` are populated only when `session_id` names a real workspace.
     pub fn record_token_spend(&self, ev: &TokenEvent, surface: &str) -> AppResult<()> {
+        // A workspace id names the workspace; a workspace TERMINAL id (the
+        // RUN-mode PTY hook scans under it) resolves to its workspace, so
+        // terminal spend counts against workspace/project budgets and lands
+        // under the workspace's name in Usage.
         let workspace_id: Option<String> = self
             .conn
             .query_row(
-                "SELECT id FROM workspaces WHERE id = ?1",
+                "SELECT id FROM workspaces WHERE id = ?1
+                 UNION ALL
+                 SELECT workspace_id FROM terminals WHERE id = ?1
+                 LIMIT 1",
                 params![ev.session_id],
                 |r| r.get(0),
             )
@@ -1755,7 +1884,9 @@ impl Db {
                         p.name,
                         MAX(e.ts_utc),
                         {slice_cols}
-                 FROM (SELECT COALESCE(workspace_id, source_id, 'unattributed') AS k, *
+                 FROM (SELECT COALESCE(workspace_id,
+                                       (SELECT t.workspace_id FROM terminals t WHERE t.id = source_id),
+                                       source_id, 'unattributed') AS k, *
                        FROM spend_events
                        WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}) e
                  LEFT JOIN workspaces w ON w.id = e.k
@@ -1781,7 +1912,9 @@ impl Db {
                 stmt.query_map(params![start_iso, end_iso], map)?.collect::<Result<Vec<_>, _>>()?
             };
             let split_sql = format!(
-                "SELECT COALESCE(workspace_id, source_id, 'unattributed'), surface, COALESCE(SUM(cost_usd),0)
+                "SELECT COALESCE(workspace_id,
+                                 (SELECT t.workspace_id FROM terminals t WHERE t.id = source_id),
+                                 source_id, 'unattributed'), surface, COALESCE(SUM(cost_usd),0)
                  FROM spend_events
                  WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
                  GROUP BY 1, 2"

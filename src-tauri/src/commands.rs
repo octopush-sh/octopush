@@ -189,8 +189,10 @@ pub async fn get_usage_report(
     surface: Option<String>,
     utc_offset_minutes: Option<i32>,
 ) -> AppResult<crate::db::UsageReport> {
+    // Fire-and-forget: a first pass over long transcripts must not hold up
+    // the page; the next 10s poll picks up what it recorded.
     let ingestor = Arc::clone(&state.transcripts);
-    let _ = tauri::async_runtime::spawn_blocking(move || ingestor.maybe_ingest()).await;
+    tauri::async_runtime::spawn_blocking(move || ingestor.maybe_ingest());
     let surface = surface.filter(|s| !s.is_empty());
     let mut report = state.db.lock().usage_report(
         &start_iso,
