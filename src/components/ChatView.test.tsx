@@ -30,6 +30,7 @@ vi.mock("../lib/ipc", () => ({
     sendChatMessage: vi.fn().mockResolvedValue(undefined),
     listChatMessages: listChatMessagesMock,
     listProviders: vi.fn().mockResolvedValue([]),
+    getSettings: vi.fn().mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} }),
     revealInFinder: vi.fn(),
     openFileInSystem: vi.fn(),
     listBudgets: vi.fn().mockResolvedValue([]),
