@@ -131,8 +131,13 @@ pub fn is_mcp_tool(name: &str) -> bool {
     name.starts_with("mcp__")
 }
 
+/// The server process, behind its own lock so it can be killed while a
+/// request holds the connection lock (a hung `read_line` inside `request`
+/// would otherwise keep the process alive for as long as the server likes).
+type ChildHandle = Arc<Mutex<Child>>;
+
 struct Connection {
-    child: Child,
+    child: ChildHandle,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: i64,
@@ -191,51 +196,141 @@ impl Connection {
     }
 }
 
+/// Kill AND reap a server process — std's Child doesn't wait on drop, so
+/// without the wait a killed server lingers as a zombie. The server is
+/// spawned in its own process group, and the whole group is killed: a
+/// wrapper (`npx`, a shell) hands its stdout pipe to the real server, and
+/// killing only the wrapper would leave that pipe open — and our reader
+/// blocked — for as long as the grandchild lives.
+fn kill_and_reap(child: &ChildHandle) {
+    let mut c = child.lock();
+    #[cfg(unix)]
+    {
+        let pgid = c.id() as libc::pid_t;
+        if pgid > 0 {
+            // SAFETY: plain syscall on a pid we own; a stale pid is harmless
+            // (ESRCH) because we reap right after.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Kill AND reap — std's Child doesn't wait on drop, so without this the
-        // killed server lingers as a zombie process.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_and_reap(&self.child);
     }
 }
 
 /// Holds live connections to MCP servers, keyed by server name.
 pub struct McpRegistry {
     conns: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+    /// The process behind each live connection, reachable without the
+    /// connection lock — what `abort_server` kills.
+    children: Mutex<HashMap<String, ChildHandle>>,
+    /// One lock per server around spawn + handshake, so two callers racing to
+    /// a not-yet-connected server spawn it once, not twice.
+    connecting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Servers that failed to start this session — skipped on subsequent turns
     /// so a broken config doesn't re-spawn a failing process every turn.
     failed: Mutex<std::collections::HashSet<String>>,
+}
+
+/// How long one MCP `tools/call` may take on the wire before the caller
+/// gives up and stops the server (`call_bounded`).
+pub const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The server a namespaced tool name belongs to.
+pub fn server_of(namespaced: &str) -> Option<String> {
+    parse_namespaced(namespaced).map(|(s, _)| s)
+}
+
+/// `registry.call(...)` off the async runtime, bounded by `bound`. On a
+/// timeout the server process is **stopped** (`abort_server`), so a call
+/// reported as timed out can never complete later in the background — the
+/// blocked worker gets EOF and returns, and the next call re-spawns the
+/// server. The error says so, and warns that a request the server had
+/// already sent (a write to a tracker) may still have landed.
+pub async fn call_bounded(
+    registry: Arc<McpRegistry>,
+    worktree: std::path::PathBuf,
+    namespaced: String,
+    input: Value,
+    bound: std::time::Duration,
+) -> Result<String, String> {
+    let reg = Arc::clone(&registry);
+    let name = namespaced.clone();
+    match tokio::time::timeout(bound, tokio::task::spawn_blocking(move || reg.call(&worktree, &name, &input))).await {
+        Ok(Ok(Ok(out))) => Ok(out),
+        Ok(Ok(Err(e))) => Err(format!("MCP error: {e}")),
+        Ok(Err(e)) => Err(format!("MCP error: call task failed: {e}")),
+        Err(_) => {
+            if let Some(server) = server_of(&namespaced) {
+                registry.abort_server(&server);
+            }
+            Err(format!(
+                "MCP error: `{namespaced}` timed out after {}s. The server was stopped, so this call \
+                 cannot complete later; if it had already sent its request, the change may exist — \
+                 check before retrying.",
+                bound.as_secs()
+            ))
+        }
+    }
 }
 
 impl McpRegistry {
     pub fn new() -> Self {
         Self {
             conns: Mutex::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
+            connecting: Mutex::new(HashMap::new()),
             failed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     /// Drop a server's cached connection (e.g. after it errored) so the next
-    /// use re-spawns it.
+    /// use re-spawns it. The process itself is killed when the last holder
+    /// of the connection lets go (`Connection::drop`).
     fn evict(&self, name: &str) {
         self.conns.lock().remove(name);
+        self.children.lock().remove(name);
+    }
+
+    /// Stop a server now — kill its process and forget the connection — even
+    /// while a request on it is blocked reading. That reader gets EOF and
+    /// returns an error; the next call re-spawns the server.
+    pub fn abort_server(&self, name: &str) {
+        let child = self.children.lock().remove(name);
+        self.conns.lock().remove(name);
+        if let Some(child) = child {
+            tracing::warn!(server = %name, "stopping MCP server after a timed-out call");
+            kill_and_reap(&child);
+        }
     }
 
     /// Spawn a server, run the MCP initialize handshake, and fetch its tools.
     fn connect(name: &str, cfg: &McpServerConfig) -> Result<Connection, String> {
-        let mut child = Command::new(&cfg.command)
-            .args(&cfg.args)
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args)
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", cfg.command))?;
+            .stderr(Stdio::null());
+        // Own process group, so an abort can take the wrapper AND the
+        // server it spawned (see `kill_and_reap`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", cfg.command))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let mut conn = Connection {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
@@ -294,8 +389,17 @@ impl McpRegistry {
         Ok(conn.tools.clone())
     }
 
-    /// Lazily connect (and cache) a server's connection.
+    /// Lazily connect (and cache) a server's connection. Spawn + handshake
+    /// run under a per-server lock: concurrent first callers (a sub-agent
+    /// fan-out) wait for one connection instead of each spawning their own.
     fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<Arc<Mutex<Connection>>, String> {
+        if let Some(c) = self.conns.lock().get(name) {
+            return Ok(Arc::clone(c));
+        }
+        let spawn_lock = Arc::clone(
+            self.connecting.lock().entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))),
+        );
+        let _spawning = spawn_lock.lock();
         if let Some(c) = self.conns.lock().get(name) {
             return Ok(Arc::clone(c));
         }
@@ -304,8 +408,10 @@ impl McpRegistry {
         }
         match Self::connect(name, cfg) {
             Ok(conn) => {
+                let child = Arc::clone(&conn.child);
                 let arc = Arc::new(Mutex::new(conn));
                 self.conns.lock().insert(name.to_string(), Arc::clone(&arc));
+                self.children.lock().insert(name.to_string(), child);
                 Ok(arc)
             }
             Err(e) => {
@@ -450,6 +556,110 @@ done
         assert_eq!(out, "pong");
     }
 
+    // A fixture that answers the handshake but never answers `tools/call`
+    // (it sleeps), and appends a line to `$SPAWN_LOG` each time it starts.
+    const HANGING_FIXTURE: &str = r#"#!/usr/bin/env bash
+echo start >> "$SPAWN_LOG"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hang","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"slow","description":"never answers","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      sleep 30 ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    fn hanging_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hang.sh");
+        std::fs::write(&script, HANGING_FIXTURE).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.path().join("spawns.log");
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"hang":{{"command":"bash","args":[{:?}],"env":{{"SPAWN_LOG":{:?}}}}}}}}}"#,
+                script.to_string_lossy(),
+                log.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        (dir, log)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_server_unblocks_a_hung_call_and_the_next_call_respawns() {
+        let (dir, log) = hanging_worktree();
+        let reg = Arc::new(McpRegistry::new());
+        let tools = reg.list_tools(dir.path());
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].read_only, "readOnlyHint is parsed");
+        // A call that the server never answers, on its own thread.
+        let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
+        let worker = std::thread::spawn(move || r2.call(&wt, "mcp__hang__slow", &json!({})));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!worker.is_finished(), "the call is blocked on the server");
+        let started = std::time::Instant::now();
+        reg.abort_server("hang");
+        let res = worker.join().unwrap();
+        assert!(res.is_err(), "the blocked call returns once the server is stopped: {res:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The next use re-spawns the server (a second start line) and works.
+        assert_eq!(reg.list_tools(dir.path()).len(), 1);
+        let starts = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(starts, 2, "one spawn before the abort, one after");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_bounded_times_out_stops_the_server_and_says_so() {
+        let (dir, log) = hanging_worktree();
+        let reg = Arc::new(McpRegistry::new());
+        let err = call_bounded(
+            Arc::clone(&reg),
+            dir.path().to_path_buf(),
+            "mcp__hang__slow".into(),
+            json!({}),
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out") && err.contains("server was stopped"), "{err}");
+        // Stopped: the connection is gone and the process was reaped; a
+        // later discovery spawns a fresh one.
+        assert!(reg.conns.lock().is_empty() && reg.children.lock().is_empty());
+        let wt = dir.path().to_path_buf();
+        let tools = tokio::task::spawn_blocking(move || reg.list_tools(&wt)).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_callers_spawn_a_server_once() {
+        let (dir, log) = hanging_worktree();
+        let reg = Arc::new(McpRegistry::new());
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let (r, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
+                std::thread::spawn(move || r.list_tools(&wt).len())
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 1);
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1, "one process for four callers");
+    }
+
     #[test]
     fn namespacing_roundtrips() {
         assert_eq!(namespaced_name("github", "create_issue"), "mcp__github__create_issue");
@@ -460,5 +670,7 @@ done
         assert!(is_mcp_tool("mcp__x__y"));
         assert!(!is_mcp_tool("read_file"));
         assert!(parse_namespaced("read_file").is_none());
+        assert_eq!(server_of("mcp__github__create_issue").as_deref(), Some("github"));
+        assert_eq!(server_of("read_file"), None);
     }
 }
