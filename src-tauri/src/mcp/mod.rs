@@ -155,20 +155,33 @@ impl Connection {
         self.next_id += 1;
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.write_message(&req)?;
+        // Non-JSON stdout lines collected for diagnostics (bridge tools like
+        // mcp-remote print auth URLs and status to stdout before the handshake).
+        let mut stdout_lines: Vec<String> = Vec::new();
         loop {
             let mut buf = String::new();
             let n = self.reader.read_line(&mut buf).map_err(|e| e.to_string())?;
             if n == 0 {
-                let log = self.stderr_log.lock();
-                let detail = log.trim();
-                return Err(if detail.is_empty() {
-                    "MCP server closed the connection".into()
-                } else {
-                    format!("MCP server closed the connection\nstderr: {detail}")
-                });
+                let stderr = self.stderr_log.lock();
+                let stderr = stderr.trim();
+                let stdout = stdout_lines.join("\n");
+                let stdout = stdout.trim();
+                let mut parts: Vec<&str> = vec!["MCP server closed the connection"];
+                if !stdout.is_empty() {
+                    parts.push(stdout);
+                }
+                if !stderr.is_empty() {
+                    parts.push(stderr);
+                }
+                return Err(parts.join("\n"));
             }
             let Ok(msg) = serde_json::from_str::<Value>(buf.trim()) else {
-                continue; // ignore non-JSON lines (some servers log to stdout)
+                // Collect non-JSON lines (bridge tools may print auth/status here).
+                let line = buf.trim().to_string();
+                if !line.is_empty() && stdout_lines.len() < 20 {
+                    stdout_lines.push(line);
+                }
+                continue;
             };
             if msg.get("id").and_then(|v| v.as_i64()) == Some(id) {
                 if let Some(err) = msg.get("error") {
