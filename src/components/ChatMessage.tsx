@@ -61,12 +61,17 @@ export function ChatMessage({ message, onOpenInEditor }: Props) {
   }
 
   if (role === "user") {
+    // Shown exactly as written: `whitespace-pre-wrap` keeps the line breaks,
+    // indentation and typed bullets the Composer let the user enter (⇧↵),
+    // and `break-words` wraps an unbroken token (a digest, a long URL) instead
+    // of overflowing. Deliberately NOT Markdown — a pasted log, stack trace or
+    // snippet must not lose its `#`, `*`, `<tags>` or indented lines.
     return (
       <div data-role="user" className="octo-selectable flex flex-col gap-1.5">
         <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
           — You
         </div>
-        <div className="text-[14px] leading-[1.55] text-octo-ivory">
+        <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">
           {content}
         </div>
       </div>
