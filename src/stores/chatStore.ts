@@ -28,6 +28,11 @@ export interface AgentMeta {
   closedAtCap: boolean;
   blocked: boolean;
   model: string;
+  /** The tier `model` is mapped to (`fast` / `balanced` / `strong`), if any. */
+  tier?: string | null;
+  /** The cheaper model a failed first attempt ran on, when the definition's
+   *  `escalate` retried this sub-agent on `model`. */
+  escalatedFrom?: string | null;
   inputTokens: number;
   outputTokens: number;
   costUsd: number;

@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
 import type { ModelInfo, ProviderConfig } from "../lib/types";
+import { AUTO_MODEL } from "../lib/policy";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
 const RECENTS_KEY = "octopush.modelPicker.recents";
@@ -62,14 +63,24 @@ interface Props {
   /** When provided, only show models from these provider names. Used by
    *  PipelineSetup to restrict CLI-substrate stages to Anthropic models. */
   allowedProviders?: string[];
+  /** Offer **Auto** (the economy director) above the models: the strong tier
+   *  decides, tiered sub-agents do the legwork. Talk's composer only. */
+  autoOption?: boolean;
 }
 
 export function ModelPicker({
   activeModel,
   onSelectModel,
   allowedProviders,
+  autoOption = false,
 }: Props) {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
+  // The tier map, for the Auto row's "runs on <strong model>" line.
+  const [tiers, setTiers] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!autoOption) return;
+    ipc.getSettings().then((s) => setTiers(s.modelTiers ?? {})).catch(() => {});
+  }, [autoOption]);
   const [open, setOpen] = useState(false);
   const [recents, setRecents] = useState<string[]>(() => loadRecents());
   const containerRef = useRef<HTMLDivElement>(null);
@@ -223,8 +234,17 @@ export function ModelPicker({
     return () => document.removeEventListener("keydown", handleKey);
   }, [open]);
 
+  const strongName = (() => {
+    const id = tiers.strong;
+    if (!id) return null;
+    return modelIndex.get(id)?.model.displayName || id;
+  })();
+
   // Find active model display name + provider
   const activeInfo = (() => {
+    if (autoOption && activeModel === AUTO_MODEL) {
+      return { displayName: strongName ? `Auto · ${strongName}` : "Auto", providerName: "" };
+    }
     for (const p of providers) {
       for (const m of p.models) {
         if (m.id === activeModel) {
@@ -235,9 +255,12 @@ export function ModelPicker({
     return { displayName: activeModel || "Select model", providerName: "" };
   })();
 
-  const dotColor = activeInfo.providerName
-    ? providerColor(activeInfo.providerName)
-    : "var(--color-octo-mute)";
+  const isAuto = autoOption && activeModel === AUTO_MODEL;
+  const dotColor = isAuto
+    ? "var(--color-octo-brass)"
+    : activeInfo.providerName
+      ? providerColor(activeInfo.providerName)
+      : "var(--color-octo-mute)";
 
   return (
     <div ref={containerRef} className="relative flex items-center gap-2">
@@ -321,6 +344,41 @@ export function ModelPicker({
                     Local only
                   </button>
                 </div>
+
+                {/* Auto — the economy director. Pinned above everything: the
+                    policy is the default a cost-conscious Talk should start
+                    from, and the models below are the per-message overrides. */}
+                {autoOption && (
+                  <>
+                    <button
+                      role="option"
+                      aria-selected={isAuto}
+                      data-testid="model-picker-auto"
+                      onClick={() => handleSelect(AUTO_MODEL)}
+                      className={clsx(
+                        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
+                        isAuto
+                          ? "border-l-2 bg-octo-brass/8 text-octo-brass"
+                          : "border-l-2 border-transparent text-octo-ivory hover:bg-octo-onyx/60",
+                      )}
+                      style={isAuto ? { borderLeftColor: "var(--color-octo-brass)" } : undefined}
+                    >
+                      <span className="flex w-full items-center gap-2">
+                        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: "var(--color-octo-brass)" }} />
+                        <span className="min-w-0 flex-1 truncate text-[12px]">Auto</span>
+                        <span className="shrink-0 font-mono text-[9px] text-octo-mute">
+                          {strongName ? `director on ${strongName}` : "strong tier not mapped"}
+                        </span>
+                      </span>
+                      <span className="pl-3.5 font-serif text-[10px] leading-snug text-octo-sage">
+                        {strongName
+                          ? "The strong model decides with a lean context; tiered sub-agents do the reading, testing and reviewing."
+                          : "Map the strong tier in Settings › Models to run the economy director."}
+                      </span>
+                    </button>
+                    <div className="mx-3 my-1.5 h-px bg-octo-hairline" />
+                  </>
+                )}
 
                 {/* Recommended — intent-based picks. Three rows max, each
                     prefaced by the intent (serif) and showing the

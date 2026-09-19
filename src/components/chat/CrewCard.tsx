@@ -17,6 +17,7 @@ import { lastActivity } from "../../lib/liveLine";
 import { formatDuration } from "../../lib/duration";
 import { fmtTokens } from "../../lib/stageMeta";
 import { prefersReducedMotion } from "../../lib/motion";
+import { formatTierMix, tierMix } from "../../lib/policy";
 import { StageDots } from "../direct/StageDots";
 import { Reveal } from "../primitives/Reveal";
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -93,8 +94,11 @@ export function beaconCallId(agents: CrewAgent[]): string | null {
   return best?.callId ?? null;
 }
 
-/** `2 running · 3 done · 1 failed · 61k tokens · $0.42` — only the parts that
- *  apply. Tokens/cost come from resolved meta, so a live crew shows counts. */
+/** `2 running · 3 done · 1 failed · 61k tokens · $0.42 · 72% fast · 28% strong`
+ *  — only the parts that apply. Tokens/cost come from resolved meta, so a
+ *  live crew shows counts. The tier mix is the share of the crew's tokens
+ *  per tier (the economy director's receipt: how much of the work ran
+ *  cheap), shown once at least one row's model maps to a tier. */
 export function crewSummary(agents: CrewAgent[]): string {
   const running = agents.filter((a) => a.status === "running").length;
   const done = agents.filter((a) => a.status === "done").length;
@@ -107,6 +111,10 @@ export function crewSummary(agents: CrewAgent[]): string {
   const cost = agents.reduce((n, a) => n + (a.meta?.costUsd ?? 0), 0);
   if (tokens > 0) parts.push(`${fmtTokens(tokens)} tokens`);
   if (cost > 0) parts.push(`$${cost.toFixed(2)}`);
+  const mix = tierMix(
+    agents.map((a) => ({ tier: a.meta?.tier ?? null, tokens: a.meta ? a.meta.inputTokens + a.meta.outputTokens : 0 })),
+  );
+  if (mix.some(([t]) => t !== "other")) parts.push(formatTierMix(mix));
   return parts.join(" · ");
 }
 
@@ -220,6 +228,7 @@ function CrewRow({
   const tokens = agent.meta ? agent.meta.inputTokens + agent.meta.outputTokens : 0;
   const ending =
     agent.meta?.closedAtCap ? "turn limit" : agent.meta?.blocked ? "needs a decision" : null;
+  const escalatedFrom = agent.meta?.escalatedFrom ?? null;
 
   return (
     <div
@@ -265,6 +274,14 @@ function CrewRow({
           {ending && (
             <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-warning">
               {ending}
+            </span>
+          )}
+          {escalatedFrom && (
+            <span
+              className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-brass"
+              title={`First attempt on ${escalatedFrom} did not finish; retried on ${agent.meta?.model ?? agent.model ?? "a stronger model"}`}
+            >
+              escalated
             </span>
           )}
         </button>

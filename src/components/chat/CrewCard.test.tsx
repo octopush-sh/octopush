@@ -74,6 +74,33 @@ describe("CrewCard — projections", () => {
     const done = crewAgentsFromTools([resolved(1, "a"), resolved(2, "b")]);
     expect(crewSummary(done)).toBe("2 done · 3.0k tokens · $0.50");
   });
+
+  it("appends the tier mix once a row's model maps to a tier", () => {
+    // 3 fast rows × 1.5k tokens + 1 strong row × 1.5k → 75% fast · 25% strong.
+    const crew = crewAgentsFromTools([
+      resolved(1, "a", true, { tier: "fast" }),
+      resolved(2, "b", true, { tier: "fast" }),
+      resolved(3, "c", true, { tier: "fast" }),
+      resolved(4, "d", true, { tier: "strong", model: "strong-1" }),
+    ]);
+    expect(crewSummary(crew)).toBe("4 done · 6.0k tokens · $1.00 · 75% fast · 25% strong");
+    // Unmapped models never invent a tier line.
+    expect(crewSummary(crewAgentsFromTools([resolved(1, "a")]))).toBe("1 done · 1.5k tokens · $0.25");
+  });
+});
+
+describe("CrewCard — escalation", () => {
+  it("marks a row whose first attempt was retried on a stronger model", () => {
+    render(
+      <CrewCard
+        workspaceId="ws"
+        agents={crewAgentsFromTools([resolved(1, "a", true, { model: "strong-1", tier: "strong", escalatedFrom: "fast-1" })])}
+      />,
+    );
+    const tag = screen.getByText("escalated");
+    expect(tag).toHaveAttribute("title", expect.stringContaining("fast-1"));
+    expect(tag).toHaveAttribute("title", expect.stringContaining("strong-1"));
+  });
 });
 
 describe("CrewCard — rendering", () => {

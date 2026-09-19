@@ -20,6 +20,7 @@
 //! `key: value` lines) so we don't pull in a YAML dependency.
 
 pub mod agents;
+pub mod builtin_agents;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};

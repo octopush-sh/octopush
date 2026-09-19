@@ -13,9 +13,15 @@
 //! You are a security reviewer. …(the sub-agent's system prompt)…
 //! ```
 //!
-//! Discovered from two roots, project shadowing user on a name clash:
+//! Discovered from two roots plus the built-in library, project shadowing
+//! user shadowing built-in on a name clash:
 //!   - `<worktree>/.claude/agents/*.md`  (project)
 //!   - `~/.claude/agents/*.md`           (user)
+//!   - `skills::builtin_agents`          (builtin — explorer, implementer, …)
+//!
+//! One extra frontmatter key Claude Code does not read: `escalate: <tier or
+//! model>` — retry once on that model when the report comes back failed,
+//! blocked, or cut off at the turn limit.
 //!
 //! When an `Agent` call's `subagent_type` names one of these, the sub-agent
 //! runs under the definition's body (appended to the generic sub-agent
@@ -40,7 +46,10 @@ pub struct AgentDefinition {
     /// The frontmatter `model` as written (an id, or an alias like `haiku`);
     /// resolved against the configured models at run time.
     pub model: Option<String>,
-    /// "project" or "user".
+    /// The frontmatter `escalate` (a tier or an id): the model to retry on,
+    /// once, when the first attempt fails, blocks, or hits its turn cap.
+    pub escalate: Option<String>,
+    /// "project", "user" or "builtin".
     pub source: String,
 }
 
@@ -53,6 +62,7 @@ pub struct AgentDefinitionMeta {
     pub source: String,
     pub tools: Option<Vec<String>>,
     pub model: Option<String>,
+    pub escalate: Option<String>,
 }
 
 impl AgentDefinition {
@@ -63,6 +73,7 @@ impl AgentDefinition {
             source: self.source.clone(),
             tools: self.tools.clone(),
             model: self.model.clone(),
+            escalate: self.escalate.clone(),
         }
     }
 }
@@ -118,6 +129,19 @@ pub fn tier_for_alias(spec: &str) -> Option<&'static str> {
     }
 }
 
+/// The tier a configured model id is mapped to in Settings › Models, if any
+/// (`strong` when the id is the strong tier's model, …). The reverse of the
+/// tier map, for the crew card's tier mix and the all-strong baseline.
+pub fn tier_of_model<'a>(
+    model: &str,
+    tiers: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    MODEL_TIERS
+        .iter()
+        .find(|t| tiers.get(**t).is_some_and(|m| m == model))
+        .and_then(|t| tiers.get_key_value(*t).map(|(k, _)| k.as_str()))
+}
+
 /// Resolve a `model` spec against the configured model ids, with no tier
 /// mapping — see [`resolve_model_with_tiers`].
 pub fn resolve_model<'a>(spec: &str, known: &'a [String]) -> Option<&'a str> {
@@ -164,6 +188,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     let mut description = String::new();
     let mut tools: Option<Vec<String>> = None;
     let mut model: Option<String> = None;
+    let mut escalate: Option<String> = None;
     for (key, value) in pairs {
         match key.as_str() {
             "name" => name = value,
@@ -186,13 +211,18 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
                     model = Some(value);
                 }
             }
+            "escalate" | "escalate_to" | "escalate-to" => {
+                if !value.is_empty() {
+                    escalate = Some(value);
+                }
+            }
             _ => {}
         }
     }
     if name.is_empty() {
         return None;
     }
-    Some(AgentDefinition { name, description, body, tools, model, source: source.to_string() })
+    Some(AgentDefinition { name, description, body, tools, model, escalate, source: source.to_string() })
 }
 
 fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -203,9 +233,22 @@ fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
     roots
 }
 
-/// Discover every agent definition for a worktree (project ∪ user), project
-/// shadowing user on a name clash, sorted by name.
+/// Discover every agent definition for a worktree (project ∪ user ∪
+/// builtin), project shadowing user shadowing builtin on a name clash,
+/// sorted by name.
 pub fn scan_agent_definitions(worktree: &Path) -> Vec<AgentDefinition> {
+    let mut out = scan_agent_files(worktree);
+    for def in super::builtin_agents::builtin_agent_definitions() {
+        if !out.iter().any(|d| d.name.eq_ignore_ascii_case(&def.name)) {
+            out.push(def);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The on-disk definitions only (project ∪ user), project shadowing user.
+fn scan_agent_files(worktree: &Path) -> Vec<AgentDefinition> {
     let mut out: Vec<AgentDefinition> = Vec::new();
     for (root, source) in agent_roots(worktree) {
         let Ok(entries) = std::fs::read_dir(&root) else { continue };
@@ -225,7 +268,6 @@ pub fn scan_agent_definitions(worktree: &Path) -> Vec<AgentDefinition> {
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -255,6 +297,9 @@ mod tests {
             Some(&["read_file".to_string(), "grep".into(), "glob".into(), "run_command".into()][..])
         );
         assert_eq!(d.model.as_deref(), Some("haiku"));
+        assert_eq!(d.escalate, None);
+        let e = parse_agent_definition("---\nname: impl\nmodel: balanced\nescalate: strong\n---\nbody", "project").unwrap();
+        assert_eq!(e.escalate.as_deref(), Some("strong"));
         // A `---` rule inside the body is body, not a fence.
         assert_eq!(d.body, "You hunt for injection and auth bugs.\n\n---\nStill body.");
         assert_eq!(d.source, "project");
@@ -344,5 +389,36 @@ mod tests {
         assert_eq!(find_agent_definition(&defs, "zeta").map(|d| d.body.as_str()), Some("z body"));
         assert_eq!(find_agent_definition(&defs, "alpha").map(|d| d.source.as_str()), Some("project"));
         assert!(find_agent_definition(&defs, "nope").is_none());
+        // The built-in library rides along …
+        assert_eq!(find_agent_definition(&defs, "explorer").map(|d| d.source.as_str()), Some("builtin"));
+        assert_eq!(find_agent_definition(&defs, "reviewer").and_then(|d| d.model.as_deref()), Some("strong"));
+    }
+
+    #[test]
+    fn a_project_file_shadows_a_builtin_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude/agents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("reviewer.md"), "---\nname: Reviewer\ndescription: ours\nmodel: fast\n---\nour body").unwrap();
+        let defs = scan_agent_definitions(tmp.path());
+        let ours: Vec<&AgentDefinition> = defs.iter().filter(|d| d.name.eq_ignore_ascii_case("reviewer")).collect();
+        assert_eq!(ours.len(), 1, "{:?}", defs.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert_eq!(ours[0].source, "project");
+        assert_eq!(ours[0].model.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn tier_of_model_is_the_reverse_of_the_tier_map() {
+        use std::collections::HashMap;
+        let tiers: HashMap<String, String> = [
+            ("fast".to_string(), "gpt-4o-mini".to_string()),
+            ("strong".to_string(), "claude-opus-5".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(tier_of_model("claude-opus-5", &tiers), Some("strong"));
+        assert_eq!(tier_of_model("gpt-4o-mini", &tiers), Some("fast"));
+        assert_eq!(tier_of_model("deepseek-chat", &tiers), None);
+        assert_eq!(tier_of_model("claude-opus-5", &HashMap::new()), None);
     }
 }
