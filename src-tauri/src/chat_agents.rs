@@ -336,6 +336,11 @@ pub fn pick_subagent_model(
     ];
     for (origin, wanted) in candidates {
         let Some(wanted) = wanted else { continue };
+        // An explicit `inherit` means the conversation's model — under Auto
+        // that is the director, not the balanced fallback.
+        if wanted.trim().eq_ignore_ascii_case("inherit") {
+            return spec.default_model.clone();
+        }
         if let Some(resolved) = resolve_model_with_tiers(wanted, known_models, tiers) {
             return resolved.to_string();
         }
@@ -372,8 +377,36 @@ pub fn director_model_for_auto(known_models: &[String], tiers: &HashMap<String, 
         .map(str::to_string)
 }
 
+/// The tiers (`fast`, `balanced`) that are not mapped to a configured model
+/// — the doctrine names them so the director knows those roles will not run
+/// cheap until Settings › Models maps them.
+pub fn unmapped_subagent_tiers(known_models: &[String], tiers: &HashMap<String, String>) -> Vec<&'static str> {
+    ["fast", "balanced"]
+        .into_iter()
+        .filter(|t| !tiers.get(*t).is_some_and(|m| known_models.iter().any(|k| k == m)))
+        .collect()
+}
+
 /// The lean-context doctrine appended to the Talk system prompt under Auto.
-pub fn director_doctrine() -> &'static str {
+/// `unmapped` is [`unmapped_subagent_tiers`]: the doctrine promises tiered
+/// delegation only where the tiers exist.
+pub fn director_doctrine(unmapped: &[&str]) -> String {
+    let mut text = DOCTRINE.to_string();
+    if !unmapped.is_empty() {
+        text.push_str(&format!(
+            " Caveat: the {} {} not mapped in Settings › Models yet, so sub-agents asking for \
+             {} run on the conversation's model at its price until the user maps {} — say so \
+             when it matters.",
+            unmapped.join(" and "),
+            if unmapped.len() == 1 { "tier is" } else { "tiers are" },
+            if unmapped.len() == 1 { "it" } else { "them" },
+            if unmapped.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    text
+}
+
+const DOCTRINE: &str =
     "\n\n# Economy director\nYou run on the strongest, most expensive model, and every \
      tool call re-sends your whole context at that price. Keep your context lean and spend \
      it on judgment. Delegate every broad read to sub-agents with the Agent tool — mapping \
@@ -387,13 +420,24 @@ pub fn director_doctrine() -> &'static str {
      `reviewer` runs strong in a fresh context — that review is the quality gate before \
      any PR, so always run it. A sub-agent you give no type or model runs balanced. Do \
      small, sequential edits yourself; decide architecture, trade-offs and what the user \
-     is really asking yourself — that is what your context is for."
-}
+     is really asking yourself — that is what your context is for.";
 
 /// Whether a sub-agent's first attempt warrants the definition's `escalate`
-/// retry: it failed, blocked on a question, or was cut off at its turn cap.
+/// retry: only a **failure** — no usable report. A report that merely hit
+/// the turn cap is still a report (and for a writing role the tree already
+/// holds its work); a `blocked` stop is a question for the director, which
+/// a stronger model cannot answer either — it goes back up as-is.
 pub fn should_escalate(outcome: &AgentOutcome) -> bool {
-    !outcome.ok || outcome.blocked || outcome.closed_at_cap
+    !outcome.ok && !outcome.blocked
+}
+
+/// Whether a sub-agent can change the workspace: its definition grants a
+/// write/edit tool or the shell, or it has the full set.
+pub fn spec_can_write(spec: &SubagentSpec) -> bool {
+    match spec.definition.as_ref().and_then(|d| d.tools.as_deref()) {
+        None => true,
+        Some(tools) => tools.iter().any(|t| t == "write_file" || t == "edit_file" || t == "run_command"),
+    }
 }
 
 /// The model to retry on when [`should_escalate`]: the definition's
@@ -414,7 +458,7 @@ pub fn escalation_model(
 /// The prompt the escalated attempt runs with: the original task plus what
 /// the cheaper attempt ended with, so the stronger model does not repeat the
 /// same dead end. Bounded so a runaway first report cannot bloat the retry.
-pub fn escalation_prompt(original: &str, first_model: &str, first_report: &str) -> String {
+pub fn escalation_prompt(original: &str, first_model: &str, first_report: &str, can_write: bool) -> String {
     const REPORT_MAX: usize = 4_000;
     let mut excerpt = first_report.trim().to_string();
     if excerpt.len() > REPORT_MAX {
@@ -425,11 +469,33 @@ pub fn escalation_prompt(original: &str, first_model: &str, first_report: &str) 
         excerpt.truncate(end);
         excerpt.push_str("\n… [truncated]");
     }
+    let tree = if can_write {
+        " The working tree may already contain that attempt's partial changes: run `git status` \
+         and `git diff` first, then build on them or revert them deliberately — never apply the \
+         same edit twice."
+    } else {
+        ""
+    };
     format!(
         "{original}\n\n---\nA previous attempt on a cheaper model ({first_model}) did not \
-         finish this task. It ended with:\n\n{excerpt}\n\nStart fresh from the task above; \
-         do not trust the previous attempt's conclusions without checking them."
+         finish this task. It ended with:\n\n{excerpt}\n\nStart from the task above; do not \
+         trust the previous attempt's conclusions without checking them.{tree}"
     )
+}
+
+/// The tier an outcome reports: the tier the call or definition asked for
+/// when the model is indeed that tier's model (two tiers may map to one id,
+/// and the asked-for one is the truthful label), else the reverse lookup.
+pub fn tier_for_outcome(spec: &SubagentSpec, model: &str, tiers: &HashMap<String, String>) -> Option<String> {
+    let asked = [spec.call.model.as_deref(), spec.definition.as_ref().and_then(|d| d.model.as_deref())];
+    for a in asked.into_iter().flatten() {
+        if let Some(t) = crate::skills::agents::tier_for_alias(a) {
+            if tiers.get(t).is_some_and(|m| m == model) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    crate::skills::agents::tier_of_model(model, tiers).map(str::to_string)
 }
 
 /// Fold an escalated attempt into one outcome: the stronger attempt's
@@ -680,12 +746,12 @@ pub async fn run_subagents(
                         if outcome.blocked { "stopped on a question" } else if outcome.closed_at_cap { "hit its turn limit" } else { "failed" }
                     ));
                     let mut retry = spec.clone();
-                    retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report);
+                    retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(&spec));
                     let second = run_attempt(&stronger, &retry, &client, &cancel, &sink, &approval_gate, std::time::Instant::now()).await;
                     outcome = merge_escalated(outcome, second);
                 }
             }
-            outcome.tier = crate::skills::agents::tier_of_model(&outcome.model, &tiers).map(str::to_string);
+            outcome.tier = tier_for_outcome(&spec, &outcome.model, &tiers);
             (spec.call_id, outcome)
         });
     }
@@ -924,7 +990,23 @@ mod tests {
         let mut stale: HashMap<String, String> = tiers.clone();
         stale.insert("strong".into(), "gone-model".into());
         assert_eq!(director_model_for_auto(&known, &stale), None, "a mapped id that is no longer configured");
-        assert!(director_doctrine().contains("Delegate every broad read"));
+        // A definition's explicit `inherit` means the director, not balanced.
+        let inherit = SubagentSpec { definition: Some(def("mine", None, Some("inherit"))), ..base.clone() };
+        assert_eq!(pick_subagent_model(&inherit, &known, &tiers), "opus");
+        // The doctrine promises tiers only where they exist.
+        assert!(unmapped_subagent_tiers(&known, &tiers).is_empty());
+        let d = director_doctrine(&[]);
+        assert!(d.contains("Delegate every broad read") && !d.contains("Caveat"));
+        assert_eq!(unmapped_subagent_tiers(&known, &no_balanced), vec!["balanced"]);
+        assert!(director_doctrine(&["balanced"]).contains("the balanced tier is not mapped"));
+        assert!(director_doctrine(&["fast", "balanced"]).contains("the fast and balanced tiers are not mapped"));
+        // The reported tier is the one asked for when two tiers share a model.
+        let mut shared = tiers.clone();
+        shared.insert("balanced".into(), "opus".into());
+        let asked_strong = SubagentSpec { definition: Some(def("reviewer", None, Some("strong"))), ..base.clone() };
+        assert_eq!(tier_for_outcome(&asked_strong, "opus", &shared).as_deref(), Some("strong"));
+        assert_eq!(tier_for_outcome(&base, "opus", &shared).as_deref(), Some("balanced"), "reverse lookup, first tier wins");
+        assert_eq!(tier_for_outcome(&base, "unmapped-model", &shared), None);
     }
 
     #[test]
@@ -948,13 +1030,17 @@ mod tests {
         };
         let ok = AgentOutcome { ok: true, finished: true, model: "sonnet".into(), ..Default::default() };
         assert!(!should_escalate(&ok));
-        for bad in [
-            AgentOutcome { ok: false, model: "sonnet".into(), ..Default::default() },
-            AgentOutcome { ok: true, finished: true, closed_at_cap: true, model: "sonnet".into(), ..Default::default() },
-            AgentOutcome { ok: false, blocked: true, model: "sonnet".into(), ..Default::default() },
-        ] {
-            assert!(should_escalate(&bad));
-        }
+        assert!(should_escalate(&AgentOutcome { ok: false, model: "sonnet".into(), ..Default::default() }));
+        // A report cut off at the cap is still a report (the tree holds its
+        // work); a question for the director is not a capability failure.
+        assert!(!should_escalate(&AgentOutcome { ok: true, finished: true, closed_at_cap: true, model: "sonnet".into(), ..Default::default() }));
+        assert!(!should_escalate(&AgentOutcome { ok: false, blocked: true, model: "sonnet".into(), ..Default::default() }));
+        // Writing roles are warned about the half-modified tree; read-only ones are not.
+        assert!(spec_can_write(&spec), "full tool set");
+        let ro = SubagentSpec { definition: Some(def("explorer", Some(vec!["read_file", "grep"]), None)), ..spec.clone() };
+        assert!(!spec_can_write(&ro));
+        assert!(escalation_prompt("t", "sonnet", "r", true).contains("git status"));
+        assert!(!escalation_prompt("t", "sonnet", "r", false).contains("git status"));
         assert_eq!(escalation_model(&spec, "sonnet", &known, &tiers).as_deref(), Some("opus"));
         // Already on the escalation model (an explicit `model: strong` call): no retry.
         assert_eq!(escalation_model(&spec, "opus", &known, &tiers), None);
@@ -964,7 +1050,7 @@ mod tests {
         assert_eq!(escalation_model(&spec, "sonnet", &known, &HashMap::new()), None);
 
         // The retry prompt carries the task and a bounded excerpt of the ending.
-        let p = escalation_prompt("Implement X", "sonnet", &"x".repeat(10_000));
+        let p = escalation_prompt("Implement X", "sonnet", &"x".repeat(10_000), false);
         assert!(p.starts_with("Implement X"));
         assert!(p.contains("cheaper model (sonnet)"));
         assert!(p.contains("[truncated]") && p.len() < 4_600, "{}", p.len());

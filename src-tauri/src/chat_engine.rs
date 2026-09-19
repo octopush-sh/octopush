@@ -8,7 +8,7 @@
 
 use crate::chat_agents::{
     agent_tool_definitions, director_doctrine, director_model_for_auto, is_agent_tool, parse_agent_call,
-    run_subagents, AgentOutcome, AUTO_MODEL,
+    run_subagents, unmapped_subagent_tiers, AgentOutcome, AUTO_MODEL,
     SubagentSpec,
 };
 use crate::chat_history::{
@@ -1848,7 +1848,7 @@ impl ChatEngine {
         // doctrine, and sub-agents take their tier by role. Resolved once,
         // here, so everything downstream (pricing, the persisted rows, the
         // stream events) sees a real model id.
-        let (request, policy_auto) = if request.model == AUTO_MODEL {
+        let (request, doctrine) = if request.model == AUTO_MODEL {
             let known: Vec<String> = crate::provider_router::ProviderRouter::load()
                 .map(|r| r.list_models().into_iter().map(|m| m.model.id).collect())
                 .unwrap_or_default();
@@ -1856,7 +1856,8 @@ impl ChatEngine {
             match director_model_for_auto(&known, &tiers) {
                 Some(model) => {
                     tracing::info!(model = %model, "Auto policy: director runs on the strong tier");
-                    (ChatRequest { model, ..request }, true)
+                    let unmapped = unmapped_subagent_tiers(&known, &tiers);
+                    (ChatRequest { model, ..request }, Some(director_doctrine(&unmapped)))
                 }
                 None => {
                     return Err(AppError::Other(
@@ -1866,8 +1867,9 @@ impl ChatEngine {
                 }
             }
         } else {
-            (request, false)
+            (request, None)
         };
+        let policy_auto = doctrine.is_some();
         let (provider, api_base, api_key) = resolve_provider(&request.model)?;
 
         let workspace_path = std::path::PathBuf::from(&request.workspace_path);
@@ -1996,8 +1998,8 @@ impl ChatEngine {
             )
         });
 
-        if policy_auto {
-            system_prompt.push_str(director_doctrine());
+        if let Some(doctrine) = &doctrine {
+            system_prompt.push_str(doctrine);
         }
 
         let mut tools = build_llm_tools();

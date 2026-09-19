@@ -224,7 +224,10 @@ function CrewRow({
       : Number.isNaN(startMs)
         ? null
         : Math.max(0, nowMs - startMs);
-  const activity = running ? lastActivity(entries ?? []) : "";
+  // A trailing notice (an escalation to a stronger model) is the row's
+  // activity until the next tool call replaces it.
+  const last = entries && entries.length > 0 ? entries[entries.length - 1] : undefined;
+  const activity = !running ? "" : last?.kind === "notice" ? last.text : lastActivity(entries ?? []);
   const tokens = agent.meta ? agent.meta.inputTokens + agent.meta.outputTokens : 0;
   const ending =
     agent.meta?.closedAtCap ? "turn limit" : agent.meta?.blocked ? "needs a decision" : null;

@@ -33,10 +33,21 @@ export function tierMix(
     all += a.tokens;
   }
   if (all === 0) return [];
+  // Largest-remainder rounding so the shares always sum to 100.
   const order: string[] = [...TIER_ORDER, "other"];
-  return order
-    .filter((t) => totals.has(t))
-    .map((t) => [t, Math.round(((totals.get(t) ?? 0) / all) * 100)] as [string, number]);
+  const present = order.filter((t) => totals.has(t));
+  const exact = present.map((t) => ((totals.get(t) ?? 0) / all) * 100);
+  const floors = exact.map((x) => Math.floor(x));
+  let left = 100 - floors.reduce((a, b) => a + b, 0);
+  const byRemainder = exact
+    .map((x, i) => [x - floors[i], i] as [number, number])
+    .sort((a, b) => b[0] - a[0]);
+  for (const [, i] of byRemainder) {
+    if (left <= 0) break;
+    floors[i] += 1;
+    left -= 1;
+  }
+  return present.map((t, i) => [t, floors[i]] as [string, number]);
 }
 
 /** `72% fast · 28% strong` */
