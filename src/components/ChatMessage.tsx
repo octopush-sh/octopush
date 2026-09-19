@@ -1,3 +1,4 @@
+import { AUTO_MODEL } from "../lib/policy";
 import ReactMarkdown from "react-markdown";
 import { parseKeyPhrase } from "../lib/parseKeyPhrase";
 import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
@@ -34,6 +35,9 @@ function formatTokenCount(n: number): string {
 }
 
 function modelDisplayName(model: string | null | undefined): string {
+  // The streaming bubble carries the store's model until the persisted row
+  // arrives with the resolved id; under Auto that is the policy's name.
+  if (model === AUTO_MODEL) return "Auto";
   if (!model) return "Assistant";
   return MODEL_DISPLAY[model] ?? model;
 }

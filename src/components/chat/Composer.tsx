@@ -660,7 +660,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
         {/* Control bar — model + effort on the left, cost + send/stop on the right. */}
         <div className="flex items-center gap-3 px-3 pb-2.5">
-          <ModelPicker activeModel={model} onSelectModel={setModel} />
+          <ModelPicker activeModel={model} onSelectModel={setModel} autoOption />
           <EffortSelector />
           <button
             type="button"

@@ -5,9 +5,12 @@ import { render, screen, act, fireEvent } from "@testing-library/react";
 
 const listProvidersMock = vi.fn().mockResolvedValue([]);
 
+const getSettingsMock = vi.fn().mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} });
+
 vi.mock("../lib/ipc", () => ({
   ipc: {
     listProviders: listProvidersMock,
+    getSettings: (...a: unknown[]) => getSettingsMock(...a),
   },
 }));
 
@@ -294,5 +297,51 @@ describe("ModelPicker dropdown escapes clipping containers", () => {
     const clip = screen.getByTestId("clip");
     // The dropdown must NOT be nested inside the overflow-clipped container.
     expect(clip.contains(listbox)).toBe(false);
+  });
+});
+
+describe("ModelPicker — Auto (economy director)", () => {
+  it("is absent unless offered, and never selectable as a plain model", async () => {
+    listProvidersMock.mockResolvedValue(twoProviders);
+    await act(async () => {
+      render(<ModelPicker activeModel="gpt-4o" onSelectModel={() => {}} />);
+    });
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.queryByTestId("model-picker-auto")).toBeNull();
+  });
+
+  it("offers Auto above the models, names the strong model it runs on, and selects it", async () => {
+    listProvidersMock.mockResolvedValue(twoProviders);
+    getSettingsMock.mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {}, modelTiers: { strong: "claude-opus-4-6" } });
+    const onSelect = vi.fn();
+    await act(async () => {
+      render(<ModelPicker activeModel="gpt-4o" onSelectModel={onSelect} autoOption />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { expanded: false }));
+    });
+    const auto = screen.getByTestId("model-picker-auto");
+    expect(auto.textContent).toContain("director on Opus 4.6");
+    fireEvent.click(auto);
+    expect(onSelect).toHaveBeenCalledWith("auto");
+  });
+
+  it("shows the strong model on the chip while Auto is active, and says when the tier is unmapped", async () => {
+    listProvidersMock.mockResolvedValue(twoProviders);
+    getSettingsMock.mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {}, modelTiers: { strong: "claude-opus-4-6" } });
+    await act(async () => {
+      render(<ModelPicker activeModel="auto" onSelectModel={() => {}} autoOption />);
+    });
+    expect(screen.getByRole("button", { expanded: false }).textContent).toContain("Auto · Opus 4.6");
+    getSettingsMock.mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} });
+    await act(async () => {
+      render(<ModelPicker activeModel="auto" onSelectModel={() => {}} autoOption />);
+    });
+    const chips = screen.getAllByRole("button", { expanded: false });
+    expect(chips[chips.length - 1].textContent).toContain("Auto");
+    await act(async () => {
+      fireEvent.click(chips[chips.length - 1]);
+    });
+    expect(screen.getByTestId("model-picker-auto").textContent).toContain("strong tier not mapped");
   });
 });
