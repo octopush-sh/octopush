@@ -469,6 +469,65 @@ export interface WorkspaceGitSummary {
   behind: number;
 }
 
+// ─── Usage report (Settings → Usage) ───────────────────────────────
+
+export type UsageSurface = "talk" | "run" | "review" | "direct" | "adhoc";
+
+/** One aggregate of the spend ledger. `cacheHitPct` is
+ *  cache_read / (input + cache_read + cache_create) × 100 — a cache write
+ *  is a miss — and null when no row reported cache data. */
+export interface UsageSlice {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  calls: number;
+  cacheHitPct: number | null;
+  cacheTracked: boolean;
+}
+
+export interface SurfaceUsage extends UsageSlice {
+  surface: string;
+}
+
+export interface ModelUsage extends UsageSlice {
+  model: string;
+}
+
+export interface SourceUsage extends UsageSlice {
+  id: string;
+  label: string;
+  kind: "workspace" | "session" | "other";
+  project: string | null;
+  lastTs: string;
+  surfaces: Array<{ surface: string; costUsd: number }>;
+}
+
+export interface UsageTrendPoint {
+  /** Local-time bucket: `YYYY-MM-DDTHH:00` (hour) or `YYYY-MM-DD` (day). */
+  bucket: string;
+  costUsd: number;
+  tokens: number;
+}
+
+export interface UsageReport {
+  start: string;
+  end: string;
+  surface: string | null;
+  totals: UsageSlice;
+  bySurface: SurfaceUsage[];
+  byModel: ModelUsage[];
+  bySource: SourceUsage[];
+  trend: UsageTrendPoint[];
+  trendBucket: "hour" | "day";
+  activeDays: number;
+  perActiveDayUsd: number;
+  last24hUsd: number;
+  unpricedCalls: number;
+  pricingRefreshedAt: string | null;
+}
+
 // ─── Usage breakdown (cloud vs local) ─────────────────────────────
 
 export interface UsageBreakdown {

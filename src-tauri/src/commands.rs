@@ -178,6 +178,34 @@ pub async fn get_token_report(
     state.tokens.report(session_id.as_deref())
 }
 
+/// The Usage page's report: one date range, optionally one surface, with
+/// day buckets in the viewer's timezone. Polls Claude Code's transcripts
+/// first (throttled) so RUN spend is current when the page reads it.
+#[tauri::command]
+pub async fn get_usage_report(
+    state: State<'_, AppState>,
+    start_iso: String,
+    end_iso: String,
+    surface: Option<String>,
+    utc_offset_minutes: Option<i32>,
+) -> AppResult<crate::db::UsageReport> {
+    // Fire-and-forget: a first pass over long transcripts must not hold up
+    // the page; the next 10s poll picks up what it recorded.
+    let ingestor = Arc::clone(&state.transcripts);
+    tauri::async_runtime::spawn_blocking(move || ingestor.maybe_ingest());
+    let surface = surface.filter(|s| !s.is_empty());
+    let mut report = state.db.lock().usage_report(
+        &start_iso,
+        &end_iso,
+        surface.as_deref(),
+        utc_offset_minutes.unwrap_or(0),
+    )?;
+    report.pricing_refreshed_at = crate::settings::load_settings()
+        .ok()
+        .and_then(|s| s.last_pricing_refresh);
+    Ok(report)
+}
+
 #[tauri::command]
 pub async fn record_token_event(
     state: State<'_, AppState>,

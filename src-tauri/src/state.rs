@@ -14,6 +14,8 @@ pub struct AppState {
     pub db: Arc<Mutex<Db>>,
     pub pty: Mutex<PtyManager>,
     pub tokens: Arc<TokenEngine>,
+    /// RUN spend from Claude Code transcripts (see `transcripts.rs`).
+    pub transcripts: Arc<crate::transcripts::TranscriptIngestor>,
     pub router: Mutex<ProviderRouter>,
     pub chat: ChatEngine,
     /// The shared daemon client — kept alive for the app lifetime.
@@ -27,6 +29,7 @@ impl AppState {
     pub fn init(daemon_client: Option<Arc<DaemonClient>>) -> AppResult<Self> {
         let db = Arc::new(Mutex::new(Db::open(&Db::default_path())?));
         let tokens = Arc::new(TokenEngine::new(Arc::clone(&db)));
+        let transcripts = Arc::new(crate::transcripts::TranscriptIngestor::new(Arc::clone(&db)));
         let chat = ChatEngine::new(Arc::clone(&db), daemon_client.clone());
         let router = ProviderRouter::load()?;
 
@@ -45,6 +48,7 @@ impl AppState {
             db,
             pty: Mutex::new(pty),
             tokens,
+            transcripts,
             router: Mutex::new(router),
             chat,
             daemon_client,

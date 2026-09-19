@@ -355,6 +355,32 @@ impl TokenEngine {
             return;
         }
         if let Some(ev) = scan_pty_output(session_id, buf) {
+            // Once Claude Code's transcript meters this session (exact model
+            // and cache split per API call — see `transcripts.rs`), the
+            // screen-scraped summary would count the same run twice: honour
+            // the high-water mark and drop the event.
+            let metered_by_transcript = {
+                let db = self.db.lock();
+                let flagged = db
+                    .meta_get(&format!("transcript_seen:{session_id}"))
+                    .ok()
+                    .flatten()
+                    .is_some();
+                // The flag lags one ingestion pass; the transcript directory
+                // exists from the moment `claude` starts in that cwd, so a
+                // first run that prints its summary before the next pass is
+                // still caught here.
+                flagged
+                    || db
+                        .run_cwd_for_source(session_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|cwd| crate::transcripts::has_transcript_dir(&cwd))
+            };
+            if metered_by_transcript {
+                let _ = self.db.lock().meta_set(&key, &seq.to_string());
+                return;
+            }
             // PTY scraping is the RUN-mode (terminal CLI agent) path.
             if let Err(e) = self.record(ev, "run") {
                 tracing::warn!(session_id = %session_id, error = %e, "token scan record failed");

@@ -272,6 +272,8 @@ pub fn parse_cli_result(
             },
             input_tokens: parsed.usage.input_tokens,
             output_tokens: parsed.usage.output_tokens,
+            cache_read_tokens: parsed.usage.cache_read_input_tokens,
+            cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
             cost_usd: parsed.total_cost_usd,
             status: StageStatus::Failed,
             tool_calls: vec![],
@@ -295,6 +297,8 @@ pub fn parse_cli_result(
         },
         input_tokens: parsed.usage.input_tokens,
         output_tokens: parsed.usage.output_tokens,
+        cache_read_tokens: parsed.usage.cache_read_input_tokens,
+        cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
         cost_usd: parsed.total_cost_usd,
         status: StageStatus::Done,
         tool_calls: vec![],
@@ -723,6 +727,8 @@ pub(crate) fn build_codex_outcome(
         let mut out = failed_stage(&error);
         out.input_tokens = usage.input_tokens;
         out.output_tokens = usage.output_tokens;
+        out.cache_read_tokens = usage.cache_read_input_tokens;
+        out.cache_creation_tokens = usage.cache_creation_input_tokens;
         out.cost_usd = cost;
         out.session_id = accum.session_id.clone();
         return out;
@@ -739,6 +745,8 @@ pub(crate) fn build_codex_outcome(
                 },
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens,
+                cache_creation_tokens: usage.cache_creation_input_tokens,
                 cost_usd: cost,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -756,6 +764,8 @@ pub(crate) fn build_codex_outcome(
             ));
             out.input_tokens = usage.input_tokens;
             out.output_tokens = usage.output_tokens;
+            out.cache_read_tokens = usage.cache_read_input_tokens;
+            out.cache_creation_tokens = usage.cache_creation_input_tokens;
             out.cost_usd = cost;
             out.session_id = accum.session_id.clone();
             out
@@ -1214,6 +1224,8 @@ fn failed_stage_with_usage(msg: &str, model: &str, u: CliUsage) -> StageOutcome 
     let mut out = failed_stage(msg);
     out.input_tokens = u.input_tokens;
     out.output_tokens = u.output_tokens;
+    out.cache_read_tokens = u.cache_read_input_tokens;
+    out.cache_creation_tokens = u.cache_creation_input_tokens;
     out.cost_usd = crate::orchestrator::cost::stage_cost(
         model,
         u.input_tokens,
@@ -1234,6 +1246,8 @@ fn failed_stage(msg: &str) -> StageOutcome {
         },
         input_tokens: 0,
         output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         cost_usd: 0.0,
         status: StageStatus::Failed,
         tool_calls: vec![],

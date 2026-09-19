@@ -3450,7 +3450,7 @@ mod run_crud_tests {
         let stages = db.list_run_stages(&run_id).unwrap();
         let first = &stages[0];
 
-        db.complete_run_stage(&first.id, "done", 100, 20, 0.5, Some("{\"kind\":\"plan\",\"text\":\"x\"}"))
+        db.complete_run_stage(&first.id, "done", 100, 20, 0, 0, 0.5, Some("{\"kind\":\"plan\",\"text\":\"x\"}"))
             .unwrap();
         let reloaded = db.list_run_stages(&run_id).unwrap();
         assert_eq!(reloaded[0].status, "done");
@@ -3570,7 +3570,7 @@ mod run_crud_tests {
         // Nothing recorded yet.
         assert_eq!(db.token_report(None).unwrap().total_cost_usd, 0.0);
 
-        db.complete_run_stage(&stage, "done", 1000, 500, 0.42, None).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.42, None).unwrap();
 
         // Usage now includes the DIRECT stage.
         let rep = db.token_report(None).unwrap();
@@ -3667,7 +3667,7 @@ mod run_crud_tests {
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
         // One live-captured completion.
-        db.complete_run_stage(&stage, "done", 1000, 500, 0.30, None).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.30, None).unwrap();
         // Simulate retired/looped history: the run meter is higher than captured.
         db.set_run_cost(&run, 0.50, 0.50).unwrap();
 
@@ -3746,7 +3746,7 @@ mod run_crud_tests {
             .unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
-        db.complete_run_stage(&stage, "done", 1000, 500, 0.42, None).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.42, None).unwrap();
 
         let rep = db.token_report(None).unwrap();
         assert!((rep.total_cost_usd - 0.52).abs() < 1e-9);
@@ -3814,7 +3814,7 @@ mod run_crud_tests {
         db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         let stage_id = db.list_run_stages(&run).unwrap()[0].id.clone();
-        db.complete_run_stage(&stage_id, "done", 10, 5, 0.1, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
+        db.complete_run_stage(&stage_id, "done", 10, 5, 0, 0, 0.1, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
             .unwrap();
         db.set_stage_diff_snapshot(&stage_id, "the worktree diff").unwrap();
 
@@ -3996,6 +3996,7 @@ mod orchestrator_tests {
                 return Ok(StageOutcome {
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    cache_read_tokens: 0, cache_creation_tokens: 0,
                     status: StageStatus::AwaitingCheckpoint,
                     tool_calls: vec![], error: None, verdict: None, session_id: None,
                     blocked: Some(BlockedAsk {
@@ -4016,6 +4017,7 @@ mod orchestrator_tests {
                     payload: None, refs_worktree: false,
                 },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None, session_id: None, blocked: None,
                 blocked_transcript: None,
@@ -4042,6 +4044,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 10,
                 output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -4077,6 +4081,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 10,
                 output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 status: if self.fail { StageStatus::Failed } else { StageStatus::Done },
                 tool_calls: vec![],
@@ -4106,6 +4112,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Diff, text: "x".into(), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Failed,
                 tool_calls: vec![], error: Some("boom".into()), verdict: None, session_id: None, blocked: None,
                 blocked_transcript: None,
@@ -4143,6 +4150,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.0,
                 status: StageStatus::Failed,
                 tool_calls: vec![],
@@ -4395,7 +4404,7 @@ mod orchestrator_tests {
         // feedback (from a prior loop-back), $0.05 spent, and a hard failure.
         db.lock().reset_run_stage(&stale.id, None, Some("fix the null check")).unwrap();
         db.lock()
-            .complete_run_stage(&stale.id, "failed", 100, 50, 0.05, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
+            .complete_run_stage(&stale.id, "failed", 100, 50, 0, 0, 0.05, Some("{\"kind\":\"diff\",\"text\":\"x\"}"))
             .unwrap();
         db.lock().fail_run_stage(&stale.id, "boom").unwrap();
         // Escalate using the STALE clone (as the drive loop does).
@@ -4699,6 +4708,7 @@ mod orchestrator_tests {
                 return Ok(StageOutcome {
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    cache_read_tokens: 0, cache_creation_tokens: 0,
                     status: StageStatus::AwaitingCheckpoint,
                     tool_calls: vec![], error: None, verdict: None, session_id: None,
                     blocked: Some(BlockedAsk {
@@ -4716,6 +4726,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "resolved".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None, session_id: None,
                 blocked: None, blocked_transcript: None,
@@ -4869,6 +4880,7 @@ mod orchestrator_tests {
                 return Ok(StageOutcome {
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    cache_read_tokens: 0, cache_creation_tokens: 0,
                     status: StageStatus::Failed,
                     tool_calls: vec![],
                     error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
@@ -4881,6 +4893,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None, session_id: None,
                 blocked: None, blocked_transcript: None,
@@ -4979,6 +4992,7 @@ mod orchestrator_tests {
                 return Ok(StageOutcome {
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                    cache_read_tokens: 0, cache_creation_tokens: 0,
                     status: StageStatus::Failed,
                     tool_calls: vec![],
                     error: Some(crate::orchestrator::runner::unfinished_stage_error(true, 25)),
@@ -4991,6 +5005,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done,
                 tool_calls: vec![], error: None, verdict: None,
                 session_id: Some("sess-cli-1".into()),
@@ -5175,7 +5190,7 @@ mod orchestrator_tests {
         // Park BOTH at a gate: ran (started_at stamped) → artifact set → awaiting_checkpoint.
         for (i, id) in ids.iter().enumerate() {
             db.lock().set_run_stage_status(id, "running").unwrap();
-            db.lock().complete_run_stage(id, "awaiting_checkpoint", 0, 0, 0.0, Some(&art(&format!("s{i}")))).unwrap();
+            db.lock().complete_run_stage(id, "awaiting_checkpoint", 0, 0, 0, 0, 0.0, Some(&art(&format!("s{i}")))).unwrap();
         }
 
         let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
@@ -5321,6 +5336,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.0,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -6429,6 +6446,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done, tool_calls: vec![], error: None,
                 verdict: None, session_id: None, blocked: None, blocked_transcript: None,
             })
@@ -6625,6 +6643,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -6911,6 +6931,7 @@ mod orchestrator_tests {
             Ok(StageOutcome {
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
                 input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
                 status: StageStatus::Done, tool_calls: vec![],
                 error: None,
                 verdict: crate::orchestrator::runner::parse_verdict(&text),
@@ -7080,6 +7101,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 10,
                 output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: self.cost,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -7228,6 +7251,8 @@ mod orchestrator_tests {
                 },
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 status: StageStatus::Done,
                 tool_calls: vec![],
@@ -11247,5 +11272,418 @@ mod clone_failure_classification_tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+}
+
+// ─── Usage report + cost honesty ───────────────────────────────────────
+
+#[cfg(test)]
+mod usage_report_tests {
+    use crate::db::{cache_hit_pct, Db, SpendEvent};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed(db: &Db) {
+        db.insert_project("p1", "Atlas", "/tmp/atlas").unwrap();
+        db.insert_workspace("w1", "p1", "billing-fix", "", "main", Some("/tmp/atlas/wt/billing"), "", None)
+            .unwrap();
+    }
+
+    fn ev(ts: &str, surface: &str, ws: Option<&str>, src: &str, model: &str, i: i64, o: i64, cr: i64, cc: i64, cost: f64, key: &str) -> SpendEvent {
+        SpendEvent {
+            ts_utc: ts.into(),
+            surface: surface.into(),
+            project_id: ws.map(|_| "p1".to_string()),
+            workspace_id: ws.map(str::to_string),
+            mission_id: None,
+            source_id: Some(src.into()),
+            attempt: 1,
+            model_raw: model.into(),
+            model: model.into(),
+            input_tokens: i,
+            output_tokens: o,
+            cache_read_tokens: cr,
+            cache_creation_tokens: cc,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(cost),
+            cost_usd: cost,
+            cost_basis: "computed".into(),
+            idempotency_key: Some(key.into()),
+        }
+    }
+
+    #[test]
+    fn hit_ratio_counts_writes_as_misses_and_knows_when_it_is_blind() {
+        // 80k read, 10k written, 10k plain → 80% of the prompt came from cache.
+        let (pct, tracked) = cache_hit_pct(10_000, 80_000, 10_000);
+        assert!(tracked);
+        assert!((pct.unwrap() - 80.0).abs() < 1e-9);
+        // Only writes: the prompt was cached for next time but nothing was
+        // read — 0%, not the old "(read+write)/(in+out)" that would say 100%+.
+        let (pct, _) = cache_hit_pct(0, 0, 50_000);
+        assert!((pct.unwrap() - 0.0).abs() < 1e-9);
+        // No cache data at all: not "0%" — unknown.
+        let (pct, tracked) = cache_hit_pct(5_000, 0, 0);
+        assert!(pct.is_none() && !tracked);
+    }
+
+    #[test]
+    fn report_splits_by_surface_model_and_source_within_the_range() {
+        let db = test_db();
+        seed(&db);
+        // Two TALK rows in the workspace (one cached), one RUN row on a plain
+        // session id, one DIRECT row, and one row outside the range.
+        db.insert_spend_event(&ev("2026-09-10T10:00:00+00:00", "talk", Some("w1"), "w1", "claude-opus-5", 1_000, 200, 9_000, 0, 0.30, "a")).unwrap();
+        db.insert_spend_event(&ev("2026-09-10T11:00:00+00:00", "talk", Some("w1"), "w1", "claude-opus-5", 1_000, 200, 0, 9_000, 0.50, "b")).unwrap();
+        db.insert_spend_event(&ev("2026-09-11T09:00:00+00:00", "run", None, "sess-1", "unknown", 5_000, 1_000, 0, 0, 0.90, "c")).unwrap();
+        db.insert_spend_event(&ev("2026-09-11T12:00:00+00:00", "direct", Some("w1"), "stage-1", "claude-sonnet-5", 2_000, 500, 1_000, 1_000, 0.20, "d")).unwrap();
+        db.insert_spend_event(&ev("2026-08-01T12:00:00+00:00", "talk", Some("w1"), "w1", "claude-opus-5", 9, 9, 0, 0, 99.0, "old")).unwrap();
+
+        let rep = db
+            .usage_report("2026-09-01T00:00:00+00:00", "2026-09-30T23:59:59+00:00", None, 0)
+            .unwrap();
+        assert!((rep.totals.cost_usd - 1.90).abs() < 1e-9, "{rep:?}");
+        assert_eq!(rep.totals.calls, 4);
+        // Totals hit ratio: read 10k of prompt (9k+9k+0+2k) + ... =
+        // input 9k, read 10k, create 10k → 10/29.
+        assert!((rep.totals.cache_hit_pct.unwrap() - 10_000.0 / 29_000.0 * 100.0).abs() < 1e-9);
+
+        let talk = rep.by_surface.iter().find(|s| s.surface == "talk").unwrap();
+        assert!((talk.usage.cost_usd - 0.80).abs() < 1e-9);
+        // TALK: 9k read of (2k + 9k + 9k) prompt = 45%.
+        assert!((talk.usage.cache_hit_pct.unwrap() - 45.0).abs() < 1e-9);
+        let run = rep.by_surface.iter().find(|s| s.surface == "run").unwrap();
+        assert!(!run.usage.cache_tracked && run.usage.cache_hit_pct.is_none(), "PTY-scraped RUN has no cache data");
+        assert!(rep.by_surface.iter().any(|s| s.surface == "direct"));
+
+        assert_eq!(rep.by_model[0].model, "unknown", "largest cost first: {:?}", rep.by_model);
+        assert_eq!(rep.unpriced_calls, 0);
+
+        // Sources: the workspace is labelled by name + project; the RUN
+        // session keeps its id as the label (no sessions row) and kind other.
+        let ws = rep.by_source.iter().find(|s| s.id == "w1").unwrap();
+        assert_eq!(ws.label, "billing-fix");
+        assert_eq!(ws.kind, "workspace");
+        assert_eq!(ws.project.as_deref(), Some("Atlas"));
+        assert!((ws.usage.cost_usd - 1.00).abs() < 1e-9);
+        assert_eq!(ws.surfaces[0].surface, "talk");
+        assert!((ws.surfaces[0].cost_usd - 0.80).abs() < 1e-9);
+        assert_eq!(ws.surfaces[1].surface, "direct");
+        let sess = rep.by_source.iter().find(|s| s.id == "sess-1").unwrap();
+        assert_eq!(sess.kind, "other");
+
+        // Day buckets over a month; two active days → per-active-day.
+        assert_eq!(rep.trend_bucket, "day");
+        assert_eq!(rep.trend.iter().map(|t| t.bucket.as_str()).collect::<Vec<_>>(), vec!["2026-09-10", "2026-09-11"]);
+        assert_eq!(rep.active_days, 2);
+        assert!((rep.per_active_day_usd - 0.95).abs() < 1e-9);
+
+        // Surface filter narrows every section.
+        let only_run = db
+            .usage_report("2026-09-01T00:00:00+00:00", "2026-09-30T23:59:59+00:00", Some("run"), 0)
+            .unwrap();
+        assert!((only_run.totals.cost_usd - 0.90).abs() < 1e-9);
+        assert_eq!(only_run.by_surface.len(), 1);
+        assert_eq!(only_run.by_source.len(), 1);
+        assert_eq!(only_run.by_model.len(), 1);
+        assert_eq!(only_run.active_days, 1);
+    }
+
+    #[test]
+    fn report_buckets_hours_for_short_ranges_in_local_time() {
+        let db = test_db();
+        seed(&db);
+        // 23:30 UTC on the 10th is 18:30 on the 10th in UTC-5 — and the
+        // 11th 03:00 UTC is still the 10th, 22:00 local.
+        db.insert_spend_event(&ev("2026-09-10T23:30:00+00:00", "talk", Some("w1"), "w1", "m", 10, 1, 0, 0, 0.1, "a")).unwrap();
+        db.insert_spend_event(&ev("2026-09-11T03:00:00+00:00", "talk", Some("w1"), "w1", "m", 10, 1, 0, 0, 0.1, "b")).unwrap();
+        let rep = db
+            .usage_report("2026-09-10T05:00:00+00:00", "2026-09-11T05:00:00+00:00", None, -300)
+            .unwrap();
+        assert_eq!(rep.trend_bucket, "hour");
+        assert_eq!(rep.trend.iter().map(|t| t.bucket.as_str()).collect::<Vec<_>>(), vec!["2026-09-10T18:00", "2026-09-10T22:00"]);
+        assert_eq!(rep.active_days, 1, "one local day");
+    }
+
+    #[test]
+    fn direct_stage_completion_keeps_its_cache_split_in_the_ledger() {
+        let db = test_db();
+        seed(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5", "api", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        db.complete_run_stage(&stage, "done", 1_000, 500, 40_000, 8_000, 0.42, None).unwrap();
+        let rep = db.usage_report("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00", Some("direct"), 0).unwrap();
+        assert_eq!(rep.totals.cache_read_tokens, 40_000);
+        assert_eq!(rep.totals.cache_creation_tokens, 8_000);
+        assert!(rep.totals.cache_tracked);
+        assert!((rep.totals.cache_hit_pct.unwrap() - 40_000.0 / 49_000.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accepting_a_halted_stage_does_not_count_its_spend_twice() {
+        let db = test_db();
+        seed(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5", "api", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        db.complete_run_stage(&stage, "failed", 1_000, 500, 0, 0, 0.42, None).unwrap();
+        db.accept_run_stage_partial(&stage, "{\"kind\":\"note\",\"text\":\"ok\"}").unwrap();
+        let rep = db.usage_report("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00", None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 1, "one ledger row, not two");
+        assert!((rep.totals.cost_usd - 0.42).abs() < 1e-9);
+        let row = db.list_run_stages(&run).unwrap().into_iter().next().unwrap();
+        assert_eq!(row.status, "done");
+        assert_eq!(row.input_tokens, 1_000);
+        assert!(row.artifact.unwrap().contains("ok"));
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use crate::db::Db;
+    use crate::session::{CreateSessionArgs, Session};
+    use crate::transcripts::{parse_transcript_line, project_dir_name, read_new_entries, TranscriptIngestor};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tempfile::{NamedTempFile, TempDir};
+
+    const ALL: (&str, &str) = ("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00");
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn line(kind: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "type": kind,
+            "requestId": req,
+            "timestamp": ts,
+            "cwd": cwd,
+            "sessionId": "cc-sess",
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": model,
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": i,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cc,
+                    "output_tokens": o
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn now_iso() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn session_on(db: &Db, id: &str, root: &str) {
+        let sess = Session::from_args(
+            id.into(),
+            CreateSessionArgs {
+                name: id.into(),
+                project_root: root.into(),
+                color: None,
+                icon: None,
+                agent: None,
+                token_budget: None,
+                tags: vec![],
+                context_files: vec![],
+            },
+        );
+        db.upsert_session(&sess).unwrap();
+    }
+
+    #[test]
+    fn project_dir_name_matches_claude_code() {
+        assert_eq!(project_dir_name("/home/user/octopush"), "-home-user-octopush");
+        assert_eq!(project_dir_name("/Users/j/.octopush/wt/x_y"), "-Users-j--octopush-wt-x-y");
+    }
+
+    #[test]
+    fn parses_only_billed_assistant_lines() {
+        let l = line("assistant", "req_1", "us.anthropic.claude-opus-5", 2, 38_271, 31_477, 201, "2026-09-18T20:50:46.418Z", "/w");
+        let u = parse_transcript_line(&l, "file-sess").unwrap();
+        assert_eq!(u.key, "cc:req_1", "keyed by the globally unique request id");
+        assert_eq!(u.session_id, "cc-sess");
+        assert_eq!(u.model, "us.anthropic.claude-opus-5");
+        assert_eq!((u.input_tokens, u.cache_read_tokens, u.cache_creation_tokens, u.output_tokens), (2, 38_271, 31_477, 201));
+        assert_eq!(u.ts_utc, "2026-09-18T20:50:46.418+00:00", "normalised to the ledger's RFC3339 form");
+        // No request id → the message id.
+        let no_req = l.replace("\"requestId\":\"req_1\",", "");
+        assert_eq!(parse_transcript_line(&no_req, "f").unwrap().key, "cc:msg:msg_req_1");
+        assert!(parse_transcript_line(&line("user", "r", "m", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
+        assert!(parse_transcript_line("not json", "f").is_none());
+        assert!(parse_transcript_line(&line("assistant", "r", "<synthetic>", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
+        assert!(parse_transcript_line(&line("assistant", "r", "m", 0, 0, 0, 0, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
+    }
+
+    #[test]
+    fn incremental_read_folds_blocks_and_leaves_a_partial_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let a = line("assistant", "req_a", "m", 10, 0, 0, 5, "2026-09-18T20:50:46Z", "/w");
+        let a2 = line("assistant", "req_a", "m", 10, 0, 0, 9, "2026-09-18T20:50:47Z", "/w"); // second block, final usage
+        let b = line("assistant", "req_b", "m", 20, 0, 0, 1, "2026-09-18T20:51:00Z", "/w");
+        // A user line with invalid UTF-8 must not abort the read.
+        let mut bytes = format!("{a}\n{a2}\n").into_bytes();
+        bytes.extend(b"{\"type\":\"user\",\"x\":\"\xff\xfe\"}\n");
+        bytes.extend(format!("{b}\n{{\"type\":\"assist").into_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let (entries, consumed) = read_new_entries(&path, 0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].output_tokens, 9, "last block's usage wins");
+        assert_eq!(entries[1].key, "cc:req_b");
+        let complete = bytes.len() - "{\"type\":\"assist".len();
+        assert_eq!(consumed, complete as u64);
+        // The partial tail completes later and is read from the offset.
+        bytes.truncate(complete);
+        bytes.extend(format!("{}\n", line("assistant", "req_c", "m", 1, 0, 0, 1, "2026-09-18T20:52:00Z", "/w")).into_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let (entries, _) = read_new_entries(&path, consumed).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "cc:req_c");
+    }
+
+    #[test]
+    fn ingests_a_run_session_transcript_with_model_and_cache_and_silences_pty() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/run-here";
+        session_on(&db.lock(), "sess-run", cwd);
+        session_on(&db.lock(), "sess-run-2", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let f = pdir.join("cc-sess.jsonl");
+        let live = now_iso();
+        std::fs::write(
+            &f,
+            format!(
+                "{}\n{}\n{}\n",
+                line("assistant", "req_old", "claude-sonnet-5", 500, 0, 0, 50, "2026-01-05T10:00:00Z", cwd),
+                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, &live, cwd),
+                line("assistant", "req_1", "claude-sonnet-5", 100, 40_000, 5_000, 300, &live, cwd),
+            ),
+        )
+        .unwrap();
+        // A transcript elsewhere on disk is not Octopush spend.
+        let other = root.path().join("-somewhere-else");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("x.jsonl"), format!("{}\n", line("assistant", "req_z", "claude-opus-5", 100, 0, 0, 100, "2026-09-18T20:50:46Z", "/somewhere/else"))).unwrap();
+
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        let s = ing.ingest().unwrap();
+        assert_eq!(s.rows_inserted, 2, "{s:?}");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 2);
+        assert_eq!(rep.totals.cache_read_tokens, 40_000);
+        assert_eq!(rep.by_model[0].model, "claude-sonnet-5");
+        assert!(rep.totals.cost_usd > 0.0, "priced through the catalog");
+        // Only the live message moved the session's own counters — the
+        // January row is history, not activity now — and every session on
+        // that root is transcript-metered.
+        let counted: u64 = ["sess-run", "sess-run-2"]
+            .iter()
+            .map(|id| db.lock().get_session(id).unwrap().unwrap().tokens_input)
+            .sum();
+        assert_eq!(counted, 100, "credited to the most recently active session on the root, once");
+        assert!(db.lock().meta_get("transcript_seen:sess-run").unwrap().is_some());
+        assert!(db.lock().meta_get("transcript_seen:sess-run-2").unwrap().is_some());
+        // Re-running is a no-op; appending one message adds exactly one row.
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 0);
+        let mut fh = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        use std::io::Write;
+        writeln!(fh, "{}", line("assistant", "req_2", "claude-sonnet-5", 10, 0, 0, 10, &now_iso(), cwd)).unwrap();
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+
+        // PTY scraping for those sessions now drops its events.
+        let engine = crate::token_engine::TokenEngine::new(Arc::clone(&db));
+        engine.scan_and_record("sess-run-2", 50, b"Total cost: $9.99 | Input: 1K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 3, "no PTY row added");
+        assert_eq!(db.lock().meta_get("pty_scan_seq:sess-run-2").unwrap().as_deref(), Some("50"));
+    }
+
+    #[test]
+    fn a_block_that_lands_after_the_poll_updates_the_row() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/split";
+        session_on(&db.lock(), "s1", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let f = pdir.join("cc-sess.jsonl");
+        // Poll 1 sees the first block (partial usage) …
+        std::fs::write(&f, format!("{}\n", line("assistant", "req_1", "claude-sonnet-5", 10, 0, 0, 5, "2026-09-18T20:50:46Z", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        // … poll 2 sees the message's final block: same key, updated usage.
+        let mut fh = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        use std::io::Write;
+        writeln!(fh, "{}", line("assistant", "req_1", "claude-sonnet-5", 10, 0, 0, 9, "2026-09-18T20:50:47Z", cwd)).unwrap();
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 0);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.totals.calls, 1);
+        assert_eq!(rep.totals.output_tokens, 9);
+    }
+
+    #[test]
+    fn workspace_terminal_scrapes_are_superseded_and_then_silenced() {
+        let db = Arc::new(Mutex::new(test_db()));
+        db.lock().insert_project("p1", "Atlas", "/tmp/atlas").unwrap();
+        db.lock().insert_workspace("w1", "p1", "ws", "", "main", Some("/tmp/atlas/wt/one"), "", None).unwrap();
+        db.lock()
+            .conn_ref()
+            .execute(
+                "INSERT INTO terminals (id, workspace_id, label, position, created_at) VALUES ('term-1','w1','Terminal',0,0)",
+                [],
+            )
+            .unwrap();
+        // Before this change: the terminal's `Total cost:` line was scraped
+        // under the terminal id (now attributed to the workspace at write time).
+        let engine = crate::token_engine::TokenEngine::new(Arc::clone(&db));
+        engine.scan_and_record("term-1", 1, b"Total cost: $2.00 | Input: 10K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 1);
+        assert_eq!(rep.by_source[0].id, "w1", "terminal spend lands under its workspace");
+
+        // The transcript for that run shows up: its exact rows replace the scrape.
+        let root = TempDir::new().unwrap();
+        let pdir = root.path().join(project_dir_name("/tmp/atlas/wt/one"));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("s.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line("assistant", "req_1", "claude-sonnet-5", 100, 0, 0, 10, "2000-01-02T00:00:00Z", "/tmp/atlas/wt/one"),
+                line("assistant", "req_2", "claude-sonnet-5", 100, 0, 0, 10, "2000-01-02T00:01:00Z", "/tmp/atlas/wt/one"),
+            ),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 2);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 2, "the scraped row is gone, the two exact rows remain");
+        assert_eq!(rep.by_source.len(), 1);
+        assert_eq!(rep.by_source[0].id, "w1");
+        assert_eq!(rep.by_source[0].kind, "workspace");
+        assert_eq!(rep.by_source[0].surfaces[0].surface, "run");
+        assert!(rep.totals.cost_usd < 2.0);
+        // A later scrape from the same terminal is dropped.
+        engine.scan_and_record("term-1", 2, b"Total cost: $5.00 | Input: 10K | Output: 1K");
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        assert_eq!(rep.totals.calls, 2);
     }
 }

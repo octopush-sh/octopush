@@ -1001,6 +1001,8 @@ impl Orchestrator {
                 "awaiting_checkpoint",
                 outcome.input_tokens as i64,
                 outcome.output_tokens as i64,
+                outcome.cache_read_tokens as i64,
+                outcome.cache_creation_tokens as i64,
                 outcome.cost_usd,
                 None,
             )?;
@@ -1037,6 +1039,8 @@ impl Orchestrator {
                     "done",
                     outcome.input_tokens as i64,
                     outcome.output_tokens as i64,
+                    outcome.cache_read_tokens as i64,
+                    outcome.cache_creation_tokens as i64,
                     outcome.cost_usd,
                     Some(&artifact_json),
                 )?;
@@ -1069,6 +1073,8 @@ impl Orchestrator {
                         "failed",
                         outcome.input_tokens as i64,
                         outcome.output_tokens as i64,
+                        outcome.cache_read_tokens as i64,
+                        outcome.cache_creation_tokens as i64,
                         outcome.cost_usd,
                         None,
                     )?;
@@ -2051,15 +2057,10 @@ impl Orchestrator {
                             refs_worktree,
                         };
                         let json = serde_json::to_string(&artifact)?;
-                        // Preserve the failed attempt's spend — only status/artifact change.
-                        self.db.lock().complete_run_stage(
-                            &s.id,
-                            "done",
-                            s.input_tokens,
-                            s.output_tokens,
-                            s.cost_usd,
-                            Some(&json),
-                        )?;
+                        // Preserve the failed attempt's spend — only status/artifact
+                        // change, and the ledger is NOT written again (the halted
+                        // attempt's row already exists).
+                        self.db.lock().accept_run_stage_partial(&s.id, &json)?;
                     }
                 }
             }
