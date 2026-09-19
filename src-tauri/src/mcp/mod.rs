@@ -386,6 +386,28 @@ impl McpRegistry {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // When the command is an absolute path (e.g. /Users/foo/.nvm/.../npx),
+        // its parent dir contains sibling binaries (node, npm, …) the script
+        // needs via /usr/bin/env. GUI apps on macOS don't inherit the shell
+        // PATH, so env(1) can't find them. Prepend the command's directory to
+        // the subprocess PATH so the shebang resolves without the user having
+        // to add PATH to the server's env manually.
+        if !cfg.env.contains_key("PATH") {
+            let cmd_path = std::path::Path::new(&cfg.command);
+            if cmd_path.is_absolute() {
+                if let Some(bin_dir) = cmd_path.parent() {
+                    let bin_dir = bin_dir.display().to_string();
+                    let new_path = match std::env::var("PATH") {
+                        Ok(existing) if !existing.is_empty() => {
+                            format!("{bin_dir}:{existing}")
+                        }
+                        _ => bin_dir,
+                    };
+                    cmd.env("PATH", new_path);
+                }
+            }
+        }
         // Own process group, so an abort can take the wrapper AND the
         // server it spawned (see `kill_and_reap`).
         #[cfg(unix)]
