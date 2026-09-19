@@ -405,6 +405,7 @@ import type {
   TokenEvent,
   TokenReport,
   UsageBreakdown,
+  UsageReport,
   Workspace,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
@@ -778,6 +779,11 @@ export const ipc = {
 
   getUsageBreakdown: (startIso: string, endIso: string) =>
     invoke<UsageBreakdown>("get_usage_breakdown", { startIso, endIso }),
+
+  /** The Usage page's report over a range, optionally one surface. Day
+   *  buckets follow `utcOffsetMinutes` (the viewer's local offset). */
+  getUsageReport: (startIso: string, endIso: string, surface: string | null, utcOffsetMinutes: number) =>
+    invoke<UsageReport>("get_usage_report", { startIso, endIso, surface, utcOffsetMinutes }),
 
   refreshPricing: () =>
     invoke<RefreshPricingResult>("refresh_pricing"),

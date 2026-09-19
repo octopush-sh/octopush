@@ -34,6 +34,7 @@ pub mod mission;
 pub mod template;
 pub mod theme;
 pub mod token_engine;
+pub mod transcripts;
 pub mod perf;
 pub mod issue_tracker;
 pub mod github;
@@ -137,6 +138,7 @@ pub fn run() {
             commands::delete_session,
             // Tokens
             commands::get_token_report,
+            commands::get_usage_report,
             commands::record_token_event,
             commands::get_budget_status,
             commands::set_token_budget,
@@ -389,6 +391,20 @@ pub fn run() {
             // Restore sessions that were active when the app last closed.
             let state = app.state::<AppState>();
             restore_active_sessions(app.handle().clone(), &state);
+
+            // RUN spend from Claude Code transcripts: one pass now, then a
+            // slow poll so the ledger (budgets, Companion, rail) stays current
+            // even while the Usage page is closed.
+            {
+                let ingestor = std::sync::Arc::clone(&state.transcripts);
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let i = std::sync::Arc::clone(&ingestor);
+                        let _ = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
 
             // Direct-mode orchestrator: seed builtin pipelines + register engine.
             {

@@ -128,53 +128,101 @@ export function SegmentedRow<T extends string>({
       {description && (
         <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
       )}
-      <div
-        role="radiogroup"
-        aria-label={ariaLabel ?? label}
-        data-testid={testId}
-        className="mt-3 inline-flex items-center gap-0.5"
-      >
-        {options.map((opt) => {
-          const active = opt.value === value;
-          return (
-            <button
-              key={opt.value}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              onClick={() => onChange(opt.value)}
-              className={
-                "relative rounded-md border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] " +
-                (active
-                  ? "text-octo-brass"
-                  : "border-transparent text-octo-mute hover:text-octo-sage")
-              }
-              style={
-                active
-                  ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
-                  : undefined
-              }
-            >
-              {opt.label}
-            </button>
-          );
-        })}
-      </div>
+      <Segments
+        className="mt-3"
+        value={value}
+        options={options}
+        onChange={onChange}
+        ariaLabel={ariaLabel ?? label}
+        testId={testId}
+      />
+    </div>
+  );
+}
+
+/** The bare segmented control (mono/uppercase pills, brass-ghost active) —
+ *  what `SegmentedRow` wraps; used on its own for page-level filters. */
+export function Segments<T extends string>({
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  testId,
+  className = "",
+}: {
+  value: T;
+  options: ReadonlyArray<{ value: T; label: string }>;
+  onChange: (v: T) => void;
+  ariaLabel: string;
+  testId?: string;
+  className?: string;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      data-testid={testId}
+      className={`inline-flex items-center gap-0.5 ${className}`}
+    >
+      {options.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(opt.value)}
+            className={
+              "relative rounded-md border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] " +
+              (active
+                ? "text-octo-brass"
+                : "border-transparent text-octo-mute hover:text-octo-sage")
+            }
+            style={
+              active
+                ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
+                : undefined
+            }
+          >
+            {opt.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
 
 // ─── Small data helpers ───────────────────────────────────────────────
 
-export function Stat({ label, value }: { label: string; value: string }) {
+export function Stat({
+  label,
+  value,
+  note,
+  title,
+  testId,
+}: {
+  label: string;
+  value: string;
+  /** One quiet line under the figure (what it is measured over). */
+  note?: string;
+  /** Tooltip explaining how the figure is computed. */
+  title?: string;
+  testId?: string;
+}) {
   return (
-    <div className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-3">
+    <div
+      className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-3"
+      title={title}
+      data-testid={testId}
+    >
       <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
         {label}
       </div>
       <div className="octo-tabular mt-1.5 font-serif text-[18px] tracking-[-0.005em] text-octo-ivory">
         {value}
       </div>
+      {note && <div className="mt-1 font-mono text-[10px] text-octo-mute">{note}</div>}
     </div>
   );
 }

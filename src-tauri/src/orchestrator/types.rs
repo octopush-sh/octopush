@@ -324,6 +324,11 @@ pub struct StageOutcome {
     pub artifact: StageArtifact,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt-cache tokens the stage's calls read back / wrote. Carried so the
+    /// spend ledger can tell a cached DIRECT stage from an uncached one — the
+    /// row's `cost_usd` already prices them.
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub cost_usd: f64,
     /// `Done` or `Failed` in the common case; `AwaitingCheckpoint` when the
     /// stage blocked on `ask_director` (see the `blocked` field below).

@@ -1333,7 +1333,13 @@ impl Db {
     /// `idempotency_key` dedupes replays/retries (a NULL key always inserts —
     /// SQLite treats NULLs as distinct under a UNIQUE constraint).
     pub fn insert_spend_event(&self, ev: &SpendEvent) -> AppResult<()> {
-        self.conn.execute(
+        self.insert_spend_event_if_new(ev).map(|_| ())
+    }
+
+    /// [`insert_spend_event`](Self::insert_spend_event), reporting whether the
+    /// row was new (`false` when its `idempotency_key` was already present).
+    pub fn insert_spend_event_if_new(&self, ev: &SpendEvent) -> AppResult<bool> {
+        let n = self.conn.execute(
             "INSERT OR IGNORE INTO spend_events
                 (ts_utc, surface, project_id, workspace_id, source_id, attempt,
                  model_raw, model, input_tokens, output_tokens,
@@ -1362,7 +1368,30 @@ impl Db {
                 ev.mission_id,
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
+    }
+
+    /// Every workspace that has a worktree on disk: `(id, project_id, path)`.
+    /// Archived ones included — spend recorded against them still belongs
+    /// to them.
+    pub fn list_workspace_paths(&self) -> AppResult<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, worktree_path FROM workspaces WHERE worktree_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The workspace whose worktree is `path`, as `(id, project_id)`.
+    pub fn workspace_by_path(&self, path: &str) -> AppResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id FROM workspaces WHERE worktree_path = ?1 LIMIT 1",
+                params![path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// One reconciliation row per run for the gap between its retire-inclusive
@@ -1623,6 +1652,262 @@ impl Db {
             hourly_trend,
             budget_remaining,
             projected_daily_cost: projected,
+        })
+    }
+
+    // ─── Usage report (Settings → Usage) ──────────────────────────
+
+    /// The Usage page's report over one date range, optionally one surface
+    /// (`talk` / `run` / `review` / `direct` / `adhoc`). Reads the canonical
+    /// `spend_events` ledger directly (the `all_spend` view has no surface).
+    ///
+    /// Cache hit ratio is `cache_read / (input + cache_read + cache_create)`:
+    /// the share of prompt tokens that were served from cache. Cache WRITES
+    /// are misses (they are billed at a premium, not saved), and a slice
+    /// whose rows report no cache tokens at all is `cache_tracked = false`
+    /// with no ratio — "0%" would claim the provider caches nothing when we
+    /// simply weren't told.
+    ///
+    /// `utc_offset_minutes` is the viewer's local offset (JS
+    /// `-getTimezoneOffset()`): day buckets and the active-day count follow
+    /// the user's calendar, not UTC's.
+    pub fn usage_report(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+        surface: Option<&str>,
+        utc_offset_minutes: i32,
+    ) -> AppResult<UsageReport> {
+        let surface_and = if surface.is_some() { "AND surface = ?3" } else { "" };
+        let sf = surface.unwrap_or("").to_string();
+        let shift = format!("{utc_offset_minutes} minutes");
+        let slice_cols = "COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                          COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
+                          COALESCE(SUM(cost_usd),0), COUNT(*)";
+        let slice_of = |r: &rusqlite::Row, at: usize| -> rusqlite::Result<UsageSlice> {
+            Ok(UsageSlice::new(
+                r.get::<_, i64>(at)?,
+                r.get::<_, i64>(at + 1)?,
+                r.get::<_, i64>(at + 2)?,
+                r.get::<_, i64>(at + 3)?,
+                r.get::<_, f64>(at + 4)?,
+                r.get::<_, i64>(at + 5)?,
+            ))
+        };
+
+        let totals = {
+            let sql = format!(
+                "SELECT {slice_cols} FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_row(params![start_iso, end_iso, sf], |r| slice_of(r, 0))?
+            } else {
+                stmt.query_row(params![start_iso, end_iso], |r| slice_of(r, 0))?
+            }
+        };
+
+        let by_surface = {
+            let sql = format!(
+                "SELECT surface, {slice_cols} FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
+                 GROUP BY surface ORDER BY 6 DESC"
+            );
+            let map = |r: &rusqlite::Row| -> rusqlite::Result<SurfaceUsage> {
+                Ok(SurfaceUsage { surface: r.get(0)?, usage: slice_of(r, 1)? })
+            };
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_map(params![start_iso, end_iso, sf], map)?.collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![start_iso, end_iso], map)?.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        let by_model = {
+            let sql = format!(
+                "SELECT model, {slice_cols} FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
+                 GROUP BY model ORDER BY 6 DESC LIMIT 30"
+            );
+            let map = |r: &rusqlite::Row| -> rusqlite::Result<ModelUsage> {
+                Ok(ModelUsage { model: r.get(0)?, usage: slice_of(r, 1)? })
+            };
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_map(params![start_iso, end_iso, sf], map)?.collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![start_iso, end_iso], map)?.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        // Where it went: one row per workspace (TALK/REVIEW/DIRECT and RUN
+        // sessions opened on a worktree) or RUN session (plain terminals),
+        // labelled by name, with its per-surface split for the stacked bar.
+        let by_source = {
+            let sql = format!(
+                "SELECT e.k,
+                        COALESCE(w.name, s.name, e.k) AS label,
+                        CASE WHEN w.id IS NOT NULL THEN 'workspace'
+                             WHEN s.id IS NOT NULL THEN 'session'
+                             ELSE 'other' END AS kind,
+                        p.name,
+                        MAX(e.ts_utc),
+                        {slice_cols}
+                 FROM (SELECT COALESCE(workspace_id, source_id, 'unattributed') AS k, *
+                       FROM spend_events
+                       WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}) e
+                 LEFT JOIN workspaces w ON w.id = e.k
+                 LEFT JOIN sessions s ON s.id = e.k
+                 LEFT JOIN projects p ON p.id = w.project_id
+                 GROUP BY e.k ORDER BY 10 DESC LIMIT 25"
+            );
+            let map = |r: &rusqlite::Row| -> rusqlite::Result<SourceUsage> {
+                Ok(SourceUsage {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    kind: r.get(2)?,
+                    project: r.get(3)?,
+                    last_ts: r.get(4)?,
+                    usage: slice_of(r, 5)?,
+                    surfaces: Vec::new(),
+                })
+            };
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows: Vec<SourceUsage> = if surface.is_some() {
+                stmt.query_map(params![start_iso, end_iso, sf], map)?.collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![start_iso, end_iso], map)?.collect::<Result<Vec<_>, _>>()?
+            };
+            let split_sql = format!(
+                "SELECT COALESCE(workspace_id, source_id, 'unattributed'), surface, COALESCE(SUM(cost_usd),0)
+                 FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
+                 GROUP BY 1, 2"
+            );
+            let split_map = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, f64)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            };
+            let mut stmt = self.conn.prepare(&split_sql)?;
+            let splits: Vec<(String, String, f64)> = if surface.is_some() {
+                stmt.query_map(params![start_iso, end_iso, sf], split_map)?.collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![start_iso, end_iso], split_map)?.collect::<Result<Vec<_>, _>>()?
+            };
+            for (k, sfc, cost) in splits {
+                if let Some(row) = rows.iter_mut().find(|r| r.id == k) {
+                    row.surfaces.push(SurfaceCost { surface: sfc, cost_usd: cost });
+                }
+            }
+            for row in &mut rows {
+                row.surfaces.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd));
+            }
+            rows
+        };
+
+        // Trend: hourly for a window of two days or less, daily beyond.
+        let span_hours = match (
+            chrono::DateTime::parse_from_rfc3339(start_iso),
+            chrono::DateTime::parse_from_rfc3339(end_iso),
+        ) {
+            (Ok(a), Ok(b)) => (b - a).num_hours(),
+            _ => 24 * 30,
+        };
+        let trend_bucket = if span_hours <= 48 { "hour" } else { "day" };
+        let bucket_fmt = if trend_bucket == "hour" { "%Y-%m-%dT%H:00" } else { "%Y-%m-%d" };
+        let trend = {
+            let sql = format!(
+                "SELECT strftime(?4, ts_utc, ?5) AS b,
+                        COALESCE(SUM(cost_usd),0), COALESCE(SUM(input_tokens + output_tokens),0)
+                 FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
+                 GROUP BY b HAVING b IS NOT NULL ORDER BY b"
+            );
+            let map = |r: &rusqlite::Row| -> rusqlite::Result<UsageTrendPoint> {
+                Ok(UsageTrendPoint {
+                    bucket: r.get(0)?,
+                    cost_usd: r.get(1)?,
+                    tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            };
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_map(params![start_iso, end_iso, sf, bucket_fmt, shift], map)?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                // ?3 is unused without a surface filter; bind a placeholder so
+                // the numbered parameters line up.
+                stmt.query_map(params![start_iso, end_iso, "", bucket_fmt, shift], map)?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        let active_days: i64 = {
+            let sql = format!(
+                "SELECT COUNT(DISTINCT strftime('%Y-%m-%d', ts_utc, ?4))
+                 FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_row(params![start_iso, end_iso, sf, shift], |r| r.get(0))?
+            } else {
+                stmt.query_row(params![start_iso, end_iso, "", shift], |r| r.get(0))?
+            }
+        };
+        let per_active_day_usd = if active_days > 0 {
+            totals.cost_usd / active_days as f64
+        } else {
+            0.0
+        };
+
+        // Rolling last 24h regardless of the range — the burn rate right now.
+        let last_24h_usd: f64 = {
+            let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+            let sql = format!(
+                "SELECT COALESCE(SUM(cost_usd),0) FROM spend_events
+                 WHERE ts_utc >= ?1 {}",
+                if surface.is_some() { "AND surface = ?2" } else { "" }
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_row(params![cutoff, sf], |r| r.get(0))?
+            } else {
+                stmt.query_row(params![cutoff], |r| r.get(0))?
+            }
+        };
+
+        // Rows the ledger could not price (unknown model / $0 catalog).
+        let unpriced_calls: i64 = {
+            let sql = format!(
+                "SELECT COUNT(*) FROM spend_events
+                 WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
+                   AND cost_usd = 0 AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            if surface.is_some() {
+                stmt.query_row(params![start_iso, end_iso, sf], |r| r.get(0))?
+            } else {
+                stmt.query_row(params![start_iso, end_iso], |r| r.get(0))?
+            }
+        };
+
+        Ok(UsageReport {
+            start: start_iso.to_string(),
+            end: end_iso.to_string(),
+            surface: surface.map(str::to_string),
+            totals,
+            by_surface,
+            by_model,
+            by_source,
+            trend,
+            trend_bucket: trend_bucket.to_string(),
+            active_days,
+            per_active_day_usd,
+            last_24h_usd,
+            unpriced_calls,
+            pricing_refreshed_at: None,
         })
     }
 
@@ -4691,6 +4976,8 @@ impl Db {
         status: &str,
         input_tokens: i64,
         output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
         cost_usd: f64,
         artifact_json: Option<&str>,
     ) -> AppResult<()> {
@@ -4711,21 +4998,47 @@ impl Db {
         // retire-inclusive run meter). Best-effort: a ledger hiccup must not fail
         // the run itself, and the authoritative run figure is still runs.cost_usd.
         if cost_usd > 0.0 || input_tokens > 0 || output_tokens > 0 {
-            if let Err(e) = self.record_direct_spend(stage_id, &now, input_tokens, output_tokens, cost_usd) {
+            if let Err(e) = self.record_direct_spend(
+                stage_id,
+                &now,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                cost_usd,
+            ) {
                 tracing::warn!(stage_id, error = %e, "failed to mirror DIRECT stage spend to the ledger");
             }
         }
         Ok(())
     }
 
+    /// Re-close a halted stage as `done` with a director-accepted artifact,
+    /// keeping the token/cost columns the failed attempt already burned. Does
+    /// NOT mirror to the ledger: that spend was recorded when the attempt
+    /// completed, and re-completing through `complete_run_stage` would insert
+    /// a second `direct` row under a fresh timestamp key (double-counting the
+    /// stage in Usage and budgets).
+    pub fn accept_run_stage_partial(&self, stage_id: &str, artifact_json: &str) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE run_stages SET status = 'done', artifact = ?2, finished_at = ?3 WHERE id = ?1",
+            params![stage_id, artifact_json, now],
+        )?;
+        Ok(())
+    }
+
     /// Resolve a stage's workspace/project/model and append a `direct` spend
     /// event. `finished_at`-derived idempotency key = one row per completion.
+    #[allow(clippy::too_many_arguments)]
     fn record_direct_spend(
         &self,
         stage_id: &str,
         ts_utc: &str,
         input_tokens: i64,
         output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
         cost_usd: f64,
     ) -> AppResult<()> {
         let attr: Option<(String, Option<String>, String, Option<String>)> = self
@@ -4757,8 +5070,8 @@ impl Db {
             model,
             input_tokens,
             output_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
+            cache_read_tokens,
+            cache_creation_tokens,
             provider_cost_usd: None,
             computed_cost_usd: Some(cost_usd),
             cost_usd,
@@ -5458,6 +5771,139 @@ fn period_since_utc(period: &str) -> String {
         .earliest()
         .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
         .unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
+// ─── Usage report types ────────────────────────────────────────────────
+
+/// One aggregate of the ledger — the whole range, one surface, one model or
+/// one workspace/session.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSlice {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cost_usd: f64,
+    /// Ledger rows (billed calls) in the slice.
+    pub calls: i64,
+    /// `cache_read / (input + cache_read + cache_create)` × 100, or `None`
+    /// when the slice's rows carry no cache data at all.
+    pub cache_hit_pct: Option<f64>,
+    /// Whether any row in the slice reported cache tokens.
+    pub cache_tracked: bool,
+}
+
+impl UsageSlice {
+    pub fn new(
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
+        cost_usd: f64,
+        calls: i64,
+    ) -> Self {
+        let (cache_hit_pct, cache_tracked) =
+            cache_hit_pct(input_tokens, cache_read_tokens, cache_creation_tokens);
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost_usd,
+            calls,
+            cache_hit_pct,
+            cache_tracked,
+        }
+    }
+}
+
+/// The honest cache hit ratio: the share of prompt tokens read from cache.
+/// A cache write is a miss (paid at a premium), so it sits in the
+/// denominator only. `(None, false)` when nothing about the cache was ever
+/// reported for these rows.
+pub fn cache_hit_pct(input: i64, cache_read: i64, cache_create: i64) -> (Option<f64>, bool) {
+    let tracked = cache_read + cache_create > 0;
+    let prompt = input + cache_read + cache_create;
+    if !tracked || prompt <= 0 {
+        return (None, tracked);
+    }
+    (Some(cache_read as f64 / prompt as f64 * 100.0), true)
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUsage {
+    pub surface: String,
+    #[serde(flatten)]
+    pub usage: UsageSlice,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model: String,
+    #[serde(flatten)]
+    pub usage: UsageSlice,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceCost {
+    pub surface: String,
+    pub cost_usd: f64,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceUsage {
+    /// Workspace id, RUN session id, or a raw source id.
+    pub id: String,
+    /// The workspace's or session's name; the id when neither is known.
+    pub label: String,
+    /// `workspace` | `session` | `other`
+    pub kind: String,
+    /// Project name (workspaces only).
+    pub project: Option<String>,
+    pub last_ts: String,
+    #[serde(flatten)]
+    pub usage: UsageSlice,
+    /// Cost split by surface, largest first — the stacked bar.
+    pub surfaces: Vec<SurfaceCost>,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTrendPoint {
+    /// Local-time bucket: `YYYY-MM-DDTHH:00` (hour) or `YYYY-MM-DD` (day).
+    pub bucket: String,
+    pub cost_usd: f64,
+    pub tokens: u64,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    pub start: String,
+    pub end: String,
+    pub surface: Option<String>,
+    pub totals: UsageSlice,
+    pub by_surface: Vec<SurfaceUsage>,
+    pub by_model: Vec<ModelUsage>,
+    pub by_source: Vec<SourceUsage>,
+    pub trend: Vec<UsageTrendPoint>,
+    /// `hour` | `day`
+    pub trend_bucket: String,
+    /// Local calendar days in the range with any spend.
+    pub active_days: i64,
+    /// `totals.cost_usd / active_days` — what a working day costs.
+    pub per_active_day_usd: f64,
+    /// Spend in the rolling last 24 hours (independent of the range).
+    pub last_24h_usd: f64,
+    /// Rows with tokens but $0 — a model the catalog could not price.
+    pub unpriced_calls: i64,
+    /// When the pricing catalog was last refreshed (filled by the command).
+    pub pricing_refreshed_at: Option<String>,
 }
 
 /// Cloud vs. local usage split for the Usage dashboard.
