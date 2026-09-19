@@ -719,23 +719,16 @@ impl ExternalTools for McpSubagentTools {
             Some(sem) => Some(Arc::clone(sem).acquire_owned().await.map_err(|_| "MCP error: server turnstile closed".to_string())?),
             None => None,
         };
-        let registry = Arc::clone(&self.registry);
-        let wp = self.worktree.clone();
-        let name = name.to_string();
-        let input = input.clone();
-        // A timeout drops the join handle, not the call: the server may still
-        // execute a write after "timed out" is reported. The registry's
-        // per-server mutex frees when the call returns.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            tokio::task::spawn_blocking(move || registry.call(&wp, &name, &input)),
+        // Bounded on the wire (the turnstile above absorbs the queue), and a
+        // timeout STOPS the server so the call can never complete later.
+        crate::mcp::call_bounded(
+            Arc::clone(&self.registry),
+            self.worktree.clone(),
+            name.to_string(),
+            input.clone(),
+            crate::mcp::CALL_TIMEOUT,
         )
         .await
-        {
-            Ok(Ok(Ok(out))) => Ok(out),
-            Ok(Ok(Err(e))) => Err(format!("MCP error: {e}")),
-            _ => Err("MCP error: tool call timed out".to_string()),
-        }
     }
 }
 

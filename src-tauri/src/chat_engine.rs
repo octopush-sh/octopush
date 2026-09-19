@@ -2502,19 +2502,19 @@ impl ChatEngine {
                 } else if u.name == RECALL_TOOL_NAME {
                     self.recall_tool_output(&request.thread_id, &u.input)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
-                    let mcp = Arc::clone(&self.mcp);
-                    let wp = workspace_path.clone();
-                    let name = u.name.clone();
-                    let input = u.input.clone();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        tokio::task::spawn_blocking(move || mcp.call(&wp, &name, &input)),
+                    // Bounded, and a timeout STOPS the server so the call can
+                    // never complete later in the background.
+                    match crate::mcp::call_bounded(
+                        Arc::clone(&self.mcp),
+                        workspace_path.clone(),
+                        u.name.clone(),
+                        u.input.clone(),
+                        crate::mcp::CALL_TIMEOUT,
                     )
                     .await
                     {
-                        Ok(Ok(Ok(out))) => (out, true),
-                        Ok(Ok(Err(e))) => (format!("MCP error: {e}"), false),
-                        _ => ("MCP error: tool call timed out".to_string(), false),
+                        Ok(out) => (out, true),
+                        Err(e) => (e, false),
                     }
                 } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
                     // Unify with `$`-direct: the agent runs commands in the SAME
