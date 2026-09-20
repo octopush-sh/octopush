@@ -1913,38 +1913,6 @@ function App() {
   }
 
   // ── Render: pre-project views ──
-  if (!project) {
-    if (appView === "new-project") {
-      return (
-        <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} onSketch={handleSketch} />
-          <ToastContainer />
-        </div>
-      );
-    }
-    return (
-      <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
-        <WelcomeScreen
-          onNewProject={() => setAppView("new-project")}
-          onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
-          onSketch={handleSketch}
-        />
-        <ToastContainer />
-      </div>
-    );
-  }
-
-  // ── Render: workspace shell ──
-  const customizingWorkspace = (() => {
-    if (!customizingWorkspaceId) return null;
-    // Search across all workspaces from all projects
-    for (const projectWs of Object.values(workspacesByProjectId)) {
-      const ws = projectWs.find((w) => w.id === customizingWorkspaceId);
-      if (ws) return ws;
-    }
-    return null;
-  })();
-
   // ⌘1..⌘9 index the active project's `workspaces` list (see the keyboard
   // handler above); the rail shows the hint on exactly those rows, so it can
   // never name a key that does something else.
@@ -2007,6 +1975,41 @@ function App() {
       workspaces: workspacesByProjectId[p.id] || [],
     }));
   }, [project, recentProjects, workspacesByProjectId, projectCustomizationsVersion]);
+
+  // ── Hooks end here. Everything below may return early (the no-project
+  // view), so no hook may follow — React counts them per render (#310).
+  // `App.hooks.test.ts` guards this line.
+  if (!project) {
+    if (appView === "new-project") {
+      return (
+        <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
+          <NewProjectFlow onBack={() => setAppView("project")} onGenesis={handleGenesis} onSketch={handleSketch} />
+          <ToastContainer />
+        </div>
+      );
+    }
+    return (
+      <div className="flex h-screen w-screen bg-octo-bg text-octo-ivory">
+        <WelcomeScreen
+          onNewProject={() => setAppView("new-project")}
+          onGenesis={(p, n, model) => handleGenesis(p, n, "~/Octopush", model)}
+          onSketch={handleSketch}
+        />
+        <ToastContainer />
+      </div>
+    );
+  }
+
+  // ── Render: workspace shell ──
+  const customizingWorkspace = (() => {
+    if (!customizingWorkspaceId) return null;
+    // Search across all workspaces from all projects
+    for (const projectWs of Object.values(workspacesByProjectId)) {
+      const ws = projectWs.find((w) => w.id === customizingWorkspaceId);
+      if (ws) return ws;
+    }
+    return null;
+  })();
 
   return (
     <div className="flex flex-col h-screen w-screen bg-octo-bg text-octo-ivory">
