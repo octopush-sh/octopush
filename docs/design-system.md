@@ -380,6 +380,7 @@ Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPan
 At any moment there is **exactly one** brass-accented *live* element per attention scope — never two pulses at once. `src/lib/beacon.ts`'s `beaconAnchor()` is the pure priority selector (decision strip CTA → running stage card → ready launcher CTA → calm/`null`); components only ask "am I the anchor?" via the id it returns. Fleet scope (Mission Control / the `RunsTray` chip) has its own rule: only the **longest-waiting** needs-you card pulses (FIFO by `statusSince`), and the top-bar chip pulses only when at least one run needs the director.
 
 - The pulse itself is `.octo-stage-pulse` — a 2.4s looping `box-shadow` keyframe (`0%,100% → 0 0 0 0 transparent`, `50% → 0 0 0 3px var(--brass-ghost)`), never `infinite`-scaling or springy.
+- The workspace rail's beacon is its own older primitive, `.animate-attention-pulse` (a 1.4s ring on the monogram), governed by the same law: `resolveAttention()` in `WorkspaceRail.tsx` lets exactly one row pulse and dots the rest.
 - **Under `prefers-reduced-motion`:** the pulse animation is disabled and replaced with a **static halo** — a permanent `0 0 0 1px var(--brass-dim)` box-shadow — so the anchor is still legible without motion.
 - PRM handling lives at the CSS layer (the class's own `@media (prefers-reduced-motion: reduce)` block), not in `beacon.ts` — the selector is presentation-agnostic; only the visual expression of "this is the anchor" changes under PRM.
 
@@ -441,7 +442,7 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 | Surface       | Width | Notes |
 |---------------|-------|-------|
-| Rail          | 48px  | Workspace monograms (italic serif, brass on active), brass vertical indicator. |
+| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it borrows the Run session rail's geometry. See "Workspace rail — the index" below. |
 | ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. |
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
@@ -456,6 +457,48 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 - **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
 
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
+
+### Workspace rail — the index (2026-09-20)
+
+The left rail lists projects and their missions as a **typeset index**, not a
+file explorer. Spec: `docs/superpowers/specs/2026-09-20-workspace-rail-index-redesign-design.md`.
+Seven rules, each a direct consequence of §1, §6 and §9:
+
+1. **One surface.** No project cards, no bordered monograms, no chips. The rail
+   is `panel` with one right hairline; hierarchy is carried by type (a 28px
+   Spectral project line over 32px sans rows) and space (12px between projects).
+2. **The edge speaks of state, never identity.** A reserved 2px slot at the
+   row's left: brass on the active row, `.rail-bar-running` marching segments
+   while the workspace works (brass on the active row, **sage** elsewhere —
+   §7's "no status in brass"), transparent at rest. The workspace tint never
+   colours the edge.
+3. **The glyph is the one carrier of the tint.** A bare 20px Spectral glyph in
+   the tint accent — no border, no fill. Customisation (glyph + tint) gains
+   visibility because nothing else on the row is coloured.
+4. **Meta is unboxed mono.** Ticket in sage, `↑N`/`↓N` in mute, PR in
+   verdigris, uncommitted changes as a glyph; `.octo-tabular`; every glyph with
+   a `title`. Header aggregates (`N missions · dirty · PRs`) appear only while
+   the project is **folded** — a count visible in the list is never repeated in
+   its header.
+5. **The project line is quiet.** Hexagon mark in mute (the project's tint only
+   when the user chose one, so N projects never mean N brass hexagons), name in
+   Spectral 13 (ivory for the project holding the active workspace), actions
+   revealed on hover/focus (new mission · grip · chevron).
+6. **One beacon.** `resolveAttention()` gives the pulse to the flagged workspace
+   waiting longest (`flag.since`, the first ping of the current wait — never the
+   latest `at`) and a static 5px brass dot to every other; the active
+   workspace and a running one never signal (the marching edge owns that row).
+   `.animate-attention-pulse` falls back to a static `--brass-dim` halo under
+   `prefers-reduced-motion`.
+7. **Collapsed, it is the Run session rail.** 44px, 32px cells, the same
+   reserved edge, one cluster per project headed by its mark, and a `fixed`
+   hover/focus flyout in the MenuSurface chrome (project · name · status ·
+   `⌘N`) instead of a native title.
+
+The search line is the rail's only chrome: a borderless `Search` icon with an
+upright-serif placeholder whose bottom hairline turns brass on focus, and the
+one `+` icon button (Add project) beside it. Hits are washed with the
+found-match tokens (§4). Nothing else in the rail carries a border.
 
 ### Run mode — session navigation
 

@@ -31,6 +31,7 @@ import {
   type DecorationSet,
 } from "@codemirror/view";
 import { identifierNear } from "./symbolIndex";
+import { isMac } from "../../lib/platform";
 
 /** What the user asked about, and where they asked from. */
 export interface DefinitionRequest {
@@ -108,13 +109,6 @@ export function resolvePointerTarget(
     if (coords.x > end.right + EDGE_SLOP) return null;
   }
   return hit;
-}
-
-/** macOS uses ⌘ where every other platform uses Ctrl. Guarded for jsdom and
- *  for the pre-hydration window where `navigator` may be absent. */
-function isMac(): boolean {
-  if (typeof navigator === "undefined") return false;
-  return /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
 }
 
 /** Is the go-to-definition modifier held for this event? */

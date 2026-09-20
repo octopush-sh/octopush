@@ -1,7 +1,14 @@
-import { useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
-  ChevronDown, GripVertical, Plus, Hammer, Shield,
-  GitCommitHorizontal, GitPullRequest, ArrowUp, ArrowDown,
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  GitCommitHorizontal,
+  GitPullRequest,
+  GripVertical,
+  Plus,
+  Search,
 } from "lucide-react";
 import {
   DndContext,
@@ -21,12 +28,32 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
+import { MENU_CHROME } from "../lib/menuStyles";
 import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
-import { useAttentionStore } from "../stores/attentionStore";
+import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
-import { INTENT_ICON } from "../lib/missionIntent";
 import { ProjectMark } from "./icons/ProjectMark";
+import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
+
+/**
+ * The workspace rail — "the index".
+ *
+ * Projects and their missions read as a typeset index, not a file explorer:
+ * one surface (no cards, no bordered monograms, no chips), hierarchy carried
+ * by type and space. The rules, from the 2026-09-20 rail redesign spec:
+ *
+ *  - The 2px identity edge speaks of STATE only — brass on the active row,
+ *    marching segments while the workspace works, transparent otherwise. The
+ *    workspace tint lives in the monogram glyph and nowhere else.
+ *  - Git/PR/ticket meta is unboxed mono in mute; PR in verdigris. Header
+ *    aggregates appear only while a project is folded (a count visible in
+ *    the list is never repeated in its header).
+ *  - Exactly one brass pulse per rail (the workspace waiting longest); every
+ *    other workspace that needs you carries a static brass dot.
+ *  - Collapsed, the rail is the Run session rail's geometry (44px, 32px
+ *    cells, reserved edge) with a hover flyout for project · name · status.
+ */
 
 /** Hierarchical project/workspace structure for the rail. */
 export interface ProjectGroup {
@@ -42,7 +69,7 @@ interface Props {
   activeWorkspaceId: string | null;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
-  /** Called when the user right-clicks a workspace monogram. */
+  /** Called when the user right-clicks a workspace row / cell. */
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
   /** Called when user clicks to create a workspace for a specific project. */
   onNewWorkspaceForProject?: (projectId: string) => void;
@@ -59,16 +86,35 @@ interface Props {
   /** Open PR per workspace id (null = none), for the PR indicator (§4.3). */
   prByWs?: Record<string, Pr | null>;
   /** Per-workspace "actively processing" signal (TALK streaming / RUN executing
-   *  / DIRECT run). When true the row's identity bar animates; mutually
-   *  exclusive with the attention pulse. */
+   *  / DIRECT run). When true the row's identity edge marches; mutually
+   *  exclusive with the attention signal. */
   runningByWs?: Record<string, boolean>;
   /** Collapsed state is owned by the parent — the toggle lives in the footer. */
   isCollapsed: boolean;
   /** Persist a new project order (ids top→bottom). */
   onReorderProjects?: (ids: string[]) => void;
+  /** Keyboard jump per workspace id (`⌘1`…`⌘9`), for tooltips and the
+   *  collapsed flyout. Computed by the owner from the same list the shortcut
+   *  handler indexes, so the hint can never lie. */
+  shortcutByWs?: Record<string, string>;
 }
 
 const COLLAPSE_KEY = "railProjectCollapsed";
+
+const RAIL_WIDTH_EXPANDED = "w-[280px]";
+const RAIL_WIDTH_COLLAPSED = "w-[44px]";
+
+const EASE = "ease-[cubic-bezier(0.2,0.8,0.3,1)]";
+
+/** The canonical quiet icon button (design-system §9), sized per use. */
+const ICON_BTN =
+  "flex shrink-0 items-center justify-center rounded text-octo-mute transition-[color,background-color,opacity] duration-[180ms] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
+
+/** The found-match wash (design-system §4) on the filter hit inside a name. */
+const HIT_WASH =
+  "rounded-[2px] bg-[var(--octo-match)] text-[var(--octo-match-ink)] shadow-[inset_0_0_0_1px_var(--octo-match-ring)]";
+
+type Attention = "beacon" | "dot";
 
 /** Per-project collapsed map from localStorage. Absent id ⇒ expanded (§4.6). */
 function loadCollapsedFromStorage(): Record<string, boolean> {
@@ -78,6 +124,55 @@ function loadCollapsedFromStorage(): Record<string, boolean> {
   } catch {
     return {};
   }
+}
+
+/**
+ * The single beacon, applied to the rail (design-system §6, Law 2): among the
+ * workspaces that can signal attention right now, exactly one pulses — the one
+ * that has been waiting longest — and the rest carry a static brass dot.
+ *
+ * A workspace cannot signal while it is the active one (you are already
+ * there) or while it is working: the marching edge owns that row, and the
+ * flag takes over the moment the run pauses or finishes. Pure and exported so
+ * the rule is testable on its own.
+ */
+export function resolveAttention(
+  projects: ProjectGroup[] | undefined,
+  flagsByWs: Record<string, AttentionFlag> | undefined,
+  activeWorkspaceId: string | null,
+  runningByWs: Record<string, boolean> | undefined,
+): Record<string, Attention> {
+  const candidates: { id: string; at: number }[] = [];
+  for (const project of projects || []) {
+    for (const ws of project?.workspaces || []) {
+      const id = ws?.id;
+      if (!id) continue;
+      const flag = flagsByWs?.[id];
+      if (!flag) continue;
+      if (id === activeWorkspaceId) continue;
+      if (runningByWs?.[id]) continue;
+      // `since` is the first ping of the current wait; `at` moves with every
+      // ping and would let a chatty terminal steal the beacon.
+      candidates.push({ id, at: flag.since ?? flag.at ?? 0 });
+    }
+  }
+  if (candidates.length === 0) return {};
+  const beacon = candidates.reduce((oldest, c) => (c.at < oldest.at ? c : oldest));
+  const out: Record<string, Attention> = {};
+  for (const c of candidates) out[c.id] = c.id === beacon.id ? "beacon" : "dot";
+  return out;
+}
+
+/** The linked ticket, or one detected from the branch under the project's key. */
+function ticketKeyFor(ws: Workspace, project: ProjectGroup): string | null {
+  return ws?.linkedIssueKey ?? detectIssueKeyForProject(ws?.branch ?? "", project?.jiraProjectKey ?? null);
+}
+
+/** A project and the rows it shows: all of them at rest or on a project-name
+ *  hit, only the hits otherwise; a project with nothing to show leaves the rail. */
+interface VisibleProject {
+  project: ProjectGroup;
+  visibleWs: Workspace[];
 }
 
 export function WorkspaceRail({
@@ -96,13 +191,35 @@ export function WorkspaceRail({
   runningByWs,
   isCollapsed,
   onReorderProjects,
+  shortcutByWs,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
     loadCollapsedFromStorage,
   );
   const [filter, setFilter] = useState("");
-  const q = isCollapsed ? "" : filter.trim().toLowerCase();
-  const toggleProjectCollapsed = (projectId: string) => {
+  const q = isCollapsed ? "" : filter.trim();
+  const flagsByWs = useAttentionStore((s) => s.flagsByWs);
+  // Memoised: an attention ping or a git refresh replaces one map, and the
+  // rail must not recompute every project's shape for it.
+  const attentionByWs = useMemo(
+    () => resolveAttention(projects, flagsByWs, activeWorkspaceId, runningByWs),
+    [projects, flagsByWs, activeWorkspaceId, runningByWs],
+  );
+  const visibleProjects = useMemo<VisibleProject[]>(() => {
+    const out: VisibleProject[] = [];
+    for (const project of projects || []) {
+      const workspaces = project?.workspaces || [];
+      if (q === "" || matchRange(project?.name ?? "", q)) {
+        out.push({ project, visibleWs: workspaces });
+        continue;
+      }
+      const hits = workspaces.filter((w) => matchRange(w?.name ?? "", q) !== null);
+      if (hits.length > 0) out.push({ project, visibleWs: hits });
+    }
+    return out;
+  }, [projects, q]);
+
+  const toggleProjectCollapsed = useCallback((projectId: string) => {
     setCollapsedProjects((prev) => {
       const next = { ...prev, [projectId]: !prev[projectId] };
       try {
@@ -112,7 +229,7 @@ export function WorkspaceRail({
       }
       return next;
     });
-  };
+  }, []);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -130,100 +247,169 @@ export function WorkspaceRail({
     next.splice(to, 0, moved);
     onReorderProjects?.(next);
   };
+
   return (
     <aside
-      className={`flex h-full flex-col items-center border-r border-octo-hairline bg-octo-panel pb-3 pt-9 transition-all duration-[220ms] ${
-        isCollapsed ? "w-[50px] gap-1" : "w-[280px] gap-2"
+      className={`flex h-full shrink-0 flex-col border-r border-octo-hairline bg-octo-panel pt-2 transition-[width] duration-[220ms] ${EASE} ${
+        isCollapsed ? RAIL_WIDTH_COLLAPSED : RAIL_WIDTH_EXPANDED
       }`}
       aria-label="Missions"
     >
-      <div className={`flex-1 flex flex-col w-full overflow-y-auto ${isCollapsed ? "gap-0.5" : "gap-2"}`}>
-        {!isCollapsed && (
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Escape") setFilter(""); }}
-            placeholder="Filter projects & missions"
-            spellCheck={false}
-            aria-label="Filter the rail"
-            className="mx-3 mb-1 rounded-md border border-octo-border-strong bg-octo-onyx px-2.5 py-1.5 font-mono text-[11px] text-octo-ivory placeholder:text-octo-mute outline-none focus:border-octo-brass"
-          />
-        )}
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-          <SortableContext items={(projects || []).map((p) => p.id)} strategy={verticalListSortingStrategy}>
-            {(projects || []).map((project, projectIndex) => {
-              // Hide projects with no filter hit (header name or any workspace).
-              if (q !== "") {
-                const nameMatch = (project?.name ?? "").toLowerCase().includes(q);
-                const anyWs = (project?.workspaces || []).some((w) =>
-                  (w?.name ?? "").toLowerCase().includes(q),
-                );
-                if (!nameMatch && !anyWs) return null;
-              }
-              return (
-                <SortableProjectGroup
-                  key={project?.id || `project-${projectIndex}`}
-                  project={project}
-                  projectIndex={projectIndex}
-                  projectCount={projects.length}
-                  isCollapsed={isCollapsed}
-                  q={q}
-                  collapsedProjects={collapsedProjects}
-                  toggleProjectCollapsed={toggleProjectCollapsed}
-                  activeWorkspaceId={activeWorkspaceId}
-                  gitSummaryByWs={gitSummaryByWs}
-                  prByWs={prByWs}
-                  runningByWs={runningByWs}
-                  onSelect={onSelect}
-                  onCustomize={onCustomize}
-                  onContextMenu={onContextMenu}
-                  onNewWorkspaceForProject={onNewWorkspaceForProject}
-                  onProjectContextMenu={onProjectContextMenu}
-                  dragEnabled={dragEnabled}
-                />
-              );
-            })}
-          </SortableContext>
-        </DndContext>
-      </div>
-
-      {/* Recently closed (expanded rail only) */}
-      {!isCollapsed && onReopenProject && (
-        <RecentlyClosedDrawer
-          projects={closedProjects ?? []}
-          onReopen={onReopenProject}
+      {isCollapsed ? (
+        <CollapsedRail
+          projects={projects || []}
+          activeWorkspaceId={activeWorkspaceId}
+          onSelect={onSelect}
+          onCustomize={onCustomize}
+          onContextMenu={onContextMenu}
+          onAddProject={onAddProject}
+          onProjectContextMenu={onProjectContextMenu}
+          gitSummaryByWs={gitSummaryByWs}
+          prByWs={prByWs}
+          runningByWs={runningByWs}
+          attentionByWs={attentionByWs}
+          flagsByWs={flagsByWs}
+          shortcutByWs={shortcutByWs}
         />
-      )}
+      ) : (
+        <>
+          {/* The head — one quiet line: a borderless search whose bottom hairline
+              turns brass on focus, and the one "Add project" icon button. */}
+          <div className="flex h-9 shrink-0 items-center gap-1.5 pl-3.5 pr-2">
+            <label
+              className="flex h-[26px] min-w-0 flex-1 items-center gap-2 border-b border-transparent text-octo-mute transition-colors duration-[220ms] focus-within:border-octo-brass focus-within:text-octo-brass"
+              title="Find a project or mission"
+            >
+              <Search size={12} aria-hidden className="shrink-0" />
+              <input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setFilter("");
+                }}
+                placeholder="Find a project or mission"
+                spellCheck={false}
+                aria-label="Find a project or mission"
+                className="min-w-0 flex-1 bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
+              />
+            </label>
+            {onAddProject && (
+              <button
+                type="button"
+                onClick={onAddProject}
+                title="Add project"
+                aria-label="Add project"
+                className={`${ICON_BTN} h-6 w-6`}
+              >
+                <Plus size={14} aria-hidden />
+              </button>
+            )}
+          </div>
 
-      {/* Add project — kept deliberately quiet (one calm footer action). */}
-      {onAddProject && (
-        <button
-          type="button"
-          onClick={onAddProject}
-          className="flex w-full items-center justify-center gap-1.5 px-3 py-2 font-mono text-[12px] text-octo-mute transition-colors hover:text-octo-brass"
-          title="Add project"
-          aria-label="Add project"
-        >
-          <Plus size={14} className="shrink-0" /> {!isCollapsed && "Add project"}
-        </button>
-      )}
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+              <SortableContext
+                items={visibleProjects.map(({ project }) => project.id)}
+                strategy={verticalListSortingStrategy}
+              >
+                {visibleProjects.map(({ project, visibleWs }, projectIndex) => (
+                  <SortableProjectGroup
+                    key={project?.id || `project-${projectIndex}`}
+                    project={project}
+                    visibleWs={visibleWs}
+                    projectIndex={projectIndex}
+                    q={q}
+                    folded={q === "" && !!collapsedProjects[project.id]}
+                    toggleProjectCollapsed={toggleProjectCollapsed}
+                    activeWorkspaceId={activeWorkspaceId}
+                    gitSummaryByWs={gitSummaryByWs}
+                    prByWs={prByWs}
+                    runningByWs={runningByWs}
+                    attentionByWs={attentionByWs}
+                    flagsByWs={flagsByWs}
+                    shortcutByWs={shortcutByWs}
+                    onSelect={onSelect}
+                    onCustomize={onCustomize}
+                    onContextMenu={onContextMenu}
+                    onNewWorkspaceForProject={onNewWorkspaceForProject}
+                    onProjectContextMenu={onProjectContextMenu}
+                    dragEnabled={dragEnabled}
+                  />
+                ))}
+              </SortableContext>
+            </DndContext>
+            {q !== "" && visibleProjects.length === 0 && (
+              <div className="octo-fade-in px-3.5 py-4 font-serif text-[13px] text-octo-mute">
+                Nothing matches
+              </div>
+            )}
+          </div>
 
+          {/* Recently closed (expanded rail only) */}
+          {onReopenProject && (
+            <RecentlyClosedDrawer projects={closedProjects ?? []} onReopen={onReopenProject} />
+          )}
+        </>
+      )}
     </aside>
   );
 }
 
+// ───────────────────────────── shared pieces ─────────────────────────────
+
+/**
+ * The reserved identity edge every row and cell carries, so state never
+ * shifts content by a pixel. Brass marks the active row; the marching bar
+ * marks work (brass on the active row, sage everywhere else — never a status
+ * in brass, never the workspace tint); transparent at rest.
+ */
+function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running: boolean; inset?: number }) {
+  if (running) {
+    return (
+      <span
+        aria-hidden
+        data-running-bar
+        className="rail-bar-running"
+        style={
+          {
+            ["--rail-bar" as string]: active ? "var(--color-octo-brass)" : "var(--color-octo-sage)",
+            left: 0,
+            width: 2,
+            top: inset,
+            bottom: inset,
+          } as React.CSSProperties
+        }
+      />
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      className={`absolute left-0 w-[2px] transition-colors duration-[180ms] ${
+        active ? "bg-octo-brass" : "bg-transparent"
+      }`}
+      style={{ top: inset, bottom: inset }}
+    />
+  );
+}
+
+// ───────────────────────────── expanded: project group ─────────────────────────────
+
 interface SortableProjectGroupProps {
   project: ProjectGroup;
+  /** The rows to show — computed once by the rail (see `VisibleProject`). */
+  visibleWs: Workspace[];
   projectIndex: number;
-  projectCount: number;
-  isCollapsed: boolean;
   q: string;
-  collapsedProjects: Record<string, boolean>;
+  folded: boolean;
   toggleProjectCollapsed: (projectId: string) => void;
   activeWorkspaceId: string | null;
   gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
   prByWs?: Record<string, Pr | null>;
   runningByWs?: Record<string, boolean>;
+  attentionByWs: Record<string, Attention>;
+  flagsByWs: Record<string, AttentionFlag>;
+  shortcutByWs?: Record<string, string>;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
@@ -234,8 +420,8 @@ interface SortableProjectGroupProps {
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
-    project, projectIndex, projectCount, isCollapsed, q, collapsedProjects,
-    toggleProjectCollapsed, activeWorkspaceId, gitSummaryByWs, prByWs, runningByWs,
+    project, visibleWs, projectIndex, q, folded, toggleProjectCollapsed, activeWorkspaceId,
+    gitSummaryByWs, prByWs, runningByWs, attentionByWs, flagsByWs, shortcutByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
     dragEnabled,
   } = props;
@@ -243,192 +429,205 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
     useSortable({ id: project.id, disabled: !dragEnabled });
 
-  const nameMatch = q === "" || (project?.name ?? "").toLowerCase().includes(q);
-  const visibleWs =
-    q === "" || nameMatch
-      ? (project?.workspaces || [])
-      : (project?.workspaces || []).filter((w) => (w?.name ?? "").toLowerCase().includes(q));
-  const projectExpanded = q !== "" ? true : !collapsedProjects[project.id];
+  const workspaces = project?.workspaces || [];
 
-  const tint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : TINTS.brass;
-  const dirtyCount = (project.workspaces || []).filter((w) => gitSummaryByWs?.[w.id]?.dirty).length;
-  const openPrCount = (project.workspaces || []).filter((w) => prByWs?.[w.id]).length;
-
-  // The workspace list — shared by expanded (grouped card) and collapsed modes.
-  const wsGrid = (
-    <div
-      aria-hidden={!isCollapsed && !projectExpanded}
-      inert={!isCollapsed && !projectExpanded}
-      className="grid overflow-hidden transition-all duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
-      style={{
-        gridTemplateColumns: "minmax(0, 1fr)",
-        gridTemplateRows: isCollapsed || projectExpanded ? "1fr" : "0fr",
-        opacity: isCollapsed || projectExpanded ? 1 : 0,
-      }}
-    >
-      {/* Clip wrapper carries NO padding so the grid-rows 0fr collapse reaches a
-          true 0px — padding on the grid item itself survives the collapse and
-          left a visible "lip" of border below a collapsed project's header. The
-          row padding lives on the inner content div instead. */}
-      <div className="min-h-0 overflow-hidden">
-        <div className={`flex flex-col gap-0.5 ${isCollapsed ? "" : "p-1"}`}>
-          {visibleWs.map((ws) => (
-            <WorkspaceRow
-              key={ws?.id || `ws-${projectIndex}`}
-              workspace={ws}
-              active={ws?.id === activeWorkspaceId}
-              isCollapsed={isCollapsed}
-              ticketKey={
-                ws?.linkedIssueKey ??
-                detectIssueKeyForProject(ws?.branch ?? "", project.jiraProjectKey ?? null)
-              }
-              dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
-              ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
-              behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
-              hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
-              running={!!runningByWs?.[ws?.id ?? ""]}
-              onSelect={() => ws?.id && onSelect(ws.id)}
-              onCustomize={() => ws?.id && onCustomize(ws.id)}
-              onContextMenu={
-                onContextMenu && ws?.id
-                  ? (x, y) => onContextMenu(ws.id, x, y)
-                  : undefined
-              }
-            />
-          ))}
-          {!isCollapsed && visibleWs.length === 0 && (
-            <div className="px-3 py-1.5 font-mono text-[10px] tracking-[0.15em] text-octo-mute">
-              No missions yet
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+  // A live filter forces every project open, so folding is not offered while
+  // one is typed: the stored fold state is left exactly as it was.
+  const canFold = q === "";
+  // The project's own tint colours its mark only when the user chose one; an
+  // untinted project stays mute, so N projects never mean N brass hexagons.
+  const projectTint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : undefined;
+  const hasActive = workspaces.some((w) => w?.id === activeWorkspaceId);
+  const dirtyCount = workspaces.filter((w) => gitSummaryByWs?.[w?.id ?? ""]?.dirty).length;
+  const openPrCount = workspaces.filter((w) => prByWs?.[w?.id ?? ""]).length;
+  const verb = folded ? "Expand" : "Collapse";
 
   return (
     <div
       ref={setNodeRef}
-      className="flex flex-col"
+      className={`flex flex-col ${projectIndex === 0 ? "mt-1" : "mt-3"}`}
       style={{
-        marginBottom: projectIndex < projectCount - 1 ? (isCollapsed ? "0.5rem" : "0.6rem") : "0",
         transform: CSS.Transform.toString(transform),
         transition,
         opacity: isDragging ? 0.6 : undefined,
       }}
     >
-      {isCollapsed ? (
-        <>
-          {/* Separator between project clusters in the slim rail. */}
-          {projectIndex > 0 && (
-            <div className="flex justify-center my-1">
-              <div className="h-[1px] w-5 bg-octo-hairline opacity-60" />
-            </div>
-          )}
-          {wsGrid}
-        </>
-      ) : (
-        // Console grouping: each project is a single-bordered card with a
-        // panel-2 header — the boundary the old flat list lacked.
-        <div className="overflow-hidden rounded-lg border border-octo-hairline">
-          {project?.name && (
-            <div
-              className="group flex items-center justify-between gap-2 bg-octo-panel-2 px-3 py-2"
-              onContextMenu={(e) => {
-                e.preventDefault();
-                onProjectContextMenu?.(project.id, e.clientX, e.clientY);
-              }}
+      {/* Header — a line of the index: mark, name, then (folded only) the
+          aggregates, and the quiet actions revealed on hover/focus. */}
+      <div
+        className="group/head relative flex h-7 items-center gap-1.5 pl-3.5 pr-2"
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onProjectContextMenu?.(project.id, e.clientX, e.clientY);
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            if (canFold) toggleProjectCollapsed(project.id);
+          }}
+          aria-expanded={canFold ? !folded : undefined}
+          title={canFold ? `${verb} ${project.name}` : undefined}
+          className="flex h-full min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none"
+        >
+          <ProjectMark
+            size={12}
+            className="shrink-0"
+            color={projectTint?.accent ?? "var(--color-octo-mute)"}
+          />
+          <span
+            data-testid="project-header"
+            className={`truncate font-serif text-[13px] leading-none transition-colors duration-[180ms] group-hover/head:text-octo-ivory ${
+              hasActive ? "text-octo-ivory" : "text-octo-sage"
+            }`}
+          >
+            {project.name}
+          </span>
+        </button>
+
+        {/* Aggregates — visible only while folded. Kept mounted so folding
+            fades them in rather than popping; while open they take no width
+            (the name keeps the line) and are inert. */}
+        <span
+          aria-hidden={!folded}
+          inert={!folded}
+          className={`octo-tabular flex shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap font-mono text-[10px] leading-none text-octo-mute transition-[max-width,opacity] duration-[220ms] ${EASE} ${
+            folded ? "max-w-[200px] opacity-100" : "pointer-events-none max-w-0 opacity-0"
+          }`}
+        >
+          <span>
+            {workspaces.length} {workspaces.length === 1 ? "mission" : "missions"}
+          </span>
+          {dirtyCount > 0 && (
+            <span
+              className="flex items-center gap-[3px]"
+              title={`${dirtyCount} mission${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
             >
-              <div
-                data-testid="project-header"
-                className="flex min-w-0 items-center gap-2 font-mono text-[10px] uppercase tracking-[0.2em]"
-                style={{ color: tint.accent }}
-              >
-                <ProjectMark size={14} className="shrink-0" />
-                <span className="truncate">{project.name}</span>
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                {/* Aggregate status — same chip vocabulary as the rows. */}
-                {dirtyCount > 0 && (
-                  <StatusChip
-                    icon={<GitCommitHorizontal size={11} />}
-                    label={String(dirtyCount)}
-                    tone="sage"
-                    title={`${dirtyCount} mission${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}
-                  />
-                )}
-                {openPrCount > 0 && (
-                  <StatusChip
-                    icon={<GitPullRequest size={11} />}
-                    label={String(openPrCount)}
-                    tone="verdigris"
-                    title={`${openPrCount} open PR${openPrCount === 1 ? "" : "s"}`}
-                  />
-                )}
-                {dragEnabled && (
-                  <button
-                    type="button"
-                    ref={setActivatorNodeRef}
-                    {...attributes}
-                    {...listeners}
-                    aria-label={`Reorder ${project.name}`}
-                    title="Drag to reorder"
-                    className="flex h-5 w-5 cursor-grab items-center justify-center text-octo-mute opacity-0 outline-none transition-opacity hover:text-octo-brass focus-visible:text-octo-brass focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 active:cursor-grabbing"
-                  >
-                    <GripVertical size={12} aria-hidden="true" />
-                  </button>
-                )}
-                {onNewWorkspaceForProject && (
-                  <button
-                    type="button"
-                    onClick={() => onNewWorkspaceForProject(project.id)}
-                    title={`New mission in ${project.name}`}
-                    aria-label={`New mission in ${project.name}`}
-                    className="flex h-5 w-5 items-center justify-center text-octo-mute opacity-0 transition-opacity hover:text-octo-brass group-hover:opacity-100 focus-visible:opacity-100"
-                  >
-                    <Plus size={12} aria-hidden="true" />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => toggleProjectCollapsed(project.id)}
-                  aria-expanded={!collapsedProjects[project.id]}
-                  aria-label={
-                    collapsedProjects[project.id]
-                      ? `Expand ${project.name}`
-                      : `Collapse ${project.name}`
-                  }
-                  className="flex h-5 w-5 items-center justify-center text-octo-mute transition hover:text-octo-brass"
-                >
-                  <ChevronDown
-                    size={12}
-                    aria-hidden="true"
-                    className={`transition-transform duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
-                      collapsedProjects[project.id] ? "-rotate-90" : ""
-                    }`}
-                  />
-                </button>
-              </div>
-            </div>
+              <GitCommitHorizontal size={10} aria-hidden />
+              {dirtyCount}
+            </span>
           )}
-          {wsGrid}
+          {openPrCount > 0 && (
+            <span
+              className="flex items-center gap-[3px] text-octo-verdigris"
+              title={`${openPrCount} open PR${openPrCount === 1 ? "" : "s"}`}
+            >
+              <GitPullRequest size={10} aria-hidden />
+              {openPrCount}
+            </span>
+          )}
+        </span>
+
+        <span className="flex shrink-0 items-center opacity-0 transition-opacity duration-[180ms] group-focus-within/head:opacity-100 group-hover/head:opacity-100">
+          {onNewWorkspaceForProject && (
+            <button
+              type="button"
+              onClick={() => onNewWorkspaceForProject(project.id)}
+              title={`New mission in ${project.name}`}
+              aria-label={`New mission in ${project.name}`}
+              className={`${ICON_BTN} h-5 w-5`}
+            >
+              <Plus size={12} aria-hidden />
+            </button>
+          )}
+          {dragEnabled && (
+            <button
+              type="button"
+              ref={setActivatorNodeRef}
+              {...attributes}
+              {...listeners}
+              aria-label={`Reorder ${project.name}`}
+              title="Drag to reorder"
+              className={`${ICON_BTN} h-5 w-5 cursor-grab active:cursor-grabbing`}
+            >
+              <GripVertical size={12} aria-hidden />
+            </button>
+          )}
+        </span>
+        {/* The chevron is decoration for the pointer: the name button already
+            is the one keyboard-reachable fold control, so this adds no second
+            tab stop. Hidden while a filter holds every project open. */}
+        {canFold && (
+          <span
+            aria-hidden
+            onClick={() => toggleProjectCollapsed(project.id)}
+            title={`${verb} ${project.name}`}
+            className={`${ICON_BTN} h-5 w-5 cursor-pointer ${
+              folded ? "opacity-100" : "opacity-0 group-focus-within/head:opacity-100 group-hover/head:opacity-100"
+            }`}
+          >
+            <ChevronDown
+              size={12}
+              className={`transition-transform duration-[280ms] ${EASE} ${folded ? "-rotate-90" : ""}`}
+            />
+          </span>
+        )}
+      </div>
+
+      {/* Rows — the grid-rows 0fr↔1fr collapse idiom. The clip wrapper carries
+          no padding so a folded project reaches a true 0px. */}
+      <div
+        aria-hidden={folded}
+        inert={folded}
+        className={`grid overflow-hidden transition-[grid-template-rows,opacity] duration-[280ms] ${EASE}`}
+        style={{
+          gridTemplateColumns: "minmax(0, 1fr)",
+          gridTemplateRows: folded ? "0fr" : "1fr",
+          opacity: folded ? 0 : 1,
+        }}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="flex flex-col py-0.5">
+            {visibleWs.map((ws) => (
+              <WorkspaceRow
+                key={ws?.id || `ws-${projectIndex}`}
+                workspace={ws}
+                active={ws?.id === activeWorkspaceId}
+                q={q}
+                ticketKey={ticketKeyFor(ws, project)}
+                dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
+                ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
+                behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
+                hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+                running={!!runningByWs?.[ws?.id ?? ""]}
+                attention={attentionByWs[ws?.id ?? ""] ?? null}
+                attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
+                shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
+                onSelect={() => ws?.id && onSelect(ws.id)}
+                onCustomize={() => ws?.id && onCustomize(ws.id)}
+                onContextMenu={
+                  onContextMenu && ws?.id ? (x, y) => onContextMenu(ws.id, x, y) : undefined
+                }
+              />
+            ))}
+            {visibleWs.length === 0 && (
+              <div className="flex h-8 items-center pl-[42px] pr-3 text-[12px] text-octo-mute">
+                No missions yet
+              </div>
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
 
+// ───────────────────────────── expanded: row ─────────────────────────────
+
 interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
-  isCollapsed: boolean;
+  q: string;
   ticketKey?: string | null;
   dirty?: boolean;
   ahead?: number;
   behind?: number;
   hasOpenPr?: boolean;
-  /** Workspace is actively processing — animates the identity bar. */
+  /** Workspace is actively processing — the identity edge marches. */
   running?: boolean;
+  attention: Attention | null;
+  attentionKind: string | null;
+  shortcut: string | null;
   onSelect: () => void;
   onCustomize: () => void;
   onContextMenu?: (x: number, y: number) => void;
@@ -437,24 +636,23 @@ interface WorkspaceRowProps {
 function WorkspaceRow({
   workspace,
   active,
-  isCollapsed,
+  q,
   ticketKey,
   dirty,
   ahead,
   behind,
   hasOpenPr,
   running,
+  attention,
+  attentionKind,
+  shortcut,
   onSelect,
   onCustomize,
   onContextMenu,
 }: WorkspaceRowProps) {
-  // Hooks must run unconditionally — before any early return (C4).
-  const attentionFlag = useAttentionStore(
-    (s) => s.flagsByWs?.[workspace?.id ?? ""],
-  );
-  // The row's mission posture (missions are 1:1 with code workspaces). Read here
-  // — like attentionFlag — rather than threaded through every prop layer. Three
-  // cheap scalar subscriptions so the row re-renders only on the field it shows.
+  // Hooks must run unconditionally — before any early return (C4). The row's
+  // mission posture (missions are 1:1 with code workspaces) is read here as
+  // three cheap scalar subscriptions rather than threaded through every layer.
   const missionIntent = useMissionsStore(
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.intent ?? null,
   );
@@ -477,12 +675,28 @@ function WorkspaceRow({
     return null;
   }
 
-  // "Needs attention" and "processing" are mutually exclusive: a running
-  // workspace shows the marching bar, never the pulse. (A run that pauses or
-  // finishes drops `running`, at which point the attention flag may take over.)
-  // The suppression only applies in the expanded rail, where the bar exists to
-  // replace the pulse — the collapsed rail has no bar, so it keeps pulsing.
-  const showPulse = !!attentionFlag && !active && (isCollapsed || !running);
+  const name = workspace.name || "Mission";
+
+  // Mission posture rides the monogram's tooltip: the intent word plus the
+  // read-only and sandboxed qualifiers. The ContextHeader carries the same
+  // posture in full, so the rail spends no glyph slot on it.
+  const posture = missionIntent
+    ? [
+        `${missionIntent} mission`,
+        missionGit === "readonly" ? "read-only" : null,
+        missionExec === "sandbox" ? "sandboxed" : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : null;
+
+  const stateSuffix = running
+    ? " — working…"
+    : attention
+      ? ` — needs your attention${attentionKind ? ` (${attentionKind})` : ""}`
+      : "";
+  const hint = shortcut ? ` (${shortcut})` : "";
+  const hit = matchRange(name, q);
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
@@ -494,201 +708,445 @@ function WorkspaceRow({
     }
   };
 
-  if (isCollapsed) {
-    // Collapsed mode: a single centered monogram button — the only identity cue
-    // when the rail is slim, so the tint background stays here.
-    return (
-      <button
-        type="button"
-        onClick={onSelect}
-        onContextMenu={handleContextMenu}
-        title={workspace?.name || "Workspace"}
-        aria-label={
-          showPulse
-            ? `${workspace?.name || "Workspace"} — needs attention`
-            : workspace?.name || "Workspace"
-        }
-        aria-current={active ? "location" : undefined}
-        className={`relative flex h-7 w-7 mx-auto items-center justify-center rounded-md border font-serif transition ${
-          showPulse ? "animate-attention-pulse" : "octo-fade-in"
-        }`}
-        style={{
-          color: tint?.accent || "var(--color-octo-onyx)",
-          borderColor: showPulse
-            ? "var(--color-octo-brass)"
-            : active
-              ? tint?.accent || "transparent"
-              : "transparent",
-          background: tint?.bg || "transparent",
-        }}
-      >
-        {mono?.glyph || "?"}
-      </button>
-    );
-  }
-
-  // Expanded mode — Console row: tint left edge (brass when active), a neutral
-  // monogram, the name, then an aligned status-chip column. Brass marks only
-  // the active workspace; git/PR status is sage/verdigris/mute.
-  const barColor = active ? "var(--color-octo-brass)" : tint?.accent || "transparent";
-
-  // Mission posture, read at a glance: the intent word, plus read-only and
-  // sandboxed qualifiers. Read-only rides the tooltip (the intent glyph already
-  // signals it — a second icon would be redundant); sandboxed earns its own
-  // Shield because exec isolation is orthogonal to intent (a build mission can
-  // be sandboxed too). Mirrors ContextHeader's Shield.
-  const sandboxed = missionExec === "sandbox";
-  const posture = missionIntent
-    ? [
-        `${missionIntent} mission`,
-        missionGit === "readonly" ? "read-only" : null,
-        sandboxed ? "sandboxed" : null,
-      ]
-        .filter(Boolean)
-        .join(" · ")
-    : null;
-
   return (
     <div
-      className={`octo-fade-in group relative flex h-9 items-center gap-2.5 rounded-r-md border-l-[3px] pl-2.5 pr-2 transition-colors duration-[180ms] ${
-        active ? "border-octo-brass bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
+      className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pl-3.5 pr-3 transition-colors duration-[180ms] ${
+        active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
       }`}
-      // While running, the static colored edge is replaced by the marching bar
-      // overlay below — hide the border so its solid color doesn't fill the
-      // gradient's gaps. Idle/active rendering is unchanged.
-      style={
-        running
-          ? { borderLeftColor: "transparent" }
-          : active
-            ? undefined
-            : { borderLeftColor: tint?.accent || "transparent" }
-      }
       onContextMenu={handleContextMenu}
     >
-      {/* Processing bar — marches over the identity edge while the workspace
-          works. aria-hidden: the running state is conveyed in the name tooltip. */}
-      {running && (
-        <span
-          aria-hidden
-          data-running-bar
-          className="rail-bar-running"
-          style={{ "--rail-bar": barColor } as React.CSSProperties}
-        />
-      )}
+      <IdentityEdge active={active} running={!!running} />
 
-      {/* Monogram (24px, neutral — identity color lives on the row edge) */}
+      {/* Monogram — the one carrier of the workspace tint: a bare serif glyph,
+          no border, no fill. The single beacon pulses here. */}
       <button
         type="button"
         onClick={onSelect}
-        title={workspace?.name || "Workspace"}
-        aria-label={workspace?.name || "Workspace"}
-        className={`relative flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md border border-octo-hairline bg-transparent font-serif text-[12px] transition ${
-          showPulse ? "animate-attention-pulse" : ""
+        title={posture ?? undefined}
+        aria-label={attention ? `${name} — needs attention` : name}
+        aria-current={active ? "location" : undefined}
+        className={`flex h-5 w-5 shrink-0 items-center justify-center rounded font-serif text-[12px] leading-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+          attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""
         }`}
-        style={{
-          color: active ? tint?.accent || "var(--color-octo-ivory)" : "var(--color-octo-mute)",
-          borderColor: showPulse ? "var(--color-octo-brass)" : "var(--color-octo-hairline)",
-        }}
+        style={{ color: tint?.accent || "var(--color-octo-sage)" }}
       >
         {mono?.glyph || "?"}
       </button>
 
-      {/* Mission posture — reserved slot so the row never shifts as missions
-          load; every code workspace has a mission, so it fills fast. The intent
-          glyph carries the tooltip (intent · read-only · sandboxed); a sandboxed
-          mission adds a mute Shield, the one posture orthogonal to intent. */}
-      <span
-        // Fixed two-glyph width, left-aligned: intent glyphs line up across every
-        // row (sandboxed or not) and the name column never shifts — not on load,
-        // not between a sandboxed row and its neighbours. A lone intent glyph
-        // leaves the Shield's slot reserved-but-empty.
-        className="flex h-4 w-6 flex-shrink-0 items-center justify-start gap-0.5"
-        role={posture ? "img" : undefined}
-        aria-label={posture ?? undefined}
-        title={posture ?? undefined}
-      >
-        {missionIntent &&
-          (() => {
-            const Icon = INTENT_ICON[missionIntent] ?? Hammer;
-            return <Icon size={11} aria-hidden className="octo-pop-in text-octo-mute" />;
-          })()}
-        {sandboxed && (
-          <Shield size={10} aria-hidden className="octo-pop-in text-octo-mute" />
-        )}
-      </span>
-
-      {/* Workspace name — a real button (keyboard-operable) that truncates with
-          the full name as its tooltip. No aria-label: its accessible name is the
-          visible text, so the monogram stays the single name-labelled control. */}
+      {/* Name — a real button (keyboard-operable) that truncates with the full
+          name, state and jump key as its tooltip. No aria-label: its accessible
+          name is the visible text, so the monogram stays the single
+          name-labelled control. */}
       <button
         type="button"
         onClick={onSelect}
-        title={
-          running
-            ? `${workspace?.name || "Workspace"} — working…`
-            : showPulse
-              ? `${workspace?.name || "Workspace"} — needs your attention${attentionFlag?.kind ? ` (${attentionFlag.kind})` : ""}`
-              : `${workspace?.name || "Workspace"} (right-click to customize)`
-        }
-        className="min-w-0 flex-1 cursor-pointer truncate bg-transparent text-left text-[13px] transition"
-        style={{ color: active ? "var(--color-octo-ivory)" : "var(--color-octo-sage)" }}
+        title={`${name}${stateSuffix}${hint}`}
+        className={`min-w-0 flex-1 truncate text-left text-[13px] transition-colors duration-[180ms] focus-visible:outline-none ${
+          active ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
+        }`}
       >
-        {workspace?.name || "Workspace"}
+        {hit ? <HighlightedLabel label={name} match={hit} className={HIT_WASH} testId="rail-hit" /> : name}
       </button>
 
-      {/* Aligned status column (§4.3) — ticket · ahead/behind · PR · dirty. */}
-      <div className="flex shrink-0 items-center justify-end gap-1">
+      {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·
+          dirty · attention. Brass appears here only as the attention dot. */}
+      <div className="octo-tabular flex shrink-0 items-center gap-2 font-mono text-[10px] leading-none text-octo-mute">
         {ticketKey && (
-          <StatusChip tone="sage" label={ticketKey} title={`Linked issue ${ticketKey}`} />
+          <span className="octo-pop-in text-octo-sage" title={`Linked issue ${ticketKey}`}>
+            {ticketKey}
+          </span>
         )}
         {!!ahead && (
-          <StatusChip icon={<ArrowUp size={11} />} label={String(ahead)} tone="mute" title={`${ahead} commit${ahead === 1 ? "" : "s"} ahead`} />
+          <span
+            className="octo-pop-in flex items-center gap-[2px]"
+            title={`${ahead} commit${ahead === 1 ? "" : "s"} ahead`}
+          >
+            <ArrowUp size={10} aria-hidden />
+            {ahead}
+          </span>
         )}
         {!!behind && (
-          <StatusChip icon={<ArrowDown size={11} />} label={String(behind)} tone="mute" title={`${behind} commit${behind === 1 ? "" : "s"} behind`} />
+          <span
+            className="octo-pop-in flex items-center gap-[2px]"
+            title={`${behind} commit${behind === 1 ? "" : "s"} behind`}
+          >
+            <ArrowDown size={10} aria-hidden />
+            {behind}
+          </span>
         )}
         {hasOpenPr && (
-          <StatusChip icon={<GitPullRequest size={11} />} tone="verdigris" title="Open pull request" />
+          <span
+            role="img"
+            aria-label="Open pull request"
+            title="Open pull request"
+            className="octo-pop-in flex text-octo-verdigris"
+          >
+            <GitPullRequest size={11} aria-hidden />
+          </span>
         )}
         {dirty && !active && (
-          <StatusChip icon={<GitCommitHorizontal size={11} />} tone="sage" title="Uncommitted changes" />
+          <span
+            role="img"
+            aria-label="Uncommitted changes"
+            title="Uncommitted changes"
+            className="octo-pop-in flex"
+          >
+            <GitCommitHorizontal size={11} aria-hidden />
+          </span>
+        )}
+        {attention === "dot" && (
+          <span
+            role="img"
+            aria-label="Needs your attention"
+            title="Needs your attention"
+            className="octo-pop-in h-[5px] w-[5px] rounded-full bg-octo-brass"
+          />
         )}
       </div>
     </div>
   );
 }
 
-/** A small status token — icon and/or short label — used identically by the
- *  project header (aggregates) and the workspace rows. Brass is never used
- *  here; it belongs to the active workspace alone. */
-function StatusChip({
-  icon,
-  label,
-  tone,
-  title,
-}: {
-  icon?: React.ReactNode;
-  label?: string;
-  tone: "sage" | "verdigris" | "mute";
-  title: string;
-}) {
-  const toneClass =
-    tone === "verdigris"
-      ? "border-octo-verdigris/40 text-octo-verdigris"
-      : tone === "mute"
-        ? "border-octo-hairline text-octo-mute"
-        : "border-octo-hairline text-octo-sage";
+// ───────────────────────────── collapsed rail ─────────────────────────────
+
+interface CollapsedRailProps {
+  projects: ProjectGroup[];
+  activeWorkspaceId: string | null;
+  onSelect: (id: string) => void;
+  onCustomize: (id: string) => void;
+  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  onAddProject?: () => void;
+  onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+  gitSummaryByWs?: Record<string, WorkspaceGitSummary>;
+  prByWs?: Record<string, Pr | null>;
+  runningByWs?: Record<string, boolean>;
+  attentionByWs: Record<string, Attention>;
+  flagsByWs: Record<string, AttentionFlag>;
+  shortcutByWs?: Record<string, string>;
+}
+
+interface FlyoutAnchor {
+  id: string;
+  top: number;
+  left: number;
+}
+
+/**
+ * The slim rail: the Run session rail's geometry (44px, 32px cells, a reserved
+ * identity edge), one cluster per project headed by its mark, and a hover /
+ * focus flyout that carries what the width cannot — project, name, status and
+ * the jump key. Positioned `fixed` against the measured cell, since the
+ * scrolling list would clip an absolutely positioned popover.
+ */
+function CollapsedRail({
+  projects,
+  activeWorkspaceId,
+  onSelect,
+  onCustomize,
+  onContextMenu,
+  onAddProject,
+  onProjectContextMenu,
+  gitSummaryByWs,
+  prByWs,
+  runningByWs,
+  attentionByWs,
+  flagsByWs,
+  shortcutByWs,
+}: CollapsedRailProps) {
+  const [flyout, setFlyout] = useState<FlyoutAnchor | null>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = undefined;
+    }
+  }, []);
+  const openFlyout = useCallback(
+    (id: string, anchor: HTMLElement) => {
+      cancelClose();
+      const r = anchor.getBoundingClientRect();
+      setFlyout({ id, top: r.top - 2, left: r.right + 8 });
+    },
+    [cancelClose],
+  );
+  const closeFlyout = useCallback((id: string) => {
+    setFlyout((f) => (f?.id === id ? null : f));
+  }, []);
+  // A short grace window: the pointer crosses 8px of canvas to reach the
+  // flyout, and re-entering cancels the close.
+  const scheduleClose = useCallback(
+    (id: string) => {
+      cancelClose();
+      closeTimer.current = setTimeout(() => closeFlyout(id), 120);
+    },
+    [cancelClose, closeFlyout],
+  );
+  useEffect(() => () => cancelClose(), [cancelClose]);
+
   return (
-    <span
-      title={title}
-      // Icon-only chips carry no text, so give them an image role + label that
-      // screen readers announce; labelled chips are read via their text.
-      role={label ? undefined : "img"}
-      aria-label={label ? undefined : title}
-      className={`octo-pop-in octo-tabular inline-flex items-center gap-[3px] rounded border px-1 py-[1px] font-mono text-[9.5px] leading-none ${toneClass}`}
+    <>
+      <div className="flex h-9 shrink-0 items-center justify-center">
+        {onAddProject && (
+          <button
+            type="button"
+            onClick={onAddProject}
+            title="Add project"
+            aria-label="Add project"
+            className={`${ICON_BTN} h-6 w-6`}
+          >
+            <Plus size={14} aria-hidden />
+          </button>
+        )}
+      </div>
+      <div
+        className="flex min-h-0 w-full flex-1 flex-col items-center overflow-y-auto pb-2"
+        // Scrolling moves the cells out from under a measured flyout, so the
+        // flyout goes rather than drifting off its anchor.
+        onScroll={() => setFlyout(null)}
+      >
+        {projects.map((project, projectIndex) => {
+          const projectTint = project?.tint ? TINTS[project.tint as keyof typeof TINTS] : undefined;
+          return (
+            <div key={project?.id || `project-${projectIndex}`} className="flex w-full flex-col items-center">
+              {projectIndex > 0 && <div aria-hidden className="my-1 h-px w-5 bg-octo-hairline" />}
+              <span
+                role="img"
+                aria-label={project?.name || "Project"}
+                title={project?.name || "Project"}
+                className="flex h-[18px] items-center"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  onProjectContextMenu?.(project.id, e.clientX, e.clientY);
+                }}
+              >
+                <ProjectMark size={12} color={projectTint?.accent ?? "var(--color-octo-mute)"} />
+              </span>
+              {(project?.workspaces || []).map((ws) => {
+                if (!ws?.id) return null;
+                return (
+                  <CollapsedCell
+                    key={ws.id}
+                    workspace={ws}
+                    projectName={project?.name || "Project"}
+                    active={ws.id === activeWorkspaceId}
+                    running={!!runningByWs?.[ws.id]}
+                    attention={attentionByWs[ws.id] ?? null}
+                    attentionKind={flagsByWs?.[ws.id]?.kind ?? null}
+                    ticketKey={ticketKeyFor(ws, project)}
+                    git={gitSummaryByWs?.[ws.id]}
+                    hasOpenPr={!!prByWs?.[ws.id]}
+                    shortcut={shortcutByWs?.[ws.id] ?? null}
+                    flyout={flyout?.id === ws.id ? flyout : null}
+                    onOpen={openFlyout}
+                    onScheduleClose={scheduleClose}
+                    onCancelClose={cancelClose}
+                    onCloseNow={closeFlyout}
+                    onSelect={() => onSelect(ws.id)}
+                    onCustomize={() => onCustomize(ws.id)}
+                    onContextMenu={onContextMenu ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
+                  />
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+interface CollapsedCellProps {
+  workspace: Workspace;
+  projectName: string;
+  active: boolean;
+  running: boolean;
+  attention: Attention | null;
+  attentionKind: string | null;
+  ticketKey: string | null;
+  git?: WorkspaceGitSummary;
+  hasOpenPr: boolean;
+  shortcut: string | null;
+  flyout: FlyoutAnchor | null;
+  onOpen: (id: string, anchor: HTMLElement) => void;
+  onScheduleClose: (id: string) => void;
+  onCancelClose: () => void;
+  onCloseNow: (id: string) => void;
+  onSelect: () => void;
+  onCustomize: () => void;
+  onContextMenu?: (x: number, y: number) => void;
+}
+
+function CollapsedCell({
+  workspace,
+  projectName,
+  active,
+  running,
+  attention,
+  attentionKind,
+  ticketKey,
+  git,
+  hasOpenPr,
+  shortcut,
+  flyout,
+  onOpen,
+  onScheduleClose,
+  onCancelClose,
+  onCloseNow,
+  onSelect,
+  onCustomize,
+  onContextMenu,
+}: CollapsedCellProps) {
+  let mono: ReturnType<typeof resolveMonogram>;
+  let tint: { accent: string; bg: string } | undefined;
+  try {
+    mono = resolveMonogram(workspace);
+    tint = TINTS[mono.tint];
+  } catch (e) {
+    console.error("Error resolving monogram for workspace:", workspace.id, e);
+    return null;
+  }
+  const name = workspace.name || "Mission";
+  // The status line says only what is known: "clean" is a statement about a
+  // fetched git summary, never a stand-in for one that has not arrived yet.
+  const atoms = [
+    ticketKey,
+    git?.ahead ? `↑${git.ahead}` : null,
+    git?.behind ? `↓${git.behind}` : null,
+    hasOpenPr ? "PR open" : null,
+    git?.dirty ? "uncommitted changes" : null,
+    running ? "working…" : null,
+    attention ? `needs your attention${attentionKind ? ` (${attentionKind})` : ""}` : null,
+  ].filter(Boolean);
+  const status = atoms.length > 0 ? atoms.join(" · ") : git ? "clean" : null;
+
+  const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (onContextMenu) {
+      onContextMenu(e.clientX, e.clientY);
+    } else {
+      onCustomize();
+    }
+  };
+
+  return (
+    <div
+      className="relative w-full"
+      onMouseEnter={(e) => onOpen(workspace.id, e.currentTarget)}
+      onMouseLeave={(e) => {
+        // A flyout the keyboard opened belongs to the focus, not the pointer:
+        // it stays until the cell blurs, however the mouse wanders.
+        if (e.currentTarget.contains(document.activeElement)) return;
+        onScheduleClose(workspace.id);
+      }}
+      // Keyboard focus opens the flyout, so keyboard blur has to close it.
+      onBlur={(e) => {
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        onCloseNow(workspace.id);
+      }}
     >
-      {icon}
-      {label}
-    </span>
+      <button
+        type="button"
+        onClick={onSelect}
+        onContextMenu={handleContextMenu}
+        onFocus={(e) => onOpen(workspace.id, e.currentTarget)}
+        // No native `title`: the flyout opens on the same hover (and on focus)
+        // and already carries the name, status and jump key.
+        aria-label={attention ? `${name} — needs attention` : name}
+        aria-current={active ? "location" : undefined}
+        className={`relative flex h-8 w-full items-center justify-center transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass ${
+          active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
+        }`}
+      >
+        <IdentityEdge active={active} running={running} inset={4} />
+        <span
+          className={`flex h-6 w-6 items-center justify-center rounded font-serif text-[13px] leading-none ${
+            attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""
+          }`}
+          style={{ color: tint?.accent || "var(--color-octo-sage)" }}
+        >
+          {mono?.glyph || "?"}
+        </span>
+        {attention === "dot" && (
+          <span
+            aria-hidden
+            className="octo-pop-in absolute right-[7px] top-[6px] h-[5px] w-[5px] rounded-full bg-octo-brass"
+          />
+        )}
+      </button>
+
+      {flyout &&
+        createPortal(
+        <RailFlyout
+          anchor={flyout}
+          testId={`rail-flyout-${workspace.id}`}
+          onMouseEnter={onCancelClose}
+          onMouseLeave={() => onScheduleClose(workspace.id)}
+        >
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="truncate font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+              {projectName}
+            </span>
+            {shortcut && (
+              <span className="shrink-0 font-mono text-[9px] text-octo-mute">{shortcut}</span>
+            )}
+          </div>
+          <div className="mt-1 truncate font-serif text-[13px] text-octo-ivory">{name}</div>
+          {status && (
+            <div className="octo-tabular mt-1 truncate font-mono text-[10px] text-octo-mute" title={status}>
+              {status}
+            </div>
+          )}
+        </RailFlyout>,
+        // Portalled out of the rail's scroll container (as MenuSurface is):
+        // a wheel over the flyout must not chain into the rail and sweep the
+        // flyout away mid-read.
+        document.body,
+        )}
+    </div>
+  );
+}
+
+/**
+ * The flyout panel in the shared menu chrome, portalled to `document.body` and
+ * kept inside the viewport: it is measured after mount and pulled up when the
+ * cell sits close enough to the window's bottom edge that the panel would run
+ * off-screen.
+ */
+function RailFlyout({
+  anchor,
+  testId,
+  onMouseEnter,
+  onMouseLeave,
+  children,
+}: {
+  anchor: FlyoutAnchor;
+  testId: string;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [top, setTop] = useState(anchor.top);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const margin = 8;
+    const { height } = el.getBoundingClientRect();
+    setTop(Math.max(margin, Math.min(anchor.top, window.innerHeight - height - margin)));
+  }, [anchor.top]);
+  return (
+    <div
+      ref={ref}
+      data-testid={testId}
+      className={`${MENU_CHROME} w-[212px] px-3 py-2`}
+      style={{ top, left: anchor.left }}
+      // The pointer made it across the gap — keep the flyout open.
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+    >
+      {children}
+    </div>
   );
 }

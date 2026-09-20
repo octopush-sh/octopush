@@ -10,6 +10,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { pushToast } from "./Toasts";
 import { useVirtualRows } from "../lib/useVirtualRows";
 import { NO_LOCATE } from "../lib/locate";
+import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 
 /** Every row (node or placeholder) renders at exactly this height — the
  *  fixed-row contract the windowing math depends on. */
@@ -138,7 +139,6 @@ function flattenFiltered(
   childrenMap: Record<string, ChildState>,
   query: string,
 ): { rows: FlatRow[]; matchCount: number } {
-  const q = query.toLowerCase();
   let matchCount = 0;
   const visit = (
     path: string,
@@ -148,8 +148,10 @@ function flattenFiltered(
     depth: number,
     isRoot: boolean,
   ): FlatRow[] | null => {
-    const idx = isRoot ? -1 : label.toLowerCase().indexOf(q);
-    const selfMatch = idx >= 0;
+    // The hit's range is found on the label itself (never on a lowercased
+    // copy whose length can differ), so the emphasis lands where the match is.
+    const range = isRoot ? null : matchRange(label, query);
+    const selfMatch = range !== null;
     if (selfMatch) matchCount += 1;
     const childRows: FlatRow[] = [];
     if (isDir) {
@@ -178,7 +180,7 @@ function flattenFiltered(
       depth,
       isRoot,
       isExpanded: isDir && childRows.length > 0,
-      match: selfMatch ? ([idx, idx + q.length] as const) : undefined,
+      match: range ?? undefined,
     };
     return [row, ...childRows];
   };
@@ -939,18 +941,6 @@ function TreeRow({
         </span>
       )}
     </div>
-  );
-}
-
-/** Filter-match emphasis: the matched substring alone reads brass. */
-function HighlightedLabel({ label, match }: { label: string; match: readonly [number, number] }) {
-  const [start, end] = match;
-  return (
-    <>
-      {label.slice(0, start)}
-      <span className="text-octo-brass">{label.slice(start, end)}</span>
-      {label.slice(end)}
-    </>
   );
 }
 

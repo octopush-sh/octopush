@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useMenuChrome } from "../lib/useMenuChrome";
+import { MENU_CHROME } from "../lib/menuStyles";
 
 interface Props {
   /** Viewport coordinates (e.clientX / e.clientY or an anchor rect edge). */
@@ -31,7 +32,7 @@ export function MenuSurface({ x, y, ariaLabel, onDismiss, widthClass = "w-[224px
       ref={ref}
       role="menu"
       aria-label={ariaLabel}
-      className={`octo-menu-enter fixed z-[60] ${widthClass} rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl`}
+      className={`${MENU_CHROME} ${widthClass} py-1`}
       style={{ left: pos.left, top: pos.top, transformOrigin: "top left" }}
     >
       {children}

@@ -4,6 +4,14 @@
  * three diverging copies of these.
  */
 
+/** The menu panel itself — entrance, layering, the panel ground and its
+ *  frame. `MenuSurface` is the one context-menu chrome; hover flyouts that
+ *  are not menus (the rail's collapsed-cell flyout) share the look through
+ *  this string so the two can never drift. Width and padding are the
+ *  caller's. */
+export const MENU_CHROME =
+  "octo-menu-enter fixed z-[60] rounded-md border border-octo-hairline bg-octo-panel shadow-2xl";
+
 /** Standard single-line menu row. */
 export const MENU_ITEM =
   "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";

@@ -73,6 +73,7 @@ import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
+import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
 import type { ModelWithProvider } from "./lib/types";
@@ -1944,7 +1945,21 @@ function App() {
     return null;
   })();
 
-  const projectGroups: ProjectGroup[] = (() => {
+  // ⌘1..⌘9 index the active project's `workspaces` list (see the keyboard
+  // handler above); the rail shows the hint on exactly those rows, so it can
+  // never name a key that does something else.
+  const shortcutByWs = useMemo(() => {
+    const mod = modKeyLabel();
+    const map: Record<string, string> = {};
+    workspaces.slice(0, 9).forEach((w, i) => {
+      map[w.id] = `${mod}${i + 1}`;
+    });
+    return map;
+  }, [workspaces]);
+
+  // Memoised on its inputs: the rail memoises its own derived maps on this
+  // array's identity, so rebuilding it every render would defeat that.
+  const projectGroups: ProjectGroup[] = useMemo(() => {
     // Depend on projectCustomizationsVersion to trigger recalculation when customizations change
     void projectCustomizationsVersion;
 
@@ -1991,7 +2006,7 @@ function App() {
       jiraProjectKey: jiraKeyById[p.id] ?? null,
       workspaces: workspacesByProjectId[p.id] || [],
     }));
-  })();
+  }, [project, recentProjects, workspacesByProjectId, projectCustomizationsVersion]);
 
   return (
     <div className="flex flex-col h-screen w-screen bg-octo-bg text-octo-ivory">
@@ -2021,6 +2036,7 @@ function App() {
         runningByWs={runningByWs}
         isCollapsed={isRailCollapsed}
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
+        shortcutByWs={shortcutByWs}
       />
 
       <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">

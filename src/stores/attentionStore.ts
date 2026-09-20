@@ -27,6 +27,14 @@ export interface AttentionFlag {
   kind: AttentionKind;
   at: number; // ms timestamp of the most recent ping
   /**
+   * ms timestamp of the FIRST ping since the flag was last cleared — how long
+   * this workspace has been waiting. `at` moves with every ping; `since` does
+   * not, so the rail's single beacon (the longest-waiting workspace) cannot
+   * hop to a quieter one just because a chatty terminal rang again. Optional
+   * only for flags written before the field existed; readers fall back to `at`.
+   */
+  since?: number;
+  /**
    * For terminal pings, WHICH session rang — so the Run rail can mark the one
    * session that wants the user instead of the whole workspace. Null for chat
    * pings and for any caller that doesn't know (the flag then behaves exactly
@@ -72,12 +80,20 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
 
   ping: (workspaceId, kind, terminalId) => {
     const now = Date.now();
-    set((s) => ({
-      flagsByWs: {
-        ...s.flagsByWs,
-        [workspaceId]: { kind, at: now, terminalId: terminalId ?? null },
-      },
-    }));
+    set((s) => {
+      const existing = s.flagsByWs[workspaceId];
+      return {
+        flagsByWs: {
+          ...s.flagsByWs,
+          [workspaceId]: {
+            kind,
+            at: now,
+            since: existing ? (existing.since ?? existing.at) : now,
+            terminalId: terminalId ?? null,
+          },
+        },
+      };
+    });
     // Sound, with cooldown so paired chat+terminal completions don't
     // produce a double-chime within the same second.
     const state = get();

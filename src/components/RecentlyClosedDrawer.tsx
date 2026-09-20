@@ -46,7 +46,7 @@ export function RecentlyClosedDrawer({ projects, onReopen }: Props) {
         <div className="mt-1 flex min-h-0 flex-col overflow-hidden">
           {projects.map((p) => (
             <div key={p.id} className="group flex items-center gap-2 px-3 py-1.5">
-              <ProjectMark size={13} className="shrink-0 opacity-50" />
+              <ProjectMark size={13} className="shrink-0" color="var(--color-octo-mute)" />
               <span className="flex-1 truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage">
                 {p.name}
               </span>
