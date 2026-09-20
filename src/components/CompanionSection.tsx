@@ -39,8 +39,6 @@ interface Props {
   storageKey?: string;
   /** Brass eyebrow — for the section the user is looking at right now. */
   accent?: boolean;
-  /** Fill the panel (the section becomes the whole Companion). */
-  fill?: boolean;
   children: ReactNode;
   testId?: string;
   className?: string;
@@ -61,7 +59,6 @@ export function CompanionSection({
   defaultOpen = true,
   storageKey,
   accent = false,
-  fill = false,
   children,
   testId,
   className = "",
@@ -77,7 +74,7 @@ export function CompanionSection({
   return (
     <section
       data-testid={testId}
-      className={`border-t border-octo-hairline first:border-t-0 ${fill ? "flex min-h-0 flex-1 flex-col" : ""} ${className}`}
+      className={`border-t border-octo-hairline first:border-t-0 ${className}`}
     >
       <div className="flex h-9 shrink-0 items-center gap-1 pl-3 pr-2">
         <button
@@ -101,9 +98,7 @@ export function CompanionSection({
         </button>
         {action}
       </div>
-      <Reveal open={open} className={fill ? "min-h-0 flex-1" : ""}>
-        {children}
-      </Reveal>
+      <Reveal open={open}>{children}</Reveal>
     </section>
   );
 }

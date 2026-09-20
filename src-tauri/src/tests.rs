@@ -8287,7 +8287,7 @@ mod live_tests {
     use parking_lot::Mutex;
     use serde_json::{json, Value};
     use crate::orchestrator::agentic::run_agentic_loop;
-    use crate::providers::{LlmProvider, LlmRequest, LlmResponse, LlmStopReason, LlmToolUse};
+    use crate::providers::{LlmContent, LlmProvider, LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmToolUse};
     use std::collections::VecDeque;
 
     struct ScriptedProvider { turns: Mutex<VecDeque<LlmResponse>> }
@@ -8366,6 +8366,21 @@ mod live_tests {
         // Usage from ALL calls (including the close) is preserved.
         assert_eq!(out.input_tokens, 3);
         assert_eq!(out.tool_calls.len(), 2);
+        // The transcript a continuation resumes from: the close instruction
+        // never leaks into it (a resumed run must not be told it cannot call
+        // tools), and it ends with the answer the model gave, as its own turn.
+        let joined = serde_json::to_string(&out.transcript).unwrap();
+        assert!(!joined.contains("cannot call any more tools"), "{joined}");
+        let last = out.transcript.last().unwrap();
+        assert!(matches!(last.role, LlmRole::Assistant));
+        assert!(matches!(&last.content, LlmContent::Text(t) if t == "what I got done: X; still missing: Y"));
+        // …so the continuation note lands as a fresh user turn after it.
+        let resumed = crate::orchestrator::agentic::resume_messages_for_continuation(
+            &crate::orchestrator::agentic::BlockedTranscript { messages: out.transcript.clone(), ask_tool_use_id: String::new() },
+            "You have 15 more tool turns.",
+        );
+        assert!(matches!(resumed.last().unwrap().role, LlmRole::User));
+        assert_eq!(resumed.len(), out.transcript.len() + 1);
     }
 
     #[tokio::test]
@@ -8392,6 +8407,11 @@ mod live_tests {
         assert!(!out.finished, "an empty forced close must not read as success");
         assert!(!out.closed_at_cap);
         assert_eq!(out.text, "(agentic loop hit 2 iterations without finishing)");
+        // The saved conversation (for Resume / a continuation) stops at the
+        // last tool results, without the close instruction.
+        let bt = out.blocked_transcript.as_ref().unwrap();
+        assert!(!serde_json::to_string(&bt.messages).unwrap().contains("cannot call any more tools"));
+        assert!(matches!(bt.messages.last().unwrap().content, LlmContent::ToolResults(_)));
         // The journal explains the cap (notice emitted before the close attempt).
         let events = rec.events.lock();
         let notices: Vec<String> = events.iter()

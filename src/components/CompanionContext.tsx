@@ -202,12 +202,13 @@ export function CompanionContext({
   );
 }
 
-/** The active thread's ledger cost, re-read when a turn settles, a row
- *  lands, or a sub-agent continuation ends — the edges that add spend. */
+/** The active thread's ledger cost, re-read when a turn settles or a
+ *  sub-agent continuation ends — the edges that add spend (not per row: a
+ *  tool-heavy turn lands dozens, and the ledger only matters once it is
+ *  over). */
 function useThreadCost(workspaceId: string): ThreadCost | null {
   const threadId = useChatStore((s) => (workspaceId ? s.activeThreadByWs[workspaceId] ?? null : null));
   const streaming = useChatStore((s) => s.streamingByWs[workspaceId] ?? false);
-  const messageCount = useChatStore((s) => (s.messagesByWs[workspaceId] ?? []).length);
   const continuing = useChatStore((s) => Object.keys(s.continuingCalls).length);
   const [cost, setCost] = useState<ThreadCost | null>(null);
   const seq = useRef(0);
@@ -233,7 +234,7 @@ function useThreadCost(workspaceId: string): ThreadCost | null {
       .catch(() => {
         /* the meter and the rest of the section stand without it */
       });
-  }, [threadId, streaming, messageCount, continuing]);
+  }, [threadId, streaming, continuing]);
 
   return cost;
 }

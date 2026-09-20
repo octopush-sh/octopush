@@ -2058,12 +2058,16 @@ impl Db {
             }
         };
 
-        // Rows the ledger could not price (unknown model / $0 catalog).
+        // Rows the ledger could not price (unknown model / $0 catalog) — the
+        // same set `reprice_unpriced` can price, so the notice and its
+        // "Price them now" agree; a subscription-covered or provider-reported
+        // $0 is a real price, not a gap.
         let unpriced_calls: i64 = {
             let sql = format!(
                 "SELECT COUNT(*) FROM spend_events
                  WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
-                   AND cost_usd = 0 AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
+                   AND cost_usd = 0 AND cost_basis IN ('computed', 'unpriced')
+                   AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             if surface.is_some() {

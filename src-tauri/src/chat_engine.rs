@@ -1454,16 +1454,34 @@ pub fn merge_continued_meta(old: &serde_json::Value, new: &AgentOutcome) -> serd
 
 // ─── Engine ───────────────────────────────────────────────────────
 
-/// Removes a workspace's cancel flag from the registry when the turn ends,
-/// no matter which of `send_agentic`'s many exit paths is taken.
+/// Removes a cancel flag from the registry when its turn ends, no matter
+/// which of `send_agentic`'s many exit paths is taken — and only ITS flag:
+/// a later turn that registered under the same key keeps its own.
 struct CancelGuard {
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     key: String,
+    flag: Arc<AtomicBool>,
 }
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        self.cancels.lock().remove(&self.key);
+        let mut cancels = self.cancels.lock();
+        if cancels.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flag)) {
+            cancels.remove(&self.key);
+        }
+    }
+}
+
+/// Marks one sub-agent as being continued for the life of the guard, so
+/// two continuations of the same run can never race on its row.
+struct ContinuingGuard {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    call_id: String,
+}
+
+impl Drop for ContinuingGuard {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.call_id);
     }
 }
 
@@ -1486,6 +1504,8 @@ pub struct ChatEngine {
     /// sub-agents a turn spawns, so their `run_command`s go through the same
     /// card and the same "don't ask again" grant.
     approvals: Arc<ApprovalBroker>,
+    /// Sub-agent call ids with a continuation in flight.
+    continuing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ChatEngine {
@@ -1500,6 +1520,7 @@ impl ChatEngine {
             mcp: Arc::new(crate::mcp::McpRegistry::new()),
             talk_shell,
             approvals: Arc::new(ApprovalBroker::default()),
+            continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1535,8 +1556,13 @@ impl ChatEngine {
     /// iterations and after each tool, then stops cleanly. Keyed by thread so
     /// two conversations in one workspace can be cancelled independently.
     pub fn cancel(&self, thread_id: &str) {
-        if let Some(flag) = self.cancels.lock().get(thread_id) {
-            flag.store(true, Ordering::Relaxed);
+        // The turn's own flag, and every sub-agent continuation running on
+        // the thread (`<thread>#continue:<call>`).
+        let prefix = format!("{thread_id}#");
+        for (key, flag) in self.cancels.lock().iter() {
+            if key == thread_id || key.starts_with(&prefix) {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
         // Resolve every pending approval for this thread (the turn's own and
         // its sub-agents') as Deny — otherwise Stop leaves a loop parked in
@@ -1808,6 +1834,12 @@ impl ChatEngine {
         extra_turns: usize,
     ) -> AppResult<()> {
         let extra_turns = extra_turns.clamp(1, CONTINUE_MAX_TURNS);
+        // One continuation per run at a time: a second click while the first
+        // runs would race on the row and lose one run's figures.
+        if !self.continuing.lock().insert(call_id.clone()) {
+            return Err(AppError::Other("This sub-agent is already being continued.".into()));
+        }
+        let _continuing_guard = ContinuingGuard { set: Arc::clone(&self.continuing), call_id: call_id.clone() };
         let run = self
             .db
             .lock()
@@ -1815,6 +1847,13 @@ impl ChatEngine {
             .ok_or_else(|| AppError::Other("This sub-agent has no saved run to continue (it predates continuations, or never started).".into()))?;
         let message_id = run
             .message_id
+            .ok_or_else(|| AppError::Other("This sub-agent's report row is gone — nothing to update.".into()))?;
+        // The row must still exist before anything is spent on it: a
+        // Regenerate / Edit-and-resend may have truncated it away.
+        let row = self
+            .db
+            .lock()
+            .get_chat_message(message_id)?
             .ok_or_else(|| AppError::Other("This sub-agent's report row is gone — nothing to update.".into()))?;
         let mut spec: SubagentSpec = serde_json::from_str(&run.spec_json)
             .map_err(|e| AppError::Other(format!("saved sub-agent run is unreadable: {e}")))?;
@@ -1838,26 +1877,12 @@ impl ChatEngine {
             resume_messages_for_answered_block(&transcript, &note)
         });
 
-        // Cancellable from the thread's Stop like a turn — unless a turn is
-        // live on the thread, whose flag stays its own.
+        // Cancellable from the thread's Stop like a turn: `cancel(thread)`
+        // flips every `<thread>#continue:<call>` flag too.
         let cancel = Arc::new(AtomicBool::new(false));
         let key = format!("{}#continue:{}", run.thread_id, call_id);
         self.cancels.lock().insert(key.clone(), Arc::clone(&cancel));
-        let _cancel_guard = CancelGuard { cancels: Arc::clone(&self.cancels), key };
-        let mirror = {
-            let mut cancels = self.cancels.lock();
-            match cancels.entry(run.thread_id.clone()) {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(Arc::clone(&cancel));
-                    true
-                }
-                std::collections::hash_map::Entry::Occupied(_) => false,
-            }
-        };
-        let _mirror_guard = mirror.then(|| CancelGuard {
-            cancels: Arc::clone(&self.cancels),
-            key: run.thread_id.clone(),
-        });
+        let _cancel_guard = CancelGuard { cancels: Arc::clone(&self.cancels), key, flag: Arc::clone(&cancel) };
 
         let _ = app.emit("chat://tool-start", &ToolStartEvent {
             workspace_id: run.workspace_id.clone(),
@@ -1897,11 +1922,8 @@ impl ChatEngine {
 
         // Rewrite the row: the continued report replaces the old one, the
         // meta carries both runs.
-        let row = self.db.lock().get_chat_message(message_id)?;
-        let mut record: serde_json::Value = row
-            .as_ref()
-            .and_then(|r| serde_json::from_str(&r.content).ok())
-            .unwrap_or_else(|| serde_json::json!({ "callId": call_id, "toolName": "Agent" }));
+        let mut record: serde_json::Value = serde_json::from_str(&row.content)
+            .unwrap_or_else(|_| serde_json::json!({ "callId": call_id, "toolName": "Agent" }));
         let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
         record["agent"] = merge_continued_meta(&old_meta, &outcome);
         record["result"] = serde_json::Value::String(outcome.report.clone());
@@ -2246,6 +2268,7 @@ impl ChatEngine {
         let _cancel_guard = CancelGuard {
             cancels: Arc::clone(&self.cancels),
             key: request.thread_id.clone(),
+            flag: Arc::clone(&cancel),
         };
 
         // Persist user message and emit message-added so the frontend learns the

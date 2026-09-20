@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { type WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
@@ -16,6 +16,10 @@ import { FadeSwap } from "./primitives/FadeSwap";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useChatStore } from "../stores/chatStore";
 import { findCrewAgent } from "./chat/CrewCard";
+
+// Stable empties so the selectors never hand React a fresh array per render.
+const EMPTY_MESSAGES: never[] = [];
+const EMPTY_LIVE: never[] = [];
 import { selectElsewhereCount } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 
@@ -92,11 +96,13 @@ export function Companion({
   // A chosen sub-agent takes the whole Talk panel — its room, not a card
   // squeezed above the other sections. Only while it still resolves: a focus
   // the thread no longer holds falls back to the sections, never to nothing.
-  const crewFocus = useChatStore((s) => {
-    if (!workspaceId) return false;
-    const id = s.crewFocusByWs[workspaceId];
-    return !!id && findCrewAgent(s.getMessages(workspaceId), s.getLiveTools(workspaceId), id) != null;
-  });
+  const crewFocusId = useChatStore((s) => (workspaceId ? s.crewFocusByWs[workspaceId] ?? null : null));
+  const crewMessages = useChatStore((s) => (workspaceId ? s.getMessages(workspaceId) : EMPTY_MESSAGES));
+  const crewLive = useChatStore((s) => (workspaceId ? s.getLiveTools(workspaceId) : EMPTY_LIVE));
+  const crewFocus = useMemo(
+    () => !!crewFocusId && findCrewAgent(crewMessages, crewLive, crewFocusId) != null,
+    [crewFocusId, crewMessages, crewLive],
+  );
 
   // The elsewhere list is scoped to the current project — never let an
   // open modal survive a project switch and show stale context.
