@@ -304,10 +304,32 @@ export interface ChatMessage {
   role: "user" | "assistant" | "tool" | "error" | "stopped";
   content: string;
   model: string | null;
+  /** Uncached input tokens summed over the turn's rounds. */
   inputTokens: number | null;
   outputTokens: number | null;
+  /** Cache-aware cost of the turn (director rounds only; sub-agents bill
+   *  their own rows). */
   costUsd: number | null;
   createdAt: string;
+  /** Tokens served from the prompt cache over the turn's rounds. */
+  cacheReadTokens?: number | null;
+  /** Tokens written to the prompt cache over the turn's rounds. */
+  cacheCreationTokens?: number | null;
+  /** The size of the LAST prompt of the turn (uncached + cached + written)
+   *  — what the context meter shows. */
+  contextTokens?: number | null;
+}
+
+/** What one Talk conversation has cost so far, from the ledger (director
+ *  rounds + sub-agent runs, cache-aware). `baselineUsd` is the same tokens
+ *  priced on the strong tier — 0 when that tier is unpriced. */
+export interface ThreadCost {
+  spentUsd: number;
+  subagentsUsd: number;
+  baselineUsd: number;
+  strongPriced: boolean;
+  calls: number;
+  cacheHitPct: number | null;
 }
 
 export interface ChatStreamEvent {
@@ -540,6 +562,8 @@ export interface UsageBreakdown {
 // ─── Pricing refresh ───────────────────────────────────────────────
 
 export interface RefreshPricingResult {
+  /** Ledger rows recorded at $0 (unpriced model) that got a price now. */
+  eventsRepriced?: number;
   modelsUpdated: number;
   modelsTotal: number;
   fetchedAt: string;

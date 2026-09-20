@@ -942,6 +942,37 @@ impl Db {
         // carry workspace_id); RUN/adhoc stay NULL until RUN gets workspace
         // attribution.
         add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN mission_id TEXT")?;
+        // Talk attribution below the workspace: the thread a row was billed
+        // in, and whether the director or a sub-agent (`subagent:<call id>`)
+        // spent it — the Companion's conversation cost reads these.
+        add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN thread_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN origin TEXT")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_spend_thread ON spend_events(thread_id, ts_utc);",
+        )?;
+        // Per-turn prompt accounting on assistant rows: what the turn's rounds
+        // read from cache and wrote to it, and the size of the LAST prompt
+        // (the real context the next turn will carry).
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN cache_read_tokens INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN cache_creation_tokens INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN context_tokens INTEGER")?;
+        // A finished sub-agent's conversation, kept so the user can give it
+        // more turns or an answer and it CONTINUES instead of starting over.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_agent_runs (
+                call_id         TEXT PRIMARY KEY,
+                thread_id       TEXT NOT NULL,
+                workspace_id    TEXT NOT NULL,
+                message_id      INTEGER,
+                spec_json       TEXT NOT NULL,
+                transcript_json TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_agent_runs_thread ON chat_agent_runs(thread_id);
+            "#,
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
         )?;
@@ -1345,8 +1376,8 @@ impl Db {
                  model_raw, model, input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
                  provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key,
-                 mission_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                 mission_id, thread_id, origin)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 ev.ts_utc,
                 ev.surface,
@@ -1366,6 +1397,8 @@ impl Db {
                 ev.cost_basis,
                 ev.idempotency_key,
                 ev.mission_id,
+                ev.thread_id,
+                ev.origin,
             ],
         )?;
         Ok(n > 0)
@@ -1561,6 +1594,18 @@ impl Db {
     /// the original id (for RUN session recap / scope), while `workspace_id` /
     /// `project_id` are populated only when `session_id` names a real workspace.
     pub fn record_token_spend(&self, ev: &TokenEvent, surface: &str) -> AppResult<()> {
+        self.record_token_spend_in_thread(ev, surface, None, None)
+    }
+
+    /// [`record_token_spend`](Self::record_token_spend) with Talk attribution:
+    /// the thread and whether the director or a sub-agent spent it.
+    pub fn record_token_spend_in_thread(
+        &self,
+        ev: &TokenEvent,
+        surface: &str,
+        thread_id: Option<&str>,
+        origin: Option<&str>,
+    ) -> AppResult<()> {
         // A workspace id names the workspace; a workspace TERMINAL id (the
         // RUN-mode PTY hook scans under it) resolves to its workspace, so
         // terminal spend counts against workspace/project budgets and lands
@@ -1613,6 +1658,8 @@ impl Db {
             // No idempotency key: these are distinct billed calls (the PTY scanner
             // already deduped via its seq high-water before we get here).
             idempotency_key: None,
+            thread_id: thread_id.map(str::to_string),
+            origin: origin.map(str::to_string),
         })
     }
 
@@ -2011,12 +2058,16 @@ impl Db {
             }
         };
 
-        // Rows the ledger could not price (unknown model / $0 catalog).
+        // Rows the ledger could not price (unknown model / $0 catalog) — the
+        // same set `reprice_unpriced` can price, so the notice and its
+        // "Price them now" agree; a subscription-covered or provider-reported
+        // $0 is a real price, not a gap.
         let unpriced_calls: i64 = {
             let sql = format!(
                 "SELECT COUNT(*) FROM spend_events
                  WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
-                   AND cost_usd = 0 AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
+                   AND cost_usd = 0 AND cost_basis IN ('computed', 'unpriced')
+                   AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             if surface.is_some() {
@@ -3472,7 +3523,8 @@ impl Db {
 
     pub fn get_chat_message(&self, message_id: i64) -> AppResult<Option<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at
+            "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
+                    cache_read_tokens, cache_creation_tokens, context_tokens
              FROM chat_messages WHERE id = ?1",
         )?;
         let row = stmt
@@ -3483,6 +3535,9 @@ impl Db {
                     role: r.get(2)?,
                     content: r.get(3)?,
                     model: r.get(4)?,
+                    cache_read_tokens: r.get(9)?,
+                    cache_creation_tokens: r.get(10)?,
+                    context_tokens: r.get(11)?,
                     input_tokens: r.get(5)?,
                     output_tokens: r.get(6)?,
                     cost_usd: r.get(7)?,
@@ -3525,11 +3580,173 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Stamp a turn's prompt accounting on its assistant row.
+    pub fn set_chat_message_usage(
+        &self,
+        message_id: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
+        context_tokens: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET cache_read_tokens = ?2, cache_creation_tokens = ?3, context_tokens = ?4
+             WHERE id = ?1",
+            params![message_id, cache_read_tokens, cache_creation_tokens, context_tokens],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a message's content in place (a continued sub-agent's tool
+    /// row takes its new report and meta).
+    pub fn update_chat_message_content(&self, message_id: i64, content: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET content = ?2 WHERE id = ?1",
+            params![message_id, content],
+        )?;
+        Ok(())
+    }
+
+    // ─── Sub-agent runs (continue / reply) ────────────────────────
+
+    /// Keep a finished sub-agent's spec + conversation so it can be given
+    /// more turns or an answer later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_chat_agent_run(
+        &self,
+        call_id: &str,
+        thread_id: &str,
+        workspace_id: &str,
+        spec_json: &str,
+        transcript_json: &str,
+        model: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO chat_agent_runs (call_id, thread_id, workspace_id, spec_json, transcript_json, model, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(call_id) DO UPDATE SET spec_json = excluded.spec_json,
+                 transcript_json = excluded.transcript_json, model = excluded.model,
+                 updated_at = excluded.updated_at",
+            params![call_id, thread_id, workspace_id, spec_json, transcript_json, model, now],
+        )?;
+        Ok(())
+    }
+
+    /// Link a sub-agent run to the tool row that carries its report.
+    pub fn set_chat_agent_run_message(&self, call_id: &str, message_id: i64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_agent_runs SET message_id = ?2 WHERE call_id = ?1",
+            params![call_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_chat_agent_run(&self, call_id: &str) -> AppResult<Option<ChatAgentRun>> {
+        self.conn
+            .query_row(
+                "SELECT call_id, thread_id, workspace_id, message_id, spec_json, transcript_json, model
+                 FROM chat_agent_runs WHERE call_id = ?1",
+                params![call_id],
+                |r| {
+                    Ok(ChatAgentRun {
+                        call_id: r.get(0)?,
+                        thread_id: r.get(1)?,
+                        workspace_id: r.get(2)?,
+                        message_id: r.get(3)?,
+                        spec_json: r.get(4)?,
+                        transcript_json: r.get(5)?,
+                        model: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// What one Talk thread cost, from the ledger: every row billed in the
+    /// thread (director rounds and sub-agent runs alike, cache-aware), how
+    /// much of it sub-agents spent, and what the same tokens would have cost
+    /// on the strong tier's model (`strong`, cache-aware) — the all-strong
+    /// baseline the economy director is judged against.
+    pub fn thread_cost(&self, thread_id: &str, strong: Option<&crate::token_engine::ModelPrices>) -> AppResult<ThreadCost> {
+        let mut stmt = self.conn.prepare(
+            "SELECT origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd
+             FROM spend_events WHERE thread_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, f64>(5)?,
+            ))
+        })?;
+        let mut out = ThreadCost::default();
+        let (mut input, mut read, mut create) = (0i64, 0i64, 0i64);
+        for row in rows {
+            let (origin, i, o, cr, cc, cost) = row?;
+            out.calls += 1;
+            out.spent_usd += cost;
+            if origin.as_deref().is_some_and(|o| o.starts_with("subagent:")) {
+                out.subagents_usd += cost;
+            }
+            input += i;
+            read += cr;
+            create += cc;
+            if let Some(p) = strong {
+                out.baseline_usd += p.cost(i.max(0) as u64, o.max(0) as u64, cr.max(0) as u64, cc.max(0) as u64);
+            }
+        }
+        out.strong_priced = strong.is_some();
+        let (pct, _) = cache_hit_pct(input, read, create);
+        out.cache_hit_pct = pct;
+        Ok(out)
+    }
+
+    /// Give a price to rows that were billed at $0 because their model was
+    /// unpriced at the time (`cost_basis = 'computed'`, tokens but no cost).
+    /// `price` resolves a model to its current prices; rows whose model is
+    /// still unpriced stay untouched. Returns rows updated.
+    pub fn reprice_unpriced(
+        &self,
+        price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
+    ) -> AppResult<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+             FROM spend_events
+             WHERE cost_usd = 0 AND cost_basis IN ('computed', 'unpriced')
+               AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0",
+        )?;
+        let rows: Vec<(i64, String, i64, i64, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut n = 0usize;
+        let mut cache: std::collections::HashMap<String, Option<crate::token_engine::ModelPrices>> =
+            std::collections::HashMap::new();
+        for (id, model, i, o, cr, cc) in rows {
+            let prices = cache.entry(model.clone()).or_insert_with(|| price(&model));
+            let Some(p) = prices.as_ref() else { continue };
+            let cost = p.cost(i.max(0) as u64, o.max(0) as u64, cr.max(0) as u64, cc.max(0) as u64);
+            if cost <= 0.0 {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE spend_events SET cost_usd = ?2, computed_cost_usd = ?2, cost_basis = 'computed' WHERE id = ?1",
+                params![id, cost],
+            )?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// List a single thread's messages in chronological order. (Scoped by
     /// thread, not workspace — a workspace can hold several conversations.)
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at
+            "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
+                    cache_read_tokens, cache_creation_tokens, context_tokens
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -3543,6 +3760,9 @@ impl Db {
                 output_tokens: r.get(6)?,
                 cost_usd: r.get(7)?,
                 created_at: r.get(8)?,
+                cache_read_tokens: r.get(9)?,
+                cache_creation_tokens: r.get(10)?,
+                context_tokens: r.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5217,6 +5437,8 @@ impl Db {
             cost_usd,
             cost_basis: "computed".into(),
             idempotency_key: Some(format!("direct:{stage_id}:{ts_utc}")),
+            thread_id: None,
+            origin: None,
         })
     }
 
@@ -5850,6 +6072,11 @@ pub struct ChatMessageRow {
     pub output_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub created_at: String,
+    /// Prompt tokens the turn's rounds read from / wrote to the cache.
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    /// Size of the turn's LAST prompt (the context the next turn carries).
+    pub context_tokens: Option<i64>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -5911,6 +6138,32 @@ fn period_since_utc(period: &str) -> String {
         .earliest()
         .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
         .unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
+/// A finished sub-agent's saved conversation (see `chat_agent_runs`).
+#[derive(Clone, Debug)]
+pub struct ChatAgentRun {
+    pub call_id: String,
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub message_id: Option<i64>,
+    pub spec_json: String,
+    pub transcript_json: String,
+    pub model: String,
+}
+
+/// One Talk thread's cost from the ledger (see `thread_cost`).
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCost {
+    pub spent_usd: f64,
+    /// The part of `spent_usd` sub-agents billed.
+    pub subagents_usd: f64,
+    /// The same tokens priced on the strong tier's model; 0 when unpriced.
+    pub baseline_usd: f64,
+    pub strong_priced: bool,
+    pub calls: i64,
+    pub cache_hit_pct: Option<f64>,
 }
 
 // ─── Usage report types ────────────────────────────────────────────────
@@ -6318,6 +6571,10 @@ pub struct SpendEvent {
     /// 'provider' | 'computed' | 'subscription' | 'unpriced' | 'estimated'
     pub cost_basis: String,
     pub idempotency_key: Option<String>,
+    /// The Talk thread the row was billed in (talk rows only).
+    pub thread_id: Option<String>,
+    /// `director` or `subagent:<call id>` for talk rows; NULL elsewhere.
+    pub origin: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

@@ -11,7 +11,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { ChatMessage } from "./ChatMessage";
+import { ChatMessage, usageFooter } from "./ChatMessage";
 
 const TABLE = [
   "Aquí están los resultados en una tabla:",
@@ -89,5 +89,22 @@ describe("ChatMessage — user turn is shown as written", () => {
     const { container } = render(<ChatMessage message={{ role: "user", content: USER_TURN }} />);
     expect(container.querySelector("ol, ul, li, h1, h2, h3, p, code")).toBeNull();
     expect(container.textContent).toContain("# not a heading, just what I typed");
+  });
+});
+
+describe("usageFooter — the honest turn figure", () => {
+  it("reads the last prompt size, the cached share, the answer tokens and the cost", () => {
+    expect(
+      usageFooter({ role: "assistant", content: "x", inputTokens: 3_100, outputTokens: 2_100, cacheReadTokens: 200_000, cacheCreationTokens: 8_000, contextTokens: 211_000, costUsd: 0.42 }),
+    ).toBe("211.0k in · 95% cached · 2.1k out · $0.42");
+  });
+
+  it("falls back to the uncached input for rows recorded before the cache split existed", () => {
+    expect(usageFooter({ role: "assistant", content: "x", inputTokens: 106, outputTokens: 900 })).toBe("106 in · 900 out");
+  });
+
+  it("keeps a cheap turn visible at three decimals and omits a free one", () => {
+    expect(usageFooter({ role: "assistant", content: "x", inputTokens: 10, outputTokens: 5, costUsd: 0.004 })).toBe("10 in · 5 out · $0.004");
+    expect(usageFooter({ role: "assistant", content: "x", inputTokens: 10, outputTokens: 5, costUsd: 0 })).toBe("10 in · 5 out");
   });
 });

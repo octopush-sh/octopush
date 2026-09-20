@@ -259,6 +259,9 @@ pub fn run() {
             commands::get_usage_breakdown,
             // Pricing refresh
             commands::refresh_pricing,
+            commands::reprice_spend,
+            commands::get_thread_cost,
+            commands::continue_subagent,
             // Settings
             commands::get_settings,
             commands::save_settings,

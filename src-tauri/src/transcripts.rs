@@ -453,6 +453,8 @@ impl TranscriptIngestor {
                     cost_usd: cost,
                     cost_basis: "computed".into(),
                     idempotency_key: Some(u.key.clone()),
+                    thread_id: None,
+                    origin: None,
                 };
                 if db.upsert_spend_event_by_key(&ev)? {
                     inserted += 1;

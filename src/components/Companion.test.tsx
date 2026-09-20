@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
+// Companion reads the crew focus from the chat store, whose module-level
+// listeners need the Tauri event bridge stubbed under jsdom.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
+
 import { Companion } from "./Companion";
 
 // Minimal stubs for child components so the test focuses on structure.

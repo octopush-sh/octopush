@@ -80,6 +80,9 @@ fn cap_tool_result(s: &str) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct AgenticResult {
     pub text: String,
+    /// The whole conversation as it stood when the loop returned — what a
+    /// continuation (more turns, an answer) resumes from.
+    pub transcript: Vec<LlmMessage>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -767,6 +770,7 @@ pub async fn run_agentic_loop(
             out.text = "(stopped by the director)".to_string();
             // Keep the conversation so a Resume CONTINUES instead of re-paying
             // the whole exploration (same mechanism as an answered block).
+            out.transcript = messages.clone();
             out.blocked_transcript =
                 Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
             return Ok(out);
@@ -781,6 +785,7 @@ pub async fn run_agentic_loop(
             if !interruptible_sleep(wait, cancel).await {
                 emitter.notice("stopped by the director");
                 out.text = "(stopped by the director)".to_string();
+                out.transcript = messages.clone();
                 out.blocked_transcript =
                     Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
                 return Ok(out);
@@ -862,6 +867,7 @@ pub async fn run_agentic_loop(
             out.blocked_transcript =
                 Some(BlockedTranscript { messages: tmsgs, ask_tool_use_id: u.id.clone() });
             out.blocked = Some(ask);
+            out.transcript = messages.clone();
             return Ok(out);
         }
 
@@ -876,6 +882,7 @@ pub async fn run_agentic_loop(
                 out.verdict = Some(v);
                 out.text = if findings.is_empty() { resp.text.trim().to_string() } else { findings };
                 out.finished = true;
+                out.transcript = messages.clone();
                 return Ok(out);
             }
         }
@@ -917,6 +924,9 @@ pub async fn run_agentic_loop(
         if is_final {
             out.text = resp.text.trim().to_string();
             out.finished = true;
+            // The conversation INCLUDING the answer, so a continuation ("also
+            // check X") reads as a reply to what the model already reported.
+            out.transcript = with_final_answer(&messages, &out.text);
             return Ok(out);
         }
 
@@ -1093,6 +1103,11 @@ pub async fn run_agentic_loop(
             "iteration cap reached — {max_iterations} of {max_iterations} tool turns used; asking the model to close with what it has"
         ));
     }
+    // What a continuation resumes from: the conversation up to the last
+    // tool results, WITHOUT the close instruction — a resumed run must not
+    // be told it cannot call tools in the same breath as it is given more
+    // turns.
+    let resume_point = messages.clone();
     if !cancel.load(Ordering::Relaxed) {
         // The budget-stop path already closed with a user turn (the voided
         // tool results carry the close instruction). For the cap path, the
@@ -1166,6 +1181,7 @@ pub async fn run_agentic_loop(
                     out.text = text;
                     out.finished = true;
                     out.closed_at_cap = true;
+                    out.transcript = with_final_answer(&resume_point, &out.text);
                     return Ok(out);
                 }
             }
@@ -1176,7 +1192,21 @@ pub async fn run_agentic_loop(
     }
     out.text = format!("(agentic loop hit {max_iterations} iterations without finishing)");
     // The turns are spent but the conversation is real work — persist it so a
-    // Resume with a fresh turn budget CONTINUES here instead of starting over.
-    out.blocked_transcript = Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
+    // Resume with a fresh turn budget CONTINUES here instead of starting over
+    // (from the clean resume point, never from the close instruction).
+    out.transcript = resume_point.clone();
+    out.blocked_transcript = Some(BlockedTranscript { messages: resume_point, ask_tool_use_id: String::new() });
     Ok(out)
+}
+
+/// The conversation plus the model's final answer as an assistant turn, so
+/// a continuation's note lands as a fresh user turn after it (strict role
+/// alternation) and the model sees what it already reported. An empty
+/// answer adds nothing.
+fn with_final_answer(messages: &[LlmMessage], answer: &str) -> Vec<LlmMessage> {
+    let mut t = messages.to_vec();
+    if !answer.trim().is_empty() {
+        t.push(LlmMessage { role: LlmRole::Assistant, content: LlmContent::Text(answer.to_string()) });
+    }
+    t
 }

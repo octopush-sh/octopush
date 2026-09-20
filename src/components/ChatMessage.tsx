@@ -9,6 +9,29 @@ interface MessageProps {
   model?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
+  contextTokens?: number | null;
+  costUsd?: number | null;
+}
+
+/** The footer of an answer: `211k in · 94% cached · 2.1k out · $0.42`. The
+ *  "in" figure is the LAST prompt's full size when the turn reported it
+ *  (uncached + cached + written — the honest context figure), else the
+ *  uncached total the old rows carry; the cached share is over every round
+ *  of the turn. Pure so the wording is tested. */
+export function usageFooter(m: MessageProps): string {
+  const parts: string[] = [];
+  const inTok = m.contextTokens ?? m.inputTokens;
+  if (inTok != null) parts.push(`${formatTokenCount(inTok)} in`);
+  const read = m.cacheReadTokens ?? 0;
+  const uncached = m.inputTokens ?? 0;
+  const written = m.cacheCreationTokens ?? 0;
+  const prompt = uncached + read + written;
+  if (read > 0 && prompt > 0) parts.push(`${Math.round((read / prompt) * 100)}% cached`);
+  if (m.outputTokens != null) parts.push(`${formatTokenCount(m.outputTokens)} out`);
+  if (m.costUsd != null && m.costUsd > 0) parts.push(`$${m.costUsd < 0.01 ? m.costUsd.toFixed(3) : m.costUsd.toFixed(2)}`);
+  return parts.join(" · ");
 }
 
 interface Props {
@@ -119,14 +142,12 @@ export function ChatMessage({ message, onOpenInEditor }: Props) {
         </div>
       )}
 
-      {(model || inputTokens != null || outputTokens != null) && (
-        <div className="animate-keyfade-body font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-          {[
-            inputTokens != null ? `${formatTokenCount(inputTokens)} in` : null,
-            outputTokens != null ? `${formatTokenCount(outputTokens)} out` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
+      {(inputTokens != null || outputTokens != null) && (
+        <div
+          className="animate-keyfade-body font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
+          title="Last prompt size · share of it served from the prompt cache · answer tokens · this turn's cost"
+        >
+          {usageFooter(message)}
         </div>
       )}
     </div>

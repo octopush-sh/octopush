@@ -31,11 +31,11 @@
 //! files that drive Claude Code drive Octopush, nothing else to set up.
 
 use super::{split_frontmatter, split_list};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A parsed agent definition.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDefinition {
     pub name: String,
     pub description: String,
@@ -51,6 +51,12 @@ pub struct AgentDefinition {
     /// The frontmatter `escalate` (a tier or an id): the model to retry on,
     /// once, when the first attempt fails, blocks, or hits its turn cap.
     pub escalate: Option<String>,
+    /// The frontmatter `max-turns`: the most tool rounds one run of this
+    /// sub-agent may take. `None` = the thread's own cap. A cap that lands
+    /// mid-work is not the end — the report says so and the director (or the
+    /// user, from the crew journal) can give it more turns.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     /// "project", "user" or "builtin".
     pub source: String,
 }
@@ -60,7 +66,7 @@ pub struct AgentDefinition {
 /// a list gets only the `mcp__…` entries it names — `mcp__server__tool` for
 /// one tool, `mcp__server` for a whole server, `mcp__*` (or `mcp`) for all —
 /// exactly as Claude Code reads them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpGrant {
     All,
     Only(Vec<String>),
@@ -108,6 +114,7 @@ pub struct AgentDefinitionMeta {
     pub tools: Option<Vec<String>>,
     pub model: Option<String>,
     pub escalate: Option<String>,
+    pub max_turns: Option<u32>,
 }
 
 impl AgentDefinition {
@@ -119,6 +126,7 @@ impl AgentDefinition {
             tools: self.tools.clone(),
             model: self.model.clone(),
             escalate: self.escalate.clone(),
+            max_turns: self.max_turns,
         }
     }
 }
@@ -235,6 +243,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     let mut mcp = McpGrant::All;
     let mut model: Option<String> = None;
     let mut escalate: Option<String> = None;
+    let mut max_turns: Option<u32> = None;
     for (key, value) in pairs {
         match key.as_str() {
             "name" => name = value,
@@ -270,13 +279,18 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
                     escalate = Some(value);
                 }
             }
+            "max-turns" | "max_turns" | "maxTurns" => {
+                // Zero or garbage means "no cap of its own", never a
+                // sub-agent that cannot take a single turn.
+                max_turns = value.trim().parse::<u32>().ok().filter(|n| *n > 0);
+            }
             _ => {}
         }
     }
     if name.is_empty() {
         return None;
     }
-    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, source: source.to_string() })
+    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, source: source.to_string() })
 }
 
 fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -337,6 +351,27 @@ pub fn find_agent_definition<'a>(defs: &'a [AgentDefinition], name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_turns_is_parsed_from_the_frontmatter_and_ignores_garbage() {
+        let d = parse_agent_definition("---\nname: a\nmax-turns: 12\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_turns, Some(12));
+        assert_eq!(d.meta().max_turns, Some(12));
+        let d = parse_agent_definition("---\nname: a\nmax_turns: 0\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_turns, None, "zero means no cap of its own");
+        let d = parse_agent_definition("---\nname: a\nmax-turns: lots\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_turns, None);
+        let d = parse_agent_definition("---\nname: a\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_turns, None);
+    }
+
+    #[test]
+    fn agent_definitions_round_trip_through_json_for_saved_runs() {
+        let d = parse_agent_definition("---\nname: a\ntools: Read, mcp__jira\nmodel: fast\nescalate: strong\nmax-turns: 15\n---\nbody", "builtin").unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        let back: AgentDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
     use std::fs;
 
     const FILE: &str = "---\nname: security-reviewer\ndescription: Finds security issues.\ntools: Read, Grep, Glob, Bash(git:*), WebFetch\nmodel: haiku\n---\nYou hunt for injection and auth bugs.\n\n---\nStill body.";

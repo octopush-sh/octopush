@@ -259,7 +259,7 @@ describe("chatStore — single workspace tool-card persistence", () => {
 
     const timeline = useChatStore.getState().getTimeline("ws-1");
     const keys = timeline.map((it) =>
-      it.kind === "tool" ? `tool-${it.id}` : it.kind === "crew" ? `crew-${it.id}` : String(it.message.id),
+      it.kind === "tool" || it.kind === "crew" || it.kind === "narration" ? `${it.kind}-${it.id}` : String(it.message.id),
     );
     const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
     expect(dupes, `Duplicate React keys: ${JSON.stringify(keys)}`).toEqual([]);
@@ -400,9 +400,10 @@ describe("chatStore — assistant_tool_use rendering", () => {
 
     const timeline = useChatStore.getState().getTimeline("ws-1");
     expect(timeline).toHaveLength(1);
-    expect(timeline[0].kind).toBe("message");
-    if (timeline[0].kind === "message") {
-      expect(timeline[0].message.content).toBe("Let me check the files.");
+    // The model's pre-tool text is narration — a quiet line, not a bubble.
+    expect(timeline[0].kind).toBe("narration");
+    if (timeline[0].kind === "narration") {
+      expect(timeline[0].text).toBe("Let me check the files.");
     }
   });
 
@@ -813,5 +814,51 @@ describe("chatStore — sub-agents", () => {
     s.focusCrewAgent("ws-1", null);
     expect(useChatStore.getState().getCrewFocus("ws-1")).toBeNull();
     expect(useChatStore.getState().getCrewFocus("ws-2")).toBe("c9");
+  });
+});
+
+describe("chatStore — sub-agent continuation", () => {
+  beforeEach(() => resetStore());
+
+  const agentRow = (id: number, callId: string, result: string, extra: Record<string, unknown> = {}) =>
+    makeMsg({
+      id,
+      role: "tool",
+      content: JSON.stringify({
+        callId,
+        toolName: "Agent",
+        toolInput: { description: "Map the tests" },
+        result,
+        agent: { ok: false, closedAtCap: true, model: "haiku", inputTokens: 10, outputTokens: 2, costUsd: 0.01, durationMs: 5, toolCalls: 15, ...extra },
+      }),
+    });
+
+  it("a tool-start on a call that already has a resolved row marks it continuing instead of opening a live card", () => {
+    emit("chat://message-added", agentRow(1, "c1", "partial"));
+    emit("chat://tool-start", { workspaceId: "ws-1", callId: "c1", toolName: "Agent", toolInput: {}, startedAt: "2026-01-01T00:00:00Z" });
+    const s = useChatStore.getState();
+    expect(s.continuingCalls.c1).toBe(true);
+    expect(s.getLiveTools("ws-1")).toHaveLength(0);
+  });
+
+  it("message-updated replaces the row in place and clears the continuing mark", () => {
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "go" }));
+    emit("chat://message-added", agentRow(2, "c1", "partial"));
+    useChatStore.setState({ continuingCalls: { c1: true } });
+    const updated = JSON.stringify({ callId: "c1", toolName: "Agent", toolInput: { description: "Map the tests" }, result: "complete", agent: { ok: true, continued: true, model: "haiku", inputTokens: 20, outputTokens: 4, costUsd: 0.02, durationMs: 9, toolCalls: 19 } });
+    emit("chat://message-updated", { workspaceId: "ws-1", id: 2, content: updated });
+    const s = useChatStore.getState();
+    const msgs = s.getMessages("ws-1");
+    expect(msgs).toHaveLength(2);
+    expect(msgs[1].content).toBe(updated);
+    expect(s.continuingCalls.c1).toBeUndefined();
+    const crew = s.getTimeline("ws-1").find((it) => it.kind === "crew");
+    expect(crew && crew.kind === "crew" ? crew.agents[0].tool.agent?.continued : null).toBe(true);
+  });
+
+  it("an update for a row this workspace does not hold changes nothing", () => {
+    emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "go" }));
+    emit("chat://message-updated", { workspaceId: "ws-1", id: 99, content: "{}" });
+    expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(1);
   });
 });
