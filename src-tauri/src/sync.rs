@@ -242,6 +242,62 @@ pub fn enforce_detail_budget(detail: &mut SyncRunDetail) {
     }
 }
 
+/// Fetch and store a fresh signed entitlement token.
+///
+/// **Best-effort by design.** Every failure path leaves the previously stored
+/// token untouched, so being offline — or a Clerk/Vercel hiccup — never
+/// downgrades a paying user. The token only stops working when it actually
+/// expires, which takes `LEASE_DAYS` consecutive days without a single
+/// successful refresh.
+///
+/// Returns the plan the server asserted, for callers that want to react to a
+/// change (the account pane flipping to Pro after checkout, say).
+pub async fn refresh_entitlement_token(
+    client: &reqwest::Client,
+    machine_id: &str,
+) -> Option<String> {
+    let Some(token) = crate::auth::current_access_token().await else {
+        return None; // signed out → nothing to assert
+    };
+    let url = format!("{SYNC_API_BASE}/api/entitlement");
+    let body = serde_json::json!({ "machineId": machine_id });
+    let resp = match client.post(&url).bearer_auth(token).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("entitlement refresh error (keeping cached token): {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        // 503 = Clerk blip, 401 = token rotation in flight, 500 = server key
+        // unset. None of those are "you are not Pro", so we keep what we have.
+        tracing::debug!(
+            "entitlement refresh failed (keeping cached token): HTTP {}",
+            resp.status()
+        );
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct IssuedToken {
+        token: String,
+        #[serde(default)]
+        plan: Option<String>,
+    }
+    let issued: IssuedToken = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("entitlement refresh: unreadable response: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = crate::entitlement_token::store_token(&issued.token) {
+        tracing::warn!("could not store the entitlement token: {e}");
+        return None;
+    }
+    tracing::debug!("entitlement token refreshed (plan={:?})", issued.plan);
+    issued.plan
+}
+
 /// POST a run's detail blob. **Best-effort** — logs and returns on any error;
 /// the run (and its already-pushed metadata) are never affected.
 pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) {

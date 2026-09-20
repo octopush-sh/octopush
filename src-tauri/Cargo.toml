@@ -67,6 +67,9 @@ globset = "0.4"
 base64 = "0.22"
 urlencoding = "2"
 sha2 = "0.10"
+# Verifies the server-signed entitlement token (see entitlement_token.rs).
+# Verification only — the private key never exists on a client.
+ed25519-dalek = "2"
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 ctrlc = "3"
