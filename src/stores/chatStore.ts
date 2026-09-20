@@ -35,9 +35,14 @@ export interface AgentMeta {
   escalatedFrom?: string | null;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   costUsd: number;
   durationMs: number;
   toolCalls: number;
+  /** The run was given more turns (or an answer) after its first ending;
+   *  the report and figures cover every run. */
+  continued?: boolean;
 }
 
 export { isAgentToolName };
@@ -134,6 +139,9 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
  *  a crew (the `Agent` calls of one response, grouped), or a persisted error. */
 export type ConversationItem =
   | { kind: "message"; message: ChatMessage }
+  /** The text the model wrote BEFORE a round's tool calls — its reasoning
+   *  in the open. A quiet line between cards, never an answer bubble. */
+  | { kind: "narration"; id: number; text: string; model: string | null }
   | { kind: "tool"; tool: ToolExecution; id: number }
   | { kind: "crew"; id: number; agents: Array<{ id: number; tool: ToolExecution }> }
   | { kind: "error"; message: ChatMessage };
@@ -144,6 +152,20 @@ export type ConversationItem =
 function stripToolCallsSuffix(content: string): string {
   const idx = content.indexOf("[tool_calls:");
   return (idx === -1 ? content : content.slice(0, idx)).trim();
+}
+
+/** Whether the thread already holds the resolved tool row for `callId`. */
+function hasResolvedTool(msgs: ChatMessage[], callId: string): boolean {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role !== "tool") continue;
+    try {
+      if ((JSON.parse(m.content) as ToolExecution).callId === callId) return true;
+    } catch {
+      /* not a tool row */
+    }
+  }
+  return false;
 }
 
 /** Project persisted messages into renderable timeline items. Shared by the
@@ -175,10 +197,10 @@ export function buildTimeline(msgs: ChatMessage[]): ConversationItem[] {
     } else if (role === "error") {
       items.push({ kind: "error", message: msg });
     } else if (role === "assistant_tool_use") {
-      // Reloaded from DB: show only the model's lead text, never the raw
+      // Live or reloaded: show only the model's lead text, never the raw
       // `[tool_calls: …]` JSON. Skip rows that are pure bookkeeping.
       const text = stripToolCallsSuffix(msg.content);
-      if (text) items.push({ kind: "message", message: { ...msg, content: text } });
+      if (text) items.push({ kind: "narration", id: msg.id, text, model: msg.model });
     } else {
       items.push({ kind: "message", message: msg });
     }
@@ -197,6 +219,18 @@ export interface MessageAddedEvent {
   outputTokens: number | null;
   costUsd: number | null;
   createdAt: string;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
+  contextTokens?: number | null;
+}
+
+/** A persisted row's content changed in place (a sub-agent's report after a
+ *  continuation). Replace by id; never append. */
+interface MessageUpdatedEvent {
+  workspaceId: string;
+  threadId?: string;
+  id: number;
+  content: string;
 }
 
 // Stable empty values returned by selectors when a workspace has no data.
@@ -300,6 +334,12 @@ interface ChatState {
   /** The sub-agent whose journal the Companion shows, per workspace (null =
    *  none). Set by a crew-card row, cleared by the panel's close. */
   crewFocusByWs: Record<string, string | null>;
+  /** Sub-agents being continued (more turns / a reply) right now, by call
+   *  id — their resolved row reads as running again until the rewritten
+   *  row lands (`chat://message-updated`). */
+  continuingCalls: Record<string, boolean>;
+  /** The last continuation error per call id (shown in the journal). */
+  continueErrorByCall: Record<string, string>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -418,6 +458,10 @@ interface ChatState {
   clearError: (workspaceId: string) => void;
   /** Open (or close, with null) a sub-agent's journal in the Companion. */
   focusCrewAgent: (workspaceId: string, callId: string | null) => void;
+  /** Give a finished sub-agent `extraTurns` more tool turns, optionally
+   *  with a message (an answer to the question it stopped on, a steer).
+   *  Resolves when the continuation ends. */
+  continueSubagent: (callId: string, instruction: string | null, extraTurns: number) => Promise<void>;
   /** Load a finished sub-agent's persisted journal when nothing streamed into
    *  memory (a reload, a thread switch). No-op when entries already exist. */
   ensureAgentLog: (callId: string) => Promise<void>;
@@ -464,6 +508,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         outputTokens: payload.outputTokens,
         costUsd: payload.costUsd,
         createdAt: payload.createdAt,
+        cacheReadTokens: payload.cacheReadTokens ?? null,
+        cacheCreationTokens: payload.cacheCreationTokens ?? null,
+        contextTokens: payload.contextTokens ?? null,
       };
 
       // When a resolved tool row arrives, retire its live "running" card so the
@@ -506,6 +553,34 @@ export const useChatStore = create<ChatState>((set, get) => {
     if (wsId && wsId !== wsStore.activeId) {
       wsStore.notify(wsId);
     }
+  });
+
+  // ── chat://message-updated ────────────────────────────────────
+  // A row rewritten in place (a sub-agent's report after a continuation):
+  // replace by id in whichever thread bucket holds it; the continuing mark
+  // on that call comes off with it.
+  listen<MessageUpdatedEvent>("chat://message-updated", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const existing = s.messagesByWs[p.workspaceId];
+      let callId: string | undefined;
+      try {
+        callId = (JSON.parse(p.content) as ToolExecution).callId;
+      } catch {
+        callId = undefined;
+      }
+      const { [callId ?? ""]: _done, ...continuing } = s.continuingCalls;
+      const continuingCalls = callId ? continuing : s.continuingCalls;
+      if (!existing || !existing.some((m) => m.id === p.id)) return { continuingCalls };
+      return {
+        continuingCalls,
+        messagesByWs: {
+          ...s.messagesByWs,
+          [p.workspaceId]: existing.map((m) => (m.id === p.id ? { ...m, content: p.content } : m)),
+        },
+      };
+    });
   });
 
   // ── chat://stream ─────────────────────────────────────────────
@@ -576,6 +651,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     set((s) => {
       const live = s.liveToolsByWs[p.workspaceId] ?? EMPTY_LIVE_TOOLS;
       if (live.some((t) => t.callId === p.callId)) return {};
+      // A continuation re-starts a sub-agent whose resolved row is already
+      // in the thread: mark it continuing instead of opening a second card.
+      if (hasResolvedTool(s.messagesByWs[p.workspaceId] ?? EMPTY_MESSAGES, p.callId)) {
+        return { continuingCalls: { ...s.continuingCalls, [p.callId]: true } };
+      }
       const entry: LiveTool = {
         callId: p.callId,
         toolName: p.toolName,
@@ -777,6 +857,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingApprovalsByWs: {},
     agentLogByCall: {},
     crewFocusByWs: {},
+    continuingCalls: {},
+    continueErrorByCall: {},
     model: "claude-sonnet-4-6",
     effort: "standard",
 
@@ -1214,6 +1296,23 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: callId },
       })),
+    continueSubagent: async (callId, instruction, extraTurns) => {
+      if (get().continuingCalls[callId]) return;
+      set((s) => {
+        const { [callId]: _gone, ...rest } = s.continueErrorByCall;
+        return { continuingCalls: { ...s.continuingCalls, [callId]: true }, continueErrorByCall: rest };
+      });
+      try {
+        await ipc.continueSubagent(callId, instruction, extraTurns);
+      } catch (e) {
+        set((s) => ({ continueErrorByCall: { ...s.continueErrorByCall, [callId]: String(e) } }));
+      } finally {
+        set((s) => {
+          const { [callId]: _done, ...rest } = s.continuingCalls;
+          return { continuingCalls: rest };
+        });
+      }
+    },
     ensureAgentLog: async (callId) => {
       if ((get().agentLogByCall[callId] ?? EMPTY_AGENT_LOG).length > 0) return;
       try {
@@ -1242,9 +1341,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     selectThread: async (workspaceId, threadId) => {
       // Switch the shown thread and load its messages. Restore the streaming
       // indicator if the target thread is the one currently running in the
-      // background (its tracker survives the switch).
+      // background (its tracker survives the switch). A focused sub-agent
+      // belongs to the thread it ran in, so the Companion returns to its
+      // sections.
       set((s) => ({
         activeThreadByWs: { ...s.activeThreadByWs, [workspaceId]: threadId },
+        crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: null },
         streamingByWs: {
           ...s.streamingByWs,
           [workspaceId]: s.streamingThreadByWs[workspaceId] === threadId,
@@ -1265,6 +1367,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     newThread: async (workspaceId) => {
       const created = await ipc.createChatThread(workspaceId, "New conversation");
       set((s) => ({
+        crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: null },
         threadsByWs: {
           ...s.threadsByWs,
           [workspaceId]: [created, ...(s.threadsByWs[workspaceId] ?? EMPTY_THREADS)],

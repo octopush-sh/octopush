@@ -304,7 +304,20 @@ impl TokenEngine {
     /// produced the spend ('talk' | 'run' | 'review' | 'adhoc') — the ledger
     /// carries it explicitly instead of overloading `session_id`, and attribution
     /// (workspace/project) is derived from what `session_id` actually is.
-    pub fn record(&self, mut event: TokenEvent, surface: &str) -> AppResult<()> {
+    pub fn record(&self, event: TokenEvent, surface: &str) -> AppResult<()> {
+        self.record_in_thread(event, surface, None, None)
+    }
+
+    /// [`record`](Self::record) with Talk attribution: the thread the spend
+    /// belongs to and whether the director or a sub-agent
+    /// (`subagent:<call id>`) spent it.
+    pub fn record_in_thread(
+        &self,
+        mut event: TokenEvent,
+        surface: &str,
+        thread_id: Option<&str>,
+        origin: Option<&str>,
+    ) -> AppResult<()> {
         if event.cost_usd == 0.0 {
             // Single pricing authority (catalog-first, cache-aware).
             event.cost_usd = cost_for(
@@ -319,7 +332,7 @@ impl TokenEngine {
             event.timestamp = Utc::now().to_rfc3339();
         }
         let db = self.db.lock();
-        db.record_token_spend(&event, surface)?;
+        db.record_token_spend_in_thread(&event, surface, thread_id, origin)?;
         db.increment_session_tokens(
             &event.session_id,
             event.input_tokens,

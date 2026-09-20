@@ -80,6 +80,9 @@ fn cap_tool_result(s: &str) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct AgenticResult {
     pub text: String,
+    /// The whole conversation as it stood when the loop returned — what a
+    /// continuation (more turns, an answer) resumes from.
+    pub transcript: Vec<LlmMessage>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -767,6 +770,7 @@ pub async fn run_agentic_loop(
             out.text = "(stopped by the director)".to_string();
             // Keep the conversation so a Resume CONTINUES instead of re-paying
             // the whole exploration (same mechanism as an answered block).
+            out.transcript = messages.clone();
             out.blocked_transcript =
                 Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
             return Ok(out);
@@ -781,6 +785,7 @@ pub async fn run_agentic_loop(
             if !interruptible_sleep(wait, cancel).await {
                 emitter.notice("stopped by the director");
                 out.text = "(stopped by the director)".to_string();
+                out.transcript = messages.clone();
                 out.blocked_transcript =
                     Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
                 return Ok(out);
@@ -862,6 +867,7 @@ pub async fn run_agentic_loop(
             out.blocked_transcript =
                 Some(BlockedTranscript { messages: tmsgs, ask_tool_use_id: u.id.clone() });
             out.blocked = Some(ask);
+            if out.transcript.is_empty() { out.transcript = messages.clone(); }
             return Ok(out);
         }
 
@@ -876,6 +882,7 @@ pub async fn run_agentic_loop(
                 out.verdict = Some(v);
                 out.text = if findings.is_empty() { resp.text.trim().to_string() } else { findings };
                 out.finished = true;
+                if out.transcript.is_empty() { out.transcript = messages.clone(); }
                 return Ok(out);
             }
         }
@@ -917,6 +924,7 @@ pub async fn run_agentic_loop(
         if is_final {
             out.text = resp.text.trim().to_string();
             out.finished = true;
+            if out.transcript.is_empty() { out.transcript = messages.clone(); }
             return Ok(out);
         }
 
@@ -1166,6 +1174,7 @@ pub async fn run_agentic_loop(
                     out.text = text;
                     out.finished = true;
                     out.closed_at_cap = true;
+                    if out.transcript.is_empty() { out.transcript = messages.clone(); }
                     return Ok(out);
                 }
             }
@@ -1177,6 +1186,7 @@ pub async fn run_agentic_loop(
     out.text = format!("(agentic loop hit {max_iterations} iterations without finishing)");
     // The turns are spent but the conversation is real work — persist it so a
     // Resume with a fresh turn budget CONTINUES here instead of starting over.
+    out.transcript = messages.clone();
     out.blocked_transcript = Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
     Ok(out)
 }

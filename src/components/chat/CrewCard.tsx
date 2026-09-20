@@ -10,7 +10,8 @@
 // tokens directly — like LiveToolCard, unlike ToolCallCard.
 import { useEffect, useMemo, useState } from "react";
 import { Bot, ScrollText } from "lucide-react";
-import { useChatStore, type AgentMeta, type LiveTool, type ToolExecution } from "../../stores/chatStore";
+import { useChatStore, isAgentToolName, type AgentMeta, type LiveTool, type ToolExecution } from "../../stores/chatStore";
+import type { ChatMessage } from "../../lib/types";
 import type { LiveEntry } from "../../lib/ipc";
 import { iconForRole } from "../../lib/roleIcons";
 import { lastActivity } from "../../lib/liveLine";
@@ -75,6 +76,28 @@ export function crewAgentsFromLive(tools: LiveTool[]): CrewAgent[] {
     report: null,
     meta: null,
   }));
+}
+
+/** Locate one sub-agent by call id: a resolved tool row first, else a live
+ *  tool. Null when the thread no longer holds it (switched, deleted). */
+export function findCrewAgent(
+  messages: ChatMessage[],
+  live: Array<{ callId: string; toolName: string; toolInput: Record<string, unknown>; startedAt: string; done: boolean; ok: boolean; durationMs: number | null }>,
+  callId: string,
+): CrewAgent | null {
+  for (const m of messages) {
+    if (m.role !== "tool") continue;
+    try {
+      const tool = JSON.parse(m.content) as ToolExecution;
+      if (tool.callId === callId && isAgentToolName(tool.toolName)) {
+        return crewAgentsFromTools([{ id: m.id, tool }])[0];
+      }
+    } catch {
+      /* not a tool row */
+    }
+  }
+  const t = live.find((l) => l.callId === callId);
+  return t ? crewAgentsFromLive([t as LiveTool])[0] : null;
 }
 
 /** The one row that pulses: the running sub-agent that started first (the
@@ -215,8 +238,11 @@ function CrewRow({
 }) {
   const [reportOpen, setReportOpen] = useState(false);
   const entries = useChatStore((s) => s.agentLogByCall[agent.callId]) as LiveEntry[] | undefined;
+  // A resolved row being continued from its journal reads as running again
+  // (brass dot, live activity) until the rewritten row lands.
+  const continuing = useChatStore((s) => !!s.continuingCalls[agent.callId]);
   const RoleIcon = iconForRole(agent.subagentType ?? "");
-  const running = agent.status === "running";
+  const running = agent.status === "running" || continuing;
   const startMs = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
   const shownMs =
     agent.durationMs != null
@@ -287,10 +313,18 @@ function CrewRow({
               escalated
             </span>
           )}
+          {agent.meta?.continued && !continuing && (
+            <span
+              className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-brass"
+              title="Given more turns from its journal; the report covers every run"
+            >
+              continued
+            </span>
+          )}
         </button>
         <span className="octo-tabular shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
           {tokens > 0 && `${fmtTokens(tokens)} · `}
-          {agent.status === "running" ? "running" : agent.status}
+          {continuing ? "continuing" : agent.status === "running" ? "running" : agent.status}
           {shownMs != null && ` · ${formatDuration(shownMs)}`}
         </span>
         {agent.report != null && (

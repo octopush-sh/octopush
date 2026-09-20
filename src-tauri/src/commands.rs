@@ -3391,6 +3391,10 @@ pub struct RefreshPricingResult {
     pub models_updated: u32,
     pub models_total: u32,
     pub fetched_at: String,
+    /// Ledger rows that were recorded at $0 because their model had no
+    /// price yet and got a price on this refresh.
+    #[serde(default)]
+    pub events_repriced: u32,
 }
 
 /// Parse the LiteLLM pricing JSON into a map of model_id → entry.
@@ -3497,11 +3501,62 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     settings.last_pricing_refresh = Some(fetched_at.clone());
     let _ = crate::settings::save_settings(&settings);
 
+    // A model that had no price when its spend was recorded left $0 rows in
+    // the ledger; now that it may have one, price them.
+    let events_repriced = reprice_ledger(&state.db)? as u32;
+
     Ok(RefreshPricingResult {
         models_updated,
         models_total,
         fetched_at,
+        events_repriced,
     })
+}
+
+/// Price every ledger row recorded at $0 with the catalog as it stands
+/// now. Rows whose model is still unpriced stay at $0.
+fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
+    db.lock().reprice_unpriced(&crate::token_engine::prices_for)
+}
+
+/// Re-price the ledger's unpriced rows on demand (Settings › Usage, next to
+/// the "unpriced" notice). Returns how many rows got a price.
+#[tauri::command]
+pub async fn reprice_spend(state: State<'_, AppState>) -> AppResult<u32> {
+    Ok(reprice_ledger(&state.db)? as u32)
+}
+
+/// What one Talk conversation has cost so far, from the ledger: the
+/// director's rounds and its sub-agents' runs, cache-aware, plus the same
+/// tokens priced on the strong tier (what the conversation would have cost
+/// with no delegation) for the Companion's "saved" figure.
+#[tauri::command]
+pub async fn get_thread_cost(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<crate::db::ThreadCost> {
+    let strong = crate::settings::load_settings()
+        .ok()
+        .and_then(|s| s.model_tiers.get("strong").cloned())
+        .and_then(|m| crate::token_engine::prices_for(&m));
+    state.db.lock().thread_cost(&thread_id, strong.as_ref())
+}
+
+/// Give a finished sub-agent more turns, optionally with a message from the
+/// user (an answer to the question it stopped on, or a steer). Runs to
+/// completion; the report row is rewritten via `chat://message-updated`.
+#[tauri::command]
+pub async fn continue_subagent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    call_id: String,
+    instruction: Option<String>,
+    extra_turns: Option<u32>,
+) -> AppResult<()> {
+    state
+        .chat
+        .continue_subagent(app, call_id, instruction, extra_turns.unwrap_or(15) as usize)
+        .await
 }
 
 // ─── Settings ─────────────────────────────────────────────────────

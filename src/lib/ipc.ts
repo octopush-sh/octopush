@@ -392,6 +392,7 @@ import type {
   ProviderConfig,
   PtySession,
   RefreshPricingResult,
+  ThreadCost,
   Session,
   SessionRecap,
   SearchHit,
@@ -666,6 +667,13 @@ export const ipc = {
     overrideBudget?: boolean;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  /** What the thread has cost so far, from the ledger (Companion). */
+  getThreadCost: (threadId: string) => invoke<ThreadCost>("get_thread_cost", { threadId }),
+  /** Give a finished sub-agent more turns, optionally with a message from the
+   *  user. Resolves when the continuation ends; the report row is rewritten
+   *  via `chat://message-updated`. */
+  continueSubagent: (callId: string, instruction: string | null, extraTurns: number) =>
+    invoke<void>("continue_subagent", { callId, instruction, extraTurns }),
   /** Delete a message and everything after it (Regenerate / Edit-and-resend). */
   truncateChatAfter: (threadId: string, messageId: number) =>
     invoke<void>("truncate_chat_after", { threadId, messageId }),
@@ -787,6 +795,9 @@ export const ipc = {
 
   refreshPricing: () =>
     invoke<RefreshPricingResult>("refresh_pricing"),
+  /** Price the ledger's $0 rows with the catalog as it stands now; returns
+   *  how many got a price. */
+  repriceSpend: () => invoke<number>("reprice_spend"),
 
   // ─── Settings ─────────────────────────────────────────────────
   getSettings: () =>

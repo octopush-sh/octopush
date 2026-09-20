@@ -111,7 +111,10 @@ describe("CompanionHistory — keyboard reachability", () => {
     const user = userEvent.setup();
     renderHistory({ chats: [chats[0]] });
 
-    // Tab order: header "+" → row select button → row delete button.
+    // Tab order: section fold → header "+" → row select button → row delete button.
+    await user.tab();
+    expect(screen.getByRole("button", { name: /chats/i })).toHaveFocus();
+
     await user.tab();
     expect(screen.getByRole("button", { name: "New conversation" })).toHaveFocus();
 

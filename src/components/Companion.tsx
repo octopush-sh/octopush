@@ -3,7 +3,6 @@ import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { type WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
 import { CompanionContext } from "./CompanionContext";
-import { SavingsLedger } from "./chat/SavingsLedger";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionCrewJournal } from "./CompanionCrewJournal";
@@ -15,6 +14,8 @@ import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useIssuesStore } from "../stores/issuesStore";
+import { useChatStore } from "../stores/chatStore";
+import { findCrewAgent } from "./chat/CrewCard";
 import { selectElsewhereCount } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 
@@ -29,6 +30,7 @@ interface ContextProps {
   mcpServers?: string[];
   onReviewClick?: () => void;
   onSettingsClick?: () => void;
+  onOpenLogbook?: () => void;
 }
 
 interface HistoryProps {
@@ -87,6 +89,14 @@ export function Companion({
 }: Props) {
   const issues = useIssuesStore((s) => s.issues);
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
+  // A chosen sub-agent takes the whole Talk panel — its room, not a card
+  // squeezed above the other sections. Only while it still resolves: a focus
+  // the thread no longer holds falls back to the sections, never to nothing.
+  const crewFocus = useChatStore((s) => {
+    if (!workspaceId) return false;
+    const id = s.crewFocusByWs[workspaceId];
+    return !!id && findCrewAgent(s.getMessages(workspaceId), s.getLiveTools(workspaceId), id) != null;
+  });
 
   // The elsewhere list is scoped to the current project — never let an
   // open modal survive a project switch and show stale context.
@@ -183,15 +193,16 @@ export function Companion({
           navigator lives on the left and AI review inside the diff, so the
           companion answers the questions those surfaces can't. */}
       <FadeSwap swapKey={mode} className="flex min-h-0 flex-1 flex-col">
-        {mode === "talk" && (
+        {mode === "talk" && workspaceId && crewFocus && (
+          <CompanionCrewJournal workspaceId={workspaceId} />
+        )}
+        {mode === "talk" && !(workspaceId && crewFocus) && (
           <div className="flex flex-col">
-            {/* A chosen sub-agent's work journal leads the stack while open —
-                it is the one thing the user just asked to see. */}
-            {workspaceId && <CompanionCrewJournal workspaceId={workspaceId} />}
+            {/* Two sections, one chrome: the conversations of this workspace,
+                and everything about the one on screen (context, cost, the
+                mission line, capabilities, budgets). */}
             <CompanionHistory {...historyProps} />
-            <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} />
-            {workspaceId && <SavingsLedger workspaceId={workspaceId} />}
-            {workspaceId && <LogbookCard workspaceId={workspaceId} onOpenRoom={onOpenLogbook} />}
+            <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} onOpenLogbook={onOpenLogbook} />
             {onMakeProject && (
               <div className="border-t border-octo-hairline px-3 py-3">
                 <button

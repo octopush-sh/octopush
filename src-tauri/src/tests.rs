@@ -226,6 +226,8 @@ mod db_tests {
             cost_usd: 0.1,
             cost_basis: "computed".into(),
             idempotency_key: Some(key.into()),
+            thread_id: None,
+            origin: None,
         };
         db.insert_spend_event(&mk("k1")).unwrap();
         db.insert_spend_event(&mk("k1")).unwrap(); // dup key → ignored
@@ -11325,6 +11327,8 @@ mod usage_report_tests {
             cost_usd: cost,
             cost_basis: "computed".into(),
             idempotency_key: Some(key.into()),
+            thread_id: None,
+            origin: None,
         }
     }
 
@@ -11697,5 +11701,136 @@ mod transcript_tests {
         engine.scan_and_record("term-1", 2, b"Total cost: $5.00 | Input: 10K | Output: 1K");
         let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
         assert_eq!(rep.totals.calls, 2);
+    }
+}
+
+/// The thread-attributed ledger behind the Companion's conversation cost,
+/// the re-pricing of rows recorded before their model had a price, and
+/// the saved sub-agent runs a continuation resumes from.
+#[cfg(test)]
+mod thread_ledger_tests {
+    use crate::db::Db;
+    use crate::token_engine::{ModelPrices, TokenEngine, TokenEvent};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn ev(model: &str, input: u64, output: u64, cache_read: u64, cost: f64) -> TokenEvent {
+        TokenEvent {
+            id: None,
+            session_id: "ws-1".into(),
+            timestamp: String::new(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: 0,
+            model: model.into(),
+            cost_usd: cost,
+        }
+    }
+
+    #[test]
+    fn thread_cost_splits_director_from_subagents_and_prices_the_strong_baseline() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        // Director: 2 rounds, mostly cached. Sub-agent: one attempt.
+        engine.record_in_thread(ev("opus", 100, 50, 900, 0.30), "talk", Some("t-1"), Some("director")).unwrap();
+        engine.record_in_thread(ev("opus", 100, 50, 900, 0.30), "talk", Some("t-1"), Some("director")).unwrap();
+        engine.record_in_thread(ev("haiku", 1000, 200, 0, 0.05), "talk", Some("t-1"), Some("subagent:call-1")).unwrap();
+        // Another thread's spend never leaks in.
+        engine.record_in_thread(ev("opus", 100, 50, 0, 9.0), "talk", Some("t-2"), Some("director")).unwrap();
+
+        let strong = ModelPrices { input_per_m: 15.0, output_per_m: 75.0, cache_read_per_m: 1.5, cache_creation_per_m: 18.75 };
+        let c = db.lock().thread_cost("t-1", Some(&strong)).unwrap();
+        assert_eq!(c.calls, 3);
+        assert!((c.spent_usd - 0.65).abs() < 1e-9, "{}", c.spent_usd);
+        assert!((c.subagents_usd - 0.05).abs() < 1e-9);
+        assert!(c.strong_priced);
+        // Baseline: every row's tokens at the strong price.
+        let expected = strong.cost(100, 50, 900, 0) * 2.0 + strong.cost(1000, 200, 0, 0);
+        assert!((c.baseline_usd - expected).abs() < 1e-9, "{} vs {expected}", c.baseline_usd);
+        // Cache hit over the thread: 1800 read / (1200 uncached + 1800 read).
+        assert!((c.cache_hit_pct.unwrap() - 60.0).abs() < 1e-6);
+
+        // No strong tier priced → no baseline, and an empty thread is empty.
+        let c2 = db.lock().thread_cost("t-1", None).unwrap();
+        assert!(!c2.strong_priced);
+        assert_eq!(c2.baseline_usd, 0.0);
+        let none = db.lock().thread_cost("t-none", Some(&strong)).unwrap();
+        assert_eq!(none.calls, 0);
+        assert!(none.cache_hit_pct.is_none());
+    }
+
+    #[test]
+    fn reprice_unpriced_prices_zero_cost_rows_once_their_model_has_a_price() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        // Cost 0 and a model the catalog does not know → recorded at $0.
+        engine.record_in_thread(ev("mystery-model-9", 100, 50, 0, 0.0), "talk", Some("t-1"), Some("director")).unwrap();
+        // A priced row is never touched.
+        engine.record_in_thread(ev("opus", 100, 50, 0, 0.30), "talk", Some("t-1"), Some("director")).unwrap();
+        assert_eq!(db.lock().thread_cost("t-1", None).unwrap().spent_usd, 0.30);
+
+        let price = |m: &str| -> Option<ModelPrices> {
+            (m == "mystery-model-9").then_some(ModelPrices { input_per_m: 1.0, output_per_m: 2.0, cache_read_per_m: 0.1, cache_creation_per_m: 1.25 })
+        };
+        assert_eq!(db.lock().reprice_unpriced(&price).unwrap(), 1);
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert!((c.spent_usd - (0.30 + 0.0001 + 0.0001)).abs() < 1e-9, "{}", c.spent_usd);
+        // Nothing left to price; a still-unknown model stays at $0.
+        assert_eq!(db.lock().reprice_unpriced(&price).unwrap(), 0);
+        engine.record_in_thread(ev("other-unknown", 10, 10, 0, 0.0), "talk", Some("t-1"), None).unwrap();
+        assert_eq!(db.lock().reprice_unpriced(&price).unwrap(), 0);
+    }
+
+    #[test]
+    fn chat_agent_runs_round_trip_and_link_to_their_row() {
+        let db = test_db();
+        db.upsert_chat_agent_run("call-1", "t-1", "ws-1", "{\"spec\":1}", "{\"messages\":[]}", "haiku").unwrap();
+        let run = db.get_chat_agent_run("call-1").unwrap().expect("saved");
+        assert_eq!(run.thread_id, "t-1");
+        assert_eq!(run.workspace_id, "ws-1");
+        assert_eq!(run.model, "haiku");
+        assert_eq!(run.message_id, None);
+        assert_eq!(run.spec_json, "{\"spec\":1}");
+        // The row link survives a later upsert of the transcript (a continuation).
+        db.set_chat_agent_run_message("call-1", 42).unwrap();
+        db.upsert_chat_agent_run("call-1", "t-1", "ws-1", "{\"spec\":2}", "{\"messages\":[1]}", "haiku").unwrap();
+        let run = db.get_chat_agent_run("call-1").unwrap().unwrap();
+        assert_eq!(run.message_id, Some(42));
+        assert_eq!(run.transcript_json, "{\"messages\":[1]}");
+        assert!(db.get_chat_agent_run("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn chat_message_usage_columns_and_in_place_content_update() {
+        let db = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref()
+            .execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now])
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)",
+                [&now],
+            )
+            .unwrap();
+        let ws = "w1".to_string();
+        let thread = db.create_chat_thread(&ws, "t").unwrap();
+        let id = db.insert_chat_message(&ws, &thread.id, "assistant", "hi", Some("opus"), Some(100), Some(20), Some(0.1)).unwrap();
+        db.set_chat_message_usage(id, 900, 50, 1050).unwrap();
+        let row = db.get_chat_message(id).unwrap().unwrap();
+        assert_eq!(row.cache_read_tokens, Some(900));
+        assert_eq!(row.cache_creation_tokens, Some(50));
+        assert_eq!(row.context_tokens, Some(1050));
+        db.update_chat_message_content(id, "changed").unwrap();
+        assert_eq!(db.get_chat_message(id).unwrap().unwrap().content, "changed");
+        let listed = db.list_chat_messages(&thread.id).unwrap();
+        assert_eq!(listed[0].context_tokens, Some(1050));
     }
 }

@@ -22,13 +22,13 @@
 use crate::db::Db;
 use crate::error::AppResult;
 use crate::chat_engine::{dangerous_command, ApprovalBroker, ApprovalDecision};
-use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, ExternalTools, ToolGate};
+use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
-use crate::providers::{LlmProvider, LlmTool};
+use crate::providers::{LlmMessage, LlmProvider, LlmTool};
 use crate::skills::agents::{resolve_model_with_tiers, AgentDefinition};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -117,7 +117,7 @@ pub fn agent_tool_definitions(defs: &[AgentDefinition]) -> Vec<LlmTool> {
 }
 
 /// One parsed `Agent` tool call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCall {
     pub description: String,
     pub prompt: String,
@@ -219,6 +219,19 @@ pub struct AgentOutcome {
     pub cost_usd: f64,
     pub duration_ms: u64,
     pub tool_calls: usize,
+    /// The run was given more turns (or an answer) from the crew journal
+    /// after its first ending; the report is the continuation's.
+    #[serde(default)]
+    pub continued: bool,
+    /// The conversation as the loop left it — what a continuation resumes
+    /// from (for a blocked run, INCLUDING the asking turn). Persisted in
+    /// `chat_agent_runs`, never on the tool row.
+    #[serde(skip)]
+    pub transcript: Vec<LlmMessage>,
+    /// The `ask_director` call a blocked run is waiting on — a continuation
+    /// answers it as that call's tool_result. Empty otherwise.
+    #[serde(skip)]
+    pub ask_tool_use_id: String,
 }
 
 /// One billed attempt of a sub-agent — the ledger records each at its own
@@ -299,7 +312,7 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: usize) -> (String
 
 /// Everything a sub-agent needs from the parent turn, owned so the run can
 /// move into its own task.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SubagentSpec {
     pub call_id: String,
     pub call: AgentCall,
@@ -314,9 +327,14 @@ pub struct SubagentSpec {
     /// The `.claude/agents` definition `subagent_type` matched, if any.
     pub definition: Option<AgentDefinition>,
     /// The turn runs under the Auto policy (economy director): a sub-agent
-    /// that names no model runs on the balanced tier, not the director's
+    /// that names no model runs on the fast tier, not the director's
     /// strong model.
     pub policy_auto: bool,
+    /// A continuation: the saved transcript (plus the note or answer that
+    /// resumes it) replaces the fresh `prompt` as the loop's opening
+    /// messages. `None` for a first run.
+    #[serde(default)]
+    pub resume: Option<Vec<LlmMessage>>,
 }
 
 /// Which model a sub-agent runs on: the call's explicit `model` wins, then
@@ -351,10 +369,10 @@ pub fn pick_subagent_model(
         );
     }
     // Under Auto the director is the strong tier; an unspecified sub-agent
-    // is legwork and runs balanced when that tier is mapped.
+    // is legwork and runs on the fast tier when that tier is mapped.
     if spec.policy_auto {
-        if let Some(balanced) = resolve_model_with_tiers(AUTO_SUBAGENT_TIER, known_models, tiers) {
-            return balanced.to_string();
+        if let Some(fast) = resolve_model_with_tiers(AUTO_SUBAGENT_TIER, known_models, tiers) {
+            return fast.to_string();
         }
     }
     spec.default_model.clone()
@@ -365,8 +383,12 @@ pub fn pick_subagent_model(
 pub const AUTO_MODEL: &str = "auto";
 /// The tier the director itself runs on under Auto.
 pub const AUTO_DIRECTOR_TIER: &str = "strong";
-/// The tier an unspecified sub-agent runs on under Auto.
-pub const AUTO_SUBAGENT_TIER: &str = "balanced";
+/// The tier an unspecified sub-agent runs on under Auto. Fast, not
+/// balanced: an untyped sub-agent is nearly always a read (the doctrine
+/// says to type anything that writes), and a mid-tier model given a vague
+/// task runs long — the loop length, not the per-token price, is what a
+/// sub-agent costs.
+pub const AUTO_SUBAGENT_TIER: &str = "fast";
 
 /// The model a turn sent as [`AUTO_MODEL`] runs on: the strong tier's model
 /// when it is mapped to a configured id. `None` means the user has not set
@@ -408,19 +430,26 @@ pub fn director_doctrine(unmapped: &[&str]) -> String {
 
 const DOCTRINE: &str =
     "\n\n# Economy director\nYou run on the strongest, most expensive model, and every \
-     tool call re-sends your whole context at that price. Keep your context lean and spend \
-     it on judgment. Delegate every broad read to sub-agents with the Agent tool — mapping \
+     tool call re-sends your whole context at that price — though with prompt caching a \
+     round of yours is cheap; what costs money is a sub-agent that runs long. So: keep your \
+     context lean and spend it on judgment, and keep every sub-agent SHORT. One sub-agent, \
+     one question, always typed. Delegate every broad read with the Agent tool — mapping \
      code, reading many files, running test suites, reading a ticket, reviewing a diff — \
-     several in ONE response when the tasks are independent, and ask each for a compact \
-     report (findings first, `path:line` evidence, a few hundred words). Never paste a long \
-     output into your own context and never re-run what a sub-agent already reported; \
-     recall stored tool output instead of re-reading. Pick the agent type by role: \
-     `explorer`, `test-runner` and `ticket-reader` run on the fast tier; `implementer` \
-     and `pr-maintainer` run balanced and escalate to strong on a failed attempt; \
-     `reviewer` runs strong in a fresh context — that review is the quality gate before \
-     any PR, so always run it. A sub-agent you give no type or model runs balanced. Do \
-     small, sequential edits yourself; decide architecture, trade-offs and what the user \
-     is really asking yourself — that is what your context is for.";
+     several in ONE response when the questions are independent, each with a narrow, \
+     answerable question and a compact report asked for (findings first, `path:line` \
+     evidence, a few hundred words). Pick the type by role: `explorer`, `test-runner`, \
+     `ticket-reader` and `pr-author` run on the fast tier with a 15-turn cap — if a task \
+     needs more than that, it was two questions; split it, never widen it. `implementer` \
+     and `pr-maintainer` run balanced and escalate to strong on a failed attempt — the \
+     ONLY sub-agents that write. `reviewer` runs strong in a fresh context — the quality \
+     gate before any PR, so always run it. A sub-agent you give no type runs on the fast \
+     tier, so type anything that must write. Never paste a long output into your own \
+     context, never re-run or re-verify what a sub-agent already reported, and recall \
+     stored tool output instead of re-reading. A report cut at its turn cap is partial, \
+     not lost: the user can give that sub-agent more turns from its journal, so say what \
+     is still open instead of re-delegating from scratch. Do small, sequential edits \
+     yourself; decide architecture, trade-offs and what the user is really asking \
+     yourself — that is what your context is for.";
 
 /// Whether a sub-agent's first attempt warrants the definition's `escalate`
 /// retry: only a **failure** — no usable report. A report that merely hit
@@ -759,7 +788,7 @@ pub async fn run_subagent_core(
         client,
         model,
         &system,
-        user_messages(&spec.call.prompt),
+        spec.resume.clone().unwrap_or_else(|| user_messages(&spec.call.prompt)),
         Path::new(&spec.workspace_path),
         spec.max_iterations,
         cancel,
@@ -798,7 +827,38 @@ pub async fn run_subagent_core(
         ),
         duration_ms: started.elapsed().as_millis() as u64,
         tool_calls: out.tool_calls.len(),
+        continued: spec.resume.is_some(),
+        ask_tool_use_id: out.blocked_transcript.as_ref().map(|b| b.ask_tool_use_id.clone()).unwrap_or_default(),
+        transcript: match out.blocked_transcript {
+            Some(b) => b.messages,
+            None => out.transcript,
+        },
     })
+}
+
+/// The workspace's MCP tools, discovered once per fan-out (off-thread,
+/// bounded — a hung server must not stall the crew); each sub-agent then
+/// sees the subset its definition grants.
+pub async fn discover_mcp_tools(mcp: Arc<crate::mcp::McpRegistry>, workspace_path: &str) -> Vec<crate::mcp::McpToolInfo> {
+    let wp = std::path::PathBuf::from(workspace_path);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or_default()
+}
+
+/// The configured model ids and the user's tier map, for definition/call
+/// model specs (`haiku`, `fast`, an id…).
+pub fn model_catalog() -> (Vec<String>, HashMap<String, String>) {
+    let known = crate::provider_router::ProviderRouter::load()
+        .map(|r| r.list_models().into_iter().map(|m| m.model.id).collect())
+        .unwrap_or_default();
+    let tiers = crate::settings::load_settings().map(|s| s.model_tiers).unwrap_or_default();
+    (known, tiers)
 }
 
 /// Run every `Agent` call of one assistant response concurrently (at most
@@ -820,31 +880,13 @@ pub async fn run_subagents(
     // bounded — a hung server must not stall the crew); each sub-agent then
     // sees the subset its definition grants.
     let mcp_tools: Arc<Vec<crate::mcp::McpToolInfo>> = Arc::new(match specs.first() {
-        Some(first) => {
-            let reg = Arc::clone(&mcp);
-            let wp = std::path::PathBuf::from(&first.workspace_path);
-            tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                tokio::task::spawn_blocking(move || reg.list_tools(&wp)),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-        }
+        Some(first) => discover_mcp_tools(Arc::clone(&mcp), &first.workspace_path).await,
         None => Vec::new(),
     });
     let turnstiles = mcp_turnstiles(&mcp_tools);
-    // Configured model ids + the user's tier map, read once per fan-out, for
-    // definition/call model specs (`haiku`, `fast`, an id…).
-    let known_models: Arc<Vec<String>> = Arc::new(
-        crate::provider_router::ProviderRouter::load()
-            .map(|r| r.list_models().into_iter().map(|m| m.model.id).collect())
-            .unwrap_or_default(),
-    );
-    let tiers: Arc<HashMap<String, String>> = Arc::new(
-        crate::settings::load_settings().map(|s| s.model_tiers).unwrap_or_default(),
-    );
+    let (known_models, tiers) = model_catalog();
+    let known_models: Arc<Vec<String>> = Arc::new(known_models);
+    let tiers: Arc<HashMap<String, String>> = Arc::new(tiers);
     for spec in specs {
         let app = app.clone();
         let db = Arc::clone(&db);
@@ -859,42 +901,10 @@ pub async fn run_subagents(
         let turnstiles = Arc::clone(&turnstiles);
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
-            let started = std::time::Instant::now();
-            let model = pick_subagent_model(&spec, &known_models, &tiers);
-            let approval_gate = SubagentGate::new(approvals, app.clone(), &spec).with_mcp_writes(&mcp_tools);
-            let external = McpSubagentTools::granted(
-                mcp,
-                Path::new(&spec.workspace_path),
-                &mcp_tools,
-                spec.definition.as_ref(),
-                Arc::clone(&turnstiles),
-            );
-            let external_ref: Option<&dyn ExternalTools> = external.as_ref().map(|e| e as &dyn ExternalTools);
-            let sink = ChatAgentSink {
-                app,
-                db,
-                workspace_id: spec.workspace_id.clone(),
-                thread_id: spec.thread_id.clone(),
-                call_id: spec.call_id.clone(),
-            };
-            let mut outcome = run_attempt(&model, &spec, &client, &cancel, &sink, &approval_gate, external_ref, started).await;
-            // The definition's `escalate`: one retry on the stronger model
-            // when the cheap attempt failed, blocked, or hit its turn cap —
-            // unless the director stopped the turn.
-            if should_escalate(&outcome) && !cancel.load(Ordering::Relaxed) {
-                if let Some(stronger) = escalation_model(&spec, &model, &known_models, &tiers) {
-                    tracing::info!(call = %spec.call_id, from = %model, to = %stronger, "escalating sub-agent");
-                    LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
-                        "escalating to {stronger}: the {model} attempt {}",
-                        if outcome.blocked { "stopped on a question" } else if outcome.closed_at_cap { "hit its turn limit" } else { "failed" }
-                    ));
-                    let mut retry = spec.clone();
-                    retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(&spec));
-                    let second = run_attempt(&stronger, &retry, &client, &cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
-                    outcome = merge_escalated(outcome, second);
-                }
-            }
-            outcome.tier = tier_for_outcome(&spec, &outcome.model, &tiers);
+            let outcome = run_one_subagent(
+                app, db, client, approvals, mcp, &mcp_tools, turnstiles, &known_models, &tiers, &spec, &cancel,
+            )
+            .await;
             (spec.call_id, outcome)
         });
     }
@@ -908,6 +918,98 @@ pub async fn run_subagents(
         }
     }
     outcomes
+}
+
+/// One sub-agent, start to finish: pick its model, gate its writes, grant
+/// its MCP tools, run it (with the definition's one `escalate` retry), tag
+/// the tier, and persist the run so it can be continued later. Shared by
+/// the fan-out and `ChatEngine::continue_subagent`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_one_subagent(
+    app: AppHandle,
+    db: Arc<Mutex<Db>>,
+    client: reqwest::Client,
+    approvals: Arc<ApprovalBroker>,
+    mcp: Arc<crate::mcp::McpRegistry>,
+    mcp_tools: &[crate::mcp::McpToolInfo],
+    turnstiles: Arc<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    known_models: &[String],
+    tiers: &HashMap<String, String>,
+    spec: &SubagentSpec,
+    cancel: &Arc<AtomicBool>,
+) -> AgentOutcome {
+    let started = std::time::Instant::now();
+    // (A continuation carries the saved run's model as the call's `model`,
+    // so it resumes on the model that wrote the transcript.)
+    let model = pick_subagent_model(spec, known_models, tiers);
+    let approval_gate = SubagentGate::new(approvals, app.clone(), spec).with_mcp_writes(mcp_tools);
+    let external = McpSubagentTools::granted(
+        mcp,
+        Path::new(&spec.workspace_path),
+        mcp_tools,
+        spec.definition.as_ref(),
+        turnstiles,
+    );
+    let external_ref: Option<&dyn ExternalTools> = external.as_ref().map(|e| e as &dyn ExternalTools);
+    let sink = ChatAgentSink {
+        app,
+        db: Arc::clone(&db),
+        workspace_id: spec.workspace_id.clone(),
+        thread_id: spec.thread_id.clone(),
+        call_id: spec.call_id.clone(),
+    };
+    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &approval_gate, external_ref, started).await;
+    // The definition's `escalate`: one retry on the stronger model when the
+    // cheap attempt failed — unless the director stopped the turn. A
+    // continuation never escalates: the user chose to give THIS run more
+    // turns.
+    if spec.resume.is_none() && should_escalate(&outcome) && !cancel.load(Ordering::Relaxed) {
+        if let Some(stronger) = escalation_model(spec, &model, known_models, tiers) {
+            tracing::info!(call = %spec.call_id, from = %model, to = %stronger, "escalating sub-agent");
+            LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
+                "escalating to {stronger}: the {model} attempt {}",
+                if outcome.blocked { "stopped on a question" } else if outcome.closed_at_cap { "hit its turn limit" } else { "failed" }
+            ));
+            let mut retry = spec.clone();
+            retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(spec));
+            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            outcome = merge_escalated(outcome, second);
+        }
+    }
+    outcome.tier = tier_for_outcome(spec, &outcome.model, tiers);
+    persist_run(&db, spec, &outcome);
+    outcome
+}
+
+/// Save what a continuation needs: the spec (minus the transcript it ran
+/// from — the saved transcript IS the resume point) and the conversation as
+/// the loop left it. A run that produced no transcript (could not start)
+/// leaves nothing to continue.
+fn persist_run(db: &Arc<Mutex<Db>>, spec: &SubagentSpec, outcome: &AgentOutcome) {
+    if outcome.transcript.is_empty() {
+        return;
+    }
+    let mut bare = spec.clone();
+    bare.resume = None;
+    let transcript = BlockedTranscript {
+        messages: outcome.transcript.clone(),
+        ask_tool_use_id: outcome.ask_tool_use_id.clone(),
+    };
+    let (Ok(spec_json), Ok(transcript_json)) =
+        (serde_json::to_string(&bare), serde_json::to_string(&transcript))
+    else {
+        return;
+    };
+    if let Err(e) = db.lock().upsert_chat_agent_run(
+        &spec.call_id,
+        &spec.thread_id,
+        &spec.workspace_id,
+        &spec_json,
+        &transcript_json,
+        &outcome.model,
+    ) {
+        tracing::warn!(error = %e, call = %spec.call_id, "failed to persist sub-agent run");
+    }
 }
 
 /// One attempt of a sub-agent on `model`: resolve the provider, run the
@@ -1045,6 +1147,7 @@ mod tests {
             mcp: crate::skills::agents::McpGrant::All,
             model: model.map(String::from),
             escalate: None,
+            max_turns: None,
             source: "project".into(),
         }
     }
@@ -1079,6 +1182,7 @@ mod tests {
             default_model: "conv-model".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: false,
+            resume: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &no_tiers), "conv-model");
         let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
@@ -1101,7 +1205,18 @@ mod tests {
     }
 
     #[test]
-    fn under_auto_an_unspecified_subagent_runs_balanced_and_the_director_runs_strong() {
+    fn the_doctrine_says_one_question_per_typed_subagent_and_that_a_cap_is_not_lost_work() {
+        let d = director_doctrine(&[]);
+        assert!(d.contains("One sub-agent, one question, always typed"), "{d}");
+        assert!(d.contains("15-turn cap"));
+        assert!(d.contains("runs on the fast tier"));
+        assert!(d.contains("give that sub-agent more turns from its journal"));
+        assert!(d.contains("never re-run or re-verify what a sub-agent already reported"));
+        assert_eq!(AUTO_SUBAGENT_TIER, "fast");
+    }
+
+    #[test]
+    fn under_auto_an_unspecified_subagent_runs_fast_and_the_director_runs_strong() {
         let known = vec!["opus".to_string(), "sonnet".to_string(), "haiku".to_string()];
         let tiers: HashMap<String, String> = [
             ("fast".to_string(), "haiku".to_string()),
@@ -1117,17 +1232,18 @@ mod tests {
             default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: true,
+            resume: None,
         };
-        assert_eq!(pick_subagent_model(&base, &known, &tiers), "sonnet", "no model → balanced under Auto");
+        assert_eq!(pick_subagent_model(&base, &known, &tiers), "haiku", "no model → fast under Auto");
         // A definition's tier still wins; a call's explicit model still wins.
-        let with_def = SubagentSpec { definition: Some(def("explorer", None, Some("fast"))), ..base.clone() };
-        assert_eq!(pick_subagent_model(&with_def, &known, &tiers), "haiku");
+        let with_def = SubagentSpec { definition: Some(def("implementer", None, Some("balanced"))), ..base.clone() };
+        assert_eq!(pick_subagent_model(&with_def, &known, &tiers), "sonnet");
         let explicit = SubagentSpec { call: AgentCall { model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
         assert_eq!(pick_subagent_model(&explicit, &known, &tiers), "opus");
-        // Balanced unmapped → inherit the director's model, as before.
-        let mut no_balanced = tiers.clone();
-        no_balanced.remove("balanced");
-        assert_eq!(pick_subagent_model(&base, &known, &no_balanced), "opus");
+        // Fast unmapped → inherit the director's model, as before.
+        let mut no_fast = tiers.clone();
+        no_fast.remove("fast");
+        assert_eq!(pick_subagent_model(&base, &known, &no_fast), "opus");
         // The director: the strong tier when mapped to a configured id, else
         // nothing (the caller tells the user to map it — never a guess).
         assert_eq!(director_model_for_auto(&known, &tiers).as_deref(), Some("opus"));
@@ -1144,6 +1260,8 @@ mod tests {
         assert!(unmapped_subagent_tiers(&known, &tiers).is_empty());
         let d = director_doctrine(&[]);
         assert!(d.contains("Delegate every broad read") && !d.contains("Caveat"));
+        let mut no_balanced = tiers.clone();
+        no_balanced.remove("balanced");
         assert_eq!(unmapped_subagent_tiers(&known, &no_balanced), vec!["balanced"]);
         assert!(director_doctrine(&["balanced"]).contains("the balanced tier is not mapped"));
         assert!(director_doctrine(&["fast", "balanced"]).contains("the fast and balanced tiers are not mapped"));
@@ -1174,6 +1292,7 @@ mod tests {
             default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
             definition: Some(d),
             policy_auto: false,
+            resume: None,
         };
         let ok = AgentOutcome { ok: true, finished: true, model: "sonnet".into(), ..Default::default() };
         assert!(!should_escalate(&ok));
@@ -1314,6 +1433,7 @@ mod tests {
             default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
             definition: Some(def("ticket-reader", Some(vec!["read_file"]), None)),
             policy_auto: false,
+            resume: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1387,6 +1507,7 @@ mod tests {
             default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: false,
+            resume: None,
         };
         let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec!["mcp__jira__add_comment"] };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -1442,6 +1563,7 @@ mod tests {
             default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
             definition: Some(def("reader", Some(vec!["read_file", "grep"]), None)),
             policy_auto: false,
+            resume: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1499,6 +1621,7 @@ mod tests {
             workspace_path: dir.path().to_string_lossy().into_owned(),
             default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None, definition: None,
             policy_auto: false,
+            resume: None,
         };
         let gate = DenyRuns { seen: Mutex::new(vec![]) };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -1546,6 +1669,7 @@ mod tests {
             sandbox_roots: None,
             definition: None,
             policy_auto: false,
+            resume: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();

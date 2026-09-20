@@ -6,6 +6,7 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
+import { ChatMarkdown } from "./ChatMarkdown";
 import { OctoWatcher } from "./OctoWatcher";
 import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
@@ -20,6 +21,23 @@ interface Props {
   onOpenInEditor?: (path: string) => void;
   /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
   onRunInTerminal?: (command: string) => void;
+}
+
+/**
+ * The model's words before a round's tool calls — its reasoning in the
+ * open ("the tests import X, so let me check…"). A quiet sage line hung on
+ * a hairline, so ten tool rounds read as a train of thought instead of a
+ * black box; never the eyebrow + key-phrase treatment of an answer.
+ */
+function NarrationLine({ text, onOpenInEditor }: { text: string; onOpenInEditor?: (path: string) => void }) {
+  return (
+    <div
+      data-role="narration"
+      className="octo-fade-in octo-selectable border-l border-octo-hairline pl-3 text-[12.5px] leading-[1.55] text-octo-sage"
+    >
+      <ChatMarkdown text={text} onOpenInEditor={onOpenInEditor} />
+    </div>
+  );
 }
 
 /**
@@ -198,6 +216,9 @@ export function ChatCanvas({
                   onRunInTerminal={onRunInTerminal}
                 />
               );
+            }
+            if (item.kind === "narration") {
+              return <NarrationLine key={`narration-${item.id}`} text={item.text} onOpenInEditor={onOpenInEditor} />;
             }
             if (item.kind === "error") {
               return (

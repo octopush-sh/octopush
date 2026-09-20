@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Plus, X, Pencil, Check, Search, Download, Pin, PinOff } from "lucide-react";
+import { CompanionSection } from "./CompanionSection";
 
 export interface CompanionHistoryChat {
   id: string;
@@ -71,22 +72,23 @@ export function CompanionHistory({
   }
 
   return (
-    <section>
-      {/* Eyebrow bar — converges on the CompanionFileTree quality bar. */}
-      <div className="flex h-11 shrink-0 items-center justify-between border-b border-octo-hairline px-4">
-        <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
-          Chats
-        </h3>
+    <CompanionSection
+      title="Chats"
+      count={chats.length > 0 ? chats.length : null}
+      storageKey="chats"
+      testId="companion-chats"
+      action={
         <button
           type="button"
           onClick={onNewChat}
           aria-label="New conversation"
           title="New conversation"
-          className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           <Plus size={12} />
         </button>
-      </div>
+      }
+    >
 
       {/* Filter — appears once there are enough conversations to need it. */}
       {chats.length > 4 && (
@@ -270,6 +272,6 @@ export function CompanionHistory({
           );
         })}
       </ul>
-    </section>
+    </CompanionSection>
   );
 }

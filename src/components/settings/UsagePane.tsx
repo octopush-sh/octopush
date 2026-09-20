@@ -176,12 +176,36 @@ export function UsagePane() {
     setRefreshingPricing(true);
     try {
       const r = await ipc.refreshPricing();
-      pushToast({ level: "success", title: "Pricing refreshed", body: `${r.modelsUpdated} of ${r.modelsTotal} models updated` });
+      const repriced = r.eventsRepriced ?? 0;
+      pushToast({
+        level: "success",
+        title: "Pricing refreshed",
+        body: `${r.modelsUpdated} of ${r.modelsTotal} models updated${repriced > 0 ? ` · ${repriced} unpriced ${repriced === 1 ? "call" : "calls"} now priced` : ""}`,
+      });
       await load();
     } catch (e) {
       pushToast({ level: "error", title: "Pricing refresh failed", body: String(e) });
     } finally {
       setRefreshingPricing(false);
+    }
+  }
+
+  // ── Re-price the ledger's $0 rows (a model priced after it was used) ──
+  const [repricing, setRepricing] = useState(false);
+  async function handleReprice() {
+    setRepricing(true);
+    try {
+      const n = await ipc.repriceSpend();
+      pushToast({
+        level: n > 0 ? "success" : "info",
+        title: n > 0 ? "Ledger re-priced" : "Nothing to re-price",
+        body: n > 0 ? `${n} ${n === 1 ? "call" : "calls"} now carry a price` : "The unpriced calls use models the catalog still has no price for.",
+      });
+      await load();
+    } catch (e) {
+      pushToast({ level: "error", title: "Re-price failed", body: String(e) });
+    } finally {
+      setRepricing(false);
     }
   }
 
@@ -324,8 +348,19 @@ export function UsagePane() {
           </div>
 
           {report.unpricedCalls > 0 && (
-            <p className="mt-2 max-w-[860px] text-[11px] text-octo-mute">
-              {report.unpricedCalls === 1 ? "1 call" : `${report.unpricedCalls} calls`} carried tokens but no price — a model the catalog does not know.
+            <p className="mt-2 flex max-w-[860px] flex-wrap items-baseline gap-x-2 text-[11px] text-octo-mute">
+              <span>
+                {report.unpricedCalls === 1 ? "1 call" : `${report.unpricedCalls} calls`} carried tokens but no price — a model the catalog did not know, or had no price for, when it ran.
+              </span>
+              <button
+                type="button"
+                onClick={handleReprice}
+                disabled={repricing}
+                title="Price those calls with the catalog as it stands now"
+                className="font-serif text-[12px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:opacity-50"
+              >
+                {repricing ? "Re-pricing…" : "Price them now"}
+              </button>
             </p>
           )}
 

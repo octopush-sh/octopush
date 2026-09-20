@@ -1195,15 +1195,16 @@ function App() {
   }, [modelCatalog, activeModel]);
 
   // Context window usage of the most recent assistant turn in the active
-  // chat. Numerator = inputTokens of the latest assistant message (that's
-  // exactly what filled the model's prompt for the next response).
-  // Denominator = max_context of the active model. This lets the user see
-  // how close they are to the conversation memory ceiling.
+  // chat. Numerator = the LAST prompt's full size (uncached + cached +
+  // written — `contextTokens`); rows from before that was recorded fall
+  // back to their uncached `inputTokens`. Denominator = max_context of the
+  // active model. This lets the user see how close they are to the
+  // conversation memory ceiling.
   const lastTurnInputTokens = useMemo(() => {
     for (let i = activeChatMessages.length - 1; i >= 0; i--) {
       const m = activeChatMessages[i];
-      if (m.role === "assistant" && m.inputTokens != null) {
-        return m.inputTokens;
+      if (m.role === "assistant" && (m.contextTokens != null || m.inputTokens != null)) {
+        return m.contextTokens ?? m.inputTokens ?? 0;
       }
     }
     return 0;

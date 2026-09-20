@@ -9,7 +9,7 @@
 use crate::chat_agents::{
     agent_tool_definitions, director_doctrine, director_model_for_auto, is_agent_tool, parse_agent_call,
     run_subagents, unmapped_subagent_tiers, AgentOutcome, AUTO_MODEL,
-    SubagentSpec,
+    SubagentSpec, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
 };
 use crate::chat_history::{
     build_history, effective_talk_max_iterations, window_text, HistoryRole, HistoryRow,
@@ -23,6 +23,7 @@ use crate::providers::{
     LlmStopReason, LlmTool, LlmToolResult,
 };
 use crate::provider_router::ProviderRouter;
+use crate::orchestrator::agentic::{resume_messages_for_answered_block, resume_messages_for_continuation, BlockedTranscript};
 use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -534,6 +535,61 @@ pub struct MessageAddedEvent {
     pub output_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub created_at: String,
+    /// Cache-aware usage for assistant rows: tokens served from the prompt
+    /// cache, tokens written to it, and the size of the LAST prompt of the
+    /// turn (uncached + cached + written) — the honest context figure.
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub context_tokens: Option<i64>,
+}
+
+/// Emitted when a persisted message's content changes in place — a
+/// sub-agent's tool row after a continuation rewrote its report and meta.
+/// The frontend replaces the row by id; nothing is appended.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageUpdatedEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub id: i64,
+    pub content: String,
+}
+
+/// One turn's token accounting across its rounds, cache-aware. `cost` sums
+/// every round priced with its own cache split (a round's cached input is
+/// ~10× cheaper than uncached, so pricing the totals as uncached input — the
+/// old way — overstated some turns and understated the cache-write ones);
+/// `last_context` is the last prompt's full size, what the context meter
+/// should show (the uncached `input` alone is the small tail of the prompt
+/// the cache did not cover).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    pub cost: f64,
+    pub last_context: u64,
+}
+
+impl TurnUsage {
+    pub fn add(&mut self, model: &str, r: &crate::providers::LlmResponse) {
+        self.input += r.input_tokens;
+        self.output += r.output_tokens;
+        self.cache_read += r.cache_read_tokens;
+        self.cache_creation += r.cache_creation_tokens;
+        self.cost += token_engine::cost_for(
+            model,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+        );
+        let ctx = r.input_tokens + r.cache_read_tokens + r.cache_creation_tokens;
+        if ctx > 0 {
+            self.last_context = ctx;
+        }
+    }
 }
 
 // ─── Tools definition ─────────────────────────────────────────────
@@ -1328,6 +1384,74 @@ pub(crate) fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, 
     Ok((impl_, api_base, key))
 }
 
+/// Ledger origin of the director's own rounds in a Talk thread.
+pub const DIRECTOR_ORIGIN: &str = "director";
+
+/// Ledger origin of one sub-agent's rounds: `subagent:<tool call id>`.
+pub fn subagent_origin(call_id: &str) -> String {
+    format!("subagent:{call_id}")
+}
+
+/// How many more tool turns a continuation may take: at least one, never
+/// more than the hard ceiling (a runaway continuation would cost as much
+/// as the run it extends).
+pub const CONTINUE_MAX_TURNS: usize = 50;
+
+/// The note that resumes a run cut at its turn cap (or stopped), with or
+/// without a word from the user. Pure so the wording is tested.
+pub fn continuation_note(instruction: Option<&str>, extra_turns: usize) -> String {
+    let turns = format!(
+        "You have {extra_turns} more tool turn{} — continue exactly where you left off, do \
+         not redo work already done, and write your final report when finished.",
+        if extra_turns == 1 { "" } else { "s" }
+    );
+    match instruction.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(text) => format!("A message from the user: {text}\n\n{turns}"),
+        None => turns,
+    }
+}
+
+/// Fold a continuation's outcome into the meta already on the tool row: the
+/// new ending and report, spend and duration summed across runs, attempts
+/// appended, `continued` set. Pure so the sums are tested.
+pub fn merge_continued_meta(old: &serde_json::Value, new: &AgentOutcome) -> serde_json::Value {
+    let mut m = serde_json::to_value(new).unwrap_or_default();
+    let n = |k: &str| old.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if let Some(obj) = m.as_object_mut() {
+        obj.remove("report");
+        for k in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "toolCalls", "durationMs"] {
+            let sum = n(k) + obj.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            obj.insert(k.to_string(), serde_json::json!(sum as u64));
+        }
+        obj.insert("costUsd".into(), serde_json::json!(n("costUsd") + new.cost_usd));
+        obj.insert("continued".into(), serde_json::json!(true));
+        if new.escalated_from.is_none() {
+            if let Some(from) = old.get("escalatedFrom").filter(|v| !v.is_null()) {
+                obj.insert("escalatedFrom".into(), from.clone());
+            }
+        }
+        let mut attempts: Vec<serde_json::Value> = old
+            .get("attempts")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if attempts.is_empty() {
+            // The first run's figures were the single attempt.
+            attempts.push(serde_json::json!({
+                "model": old.get("model").cloned().unwrap_or(serde_json::Value::Null),
+                "inputTokens": n("inputTokens") as u64,
+                "outputTokens": n("outputTokens") as u64,
+                "cacheReadTokens": n("cacheReadTokens") as u64,
+                "cacheCreationTokens": n("cacheCreationTokens") as u64,
+                "costUsd": n("costUsd"),
+            }));
+        }
+        attempts.extend(new.billed_attempts().iter().map(|a| serde_json::to_value(a).unwrap_or_default()));
+        obj.insert("attempts".into(), serde_json::Value::Array(attempts));
+    }
+    m
+}
+
 // ─── Engine ───────────────────────────────────────────────────────
 
 /// Removes a workspace's cancel flag from the registry when the turn ends,
@@ -1424,10 +1548,10 @@ impl ChatEngine {
     /// Record one provider response's token usage: the canonical spend ledger
     /// (so the Companion CONTEXT card and Settings · Usage see chat turns)
     /// and the mission logbook. Shared by the loop and the forced close.
-    fn record_usage(&self, workspace_id: &str, model: &str, response: &crate::providers::LlmResponse) {
+    fn record_usage(&self, workspace_id: &str, thread_id: &str, model: &str, response: &crate::providers::LlmResponse) {
         if response.input_tokens > 0 || response.output_tokens > 0 {
             let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
-            if let Err(e) = engine.record(token_engine::TokenEvent {
+            if let Err(e) = engine.record_in_thread(token_engine::TokenEvent {
                 id: None,
                 session_id: workspace_id.to_string(),
                 timestamp: String::new(),
@@ -1437,12 +1561,40 @@ impl ChatEngine {
                 cache_creation_tokens: response.cache_creation_tokens,
                 model: model.to_string(),
                 cost_usd: 0.0,
-            }, "talk") {
+            }, "talk", Some(thread_id), Some(DIRECTOR_ORIGIN)) {
                 tracing::warn!(error = %e, "failed to record chat token event");
             }
         }
         // Logbook: a completed chat turn is active TALK work on the mission.
         let _ = self.db.lock().record_activity(workspace_id, "talk", "chat");
+    }
+
+    /// Sub-agent spend goes to the ledger under ITS model (a `model`
+    /// override may differ from the thread's) and under its call id, so the
+    /// Companion's conversation cost splits director from crew. An escalated
+    /// sub-agent bills every attempt at its own model's price, so each
+    /// attempt is its own ledger row.
+    fn record_subagent_spend(&self, workspace_id: &str, thread_id: &str, call_id: &str, o: &AgentOutcome) {
+        let origin = subagent_origin(call_id);
+        for a in o.billed_attempts() {
+            if a.input_tokens == 0 && a.output_tokens == 0 {
+                continue;
+            }
+            let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
+            if let Err(e) = engine.record_in_thread(token_engine::TokenEvent {
+                id: None,
+                session_id: workspace_id.to_string(),
+                timestamp: String::new(),
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                cache_read_tokens: a.cache_read_tokens,
+                cache_creation_tokens: a.cache_creation_tokens,
+                model: a.model.clone(),
+                cost_usd: 0.0,
+            }, "talk", Some(thread_id), Some(&origin)) {
+                tracing::warn!(error = %e, "failed to record sub-agent token event");
+            }
+        }
     }
 
     /// Execute `recall_tool_output`: the full stored result of an earlier
@@ -1493,11 +1645,10 @@ impl ChatEngine {
         workspace_id: &str,
         thread_id: &str,
         model: &str,
-        total_input: u64,
-        total_output: u64,
+        usage: &TurnUsage,
     ) -> AppResult<()> {
         self.finish_with_note(
-            app, workspace_id, thread_id, model, total_input, total_output,
+            app, workspace_id, thread_id, model, usage,
             "Generation stopped.",
         )
     }
@@ -1513,11 +1664,10 @@ impl ChatEngine {
         workspace_id: &str,
         thread_id: &str,
         model: &str,
-        total_input: u64,
-        total_output: u64,
+        usage: &TurnUsage,
     ) -> AppResult<()> {
         self.finish_with_note(
-            app, workspace_id, thread_id, model, total_input, total_output,
+            app, workspace_id, thread_id, model, usage,
             "Budget cap reached — turn stopped. Override to continue.",
         )
     }
@@ -1533,31 +1683,75 @@ impl ChatEngine {
         workspace_id: &str,
         thread_id: &str,
         model: &str,
-        total_input: u64,
-        total_output: u64,
+        usage: &TurnUsage,
         note: &str,
     ) -> AppResult<()> {
-        let cost = token_engine::cost_for(model, total_input, total_output, 0, 0);
-        self.insert_and_emit_message(
-            app,
-            workspace_id,
-            thread_id,
-            "stopped",
-            note,
-            Some(model),
-            Some(total_input as i64),
-            Some(total_output as i64),
-            Some(cost),
-        )?;
+        self.insert_and_emit_priced(app, workspace_id, thread_id, "stopped", note, model, usage)?;
         let _ = app.emit("chat://stream", &ChatStreamEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             delta: String::new(),
             done: true,
-            input_tokens: Some(total_input),
-            output_tokens: Some(total_output),
+            input_tokens: Some(usage.input),
+            output_tokens: Some(usage.output),
         });
         Ok(())
+    }
+
+    /// Persist a row that carries a turn's usage (an assistant answer or a
+    /// stopped note): tokens + cache-aware cost on the row, the cache split
+    /// and the last prompt's size alongside, and one `chat://message-added`
+    /// with all of it.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_and_emit_priced(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        model: &str,
+        usage: &TurnUsage,
+    ) -> AppResult<i64> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let id = {
+            let db = self.db.lock();
+            let id = db.insert_chat_message(
+                workspace_id,
+                thread_id,
+                role,
+                content,
+                Some(model),
+                Some(usage.input as i64),
+                Some(usage.output as i64),
+                Some(usage.cost),
+            )?;
+            if let Err(e) = db.set_chat_message_usage(
+                id,
+                usage.cache_read as i64,
+                usage.cache_creation as i64,
+                usage.last_context as i64,
+            ) {
+                tracing::warn!(error = %e, "failed to store cache usage on chat row");
+            }
+            id
+        };
+        let _ = app.emit("chat://message-added", &MessageAddedEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            id,
+            role: role.to_string(),
+            content: content.to_string(),
+            model: Some(model.to_string()),
+            input_tokens: Some(usage.input as i64),
+            output_tokens: Some(usage.output as i64),
+            cost_usd: Some(usage.cost),
+            created_at: now,
+            cache_read_tokens: Some(usage.cache_read as i64),
+            cache_creation_tokens: Some(usage.cache_creation as i64),
+            context_tokens: Some(usage.last_context as i64),
+        });
+        Ok(id)
     }
 
     /// Insert a message into the DB and emit a `chat://message-added` event
@@ -1590,8 +1784,154 @@ impl ChatEngine {
             output_tokens,
             cost_usd,
             created_at: now,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            context_tokens: None,
         });
         Ok(id)
+    }
+
+    /// Give a finished sub-agent more turns — and, optionally, a word from
+    /// the user — on its saved transcript. A run cut at its cap, stopped, or
+    /// blocked on a question is not lost work: it resumes exactly where it
+    /// left off (a blocked run receives the message as the answer to its
+    /// `ask_director`), on the model that wrote the transcript, with the same
+    /// approval gate and MCP grants. The tool row's report and meta are
+    /// rewritten in place (`chat://message-updated`) so the director's next
+    /// turn reads the continued report from history; a quiet note marks the
+    /// continuation in the thread.
+    pub async fn continue_subagent(
+        &self,
+        app: AppHandle,
+        call_id: String,
+        instruction: Option<String>,
+        extra_turns: usize,
+    ) -> AppResult<()> {
+        let extra_turns = extra_turns.clamp(1, CONTINUE_MAX_TURNS);
+        let run = self
+            .db
+            .lock()
+            .get_chat_agent_run(&call_id)?
+            .ok_or_else(|| AppError::Other("This sub-agent has no saved run to continue (it predates continuations, or never started).".into()))?;
+        let message_id = run
+            .message_id
+            .ok_or_else(|| AppError::Other("This sub-agent's report row is gone — nothing to update.".into()))?;
+        let mut spec: SubagentSpec = serde_json::from_str(&run.spec_json)
+            .map_err(|e| AppError::Other(format!("saved sub-agent run is unreadable: {e}")))?;
+        let transcript: BlockedTranscript = serde_json::from_str(&run.transcript_json)
+            .map_err(|e| AppError::Other(format!("saved sub-agent transcript is unreadable: {e}")))?;
+        if transcript.messages.is_empty() {
+            return Err(AppError::Other("This sub-agent left no transcript to continue from.".into()));
+        }
+        let thread_alive = self.db.lock().chat_thread_exists(&run.thread_id).unwrap_or(false);
+        if !thread_alive {
+            return Err(AppError::Other("The conversation this sub-agent belonged to was deleted.".into()));
+        }
+
+        // Resume on the model that wrote the transcript, never re-picked.
+        spec.call.model = Some(run.model.clone());
+        spec.max_iterations = extra_turns;
+        let note = continuation_note(instruction.as_deref(), extra_turns);
+        spec.resume = Some(if transcript.ask_tool_use_id.is_empty() {
+            resume_messages_for_continuation(&transcript, &note)
+        } else {
+            resume_messages_for_answered_block(&transcript, &note)
+        });
+
+        // Cancellable from the thread's Stop like a turn — unless a turn is
+        // live on the thread, whose flag stays its own.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let key = format!("{}#continue:{}", run.thread_id, call_id);
+        self.cancels.lock().insert(key.clone(), Arc::clone(&cancel));
+        let _cancel_guard = CancelGuard { cancels: Arc::clone(&self.cancels), key };
+        let mirror = {
+            let mut cancels = self.cancels.lock();
+            match cancels.entry(run.thread_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(Arc::clone(&cancel));
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            }
+        };
+        let _mirror_guard = mirror.then(|| CancelGuard {
+            cancels: Arc::clone(&self.cancels),
+            key: run.thread_id.clone(),
+        });
+
+        let _ = app.emit("chat://tool-start", &ToolStartEvent {
+            workspace_id: run.workspace_id.clone(),
+            thread_id: run.thread_id.clone(),
+            call_id: call_id.clone(),
+            tool_name: "Agent".to_string(),
+            tool_input: agent_input_for_display(&spec.call),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        });
+
+        let mcp_tools = discover_mcp_tools(Arc::clone(&self.mcp), &spec.workspace_path).await;
+        let turnstiles = mcp_turnstiles(&mcp_tools);
+        let (known_models, tiers) = model_catalog();
+        let outcome = run_one_subagent(
+            app.clone(),
+            Arc::clone(&self.db),
+            self.client.clone(),
+            self.approvals(),
+            Arc::clone(&self.mcp),
+            &mcp_tools,
+            turnstiles,
+            &known_models,
+            &tiers,
+            &spec,
+            &cancel,
+        )
+        .await;
+        self.record_subagent_spend(&run.workspace_id, &run.thread_id, &call_id, &outcome);
+
+        let _ = app.emit("chat://tool-end", &ToolEndEvent {
+            workspace_id: run.workspace_id.clone(),
+            thread_id: run.thread_id.clone(),
+            call_id: call_id.clone(),
+            ok: outcome.ok,
+            duration_ms: outcome.duration_ms,
+        });
+
+        // Rewrite the row: the continued report replaces the old one, the
+        // meta carries both runs.
+        let row = self.db.lock().get_chat_message(message_id)?;
+        let mut record: serde_json::Value = row
+            .as_ref()
+            .and_then(|r| serde_json::from_str(&r.content).ok())
+            .unwrap_or_else(|| serde_json::json!({ "callId": call_id, "toolName": "Agent" }));
+        let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
+        record["agent"] = merge_continued_meta(&old_meta, &outcome);
+        record["result"] = serde_json::Value::String(outcome.report.clone());
+        let content = record.to_string();
+        self.db.lock().update_chat_message_content(message_id, &content)?;
+        let _ = app.emit("chat://message-updated", &MessageUpdatedEvent {
+            workspace_id: run.workspace_id.clone(),
+            thread_id: run.thread_id.clone(),
+            id: message_id,
+            content,
+        });
+        let label = spec.call.description.trim();
+        let note = format!(
+            "Sub-agent “{}” {} {extra_turns} more turn{} — its report was updated.",
+            if label.is_empty() { "Agent" } else { label },
+            if instruction.as_deref().is_some_and(|t| !t.trim().is_empty()) { "was answered and given" } else { "was given" },
+            if extra_turns == 1 { "" } else { "s" },
+        );
+        self.insert_and_emit_message(
+            &app,
+            &run.workspace_id,
+            &run.thread_id,
+            "stopped",
+            &note,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(())
     }
 
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -1829,6 +2169,9 @@ impl ChatEngine {
                         output_tokens: None,
                         cost_usd: None,
                         created_at: now,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                        context_tokens: None,
                     });
                 }
             })
@@ -2077,8 +2420,7 @@ impl ChatEngine {
             }
         }
 
-        let mut total_input: u64 = 0;
-        let mut total_output: u64 = 0;
+        let mut usage = TurnUsage::default();
 
         // Snapshot files already modified before this turn started. Anything
         // present here was the user's own change — we won't credit it to the
@@ -2102,7 +2444,7 @@ impl ChatEngine {
             // Stop cleanly if the user cancelled this turn (checked here and
             // after each tool — the in-flight request itself isn't aborted).
             if cancel.load(Ordering::Relaxed) {
-                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                 return Ok(());
             }
 
@@ -2121,7 +2463,7 @@ impl ChatEngine {
             if iteration > 0 && !request.override_budget {
                 let verdict = self.db.lock().check_budget(Some(&request.workspace_id))?;
                 if should_stop_for_budget(iteration, request.override_budget, &verdict) {
-                    self.finish_budget_capped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+                    self.finish_budget_capped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                     return Ok(());
                 }
             }
@@ -2169,9 +2511,8 @@ impl ChatEngine {
                 }
             };
 
-            total_input += response.input_tokens;
-            total_output += response.output_tokens;
-            self.record_usage(&request.workspace_id, &request.model, &response);
+            usage.add(&request.model, &response);
+            self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
 
             tracing::info!(
                 iteration = iteration,
@@ -2233,17 +2574,14 @@ impl ChatEngine {
                 // this event must arrive before the done event so the frontend has the
                 // final message before it clears the streaming bubble.
                 if !final_text.is_empty() {
-                    let cost = token_engine::cost_for(&request.model, total_input, total_output, 0, 0);
-                    self.insert_and_emit_message(
+                    self.insert_and_emit_priced(
                         &app,
                         &request.workspace_id,
                         &request.thread_id,
                         "assistant",
                         &final_text,
-                        Some(&request.model),
-                        Some(total_input as i64),
-                        Some(total_output as i64),
-                        Some(cost),
+                        &request.model,
+                        &usage,
                     )?;
                 }
 
@@ -2254,8 +2592,8 @@ impl ChatEngine {
                     thread_id: request.thread_id.clone(),
                     delta: String::new(),
                     done: true,
-                    input_tokens: Some(total_input),
-                    output_tokens: Some(total_output),
+                    input_tokens: Some(usage.input),
+                    output_tokens: Some(usage.output),
                 });
 
                 return Ok(());
@@ -2276,7 +2614,13 @@ impl ChatEngine {
                     format!("[tool_calls: {}]",
                         serde_json::to_string(&tool_summary).unwrap_or_default())
                 };
-                match self.db.lock().insert_chat_message(
+                // Emitted live too: the text the model wrote before its tool
+                // calls is its reasoning-in-the-open ("the tests import X, so
+                // let me check…"), and a turn of ten silent rounds reads as a
+                // black box without it. The frontend renders it as a quiet
+                // narration line, never as an answer bubble.
+                match self.insert_and_emit_message(
+                    &app,
                     &request.workspace_id,
                     &request.thread_id,
                     "assistant_tool_use",
@@ -2342,11 +2686,18 @@ impl ChatEngine {
                                 thread_id: request.thread_id.clone(),
                                 workspace_path: request.workspace_path.clone(),
                                 default_model: request.model.clone(),
-                                max_iterations,
+                                // The definition's own cap, never above the
+                                // thread's (Settings › General).
+                                max_iterations: definition
+                                    .as_ref()
+                                    .and_then(|d| d.max_turns)
+                                    .map(|n| (n as usize).min(max_iterations))
+                                    .unwrap_or(max_iterations),
                                 max_tokens: request.max_tokens,
                                 sandbox_roots: sandbox_roots.clone(),
                                 definition,
                                 policy_auto,
+                                resume: None,
                             });
                         }
                         Err(msg) => {
@@ -2376,26 +2727,8 @@ impl ChatEngine {
                     // assistant row is priced at the parent model.
                     // An escalated sub-agent bills every attempt at its own
                     // model's price, so each attempt is its own ledger row.
-                    for o in done.values() {
-                        for a in o.billed_attempts() {
-                            if a.input_tokens == 0 && a.output_tokens == 0 {
-                                continue;
-                            }
-                            let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
-                            if let Err(e) = engine.record(token_engine::TokenEvent {
-                                id: None,
-                                session_id: request.workspace_id.clone(),
-                                timestamp: String::new(),
-                                input_tokens: a.input_tokens,
-                                output_tokens: a.output_tokens,
-                                cache_read_tokens: a.cache_read_tokens,
-                                cache_creation_tokens: a.cache_creation_tokens,
-                                model: a.model.clone(),
-                                cost_usd: 0.0,
-                            }, "talk") {
-                                tracing::warn!(error = %e, "failed to record sub-agent token event");
-                            }
-                        }
+                    for (call_id, o) in done.iter() {
+                        self.record_subagent_spend(&request.workspace_id, &request.thread_id, call_id, o);
                     }
                     agent_outcomes.extend(done);
                 }
@@ -2407,7 +2740,7 @@ impl ChatEngine {
                 // Honor a cancel that landed between tools — stop before
                 // kicking off another (possibly long) tool.
                 if cancel.load(Ordering::Relaxed) {
-                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                     return Ok(());
                 }
                 tracing::info!(tool = %u.name, "executing tool");
@@ -2672,7 +3005,7 @@ impl ChatEngine {
                     .chat_thread_exists(&request.thread_id)
                     .unwrap_or(true);
                 if thread_alive {
-                    if let Err(e) = self.insert_and_emit_message(
+                    match self.insert_and_emit_message(
                         &app,
                         &request.workspace_id,
                         &request.thread_id,
@@ -2680,7 +3013,17 @@ impl ChatEngine {
                         &tool_record.to_string(),
                         None, None, None, None,
                     ) {
-                        tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
+                        // The saved run points at its row so a continuation
+                        // can rewrite the report in place.
+                        Ok(id) if is_agent => {
+                            if let Err(e) = self.db.lock().set_chat_agent_run_message(&u.id, id) {
+                                tracing::warn!(error = %e, "failed to link sub-agent run to its row");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
+                        }
                     }
                 }
 
@@ -2756,7 +3099,7 @@ impl ChatEngine {
         // got to write its closing summary; a possibly-incomplete but real
         // answer beats an empty failure. (Mirrors `orchestrator::agentic`.)
         if cancel.load(Ordering::Relaxed) {
-            self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, total_input, total_output)?;
+            self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
             return Ok(());
         }
         const CLOSE_INSTRUCTION: &str =
@@ -2801,9 +3144,8 @@ impl ChatEngine {
             .await
         {
             Ok(response) => {
-                total_input += response.input_tokens;
-                total_output += response.output_tokens;
-                self.record_usage(&request.workspace_id, &request.model, &response);
+                usage.add(&request.model, &response);
+                self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
                 let final_text = response.text.trim().to_string();
                 if !final_text.is_empty() {
                     let _ = app.emit("chat://stream", &ChatStreamEvent {
@@ -2814,17 +3156,14 @@ impl ChatEngine {
                         input_tokens: None,
                         output_tokens: None,
                     });
-                    let cost = token_engine::cost_for(&request.model, total_input, total_output, 0, 0);
-                    self.insert_and_emit_message(
+                    self.insert_and_emit_priced(
                         &app,
                         &request.workspace_id,
                         &request.thread_id,
                         "assistant",
                         &final_text,
-                        Some(&request.model),
-                        Some(total_input as i64),
-                        Some(total_output as i64),
-                        Some(cost),
+                        &request.model,
+                        &usage,
                     )?;
                     // The quiet note explains WHY the answer may be partial and
                     // where the limit lives. Tokens/cost already sit on the
@@ -2834,8 +3173,7 @@ impl ChatEngine {
                         &request.workspace_id,
                         &request.thread_id,
                         &request.model,
-                        0,
-                        0,
+                        &TurnUsage::default(),
                         &format!(
                             "Reached the {max_iterations}-turn tool limit — answered with what it had. \
                              Say \"continue\" to pick up where it left off, or raise the limit in Settings › General."
@@ -2900,6 +3238,111 @@ fn git_status_files(workspace_path: &std::path::Path) -> std::collections::HashS
         files.insert(path.trim().to_string());
     }
     files
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::chat_agents::AgentAttempt;
+
+    #[test]
+    fn continuation_note_carries_the_turn_budget_and_the_users_words() {
+        let plain = continuation_note(None, 15);
+        assert!(plain.starts_with("You have 15 more tool turns"), "{plain}");
+        assert!(plain.contains("do not redo work already done"));
+        let one = continuation_note(Some("  "), 1);
+        assert!(one.starts_with("You have 1 more tool turn —"), "{one}");
+        let answered = continuation_note(Some("Use the staging DB."), 5);
+        assert!(answered.starts_with("A message from the user: Use the staging DB.\n\n"), "{answered}");
+        assert!(answered.contains("You have 5 more tool turns"));
+    }
+
+    #[test]
+    fn merge_continued_meta_sums_both_runs_and_keeps_the_new_ending() {
+        let old = serde_json::json!({
+            "ok": false, "finished": false, "closedAtCap": true, "blocked": false,
+            "model": "haiku", "tier": "fast", "escalatedFrom": null,
+            "inputTokens": 1000, "outputTokens": 200, "cacheReadTokens": 500, "cacheCreationTokens": 0,
+            "costUsd": 0.10, "durationMs": 4000, "toolCalls": 15, "attempts": []
+        });
+        let new = AgentOutcome {
+            report: "done now".into(),
+            ok: true,
+            finished: true,
+            closed_at_cap: false,
+            model: "haiku".into(),
+            tier: Some("fast".into()),
+            input_tokens: 300,
+            output_tokens: 100,
+            cache_read_tokens: 700,
+            cost_usd: 0.04,
+            duration_ms: 1500,
+            tool_calls: 4,
+            continued: true,
+            ..AgentOutcome::default()
+        };
+        let m = merge_continued_meta(&old, &new);
+        assert_eq!(m["ok"], true);
+        assert_eq!(m["closedAtCap"], false);
+        assert_eq!(m["continued"], true);
+        assert!(m.get("report").is_none(), "the report rides on `result`, never the meta");
+        assert_eq!(m["inputTokens"], 1300);
+        assert_eq!(m["outputTokens"], 300);
+        assert_eq!(m["cacheReadTokens"], 1200);
+        assert_eq!(m["toolCalls"], 19);
+        assert_eq!(m["durationMs"], 5500);
+        assert!((m["costUsd"].as_f64().unwrap() - 0.14).abs() < 1e-9);
+        // The first run becomes attempt #1, the continuation attempt #2.
+        let attempts = m["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["inputTokens"], 1000);
+        assert_eq!(attempts[1], serde_json::to_value(AgentAttempt::from_outcome(&new)).unwrap());
+    }
+
+    #[test]
+    fn merge_continued_meta_keeps_an_earlier_escalation() {
+        let old = serde_json::json!({ "model": "sonnet", "escalatedFrom": "haiku", "inputTokens": 10, "outputTokens": 1, "costUsd": 0.0,
+            "attempts": [{"model":"haiku","inputTokens":5,"outputTokens":1,"cacheReadTokens":0,"cacheCreationTokens":0,"costUsd":0.0},
+                         {"model":"sonnet","inputTokens":5,"outputTokens":0,"cacheReadTokens":0,"cacheCreationTokens":0,"costUsd":0.0}] });
+        let new = AgentOutcome { model: "sonnet".into(), ok: true, input_tokens: 2, ..AgentOutcome::default() };
+        let m = merge_continued_meta(&old, &new);
+        assert_eq!(m["escalatedFrom"], "haiku");
+        assert_eq!(m["attempts"].as_array().unwrap().len(), 3);
+        assert_eq!(m["inputTokens"], 12);
+    }
+
+    #[test]
+    fn turn_usage_prices_each_round_with_its_cache_split_and_keeps_the_last_prompt_size() {
+        let r = |input: u64, output: u64, read: u64, write: u64| crate::providers::LlmResponse {
+            text: String::new(),
+            tool_uses: vec![],
+            stop_reason: crate::providers::LlmStopReason::EndTurn,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: write,
+            rate_limit: None,
+            raw_content: vec![],
+        };
+        let mut u = TurnUsage::default();
+        u.add("claude-opus-4-6", &r(100, 50, 0, 2000));
+        u.add("claude-opus-4-6", &r(50, 30, 2100, 0));
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (150, 80, 2100, 2000));
+        assert_eq!(u.last_context, 2150, "the last prompt: uncached + cached + written");
+        let expected = token_engine::cost_for("claude-opus-4-6", 100, 50, 0, 2000)
+            + token_engine::cost_for("claude-opus-4-6", 50, 30, 2100, 0);
+        assert!((u.cost - expected).abs() < 1e-12);
+        assert!(u.cost < token_engine::cost_for("claude-opus-4-6", 4250, 80, 0, 0), "cached rounds cost less than the same tokens uncached");
+        // A round with no usage never zeroes the context figure.
+        u.add("claude-opus-4-6", &r(0, 0, 0, 0));
+        assert_eq!(u.last_context, 2150);
+    }
+
+    #[test]
+    fn subagent_origin_is_keyed_by_call_id() {
+        assert_eq!(subagent_origin("toolu_01"), "subagent:toolu_01");
+        assert_eq!(DIRECTOR_ORIGIN, "director");
+    }
 }
 
 #[cfg(test)]

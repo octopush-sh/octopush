@@ -10,14 +10,19 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
 }));
 const getChatAgentLog = vi.fn();
+const continueSubagent = vi.fn();
 vi.mock("../lib/ipc", () => ({
   CHAT_AGENT_LOG_EVENT: "chat://agent-log",
-  ipc: { getChatAgentLog: (...a: unknown[]) => getChatAgentLog(...a) },
+  ipc: {
+    getChatAgentLog: (...a: unknown[]) => getChatAgentLog(...a),
+    continueSubagent: (...a: unknown[]) => continueSubagent(...a),
+  },
 }));
 
 import { useChatStore } from "../stores/chatStore";
 import type { ChatMessage } from "../lib/types";
-import { CompanionCrewJournal, findCrewAgent } from "./CompanionCrewJournal";
+import { CompanionCrewJournal, continueLabel, findCrewAgent, statusWordFor } from "./CompanionCrewJournal";
+import type { CrewAgent } from "./chat/CrewCard";
 
 const toolRow = (id: number, callId: string): ChatMessage => ({
   id,
@@ -39,11 +44,46 @@ const toolRow = (id: number, callId: string): ChatMessage => ({
 
 beforeEach(() => {
   getChatAgentLog.mockReset().mockResolvedValue([]);
+  continueSubagent.mockReset().mockResolvedValue(undefined);
   useChatStore.setState({
     messagesByWs: { ws: [toolRow(1, "c1")] },
     liveToolsByWs: {},
     agentLogByCall: {},
     crewFocusByWs: {},
+    continuingCalls: {},
+    continueErrorByCall: {},
+  });
+});
+
+const agentWith = (meta: Partial<NonNullable<CrewAgent["meta"]>> | null, status: CrewAgent["status"] = "done"): CrewAgent => ({
+  callId: "c1",
+  description: "d",
+  subagentType: null,
+  model: null,
+  status,
+  startedAt: null,
+  durationMs: null,
+  report: null,
+  meta: meta
+    ? { ok: true, finished: true, closedAtCap: false, blocked: false, model: "m", inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, toolCalls: 0, ...meta }
+    : null,
+});
+
+describe("continueLabel / statusWordFor", () => {
+  it("phrases the control by ending and by whether the user wrote something", () => {
+    expect(continueLabel(agentWith({}), false, 15)).toBe("Give it 15 more turns");
+    expect(continueLabel(agentWith({}), false, 1)).toBe("Give it 1 more turn");
+    expect(continueLabel(agentWith({}), true, 15)).toBe("Reply and continue");
+    expect(continueLabel(agentWith({ blocked: true }), true, 5)).toBe("Answer and continue");
+    expect(continueLabel(agentWith({ blocked: true }), false, 5)).toBe("Continue without an answer");
+  });
+
+  it("names the ending, and 'continuing' while a continuation runs", () => {
+    expect(statusWordFor(agentWith({ closedAtCap: true }), false)).toBe("done · turn limit");
+    expect(statusWordFor(agentWith({ blocked: true }), false)).toBe("needs a decision");
+    expect(statusWordFor(agentWith(null, "running"), false)).toBe("running");
+    expect(statusWordFor(agentWith({ ok: false }, "failed"), false)).toBe("failed");
+    expect(statusWordFor(agentWith({}), true)).toBe("continuing");
   });
 });
 
@@ -81,6 +121,51 @@ describe("CompanionCrewJournal", () => {
     fireEvent.click(screen.getByLabelText("Close the crew journal"));
     expect(useChatStore.getState().getCrewFocus("ws")).toBeNull();
     expect(screen.queryByTestId("crew-journal")).toBeNull();
+  });
+
+  it("gives a finished sub-agent more turns from its own thread and marks it continuing", async () => {
+    let finish: () => void = () => {};
+    continueSubagent.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+    useChatStore.setState({ crewFocusByWs: { ws: "c1" } });
+    await act(async () => {
+      render(<CompanionCrewJournal workspaceId="ws" />);
+    });
+    fireEvent.change(screen.getByLabelText("More turns to give"), { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "Give it 30 more turns" }));
+    expect(continueSubagent).toHaveBeenCalledWith("c1", null, 30);
+    expect(useChatStore.getState().continuingCalls.c1).toBe(true);
+    expect(screen.getByTestId("crew-journal-status")).toHaveTextContent("continuing");
+    expect(screen.queryByLabelText("Reply to this sub-agent")).toBeNull();
+    await act(async () => {
+      finish();
+    });
+    expect(useChatStore.getState().continuingCalls.c1).toBeUndefined();
+    expect(screen.getByLabelText("Reply to this sub-agent")).toBeInTheDocument();
+  });
+
+  it("sends the reply as the instruction and shows a failed continuation", async () => {
+    continueSubagent.mockRejectedValue(new Error("This sub-agent has no saved run to continue"));
+    useChatStore.setState({ crewFocusByWs: { ws: "c1" } });
+    await act(async () => {
+      render(<CompanionCrewJournal workspaceId="ws" />);
+    });
+    fireEvent.change(screen.getByLabelText("Reply to this sub-agent"), { target: { value: "Also check the e2e suite." } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reply and continue" }));
+    });
+    expect(continueSubagent).toHaveBeenCalledWith("c1", "Also check the e2e suite.", 15);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("no saved run"));
+  });
+
+  it("a live (unfinished) sub-agent has no continue composer yet", () => {
+    useChatStore.setState({
+      messagesByWs: { ws: [] },
+      liveToolsByWs: { ws: [{ callId: "l1", toolName: "Agent", toolInput: { description: "Live one" }, startedAt: "2026-01-01T00:00:00Z", done: false, ok: true, durationMs: null }] },
+      crewFocusByWs: { ws: "l1" },
+    });
+    render(<CompanionCrewJournal workspaceId="ws" />);
+    expect(screen.getByTestId("crew-journal")).toBeInTheDocument();
+    expect(screen.queryByTestId("crew-continue")).toBeNull();
   });
 
   it("finds a live sub-agent when no resolved row exists yet", () => {
