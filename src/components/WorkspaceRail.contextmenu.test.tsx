@@ -385,7 +385,7 @@ describe("WorkspaceRail - Context Menu - EXHAUSTIVE", () => {
         },
       ];
 
-      const { container } = render(
+      render(
         <WorkspaceRail
           projects={projects}
           activeWorkspaceId="ws-1"
@@ -396,9 +396,11 @@ describe("WorkspaceRail - Context Menu - EXHAUSTIVE", () => {
         />,
       );
 
-      const projectHeader = Array.from(container.querySelectorAll("div")).find(
-        (div) => div.textContent.includes("Frontend") && div.className.includes("font-mono")
-      );
+      // The name span sits inside the header line; the context-menu handler
+      // lives on the line, so the event bubbles up from the name.
+      const projectHeader = screen
+        .getAllByTestId("project-header")
+        .find((h) => h.textContent === "Frontend");
 
       expect(projectHeader).toBeDefined();
       fireEvent.contextMenu(projectHeader!, { clientX: 100, clientY: 100 });
@@ -420,7 +422,7 @@ describe("WorkspaceRail - Context Menu - EXHAUSTIVE", () => {
         },
       ];
 
-      const { container } = render(
+      render(
         <WorkspaceRail
           projects={projects}
           activeWorkspaceId="ws-2"
@@ -431,9 +433,9 @@ describe("WorkspaceRail - Context Menu - EXHAUSTIVE", () => {
         />,
       );
 
-      const projectHeader = Array.from(container.querySelectorAll("div")).find(
-        (div) => div.textContent.includes("Backend") && div.className.includes("font-mono")
-      );
+      const projectHeader = screen
+        .getAllByTestId("project-header")
+        .find((h) => h.textContent === "Backend");
 
       expect(projectHeader).toBeDefined();
       fireEvent.contextMenu(projectHeader!, { clientX: 200, clientY: 200 });

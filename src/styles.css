@@ -265,12 +265,25 @@
   animation: attention-pulse 1.4s var(--ease-octo) infinite;
 }
 
-/* Rail row "processing" bar — while a workspace is actively working (TALK
-   streaming or a DIRECT run), its 3px identity edge turns into marching segments
+/* The workspace rail's beacon (the one monogram allowed to pulse — design
+   system §6). Under reduced motion the pulse becomes a static brass halo so
+   the beacon stays legible without movement. Scoped to the rail glyph: the
+   ModeSwitcher shares `.animate-attention-pulse` and keeps its own look. */
+@media (prefers-reduced-motion: reduce) {
+  .rail-beacon {
+    animation: none;
+    box-shadow: 0 0 0 1px var(--brass-dim);
+  }
+}
+
+/* Rail "processing" bar — while a workspace is actively working (TALK
+   streaming or a DIRECT run), its identity edge turns into marching segments
    that scroll upward, signalling live activity. This is mutually exclusive with
    the attention pulse (which means paused/finished).
-   The colour comes from --rail-bar (brass on the active row, the workspace tint
-   otherwise). Reduced motion falls back to a solid bar — never a frozen dash. */
+   The colour comes from --rail-bar (brass on the active row / cell, sage on
+   every other — never a status in brass, never the workspace tint). Consumers
+   size the edge inline (the workspace rail's 2px edge, the Run session rail's
+   3px one). Reduced motion falls back to a solid bar — never a frozen dash. */
 @keyframes rail-march {
   to {
     background-position-y: -11px;
