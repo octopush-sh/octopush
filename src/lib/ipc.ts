@@ -679,6 +679,10 @@ export const ipc = {
     invoke<void>("truncate_chat_after", { threadId, messageId }),
   /** Stop the in-flight agentic turn for this thread. */
   cancelChat: (threadId: string) => invoke<void>("cancel_chat", { threadId }),
+  /** Answer a turn-limit card: extra turns for the paused writing sub-agent,
+   *  or null to accept its partial report. */
+  respondSubagentCap: (callId: string, extraTurns: number | null) =>
+    invoke<void>("respond_subagent_cap", { callId, extraTurns }),
   /** Resolve an inline approval for a dangerous agent command. */
   respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),

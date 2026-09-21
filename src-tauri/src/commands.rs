@@ -3542,6 +3542,18 @@ pub async fn get_thread_cost(
     state.db.lock().thread_cost(&thread_id, strong.as_ref())
 }
 
+/// Answer a turn-limit card: the extra turns to give the paused writing
+/// sub-agent, or none to accept its partial report and let the director go on.
+#[tauri::command]
+pub async fn respond_subagent_cap(
+    state: State<'_, AppState>,
+    call_id: String,
+    extra_turns: Option<u32>,
+) -> AppResult<()> {
+    state.chat.cap_gate.respond(&call_id, extra_turns.map(|n| n as usize));
+    Ok(())
+}
+
 /// Give a finished sub-agent more turns, optionally with a message from the
 /// user (an answer to the question it stopped on, or a steer). Runs to
 /// completion; the report row is rewritten via `chat://message-updated`.

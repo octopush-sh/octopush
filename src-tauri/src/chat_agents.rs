@@ -21,7 +21,8 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::chat_engine::{dangerous_command, ApprovalBroker, ApprovalDecision};
+use crate::chat_engine::{continuation_note, dangerous_command, ApprovalBroker, ApprovalDecision, CapGate};
+use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
@@ -445,7 +446,10 @@ const DOCTRINE: &str =
      gate before any PR, so always run it. A sub-agent you give no type runs on the fast \
      tier, so type anything that must write. Never paste a long output into your own \
      context, never re-run or re-verify what a sub-agent already reported, and recall \
-     stored tool output instead of re-reading. A report cut at its turn cap is partial, \
+     stored tool output instead of re-reading. A writing sub-agent that runs out of turns \
+     mid-work pauses your turn until the user gives it more turns or accepts its partial \
+     report — if you receive a report marked incomplete, the user chose that: do not build \
+     on it, say what is done and what is not, and stop. A read cut at its cap is partial, \
      not lost: the user can give that sub-agent more turns from its journal, so say what \
      is still open instead of re-delegating from scratch. Do small, sequential edits \
      yourself; decide architecture, trade-offs and what the user is really asking \
@@ -873,6 +877,7 @@ pub async fn run_subagents(
     mcp: Arc<crate::mcp::McpRegistry>,
     specs: Vec<SubagentSpec>,
     cancel: Arc<AtomicBool>,
+    cap_gate: Option<Arc<CapGate>>,
 ) -> HashMap<String, AgentOutcome> {
     let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENTS));
     let mut set = tokio::task::JoinSet::new();
@@ -899,10 +904,12 @@ pub async fn run_subagents(
         let mcp = Arc::clone(&mcp);
         let mcp_tools = Arc::clone(&mcp_tools);
         let turnstiles = Arc::clone(&turnstiles);
+        let cap_gate = cap_gate.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await;
             let outcome = run_one_subagent(
                 app, db, client, approvals, mcp, &mcp_tools, turnstiles, &known_models, &tiers, &spec, &cancel,
+                cap_gate.as_deref(),
             )
             .await;
             (spec.call_id, outcome)
@@ -937,6 +944,7 @@ pub async fn run_one_subagent(
     tiers: &HashMap<String, String>,
     spec: &SubagentSpec,
     cancel: &Arc<AtomicBool>,
+    cap_gate: Option<&CapGate>,
 ) -> AgentOutcome {
     let started = std::time::Instant::now();
     // (A continuation carries the saved run's model as the call's `model`,
@@ -976,9 +984,82 @@ pub async fn run_one_subagent(
             outcome = merge_escalated(outcome, second);
         }
     }
+    // A WRITING sub-agent that ran out of turns mid-work never reaches the
+    // director as a result on its own: the turn pauses on a card and the
+    // user grants more turns (as many rounds as it takes) or accepts the
+    // partial report knowingly. Reads are different — a partial map is
+    // information, not a half-done tree — so they return as before.
+    if let Some(gate) = cap_gate {
+        let mut turns_used = spec.max_iterations;
+        while ran_out_of_turns(&outcome) && spec_can_write(spec) && !cancel.load(Ordering::Relaxed) {
+            LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
+                "hit its {turns_used}-turn limit mid-work — waiting for you: more turns, or accept what it has"
+            ));
+            let extra = gate
+                .ask(
+                    &sink.app,
+                    &spec.workspace_id,
+                    &spec.thread_id,
+                    &spec.call_id,
+                    &spec.call.description,
+                    spec.call.subagent_type.as_deref(),
+                    turns_used,
+                )
+                .await;
+            let Some(extra) = extra else {
+                LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
+                    .notice("partial report accepted by the user");
+                break;
+            };
+            LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
+                .notice(&format!("given {extra} more turns — continuing where it left off"));
+            let mut more = spec.clone();
+            more.call.model = Some(outcome.model.clone());
+            more.max_iterations = extra;
+            more.resume = Some(resume_messages_for_continuation(
+                &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
+                &continuation_note(None, extra),
+            ));
+            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            outcome = merge_continued(outcome, second);
+            turns_used += extra;
+        }
+    }
     outcome.tier = tier_for_outcome(spec, &outcome.model, tiers);
     persist_run(&db, spec, &outcome);
     outcome
+}
+
+/// A run that stopped because its turns ran out — with or without a usable
+/// forced close — and left a transcript to continue from. A blocked run
+/// (a question) and a run that could not start are not this.
+pub fn ran_out_of_turns(o: &AgentOutcome) -> bool {
+    !o.blocked && !o.transcript.is_empty() && (o.closed_at_cap || !o.finished)
+}
+
+/// Fold a continuation (more turns on the same transcript) into one outcome:
+/// the continuation's report, ending and transcript; both runs' spend,
+/// duration and tool calls; attempts appended; `continued` set. An earlier
+/// escalation is remembered.
+pub fn merge_continued(first: AgentOutcome, second: AgentOutcome) -> AgentOutcome {
+    let mut attempts = first.attempts.clone();
+    if attempts.is_empty() {
+        attempts.push(AgentAttempt::from_outcome(&first));
+    }
+    attempts.push(AgentAttempt::from_outcome(&second));
+    AgentOutcome {
+        escalated_from: second.escalated_from.clone().or(first.escalated_from.clone()),
+        input_tokens: first.input_tokens + second.input_tokens,
+        output_tokens: first.output_tokens + second.output_tokens,
+        cache_read_tokens: first.cache_read_tokens + second.cache_read_tokens,
+        cache_creation_tokens: first.cache_creation_tokens + second.cache_creation_tokens,
+        cost_usd: first.cost_usd + second.cost_usd,
+        duration_ms: first.duration_ms + second.duration_ms,
+        tool_calls: first.tool_calls + second.tool_calls,
+        attempts,
+        continued: true,
+        ..second
+    }
 }
 
 /// Save what a continuation needs: the spec (minus the transcript it ran
@@ -1205,12 +1286,50 @@ mod tests {
     }
 
     #[test]
+    fn a_continuation_folds_into_one_outcome_with_the_new_ending() {
+        let first = AgentOutcome {
+            report: "partial".into(), ok: true, finished: true, closed_at_cap: true, model: "sonnet".into(),
+            escalated_from: Some("haiku".into()), input_tokens: 100, output_tokens: 10, cost_usd: 0.1, duration_ms: 50, tool_calls: 25,
+            ..AgentOutcome::default()
+        };
+        let second = AgentOutcome {
+            report: "complete".into(), ok: true, finished: true, closed_at_cap: false, model: "sonnet".into(),
+            input_tokens: 40, output_tokens: 5, cost_usd: 0.04, duration_ms: 20, tool_calls: 8,
+            ..AgentOutcome::default()
+        };
+        let m = merge_continued(first, second);
+        assert_eq!(m.report, "complete");
+        assert!(!m.closed_at_cap && m.continued);
+        assert_eq!(m.escalated_from.as_deref(), Some("haiku"), "an earlier escalation is remembered");
+        assert_eq!((m.input_tokens, m.output_tokens, m.tool_calls, m.duration_ms), (140, 15, 33, 70));
+        assert!((m.cost_usd - 0.14).abs() < 1e-9);
+        assert_eq!(m.attempts.len(), 2);
+    }
+
+    #[test]
+    fn ran_out_of_turns_means_a_cap_ending_with_a_transcript_to_resume() {
+        let msg = crate::orchestrator::agentic::user_messages("p");
+        let capped = AgentOutcome { closed_at_cap: true, finished: true, transcript: msg.clone(), ..AgentOutcome::default() };
+        assert!(ran_out_of_turns(&capped));
+        let unfinished = AgentOutcome { finished: false, transcript: msg.clone(), ..AgentOutcome::default() };
+        assert!(ran_out_of_turns(&unfinished));
+        let blocked = AgentOutcome { blocked: true, transcript: msg.clone(), ..AgentOutcome::default() };
+        assert!(!ran_out_of_turns(&blocked), "a question is for the director, not a cap");
+        let failed_to_start = AgentOutcome { finished: false, ..AgentOutcome::default() };
+        assert!(!ran_out_of_turns(&failed_to_start), "nothing to resume");
+        let done = AgentOutcome { finished: true, transcript: msg, ..AgentOutcome::default() };
+        assert!(!ran_out_of_turns(&done));
+    }
+
+    #[test]
     fn the_doctrine_says_one_question_per_typed_subagent_and_that_a_cap_is_not_lost_work() {
         let d = director_doctrine(&[]);
         assert!(d.contains("One sub-agent, one question, always typed"), "{d}");
         assert!(d.contains("15-turn cap"));
         assert!(d.contains("runs on the fast tier"));
         assert!(d.contains("give that sub-agent more turns from its journal"));
+        assert!(d.contains("pauses your turn until the user gives it more turns or accepts its partial"));
+        assert!(d.contains("do not build on it"));
         assert!(d.contains("never re-run or re-verify what a sub-agent already reported"));
         assert_eq!(AUTO_SUBAGENT_TIER, "fast");
     }

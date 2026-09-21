@@ -127,6 +127,17 @@ export interface PendingApproval {
   reason: string;
 }
 
+/** A writing sub-agent that ran out of turns mid-work; the director's turn
+ *  is paused on this card until the user grants more turns or accepts the
+ *  partial report. */
+export interface PendingCap {
+  callId: string;
+  threadId: string;
+  description: string;
+  subagentType: string | null;
+  turnsUsed: number;
+}
+
 export type Effort = "swift" | "standard" | "deep";
 
 export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
@@ -244,6 +255,7 @@ const EMPTY_THREADS: ChatThread[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_HISTORY: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
+const EMPTY_CAPS: PendingCap[] = [];
 
 /** The per-turn budget decision. `blocked` → the workspace/global cap is hit and
  *  no override was available (refuse the turn). `overrode` → the cap was hit but a
@@ -327,6 +339,9 @@ interface ChatState {
   /** Pending dangerous-command approval requests per workspace (inline cards).
    *  Present between chat://approval-request and approval-resolved. */
   pendingApprovalsByWs: Record<string, PendingApproval[]>;
+  /** Turn-limit cards per workspace (see `PendingCap`). Present between
+   *  chat://subagent-cap and subagent-cap-resolved. */
+  pendingCapsByWs: Record<string, PendingCap[]>;
   /** Live journal of each sub-agent (`Agent` tool call), keyed by call id —
    *  fed by `chat://agent-log` while it runs, or loaded from the persisted
    *  log on demand (`ensureAgentLog`) after a reload. */
@@ -369,6 +384,7 @@ interface ChatState {
   getShellHistory: (workspaceId: string) => string[];
   /** Pending dangerous-command approvals for the active thread. */
   getPendingApprovals: (workspaceId: string) => PendingApproval[];
+  getPendingCaps: (workspaceId: string) => PendingCap[];
   /** A sub-agent's journal entries (empty until streamed or loaded). */
   getAgentLog: (callId: string) => LiveEntry[];
   /** The focused sub-agent call id for the Companion journal, or null. */
@@ -458,6 +474,9 @@ interface ChatState {
   clearError: (workspaceId: string) => void;
   /** Open (or close, with null) a sub-agent's journal in the Companion. */
   focusCrewAgent: (workspaceId: string, callId: string | null) => void;
+  /** Answer a turn-limit card: `extraTurns` more turns, or null to accept
+   *  the partial report. */
+  respondSubagentCap: (workspaceId: string, callId: string, extraTurns: number | null) => void;
   /** Give a finished sub-agent `extraTurns` more tool turns, optionally
    *  with a message (an answer to the question it stopped on, a steer).
    *  Resolves when the continuation ends. */
@@ -779,6 +798,47 @@ export const useChatStore = create<ChatState>((set, get) => {
     });
   });
 
+  // ── chat://subagent-cap ───────────────────────────────────────
+  // A writing sub-agent ran out of turns mid-work — the director's turn is
+  // paused until respondSubagentCap answers.
+  listen<{
+    workspaceId: string;
+    threadId: string;
+    callId: string;
+    description: string;
+    subagentType: string | null;
+    turnsUsed: number;
+  }>("chat://subagent-cap", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const cur = s.pendingCapsByWs[p.workspaceId] ?? EMPTY_CAPS;
+      if (cur.some((c) => c.callId === p.callId)) return {};
+      return {
+        pendingCapsByWs: {
+          ...s.pendingCapsByWs,
+          [p.workspaceId]: [
+            ...cur,
+            { callId: p.callId, threadId: p.threadId, description: p.description, subagentType: p.subagentType ?? null, turnsUsed: p.turnsUsed },
+          ],
+        },
+      };
+    });
+    const wsStore = useWorkspaceStore.getState();
+    if (p.workspaceId !== wsStore.activeId) wsStore.notify(p.workspaceId);
+  });
+
+  // ── chat://subagent-cap-resolved ──────────────────────────────
+  listen<{ workspaceId: string; callId: string }>("chat://subagent-cap-resolved", (ev) => {
+    const p = ev.payload;
+    if (!p.workspaceId) return;
+    set((s) => {
+      const cur = s.pendingCapsByWs[p.workspaceId];
+      if (!cur) return {};
+      return { pendingCapsByWs: { ...s.pendingCapsByWs, [p.workspaceId]: cur.filter((c) => c.callId !== p.callId) } };
+    });
+  });
+
   // ── chat://approval-resolved ──────────────────────────────────
   // The request was answered (or timed out) — retire the card.
   listen<{ workspaceId: string; callId: string }>("chat://approval-resolved", (ev) => {
@@ -857,6 +917,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingApprovalsByWs: {},
     agentLogByCall: {},
     crewFocusByWs: {},
+    pendingCapsByWs: {},
     continuingCalls: {},
     continueErrorByCall: {},
     model: "claude-sonnet-4-6",
@@ -868,6 +929,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     getError: (workspaceId) => get().errorByWs[workspaceId] ?? null,
     getLiveTools: (workspaceId) => get().liveToolsByWs[workspaceId] ?? EMPTY_LIVE_TOOLS,
     getAgentLog: (callId) => get().agentLogByCall[callId] ?? EMPTY_AGENT_LOG,
+    getPendingCaps: (workspaceId) => get().pendingCapsByWs[workspaceId] ?? EMPTY_CAPS,
     getCrewFocus: (workspaceId) => get().crewFocusByWs[workspaceId] ?? null,
     getThreads: (workspaceId) => get().threadsByWs[workspaceId] ?? EMPTY_THREADS,
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
@@ -1296,6 +1358,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: callId },
       })),
+    respondSubagentCap: (workspaceId, callId, extraTurns) => {
+      const card = (get().pendingCapsByWs[workspaceId] ?? EMPTY_CAPS).find((c) => c.callId === callId);
+      // Optimistically retire the card; the backend also emits cap-resolved.
+      set((s) => {
+        const cur = s.pendingCapsByWs[workspaceId];
+        if (!cur) return {};
+        return { pendingCapsByWs: { ...s.pendingCapsByWs, [workspaceId]: cur.filter((c) => c.callId !== callId) } };
+      });
+      void ipc.respondSubagentCap(callId, extraTurns).catch((e) => {
+        // Restore the card + surface the error so the answer can be retried.
+        set((s) => ({
+          errorByWs: { ...s.errorByWs, [workspaceId]: `Could not answer the turn-limit card: ${String(e)}` },
+          pendingCapsByWs: card
+            ? { ...s.pendingCapsByWs, [workspaceId]: [...(s.pendingCapsByWs[workspaceId] ?? EMPTY_CAPS), card] }
+            : s.pendingCapsByWs,
+        }));
+      });
+    },
     continueSubagent: async (callId, instruction, extraTurns) => {
       if (get().continuingCalls[callId]) return;
       set((s) => {

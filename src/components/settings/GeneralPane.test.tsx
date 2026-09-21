@@ -98,3 +98,39 @@ describe("GeneralPane — Talk · tool turns per message", () => {
     expect(stepper()).toHaveTextContent(String(25 + TALK_TURNS_STEP));
   });
 });
+
+describe("GeneralPane — Talk · sub-agent tool turns", () => {
+  function stepper() {
+    return screen.getByLabelText("Sub-agent tool turns");
+  }
+
+  it("shows the default when nothing is saved", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    expect(stepper()).toHaveTextContent(String(TALK_TURNS_DEFAULT));
+  });
+
+  it("loads the persisted value from settings", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, subagentMaxTurns: 60 });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await waitFor(() => expect(stepper()).toHaveTextContent("60"));
+  });
+
+  it("stepping persists subagentMaxTurns without touching the Talk turns", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, talkMaxIterations: 25, subagentMaxTurns: 25 });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    const increase = stepper().querySelector('button[aria-label="Increase"]') as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.click(increase);
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ talkMaxIterations: 25, subagentMaxTurns: 25 + TALK_TURNS_STEP }),
+    );
+  });
+});
