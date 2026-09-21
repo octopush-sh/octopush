@@ -3554,6 +3554,16 @@ pub async fn respond_subagent_cap(
     Ok(())
 }
 
+/// The turn-limit cards still waiting on a thread — a reloaded webview asks
+/// for them when it opens the thread (the parked turn outlives the view).
+#[tauri::command]
+pub async fn pending_subagent_caps(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<Vec<crate::chat_engine::SubagentCapEvent>> {
+    Ok(state.chat.cap_gate.pending_for_thread(&thread_id))
+}
+
 /// Give a finished sub-agent more turns, optionally with a message from the
 /// user (an answer to the question it stopped on, or a steer). Runs to
 /// completion; the report row is rewritten via `chat://message-updated`.

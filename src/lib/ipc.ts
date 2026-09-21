@@ -683,6 +683,12 @@ export const ipc = {
    *  or null to accept its partial report. */
   respondSubagentCap: (callId: string, extraTurns: number | null) =>
     invoke<void>("respond_subagent_cap", { callId, extraTurns }),
+  /** Turn-limit cards still waiting on a thread (rehydrate after a reload). */
+  pendingSubagentCaps: (threadId: string) =>
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; description: string; subagentType: string | null; turnsUsed: number }>>(
+      "pending_subagent_caps",
+      { threadId },
+    ),
   /** Resolve an inline approval for a dangerous agent command. */
   respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),

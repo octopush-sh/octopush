@@ -496,6 +496,31 @@ interface ChatState {
   deleteThread: (workspaceId: string, threadId: string) => Promise<void>;
 }
 
+/** A turn parked on a turn-limit card outlives a webview reload; when a
+ *  thread opens, ask the backend what still waits and show it again. */
+async function rehydrateCaps(workspaceId: string, threadId: string): Promise<void> {
+  if (typeof ipc.pendingSubagentCaps !== "function") return;
+  try {
+    const caps = await ipc.pendingSubagentCaps(threadId);
+    if (!Array.isArray(caps)) return;
+    useChatStore.setState((s) => {
+      const others = (s.pendingCapsByWs[workspaceId] ?? EMPTY_CAPS).filter((c) => c.threadId !== threadId);
+      const mine = caps.map((c) => ({
+        callId: c.callId,
+        threadId: c.threadId,
+        description: c.description,
+        subagentType: c.subagentType ?? null,
+        turnsUsed: c.turnsUsed,
+      }));
+      if (others.length === 0 && mine.length === 0 && !s.pendingCapsByWs[workspaceId]) return {};
+      return { pendingCapsByWs: { ...s.pendingCapsByWs, [workspaceId]: [...others, ...mine] } };
+    });
+  } catch {
+    // The live event stream still delivers new cards; a missed rehydrate
+    // only matters for a card raised before this reload.
+  }
+}
+
 export const useChatStore = create<ChatState>((set, get) => {
   // Guards loadHistory against concurrent double-creation of a default thread
   // (rapid workspace switches / mount races). Mirrors the terminal-init guard.
@@ -987,6 +1012,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
         }));
+        void rehydrateCaps(workspaceId, activeId);
       } finally {
         loadingHistory.delete(workspaceId);
       }
@@ -1439,6 +1465,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: null },
       }));
       const messages = await ipc.listChatMessages(threadId);
+      void rehydrateCaps(workspaceId, threadId);
       set((s) => ({
         messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
       }));
@@ -1509,6 +1536,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           [workspaceId]: (s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).filter(
             (a) => a.threadId !== threadId,
           ),
+        },
+        pendingCapsByWs: {
+          ...s.pendingCapsByWs,
+          [workspaceId]: (s.pendingCapsByWs[workspaceId] ?? EMPTY_CAPS).filter((c) => c.threadId !== threadId),
         },
       }));
       // Only reload the view if we deleted the thread being shown; deleting a

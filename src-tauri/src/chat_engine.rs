@@ -540,18 +540,35 @@ pub struct SubagentCapResolvedEvent {
 /// alternative is a director building on half-done work.
 pub const CAP_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// How a turn-limit card was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapAnswer {
+    /// Resume the run with this many more turns.
+    More(usize),
+    /// The user accepts the partial report; the director goes on with it.
+    Accept,
+    /// Stop on the thread resolved the card; the turn is ending anyway.
+    Stopped,
+    /// Nobody answered within `CAP_GATE_TIMEOUT`; treated as accept.
+    Timeout,
+}
+
 /// The turn-limit gate: a writing sub-agent that hit its cap asks through it,
-/// the frontend answers by call id with the extra turns to grant (`None` =
-/// accept the partial report), Stop resolves a whole thread as accept.
+/// the frontend answers by call id with the extra turns to grant (or none to
+/// accept the partial report), Stop resolves a whole thread as `Stopped`.
+/// Pending cards are listable so a reloaded webview can show them again.
 #[derive(Default)]
 pub struct CapGate {
-    pending: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<Option<usize>>)>>,
+    pending: Mutex<HashMap<String, (SubagentCapEvent, tokio::sync::oneshot::Sender<CapAnswer>)>>,
 }
 
 impl CapGate {
     pub fn respond(&self, call_id: &str, extra_turns: Option<usize>) {
-        if let Some((_thread, tx)) = self.pending.lock().remove(call_id) {
-            let _ = tx.send(extra_turns);
+        if let Some((_ev, tx)) = self.pending.lock().remove(call_id) {
+            let _ = tx.send(match extra_turns {
+                Some(n) => CapAnswer::More(n.clamp(1, CONTINUE_MAX_TURNS)),
+                None => CapAnswer::Accept,
+            });
         }
     }
 
@@ -559,18 +576,28 @@ impl CapGate {
         let mut pending = self.pending.lock();
         let ids: Vec<String> = pending
             .iter()
-            .filter(|(_, (tid, _))| tid == thread_id)
+            .filter(|(_, (ev, _))| ev.thread_id == thread_id)
             .map(|(cid, _)| cid.clone())
             .collect();
         for cid in ids {
             if let Some((_, tx)) = pending.remove(&cid) {
-                let _ = tx.send(None);
+                let _ = tx.send(CapAnswer::Stopped);
             }
         }
     }
 
+    /// The cards still waiting on a thread — what a reloaded webview needs
+    /// to show again (its in-memory list is gone, the parked turn is not).
+    pub fn pending_for_thread(&self, thread_id: &str) -> Vec<SubagentCapEvent> {
+        self.pending
+            .lock()
+            .values()
+            .filter(|(ev, _)| ev.thread_id == thread_id)
+            .map(|(ev, _)| ev.clone())
+            .collect()
+    }
+
     /// Ask the user what to do with a capped writing sub-agent and wait.
-    /// Returns the extra turns to grant, or `None` to accept what it has.
     #[allow(clippy::too_many_arguments)]
     pub async fn ask(
         &self,
@@ -581,22 +608,24 @@ impl CapGate {
         description: &str,
         subagent_type: Option<&str>,
         turns_used: usize,
-    ) -> Option<usize> {
+    ) -> CapAnswer {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().insert(call_id.to_string(), (thread_id.to_string(), tx));
-        let _ = app.emit("chat://subagent-cap", &SubagentCapEvent {
+        let ev = SubagentCapEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
             description: description.to_string(),
             subagent_type: subagent_type.map(str::to_string),
             turns_used,
-        });
+        };
+        self.pending.lock().insert(call_id.to_string(), (ev.clone(), tx));
+        let _ = app.emit("chat://subagent-cap", &ev);
         let answer = match tokio::time::timeout(CAP_GATE_TIMEOUT, rx).await {
             Ok(Ok(a)) => a,
-            _ => {
+            Ok(Err(_)) => CapAnswer::Stopped,
+            Err(_) => {
                 self.pending.lock().remove(call_id);
-                None
+                CapAnswer::Timeout
             }
         };
         let _ = app.emit("chat://subagent-cap-resolved", &SubagentCapResolvedEvent {
@@ -604,7 +633,7 @@ impl CapGate {
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
         });
-        answer.map(|n| n.clamp(1, CONTINUE_MAX_TURNS))
+        answer
     }
 }
 
@@ -3473,22 +3502,28 @@ mod continuation_tests {
     }
 
     #[test]
-    fn cap_gate_answers_by_call_id_and_stop_accepts_a_whole_thread() {
+    fn cap_gate_answers_by_call_id_and_stop_resolves_a_whole_thread() {
         let gate = CapGate::default();
+        let ev = |call: &str, thread: &str| SubagentCapEvent {
+            workspace_id: "w".into(), thread_id: thread.into(), call_id: call.into(),
+            description: "d".into(), subagent_type: Some("implementer".into()), turns_used: 25,
+        };
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         let (tx3, rx3) = tokio::sync::oneshot::channel();
-        gate.pending.lock().insert("c1".into(), ("t1".into(), tx1));
-        gate.pending.lock().insert("c2".into(), ("t1".into(), tx2));
-        gate.pending.lock().insert("c3".into(), ("t2".into(), tx3));
+        gate.pending.lock().insert("c1".into(), (ev("c1", "t1"), tx1));
+        gate.pending.lock().insert("c2".into(), (ev("c2", "t1"), tx2));
+        gate.pending.lock().insert("c3".into(), (ev("c3", "t2"), tx3));
+        assert_eq!(gate.pending_for_thread("t1").len(), 2, "a reload can list what waits");
         gate.respond("c1", Some(25));
-        assert_eq!(rx1.blocking_recv().unwrap(), Some(25));
+        assert_eq!(rx1.blocking_recv().unwrap(), CapAnswer::More(25));
         gate.respond("nope", Some(1)); // unknown ids are ignored
         gate.deny_thread("t1");
-        assert_eq!(rx2.blocking_recv().unwrap(), None, "Stop accepts what the run has");
+        assert_eq!(rx2.blocking_recv().unwrap(), CapAnswer::Stopped, "Stop is not an acceptance");
         assert!(gate.pending.lock().contains_key("c3"), "another thread's card survives");
-        drop(gate);
-        assert!(rx3.blocking_recv().is_err());
+        assert_eq!(gate.pending_for_thread("t1").len(), 0);
+        gate.respond("c3", None);
+        assert_eq!(rx3.blocking_recv().unwrap(), CapAnswer::Accept);
     }
 
     #[test]

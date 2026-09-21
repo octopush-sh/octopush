@@ -21,7 +21,7 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::chat_engine::{continuation_note, dangerous_command, ApprovalBroker, ApprovalDecision, CapGate};
+use crate::chat_engine::{continuation_note, dangerous_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
@@ -990,12 +990,14 @@ pub async fn run_one_subagent(
     // partial report knowingly. Reads are different — a partial map is
     // information, not a half-done tree — so they return as before.
     if let Some(gate) = cap_gate {
-        let mut turns_used = spec.max_iterations;
-        while ran_out_of_turns(&outcome) && spec_can_write(spec) && !cancel.load(Ordering::Relaxed) {
+        // Turns spent so far: every billed attempt (an escalated run spent
+        // up to two budgets) — the card says how much it already took.
+        let mut turns_used = spec.max_iterations * outcome.billed_attempts().len().max(1);
+        while ran_out_of_turns(&outcome) && spec_edits_files(spec) && !cancel.load(Ordering::Relaxed) {
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
-                "hit its {turns_used}-turn limit mid-work — waiting for you: more turns, or accept what it has"
+                "hit its turn limit mid-work after {turns_used} turns — waiting for you: more turns, or accept what it has"
             ));
-            let extra = gate
+            let answer = gate
                 .ask(
                     &sink.app,
                     &spec.workspace_id,
@@ -1006,10 +1008,22 @@ pub async fn run_one_subagent(
                     turns_used,
                 )
                 .await;
-            let Some(extra) = extra else {
-                LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
-                    .notice("partial report accepted by the user");
-                break;
+            let extra = match answer {
+                CapAnswer::More(n) => n,
+                CapAnswer::Accept => {
+                    LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
+                        .notice("partial report accepted by the user");
+                    break;
+                }
+                CapAnswer::Stopped => {
+                    LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice("stopped by the director");
+                    break;
+                }
+                CapAnswer::Timeout => {
+                    LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
+                        .notice("no answer in 30 minutes — partial report handed to the director");
+                    break;
+                }
             };
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
                 .notice(&format!("given {extra} more turns — continuing where it left off"));
@@ -1030,6 +1044,19 @@ pub async fn run_one_subagent(
     outcome
 }
 
+/// Whether a sub-agent may change files: its definition grants `write_file`
+/// or `edit_file`, or it has no definition (the full tool set). Narrower than
+/// [`spec_can_write`] (which counts the shell, for the escalation warning):
+/// `test-runner`, `ticket-reader`, `pr-author` and `reviewer` keep `bash`
+/// for tests, `gh` and git but never edit the tree, so a cap on them is a
+/// partial read the director can handle, not half-done work.
+pub fn spec_edits_files(spec: &SubagentSpec) -> bool {
+    match spec.definition.as_ref().and_then(|d| d.tools.as_deref()) {
+        None => true,
+        Some(tools) => tools.iter().any(|t| t == "write_file" || t == "edit_file"),
+    }
+}
+
 /// A run that stopped because its turns ran out — with or without a usable
 /// forced close — and left a transcript to continue from. A blocked run
 /// (a question) and a run that could not start are not this.
@@ -1047,6 +1074,24 @@ pub fn merge_continued(first: AgentOutcome, second: AgentOutcome) -> AgentOutcom
         attempts.push(AgentAttempt::from_outcome(&first));
     }
     attempts.push(AgentAttempt::from_outcome(&second));
+    // A continuation that never got going (provider error, could not start)
+    // leaves no transcript: keep the first run's report, ending and resume
+    // point — the work is still there to continue — and say what happened.
+    if second.transcript.is_empty() {
+        return AgentOutcome {
+            report: format!("{}\n\n(A continuation did not run: {})", first.report, second.report.trim()),
+            input_tokens: first.input_tokens + second.input_tokens,
+            output_tokens: first.output_tokens + second.output_tokens,
+            cache_read_tokens: first.cache_read_tokens + second.cache_read_tokens,
+            cache_creation_tokens: first.cache_creation_tokens + second.cache_creation_tokens,
+            cost_usd: first.cost_usd + second.cost_usd,
+            duration_ms: first.duration_ms + second.duration_ms,
+            tool_calls: first.tool_calls + second.tool_calls,
+            attempts,
+            continued: true,
+            ..first
+        };
+    }
     AgentOutcome {
         escalated_from: second.escalated_from.clone().or(first.escalated_from.clone()),
         input_tokens: first.input_tokens + second.input_tokens,
@@ -1295,6 +1340,7 @@ mod tests {
         let second = AgentOutcome {
             report: "complete".into(), ok: true, finished: true, closed_at_cap: false, model: "sonnet".into(),
             input_tokens: 40, output_tokens: 5, cost_usd: 0.04, duration_ms: 20, tool_calls: 8,
+            transcript: crate::orchestrator::agentic::user_messages("p"),
             ..AgentOutcome::default()
         };
         let m = merge_continued(first, second);
@@ -1304,6 +1350,40 @@ mod tests {
         assert_eq!((m.input_tokens, m.output_tokens, m.tool_calls, m.duration_ms), (140, 15, 33, 70));
         assert!((m.cost_usd - 0.14).abs() < 1e-9);
         assert_eq!(m.attempts.len(), 2);
+    }
+
+    #[test]
+    fn a_continuation_that_never_ran_keeps_the_first_runs_work() {
+        let msg = crate::orchestrator::agentic::user_messages("p");
+        let first = AgentOutcome { report: "partial".into(), ok: true, finished: true, closed_at_cap: true, model: "m".into(), transcript: msg.clone(), input_tokens: 10, ..AgentOutcome::default() };
+        let failed = AgentOutcome { report: "Sub-agent failed: network".into(), ok: false, model: "m".into(), ..AgentOutcome::default() };
+        let m = merge_continued(first, failed);
+        assert!(m.report.starts_with("partial"), "{}", m.report);
+        assert!(m.report.contains("A continuation did not run: Sub-agent failed: network"));
+        assert!(m.ok && m.closed_at_cap && m.continued);
+        assert_eq!(m.transcript.len(), msg.len(), "the resume point survives");
+        assert!(ran_out_of_turns(&m), "and the gate can ask again");
+    }
+
+    #[test]
+    fn only_file_editing_subagents_are_gated_at_the_cap() {
+        let base = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
+            default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            definition: None, policy_auto: false, resume: None,
+        };
+        assert!(spec_edits_files(&base), "no definition → the full tool set");
+        let with = |tools: Vec<&str>| SubagentSpec { definition: Some(def("x", Some(tools), None)), ..base.clone() };
+        assert!(spec_edits_files(&with(vec!["read_file", "edit_file"])));
+        assert!(!spec_edits_files(&with(vec!["read_file", "run_command"])), "bash alone is a reader (test-runner, pr-author)");
+        assert!(spec_can_write(&with(vec!["run_command"])), "…though the escalation warning still counts the shell");
+        // The built-ins: only the two writing roles are gated.
+        for d in crate::skills::builtin_agents::builtin_agent_definitions() {
+            let spec = SubagentSpec { definition: Some(d.clone()), ..base.clone() };
+            assert_eq!(spec_edits_files(&spec), matches!(d.name.as_str(), "implementer" | "pr-maintainer"), "{}", d.name);
+        }
     }
 
     #[test]
