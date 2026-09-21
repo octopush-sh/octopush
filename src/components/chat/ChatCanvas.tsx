@@ -12,6 +12,7 @@ import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
 import { CrewCard, crewAgentsFromLive, crewAgentsFromTools } from "./CrewCard";
 import { ApprovalCard } from "./ApprovalCard";
+import { SubagentCapCard } from "./SubagentCapCard";
 import { OctoStatus } from "./OctoStatus";
 
 interface Props {
@@ -64,6 +65,8 @@ export function ChatCanvas({
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
   const respondApproval = useChatStore((s) => s.respondApproval);
+  const pendingCaps = useChatStore((s) => s.getPendingCaps(workspaceId));
+  const respondSubagentCap = useChatStore((s) => s.respondSubagentCap);
   const regenerate = useChatStore((s) => s.regenerate);
   const editAndResend = useChatStore((s) => s.editAndResend);
   const model = useChatStore((s) => s.model);
@@ -172,7 +175,11 @@ export function ChatCanvas({
   // deactivation for its beat+fade exit, so everything that arranges itself
   // around it (wash, jump pill, bottom padding) must track that window, not
   // the raw streaming flag — otherwise the pill snaps onto the exiting mascot.
-  const playerActive = streaming || approvalsForThread.length > 0;
+  const capsForThread = useMemo(
+    () => (activeThreadId ? pendingCaps.filter((c) => c.threadId === activeThreadId) : pendingCaps),
+    [pendingCaps, activeThreadId],
+  );
+  const playerActive = streaming || approvalsForThread.length > 0 || capsForThread.length > 0;
   const [playerVisible, setPlayerVisible] = useState(playerActive);
   useEffect(() => {
     if (playerActive) {
@@ -260,6 +267,16 @@ export function ChatCanvas({
               retire as their resolved rows arrive (see chatStore). */}
           {liveOthers.map((t) => (
             <LiveToolCard key={`live-${t.callId}`} tool={t} />
+          ))}
+
+          {/* Turn-limit cards — a writing sub-agent stopped mid-work; the
+              turn is paused until the user grants turns or accepts. */}
+          {capsForThread.map((c) => (
+            <SubagentCapCard
+              key={`cap-${c.callId}`}
+              cap={c}
+              onRespond={(extra) => respondSubagentCap(workspaceId, c.callId, extra)}
+            />
           ))}
 
           {/* Inline approval cards — the turn is paused on these. */}

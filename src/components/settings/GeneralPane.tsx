@@ -51,7 +51,18 @@ export function GeneralPane() {
 
         <div className="space-y-4">
           <SectionLabel>Talk</SectionLabel>
-          <TalkTurnsRow />
+          <TurnsRow
+            field="talkMaxIterations"
+            label="Tool turns per message"
+            description={`Rounds of tool calls one message may run before Octopush asks the model to answer with what it has. A long review or refactor needs more; the default is ${TALK_TURNS_DEFAULT}.`}
+            testId="talk-turns-row"
+          />
+          <TurnsRow
+            field="subagentMaxTurns"
+            label="Sub-agent tool turns"
+            description={`Rounds one sub-agent run may take. A definition's own max-turns applies under it (the built-in explorer, test-runner, ticket-reader and pr-author keep 15). A sub-agent that writes and runs out of turns pauses the conversation until you give it more or accept what it has; the default is ${TALK_TURNS_DEFAULT}.`}
+            testId="subagent-turns-row"
+          />
         </div>
 
         <div className="space-y-4">
@@ -78,11 +89,20 @@ function clampTurns(n: number): number {
   return Math.min(TALK_TURNS_MAX, Math.max(TALK_TURNS_MIN, Math.round(n)));
 }
 
-/** "Tool turns per message" — how many rounds of tool calls one Talk turn may
- *  run before the engine asks the model to close with what it has. Persisted
- *  in `settings.json` (`talkMaxIterations`); read-modify-write so the other
- *  settings fields aren't clobbered. */
-function TalkTurnsRow() {
+/** One persisted turn budget (`settings.json`, read-modify-write so the
+ *  other settings fields aren't clobbered): "Tool turns per message" for the
+ *  director's own rounds, "Sub-agent tool turns" for one sub-agent run. */
+function TurnsRow({
+  field,
+  label,
+  description,
+  testId,
+}: {
+  field: "talkMaxIterations" | "subagentMaxTurns";
+  label: string;
+  description: string;
+  testId: string;
+}) {
   const [turns, setTurns] = useState(TALK_TURNS_DEFAULT);
   const [saved, setSaved] = useState(false);
 
@@ -90,17 +110,18 @@ function TalkTurnsRow() {
     ipc
       .getSettings()
       .then((s) => {
-        if (typeof s.talkMaxIterations === "number") setTurns(clampTurns(s.talkMaxIterations));
+        const v = s[field];
+        if (typeof v === "number") setTurns(clampTurns(v));
       })
       .catch(() => {});
-  }, []);
+  }, [field]);
 
   async function change(next: number) {
     const value = clampTurns(next);
     setTurns(value);
     try {
       const s = await ipc.getSettings();
-      await ipc.saveSettings({ ...s, talkMaxIterations: value });
+      await ipc.saveSettings({ ...s, [field]: value });
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
     } catch {
@@ -110,16 +131,13 @@ function TalkTurnsRow() {
 
   return (
     <div
-      data-testid="talk-turns-row"
+      data-testid={testId}
       className="flex items-center justify-between gap-4 rounded-lg px-4 py-3"
       style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}
     >
       <div className="min-w-0 flex-1">
-        <div className="font-serif text-[14px] leading-tight text-octo-ivory">Tool turns per message</div>
-        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
-          Rounds of tool calls one message may run before Octopush asks the model to answer with what it has.
-          A long review or refactor needs more; the default is {TALK_TURNS_DEFAULT}.
-        </div>
+        <div className="font-serif text-[14px] leading-tight text-octo-ivory">{label}</div>
+        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
         {saved && <div className="mt-1 font-mono text-[10px] text-octo-verdigris">Saved</div>}
       </div>
       <div className="shrink-0">
@@ -129,7 +147,7 @@ function TalkTurnsRow() {
           max={TALK_TURNS_MAX}
           step={TALK_TURNS_STEP}
           onChange={change}
-          ariaLabel="Tool turns per message"
+          ariaLabel={label}
         />
       </div>
     </div>

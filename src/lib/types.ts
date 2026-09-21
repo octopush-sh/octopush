@@ -465,6 +465,9 @@ export interface AppSettings {
   /** Tool-call rounds one Talk message may run before the model is asked to
    *  answer with what it has. Unset → the backend default (25). */
   talkMaxIterations?: number | null;
+  /** Tool-call rounds one sub-agent run may take (default 25); a
+   *  definition's `max-turns` applies under it. */
+  subagentMaxTurns?: number | null;
   /** Provider-agnostic model tiers (`fast` / `balanced` / `strong`) → a
    *  configured model id. What a sub-agent's `model: haiku` or `model: "fast"`
    *  resolves to on this machine. */

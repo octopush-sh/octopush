@@ -38,6 +38,8 @@ vi.mock("../lib/ipc", () => ({
     }),
     renameChatThread: vi.fn().mockResolvedValue(undefined),
     deleteChatThread: vi.fn().mockResolvedValue(undefined),
+    respondSubagentCap: vi.fn().mockResolvedValue(undefined),
+    pendingSubagentCaps: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -860,5 +862,54 @@ describe("chatStore — sub-agent continuation", () => {
     emit("chat://message-added", makeMsg({ id: 1, role: "user", content: "go" }));
     emit("chat://message-updated", { workspaceId: "ws-1", id: 99, content: "{}" });
     expect(useChatStore.getState().getMessages("ws-1")).toHaveLength(1);
+  });
+});
+
+describe("chatStore — turn-limit cards", () => {
+  beforeEach(() => resetStore());
+
+  const capEvent = { workspaceId: "ws-1", threadId: "t1", callId: "c1", description: "Implement it", subagentType: "implementer", turnsUsed: 25 };
+
+  it("surfaces a capped writing sub-agent and retires it on resolve", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
+    emit("chat://subagent-cap", capEvent);
+    emit("chat://subagent-cap", capEvent); // idempotent
+    const caps = useChatStore.getState().getPendingCaps("ws-1");
+    expect(caps).toHaveLength(1);
+    expect(caps[0]).toMatchObject({ callId: "c1", description: "Implement it", subagentType: "implementer", turnsUsed: 25 });
+    emit("chat://subagent-cap-resolved", { workspaceId: "ws-1", callId: "c1" });
+    expect(useChatStore.getState().getPendingCaps("ws-1")).toHaveLength(0);
+  });
+
+  it("answering retires the card optimistically and sends the grant (or the accept)", async () => {
+    emit("chat://subagent-cap", capEvent);
+    useChatStore.getState().respondSubagentCap("ws-1", "c1", 50);
+    expect(useChatStore.getState().getPendingCaps("ws-1")).toHaveLength(0);
+    expect(ipc.respondSubagentCap).toHaveBeenCalledWith("c1", 50);
+    emit("chat://subagent-cap", capEvent);
+    useChatStore.getState().respondSubagentCap("ws-1", "c1", null);
+    expect(ipc.respondSubagentCap).toHaveBeenLastCalledWith("c1", null);
+  });
+});
+
+describe("chatStore — turn-limit cards survive a reload", () => {
+  beforeEach(() => resetStore());
+
+  it("re-reads the thread's waiting cards when the thread is selected", async () => {
+    (ipc.pendingSubagentCaps as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { workspaceId: "ws-1", threadId: "t1", callId: "c9", description: "Implement it", subagentType: "implementer", turnsUsed: 50 },
+    ]);
+    await useChatStore.getState().selectThread("ws-1", "t1");
+    await vi.waitFor(() => expect(useChatStore.getState().getPendingCaps("ws-1")).toHaveLength(1));
+    expect(useChatStore.getState().getPendingCaps("ws-1")[0]).toMatchObject({ callId: "c9", turnsUsed: 50 });
+    expect(ipc.pendingSubagentCaps).toHaveBeenCalledWith("t1");
+  });
+
+  it("deleting a thread drops its cards", async () => {
+    emit("chat://subagent-cap", { workspaceId: "ws-1", threadId: "t1", callId: "c1", description: "x", subagentType: null, turnsUsed: 25 });
+    emit("chat://subagent-cap", { workspaceId: "ws-1", threadId: "t2", callId: "c2", description: "y", subagentType: null, turnsUsed: 25 });
+    useChatStore.setState({ threadsByWs: { "ws-1": [] }, activeThreadByWs: { "ws-1": "t2" } });
+    await useChatStore.getState().deleteThread("ws-1", "t1");
+    expect(useChatStore.getState().getPendingCaps("ws-1").map((c) => c.callId)).toEqual(["c2"]);
   });
 });

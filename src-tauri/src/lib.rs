@@ -262,6 +262,8 @@ pub fn run() {
             commands::reprice_spend,
             commands::get_thread_cost,
             commands::continue_subagent,
+            commands::respond_subagent_cap,
+            commands::pending_subagent_caps,
             // Settings
             commands::get_settings,
             commands::save_settings,

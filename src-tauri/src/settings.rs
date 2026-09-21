@@ -46,6 +46,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub talk_max_iterations: Option<u32>,
 
+    /// Tool-call rounds one sub-agent run may take (Settings › General ›
+    /// "Sub-agent tool turns"). `None` = the built-in default
+    /// (`chat_history::DEFAULT_SUBAGENT_MAX_ITERATIONS`); a definition's own
+    /// `max-turns` never exceeds it. Independent of `talk_max_iterations`: a
+    /// director's rounds and a sub-agent's are different budgets.
+    #[serde(default)]
+    pub subagent_max_turns: Option<u32>,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
@@ -209,6 +217,16 @@ mod tests {
             settings.provider_base_urls.get("ollama").map(String::as_str),
             Some("http://localhost:11434")
         );
+    }
+
+    #[test]
+    fn subagent_max_turns_round_trips_and_defaults_to_none() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.subagent_max_turns, None);
+        let settings: AppSettings = serde_json::from_str(r#"{"subagentMaxTurns":40}"#).unwrap();
+        assert_eq!(settings.subagent_max_turns, Some(40));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""subagentMaxTurns":40"#), "{json}");
     }
 
     #[test]

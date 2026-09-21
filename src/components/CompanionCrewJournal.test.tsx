@@ -21,7 +21,7 @@ vi.mock("../lib/ipc", () => ({
 
 import { useChatStore } from "../stores/chatStore";
 import type { ChatMessage } from "../lib/types";
-import { CompanionCrewJournal, continueLabel, findCrewAgent, statusWordFor } from "./CompanionCrewJournal";
+import { CompanionCrewJournal, continueLabel, directorAnsweredAfter, findCrewAgent, statusWordFor } from "./CompanionCrewJournal";
 import type { CrewAgent } from "./chat/CrewCard";
 
 const toolRow = (id: number, callId: string): ChatMessage => ({
@@ -155,6 +155,18 @@ describe("CompanionCrewJournal", () => {
     });
     expect(continueSubagent).toHaveBeenCalledWith("c1", "Also check the e2e suite.", 15);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("no saved run"));
+  });
+
+  it("warns when the director already went on with the report", async () => {
+    const answer = { id: 2, workspaceId: "ws", role: "assistant", content: "Done, moving on.", model: null, inputTokens: null, outputTokens: null, costUsd: null, createdAt: "" } as unknown as ChatMessage;
+    expect(directorAnsweredAfter([toolRow(1, "c1"), answer], "c1")).toBe(true);
+    expect(directorAnsweredAfter([answer, toolRow(3, "c1")], "c1")).toBe(false);
+    expect(directorAnsweredAfter([toolRow(1, "c1")], null)).toBe(false);
+    useChatStore.setState({ messagesByWs: { ws: [toolRow(1, "c1"), answer] }, crewFocusByWs: { ws: "c1" } });
+    await act(async () => {
+      render(<CompanionCrewJournal workspaceId="ws" />);
+    });
+    expect(screen.getByTestId("crew-moved-on")).toHaveTextContent("already went on");
   });
 
   it("a live (unfinished) sub-agent has no continue composer yet", () => {

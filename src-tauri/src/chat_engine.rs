@@ -12,7 +12,7 @@ use crate::chat_agents::{
     SubagentSpec, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
 };
 use crate::chat_history::{
-    build_history, effective_talk_max_iterations, window_text, HistoryRole, HistoryRow,
+    build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
@@ -505,6 +505,135 @@ impl ApprovalBroker {
             call_id: call_id.to_string(),
         });
         decision
+    }
+}
+
+/// Emitted when a sub-agent that WRITES (implementer, pr-maintainer, any
+/// definition with write/edit/shell tools) ran out of turns mid-work: the
+/// director's turn pauses on an inline card until the user gives it more
+/// turns or accepts the partial report. A half-done implementation must never
+/// reach the director as if it were a result.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCapEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub call_id: String,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    /// Turns the run has taken so far (every extension included).
+    pub turns_used: usize,
+}
+
+/// Emitted when a turn-limit card is answered (or Stop resolved it) so the
+/// frontend retires it.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCapResolvedEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub call_id: String,
+}
+
+/// How long a turn-limit card may wait for an answer before the run is
+/// accepted as partial. Long: the user may have stepped away, and the
+/// alternative is a director building on half-done work.
+pub const CAP_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How a turn-limit card was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapAnswer {
+    /// Resume the run with this many more turns.
+    More(usize),
+    /// The user accepts the partial report; the director goes on with it.
+    Accept,
+    /// Stop on the thread resolved the card; the turn is ending anyway.
+    Stopped,
+    /// Nobody answered within `CAP_GATE_TIMEOUT`; treated as accept.
+    Timeout,
+}
+
+/// The turn-limit gate: a writing sub-agent that hit its cap asks through it,
+/// the frontend answers by call id with the extra turns to grant (or none to
+/// accept the partial report), Stop resolves a whole thread as `Stopped`.
+/// Pending cards are listable so a reloaded webview can show them again.
+#[derive(Default)]
+pub struct CapGate {
+    pending: Mutex<HashMap<String, (SubagentCapEvent, tokio::sync::oneshot::Sender<CapAnswer>)>>,
+}
+
+impl CapGate {
+    pub fn respond(&self, call_id: &str, extra_turns: Option<usize>) {
+        if let Some((_ev, tx)) = self.pending.lock().remove(call_id) {
+            let _ = tx.send(match extra_turns {
+                Some(n) => CapAnswer::More(n.clamp(1, CONTINUE_MAX_TURNS)),
+                None => CapAnswer::Accept,
+            });
+        }
+    }
+
+    pub fn deny_thread(&self, thread_id: &str) {
+        let mut pending = self.pending.lock();
+        let ids: Vec<String> = pending
+            .iter()
+            .filter(|(_, (ev, _))| ev.thread_id == thread_id)
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        for cid in ids {
+            if let Some((_, tx)) = pending.remove(&cid) {
+                let _ = tx.send(CapAnswer::Stopped);
+            }
+        }
+    }
+
+    /// The cards still waiting on a thread — what a reloaded webview needs
+    /// to show again (its in-memory list is gone, the parked turn is not).
+    pub fn pending_for_thread(&self, thread_id: &str) -> Vec<SubagentCapEvent> {
+        self.pending
+            .lock()
+            .values()
+            .filter(|(ev, _)| ev.thread_id == thread_id)
+            .map(|(ev, _)| ev.clone())
+            .collect()
+    }
+
+    /// Ask the user what to do with a capped writing sub-agent and wait.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        description: &str,
+        subagent_type: Option<&str>,
+        turns_used: usize,
+    ) -> CapAnswer {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ev = SubagentCapEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            call_id: call_id.to_string(),
+            description: description.to_string(),
+            subagent_type: subagent_type.map(str::to_string),
+            turns_used,
+        };
+        self.pending.lock().insert(call_id.to_string(), (ev.clone(), tx));
+        let _ = app.emit("chat://subagent-cap", &ev);
+        let answer = match tokio::time::timeout(CAP_GATE_TIMEOUT, rx).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(_)) => CapAnswer::Stopped,
+            Err(_) => {
+                self.pending.lock().remove(call_id);
+                CapAnswer::Timeout
+            }
+        };
+        let _ = app.emit("chat://subagent-cap-resolved", &SubagentCapResolvedEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            call_id: call_id.to_string(),
+        });
+        answer
     }
 }
 
@@ -1506,6 +1635,8 @@ pub struct ChatEngine {
     approvals: Arc<ApprovalBroker>,
     /// Sub-agent call ids with a continuation in flight.
     continuing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The turn-limit gate for writing sub-agents (see `CapGate`).
+    pub cap_gate: Arc<CapGate>,
 }
 
 impl ChatEngine {
@@ -1521,6 +1652,7 @@ impl ChatEngine {
             talk_shell,
             approvals: Arc::new(ApprovalBroker::default()),
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            cap_gate: Arc::new(CapGate::default()),
         }
     }
 
@@ -1569,6 +1701,9 @@ impl ChatEngine {
         // await_approval (and a later Approve would run a destructive command
         // on a turn the user already cancelled).
         self.approvals.deny_thread(thread_id);
+        // A turn-limit card waiting on the thread resolves as "accept what it
+        // has" — the stop ends the turn either way.
+        self.cap_gate.deny_thread(thread_id);
     }
 
     /// Record one provider response's token usage: the canonical spend ledger
@@ -1908,6 +2043,7 @@ impl ChatEngine {
             &tiers,
             &spec,
             &cancel,
+            None,
         )
         .await;
         self.record_subagent_spend(&run.workspace_id, &run.thread_id, &call_id, &outcome);
@@ -2458,8 +2594,14 @@ impl ChatEngine {
 
         // Tool-call rounds this turn may run: the saved "Tool turns per
         // message" preference (Settings › General), clamped, or the default.
+        let saved_settings = crate::settings::load_settings().ok();
         let max_iterations = effective_talk_max_iterations(
-            crate::settings::load_settings().ok().and_then(|s| s.talk_max_iterations),
+            saved_settings.as_ref().and_then(|s| s.talk_max_iterations),
+        );
+        // Sub-agents have their own budget (Settings › General › "Sub-agent
+        // tool turns"); a definition's `max-turns` applies under it.
+        let subagent_cap = effective_subagent_max_iterations(
+            saved_settings.as_ref().and_then(|s| s.subagent_max_turns),
         );
 
         // ─── Agentic loop ─────────────────────────────────────────
@@ -2709,13 +2851,10 @@ impl ChatEngine {
                                 thread_id: request.thread_id.clone(),
                                 workspace_path: request.workspace_path.clone(),
                                 default_model: request.model.clone(),
-                                // The definition's own cap, never above the
-                                // thread's (Settings › General).
-                                max_iterations: definition
-                                    .as_ref()
-                                    .and_then(|d| d.max_turns)
-                                    .map(|n| (n as usize).min(max_iterations))
-                                    .unwrap_or(max_iterations),
+                                max_iterations: subagent_iterations(
+                                    definition.as_ref().and_then(|d| d.max_turns),
+                                    subagent_cap,
+                                ),
                                 max_tokens: request.max_tokens,
                                 sandbox_roots: sandbox_roots.clone(),
                                 definition,
@@ -2741,6 +2880,7 @@ impl ChatEngine {
                         Arc::clone(&self.mcp),
                         specs,
                         Arc::clone(&cancel),
+                        Some(Arc::clone(&self.cap_gate)),
                     )
                     .await;
                     // Sub-agent spend goes to the ledger under ITS model (a
@@ -3359,6 +3499,31 @@ mod continuation_tests {
         // A round with no usage never zeroes the context figure.
         u.add("claude-opus-4-6", &r(0, 0, 0, 0));
         assert_eq!(u.last_context, 2150);
+    }
+
+    #[test]
+    fn cap_gate_answers_by_call_id_and_stop_resolves_a_whole_thread() {
+        let gate = CapGate::default();
+        let ev = |call: &str, thread: &str| SubagentCapEvent {
+            workspace_id: "w".into(), thread_id: thread.into(), call_id: call.into(),
+            description: "d".into(), subagent_type: Some("implementer".into()), turns_used: 25,
+        };
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        gate.pending.lock().insert("c1".into(), (ev("c1", "t1"), tx1));
+        gate.pending.lock().insert("c2".into(), (ev("c2", "t1"), tx2));
+        gate.pending.lock().insert("c3".into(), (ev("c3", "t2"), tx3));
+        assert_eq!(gate.pending_for_thread("t1").len(), 2, "a reload can list what waits");
+        gate.respond("c1", Some(25));
+        assert_eq!(rx1.blocking_recv().unwrap(), CapAnswer::More(25));
+        gate.respond("nope", Some(1)); // unknown ids are ignored
+        gate.deny_thread("t1");
+        assert_eq!(rx2.blocking_recv().unwrap(), CapAnswer::Stopped, "Stop is not an acceptance");
+        assert!(gate.pending.lock().contains_key("c3"), "another thread's card survives");
+        assert_eq!(gate.pending_for_thread("t1").len(), 0);
+        gate.respond("c3", None);
+        assert_eq!(rx3.blocking_recv().unwrap(), CapAnswer::Accept);
     }
 
     #[test]

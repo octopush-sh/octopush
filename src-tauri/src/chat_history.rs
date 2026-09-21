@@ -38,6 +38,27 @@ pub fn effective_talk_max_iterations(setting: Option<u32>) -> usize {
     }
 }
 
+/// Tool-call rounds one sub-agent run may take when no preference is saved.
+pub const DEFAULT_SUBAGENT_MAX_ITERATIONS: usize = 25;
+
+/// The saved "Sub-agent tool turns" preference as the bound a sub-agent runs
+/// with (same clamp as the Talk turns). A definition's own `max-turns` is
+/// applied on top, never above this.
+pub fn effective_subagent_max_iterations(setting: Option<u32>) -> usize {
+    match setting {
+        Some(n) => (n as usize).clamp(TALK_MAX_ITERATIONS_MIN, TALK_MAX_ITERATIONS_MAX),
+        None => DEFAULT_SUBAGENT_MAX_ITERATIONS,
+    }
+}
+
+/// The turn bound one sub-agent runs with: its definition's `max-turns` when
+/// it has one, capped by the sub-agent preference; else the preference.
+pub fn subagent_iterations(definition_max_turns: Option<u32>, subagent_cap: usize) -> usize {
+    definition_max_turns
+        .map(|n| (n as usize).max(1).min(subagent_cap))
+        .unwrap_or(subagent_cap)
+}
+
 /// Chars of one tool result kept in context, by how many turns ago it ran
 /// (0 = the turn just before the message being sent). A follow-up almost
 /// always refers to the previous turn, so that one stays close to verbatim;
@@ -349,6 +370,19 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_turns_come_from_the_preference_with_the_definition_cap_under_it() {
+        assert_eq!(effective_subagent_max_iterations(None), DEFAULT_SUBAGENT_MAX_ITERATIONS);
+        assert_eq!(effective_subagent_max_iterations(Some(60)), 60);
+        assert_eq!(effective_subagent_max_iterations(Some(1)), TALK_MAX_ITERATIONS_MIN);
+        assert_eq!(effective_subagent_max_iterations(Some(9_999)), TALK_MAX_ITERATIONS_MAX);
+        // A definition's max-turns applies under the preference, never above.
+        assert_eq!(subagent_iterations(Some(15), 60), 15);
+        assert_eq!(subagent_iterations(Some(80), 60), 60);
+        assert_eq!(subagent_iterations(None, 60), 60);
+        assert_eq!(subagent_iterations(Some(0), 60), 1);
+    }
 
     fn tool_row(id: i64, name: &str, result: &str) -> String {
         serde_json::json!({

@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft } from "lucide-react";
 import { useChatStore } from "../stores/chatStore";
+import type { ChatMessage } from "../lib/types";
 import { iconForRole } from "../lib/roleIcons";
 import { fmtTokens } from "../lib/stageMeta";
 import { formatDuration } from "../lib/duration";
@@ -27,6 +28,21 @@ export function continueLabel(agent: CrewAgent, hasText: boolean, turns: number)
   if (agent.meta?.blocked) return hasText ? "Answer and continue" : "Continue without an answer";
   if (hasText) return "Reply and continue";
   return `Give it ${turns} more turn${turns === 1 ? "" : "s"}`;
+}
+
+/** Whether an assistant answer follows the sub-agent's tool row — i.e. the
+ *  director already went on with whatever the row held. */
+export function directorAnsweredAfter(messages: ChatMessage[], callId: string | null): boolean {
+  if (!callId) return false;
+  let seen = false;
+  for (const m of messages) {
+    if (!seen) {
+      if (m.role === "tool" && m.content.includes(`"callId":"${callId}"`)) seen = true;
+      continue;
+    }
+    if (m.role === "assistant") return true;
+  }
+  return false;
 }
 
 /** The one-line ending of a finished sub-agent, for the meta line. */
@@ -53,6 +69,10 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
     () => (callId ? findCrewAgent(messages, liveTools, callId) : null),
     [messages, liveTools, callId],
   );
+  // The director already answered after this sub-agent's row: a continuation
+  // from here lands in history for the NEXT turn, and may clash with what
+  // the director did meanwhile. Said plainly on the composer.
+  const directorMovedOn = useMemo(() => directorAnsweredAfter(messages, callId), [messages, callId]);
 
   useEffect(() => {
     if (callId) void ensureAgentLog(callId);
@@ -171,6 +191,11 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
             </div>
           ) : (
             <>
+              {directorMovedOn && (
+                <div data-testid="crew-moved-on" className="mb-2 text-[11px] leading-snug text-octo-mute">
+                  The director already went on with this report. A continuation updates it for the next turn and may clash with what the director did since.
+                </div>
+              )}
               <textarea
                 value={text}
                 onChange={(e) => setText(e.target.value)}
