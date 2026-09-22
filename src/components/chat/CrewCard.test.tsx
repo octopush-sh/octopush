@@ -17,7 +17,7 @@ vi.mock("../../lib/ipc", () => ({
 }));
 
 import { useChatStore, type LiveTool, type ToolExecution } from "../../stores/chatStore";
-import { CrewCard, beaconCallId, crewAgentsFromLive, crewAgentsFromTools, crewSummary } from "./CrewCard";
+import { CrewCard, beaconCallId, crewAgentsFromLive, crewAgentsFromTools, crewSummary, runLine, shortModel } from "./CrewCard";
 
 const live = (callId: string, startedAt: string, done = false, ok = true): LiveTool => ({
   callId,
@@ -156,5 +156,37 @@ describe("CrewCard — rendering", () => {
   it("flags a turn-limit ending on the row", () => {
     render(<CrewCard workspaceId="ws" agents={crewAgentsFromTools([resolved(1, "c1", true, { closedAtCap: true })])} />);
     expect(screen.getByText("turn limit")).toBeInTheDocument();
+  });
+});
+
+describe("CrewCard — what the run is on, from the first second", () => {
+  it("reads model, tier, effort and the director's ask off the live card's input", () => {
+    const t = live("c1", "2026-01-01T00:00:00Z");
+    t.toolInput = { ...t.toolInput, model: "claude-sonnet-4-6", tier: "balanced", effort: "medium", askedModel: "strong", askedHonored: false };
+    const [a] = crewAgentsFromLive([t]);
+    expect(a).toMatchObject({ model: "claude-sonnet-4-6", tier: "balanced", effort: "medium", askedModel: "strong", askedHonored: false });
+    expect(runLine(a)).toBe("sonnet-4-6 · medium");
+    expect(shortModel("gpt-4o")).toBe("gpt-4o");
+    render(<CrewCard workspaceId="ws" agents={[a]} />);
+    expect(screen.getByTestId("crew-run-line")).toHaveTextContent("sonnet-4-6 · medium");
+    const asked = screen.getByTestId("crew-asked");
+    expect(asked).toHaveTextContent("asked strong");
+    expect(asked).toHaveAttribute("title", expect.stringContaining("keeps its tier"));
+  });
+
+  it("an honored ask reads as such, and a row without a plan shows nothing extra", () => {
+    const t = live("c2", "2026-01-01T00:00:00Z");
+    t.toolInput = { ...t.toolInput, model: "claude-opus-5", tier: "strong", effort: "high", askedModel: "opus", askedHonored: true };
+    render(<CrewCard workspaceId="ws" agents={crewAgentsFromLive([t])} />);
+    expect(screen.getByTestId("crew-asked")).toHaveAttribute("title", expect.stringContaining("honors it"));
+    render(<CrewCard workspaceId="ws2" agents={crewAgentsFromLive([live("c3", "2026-01-01T00:00:00Z")])} />);
+    expect(screen.getAllByTestId("crew-run-line")).toHaveLength(1);
+    expect(screen.getAllByTestId("crew-asked")).toHaveLength(1);
+  });
+
+  it("a resolved row prefers the outcome's model and tier over the planned ones", () => {
+    const [a] = crewAgentsFromTools([resolved(1, "c1", true, { model: "claude-opus-5", tier: "strong" })]);
+    expect(a.model).toBe("claude-opus-5");
+    expect(a.tier).toBe("strong");
   });
 });

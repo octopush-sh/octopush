@@ -144,6 +144,8 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
         <div className="octo-tabular mt-1 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
           {agent.subagentType && `${agent.subagentType} · `}
           {agent.model && `${agent.model} · `}
+          {agent.tier && `${agent.tier} · `}
+          {agent.effort && `effort ${agent.effort} · `}
           {statusWord}
           {tokens > 0 && ` · ${fmtTokens(tokens)} tokens`}
           {agent.meta && agent.meta.costUsd > 0 && ` · $${agent.meta.costUsd.toFixed(2)}`}

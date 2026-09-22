@@ -31,7 +31,16 @@ export interface CrewAgent {
   callId: string;
   description: string;
   subagentType: string | null;
+  /** The model the run USES (resolved id), known from the first second. */
   model: string | null;
+  /** Its tier (`fast` / `balanced` / `strong`) and effort, when planned. */
+  tier: string | null;
+  effort: string | null;
+  /** The `model` the director put on the call when it differed from what
+   *  the run uses, and whether that ask was honored (under Auto a typed
+   *  role keeps its tier). */
+  askedModel: string | null;
+  askedHonored: boolean;
   status: CrewAgentStatus;
   /** Backend start timestamp (live only) — the elapsed timer measures from here. */
   startedAt: string | null;
@@ -45,6 +54,20 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
+/** `claude-sonnet-4-6` → `sonnet-4-6`: the vendor prefix earns no space on a row. */
+export function shortModel(id: string): string {
+  return id.replace(/^claude-/, "");
+}
+
+/** `sonnet-4-6 · medium` — what the row says the run is on; the tier rides
+ *  in the tooltip. Pure so the wording is tested. */
+export function runLine(agent: Pick<CrewAgent, "model" | "effort">): string {
+  const parts: string[] = [];
+  if (agent.model) parts.push(shortModel(agent.model));
+  if (agent.effort) parts.push(agent.effort);
+  return parts.join(" · ");
+}
+
 /** Resolved `Agent` rows (one crew item of the timeline) → card rows. */
 export function crewAgentsFromTools(rows: Array<{ id: number; tool: ToolExecution }>): CrewAgent[] {
   return rows.map(({ id, tool }) => {
@@ -53,7 +76,11 @@ export function crewAgentsFromTools(rows: Array<{ id: number; tool: ToolExecutio
       callId: tool.callId ?? `row-${id}`,
       description: str(tool.toolInput?.description) ?? "Sub-agent",
       subagentType: str(tool.toolInput?.subagentType),
-      model: str(tool.toolInput?.model) ?? meta?.model ?? null,
+      model: meta?.model ?? str(tool.toolInput?.model) ?? null,
+      tier: meta?.tier ?? str(tool.toolInput?.tier),
+      effort: str(tool.toolInput?.effort),
+      askedModel: str(tool.toolInput?.askedModel),
+      askedHonored: tool.toolInput?.askedHonored !== false,
       status: meta ? (meta.ok ? "done" : "failed") : "done",
       startedAt: null,
       durationMs: meta?.durationMs ?? null,
@@ -70,6 +97,10 @@ export function crewAgentsFromLive(tools: LiveTool[]): CrewAgent[] {
     description: str(t.toolInput?.description) ?? "Sub-agent",
     subagentType: str(t.toolInput?.subagentType),
     model: str(t.toolInput?.model),
+    tier: str(t.toolInput?.tier),
+    effort: str(t.toolInput?.effort),
+    askedModel: str(t.toolInput?.askedModel),
+    askedHonored: t.toolInput?.askedHonored !== false,
     status: t.done ? (t.ok ? "done" : "failed") : "running",
     startedAt: t.startedAt,
     durationMs: t.durationMs,
@@ -294,6 +325,28 @@ function CrewRow({
           <span className="shrink-0 truncate text-[12px] text-octo-ivory">{agent.description}</span>
           {agent.subagentType && (
             <span className="shrink-0 font-mono text-[10px] text-octo-sage">{agent.subagentType}</span>
+          )}
+          {runLine(agent) && (
+            <span
+              data-testid="crew-run-line"
+              className="shrink-0 font-mono text-[10px] text-octo-mute"
+              title={`Runs on ${agent.model}${agent.tier ? ` (${agent.tier} tier)` : ""}${agent.effort ? ` at effort ${agent.effort}` : ""}`}
+            >
+              {runLine(agent)}
+            </span>
+          )}
+          {agent.askedModel && (
+            <span
+              data-testid="crew-asked"
+              className={`shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] ${agent.askedHonored ? "text-octo-sage" : "text-octo-brass"}`}
+              title={
+                agent.askedHonored
+                  ? `The director asked for ${agent.askedModel}; the run honors it`
+                  : `The director asked for ${agent.askedModel}; under Auto a typed role keeps its tier`
+              }
+            >
+              asked {agent.askedModel}
+            </span>
           )}
           {activity && (
             <span className="min-w-0 truncate font-mono text-[11px] text-octo-sage" title={activity}>

@@ -548,6 +548,27 @@ mod effort {
     }
 
     #[test]
+    fn opus_5_takes_the_effort_path_up_to_xhigh() {
+        let (thinking, output_config) = thinking_json("claude-opus-5", Some(Effort::Low), 32768);
+        assert_eq!(thinking, Some(json!({ "type": "adaptive" })));
+        assert_eq!(output_config, Some(json!({ "effort": "low" })));
+        let (_t, oc) = thinking_json("claude-opus-5", Some(Effort::Xhigh), 64000);
+        assert_eq!(oc, Some(json!({ "effort": "xhigh" })));
+        // Without an effort the request carries no thinking params at all —
+        // on Opus 5 that means the API's own default (adaptive, high).
+        assert_eq!(thinking_json("claude-opus-5", None, 32768), (None, None));
+    }
+
+    #[test]
+    fn low_effort_on_a_budget_model_means_no_thinking() {
+        // The fast tier's sub-agents run `low` on Haiku: that must not turn
+        // on a thinking budget the model never had.
+        assert_eq!(thinking_json("claude-haiku-4-5", Some(Effort::Low), 32768), (None, None));
+        let (thinking, _) = thinking_json("claude-haiku-4-5", Some(Effort::Medium), 32768);
+        assert_eq!(thinking, Some(json!({ "type": "enabled", "budget_tokens": 8192 })));
+    }
+
+    #[test]
     fn thinking_json_haiku_uses_budget_under_max_and_no_output_config() {
         let (thinking, output_config) = thinking_json("claude-haiku-4-5", Some(Effort::High), 32768);
         let thinking = thinking.unwrap();
