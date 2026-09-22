@@ -184,9 +184,12 @@ describe("CrewCard — what the run is on, from the first second", () => {
     expect(screen.getAllByTestId("crew-asked")).toHaveLength(1);
   });
 
-  it("a resolved row prefers the outcome's model and tier over the planned ones", () => {
-    const [a] = crewAgentsFromTools([resolved(1, "c1", true, { model: "claude-opus-5", tier: "strong" })]);
+  it("a resolved row prefers the outcome's model, tier and effort over the planned ones", () => {
+    const row = resolved(1, "c1", true, { model: "claude-opus-5", tier: "strong", effort: "high" });
+    row.tool.toolInput = { ...row.tool.toolInput, effort: "medium" };
+    const [a] = crewAgentsFromTools([row]);
     expect(a.model).toBe("claude-opus-5");
     expect(a.tier).toBe("strong");
+    expect(a.effort).toBe("high");
   });
 });

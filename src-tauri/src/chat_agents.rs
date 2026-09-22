@@ -207,6 +207,9 @@ pub struct AgentOutcome {
     /// The tier `model` is mapped to in Settings › Models (`fast` /
     /// `balanced` / `strong`), when it is one — the crew card's tier mix.
     pub tier: Option<String>,
+    /// The effort the FINAL attempt ran at (an escalation changes it).
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// The cheaper model a failed first attempt ran on, when the definition's
     /// `escalate` retried this sub-agent on `model`.
     pub escalated_from: Option<String>,
@@ -391,18 +394,29 @@ pub fn default_effort_for_tier(tier: Option<&str>) -> Option<Effort> {
 /// definition's `effort`, else the tier's default.
 pub fn plan_subagent(spec: &SubagentSpec, known_models: &[String], tiers: &HashMap<String, String>) -> SubagentPlan {
     let asked = spec.call.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
-    let def_tier = spec.definition.as_ref().and_then(|d| d.model.as_deref()).and_then(crate::skills::agents::tier_for_alias);
+    // The role's tier: the definition's alias (`balanced`), or the tier its
+    // model id is mapped to.
+    let def_tier = spec.definition.as_ref().and_then(|d| d.model.as_deref()).and_then(|m| {
+        crate::skills::agents::tier_for_alias(m)
+            .or_else(|| resolve_model_with_tiers(m, known_models, tiers).and_then(|id| crate::skills::agents::tier_of_model(id, tiers)))
+    });
     let mut effective = spec.clone();
     let mut honored = true;
-    if let (true, Some(asked), Some(def_tier)) = (spec.policy_auto, asked.as_deref(), def_tier) {
-        let asked_tier = crate::skills::agents::tier_for_alias(asked)
-            .or_else(|| resolve_model_with_tiers(asked, known_models, tiers).and_then(|id| crate::skills::agents::tier_of_model(id, tiers)));
-        if asked_tier.is_some_and(|t| tier_rank(t) > tier_rank(def_tier)) {
+    let mut model = pick_subagent_model(&effective, known_models, tiers);
+    // The ceiling is judged on the OUTCOME, not the wording of the ask, so
+    // `strong`, the strong model's id and `inherit` (the director's model)
+    // all land the same way: a typed role never runs above its tier under
+    // Auto. Under Auto the director IS the strong tier, so an outcome that
+    // is the conversation's model counts as strong even when unmapped.
+    if let (true, Some(_), Some(def_tier)) = (spec.policy_auto, asked.as_deref(), def_tier) {
+        let outcome_tier = crate::skills::agents::tier_of_model(&model, tiers)
+            .or_else(|| (model == spec.default_model).then_some("strong"));
+        if outcome_tier.is_some_and(|t| tier_rank(t) > tier_rank(def_tier)) {
             effective.call.model = None;
             honored = false;
+            model = pick_subagent_model(&effective, known_models, tiers);
         }
     }
-    let model = pick_subagent_model(&effective, known_models, tiers);
     let tier = tier_for_outcome(&effective, &model, tiers);
     let effort = spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(tier.as_deref()));
     let asked_model = asked.filter(|a| !honored || !a.eq_ignore_ascii_case(&model));
@@ -905,6 +919,7 @@ pub async fn run_subagent_core(
         blocked: out.blocked.is_some(),
         model: model.to_string(),
         tier: None,
+        effort,
         escalated_from: None,
         attempts: Vec::new(),
         input_tokens: out.input_tokens,
@@ -1153,6 +1168,8 @@ pub async fn run_one_subagent(
             if let Some(p) = more.plan.as_mut() {
                 p.model = outcome.model.clone();
                 p.tier = crate::skills::agents::tier_of_model(&outcome.model, tiers).map(str::to_string);
+                // An escalated writer continues at the strong tier's effort.
+                p.effort = spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(p.tier.as_deref()));
             }
             more.resume = Some(resume_messages_for_continuation(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
@@ -1563,9 +1580,17 @@ mod tests {
         assert_eq!(p.model, "sonnet");
         assert_eq!(p.asked_model.as_deref(), Some("strong"));
         assert!(!p.asked_honored);
-        // …so is the strong model's id itself.
+        // …so is the strong model's id itself, and so is `inherit` (the
+        // director's model — under Auto that is the strong tier).
         let asked_id = SubagentSpec { call: AgentCall { model: Some("opus".into()), ..base.call.clone() }, ..base.clone() };
         assert_eq!(plan_subagent(&asked_id, &known, &tiers).model, "sonnet");
+        let inherit = SubagentSpec { call: AgentCall { model: Some("inherit".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&inherit, &known, &tiers);
+        assert_eq!(p.model, "sonnet");
+        assert!(!p.asked_honored);
+        // A definition whose `model` is an id (not an alias) has a tier too.
+        let by_id = SubagentSpec { definition: Some(def("impl-id", None, Some("sonnet"))), call: AgentCall { model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
+        assert_eq!(plan_subagent(&by_id, &known, &tiers).model, "sonnet");
         // Asking DOWN is honored (a cheaper implementer is the director's call).
         let down = SubagentSpec { call: AgentCall { model: Some("fast".into()), ..base.call.clone() }, ..base.clone() };
         let p = plan_subagent(&down, &known, &tiers);

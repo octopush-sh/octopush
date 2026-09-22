@@ -78,7 +78,7 @@ export function crewAgentsFromTools(rows: Array<{ id: number; tool: ToolExecutio
       subagentType: str(tool.toolInput?.subagentType),
       model: meta?.model ?? str(tool.toolInput?.model) ?? null,
       tier: meta?.tier ?? str(tool.toolInput?.tier),
-      effort: str(tool.toolInput?.effort),
+      effort: meta?.effort ?? str(tool.toolInput?.effort),
       askedModel: str(tool.toolInput?.askedModel),
       askedHonored: tool.toolInput?.askedHonored !== false,
       status: meta ? (meta.ok ? "done" : "failed") : "done",

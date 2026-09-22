@@ -190,7 +190,7 @@ fn budget_for_effort(effort: Effort) -> u32 {
 /// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
-/// - Effort model (Opus 4.5–4.8, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
+/// - Effort model (Opus 4.5–5, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
 ///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
 ///   level clamped per model (`effective_effort_level`).
 /// - Budget model (Haiku 4.5, Sonnet 4.5/4.0) ⇒
