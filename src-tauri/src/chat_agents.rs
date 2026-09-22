@@ -26,7 +26,7 @@ use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
-use crate::providers::{LlmMessage, LlmProvider, LlmTool};
+use crate::providers::{Effort, LlmMessage, LlmProvider, LlmTool};
 use crate::skills::agents::{resolve_model_with_tiers, AgentDefinition};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -207,6 +207,9 @@ pub struct AgentOutcome {
     /// The tier `model` is mapped to in Settings › Models (`fast` /
     /// `balanced` / `strong`), when it is one — the crew card's tier mix.
     pub tier: Option<String>,
+    /// The effort the FINAL attempt ran at (an escalation changes it).
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// The cheaper model a failed first attempt ran on, when the definition's
     /// `escalate` retried this sub-agent on `model`.
     pub escalated_from: Option<String>,
@@ -336,6 +339,101 @@ pub struct SubagentSpec {
     /// messages. `None` for a first run.
     #[serde(default)]
     pub resume: Option<Vec<LlmMessage>>,
+    /// What the run will use, decided before it starts (`plan_subagent`) so
+    /// the live card can say it: the model, its tier, the effort, and what
+    /// the director asked for when that was not honored.
+    #[serde(default)]
+    pub plan: Option<SubagentPlan>,
+}
+
+/// The resolved shape of one sub-agent run — model, tier and effort — plus
+/// the director's `model` ask when it differed. Computed once, before the
+/// run, so the crew card and journal can show it while the sub-agent works.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentPlan {
+    pub model: String,
+    pub tier: Option<String>,
+    pub effort: Option<Effort>,
+    /// The `model` the director put on the call, when it was not what the
+    /// run uses (either ignored under Auto, or resolved to a different id).
+    pub asked_model: Option<String>,
+    /// Whether the director's ask was honored (`false` = ignored: under Auto
+    /// a typed role keeps its tier).
+    pub asked_honored: bool,
+}
+
+/// The rank of a tier for the "never above the role's tier" rule.
+fn tier_rank(tier: &str) -> u8 {
+    match tier {
+        "fast" => 0,
+        "balanced" => 1,
+        "strong" => 2,
+        _ => 1,
+    }
+}
+
+/// The effort a tier runs at when the definition says nothing: the cheap
+/// tier thinks little (a read, a test run), the middle tier moderately, the
+/// strong tier hard (a review, an escalated implementation).
+pub fn default_effort_for_tier(tier: Option<&str>) -> Option<Effort> {
+    match tier {
+        Some("fast") => Some(Effort::Low),
+        Some("balanced") => Some(Effort::Medium),
+        Some("strong") => Some(Effort::High),
+        _ => None,
+    }
+}
+
+/// Decide a run's model, tier and effort. Under Auto, a call's `model` may
+/// not lift a typed role above its definition's tier — the escalation
+/// exists for when the cheap attempt fails, not for caution up front — so
+/// `implementer` + `model: "strong"` still runs balanced and the plan
+/// records the ask as not honored. Outside Auto (the user picked the
+/// model), the call's `model` is honored as before. Effort: the
+/// definition's `effort`, else the tier's default.
+pub fn plan_subagent(spec: &SubagentSpec, known_models: &[String], tiers: &HashMap<String, String>) -> SubagentPlan {
+    let asked = spec.call.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+    // The role's tier: the definition's alias (`balanced`), or the tier its
+    // model id is mapped to.
+    let def_tier = spec.definition.as_ref().and_then(|d| d.model.as_deref()).and_then(|m| {
+        crate::skills::agents::tier_for_alias(m)
+            .or_else(|| resolve_model_with_tiers(m, known_models, tiers).and_then(|id| crate::skills::agents::tier_of_model(id, tiers)))
+    });
+    let mut effective = spec.clone();
+    let mut honored = true;
+    let mut model = pick_subagent_model(&effective, known_models, tiers);
+    // The ceiling is judged on the OUTCOME, not the wording of the ask, so
+    // `strong`, the strong model's id and `inherit` (the director's model)
+    // all land the same way: a typed role never runs above its tier under
+    // Auto. Under Auto the director IS the strong tier, so an outcome that
+    // is the conversation's model counts as strong even when unmapped.
+    if let (true, Some(_), Some(def_tier)) = (spec.policy_auto, asked.as_deref(), def_tier) {
+        let outcome_tier = crate::skills::agents::tier_of_model(&model, tiers)
+            .or_else(|| (model == spec.default_model).then_some("strong"));
+        if outcome_tier.is_some_and(|t| tier_rank(t) > tier_rank(def_tier)) {
+            effective.call.model = None;
+            honored = false;
+            model = pick_subagent_model(&effective, known_models, tiers);
+        }
+    }
+    let tier = tier_for_outcome(&effective, &model, tiers);
+    let effort = spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(tier.as_deref()));
+    let asked_model = asked.filter(|a| !honored || !a.eq_ignore_ascii_case(&model));
+    SubagentPlan { model, tier, effort, asked_model, asked_honored: honored }
+}
+
+/// One line for the journal and the card: `claude-sonnet-4-6 · balanced · effort medium`.
+pub fn plan_line(plan: &SubagentPlan) -> String {
+    let mut parts = vec![plan.model.clone()];
+    if let Some(t) = &plan.tier {
+        parts.push(t.clone());
+    }
+    match plan.effort {
+        Some(e) => parts.push(format!("effort {}", e.as_str())),
+        None => parts.push("effort default".into()),
+    }
+    parts.join(" · ")
 }
 
 /// Which model a sub-agent runs on: the call's explicit `model` wins, then
@@ -443,8 +541,12 @@ const DOCTRINE: &str =
      needs more than that, it was two questions; split it, never widen it. `implementer` \
      and `pr-maintainer` run balanced and escalate to strong on a failed attempt — the \
      ONLY sub-agents that write. `reviewer` runs strong in a fresh context — the quality \
-     gate before any PR, so always run it. A sub-agent you give no type runs on the fast \
-     tier, so type anything that must write. Never paste a long output into your own \
+     gate before any PR, so always run it. Never pass `model` on a typed call — the role \
+     carries its tier and its effort, and under Auto a request above the role's tier is \
+     ignored; the escalation exists for when the cheap attempt fails, not for caution up \
+     front. If the user names a model, say so in the prompt instead. A sub-agent you give \
+     no type runs on the fast tier, so type anything that must write. Never paste a long \
+     output into your own \
      context, never re-run or re-verify what a sub-agent already reported, and recall \
      stored tool output instead of re-reading. A writing sub-agent that runs out of turns \
      mid-work pauses your turn until the user gives it more turns or accepts its partial \
@@ -785,6 +887,7 @@ pub async fn run_subagent_core(
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
     let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref());
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
+    let effort = spec.plan.as_ref().and_then(|p| p.effort);
     let out = run_agentic_loop(
         provider,
         api_base,
@@ -798,7 +901,7 @@ pub async fn run_subagent_core(
         cancel,
         &emitter,
         allowed_tools,
-        None,
+        effort,
         spec.sandbox_roots.as_deref(),
         false,
         None,
@@ -816,6 +919,7 @@ pub async fn run_subagent_core(
         blocked: out.blocked.is_some(),
         model: model.to_string(),
         tier: None,
+        effort,
         escalated_from: None,
         attempts: Vec::new(),
         input_tokens: out.input_tokens,
@@ -947,9 +1051,17 @@ pub async fn run_one_subagent(
     cap_gate: Option<&CapGate>,
 ) -> AgentOutcome {
     let started = std::time::Instant::now();
-    // (A continuation carries the saved run's model as the call's `model`,
-    // so it resumes on the model that wrote the transcript.)
-    let model = pick_subagent_model(spec, known_models, tiers);
+    // The plan was decided at fan-out (so the card could say it); a caller
+    // without one (a continuation, a test) gets it decided here.
+    let plan = spec.plan.clone().unwrap_or_else(|| plan_subagent(spec, known_models, tiers));
+    let spec_owned;
+    let spec: &SubagentSpec = if spec.plan.is_some() {
+        spec
+    } else {
+        spec_owned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
+        &spec_owned
+    };
+    let model = plan.model.clone();
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec).with_mcp_writes(mcp_tools);
     let external = McpSubagentTools::granted(
         mcp,
@@ -966,6 +1078,17 @@ pub async fn run_one_subagent(
         thread_id: spec.thread_id.clone(),
         call_id: spec.call_id.clone(),
     };
+    // Say up front what this run is — the model, its tier, the effort — and
+    // whether the director asked for more than the role gets.
+    {
+        let em = LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id);
+        em.notice(&format!("running on {}", plan_line(&plan)));
+        if let Some(asked) = &plan.asked_model {
+            if !plan.asked_honored {
+                em.notice(&format!("the director asked for {asked}; under Auto a typed role keeps its tier"));
+            }
+        }
+    }
     let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &approval_gate, external_ref, started).await;
     // The definition's `escalate`: one retry on the stronger model when the
     // cheap attempt failed — unless the director stopped the turn. A
@@ -980,6 +1103,18 @@ pub async fn run_one_subagent(
             ));
             let mut retry = spec.clone();
             retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(spec));
+            // The stronger attempt thinks at its own tier's effort (a
+            // definition's explicit `effort` still wins).
+            let stronger_tier = crate::skills::agents::tier_of_model(&stronger, tiers).map(str::to_string);
+            retry.plan = Some(SubagentPlan {
+                model: stronger.clone(),
+                tier: stronger_tier.clone(),
+                effort: spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(stronger_tier.as_deref())),
+                asked_model: None,
+                asked_honored: true,
+            });
+            LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
+                .notice(&format!("running on {}", plan_line(retry.plan.as_ref().unwrap())));
             let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_escalated(outcome, second);
         }
@@ -1030,6 +1165,12 @@ pub async fn run_one_subagent(
             let mut more = spec.clone();
             more.call.model = Some(outcome.model.clone());
             more.max_iterations = extra;
+            if let Some(p) = more.plan.as_mut() {
+                p.model = outcome.model.clone();
+                p.tier = crate::skills::agents::tier_of_model(&outcome.model, tiers).map(str::to_string);
+                // An escalated writer continues at the strong tier's effort.
+                p.effort = spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(p.tier.as_deref()));
+            }
             more.resume = Some(resume_messages_for_continuation(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
                 &continuation_note(None, extra),
@@ -1274,6 +1415,7 @@ mod tests {
             model: model.map(String::from),
             escalate: None,
             max_turns: None,
+            effort: None,
             source: "project".into(),
         }
     }
@@ -1309,6 +1451,7 @@ mod tests {
             definition: None,
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &no_tiers), "conv-model");
         let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
@@ -1373,6 +1516,7 @@ mod tests {
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
             default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
             definition: None, policy_auto: false, resume: None,
+            plan: None,
         };
         assert!(spec_edits_files(&base), "no definition → the full tool set");
         let with = |tools: Vec<&str>| SubagentSpec { definition: Some(def("x", Some(tools), None)), ..base.clone() };
@@ -1401,6 +1545,87 @@ mod tests {
         assert!(!ran_out_of_turns(&done));
     }
 
+    fn planning_fixture() -> (Vec<String>, HashMap<String, String>, SubagentSpec) {
+        let known = vec!["opus".to_string(), "sonnet".to_string(), "haiku".to_string()];
+        let tiers: HashMap<String, String> = [
+            ("fast".to_string(), "haiku".to_string()),
+            ("balanced".to_string(), "sonnet".to_string()),
+            ("strong".to_string(), "opus".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let base = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: Some("implementer".into()), model: None },
+            workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
+            default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            definition: Some(def("implementer", None, Some("balanced"))),
+            policy_auto: true,
+            resume: None,
+            plan: None,
+        };
+        (known, tiers, base)
+    }
+
+    #[test]
+    fn under_auto_a_typed_role_keeps_its_tier_when_the_director_asks_for_more() {
+        let (known, tiers, base) = planning_fixture();
+        // No ask: the definition's tier, the tier's effort.
+        let p = plan_subagent(&base, &known, &tiers);
+        assert_eq!((p.model.as_str(), p.tier.as_deref(), p.effort), ("sonnet", Some("balanced"), Some(Effort::Medium)));
+        assert_eq!(p.asked_model, None);
+        // `model: "strong"` on an implementer is ignored under Auto, and remembered.
+        let asked = SubagentSpec { call: AgentCall { model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&asked, &known, &tiers);
+        assert_eq!(p.model, "sonnet");
+        assert_eq!(p.asked_model.as_deref(), Some("strong"));
+        assert!(!p.asked_honored);
+        // …so is the strong model's id itself, and so is `inherit` (the
+        // director's model — under Auto that is the strong tier).
+        let asked_id = SubagentSpec { call: AgentCall { model: Some("opus".into()), ..base.call.clone() }, ..base.clone() };
+        assert_eq!(plan_subagent(&asked_id, &known, &tiers).model, "sonnet");
+        let inherit = SubagentSpec { call: AgentCall { model: Some("inherit".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&inherit, &known, &tiers);
+        assert_eq!(p.model, "sonnet");
+        assert!(!p.asked_honored);
+        // A definition whose `model` is an id (not an alias) has a tier too.
+        let by_id = SubagentSpec { definition: Some(def("impl-id", None, Some("sonnet"))), call: AgentCall { model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
+        assert_eq!(plan_subagent(&by_id, &known, &tiers).model, "sonnet");
+        // Asking DOWN is honored (a cheaper implementer is the director's call).
+        let down = SubagentSpec { call: AgentCall { model: Some("fast".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&down, &known, &tiers);
+        assert_eq!((p.model.as_str(), p.effort), ("haiku", Some(Effort::Low)));
+        assert_eq!(p.asked_model.as_deref(), Some("fast"), "the ask differs from the id, so it is shown");
+        assert!(p.asked_honored);
+    }
+
+    #[test]
+    fn outside_auto_the_directors_model_is_honored_and_effort_follows_the_definition() {
+        let (known, tiers, base) = planning_fixture();
+        let manual = SubagentSpec { policy_auto: false, call: AgentCall { model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&manual, &known, &tiers);
+        assert_eq!((p.model.as_str(), p.tier.as_deref(), p.effort), ("opus", Some("strong"), Some(Effort::High)));
+        assert!(p.asked_honored);
+        // A definition's own `effort` beats the tier default.
+        let mut d = def("implementer", None, Some("balanced"));
+        d.effort = Some(Effort::Xhigh);
+        let explicit = SubagentSpec { definition: Some(d), ..base.clone() };
+        assert_eq!(plan_subagent(&explicit, &known, &tiers).effort, Some(Effort::Xhigh));
+        // Untyped under Auto: fast tier, low effort; the ceiling never applies (no role).
+        let untyped = SubagentSpec { definition: None, call: AgentCall { subagent_type: None, model: Some("strong".into()), ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&untyped, &known, &tiers);
+        assert_eq!((p.model.as_str(), p.effort), ("opus", Some(Effort::High)));
+        assert!(p.asked_honored);
+        let untyped_plain = SubagentSpec { definition: None, call: AgentCall { subagent_type: None, model: None, ..base.call.clone() }, ..base.clone() };
+        assert_eq!(plan_subagent(&untyped_plain, &known, &tiers).effort, Some(Effort::Low));
+        // A model outside every tier: no effort default.
+        let odd = SubagentSpec { definition: None, policy_auto: false, default_model: "local-llm".into(), call: AgentCall { subagent_type: None, model: None, ..base.call.clone() }, ..base.clone() };
+        let p = plan_subagent(&odd, &known, &tiers);
+        assert_eq!((p.model.as_str(), p.tier.as_deref(), p.effort), ("local-llm", None, None));
+        assert_eq!(plan_line(&p), "local-llm · effort default");
+        assert_eq!(plan_line(&plan_subagent(&base, &known, &tiers)), "sonnet · balanced · effort medium");
+    }
+
     #[test]
     fn the_doctrine_says_one_question_per_typed_subagent_and_that_a_cap_is_not_lost_work() {
         let d = director_doctrine(&[]);
@@ -1410,6 +1635,7 @@ mod tests {
         assert!(d.contains("give that sub-agent more turns from its journal"));
         assert!(d.contains("pauses your turn until the user gives it more turns or accepts its partial"));
         assert!(d.contains("do not build on it"));
+        assert!(d.contains("Never pass `model` on a typed call"));
         assert!(d.contains("never re-run or re-verify what a sub-agent already reported"));
         assert_eq!(AUTO_SUBAGENT_TIER, "fast");
     }
@@ -1432,6 +1658,7 @@ mod tests {
             definition: None,
             policy_auto: true,
             resume: None,
+            plan: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &tiers), "haiku", "no model → fast under Auto");
         // A definition's tier still wins; a call's explicit model still wins.
@@ -1492,6 +1719,7 @@ mod tests {
             definition: Some(d),
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let ok = AgentOutcome { ok: true, finished: true, model: "sonnet".into(), ..Default::default() };
         assert!(!should_escalate(&ok));
@@ -1633,6 +1861,7 @@ mod tests {
             definition: Some(def("ticket-reader", Some(vec!["read_file"]), None)),
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1707,6 +1936,7 @@ mod tests {
             definition: None,
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec!["mcp__jira__add_comment"] };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -1763,6 +1993,7 @@ mod tests {
             definition: Some(def("reader", Some(vec!["read_file", "grep"]), None)),
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1821,6 +2052,7 @@ mod tests {
             default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None, definition: None,
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let gate = DenyRuns { seen: Mutex::new(vec![]) };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -1869,6 +2101,7 @@ mod tests {
             definition: None,
             policy_auto: false,
             resume: None,
+            plan: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();

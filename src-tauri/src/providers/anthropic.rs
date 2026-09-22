@@ -122,7 +122,7 @@ fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
 /// would 400) — it gets no thinking at all (see `thinking_json`).
 fn is_effort_model(id: &str) -> bool {
     [
-        "opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8",
+        "opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5",
         "sonnet-4-6", "sonnet-5", "fable-5", "mythos-5",
     ]
     .iter()
@@ -141,7 +141,7 @@ fn is_budget_model(id: &str) -> bool {
 /// families do (Opus 4.7/4.8, Sonnet 5, Fable 5, Mythos 5); Opus 4.6 / Sonnet
 /// 4.6 cap at `max` (no `xhigh`), and Opus 4.5 caps at `high`.
 fn supports_xhigh(id: &str) -> bool {
-    ["opus-4-7", "opus-4-8", "sonnet-5", "fable-5", "mythos-5"]
+    ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5", "mythos-5"]
         .iter()
         .any(|m| id.contains(m))
 }
@@ -190,7 +190,7 @@ fn budget_for_effort(effort: Effort) -> u32 {
 /// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
-/// - Effort model (Opus 4.5–4.8, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
+/// - Effort model (Opus 4.5–5, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
 ///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
 ///   level clamped per model (`effective_effort_level`).
 /// - Budget model (Haiku 4.5, Sonnet 4.5/4.0) ⇒
@@ -214,6 +214,13 @@ pub fn thinking_json(
             Some(json!({ "effort": effective_effort_level(model_id, effort) })),
         )
     } else if is_budget_model(&id) {
+        // `low` on a model whose thinking is off unless asked for (Haiku 4.5,
+        // Sonnet 4.5) means the cheapest thing that works: no thinking at
+        // all — the fast tier's sub-agents must not pay for a budget they
+        // never had. Medium and up buy one.
+        if effort == Effort::Low {
+            return (None, None);
+        }
         // budget_tokens must be < max_tokens and >= the 1024 API floor.
         let ceiling = max_tokens.saturating_sub(1).max(1024);
         let budget = budget_for_effort(effort).clamp(1024, ceiling);

@@ -57,6 +57,11 @@ pub struct AgentDefinition {
     /// user, from the crew journal) can give it more turns.
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// The frontmatter `effort` (`low` … `max`): how hard one run of this
+    /// sub-agent thinks. `None` = the tier's default (fast → low, balanced →
+    /// medium, strong → high; see `chat_agents::default_effort_for_tier`).
+    #[serde(default)]
+    pub effort: Option<crate::providers::Effort>,
     /// "project", "user" or "builtin".
     pub source: String,
 }
@@ -115,6 +120,7 @@ pub struct AgentDefinitionMeta {
     pub model: Option<String>,
     pub escalate: Option<String>,
     pub max_turns: Option<u32>,
+    pub effort: Option<crate::providers::Effort>,
 }
 
 impl AgentDefinition {
@@ -127,6 +133,7 @@ impl AgentDefinition {
             model: self.model.clone(),
             escalate: self.escalate.clone(),
             max_turns: self.max_turns,
+            effort: self.effort,
         }
     }
 }
@@ -244,6 +251,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     let mut model: Option<String> = None;
     let mut escalate: Option<String> = None;
     let mut max_turns: Option<u32> = None;
+    let mut effort: Option<crate::providers::Effort> = None;
     for (key, value) in pairs {
         match key.as_str() {
             "name" => name = value,
@@ -279,6 +287,9 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
                     escalate = Some(value);
                 }
             }
+            "effort" => {
+                effort = crate::providers::Effort::from_str(&value);
+            }
             "max-turns" | "max_turns" | "maxTurns" => {
                 // Zero or garbage means "no cap of its own", never a
                 // sub-agent that cannot take a single turn.
@@ -290,7 +301,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     if name.is_empty() {
         return None;
     }
-    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, source: source.to_string() })
+    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, effort, source: source.to_string() })
 }
 
 fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -367,7 +378,9 @@ mod tests {
 
     #[test]
     fn agent_definitions_round_trip_through_json_for_saved_runs() {
-        let d = parse_agent_definition("---\nname: a\ntools: Read, mcp__jira\nmodel: fast\nescalate: strong\nmax-turns: 15\n---\nbody", "builtin").unwrap();
+        let d = parse_agent_definition("---\nname: a\ntools: Read, mcp__jira\nmodel: fast\nescalate: strong\nmax-turns: 15\neffort: low\n---\nbody", "builtin").unwrap();
+        assert_eq!(d.effort, Some(crate::providers::Effort::Low));
+        assert_eq!(parse_agent_definition("---\nname: b\neffort: absurd\n---\nbody", "project").unwrap().effort, None);
         let json = serde_json::to_string(&d).unwrap();
         let back: AgentDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);

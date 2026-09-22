@@ -9,7 +9,7 @@
 use crate::chat_agents::{
     agent_tool_definitions, director_doctrine, director_model_for_auto, is_agent_tool, parse_agent_call,
     run_subagents, unmapped_subagent_tiers, AgentOutcome, AUTO_MODEL,
-    SubagentSpec, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
+    SubagentSpec, SubagentPlan, plan_subagent, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
 };
 use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
@@ -78,7 +78,7 @@ fn recall_tool_definition() -> LlmTool {
 /// What an `Agent` call's card and persisted row show as the input: the
 /// short description, the role hint and the model override — never the raw
 /// multi-KB prompt (the model's own words, already in the assistant row).
-fn agent_input_for_display(call: &crate::chat_agents::AgentCall) -> serde_json::Value {
+fn agent_input_for_display(call: &crate::chat_agents::AgentCall, plan: Option<&SubagentPlan>) -> serde_json::Value {
     let mut v = serde_json::json!({
         "description": call.description,
         "promptChars": call.prompt.len(),
@@ -86,8 +86,28 @@ fn agent_input_for_display(call: &crate::chat_agents::AgentCall) -> serde_json::
     if let Some(t) = &call.subagent_type {
         v["subagentType"] = serde_json::json!(t);
     }
-    if let Some(m) = &call.model {
-        v["model"] = serde_json::json!(m);
+    match plan {
+        // What the run USES — the resolved model id, its tier, the effort —
+        // and, when the director asked for something else, that ask and
+        // whether it was honored. The card reads these live.
+        Some(p) => {
+            v["model"] = serde_json::json!(p.model);
+            if let Some(t) = &p.tier {
+                v["tier"] = serde_json::json!(t);
+            }
+            if let Some(e) = p.effort {
+                v["effort"] = serde_json::json!(e.as_str());
+            }
+            if let Some(a) = &p.asked_model {
+                v["askedModel"] = serde_json::json!(a);
+                v["askedHonored"] = serde_json::json!(p.asked_honored);
+            }
+        }
+        None => {
+            if let Some(m) = &call.model {
+                v["model"] = serde_json::json!(m);
+            }
+        }
     }
     v
 }
@@ -2002,9 +2022,19 @@ impl ChatEngine {
             return Err(AppError::Other("The conversation this sub-agent belonged to was deleted.".into()));
         }
 
-        // Resume on the model that wrote the transcript, never re-picked.
+        // Resume on the model that wrote the transcript, never re-picked —
+        // the plan is that model, its tier, and the role's effort.
         spec.call.model = Some(run.model.clone());
         spec.max_iterations = extra_turns;
+        {
+            let (known_models, tiers) = model_catalog();
+            let mut plan = plan_subagent(&SubagentSpec { policy_auto: false, ..spec.clone() }, &known_models, &tiers);
+            plan.model = run.model.clone();
+            plan.tier = crate::skills::agents::tier_of_model(&run.model, &tiers).map(str::to_string);
+            plan.asked_model = None;
+            plan.asked_honored = true;
+            spec.plan = Some(plan);
+        }
         let note = continuation_note(instruction.as_deref(), extra_turns);
         spec.resume = Some(if transcript.ask_tool_use_id.is_empty() {
             resume_messages_for_continuation(&transcript, &note)
@@ -2024,7 +2054,7 @@ impl ChatEngine {
             thread_id: run.thread_id.clone(),
             call_id: call_id.clone(),
             tool_name: "Agent".to_string(),
-            tool_input: agent_input_for_display(&spec.call),
+            tool_input: agent_input_for_display(&spec.call, spec.plan.as_ref()),
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         });
 
@@ -2819,50 +2849,69 @@ impl ChatEngine {
             // response's order. A malformed call fails fast with the parse
             // error as its report instead of occupying a slot.
             let mut agent_outcomes: HashMap<String, AgentOutcome> = HashMap::new();
+            // Each sub-agent's plan (model · tier · effort), kept for its
+            // persisted row after the fan-out consumed the specs.
+            let mut agent_plans: HashMap<String, SubagentPlan> = HashMap::new();
             {
                 let mut specs: Vec<SubagentSpec> = Vec::new();
+                let has_agents = response.tool_uses.iter().any(|u| is_agent_tool(&u.name));
+                // The catalog + tier map, read once per fan-out, so every
+                // call's plan is decided BEFORE its card opens.
+                let (known_models, tiers) = if has_agents { model_catalog() } else { (Vec::new(), HashMap::new()) };
                 for u in response.tool_uses.iter().filter(|u| is_agent_tool(&u.name)) {
                     let parsed = parse_agent_call(&u.input);
+                    let mut planned: Option<(SubagentSpec, SubagentPlan)> = None;
+                    if let Ok(call) = &parsed {
+                        let definition = call
+                            .subagent_type
+                            .as_deref()
+                            .and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, t))
+                            .cloned();
+                        let mut spec = SubagentSpec {
+                            call_id: u.id.clone(),
+                            call: call.clone(),
+                            workspace_id: request.workspace_id.clone(),
+                            thread_id: request.thread_id.clone(),
+                            workspace_path: request.workspace_path.clone(),
+                            default_model: request.model.clone(),
+                            max_iterations: subagent_iterations(
+                                definition.as_ref().and_then(|d| d.max_turns),
+                                subagent_cap,
+                            ),
+                            max_tokens: request.max_tokens,
+                            sandbox_roots: sandbox_roots.clone(),
+                            definition,
+                            policy_auto,
+                            resume: None,
+                            plan: None,
+                        };
+                        let plan = plan_subagent(&spec, &known_models, &tiers);
+                        spec.plan = Some(plan.clone());
+                        planned = Some((spec, plan));
+                    }
                     // The live card opens for every call, well-formed or not,
                     // so a parse failure flips it to failed instead of leaving
-                    // a tool-end with no card to land on.
+                    // a tool-end with no card to land on. It carries the plan,
+                    // so the row says what the run uses from its first second.
                     let _ = app.emit("chat://tool-start", &ToolStartEvent {
                         workspace_id: request.workspace_id.clone(),
                         thread_id: request.thread_id.clone(),
                         call_id: u.id.clone(),
                         tool_name: u.name.clone(),
-                        tool_input: parsed
-                            .as_ref()
-                            .map(agent_input_for_display)
-                            .unwrap_or_else(|_| u.input.clone()),
+                        tool_input: match (&parsed, &planned) {
+                            (Ok(call), Some((_, plan))) => agent_input_for_display(call, Some(plan)),
+                            (Ok(call), None) => agent_input_for_display(call, None),
+                            _ => u.input.clone(),
+                        },
                         started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                     });
-                    match parsed {
-                        Ok(call) => {
-                            let definition = call
-                                .subagent_type
-                                .as_deref()
-                                .and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, t))
-                                .cloned();
-                            specs.push(SubagentSpec {
-                                call_id: u.id.clone(),
-                                call,
-                                workspace_id: request.workspace_id.clone(),
-                                thread_id: request.thread_id.clone(),
-                                workspace_path: request.workspace_path.clone(),
-                                default_model: request.model.clone(),
-                                max_iterations: subagent_iterations(
-                                    definition.as_ref().and_then(|d| d.max_turns),
-                                    subagent_cap,
-                                ),
-                                max_tokens: request.max_tokens,
-                                sandbox_roots: sandbox_roots.clone(),
-                                definition,
-                                policy_auto,
-                                resume: None,
-                            });
+                    match (parsed, planned) {
+                        (Ok(_), Some((spec, plan))) => {
+                            agent_plans.insert(u.id.clone(), plan);
+                            specs.push(spec);
                         }
-                        Err(msg) => {
+                        (Ok(_), None) => unreachable!("a parsed call is always planned"),
+                        (Err(msg), _) => {
                             agent_outcomes.insert(
                                 u.id.clone(),
                                 AgentOutcome { report: msg, ok: false, ..AgentOutcome::default() },
@@ -2915,7 +2964,7 @@ impl ChatEngine {
                 let is_agent = is_agent_tool(&u.name);
                 let input_for_display = if is_agent {
                     parse_agent_call(&u.input)
-                        .map(|c| agent_input_for_display(&c))
+                        .map(|c| agent_input_for_display(&c, agent_plans.get(&u.id)))
                         .unwrap_or_else(|_| u.input.clone())
                 } else if u.name == "write_file" {
                     let mut display = u.input.clone();

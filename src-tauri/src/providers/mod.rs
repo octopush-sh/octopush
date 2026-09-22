@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// (or a `budget_tokens` thinking budget on the models that predate effort),
 /// OpenAI-compat maps it to `reasoning_effort`. `None` (represented as "off" in
 /// the UI) means no thinking params at all.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
