@@ -1,6 +1,6 @@
 // Settings → General — application-wide behavior (attention chime, workspace
-// defaults, the Talk turn budget, and future app-wide preferences). Editor
-// preferences live in their own pane.
+// defaults, the Talk turn limits — off by default — and future app-wide
+// preferences). Editor preferences live in their own pane.
 import { useEffect, useState } from "react";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { useWorkspacePrefs } from "../../stores/workspacePrefsStore";
@@ -13,8 +13,10 @@ import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
 
-/** Talk's "Tool turns per message" range — mirrors the backend clamp in
- *  `chat_history.rs` (`TALK_MAX_ITERATIONS_MIN/MAX`, `DEFAULT_TALK_MAX_ITERATIONS`). */
+/** Talk's turn-limit range — mirrors the backend clamp in `chat_history.rs`
+ *  (`TALK_MAX_ITERATIONS_MIN/MAX`). Both limits are OFF by default (no
+ *  limit); `TALK_TURNS_DEFAULT` is only the value a freshly switched-on
+ *  limit starts at. */
 export const TALK_TURNS_DEFAULT = 25;
 export const TALK_TURNS_MIN = 5;
 export const TALK_TURNS_MAX = 200;
@@ -52,13 +54,20 @@ export function GeneralPane() {
 
         <div className="space-y-4">
           <SectionLabel>Talk</SectionLabel>
-          <TurnsRow
+          <LimitTurnsRow
             field="talkMaxIterations"
-            label="Tool turns per message"
-            description={`Rounds of tool calls one message may run before Octopush asks the model to answer with what it has. A long review or refactor needs more; the default is ${TALK_TURNS_DEFAULT}.`}
+            label="Limit tool turns per message"
+            description="Off, a message runs as many rounds of tool calls as the answer needs, until the model answers or you stop it. On, Octopush asks the model to answer with what it has after this many rounds."
+            stepperLabel="Tool turns per message"
             testId="talk-turns-row"
           />
-          <SubagentTurnsRow />
+          <LimitTurnsRow
+            field="subagentMaxTurns"
+            label="Limit sub-agent tool turns"
+            description="Off, a sub-agent runs until it finishes or you stop it, so the director never builds on a report cut mid-work. On, one run may take this many rounds of tool calls; a definition's own max-turns applies under it, and a sub-agent that writes and runs out of turns pauses the conversation until you give it more or accept what it has."
+            stepperLabel="Sub-agent tool turns"
+            testId="subagent-turns-row"
+          />
         </div>
 
         <div className="space-y-4">
@@ -85,78 +94,25 @@ function clampTurns(n: number): number {
   return Math.min(TALK_TURNS_MAX, Math.max(TALK_TURNS_MIN, Math.round(n)));
 }
 
-/** The director's own persisted turn budget ("Tool turns per message";
- *  `settings.json`, read-modify-write so the other settings fields aren't
- *  clobbered). */
-function TurnsRow({
+/** One persisted turn limit, **off by default — no limit**: the director's
+ *  own rounds (`talkMaxIterations`) or one sub-agent run's
+ *  (`subagentMaxTurns`). A switch turns the limit on (starting at
+ *  `TALK_TURNS_DEFAULT`) and reveals the rounds stepper; off again persists
+ *  `null`. Read-modify-write on `settings.json` so the other fields aren't
+ *  clobbered. */
+function LimitTurnsRow({
   field,
   label,
   description,
+  stepperLabel,
   testId,
 }: {
-  field: "talkMaxIterations";
+  field: "talkMaxIterations" | "subagentMaxTurns";
   label: string;
   description: string;
+  stepperLabel: string;
   testId: string;
 }) {
-  const [turns, setTurns] = useState(TALK_TURNS_DEFAULT);
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    ipc
-      .getSettings()
-      .then((s) => {
-        const v = s[field];
-        if (typeof v === "number") setTurns(clampTurns(v));
-      })
-      .catch(() => {});
-  }, [field]);
-
-  async function change(next: number) {
-    const value = clampTurns(next);
-    setTurns(value);
-    try {
-      const s = await ipc.getSettings();
-      await ipc.saveSettings({ ...s, [field]: value });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
-    } catch {
-      // Leave the stepper where the user put it; the next change retries.
-    }
-  }
-
-  return (
-    <div
-      data-testid={testId}
-      className="flex items-center justify-between gap-4 rounded-lg px-4 py-3"
-      style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}
-    >
-      <div className="min-w-0 flex-1">
-        <div className="font-serif text-[14px] leading-tight text-octo-ivory">{label}</div>
-        <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
-        {saved && <div className="mt-1 font-mono text-[10px] text-octo-verdigris">Saved</div>}
-      </div>
-      <div className="shrink-0">
-        <Stepper
-          value={turns}
-          min={TALK_TURNS_MIN}
-          max={TALK_TURNS_MAX}
-          step={TALK_TURNS_STEP}
-          onChange={change}
-          ariaLabel={label}
-        />
-      </div>
-    </div>
-  );
-}
-
-/** Sub-agent turns: **off by default — no limit.** A sub-agent runs until it
- *  finishes or is stopped, so the director never builds on a report cut
- *  mid-work. Switched on, one run may take the stepper's rounds (a
- *  definition's own `max-turns` applies under it) and a writing sub-agent
- *  that runs out pauses the conversation for more turns. Persists
- *  `subagentMaxTurns`: a number when limited, `null` when not. */
-function SubagentTurnsRow() {
   const [limit, setLimit] = useState<number | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -164,17 +120,17 @@ function SubagentTurnsRow() {
     ipc
       .getSettings()
       .then((s) => {
-        const v = s.subagentMaxTurns;
+        const v = s[field];
         setLimit(typeof v === "number" ? clampTurns(v) : null);
       })
       .catch(() => {});
-  }, []);
+  }, [field]);
 
   async function persist(value: number | null) {
     setLimit(value);
     try {
       const s = await ipc.getSettings();
-      await ipc.saveSettings({ ...s, subagentMaxTurns: value });
+      await ipc.saveSettings({ ...s, [field]: value });
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
     } catch {
@@ -185,37 +141,33 @@ function SubagentTurnsRow() {
   const limited = limit !== null;
   return (
     <div
-      data-testid="subagent-turns-row"
+      data-testid={testId}
       className="rounded-lg px-4 py-3"
       style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <div className="font-serif text-[14px] leading-tight text-octo-ivory">Limit sub-agent tool turns</div>
-          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
-            Off, a sub-agent runs until it finishes or you stop it, so the director never builds on a report cut mid-work.
-            On, one run may take this many rounds of tool calls; a definition's own max-turns applies under it, and a
-            sub-agent that writes and runs out of turns pauses the conversation until you give it more or accept what it has.
-          </div>
+          <div className="font-serif text-[14px] leading-tight text-octo-ivory">{label}</div>
+          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
           {saved && <div className="mt-1 font-mono text-[10px] text-octo-verdigris">Saved</div>}
         </div>
         <Switch
           checked={limited}
           onChange={(on) => void persist(on ? TALK_TURNS_DEFAULT : null)}
-          ariaLabel="Limit sub-agent tool turns"
-          testId="subagent-turns-switch"
+          ariaLabel={label}
+          testId={`${testId}-switch`}
         />
       </div>
       <Reveal open={limited}>
         <div className="mt-3 flex items-center justify-between gap-4">
-          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">turns per run</span>
+          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">rounds</span>
           <Stepper
             value={limit ?? TALK_TURNS_DEFAULT}
             min={TALK_TURNS_MIN}
             max={TALK_TURNS_MAX}
             step={TALK_TURNS_STEP}
             onChange={(n) => void persist(clampTurns(n))}
-            ariaLabel="Sub-agent tool turns"
+            ariaLabel={stepperLabel}
           />
         </div>
       </Reveal>

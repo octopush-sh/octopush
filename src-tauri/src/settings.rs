@@ -40,8 +40,8 @@ pub struct AppSettings {
     pub editor_command: Option<String>,
 
     /// Tool-call rounds a single TALK turn may run before the engine asks the
-    /// model to close with what it has. `None` = the built-in default
-    /// (`chat_history::DEFAULT_TALK_MAX_ITERATIONS`); the engine clamps a set
+    /// model to close with what it has. `None` = **no limit** — the turn runs
+    /// until the model answers or the user stops it; the engine clamps a set
     /// value to the supported range.
     #[serde(default)]
     pub talk_max_iterations: Option<u32>,

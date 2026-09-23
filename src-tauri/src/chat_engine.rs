@@ -2655,8 +2655,9 @@ impl ChatEngine {
         let mut attributed: std::collections::HashSet<(String, i64)> =
             std::collections::HashSet::new();
 
-        // Tool-call rounds this turn may run: the saved "Tool turns per
-        // message" preference (Settings › General), clamped, or the default.
+        // Tool-call rounds this turn may run: the saved "Limit tool turns per
+        // message" preference (Settings › General), clamped — or, unset, no
+        // limit: the turn runs until the model answers or the user stops it.
         let saved_settings = crate::settings::load_settings().ok();
         let max_iterations = effective_talk_max_iterations(
             saved_settings.as_ref().and_then(|s| s.talk_max_iterations),
@@ -2669,7 +2670,7 @@ impl ChatEngine {
         );
 
         // ─── Agentic loop ─────────────────────────────────────────
-        for iteration in 0..max_iterations {
+        for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
             // Stop cleanly if the user cancelled this turn (checked here and
             // after each tool — the in-flight request itself isn't aborted).
             if cancel.load(Ordering::Relaxed) {
@@ -3381,8 +3382,14 @@ impl ChatEngine {
             effort: None,
             cache: true,
         };
+        // Only reachable with a configured limit (an unlimited loop never
+        // exhausts); the wording names it.
+        let limit = match max_iterations {
+            Some(n) => format!("{n}-turn tool limit"),
+            None => "tool-turn limit".to_string(),
+        };
         tracing::info!(
-            max_iterations,
+            max_iterations = ?max_iterations,
             "agentic loop: iteration cap reached — asking the model to close with what it has"
         );
         match provider
@@ -3421,8 +3428,8 @@ impl ChatEngine {
                         &request.model,
                         &TurnUsage::default(),
                         &format!(
-                            "Reached the {max_iterations}-turn tool limit — answered with what it had. \
-                             Say \"continue\" to pick up where it left off, or raise the limit in Settings › General."
+                            "Reached the {limit} — answered with what it had. \
+                             Say \"continue\" to pick up where it left off, or raise or switch off the limit in Settings › General."
                         ),
                     )?;
                     return Ok(());
@@ -3435,8 +3442,8 @@ impl ChatEngine {
         }
 
         let loop_err = AppError::Other(format!(
-            "Stopped at the {max_iterations}-turn tool limit before finishing. Say \"continue\" to \
-             pick up where it left off, or raise the limit in Settings › General."
+            "Stopped at the {limit} before finishing. Say \"continue\" to \
+             pick up where it left off, or raise or switch off the limit in Settings › General."
         ));
         // Persist the error so it survives a relaunch.
         let error_text = format!("{loop_err}");

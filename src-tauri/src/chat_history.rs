@@ -20,22 +20,18 @@
 //! errors live) that names its message id, so the model can pull the full
 //! stored output back on demand with the `recall_tool_output` tool.
 
-/// Tool-call rounds a single TALK turn may run when no preference is saved.
-pub const DEFAULT_TALK_MAX_ITERATIONS: usize = 25;
 /// Lowest value the "Tool turns per message" preference may take.
 pub const TALK_MAX_ITERATIONS_MIN: usize = 5;
 /// Highest value the "Tool turns per message" preference may take.
 pub const TALK_MAX_ITERATIONS_MAX: usize = 200;
 
 /// Resolve the saved "Tool turns per message" preference into the loop bound
-/// `send_agentic` runs with: unset → the default, set → clamped to the
-/// supported range (a hand-edited settings.json can't produce a zero-turn or
-/// runaway loop).
-pub fn effective_talk_max_iterations(setting: Option<u32>) -> usize {
-    match setting {
-        Some(n) => (n as usize).clamp(TALK_MAX_ITERATIONS_MIN, TALK_MAX_ITERATIONS_MAX),
-        None => DEFAULT_TALK_MAX_ITERATIONS,
-    }
+/// `send_agentic` runs with: unset (the default) → **no limit**, the turn
+/// runs until the model answers or the user stops it; set → clamped to the
+/// supported range (a hand-edited settings.json can't produce a zero-turn
+/// loop).
+pub fn effective_talk_max_iterations(setting: Option<u32>) -> Option<usize> {
+    setting.map(|n| (n as usize).clamp(TALK_MAX_ITERATIONS_MIN, TALK_MAX_ITERATIONS_MAX))
 }
 
 /// The saved "Sub-agent tool turns" preference as the bound a sub-agent runs
@@ -399,10 +395,10 @@ mod tests {
 
     #[test]
     fn max_iterations_defaults_and_clamps() {
-        assert_eq!(effective_talk_max_iterations(None), DEFAULT_TALK_MAX_ITERATIONS);
-        assert_eq!(effective_talk_max_iterations(Some(60)), 60);
-        assert_eq!(effective_talk_max_iterations(Some(0)), TALK_MAX_ITERATIONS_MIN);
-        assert_eq!(effective_talk_max_iterations(Some(10_000)), TALK_MAX_ITERATIONS_MAX);
+        assert_eq!(effective_talk_max_iterations(None), None, "unset = no limit");
+        assert_eq!(effective_talk_max_iterations(Some(60)), Some(60));
+        assert_eq!(effective_talk_max_iterations(Some(0)), Some(TALK_MAX_ITERATIONS_MIN));
+        assert_eq!(effective_talk_max_iterations(Some(10_000)), Some(TALK_MAX_ITERATIONS_MAX));
     }
 
     #[test]
