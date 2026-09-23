@@ -40,17 +40,18 @@ pub struct AppSettings {
     pub editor_command: Option<String>,
 
     /// Tool-call rounds a single TALK turn may run before the engine asks the
-    /// model to close with what it has. `None` = the built-in default
-    /// (`chat_history::DEFAULT_TALK_MAX_ITERATIONS`); the engine clamps a set
+    /// model to close with what it has. `None` = **no limit** — the turn runs
+    /// until the model answers or the user stops it; the engine clamps a set
     /// value to the supported range.
     #[serde(default)]
     pub talk_max_iterations: Option<u32>,
 
     /// Tool-call rounds one sub-agent run may take (Settings › General ›
-    /// "Sub-agent tool turns"). `None` = the built-in default
-    /// (`chat_history::DEFAULT_SUBAGENT_MAX_ITERATIONS`); a definition's own
-    /// `max-turns` never exceeds it. Independent of `talk_max_iterations`: a
-    /// director's rounds and a sub-agent's are different budgets.
+    /// "Limit sub-agent tool turns"). `None` = **no limit** — a sub-agent
+    /// runs until it finishes or is stopped; a set value is clamped like the
+    /// Talk turns and a definition's own `max-turns` never exceeds it.
+    /// Independent of `talk_max_iterations`: a director's rounds and a
+    /// sub-agent's are different budgets.
     #[serde(default)]
     pub subagent_max_turns: Option<u32>,
 

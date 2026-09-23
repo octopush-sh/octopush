@@ -117,7 +117,6 @@ describe("CompanionContext", () => {
           unstaged={0}
           toolCalls={0}
           workspaceId="ws"
-          activeSkill="release"
           mcpServers={["jira"]}
           budgets={[{ id: "b", scopeType: "global", scopeId: "", period: "daily", limitUsd: 10, createdAt: "" } as never]}
           spend={{ "global::daily": { costUsd: 2.5 } as never }}
@@ -125,7 +124,6 @@ describe("CompanionContext", () => {
       );
     });
     expect(screen.getByText("can use")).toBeInTheDocument();
-    expect(screen.getByText("release")).toBeInTheDocument();
     expect(screen.getByText("jira")).toBeInTheDocument();
     expect(screen.getByText("budget · today")).toBeInTheDocument();
     expect(screen.getByText("$2.50 / $10.00")).toBeInTheDocument();
@@ -177,7 +175,7 @@ describe("CompanionContext — budgets, capabilities, rows", () => {
     expect(screen.getByText("250k / 1M")).toBeInTheDocument();
   });
 
-  it("omits the capabilities row when there is no skill and no MCP server", async () => {
+  it("omits the capabilities row when there is no MCP server", async () => {
     await act(async () => {
       render(<CompanionContext {...baseProps} />);
     });

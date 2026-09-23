@@ -69,27 +69,47 @@ export function ToggleRow({
           </div>
         )}
       </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        data-testid={testId}
-        onClick={() => onChange(!checked)}
-        className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
-        style={{
-          background: checked ? "var(--brass-ghost)" : "var(--color-octo-onyx)",
-          border: `1px solid ${checked ? "var(--brass-dim)" : "var(--color-octo-border-strong)"}`,
-        }}
-      >
-        <span
-          className="absolute top-[2px] h-3.5 w-3.5 rounded-full transition-all"
-          style={{
-            left: checked ? "18px" : "3px",
-            background: checked ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
-          }}
-        />
-      </button>
+      <Switch checked={checked} onChange={onChange} testId={testId} />
     </label>
+  );
+}
+
+/** The settings switch on its own — for a row that needs more than a label
+ *  beside it (a control that reveals under the switch). Inside a `<label>`
+ *  the label text toggles it; elsewhere pass `ariaLabel`. */
+export function Switch({
+  checked,
+  onChange,
+  testId,
+  ariaLabel,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  testId?: string;
+  ariaLabel?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      data-testid={testId}
+      onClick={() => onChange(!checked)}
+      className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
+      style={{
+        background: checked ? "var(--brass-ghost)" : "var(--color-octo-onyx)",
+        border: `1px solid ${checked ? "var(--brass-dim)" : "var(--color-octo-border-strong)"}`,
+      }}
+    >
+      <span
+        className="absolute top-[2px] h-3.5 w-3.5 rounded-full transition-all"
+        style={{
+          left: checked ? "18px" : "3px",
+          background: checked ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
+        }}
+      />
+    </button>
   );
 }
 

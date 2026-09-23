@@ -1125,10 +1125,6 @@ function App() {
   const streamingThreadId = useChatStore((s) =>
     activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
   );
-  // Active skill for the conversation — surfaced in Context "Capabilities".
-  const activeSkill = useChatStore((s) =>
-    activeWorkspaceId ? (s.activeSkillByWs[activeWorkspaceId] ?? null) : null,
-  );
   // Connected MCP servers for the workspace — also shown under Capabilities.
   const [mcpServers, setMcpServers] = useState<string[]>([]);
   useEffect(() => {
@@ -1219,7 +1215,6 @@ function App() {
       toolCalls: liveToolCalls,
       budgets,
       spend,
-      activeSkill,
       mcpServers,
       onReviewClick: () => setMode("review"),
       onSettingsClick: () => setSettingsTab("usage"),
@@ -1231,7 +1226,6 @@ function App() {
     liveToolCalls,
     budgets,
     spend,
-    activeSkill,
     mcpServers,
     setMode,
   ]);

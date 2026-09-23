@@ -66,6 +66,7 @@ export function ChatCanvas({
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
   const respondApproval = useChatStore((s) => s.respondApproval);
   const pendingCaps = useChatStore((s) => s.getPendingCaps(workspaceId));
+  const skillNames = useChatStore((s) => s.getSkillNames(workspaceId));
   const respondSubagentCap = useChatStore((s) => s.respondSubagentCap);
   const regenerate = useChatStore((s) => s.regenerate);
   const editAndResend = useChatStore((s) => s.editAndResend);
@@ -240,6 +241,7 @@ export function ChatCanvas({
               <MessageRow
                 key={item.message.id}
                 message={item.message}
+                skillNames={skillNames}
                 onOpenInEditor={onOpenInEditor}
                 onRegenerate={
                   item.message.role === "assistant" && item.message.id === lastAssistantId
@@ -372,12 +374,14 @@ export function ChatCanvas({
  */
 function MessageRow({
   message,
+  skillNames,
   onOpenInEditor,
   onRegenerate,
   onEdit,
   disabled,
 }: {
   message: StoredMessage;
+  skillNames?: string[];
   onOpenInEditor?: (path: string) => void;
   onRegenerate?: (id: number) => void;
   onEdit?: (id: number, newContent: string) => void;
@@ -441,7 +445,7 @@ function MessageRow({
   return (
     <div className="group/msg relative">
       <div ref={ref}>
-        <ChatMessage message={message} onOpenInEditor={onOpenInEditor} />
+        <ChatMessage message={message} onOpenInEditor={onOpenInEditor} skillNames={skillNames} />
       </div>
       <div className="absolute -top-1 right-0 flex items-center gap-0.5 opacity-0 transition group-hover/msg:opacity-100 focus-within:opacity-100">
         {onEdit && (

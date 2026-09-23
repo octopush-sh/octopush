@@ -108,3 +108,45 @@ describe("usageFooter — the honest turn figure", () => {
     expect(usageFooter({ role: "assistant", content: "x", inputTokens: 10, outputTokens: 5, costUsd: 0 })).toBe("10 in · 5 out");
   });
 });
+
+describe("user message — skills invoked with it", () => {
+  it("renders a known /skill token as a brass chip and leaves the rest as text", () => {
+    render(
+      <ChatMessage
+        message={{ role: "user", content: "run /release and src/release now" }}
+        skillNames={["release"]}
+      />,
+    );
+    const chips = screen.getAllByTestId("skill-chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent("/release");
+    expect(chips[0]).toHaveAttribute("title", "Skill invoked with this message: release");
+  });
+
+  it("renders several chips in order and keeps a sentence-ending period out of the chip", () => {
+    render(
+      <ChatMessage
+        message={{ role: "user", content: "/code-review this, then /release." }}
+        skillNames={["code-review", "release"]}
+      />,
+    );
+    const chips = screen.getAllByTestId("skill-chip");
+    expect(chips.map((c) => c.textContent)).toEqual(["/code-review", "/release"]);
+  });
+
+  it("paints no chip inside a fenced block — pasted file content is not an invocation", () => {
+    render(
+      <ChatMessage
+        message={{ role: "user", content: "summarise\n\nCHANGELOG.md\n```\nrun /release first\n```" }}
+        skillNames={["release"]}
+      />,
+    );
+    expect(screen.queryByTestId("skill-chip")).toBeNull();
+  });
+
+  it("renders plain text when no skill names are known", () => {
+    render(<ChatMessage message={{ role: "user", content: "run /release" }} />);
+    expect(screen.queryByTestId("skill-chip")).toBeNull();
+    expect(screen.getByText("run /release")).toBeInTheDocument();
+  });
+});

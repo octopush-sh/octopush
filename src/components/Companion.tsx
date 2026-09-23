@@ -30,7 +30,6 @@ interface ContextProps {
   toolCalls: number;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  activeSkill?: string | null;
   mcpServers?: string[];
   onReviewClick?: () => void;
   onSettingsClick?: () => void;

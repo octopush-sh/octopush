@@ -146,8 +146,12 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
-    /// Optional skill name — its SKILL.md body is appended to the system prompt
-    /// and, if it declares `allowed-tools`, the turn's tool set is restricted.
+    /// Legacy: a skill name pinned to the conversation. The composer no
+    /// longer sends one — skills are invoked per message as `/name` tokens in
+    /// the text, resolved against the worktree's skills when the turn runs.
+    /// A pinned name is still honored as if the message had named it: its
+    /// SKILL.md body joins the system prompt and its `allowed-tools` the
+    /// turn's tool filter.
     #[serde(default)]
     pub skill: Option<String>,
     /// Inline image attachments for THIS turn (base64). Sent as multimodal
@@ -586,7 +590,7 @@ impl CapGate {
     pub fn respond(&self, call_id: &str, extra_turns: Option<usize>) {
         if let Some((_ev, tx)) = self.pending.lock().remove(call_id) {
             let _ = tx.send(match extra_turns {
-                Some(n) => CapAnswer::More(n.clamp(1, CONTINUE_MAX_TURNS)),
+                Some(n) => CapAnswer::More(n.max(1)),
                 None => CapAnswer::Accept,
             });
         }
@@ -1541,18 +1545,18 @@ pub fn subagent_origin(call_id: &str) -> String {
     format!("subagent:{call_id}")
 }
 
-/// How many more tool turns a continuation may take: at least one, never
-/// more than the hard ceiling (a runaway continuation would cost as much
-/// as the run it extends).
-pub const CONTINUE_MAX_TURNS: usize = 50;
-
 /// The note that resumes a run cut at its turn cap (or stopped), with or
-/// without a word from the user. Pure so the wording is tested.
-pub fn continuation_note(instruction: Option<&str>, extra_turns: usize) -> String {
+/// without a word from the user. `extra_turns` `None` = no turn limit on
+/// the continuation. Pure so the wording is tested.
+pub fn continuation_note(instruction: Option<&str>, extra_turns: Option<usize>) -> String {
+    let budget = match extra_turns {
+        Some(1) => "You have 1 more tool turn".to_string(),
+        Some(n) => format!("You have {n} more tool turns"),
+        None => "You have no turn limit — take the tool turns the work needs".to_string(),
+    };
     let turns = format!(
-        "You have {extra_turns} more tool turn{} — continue exactly where you left off, do \
-         not redo work already done, and write your final report when finished.",
-        if extra_turns == 1 { "" } else { "s" }
+        "{budget} — continue exactly where you left off, do \
+         not redo work already done, and write your final report when finished."
     );
     match instruction.map(str::trim).filter(|t| !t.is_empty()) {
         Some(text) => format!("A message from the user: {text}\n\n{turns}"),
@@ -1986,9 +1990,11 @@ impl ChatEngine {
         app: AppHandle,
         call_id: String,
         instruction: Option<String>,
-        extra_turns: usize,
+        extra_turns: Option<usize>,
     ) -> AppResult<()> {
-        let extra_turns = extra_turns.clamp(1, CONTINUE_MAX_TURNS);
+        // `None` = no turn limit (the default everywhere for a sub-agent); a
+        // number the user picked is honored as is, at least one.
+        let extra_turns = extra_turns.map(|n| n.max(1));
         // One continuation per run at a time: a second click while the first
         // runs would race on the row and lose one run's figures.
         if !self.continuing.lock().insert(call_id.clone()) {
@@ -2103,10 +2109,14 @@ impl ChatEngine {
         });
         let label = spec.call.description.trim();
         let note = format!(
-            "Sub-agent “{}” {} {extra_turns} more turn{} — its report was updated.",
+            "Sub-agent “{}” {} {} — its report was updated.",
             if label.is_empty() { "Agent" } else { label },
             if instruction.as_deref().is_some_and(|t| !t.trim().is_empty()) { "was answered and given" } else { "was given" },
-            if extra_turns == 1 { "" } else { "s" },
+            match extra_turns {
+                Some(1) => "1 more turn".to_string(),
+                Some(n) => format!("{n} more turns"),
+                None => "the turns it needed".to_string(),
+            },
         );
         self.insert_and_emit_message(
             &app,
@@ -2536,31 +2546,54 @@ impl ChatEngine {
 
         let mut tools = build_llm_tools();
 
-        // ── Active skill ──────────────────────────────────────────
-        // A selected skill appends its SKILL.md body to the system prompt and,
-        // if it declares `allowed-tools`, restricts this turn's tool set.
-        if let Some(skill_name) = request.skill.as_deref() {
-            if let Some(skill) = crate::skills::load_skill(&workspace_path, skill_name) {
-                system_prompt.push_str(&format!(
-                    "\n\n# Active skill: {}\n{}",
-                    skill.name, skill.body
-                ));
-                if let Some(allowed) = &skill.allowed_tools {
-                    let filtered: Vec<LlmTool> = tools
-                        .iter()
-                        .filter(|t| allowed.iter().any(|a| a == &t.name))
-                        .cloned()
-                        .collect();
-                    // A typo'd / unknown tool name would otherwise empty the set
-                    // and silently disable the agent — keep all tools + warn.
-                    if filtered.is_empty() {
-                        tracing::warn!(
-                            skill = %skill.name,
-                            "skill allowed-tools matched no known tools; keeping the full tool set"
-                        );
-                    } else {
-                        tools = filtered;
-                    }
+        // ── Skills invoked by this message ───────────────────────
+        // A message names the skills it wants as `/name` tokens (several,
+        // anywhere in the text); each one's SKILL.md body is appended to the
+        // system prompt FOR THIS TURN only — nothing is pinned to the
+        // conversation, so a skill never rides on later messages unasked. The
+        // tokens are resolved against the worktree's known skills, so prose
+        // (`src/lib`, `and/or`) can never invoke one. On a regenerate the
+        // message is the last user row, the same as on a fresh send.
+        let turn_text: String = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| request.user_message.clone());
+        let mut invoked = crate::skills::referenced_skills(&workspace_path, &turn_text);
+        if let Some(pinned) = request.skill.as_deref() {
+            if !invoked.iter().any(|s| s.name == pinned) {
+                if let Some(skill) = crate::skills::load_skill(&workspace_path, pinned) {
+                    invoked.push(skill);
+                }
+            }
+        }
+        if !invoked.is_empty() {
+            system_prompt.push_str(&crate::skills::skill_prompt_section(&invoked));
+            // `allowed-tools`: the union across the invoked skills; a skill
+            // that declares none opens the full set for the turn.
+            let (allowed, open): (Vec<&Vec<String>>, bool) = invoked.iter().fold((Vec::new(), false), |(mut v, open), s| {
+                match &s.allowed_tools {
+                    Some(a) => v.push(a),
+                    None => return (v, true),
+                }
+                (v, open)
+            });
+            if !open && !allowed.is_empty() {
+                let filtered: Vec<LlmTool> = tools
+                    .iter()
+                    .filter(|t| allowed.iter().any(|list| list.iter().any(|a| a == &t.name)))
+                    .cloned()
+                    .collect();
+                // A typo'd / unknown tool name would otherwise empty the set
+                // and silently disable the agent — keep all tools + warn.
+                if filtered.is_empty() {
+                    tracing::warn!(
+                        skills = ?invoked.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                        "skill allowed-tools matched no known tools; keeping the full tool set"
+                    );
+                } else {
+                    tools = filtered;
                 }
             }
         }
@@ -2622,20 +2655,22 @@ impl ChatEngine {
         let mut attributed: std::collections::HashSet<(String, i64)> =
             std::collections::HashSet::new();
 
-        // Tool-call rounds this turn may run: the saved "Tool turns per
-        // message" preference (Settings › General), clamped, or the default.
+        // Tool-call rounds this turn may run: the saved "Limit tool turns per
+        // message" preference (Settings › General), clamped — or, unset, no
+        // limit: the turn runs until the model answers or the user stops it.
         let saved_settings = crate::settings::load_settings().ok();
         let max_iterations = effective_talk_max_iterations(
             saved_settings.as_ref().and_then(|s| s.talk_max_iterations),
         );
-        // Sub-agents have their own budget (Settings › General › "Sub-agent
-        // tool turns"); a definition's `max-turns` applies under it.
+        // Sub-agents have no turn limit unless one is configured (Settings ›
+        // General › "Limit sub-agent tool turns", or a definition's own
+        // `max-turns`, which applies under a set preference).
         let subagent_cap = effective_subagent_max_iterations(
             saved_settings.as_ref().and_then(|s| s.subagent_max_turns),
         );
 
         // ─── Agentic loop ─────────────────────────────────────────
-        for iteration in 0..max_iterations {
+        for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
             // Stop cleanly if the user cancelled this turn (checked here and
             // after each tool — the in-flight request itself isn't aborted).
             if cancel.load(Ordering::Relaxed) {
@@ -3347,8 +3382,14 @@ impl ChatEngine {
             effort: None,
             cache: true,
         };
+        // Only reachable with a configured limit (an unlimited loop never
+        // exhausts); the wording names it.
+        let limit = match max_iterations {
+            Some(n) => format!("{n}-turn tool limit"),
+            None => "tool-turn limit".to_string(),
+        };
         tracing::info!(
-            max_iterations,
+            max_iterations = ?max_iterations,
             "agentic loop: iteration cap reached — asking the model to close with what it has"
         );
         match provider
@@ -3387,8 +3428,8 @@ impl ChatEngine {
                         &request.model,
                         &TurnUsage::default(),
                         &format!(
-                            "Reached the {max_iterations}-turn tool limit — answered with what it had. \
-                             Say \"continue\" to pick up where it left off, or raise the limit in Settings › General."
+                            "Reached the {limit} — answered with what it had. \
+                             Say \"continue\" to pick up where it left off, or raise or switch off the limit in Settings › General."
                         ),
                     )?;
                     return Ok(());
@@ -3401,8 +3442,8 @@ impl ChatEngine {
         }
 
         let loop_err = AppError::Other(format!(
-            "Stopped at the {max_iterations}-turn tool limit before finishing. Say \"continue\" to \
-             pick up where it left off, or raise the limit in Settings › General."
+            "Stopped at the {limit} before finishing. Say \"continue\" to \
+             pick up where it left off, or raise or switch off the limit in Settings › General."
         ));
         // Persist the error so it survives a relaunch.
         let error_text = format!("{loop_err}");
@@ -3459,14 +3500,17 @@ mod continuation_tests {
 
     #[test]
     fn continuation_note_carries_the_turn_budget_and_the_users_words() {
-        let plain = continuation_note(None, 15);
+        let plain = continuation_note(None, Some(15));
         assert!(plain.starts_with("You have 15 more tool turns"), "{plain}");
         assert!(plain.contains("do not redo work already done"));
-        let one = continuation_note(Some("  "), 1);
+        let one = continuation_note(Some("  "), Some(1));
         assert!(one.starts_with("You have 1 more tool turn —"), "{one}");
-        let answered = continuation_note(Some("Use the staging DB."), 5);
+        let answered = continuation_note(Some("Use the staging DB."), Some(5));
         assert!(answered.starts_with("A message from the user: Use the staging DB.\n\n"), "{answered}");
         assert!(answered.contains("You have 5 more tool turns"));
+        let open = continuation_note(None, None);
+        assert!(open.starts_with("You have no turn limit"), "{open}");
+        assert!(open.contains("continue exactly where you left off"));
     }
 
     #[test]

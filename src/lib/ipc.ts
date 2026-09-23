@@ -659,7 +659,6 @@ export const ipc = {
     userMessage: string;
     system?: string;
     maxTokens: number;
-    skill?: string;
     attachments?: { mediaType: string; data: string }[];
     /** Re-run without inserting a new user row (history already ends with it). */
     regenerate?: boolean;
@@ -672,7 +671,8 @@ export const ipc = {
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */
-  continueSubagent: (callId: string, instruction: string | null, extraTurns: number) =>
+  /** `extraTurns` null = no turn limit on the continuation. */
+  continueSubagent: (callId: string, instruction: string | null, extraTurns: number | null) =>
     invoke<void>("continue_subagent", { callId, instruction, extraTurns }),
   /** Delete a message and everything after it (Regenerate / Edit-and-resend). */
   truncateChatAfter: (threadId: string, messageId: number) =>

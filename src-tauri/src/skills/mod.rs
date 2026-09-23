@@ -177,25 +177,47 @@ pub fn load_skill(worktree: &Path, name: &str) -> Option<Skill> {
 /// The skills a piece of prose names with a `/slug` token, in the order they
 /// first appear, deduped.
 ///
-/// DIRECT has no per-run "active skill" field the way a TALK turn does — the
-/// brief is the only channel the director has. So a reference has to survive as
-/// text and be resolved when the stage actually runs, which is also what makes
-/// it robust: a hand-typed `/code-review` works exactly like one inserted from
-/// the picker.
+/// Both TALK and DIRECT resolve skills this way: a reference is text, kept
+/// with the message or brief it was written in, and resolved when the turn
+/// or stage actually runs. That is also what makes it robust: a hand-typed
+/// `/code-review` works exactly like one inserted from the picker, and a
+/// message carries exactly the skills it names — nothing is pinned.
 ///
 /// Matching is against the worktree's KNOWN skills only, so ordinary prose
 /// (a path like `src/lib`, a date, `and/or`) can never be mistaken for a
 /// reference. The token must also stand alone — `/code-review` matches,
-/// `/code-review-notes` and `x/code-review` do not.
+/// `/code-review-notes` and `x/code-review` do not — and fenced code is
+/// never searched (an `@file` expansion pastes the file as a fenced block;
+/// a CHANGELOG line saying "run /release" must not invoke the skill).
 pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
     let known = scan_skills(worktree);
+    let prose = outside_fences(text);
     let mut out: Vec<Skill> = Vec::new();
     for skill in known {
         if out.iter().any(|s| s.name == skill.name) {
             continue;
         }
-        if mentions_skill(text, &skill.name) {
+        if mentions_skill(&prose, &skill.name) {
             out.push(skill);
+        }
+    }
+    out
+}
+
+/// The text with every fenced code block (``` … ```, fence lines included)
+/// removed; an unclosed fence runs to the end. Mirrors `fencedRanges` in
+/// `src/lib/skillMentions.ts`, so the composer highlights exactly what the
+/// backend will invoke.
+fn outside_fences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            out.push_str(line);
         }
     }
     out
@@ -218,8 +240,14 @@ fn mentions_skill(text: &str, name: &str) -> bool {
         let end = start + needle.len();
         // The slash must not be glued to a preceding word (a path segment)…
         let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word_char(c));
-        // …and the name must end the token.
-        let after_ok = text[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        // …and the name must end the token — a sentence-ending period does
+        // not continue it (`/release.` invokes; `/release.md` does not).
+        let mut rest = text[end..].chars();
+        let after_ok = match rest.next() {
+            None => true,
+            Some('.') => rest.next().is_none_or(|c| !is_word_char(c)),
+            Some(c) => !is_word_char(c),
+        };
         if before_ok && after_ok {
             return true;
         }
@@ -228,13 +256,13 @@ fn mentions_skill(text: &str, name: &str) -> bool {
     false
 }
 
-/// The section appended to a stage's system prompt for each skill the brief
-/// named. Same shape TALK uses for its active skill, so an agent meets the
-/// instructions in a form it has already been trained on in this app.
+/// The section appended to a system prompt for each skill a message or brief
+/// named — the one shape TALK and DIRECT share, so an agent meets the
+/// instructions in the same form on both substrates.
 pub fn skill_prompt_section(skills: &[Skill]) -> String {
     let mut out = String::new();
     for skill in skills {
-        out.push_str(&format!("\n\n# Active skill: {}\n{}", skill.name, skill.body));
+        out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
     }
     out
 }
@@ -305,6 +333,33 @@ mod tests {
     }
 
     #[test]
+    fn a_sentence_ending_period_closes_the_token_but_an_extension_does_not() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "release", "b");
+        for text in ["then /release.", "then /release.\nnext line", "(/release), /release? /release,"] {
+            assert_eq!(referenced_skills(tmp.path(), text).len(), 1, "should invoke: {text}");
+        }
+        for text in ["open /release.md", "see /release..notes", "/release.v2"] {
+            assert!(referenced_skills(tmp.path(), text).is_empty(), "false positive for: {text}");
+        }
+    }
+
+    #[test]
+    fn fenced_code_is_content_not_an_invocation() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "release", "b");
+        // An `@file` expansion: the prose names nothing, the file does.
+        let pasted = "summarise this\n\nCHANGELOG.md\n```\nrun /release before tagging\n```";
+        assert!(referenced_skills(tmp.path(), pasted).is_empty());
+        // The same token in the prose still invokes.
+        let both = "/release this\n\n```\nrun /release before tagging\n```";
+        assert_eq!(referenced_skills(tmp.path(), both).len(), 1);
+        // An unclosed fence runs to the end.
+        assert!(referenced_skills(tmp.path(), "```\n/release").is_empty());
+        assert_eq!(outside_fences("a\n```\nb\n```\nc"), "a\nc");
+    }
+
+    #[test]
     fn a_skill_named_twice_is_carried_once() {
         let tmp = tempfile::tempdir().expect("tmp");
         write_skill(tmp.path(), "simplify", "b");
@@ -313,11 +368,11 @@ mod tests {
     }
 
     #[test]
-    fn skill_section_is_the_shape_talk_uses() {
+    fn skill_section_is_the_shape_both_substrates_use() {
         let tmp = tempfile::tempdir().expect("tmp");
         write_skill(tmp.path(), "code-review", "Review like a hawk.");
         let section = skill_prompt_section(&referenced_skills(tmp.path(), "/code-review"));
-        assert!(section.contains("# Active skill: code-review"));
+        assert!(section.contains("# Skill: code-review"));
         assert!(section.contains("Review like a hawk."));
     }
 

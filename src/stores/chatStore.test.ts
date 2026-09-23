@@ -62,7 +62,7 @@ function resetStore() {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
-    activeSkillByWs: {},
+    skillNamesByWs: {},
     attachmentsByWs: {},
   });
 }
@@ -436,13 +436,13 @@ describe("chatStore — stop + effort (P3)", () => {
     expect(ipc.cancelChat).toHaveBeenCalledWith("t1");
   });
 
-  it("send() passes the workspace's active skill (P6)", async () => {
-    useChatStore.getState().setActiveSkill("ws-1", "write-tests");
-    await useChatStore.getState().send("ws-1", "/tmp", "go");
-    expect(ipc.sendChatMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ skill: "write-tests" }),
-    );
-    expect(useChatStore.getState().getActiveSkill("ws-1")).toBe("write-tests");
+  it("send() pins no skill to the conversation — skills ride as /name tokens in the text", async () => {
+    useChatStore.getState().setSkillNames("ws-1", ["write-tests"]);
+    await useChatStore.getState().send("ws-1", "/tmp", "/write-tests for the parser");
+    const req = (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toBe("/write-tests for the parser");
+    expect("skill" in req).toBe(false);
+    expect(useChatStore.getState().getSkillNames("ws-1")).toEqual(["write-tests"]);
   });
 
   it("send() passes pending attachments then clears them (P7)", async () => {
