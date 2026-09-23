@@ -97,36 +97,50 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const [skills, setSkills] = useState<SkillMeta[]>([]);
   const skillNames = useMemo(() => skills.map((s) => s.name), [skills]);
   const [slash, setSlash] = useState<{ query: string; start: number; caret: number } | null>(null);
-  const [slashItems, setSlashItems] = useState<SkillMeta[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
   const slashOpen = slash !== null;
-  useEffect(() => {
-    let cancelled = false;
+  // The menu's rows follow the catalog live: a reload that lands while the
+  // menu is open fills it, and the highlight, the chips and the backend all
+  // read the same list.
+  const slashItems = useMemo(() => {
+    if (!slash) return [];
+    const q = slash.query.toLowerCase();
+    return q ? skills.filter((s) => s.name.toLowerCase().includes(q)) : skills;
+  }, [slash, skills]);
+  // The backend rescans the worktree on every turn, so the composer's list
+  // is refreshed whenever the menu opens (and once per workspace) — the
+  // highlight is the user's only signal of what will be invoked.
+  const skillsReqRef = useRef(0);
+  const reloadSkills = useCallback(() => {
+    const req = ++skillsReqRef.current;
     ipc
       .listSkills(workspacePath)
       .then((s) => {
-        if (cancelled) return;
+        if (req !== skillsReqRef.current) return;
         setSkills(s);
         // The thread's sent messages read their `/name` tokens as chips too.
         setSkillNames(workspaceId, s.map((k) => k.name));
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
   }, [workspacePath, workspaceId, setSkillNames]);
+  useEffect(() => {
+    reloadSkills();
+    return () => {
+      skillsReqRef.current++;
+    };
+  }, [reloadSkills]);
 
   function closeSlash() {
     setSlash(null);
-    setSlashItems([]);
     setSlashIndex(0);
   }
 
   /** The `/query` left of the caret opens the skill menu (filtered by the
    *  query) — at line start or after whitespace, anywhere in the message. A
-   *  `$`-direct command line never does. */
+   *  `$`-direct command line never does, and a query that matches no skill
+   *  closes it (a `/etc` mid-sentence is prose, not a request). */
   function refreshSlash(value: string, caret: number) {
-    if (value.trimStart().startsWith("$")) {
+    if (/^\s*\$(\s|$)/.test(value)) {
       closeSlash();
       return;
     }
@@ -136,11 +150,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       return;
     }
     const q = m.query.toLowerCase();
-    const items = q ? skills.filter((s) => s.name.toLowerCase().includes(q)) : skills;
+    if (q && !skills.some((s) => s.name.toLowerCase().includes(q))) {
+      closeSlash();
+      return;
+    }
     closeMention();
     closeCmdHist();
+    if (!slash) reloadSkills();
     setSlash({ ...m, caret });
-    setSlashItems(items);
     setSlashIndex(0);
   }
 
@@ -360,6 +377,18 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     refreshCmdHist(value);
   }
 
+  /** Keep the highlight backdrop on the textarea's grid: same scroll offset,
+   *  and the same right edge — a non-overlay scrollbar (WebKitGTK, WebView2,
+   *  "always show scroll bars") narrows the textarea's content box, so the
+   *  backdrop pads by that width or long lines would wrap one column apart. */
+  function syncHighlight(ta: HTMLTextAreaElement) {
+    const hl = highlightRef.current;
+    if (!hl) return;
+    hl.scrollTop = ta.scrollTop;
+    const gutter = Math.max(0, ta.offsetWidth - ta.clientWidth);
+    hl.style.paddingRight = gutter > 0 ? `calc(1rem + ${gutter}px)` : "";
+  }
+
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const val = e.target.value;
     setInput(val);
@@ -371,6 +400,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     const lineHeight = 20;
     const maxHeight = lineHeight * 8 + 24;
     ta.style.height = `${Math.min(ta.scrollHeight, maxHeight)}px`;
+    syncHighlight(ta);
   }
 
   const handleSend = useCallback(() => {
@@ -467,6 +497,11 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     }
 
     // ── Slash (skill) menu takes precedence while open ──
+    if (slashOpen && e.key === "Escape") {
+      e.preventDefault();
+      closeSlash();
+      return;
+    }
     if (slashOpen && slashItems.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -480,12 +515,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        selectSkill(slashItems[slashIndex]);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closeSlash();
+        selectSkill(slashItems[Math.min(slashIndex, slashItems.length - 1)]);
         return;
       }
     }
@@ -638,9 +668,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             const ta = e.currentTarget;
             runPopoverRefresh(ta.value, ta.selectionStart ?? ta.value.length);
           }}
-          onScroll={(e) => {
-            if (highlightRef.current) highlightRef.current.scrollTop = e.currentTarget.scrollTop;
-          }}
+          onScroll={(e) => syncHighlight(e.currentTarget)}
           // Recompute the mention on every caret move (click, ArrowLeft/Right,
           // Home/End) — not just on typing — so the popover closes when the
           // caret leaves the trigger and mention.caret never goes stale.

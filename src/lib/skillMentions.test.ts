@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   applySkillMention,
   extractSkillMentions,
+  fencedRanges,
   findActiveSkillMention,
   skillTokens,
   splitBySkillTokens,
@@ -44,8 +45,30 @@ describe("skillTokens / extractSkillMentions", () => {
 
   it("ignores unknown names, path segments, and longer words", () => {
     expect(extractSkillMentions("see src/release and /release-notes and /unknown", known)).toEqual([]);
-    expect(extractSkillMentions("and/or /release.", known)).toEqual(["release"]);
+    expect(extractSkillMentions("open /release.md or /release.v2", known)).toEqual([]);
     expect(extractSkillMentions("/release", [])).toEqual([]);
+  });
+
+  it("lets punctuation close a token — a sentence-ending period, a comma, brackets", () => {
+    expect(extractSkillMentions("and/or /release.", known)).toEqual(["release"]);
+    expect(skillTokens("then /release.\nnext", known)).toEqual([{ name: "release", start: 5, end: 13 }]);
+    expect(extractSkillMentions("(/release), /release? /release,", known)).toEqual(["release"]);
+  });
+
+  it("matches names that start with a non-letter, as the backend does", () => {
+    expect(extractSkillMentions("use /_internal and /.hidden", ["_internal", ".hidden"])).toEqual(["_internal", ".hidden"]);
+  });
+
+  it("never reads fenced code as an invocation — an @file expansion is content", () => {
+    const pasted = "summarise this\n\nCHANGELOG.md\n```\nrun /release before tagging\n```";
+    expect(fencedRanges(pasted)).toEqual([[29, pasted.length]]);
+    expect(extractSkillMentions(pasted, known)).toEqual([]);
+    expect(extractSkillMentions("/release this\n\n```\nrun /release before tagging\n```\nand /code-review", known)).toEqual([
+      "release",
+      "code-review",
+    ]);
+    // An unclosed fence runs to the end.
+    expect(extractSkillMentions("```\n/release", known)).toEqual([]);
   });
 
   it("splits a text into runs and tokens for rendering", () => {

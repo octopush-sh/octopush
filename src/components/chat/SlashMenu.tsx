@@ -16,8 +16,8 @@ interface Props {
 /**
  * `/`-triggered skill menu, anchored above the composer. Lists the worktree's
  * skills (project ∪ user SKILL.md). Purely presentational — keyboard nav lives
- * in the Composer (shared with the @file popover). Selecting a skill activates
- * it for subsequent turns until cleared.
+ * in the Composer (shared with the @file popover). Selecting a skill inserts a
+ * `/name` token into the message — it rides with that message only.
  */
 export function SlashMenu({ items, activeIndex, onSelect, onHover, placement = "up" }: Props) {
   return (

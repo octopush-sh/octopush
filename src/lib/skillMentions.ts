@@ -61,17 +61,43 @@ export interface SkillToken {
   end: number;
 }
 
+/** The `[start, end)` ranges of fenced code blocks (``` … ```), including
+ *  the fence lines. Text inside a fence is content, never an invocation:
+ *  an `@file` expansion pastes the file as a fenced block, and a
+ *  CHANGELOG line saying "run /release" must not invoke the skill. Mirrors
+ *  `skills::outside_fences` on the backend. */
+export function fencedRanges(text: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  let open: number | null = null;
+  const lineRe = /^[ \t]*```/gmu;
+  let m: RegExpExecArray | null;
+  while ((m = lineRe.exec(text)) !== null) {
+    const lineEnd = text.indexOf("\n", m.index);
+    if (open === null) {
+      open = m.index;
+    } else {
+      out.push([open, lineEnd === -1 ? text.length : lineEnd + 1]);
+      open = null;
+    }
+    lineRe.lastIndex = lineEnd === -1 ? text.length : lineEnd + 1;
+  }
+  if (open !== null) out.push([open, text.length]); // an unclosed fence runs to the end
+  return out;
+}
+
 /** Every standalone `/name` token whose name is a known skill, in text
- *  order. Drives both the composer's inline highlight and the sent
- *  message's chips. */
+ *  order — fenced code excluded. Drives both the composer's inline
+ *  highlight and the sent message's chips. */
 export function skillTokens(text: string, known: Iterable<string>): SkillToken[] {
   const names = new Set(known);
   if (names.size === 0) return [];
+  const fences = fencedRanges(text);
   const out: SkillToken[] = [];
-  const re = /\/([\p{L}\p{N}][\p{L}\p{N}\-_.]*)/gu;
+  const re = /\/([\p{L}\p{N}\-_.]+)/gu;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const start = m.index;
+    if (fences.some(([a, b]) => start >= a && start < b)) continue; // code, not an invocation
     // A trailing period is punctuation, not part of the name (`/release.`
     // ends a sentence; `/release.md` is a file and stays a longer word).
     const name = m[1].replace(/\.+$/, "");

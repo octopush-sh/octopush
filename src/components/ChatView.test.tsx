@@ -56,6 +56,7 @@ const { useChatStore } = await import("../stores/chatStore");
 const { ChatView } = await import("./ChatView");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useBudgetsStore, BUDGET_CAP_MSG } = await import("../stores/budgetsStore");
+const { ipc: ipcMock } = await import("../lib/ipc");
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 function resetStore() {
@@ -700,5 +701,77 @@ describe("ChatView — budget error and override", () => {
     expect(screen.queryByText(/Budget cap reached/i)).toBeNull();
     expect(screen.queryByText(/Override for this turn/i)).toBeNull();
     expect(screen.getByText(/Something went wrong/i)).toBeTruthy();
+  });
+});
+
+describe("ChatView — /skill menu and inline highlight", () => {
+  const skills = [
+    { name: "release", description: "Cut a release", source: "project" },
+    { name: "code-review", description: "Review the diff", source: "project" },
+  ];
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.listSkills).mockResolvedValue(skills);
+  });
+
+  function getTextarea() {
+    return screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+  }
+
+  /** Type `value` with the caret at its end. */
+  function type(ta: HTMLTextAreaElement, value: string) {
+    fireEvent.change(ta, { target: { value, selectionStart: value.length, selectionEnd: value.length } });
+  }
+
+  it("opens mid-sentence on a matching /query, inserts the token on Enter, and paints it inline", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    type(ta, "please /rel");
+    const menu = await screen.findByRole("listbox", { name: "Skills" });
+    expect(menu).toHaveTextContent("release");
+    expect(menu).not.toHaveTextContent("code-review");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("please /release ");
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+    // The token is painted in the sentence, not pinned anywhere.
+    expect(screen.getAllByTestId("skill-highlight").map((m) => m.textContent)).toEqual(["/release"]);
+    type(ta, "please /release and /code-review");
+    expect(screen.getAllByTestId("skill-highlight").map((m) => m.textContent)).toEqual(["/release", "/code-review"]);
+  });
+
+  it("stays closed for a query no skill matches, a path, and a $ command line; Escape dismisses it", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    type(ta, "see /etc");
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+    type(ta, "see src/rel");
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+    type(ta, "$ ls /rel");
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+    type(ta, "run /rel");
+    expect(await screen.findByRole("listbox", { name: "Skills" })).toBeInTheDocument();
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+  });
+
+  it("sends the tokens as plain text — no skill field, nothing pinned for the next message", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    await act(async () => {
+      type(ta, "/release this");
+      fireEvent.keyDown(ta, { key: "Enter" });
+      await Promise.resolve();
+    });
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toBe("/release this");
+    expect("skill" in req).toBe(false);
+    expect(ta.value).toBe("");
+    expect(screen.queryByTestId("skill-highlight")).toBeNull();
   });
 });

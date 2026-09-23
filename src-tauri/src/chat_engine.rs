@@ -146,11 +146,12 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
-    /// Legacy: a skill name pinned to the conversation. Skills are now invoked
-    /// per message as `/name` tokens in the text (resolved against the
-    /// worktree's skills when the turn runs); a pinned name is still honored
-    /// as if the message named it. Optional skill name — its SKILL.md body is appended to the system prompt
-    /// and, if it declares `allowed-tools`, the turn's tool set is restricted.
+    /// Legacy: a skill name pinned to the conversation. The composer no
+    /// longer sends one — skills are invoked per message as `/name` tokens in
+    /// the text, resolved against the worktree's skills when the turn runs.
+    /// A pinned name is still honored as if the message had named it: its
+    /// SKILL.md body joins the system prompt and its `allowed-tools` the
+    /// turn's tool filter.
     #[serde(default)]
     pub skill: Option<String>,
     /// Inline image attachments for THIS turn (base64). Sent as multimodal
@@ -2562,9 +2563,7 @@ impl ChatEngine {
             }
         }
         if !invoked.is_empty() {
-            for skill in &invoked {
-                system_prompt.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
-            }
+            system_prompt.push_str(&crate::skills::skill_prompt_section(&invoked));
             // `allowed-tools`: the union across the invoked skills; a skill
             // that declares none opens the full set for the turn.
             let (allowed, open): (Vec<&Vec<String>>, bool) = invoked.iter().fold((Vec::new(), false), |(mut v, open), s| {
