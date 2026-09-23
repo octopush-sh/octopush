@@ -68,7 +68,6 @@ function resetStore() {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
-    activeSkillByWs: {},
     attachmentsByWs: {},
   });
   useBudgetsStore.setState({

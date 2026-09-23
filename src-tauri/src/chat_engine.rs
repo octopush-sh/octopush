@@ -146,7 +146,10 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
-    /// Optional skill name — its SKILL.md body is appended to the system prompt
+    /// Legacy: a skill name pinned to the conversation. Skills are now invoked
+    /// per message as `/name` tokens in the text (resolved against the
+    /// worktree's skills when the turn runs); a pinned name is still honored
+    /// as if the message named it. Optional skill name — its SKILL.md body is appended to the system prompt
     /// and, if it declares `allowed-tools`, the turn's tool set is restricted.
     #[serde(default)]
     pub skill: Option<String>,
@@ -2536,31 +2539,56 @@ impl ChatEngine {
 
         let mut tools = build_llm_tools();
 
-        // ── Active skill ──────────────────────────────────────────
-        // A selected skill appends its SKILL.md body to the system prompt and,
-        // if it declares `allowed-tools`, restricts this turn's tool set.
-        if let Some(skill_name) = request.skill.as_deref() {
-            if let Some(skill) = crate::skills::load_skill(&workspace_path, skill_name) {
-                system_prompt.push_str(&format!(
-                    "\n\n# Active skill: {}\n{}",
-                    skill.name, skill.body
-                ));
-                if let Some(allowed) = &skill.allowed_tools {
-                    let filtered: Vec<LlmTool> = tools
-                        .iter()
-                        .filter(|t| allowed.iter().any(|a| a == &t.name))
-                        .cloned()
-                        .collect();
-                    // A typo'd / unknown tool name would otherwise empty the set
-                    // and silently disable the agent — keep all tools + warn.
-                    if filtered.is_empty() {
-                        tracing::warn!(
-                            skill = %skill.name,
-                            "skill allowed-tools matched no known tools; keeping the full tool set"
-                        );
-                    } else {
-                        tools = filtered;
-                    }
+        // ── Skills invoked by this message ───────────────────────
+        // A message names the skills it wants as `/name` tokens (several,
+        // anywhere in the text); each one's SKILL.md body is appended to the
+        // system prompt FOR THIS TURN only — nothing is pinned to the
+        // conversation, so a skill never rides on later messages unasked. The
+        // tokens are resolved against the worktree's known skills, so prose
+        // (`src/lib`, `and/or`) can never invoke one. On a regenerate the
+        // message is the last user row, the same as on a fresh send.
+        let turn_text: String = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| request.user_message.clone());
+        let mut invoked = crate::skills::referenced_skills(&workspace_path, &turn_text);
+        if let Some(pinned) = request.skill.as_deref() {
+            if !invoked.iter().any(|s| s.name == pinned) {
+                if let Some(skill) = crate::skills::load_skill(&workspace_path, pinned) {
+                    invoked.push(skill);
+                }
+            }
+        }
+        if !invoked.is_empty() {
+            for skill in &invoked {
+                system_prompt.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+            }
+            // `allowed-tools`: the union across the invoked skills; a skill
+            // that declares none opens the full set for the turn.
+            let (allowed, open): (Vec<&Vec<String>>, bool) = invoked.iter().fold((Vec::new(), false), |(mut v, open), s| {
+                match &s.allowed_tools {
+                    Some(a) => v.push(a),
+                    None => return (v, true),
+                }
+                (v, open)
+            });
+            if !open && !allowed.is_empty() {
+                let filtered: Vec<LlmTool> = tools
+                    .iter()
+                    .filter(|t| allowed.iter().any(|list| list.iter().any(|a| a == &t.name)))
+                    .cloned()
+                    .collect();
+                // A typo'd / unknown tool name would otherwise empty the set
+                // and silently disable the agent — keep all tools + warn.
+                if filtered.is_empty() {
+                    tracing::warn!(
+                        skills = ?invoked.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                        "skill allowed-tools matched no known tools; keeping the full tool set"
+                    );
+                } else {
+                    tools = filtered;
                 }
             }
         }

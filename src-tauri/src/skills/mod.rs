@@ -218,8 +218,14 @@ fn mentions_skill(text: &str, name: &str) -> bool {
         let end = start + needle.len();
         // The slash must not be glued to a preceding word (a path segment)…
         let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word_char(c));
-        // …and the name must end the token.
-        let after_ok = text[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        // …and the name must end the token — a sentence-ending period does
+        // not continue it (`/release.` invokes; `/release.md` does not).
+        let mut rest = text[end..].chars();
+        let after_ok = match rest.next() {
+            None => true,
+            Some('.') => rest.next().is_none_or(|c| !is_word_char(c)),
+            Some(c) => !is_word_char(c),
+        };
         if before_ok && after_ok {
             return true;
         }

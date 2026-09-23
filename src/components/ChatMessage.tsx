@@ -2,6 +2,7 @@ import { AUTO_MODEL } from "../lib/policy";
 import ReactMarkdown from "react-markdown";
 import { parseKeyPhrase } from "../lib/parseKeyPhrase";
 import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
+import { splitBySkillTokens } from "../lib/skillMentions";
 
 interface MessageProps {
   role: "user" | "assistant" | "tool" | "error" | string;
@@ -39,6 +40,9 @@ interface Props {
   /** When supplied, file-path-shaped inline code becomes a clickable link
    *  that opens the file in the in-app editor. */
   onOpenInEditor?: (path: string) => void;
+  /** The worktree's skill names: a user message's standalone `/name` tokens
+   *  that match read as brass skill chips — the skills that rode with it. */
+  skillNames?: string[];
 }
 
 // Maps Anthropic / OpenAI model IDs to short display names. Falls back to
@@ -65,7 +69,7 @@ function modelDisplayName(model: string | null | undefined): string {
   return MODEL_DISPLAY[model] ?? model;
 }
 
-export function ChatMessage({ message, onOpenInEditor }: Props) {
+export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
   const { role, content, model, inputTokens, outputTokens } = message;
 
   if (!content || !content.trim()) return null;
@@ -95,7 +99,23 @@ export function ChatMessage({ message, onOpenInEditor }: Props) {
           — You
         </div>
         <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">
-          {content}
+          {skillNames && skillNames.length > 0
+            ? splitBySkillTokens(content, skillNames).map((part, i) =>
+                part.kind === "skill" ? (
+                  <span
+                    key={i}
+                    data-testid="skill-chip"
+                    className="rounded-sm px-1 font-mono text-[12.5px] text-octo-brass"
+                    style={{ background: "var(--brass-ghost)", boxShadow: "0 0 0 1px var(--brass-dim)" }}
+                    title={`Skill invoked with this message: ${part.name}`}
+                  >
+                    {part.text}
+                  </span>
+                ) : (
+                  <span key={i}>{part.text}</span>
+                ),
+              )
+            : content}
         </div>
       </div>
     );

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Wand2, Server, Maximize2 } from "lucide-react";
+import { Server, Maximize2 } from "lucide-react";
 import type { Budget, BudgetPeriod, BudgetScope, SpendSnapshot, ThreadCost } from "../lib/types";
 import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
@@ -16,8 +16,6 @@ interface Props {
   workspaceId?: string;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  /** Active skill for the conversation, if any (capabilities row). */
-  activeSkill?: string | null;
   /** Connected MCP servers for the workspace (capabilities row). */
   mcpServers?: string[];
   /** Jump to Review mode (e.g. clicking the unstaged-changes row). */
@@ -69,7 +67,6 @@ export function CompanionContext({
   workspaceId,
   budgets = [],
   spend = {},
-  activeSkill,
   mcpServers = [],
   onReviewClick,
   onSettingsClick,
@@ -87,7 +84,7 @@ export function CompanionContext({
   const cost = useThreadCost(workspaceId ?? "");
   const logbook = useMissionLogbook(workspaceId ?? "");
   const spendingRows = buildSpendingRows(budgets, spend, workspaceId ?? "");
-  const hasCapabilities = !!activeSkill || mcpServers.length > 0;
+  const hasCapabilities = mcpServers.length > 0;
   const lines = costLines(cost);
   const logbookHasWork = !!logbook.row && (logbook.row.hoursSecs > 0 || logbook.row.costUsd > 0);
 
@@ -170,16 +167,12 @@ export function CompanionContext({
           )}
         </div>
 
-        {/* Capabilities — the skill + MCP servers this conversation can use. */}
+        {/* Capabilities — the MCP servers this conversation can use. Skills
+            are per message now (`/name` in the text), not a conversation
+            setting, so none is listed here. */}
         {hasCapabilities && (
           <div className="octo-rise-in mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
             <span className="text-octo-sage">can use</span>
-            {activeSkill && (
-              <span className="flex items-center gap-1 text-[10px]" title="Active skill">
-                <Wand2 size={10} className="shrink-0 text-octo-brass" />
-                <span className="font-mono text-octo-ivory">{activeSkill}</span>
-              </span>
-            )}
             {mcpServers.map((s) => (
               <span key={s} className="flex items-center gap-1 text-[10px]" title="MCP server">
                 <Server size={10} className="shrink-0 text-octo-brass" />

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { clsx } from "clsx";
 import { useChatStore } from "../../stores/chatStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
@@ -24,8 +24,10 @@ import { CommandHistoryPopover } from "./CommandHistoryPopover";
 import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
 import { parseShellCommand } from "../../lib/shellCommand";
+import { applySkillMention, findActiveSkillMention } from "../../lib/skillMentions";
+import { SkillHighlights } from "./SkillHighlights";
 import { FadeSwap } from "../primitives/FadeSwap";
-import { X, Paperclip, TerminalSquare, HelpCircle, Slash } from "lucide-react";
+import { Paperclip, TerminalSquare, HelpCircle } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -55,8 +57,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const shellHistory = useChatStore((s) => s.getShellHistory(workspaceId));
   const loadShellHistory = useChatStore((s) => s.loadShellHistory);
   const stop = useChatStore((s) => s.stop);
-  const activeSkill = useChatStore((s) => s.getActiveSkill(workspaceId));
-  const setActiveSkill = useChatStore((s) => s.setActiveSkill);
+  const setSkillNames = useChatStore((s) => s.setSkillNames);
   const attachments = useChatStore((s) => s.getAttachments(workspaceId));
   const addAttachment = useChatStore((s) => s.addAttachment);
   const removeAttachment = useChatStore((s) => s.removeAttachment);
@@ -72,6 +73,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // The highlight backdrop behind the textarea (scroll-synced).
+  const highlightRef = useRef<HTMLDivElement>(null);
   // Prompt history — refs so handleKeyDown sees current values without
   // re-creating the handler each render.
   const historyRef = useRef<string[]>([]);
@@ -86,51 +89,68 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const [mentionItems, setMentionItems] = useState<string[]>([]);
   const [mentionIndex, setMentionIndex] = useState(0);
 
-  // ── /skill slash menu ───────────────────────────────────────────────
+  // ── /skill mentions ─────────────────────────────────────────────────
+  // A skill is invoked per message: `/name` anywhere in the text (several
+  // allowed), inserted from the menu or typed by hand, highlighted inline
+  // while drafting, and resolved by the backend when the turn runs. Nothing
+  // is pinned to the conversation — the next message starts clean.
   const [skills, setSkills] = useState<SkillMeta[]>([]);
-  const [slashOpen, setSlashOpen] = useState(false);
+  const skillNames = useMemo(() => skills.map((s) => s.name), [skills]);
+  const [slash, setSlash] = useState<{ query: string; start: number; caret: number } | null>(null);
   const [slashItems, setSlashItems] = useState<SkillMeta[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
+  const slashOpen = slash !== null;
   useEffect(() => {
     let cancelled = false;
     ipc
       .listSkills(workspacePath)
-      .then((s) => !cancelled && setSkills(s))
+      .then((s) => {
+        if (cancelled) return;
+        setSkills(s);
+        // The thread's sent messages read their `/name` tokens as chips too.
+        setSkillNames(workspaceId, s.map((k) => k.name));
+      })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [workspacePath]);
+  }, [workspacePath, workspaceId, setSkillNames]);
 
   function closeSlash() {
-    setSlashOpen(false);
+    setSlash(null);
     setSlashItems([]);
     setSlashIndex(0);
   }
 
-  /** A `/` at the very start of the input opens the skill menu, filtered by the
-   *  text after it (until the first space). */
-  function refreshSlash(value: string) {
-    if (value.startsWith("/") && !value.includes(" ") && !value.includes("\n")) {
-      const q = value.slice(1).toLowerCase();
-      const items = q
-        ? skills.filter((s) => s.name.toLowerCase().includes(q))
-        : skills;
-      closeMention();
-      closeCmdHist();
-      setSlashOpen(true);
-      setSlashItems(items);
-      setSlashIndex(0);
-    } else {
+  /** The `/query` left of the caret opens the skill menu (filtered by the
+   *  query) — at line start or after whitespace, anywhere in the message. A
+   *  `$`-direct command line never does. */
+  function refreshSlash(value: string, caret: number) {
+    if (value.trimStart().startsWith("$")) {
       closeSlash();
+      return;
     }
+    const m = findActiveSkillMention(value, caret);
+    if (!m) {
+      closeSlash();
+      return;
+    }
+    const q = m.query.toLowerCase();
+    const items = q ? skills.filter((s) => s.name.toLowerCase().includes(q)) : skills;
+    closeMention();
+    closeCmdHist();
+    setSlash({ ...m, caret });
+    setSlashItems(items);
+    setSlashIndex(0);
   }
 
+  /** Insert `/name ` in place of the typed `/query`, caret after it. */
   function selectSkill(skill: SkillMeta) {
-    setActiveSkill(workspaceId, skill.name);
-    setInput("");
+    if (!slash) return;
+    const { text, caret } = applySkillMention(inputRef.current, slash.start, slash.caret, skill.name);
+    pendingCaretRef.current = caret;
+    setInput(text);
     closeSlash();
-    pendingCaretRef.current = 0;
   }
 
   // ── `$` command-recall palette ───────────────────────────────────────
@@ -336,7 +356,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
   function runPopoverRefresh(value: string, caret: number) {
     refreshMention(value, caret);
-    refreshSlash(value);
+    refreshSlash(value, caret);
     refreshCmdHist(value);
   }
 
@@ -593,29 +613,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             onHover={setCmdHistIndex}
           />
         )}
-        {/* Active skill chip — the turn runs under this skill until cleared. */}
-        {activeSkill && (
-          <div className="flex items-center gap-1.5 px-4 pt-2.5">
-            <span
-              className="flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono text-[10px] text-octo-brass"
-              style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-            >
-              <span title="Active skill" className="flex items-center">
-                <Slash size={12} strokeWidth={1.75} />
-              </span>
-              {activeSkill}
-              <button
-                type="button"
-                onClick={() => setActiveSkill(workspaceId, null)}
-                aria-label="Clear active skill"
-                title="Clear active skill"
-                className="flex items-center text-octo-mute transition-colors hover:text-octo-rouge"
-              >
-                <X size={11} />
-              </button>
-            </span>
-          </div>
-        )}
+        {/* The draft and, behind it, its highlights: every `/skill` token
+            the worktree knows gets a brass wash so the skills riding with
+            THIS message read as such in the sentence itself. The backdrop
+            mirrors the textarea's metrics exactly and scrolls with it. */}
+        <div className="relative">
+          <SkillHighlights text={input} skillNames={skillNames} scrollRef={highlightRef} />
         <textarea
           ref={textareaRef}
           value={input}
@@ -635,12 +638,16 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             const ta = e.currentTarget;
             runPopoverRefresh(ta.value, ta.selectionStart ?? ta.value.length);
           }}
+          onScroll={(e) => {
+            if (highlightRef.current) highlightRef.current.scrollTop = e.currentTarget.scrollTop;
+          }}
           // Recompute the mention on every caret move (click, ArrowLeft/Right,
           // Home/End) — not just on typing — so the popover closes when the
           // caret leaves the trigger and mention.caret never goes stale.
-          onSelect={(e) =>
-            refreshMention(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)
-          }
+          onSelect={(e) => {
+            refreshMention(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
+            refreshSlash(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
+          }}
           onBlur={() => {
             // Let a popover mouse-down selection land first (it preventDefaults
             // blur), then dismiss on a genuine focus loss. Tracked so it can be
@@ -648,15 +655,17 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             if (blurTimerRef.current) clearTimeout(blurTimerRef.current);
             blurTimerRef.current = setTimeout(() => {
               closeMention();
+              closeSlash();
               closeCmdHist();
             }, 120);
           }}
           disabled={streaming}
           placeholder="Ask anything…   @ file · / skill · $ run a command"
           rows={1}
-          className="w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
+          className="relative w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-[1.5] text-octo-ivory outline-none placeholder:font-serif placeholder:not-italic placeholder:text-octo-mute"
           style={{ maxHeight: "calc(8 * 1.25rem + 1.5rem)" }}
         />
+        </div>
 
         {/* Control bar — model + effort on the left, cost + send/stop on the right. */}
         <div className="flex items-center gap-3 px-3 pb-2.5">
@@ -749,7 +758,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 function ComposerHelp({ onClose }: { onClose: () => void }) {
   const rows: { key: string; desc: string }[] = [
     { key: "@ file", desc: "Reference a file — its contents ride along with the message" },
-    { key: "/ skill", desc: "Run a skill for this conversation" },
+    { key: "/ skill", desc: "Invoke a skill with this message — several allowed, none sticks" },
     { key: "$ cmd", desc: "Run a command in the shared shell (also /run cmd)" },
     { key: "\\$ …", desc: "Send a literal $… to the agent instead of running it" },
     { key: "Enter", desc: "Send · ⇧↵ newline · ↑ ↓ history" },

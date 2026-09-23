@@ -256,6 +256,7 @@ const EMPTY_AGENT_LOG: LiveEntry[] = [];
 const EMPTY_THREADS: ChatThread[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_HISTORY: string[] = [];
+const EMPTY_SKILL_NAMES: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_CAPS: PendingCap[] = [];
 
@@ -317,9 +318,9 @@ interface ChatState {
    *  if it's not the one being shown — lets the streaming indicator be restored
    *  when switching back to a still-running thread. */
   streamingThreadByWs: Record<string, string | null>;
-  /** Active skill name per workspace — appended to the system prompt + tool
-   *  scoping for each turn until cleared. */
-  activeSkillByWs: Record<string, string | null>;
+  /** The worktree's skill names per workspace (loaded by the composer), so
+   *  `/name` tokens in a draft and in sent messages read as skills. */
+  skillNamesByWs: Record<string, string[]>;
   /** Pending image attachments per workspace — sent with the next turn, then
    *  cleared. */
   attachmentsByWs: Record<string, Attachment[]>;
@@ -372,7 +373,7 @@ interface ChatState {
   getTimeline: (workspaceId: string) => ConversationItem[];
   getThreads: (workspaceId: string) => ChatThread[];
   getActiveThread: (workspaceId: string) => string | null;
-  getActiveSkill: (workspaceId: string) => string | null;
+  getSkillNames: (workspaceId: string) => string[];
   getAttachments: (workspaceId: string) => Attachment[];
   /** The active thread's TALK shell cwd label (badge text), or null. */
   getShellCwd: (workspaceId: string) => string | null;
@@ -465,7 +466,7 @@ interface ChatState {
   ) => void;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
-  setActiveSkill: (workspaceId: string, skill: string | null) => void;
+  setSkillNames: (workspaceId: string, names: string[]) => void;
   addAttachment: (workspaceId: string, attachment: Attachment) => void;
   removeAttachment: (workspaceId: string, index: number) => void;
   clearAttachments: (workspaceId: string) => void;
@@ -934,7 +935,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingThreadByWs: {},
-    activeSkillByWs: {},
+    skillNamesByWs: {},
     attachmentsByWs: {},
     shellCwdByThread: {},
     shellCwdAbsByThread: {},
@@ -960,7 +961,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     getCrewFocus: (workspaceId) => get().crewFocusByWs[workspaceId] ?? null,
     getThreads: (workspaceId) => get().threadsByWs[workspaceId] ?? EMPTY_THREADS,
     getActiveThread: (workspaceId) => get().activeThreadByWs[workspaceId] ?? null,
-    getActiveSkill: (workspaceId) => get().activeSkillByWs[workspaceId] ?? null,
+    getSkillNames: (workspaceId) => get().skillNamesByWs[workspaceId] ?? EMPTY_SKILL_NAMES,
     getAttachments: (workspaceId) => get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS,
     getShellCwd: (workspaceId) => {
       const threadId = get().activeThreadByWs[workspaceId];
@@ -1089,7 +1090,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           userMessage: opts.userMessage,
           system: opts.systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
-          skill: get().activeSkillByWs[workspaceId] ?? undefined,
           attachments: attachments.length
             ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
             : undefined,
@@ -1323,8 +1323,8 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     setModel: (model) => set({ model }),
     setEffort: (effort) => set({ effort }),
-    setActiveSkill: (workspaceId, skill) =>
-      set((s) => ({ activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: skill } })),
+    setSkillNames: (workspaceId, names) =>
+      set((s) => ({ skillNamesByWs: { ...s.skillNamesByWs, [workspaceId]: names } })),
     addAttachment: (workspaceId, attachment) =>
       set((s) => ({
         attachmentsByWs: {
@@ -1463,8 +1463,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
         messagesByWs: { ...s.messagesByWs, [workspaceId]: EMPTY_MESSAGES },
-        // A skill is a per-conversation choice — don't leak it across threads.
-        activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: null },
       }));
       const messages = await ipc.listChatMessages(threadId);
       void rehydrateCaps(workspaceId, threadId);
@@ -1488,7 +1486,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
-        activeSkillByWs: { ...s.activeSkillByWs, [workspaceId]: null },
       }));
     },
 

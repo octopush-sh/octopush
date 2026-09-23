@@ -659,7 +659,6 @@ export const ipc = {
     userMessage: string;
     system?: string;
     maxTokens: number;
-    skill?: string;
     attachments?: { mediaType: string; data: string }[];
     /** Re-run without inserting a new user row (history already ends with it). */
     regenerate?: boolean;
