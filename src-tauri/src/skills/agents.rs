@@ -52,9 +52,10 @@ pub struct AgentDefinition {
     /// once, when the first attempt fails, blocks, or hits its turn cap.
     pub escalate: Option<String>,
     /// The frontmatter `max-turns`: the most tool rounds one run of this
-    /// sub-agent may take. `None` = the thread's own cap. A cap that lands
-    /// mid-work is not the end — the report says so and the director (or the
-    /// user, from the crew journal) can give it more turns.
+    /// sub-agent may take. `None` = the Settings preference, itself unset by
+    /// default — no limit. A cap that lands mid-work is not the end — the
+    /// report says so and the director (or the user, from the crew journal)
+    /// can give it more turns.
     #[serde(default)]
     pub max_turns: Option<u32>,
     /// The frontmatter `effort` (`low` … `max`): how hard one run of this

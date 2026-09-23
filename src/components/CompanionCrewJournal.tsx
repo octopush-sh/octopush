@@ -15,18 +15,22 @@ import { buildJournalItems } from "./direct/JournalItems";
 import { findCrewAgent, type CrewAgent } from "./chat/CrewCard";
 import { ChatMarkdown } from "./chat/ChatMarkdown";
 
-/** The turn budgets a continuation can be given. */
-export const CONTINUE_TURN_OPTIONS = [5, 15, 30] as const;
-export const DEFAULT_CONTINUE_TURNS = 15;
+/** The turn budgets a continuation can be given; `null` = no limit, the
+ *  default — the run takes the turns the work needs, like a fresh one. */
+export const CONTINUE_TURN_OPTIONS = [null, 5, 15, 30] as const;
+export const DEFAULT_CONTINUE_TURNS: number | null = null;
+/** The `<select>` value standing for no limit. */
+const NO_LIMIT_VALUE = "none";
 
 export { findCrewAgent };
 
 /** The phrase on the continue control: an answer for a blocked run, a
  *  reply when the user typed one, plain more turns otherwise. Pure so the
  *  wording is tested. */
-export function continueLabel(agent: CrewAgent, hasText: boolean, turns: number): string {
+export function continueLabel(agent: CrewAgent, hasText: boolean, turns: number | null): string {
   if (agent.meta?.blocked) return hasText ? "Answer and continue" : "Continue without an answer";
   if (hasText) return "Reply and continue";
+  if (turns === null) return "Let it finish";
   return `Give it ${turns} more turn${turns === 1 ? "" : "s"}`;
 }
 
@@ -79,7 +83,7 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
   }, [callId, ensureAgentLog]);
 
   const [text, setText] = useState("");
-  const [turns, setTurns] = useState<number>(DEFAULT_CONTINUE_TURNS);
+  const [turns, setTurns] = useState<number | null>(DEFAULT_CONTINUE_TURNS);
   // A fresh sub-agent gets a fresh composer.
   useEffect(() => {
     setText("");
@@ -216,15 +220,15 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
                 <label className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
                   turns
                   <select
-                    value={turns}
-                    onChange={(e) => setTurns(Number(e.target.value))}
+                    value={turns === null ? NO_LIMIT_VALUE : turns}
+                    onChange={(e) => setTurns(e.target.value === NO_LIMIT_VALUE ? null : Number(e.target.value))}
                     aria-label="More turns to give"
-                    title="How many more tool turns the sub-agent may take"
+                    title="How many more tool turns the sub-agent may take — no limit lets it run until it finishes"
                     className="rounded bg-octo-onyx px-1 py-0.5 font-mono text-[10px] tracking-normal text-octo-ivory outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
                     {CONTINUE_TURN_OPTIONS.map((n) => (
-                      <option key={n} value={n}>
-                        {n}
+                      <option key={n ?? NO_LIMIT_VALUE} value={n ?? NO_LIMIT_VALUE}>
+                        {n ?? "no limit"}
                       </option>
                     ))}
                   </select>

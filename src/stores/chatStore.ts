@@ -483,7 +483,7 @@ interface ChatState {
   /** Give a finished sub-agent `extraTurns` more tool turns, optionally
    *  with a message (an answer to the question it stopped on, a steer).
    *  Resolves when the continuation ends. */
-  continueSubagent: (callId: string, instruction: string | null, extraTurns: number) => Promise<void>;
+  continueSubagent: (callId: string, instruction: string | null, extraTurns: number | null) => Promise<void>;
   /** Load a finished sub-agent's persisted journal when nothing streamed into
    *  memory (a reload, a thread switch). No-op when entries already exist. */
   ensureAgentLog: (callId: string) => Promise<void>;

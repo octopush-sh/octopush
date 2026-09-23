@@ -100,30 +100,58 @@ describe("GeneralPane — Talk · tool turns per message", () => {
 });
 
 describe("GeneralPane — Talk · sub-agent tool turns", () => {
+  function toggle() {
+    return screen.getByRole("switch", { name: "Limit sub-agent tool turns" });
+  }
   function stepper() {
     return screen.getByLabelText("Sub-agent tool turns");
   }
 
-  it("shows the default when nothing is saved", async () => {
+  it("is off — no limit — when nothing is saved, with the stepper put away", async () => {
     await act(async () => {
       render(<GeneralPane />);
     });
-    expect(stepper()).toHaveTextContent(String(TALK_TURNS_DEFAULT));
+    expect(toggle()).toHaveAttribute("aria-checked", "false");
+    expect(stepper().closest("[aria-hidden]")).toHaveAttribute("aria-hidden", "true");
   });
 
-  it("loads the persisted value from settings", async () => {
+  it("loads a persisted limit as on, with its value", async () => {
     getSettings.mockResolvedValue({ ...BASE_SETTINGS, subagentMaxTurns: 60 });
     await act(async () => {
       render(<GeneralPane />);
     });
-    await waitFor(() => expect(stepper()).toHaveTextContent("60"));
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "true"));
+    expect(stepper()).toHaveTextContent("60");
+    expect(stepper().closest("[aria-hidden]")).toHaveAttribute("aria-hidden", "false");
   });
 
-  it("stepping persists subagentMaxTurns without touching the Talk turns", async () => {
+  it("switching on persists a starting limit; switching off persists no limit", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, talkMaxIterations: 25 });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ talkMaxIterations: 25, subagentMaxTurns: TALK_TURNS_DEFAULT }),
+    );
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    expect(saveSettings).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMaxTurns: null }));
+    expect(toggle()).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("stepping a limit persists subagentMaxTurns without touching the Talk turns", async () => {
     getSettings.mockResolvedValue({ ...BASE_SETTINGS, talkMaxIterations: 25, subagentMaxTurns: 25 });
     await act(async () => {
       render(<GeneralPane />);
     });
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "true"));
     const increase = stepper().querySelector('button[aria-label="Increase"]') as HTMLButtonElement;
     await act(async () => {
       fireEvent.click(increase);

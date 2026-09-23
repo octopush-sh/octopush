@@ -282,7 +282,13 @@ impl AgentOutcome {
 /// (the loop's escape valve — meaningless here, nobody answers) becomes the
 /// question itself so the parent can decide or re-delegate; an unfinished
 /// loop is a failure.
-pub fn report_from_result(out: &AgenticResult, max_iterations: usize) -> (String, bool) {
+pub fn report_from_result(out: &AgenticResult, max_iterations: Option<usize>) -> (String, bool) {
+    // A cap ending only exists when a limit was configured; the wording
+    // names it when it can.
+    let limit = match max_iterations {
+        Some(n) => format!("{n}-turn tool limit"),
+        None => "turn limit".to_string(),
+    };
     if let Some(ask) = &out.blocked {
         let mut s = String::from("Sub-agent stopped: it needed a decision it could not make alone.");
         if !ask.summary.trim().is_empty() {
@@ -301,7 +307,7 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: usize) -> (String
         if out.closed_at_cap {
             return (
                 format!(
-                    "{text}\n\n[sub-agent reached its {max_iterations}-turn tool limit before finishing — this report may be incomplete]"
+                    "{text}\n\n[sub-agent reached its {limit} before finishing — this report may be incomplete]"
                 ),
                 true,
             );
@@ -309,7 +315,7 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: usize) -> (String
         return (text.to_string(), true);
     }
     (
-        format!("Sub-agent hit its {max_iterations}-turn tool limit without producing a report."),
+        format!("Sub-agent hit its {limit} without producing a report."),
         false,
     )
 }
@@ -325,7 +331,12 @@ pub struct SubagentSpec {
     pub workspace_path: String,
     /// The conversation's model; `call.model` overrides it.
     pub default_model: String,
-    pub max_iterations: usize,
+    /// Tool rounds this run may take; `None` = no limit (the default: a
+    /// sub-agent runs until it finishes or is stopped). A limit exists only
+    /// when configured — the Settings preference, a definition's
+    /// `max-turns`, or the turns a user granted a continuation.
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
     pub max_tokens: u32,
     pub sandbox_roots: Option<Vec<String>>,
     /// The `.claude/agents` definition `subagent_type` matched, if any.
@@ -537,8 +548,8 @@ const DOCTRINE: &str =
      several in ONE response when the questions are independent, each with a narrow, \
      answerable question and a compact report asked for (findings first, `path:line` \
      evidence, a few hundred words). Pick the type by role: `explorer`, `test-runner`, \
-     `ticket-reader` and `pr-author` run on the fast tier with a 15-turn cap — if a task \
-     needs more than that, it was two questions; split it, never widen it. `implementer` \
+     `ticket-reader` and `pr-author` run on the fast tier and run until they finish — if a \
+     task would take them long, it was two questions; split it, never widen it. `implementer` \
      and `pr-maintainer` run balanced and escalate to strong on a failed attempt — the \
      ONLY sub-agents that write. `reviewer` runs strong in a fresh context — the quality \
      gate before any PR, so always run it. Never pass `model` on a typed call — the role \
@@ -548,12 +559,13 @@ const DOCTRINE: &str =
      no type runs on the fast tier, so type anything that must write. Never paste a long \
      output into your own \
      context, never re-run or re-verify what a sub-agent already reported, and recall \
-     stored tool output instead of re-reading. A writing sub-agent that runs out of turns \
-     mid-work pauses your turn until the user gives it more turns or accepts its partial \
-     report — if you receive a report marked incomplete, the user chose that: do not build \
-     on it, say what is done and what is not, and stop. A read cut at its cap is partial, \
-     not lost: the user can give that sub-agent more turns from its journal, so say what \
-     is still open instead of re-delegating from scratch. Do small, sequential edits \
+     stored tool output instead of re-reading. A sub-agent has no turn limit unless the \
+     user set one; when one is set, a writing sub-agent that runs out of turns mid-work \
+     pauses your turn until the user gives it more turns or accepts its partial report — \
+     if you receive a report marked incomplete, the user chose that: do not build on it, \
+     say what is done and what is not, and stop. A read cut at a cap is partial, not \
+     lost: the user can give that sub-agent more turns from its journal, so say what is \
+     still open instead of re-delegating from scratch. Do small, sequential edits \
      yourself; decide architecture, trade-offs and what the user is really asking \
      yourself — that is what your context is for.";
 
@@ -897,7 +909,7 @@ pub async fn run_subagent_core(
         &system,
         spec.resume.clone().unwrap_or_else(|| user_messages(&spec.call.prompt)),
         Path::new(&spec.workspace_path),
-        spec.max_iterations,
+        spec.max_iterations.unwrap_or(usize::MAX),
         cancel,
         &emitter,
         allowed_tools,
@@ -1127,7 +1139,7 @@ pub async fn run_one_subagent(
     if let Some(gate) = cap_gate {
         // Turns spent so far: every billed attempt (an escalated run spent
         // up to two budgets) — the card says how much it already took.
-        let mut turns_used = spec.max_iterations * outcome.billed_attempts().len().max(1);
+        let mut turns_used = spec.max_iterations.unwrap_or(0) * outcome.billed_attempts().len().max(1);
         while ran_out_of_turns(&outcome) && spec_edits_files(spec) && !cancel.load(Ordering::Relaxed) {
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
                 "hit its turn limit mid-work after {turns_used} turns — waiting for you: more turns, or accept what it has"
@@ -1164,7 +1176,7 @@ pub async fn run_one_subagent(
                 .notice(&format!("given {extra} more turns — continuing where it left off"));
             let mut more = spec.clone();
             more.call.model = Some(outcome.model.clone());
-            more.max_iterations = extra;
+            more.max_iterations = Some(extra);
             if let Some(p) = more.plan.as_mut() {
                 p.model = outcome.model.clone();
                 p.tier = crate::skills::agents::tier_of_model(&outcome.model, tiers).map(str::to_string);
@@ -1173,7 +1185,7 @@ pub async fn run_one_subagent(
             }
             more.resume = Some(resume_messages_for_continuation(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
-                &continuation_note(None, extra),
+                &continuation_note(None, Some(extra)),
             ));
             let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_continued(outcome, second);
@@ -1380,14 +1392,14 @@ mod tests {
     #[test]
     fn report_mapping_covers_every_ending() {
         let mut out = AgenticResult { text: "  findings  ".into(), finished: true, ..Default::default() };
-        assert_eq!(report_from_result(&out, 25), ("findings".into(), true));
+        assert_eq!(report_from_result(&out, Some(25)), ("findings".into(), true));
 
         out.closed_at_cap = true;
-        let (r, ok) = report_from_result(&out, 25);
+        let (r, ok) = report_from_result(&out, Some(25));
         assert!(ok && r.starts_with("findings") && r.contains("25-turn tool limit"), "{r}");
 
         let unfinished = AgenticResult::default();
-        let (r, ok) = report_from_result(&unfinished, 25);
+        let (r, ok) = report_from_result(&unfinished, Some(25));
         assert!(!ok && r.contains("without producing a report"), "{r}");
 
         let blocked = AgenticResult {
@@ -1401,7 +1413,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (r, ok) = report_from_result(&blocked, 25);
+        let (r, ok) = report_from_result(&blocked, Some(25));
         assert!(!ok && r.contains("Which branch?") && r.contains("- main or develop?"), "{r}");
     }
 
@@ -1447,7 +1459,7 @@ mod tests {
             call_id: "c".into(),
             call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: None, model: None },
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
-            default_model: "conv-model".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            default_model: "conv-model".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: false,
             resume: None,
@@ -1514,7 +1526,7 @@ mod tests {
             call_id: "c".into(),
             call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: None, model: None },
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
-            default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: None, policy_auto: false, resume: None,
             plan: None,
         };
@@ -1558,7 +1570,7 @@ mod tests {
             call_id: "c".into(),
             call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: Some("implementer".into()), model: None },
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
-            default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            default_model: "opus".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: Some(def("implementer", None, Some("balanced"))),
             policy_auto: true,
             resume: None,
@@ -1630,7 +1642,9 @@ mod tests {
     fn the_doctrine_says_one_question_per_typed_subagent_and_that_a_cap_is_not_lost_work() {
         let d = director_doctrine(&[]);
         assert!(d.contains("One sub-agent, one question, always typed"), "{d}");
-        assert!(d.contains("15-turn cap"));
+        assert!(d.contains("run until they finish"), "{d}");
+        assert!(!d.contains("15-turn cap"), "no shipped cap is described to the director: {d}");
+        assert!(d.contains("no turn limit unless the user set one"), "{d}");
         assert!(d.contains("runs on the fast tier"));
         assert!(d.contains("give that sub-agent more turns from its journal"));
         assert!(d.contains("pauses your turn until the user gives it more turns or accepts its partial"));
@@ -1654,7 +1668,7 @@ mod tests {
             call_id: "c".into(),
             call: AgentCall { description: "d".into(), prompt: "p".into(), subagent_type: None, model: None },
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
-            default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            default_model: "opus".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: true,
             resume: None,
@@ -1715,7 +1729,7 @@ mod tests {
             call_id: "c".into(),
             call: AgentCall { description: "d".into(), prompt: "Implement X".into(), subagent_type: Some("implementer".into()), model: None },
             workspace_id: "w".into(), thread_id: "t".into(), workspace_path: "/w".into(),
-            default_model: "opus".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None,
+            default_model: "opus".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: Some(d),
             policy_auto: false,
             resume: None,
@@ -1857,7 +1871,7 @@ mod tests {
             call: AgentCall { description: "Read ticket".into(), prompt: "PROJ-1".into(), subagent_type: Some("ticket-reader".into()), model: None },
             workspace_id: "w".into(), thread_id: "t".into(),
             workspace_path: dir.path().to_string_lossy().into_owned(),
-            default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
             definition: Some(def("ticket-reader", Some(vec!["read_file"]), None)),
             policy_auto: false,
             resume: None,
@@ -1932,7 +1946,7 @@ mod tests {
             call: AgentCall { description: "Ticket".into(), prompt: "p".into(), subagent_type: None, model: None },
             workspace_id: "w".into(), thread_id: "t".into(),
             workspace_path: dir.path().to_string_lossy().into_owned(),
-            default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
             definition: None,
             policy_auto: false,
             resume: None,
@@ -1989,7 +2003,7 @@ mod tests {
             call: AgentCall { description: "Read".into(), prompt: "read".into(), subagent_type: Some("reader".into()), model: None },
             workspace_id: "w".into(), thread_id: "t".into(),
             workspace_path: dir.path().to_string_lossy().into_owned(),
-            default_model: "m".into(), max_iterations: 3, max_tokens: 1, sandbox_roots: None,
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
             definition: Some(def("reader", Some(vec!["read_file", "grep"]), None)),
             policy_auto: false,
             resume: None,
@@ -2049,7 +2063,7 @@ mod tests {
             call: AgentCall { description: "Clean up".into(), prompt: "rm it".into(), subagent_type: None, model: None },
             workspace_id: "w".into(), thread_id: "t".into(),
             workspace_path: dir.path().to_string_lossy().into_owned(),
-            default_model: "m".into(), max_iterations: 5, max_tokens: 1, sandbox_roots: None, definition: None,
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None, definition: None,
             policy_auto: false,
             resume: None,
             plan: None,
@@ -2095,7 +2109,7 @@ mod tests {
             thread_id: "th".into(),
             workspace_path: dir.path().to_string_lossy().into_owned(),
             default_model: "m".into(),
-            max_iterations: 5,
+            max_iterations: Some(5),
             max_tokens: 4096,
             sandbox_roots: None,
             definition: None,

@@ -47,10 +47,11 @@ pub struct AppSettings {
     pub talk_max_iterations: Option<u32>,
 
     /// Tool-call rounds one sub-agent run may take (Settings › General ›
-    /// "Sub-agent tool turns"). `None` = the built-in default
-    /// (`chat_history::DEFAULT_SUBAGENT_MAX_ITERATIONS`); a definition's own
-    /// `max-turns` never exceeds it. Independent of `talk_max_iterations`: a
-    /// director's rounds and a sub-agent's are different budgets.
+    /// "Limit sub-agent tool turns"). `None` = **no limit** — a sub-agent
+    /// runs until it finishes or is stopped; a set value is clamped like the
+    /// Talk turns and a definition's own `max-turns` never exceeds it.
+    /// Independent of `talk_max_iterations`: a director's rounds and a
+    /// sub-agent's are different budgets.
     #[serde(default)]
     pub subagent_max_turns: Option<u32>,
 

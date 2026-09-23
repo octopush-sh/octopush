@@ -7,7 +7,8 @@ import { useWorkspacePrefs } from "../../stores/workspacePrefsStore";
 import { MODES, MODE_LABELS } from "../../lib/modes";
 import { ipc } from "../../lib/ipc";
 import { Stepper } from "../controls/Stepper";
-import { PaneHeader, SectionLabel, SegmentedRow, ToggleRow } from "./shared";
+import { Reveal } from "../primitives/Reveal";
+import { PaneHeader, SectionLabel, SegmentedRow, Switch, ToggleRow } from "./shared";
 import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
@@ -57,12 +58,7 @@ export function GeneralPane() {
             description={`Rounds of tool calls one message may run before Octopush asks the model to answer with what it has. A long review or refactor needs more; the default is ${TALK_TURNS_DEFAULT}.`}
             testId="talk-turns-row"
           />
-          <TurnsRow
-            field="subagentMaxTurns"
-            label="Sub-agent tool turns"
-            description={`Rounds one sub-agent run may take. A definition's own max-turns applies under it (the built-in explorer, test-runner, ticket-reader and pr-author keep 15). A sub-agent that writes and runs out of turns pauses the conversation until you give it more or accept what it has; the default is ${TALK_TURNS_DEFAULT}.`}
-            testId="subagent-turns-row"
-          />
+          <SubagentTurnsRow />
         </div>
 
         <div className="space-y-4">
@@ -89,16 +85,16 @@ function clampTurns(n: number): number {
   return Math.min(TALK_TURNS_MAX, Math.max(TALK_TURNS_MIN, Math.round(n)));
 }
 
-/** One persisted turn budget (`settings.json`, read-modify-write so the
- *  other settings fields aren't clobbered): "Tool turns per message" for the
- *  director's own rounds, "Sub-agent tool turns" for one sub-agent run. */
+/** The director's own persisted turn budget ("Tool turns per message";
+ *  `settings.json`, read-modify-write so the other settings fields aren't
+ *  clobbered). */
 function TurnsRow({
   field,
   label,
   description,
   testId,
 }: {
-  field: "talkMaxIterations" | "subagentMaxTurns";
+  field: "talkMaxIterations";
   label: string;
   description: string;
   testId: string;
@@ -150,6 +146,79 @@ function TurnsRow({
           ariaLabel={label}
         />
       </div>
+    </div>
+  );
+}
+
+/** Sub-agent turns: **off by default — no limit.** A sub-agent runs until it
+ *  finishes or is stopped, so the director never builds on a report cut
+ *  mid-work. Switched on, one run may take the stepper's rounds (a
+ *  definition's own `max-turns` applies under it) and a writing sub-agent
+ *  that runs out pauses the conversation for more turns. Persists
+ *  `subagentMaxTurns`: a number when limited, `null` when not. */
+function SubagentTurnsRow() {
+  const [limit, setLimit] = useState<number | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    ipc
+      .getSettings()
+      .then((s) => {
+        const v = s.subagentMaxTurns;
+        setLimit(typeof v === "number" ? clampTurns(v) : null);
+      })
+      .catch(() => {});
+  }, []);
+
+  async function persist(value: number | null) {
+    setLimit(value);
+    try {
+      const s = await ipc.getSettings();
+      await ipc.saveSettings({ ...s, subagentMaxTurns: value });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch {
+      // Leave the control where the user put it; the next change retries.
+    }
+  }
+
+  const limited = limit !== null;
+  return (
+    <div
+      data-testid="subagent-turns-row"
+      className="rounded-lg px-4 py-3"
+      style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <div className="font-serif text-[14px] leading-tight text-octo-ivory">Limit sub-agent tool turns</div>
+          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+            Off, a sub-agent runs until it finishes or you stop it, so the director never builds on a report cut mid-work.
+            On, one run may take this many rounds of tool calls; a definition's own max-turns applies under it, and a
+            sub-agent that writes and runs out of turns pauses the conversation until you give it more or accept what it has.
+          </div>
+          {saved && <div className="mt-1 font-mono text-[10px] text-octo-verdigris">Saved</div>}
+        </div>
+        <Switch
+          checked={limited}
+          onChange={(on) => void persist(on ? TALK_TURNS_DEFAULT : null)}
+          ariaLabel="Limit sub-agent tool turns"
+          testId="subagent-turns-switch"
+        />
+      </div>
+      <Reveal open={limited}>
+        <div className="mt-3 flex items-center justify-between gap-4">
+          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">turns per run</span>
+          <Stepper
+            value={limit ?? TALK_TURNS_DEFAULT}
+            min={TALK_TURNS_MIN}
+            max={TALK_TURNS_MAX}
+            step={TALK_TURNS_STEP}
+            onChange={(n) => void persist(clampTurns(n))}
+            ariaLabel="Sub-agent tool turns"
+          />
+        </div>
+      </Reveal>
     </div>
   );
 }

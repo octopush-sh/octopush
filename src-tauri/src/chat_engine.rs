@@ -590,7 +590,7 @@ impl CapGate {
     pub fn respond(&self, call_id: &str, extra_turns: Option<usize>) {
         if let Some((_ev, tx)) = self.pending.lock().remove(call_id) {
             let _ = tx.send(match extra_turns {
-                Some(n) => CapAnswer::More(n.clamp(1, CONTINUE_MAX_TURNS)),
+                Some(n) => CapAnswer::More(n.max(1)),
                 None => CapAnswer::Accept,
             });
         }
@@ -1545,18 +1545,18 @@ pub fn subagent_origin(call_id: &str) -> String {
     format!("subagent:{call_id}")
 }
 
-/// How many more tool turns a continuation may take: at least one, never
-/// more than the hard ceiling (a runaway continuation would cost as much
-/// as the run it extends).
-pub const CONTINUE_MAX_TURNS: usize = 50;
-
 /// The note that resumes a run cut at its turn cap (or stopped), with or
-/// without a word from the user. Pure so the wording is tested.
-pub fn continuation_note(instruction: Option<&str>, extra_turns: usize) -> String {
+/// without a word from the user. `extra_turns` `None` = no turn limit on
+/// the continuation. Pure so the wording is tested.
+pub fn continuation_note(instruction: Option<&str>, extra_turns: Option<usize>) -> String {
+    let budget = match extra_turns {
+        Some(1) => "You have 1 more tool turn".to_string(),
+        Some(n) => format!("You have {n} more tool turns"),
+        None => "You have no turn limit — take the tool turns the work needs".to_string(),
+    };
     let turns = format!(
-        "You have {extra_turns} more tool turn{} — continue exactly where you left off, do \
-         not redo work already done, and write your final report when finished.",
-        if extra_turns == 1 { "" } else { "s" }
+        "{budget} — continue exactly where you left off, do \
+         not redo work already done, and write your final report when finished."
     );
     match instruction.map(str::trim).filter(|t| !t.is_empty()) {
         Some(text) => format!("A message from the user: {text}\n\n{turns}"),
@@ -1990,9 +1990,11 @@ impl ChatEngine {
         app: AppHandle,
         call_id: String,
         instruction: Option<String>,
-        extra_turns: usize,
+        extra_turns: Option<usize>,
     ) -> AppResult<()> {
-        let extra_turns = extra_turns.clamp(1, CONTINUE_MAX_TURNS);
+        // `None` = no turn limit (the default everywhere for a sub-agent); a
+        // number the user picked is honored as is, at least one.
+        let extra_turns = extra_turns.map(|n| n.max(1));
         // One continuation per run at a time: a second click while the first
         // runs would race on the row and lose one run's figures.
         if !self.continuing.lock().insert(call_id.clone()) {
@@ -2107,10 +2109,14 @@ impl ChatEngine {
         });
         let label = spec.call.description.trim();
         let note = format!(
-            "Sub-agent “{}” {} {extra_turns} more turn{} — its report was updated.",
+            "Sub-agent “{}” {} {} — its report was updated.",
             if label.is_empty() { "Agent" } else { label },
             if instruction.as_deref().is_some_and(|t| !t.trim().is_empty()) { "was answered and given" } else { "was given" },
-            if extra_turns == 1 { "" } else { "s" },
+            match extra_turns {
+                Some(1) => "1 more turn".to_string(),
+                Some(n) => format!("{n} more turns"),
+                None => "the turns it needed".to_string(),
+            },
         );
         self.insert_and_emit_message(
             &app,
@@ -2655,8 +2661,9 @@ impl ChatEngine {
         let max_iterations = effective_talk_max_iterations(
             saved_settings.as_ref().and_then(|s| s.talk_max_iterations),
         );
-        // Sub-agents have their own budget (Settings › General › "Sub-agent
-        // tool turns"); a definition's `max-turns` applies under it.
+        // Sub-agents have no turn limit unless one is configured (Settings ›
+        // General › "Limit sub-agent tool turns", or a definition's own
+        // `max-turns`, which applies under a set preference).
         let subagent_cap = effective_subagent_max_iterations(
             saved_settings.as_ref().and_then(|s| s.subagent_max_turns),
         );
@@ -3486,14 +3493,17 @@ mod continuation_tests {
 
     #[test]
     fn continuation_note_carries_the_turn_budget_and_the_users_words() {
-        let plain = continuation_note(None, 15);
+        let plain = continuation_note(None, Some(15));
         assert!(plain.starts_with("You have 15 more tool turns"), "{plain}");
         assert!(plain.contains("do not redo work already done"));
-        let one = continuation_note(Some("  "), 1);
+        let one = continuation_note(Some("  "), Some(1));
         assert!(one.starts_with("You have 1 more tool turn —"), "{one}");
-        let answered = continuation_note(Some("Use the staging DB."), 5);
+        let answered = continuation_note(Some("Use the staging DB."), Some(5));
         assert!(answered.starts_with("A message from the user: Use the staging DB.\n\n"), "{answered}");
         assert!(answered.contains("You have 5 more tool turns"));
+        let open = continuation_note(None, None);
+        assert!(open.starts_with("You have no turn limit"), "{open}");
+        assert!(open.contains("continue exactly where you left off"));
     }
 
     #[test]

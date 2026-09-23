@@ -77,6 +77,7 @@ describe("continueLabel / statusWordFor", () => {
   it("phrases the control by ending and by whether the user wrote something", () => {
     expect(continueLabel(agentWith({}), false, 15)).toBe("Give it 15 more turns");
     expect(continueLabel(agentWith({}), false, 1)).toBe("Give it 1 more turn");
+    expect(continueLabel(agentWith({}), false, null)).toBe("Let it finish");
     expect(continueLabel(agentWith({}), true, 15)).toBe("Reply and continue");
     expect(continueLabel(agentWith({ blocked: true }), true, 5)).toBe("Answer and continue");
     expect(continueLabel(agentWith({ blocked: true }), false, 5)).toBe("Continue without an answer");
@@ -157,7 +158,8 @@ describe("CompanionCrewJournal", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Reply and continue" }));
     });
-    expect(continueSubagent).toHaveBeenCalledWith("c1", "Also check the e2e suite.", 15);
+    // No turns picked = no limit on the continuation.
+    expect(continueSubagent).toHaveBeenCalledWith("c1", "Also check the e2e suite.", null);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("no saved run"));
   });
 

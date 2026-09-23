@@ -38,25 +38,24 @@ pub fn effective_talk_max_iterations(setting: Option<u32>) -> usize {
     }
 }
 
-/// Tool-call rounds one sub-agent run may take when no preference is saved.
-pub const DEFAULT_SUBAGENT_MAX_ITERATIONS: usize = 25;
-
 /// The saved "Sub-agent tool turns" preference as the bound a sub-agent runs
-/// with (same clamp as the Talk turns). A definition's own `max-turns` is
-/// applied on top, never above this.
-pub fn effective_subagent_max_iterations(setting: Option<u32>) -> usize {
-    match setting {
-        Some(n) => (n as usize).clamp(TALK_MAX_ITERATIONS_MIN, TALK_MAX_ITERATIONS_MAX),
-        None => DEFAULT_SUBAGENT_MAX_ITERATIONS,
-    }
+/// with: unset (the default) is **no limit** — a sub-agent runs until it
+/// finishes or is stopped, so the director never builds on a report cut
+/// mid-work; a set value is clamped like the Talk turns. A definition's own
+/// `max-turns` is applied on top, never above a set preference.
+pub fn effective_subagent_max_iterations(setting: Option<u32>) -> Option<usize> {
+    setting.map(|n| (n as usize).clamp(TALK_MAX_ITERATIONS_MIN, TALK_MAX_ITERATIONS_MAX))
 }
 
-/// The turn bound one sub-agent runs with: its definition's `max-turns` when
-/// it has one, capped by the sub-agent preference; else the preference.
-pub fn subagent_iterations(definition_max_turns: Option<u32>, subagent_cap: usize) -> usize {
-    definition_max_turns
-        .map(|n| (n as usize).max(1).min(subagent_cap))
-        .unwrap_or(subagent_cap)
+/// The turn bound one sub-agent runs with, `None` = unlimited: its
+/// definition's `max-turns` when it has one (capped by a set preference),
+/// else the preference — which, unset, is no limit at all.
+pub fn subagent_iterations(definition_max_turns: Option<u32>, subagent_cap: Option<usize>) -> Option<usize> {
+    match (definition_max_turns, subagent_cap) {
+        (Some(n), Some(cap)) => Some((n as usize).max(1).min(cap)),
+        (Some(n), None) => Some((n as usize).max(1)),
+        (None, cap) => cap,
+    }
 }
 
 /// Chars of one tool result kept in context, by how many turns ago it ran
@@ -373,15 +372,19 @@ mod tests {
 
     #[test]
     fn subagent_turns_come_from_the_preference_with_the_definition_cap_under_it() {
-        assert_eq!(effective_subagent_max_iterations(None), DEFAULT_SUBAGENT_MAX_ITERATIONS);
-        assert_eq!(effective_subagent_max_iterations(Some(60)), 60);
-        assert_eq!(effective_subagent_max_iterations(Some(1)), TALK_MAX_ITERATIONS_MIN);
-        assert_eq!(effective_subagent_max_iterations(Some(9_999)), TALK_MAX_ITERATIONS_MAX);
-        // A definition's max-turns applies under the preference, never above.
-        assert_eq!(subagent_iterations(Some(15), 60), 15);
-        assert_eq!(subagent_iterations(Some(80), 60), 60);
-        assert_eq!(subagent_iterations(None, 60), 60);
-        assert_eq!(subagent_iterations(Some(0), 60), 1);
+        // Unset = no limit; a set value is clamped like the Talk turns.
+        assert_eq!(effective_subagent_max_iterations(None), None);
+        assert_eq!(effective_subagent_max_iterations(Some(60)), Some(60));
+        assert_eq!(effective_subagent_max_iterations(Some(1)), Some(TALK_MAX_ITERATIONS_MIN));
+        assert_eq!(effective_subagent_max_iterations(Some(9_999)), Some(TALK_MAX_ITERATIONS_MAX));
+        // A definition's max-turns applies under a set preference, never
+        // above — and stands on its own when nothing is configured.
+        assert_eq!(subagent_iterations(Some(15), Some(60)), Some(15));
+        assert_eq!(subagent_iterations(Some(80), Some(60)), Some(60));
+        assert_eq!(subagent_iterations(Some(15), None), Some(15));
+        assert_eq!(subagent_iterations(None, None), None);
+        assert_eq!(subagent_iterations(None, Some(60)), Some(60));
+        assert_eq!(subagent_iterations(Some(0), Some(60)), Some(1));
     }
 
     fn tool_row(id: i64, name: &str, result: &str) -> String {

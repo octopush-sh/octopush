@@ -3564,9 +3564,10 @@ pub async fn pending_subagent_caps(
     Ok(state.chat.cap_gate.pending_for_thread(&thread_id))
 }
 
-/// Give a finished sub-agent more turns, optionally with a message from the
-/// user (an answer to the question it stopped on, or a steer). Runs to
-/// completion; the report row is rewritten via `chat://message-updated`.
+/// Give a finished sub-agent more turns (`extra_turns` `None` = no limit),
+/// optionally with a message from the user (an answer to the question it
+/// stopped on, or a steer). Runs to completion; the report row is rewritten
+/// via `chat://message-updated`.
 #[tauri::command]
 pub async fn continue_subagent(
     app: AppHandle,
@@ -3577,7 +3578,7 @@ pub async fn continue_subagent(
 ) -> AppResult<()> {
     state
         .chat
-        .continue_subagent(app, call_id, instruction, extra_turns.unwrap_or(15) as usize)
+        .continue_subagent(app, call_id, instruction, extra_turns.map(|n| n as usize))
         .await
 }
 
