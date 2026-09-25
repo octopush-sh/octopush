@@ -320,16 +320,20 @@ function CrewRow({
           onClick={onOpenJournal}
           aria-pressed={focused}
           title="Open the work journal in the Companion"
-          className="flex min-w-0 flex-1 items-baseline gap-2 text-left transition-colors duration-[180ms] hover:text-octo-brass"
+          className="flex min-w-0 flex-1 items-baseline gap-2 overflow-hidden text-left transition-colors duration-[180ms] hover:text-octo-brass"
         >
-          <span className="shrink-0 truncate text-[12px] text-octo-ivory">{agent.description}</span>
+          {/* Everything but the status badges may truncate; the live activity
+              gives way first (shrink-[100]) so the task title survives. */}
+          <span className="min-w-[6rem] truncate text-[12px] text-octo-ivory" title={agent.description}>
+            {agent.description}
+          </span>
           {agent.subagentType && (
-            <span className="shrink-0 font-mono text-[10px] text-octo-sage">{agent.subagentType}</span>
+            <span className="min-w-0 truncate font-mono text-[10px] text-octo-sage">{agent.subagentType}</span>
           )}
           {runLine(agent) && (
             <span
               data-testid="crew-run-line"
-              className="shrink-0 font-mono text-[10px] text-octo-mute"
+              className="min-w-0 truncate font-mono text-[10px] text-octo-mute"
               title={`Runs on ${agent.model}${agent.tier ? ` (${agent.tier} tier)` : ""}${agent.effort ? ` at effort ${agent.effort}` : ""}`}
             >
               {runLine(agent)}
@@ -338,7 +342,7 @@ function CrewRow({
           {agent.askedModel && (
             <span
               data-testid="crew-asked"
-              className={`shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] ${agent.askedHonored ? "text-octo-sage" : "text-octo-brass"}`}
+              className={`min-w-0 truncate font-mono text-[9px] uppercase tracking-[0.15em] ${agent.askedHonored ? "text-octo-sage" : "text-octo-brass"}`}
               title={
                 agent.askedHonored
                   ? `The director asked for ${agent.askedModel}; the run honors it`
@@ -349,7 +353,7 @@ function CrewRow({
             </span>
           )}
           {activity && (
-            <span className="min-w-0 truncate font-mono text-[11px] text-octo-sage" title={activity}>
+            <span className="min-w-0 shrink-[100] truncate font-mono text-[11px] text-octo-sage" title={activity}>
               {activity}
             </span>
           )}

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { clsx } from "clsx";
 import { useChatStore } from "../../stores/chatStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
+import { useProvidersStore } from "../../stores/providersStore";
 import {
   estimateNextTurnTokens,
   estimatePerMessageCost,
@@ -9,7 +10,7 @@ import {
   formatTokens,
 } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
-import type { ModelInfo, ProviderConfig, SkillMeta } from "../../lib/types";
+import type { ModelInfo, SkillMeta } from "../../lib/types";
 import {
   findActiveMention,
   rankFiles,
@@ -302,10 +303,11 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }, [workspaceId]);
 
   // ── Inline cost preview ─────────────────────────────────────────────
-  const [modelCatalog, setModelCatalog] = useState<ProviderConfig[]>([]);
+  const modelCatalog = useProvidersStore((s) => s.providers);
+  const refreshCatalog = useProvidersStore((s) => s.refresh);
   useEffect(() => {
-    ipc.listProviders().then(setModelCatalog).catch(() => {});
-  }, []);
+    void refreshCatalog();
+  }, [refreshCatalog]);
   const activeModelInfo: ModelInfo | null = (() => {
     for (const p of modelCatalog) {
       for (const m of p.models) {

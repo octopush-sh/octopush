@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Pencil, X, RefreshCw, Plus } from "lucide-react";
 import { ipc } from "../../lib/ipc";
+import { useProvidersStore } from "../../stores/providersStore";
 import type { ModelInfo, ProviderConfig } from "../../lib/types";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { IconButton } from "../controls/IconButton";
@@ -98,6 +99,7 @@ export function ModelsPane() {
       await ipc.saveSettings({ ...current, providerKeys: filteredKeys, providerBaseUrls: filteredBaseUrls });
       // Refresh models so the picker reflects edits.
       await ipc.listModels?.();
+      await useProvidersStore.getState().refresh();
       // Align the working copy + snapshot with exactly what was persisted —
       // empty credential entries are dropped on disk, so adopt the filtered set
       // here too, otherwise the in-memory snapshot wouldn't match a fresh load.
@@ -142,6 +144,7 @@ export function ModelsPane() {
       setPricingMessage(`Updated ${result.modelsUpdated} of ${result.modelsTotal}`);
       const provs = await ipc.listProviders();
       setProviders(provs);
+      void useProvidersStore.getState().refresh();
       setSnapshot((s) => {
         // Pricing refresh writes to disk server-side; rebase the snapshot's
         // providers onto the refreshed catalog so it doesn't read as dirty.
