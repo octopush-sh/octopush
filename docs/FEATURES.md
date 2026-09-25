@@ -848,7 +848,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **Legacy `get_token_report`** — Still serves the session sidebar / App total (`tokenStore`); the Usage page no longer reads it.
 
 ### Model picker / switcher
-- **ModelPicker** — Chip dropdown (provider-color dot): optional **Auto** row pinned on top (`autoOption`, Talk composer only — the economy director, see §"Auto policy"), Local-only filter, Recommended (depth/speed/cost), Recents (last 3), per-provider groups with `$in/$out · ctx` + tag pills; optional `allowedProviders` (e.g. CLI stages → Anthropic). _Support:_ `ModelPicker.tsx`. _Entry:_ TALK composer, Direct stage flow.
+- **ModelPicker** — Chip dropdown (provider-color dot): optional **Auto** row pinned on top (`autoOption`, Talk composer only — the economy director, see §"Auto policy"), Local-only filter, Recommended (depth/speed/cost), Recents (last 3), per-provider groups with `$in/$out · ctx` + tag pills; optional `allowedProviders` (e.g. CLI stages → Anthropic). The catalog is shared (`providersStore`) and live: a model added or edited in Settings › Models shows up without a remount — Settings refreshes the store after saving, and the picker re-reads the catalog (and the tier map) every time it opens. _Support:_ `ModelPicker.tsx`, `stores/providersStore.ts`. _Entry:_ TALK composer, Direct stage flow.
 - **ModelSwitcher** — Titlebar popover grouped by provider with a cost badge ($/$$/$$$) + meta; selecting calls `switchAgent`. _Support:_ `ModelSwitcher.tsx`. _Entry:_ titlebar. (Its old `⌘⇧M` binding was retired; `⌘⇧M` now opens Mission Control.)
 
 ### "Zero wasted tokens / cost savings" value proposition

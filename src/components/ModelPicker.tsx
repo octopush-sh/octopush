@@ -2,8 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
-import type { ModelInfo, ProviderConfig } from "../lib/types";
+import type { ModelInfo } from "../lib/types";
 import { AUTO_MODEL } from "../lib/policy";
+import { useProvidersStore } from "../stores/providersStore";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
 const RECENTS_KEY = "octopush.modelPicker.recents";
@@ -74,14 +75,21 @@ export function ModelPicker({
   allowedProviders,
   autoOption = false,
 }: Props) {
-  const [providers, setProviders] = useState<ProviderConfig[]>([]);
-  // The tier map, for the Auto row's "runs on <strong model>" line.
+  // Shared catalog — a model saved in Settings · Models shows up here live.
+  const catalog = useProvidersStore((s) => s.providers);
+  const refreshCatalog = useProvidersStore((s) => s.refresh);
+  const providers = useMemo(
+    () => catalog.filter((p) => p.enabled && p.models.length > 0),
+    [catalog],
+  );
+  const [open, setOpen] = useState(false);
+  // The tier map, for the Auto row's "runs on <strong model>" line. Re-read
+  // on open so a tier remapped in Settings is reflected without a remount.
   const [tiers, setTiers] = useState<Record<string, string>>({});
   useEffect(() => {
     if (!autoOption) return;
     ipc.getSettings().then((s) => setTiers(s.modelTiers ?? {})).catch(() => {});
-  }, [autoOption]);
-  const [open, setOpen] = useState(false);
+  }, [autoOption, open]);
   const [recents, setRecents] = useState<string[]>(() => loadRecents());
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -91,11 +99,14 @@ export function ModelPicker({
     placement: "below" | "above";
   } | null>(null);
 
+  // Load on mount and re-read on every open, so the list is never stale
+  // regardless of which path wrote the catalog.
   useEffect(() => {
-    ipc.listProviders().then((provs) => {
-      setProviders(provs.filter((p) => p.enabled && p.models.length > 0));
-    });
-  }, []);
+    void refreshCatalog();
+  }, [refreshCatalog]);
+  useEffect(() => {
+    if (open) void refreshCatalog();
+  }, [open, refreshCatalog]);
 
   const PANEL_W = 300;
   const updatePosition = useCallback(() => {

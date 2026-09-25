@@ -1,4 +1,5 @@
 import { ipc } from "./ipc";
+import { useProvidersStore } from "../stores/providersStore";
 
 /**
  * Persist an Anthropic API key + enable the provider, via the SAME path
@@ -35,4 +36,5 @@ export async function saveAnthropicKey(key: string): Promise<void> {
     ...current,
     providerKeys: { ...current.providerKeys, anthropic: trimmed },
   });
+  await useProvidersStore.getState().refresh();
 }
