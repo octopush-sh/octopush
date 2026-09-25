@@ -15,12 +15,18 @@ interface ProvidersState {
   refresh: () => Promise<void>;
 }
 
+// Refreshes can overlap (the picker opening while Settings saves); only the
+// latest request may write, so a slow stale read never clobbers a newer one.
+let latestRequest = 0;
+
 export const useProvidersStore = create<ProvidersState>((set) => ({
   providers: [],
   loaded: false,
   refresh: async () => {
+    const request = ++latestRequest;
     try {
       const providers = await ipc.listProviders();
+      if (request !== latestRequest) return;
       set({ providers, loaded: true });
     } catch {
       // Keep the last good catalog; a failed read shouldn't blank the picker.

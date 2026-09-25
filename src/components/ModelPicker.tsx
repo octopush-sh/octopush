@@ -88,7 +88,9 @@ export function ModelPicker({
   const [tiers, setTiers] = useState<Record<string, string>>({});
   useEffect(() => {
     if (!autoOption) return;
+    if (!open && Object.keys(tiers).length > 0) return; // mount or open, not close
     ipc.getSettings().then((s) => setTiers(s.modelTiers ?? {})).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoOption, open]);
   const [recents, setRecents] = useState<string[]>(() => loadRecents());
   const containerRef = useRef<HTMLDivElement>(null);

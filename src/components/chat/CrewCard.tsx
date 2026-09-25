@@ -322,6 +322,8 @@ function CrewRow({
           title="Open the work journal in the Companion"
           className="flex min-w-0 flex-1 items-baseline gap-2 overflow-hidden text-left transition-colors duration-[180ms] hover:text-octo-brass"
         >
+          {/* Everything but the status badges may truncate; the live activity
+              gives way first (shrink-[100]) so the task title survives. */}
           <span className="min-w-[6rem] truncate text-[12px] text-octo-ivory" title={agent.description}>
             {agent.description}
           </span>
@@ -351,7 +353,7 @@ function CrewRow({
             </span>
           )}
           {activity && (
-            <span className="min-w-0 truncate font-mono text-[11px] text-octo-sage" title={activity}>
+            <span className="min-w-0 shrink-[100] truncate font-mono text-[11px] text-octo-sage" title={activity}>
               {activity}
             </span>
           )}
