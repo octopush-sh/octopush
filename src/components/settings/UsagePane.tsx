@@ -20,7 +20,7 @@ import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
 import {
-  PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, useChartColors,
+  PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, usd, useChartColors,
   type ChartColors,
 } from "./shared";
 
@@ -107,10 +107,6 @@ export function pricingAgeDays(refreshedAt: string | null, now: Date = new Date(
   return Math.max(0, Math.floor((now.getTime() - t) / 86_400_000));
 }
 
-function usd(n: number): string {
-  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
-}
-
 function hitPct(slice: { cacheHitPct: number | null; cacheTracked: boolean }): string {
   return slice.cacheHitPct == null ? "—" : `${slice.cacheHitPct.toFixed(0)}%`;
 }
@@ -161,12 +157,6 @@ export function UsagePane() {
     }
     // Cloud vs local is a side figure; a failure just hides it.
     ipc.getUsageBreakdown(range.start, range.end).then(setBreakdown).catch(() => {});
-    // The gateway's side of the ledger: absent when no provider is one, and
-    // never a reason to fail the page. Backend-cached, so the poll is cheap.
-    ipc
-      .getGatewayReconciliation(range.start, range.end, -new Date().getTimezoneOffset())
-      .then(setGateway)
-      .catch(() => {});
   }, [period, custom, mode]);
 
   useEffect(() => {
@@ -174,6 +164,23 @@ export function UsagePane() {
     const id = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(id);
   }, [load]);
+
+  // The gateway's side of the ledger: absent when no provider is one, and
+  // never a reason to fail the page. It compares every mode (the gateway
+  // saw every request), so the Mode filter neither scopes nor re-fetches
+  // it; it follows the period, on the same cadence, backend-cached.
+  useEffect(() => {
+    const fetch = () => {
+      const range = periodRange(period, custom);
+      ipc
+        .getGatewayReconciliation(range.start, range.end, -new Date().getTimezoneOffset())
+        .then(setGateway)
+        .catch(() => {});
+    };
+    fetch();
+    const id = setInterval(fetch, POLL_MS);
+    return () => clearInterval(id);
+  }, [period, custom]);
 
   useEffect(() => {
     loadBudgets();
@@ -515,7 +522,7 @@ export function UsagePane() {
             </p>
           </div>
 
-          {gateway && <GatewaySection report={gateway} />}
+          {gateway && <GatewaySection report={gateway} filtered={mode !== "all"} />}
 
           {breakdown && breakdown.localTokens > 0 && (
             <div className="mt-8 max-w-[860px]">

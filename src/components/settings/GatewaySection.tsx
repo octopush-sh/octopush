@@ -6,11 +6,7 @@
 // transcripts, so RUN can only account for the turns — and a gateway-side key
 // budget is the one a 429 "budget exceeded" refers to.
 import type { GatewayReconciliation } from "../../lib/types";
-import { SectionLabel, Stat, formatTokens } from "./shared";
-
-function usd(n: number): string {
-  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
-}
+import { SectionLabel, Stat, formatTokens, usd } from "./shared";
 
 /** A budget reset instant as a short calendar date; the raw value when
  *  it does not parse. */
@@ -44,7 +40,10 @@ export function budgetLine(r: GatewayReconciliation): string | null {
   return `${over ? "Key budget exhausted" : "Key budget"} · ${usd(spent)} of ${usd(g.keyMaxBudgetUsd)}${reset}`;
 }
 
-export function GatewaySection({ report }: { report: GatewayReconciliation }) {
+/** `filtered`: the page's Mode filter is on. The comparison is always every
+ *  mode — the gateway saw every request — so the section says so rather
+ *  than show a "ledger" figure the rest of the page contradicts. */
+export function GatewaySection({ report, filtered = false }: { report: GatewayReconciliation; filtered?: boolean }) {
   const g = report.gateway;
   const budget = budgetLine(report);
   const over = g.keyMaxBudgetUsd != null && (g.keySpendUsd ?? 0) >= g.keyMaxBudgetUsd;
@@ -152,6 +151,7 @@ export function GatewaySection({ report }: { report: GatewayReconciliation }) {
 
       <p className="mt-2 text-[11px] leading-[1.55] text-octo-mute">
         RUN counts the turns Claude Code writes to its transcripts. The gateway also bills its service calls and prompt-cache upkeep, which leave no transcript.
+        {filtered && " Compared against every mode, not only the one selected above."}
         {report.ledgerOnlyModels.length > 0 && ` Not compared: ${report.ledgerOnlyModels.join(", ")}.`}
         {report.note && ` ${report.note}`}
       </p>

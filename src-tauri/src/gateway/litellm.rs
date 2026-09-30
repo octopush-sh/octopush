@@ -28,13 +28,19 @@ pub struct LiteLlm;
 /// root of all of them.
 pub fn root_url(base_url: &str) -> String {
     let mut base = base_url.trim().trim_end_matches('/');
-    for suffix in ["/v1/messages", "/v1", "/anthropic", "/openai"] {
-        if let Some(rest) = base.strip_suffix(suffix) {
-            base = rest;
+    // Peel until nothing matches: `…/anthropic/v1/messages` is three layers.
+    loop {
+        let before = base;
+        for suffix in ["/messages", "/v1", "/anthropic", "/openai"] {
+            if let Some(rest) = base.strip_suffix(suffix) {
+                base = rest.trim_end_matches('/');
+            }
+        }
+        if base == before {
             break;
         }
     }
-    base.trim_end_matches('/').to_string()
+    base.to_string()
 }
 
 async fn get_json(client: &reqwest::Client, url: &str, api_key: &str) -> Result<(u16, Value), String> {
@@ -63,6 +69,16 @@ fn i64_of(v: Option<&Value>) -> i64 {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
         Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
+    }
+}
+
+/// A daily-activity request count: the successful ones when the deployment
+/// reports them (zero included — a day the key was over budget billed
+/// nothing), else every request.
+fn billed_requests_of(m: &Value) -> i64 {
+    match m.get("successful_requests") {
+        Some(v) if !v.is_null() => i64_of(Some(v)),
+        _ => i64_of(m.get("api_requests")),
     }
 }
 
@@ -174,10 +190,7 @@ pub fn parse_daily_activity(body: &Value, start_day: &str, end_day: &str) -> Opt
         any = true;
         let m = day.get("metrics").cloned().unwrap_or(Value::Null);
         spend.cost_usd += f64_of(m.get("spend")).unwrap_or(0.0);
-        spend.requests += {
-            let ok = i64_of(m.get("successful_requests"));
-            if ok > 0 { ok } else { i64_of(m.get("api_requests")) }
-        };
+        spend.requests += billed_requests_of(&m);
         spend.prompt_tokens += i64_of(m.get("prompt_tokens"));
         spend.completion_tokens += i64_of(m.get("completion_tokens"));
         if let Some(models) = day.get("breakdown").and_then(|b| b.get("models")).and_then(|x| x.as_object()) {
@@ -185,10 +198,7 @@ pub fn parse_daily_activity(body: &Value, start_day: &str, end_day: &str) -> Opt
                 let mm = entry.get("metrics").cloned().unwrap_or_else(|| entry.clone());
                 let e = by.entry(name.clone()).or_insert_with(|| GatewayModelSpend { model: name.clone(), ..Default::default() });
                 e.cost_usd += f64_of(mm.get("spend")).unwrap_or(0.0);
-                e.requests += {
-                    let ok = i64_of(mm.get("successful_requests"));
-                    if ok > 0 { ok } else { i64_of(mm.get("api_requests")) }
-                };
+                e.requests += billed_requests_of(&mm);
                 e.prompt_tokens += i64_of(mm.get("prompt_tokens"));
                 e.completion_tokens += i64_of(mm.get("completion_tokens"));
             }
@@ -278,6 +288,9 @@ mod tests {
         assert_eq!(root_url("https://llm.corp/anthropic"), "https://llm.corp");
         assert_eq!(root_url("https://llm.corp"), "https://llm.corp");
         assert_eq!(root_url("https://llm.corp/gateway/v1"), "https://llm.corp/gateway");
+        // Every shape the Anthropic adapter accepts resolves to the same root.
+        assert_eq!(root_url("https://llm.corp/anthropic/v1"), "https://llm.corp");
+        assert_eq!(root_url("https://llm.corp/anthropic/v1/messages/"), "https://llm.corp");
     }
 
     #[test]
@@ -359,6 +372,14 @@ mod tests {
         assert_eq!(s.by_model[0].model, "claude-sonnet-5");
         assert_eq!(s.by_model[1].requests, 14);
         assert!(s.note.is_some());
+        // A day that reports zero successful requests billed nothing: its
+        // failed requests are never counted as billed ones.
+        let over_budget = json!({"results": [
+            {"date": "2026-10-01", "metrics": {"spend": 0, "api_requests": 40, "successful_requests": 0, "failed_requests": 40}},
+            {"date": "2026-10-02", "metrics": {"spend": 1.0, "api_requests": 7}}
+        ]});
+        let z = parse_daily_activity(&over_budget, "2026-10-01", "2026-10-02").unwrap();
+        assert_eq!(z.requests, 7, "only the deployment that reports no success count falls back to every request");
         // No day in range: an empty spend, still on the daily basis.
         let none = parse_daily_activity(&body, "2026-10-05", "2026-10-06").unwrap();
         assert_eq!(none.requests, 0);

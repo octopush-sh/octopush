@@ -53,6 +53,13 @@ describe("GatewaySection", () => {
     expect(screen.getByTestId("usage-gateway").textContent).toContain("Only the key's running total was readable.");
   });
 
+  it("says it compares every mode when the page's Mode filter is on", () => {
+    const { rerender } = render(<GatewaySection report={base} />);
+    expect(screen.getByTestId("usage-gateway").textContent).not.toContain("every mode");
+    rerender(<GatewaySection report={base} filtered />);
+    expect(screen.getByTestId("usage-gateway").textContent).toContain("Compared against every mode");
+  });
+
   it("carries the UTC-day caveat of the daily reading", () => {
     render(<GatewaySection report={{ ...base, basis: "daily", unmatchedRequests: null, unmatchedCostUsd: null, note: "The gateway reports whole UTC days." }} />);
     expect(screen.getByTestId("usage-gateway").textContent).toContain("whole UTC days");

@@ -8,8 +8,8 @@
 //! gateway-side key budget can refuse a call the ledger never saw coming.
 //! This module asks the gateway for the period the Usage page shows and
 //! reports the gap: totals, per model, and — when the gateway's request
-//! logs are readable — per request, matched by the provider's message id
-//! against the ledger's `cc:msg:<id>` keys.
+//! logs are readable — per request, matched by the ids the ledger knows
+//! (Claude Code's request id and the provider's message id per row).
 //!
 //! Extensible by design: [`SpendGateway`] is the contract, [`gateways`]
 //! lists the known implementations. A new gateway is one file and one line.
@@ -51,7 +51,8 @@ pub struct GatewayIdentity {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayRequest {
-    /// The provider's response id (`msg_…`) — what the ledger keys on.
+    /// The request's id as the gateway logged it — matched against the
+    /// ledger's request and message ids.
     pub id: String,
     pub ts_utc: String,
     pub model: String,
@@ -212,9 +213,17 @@ pub struct GatewayReconciliation {
 #[derive(Clone, Debug, Default)]
 pub struct LedgerSide {
     pub by_model: Vec<ModelUsage>,
-    /// `idempotency_key` of every ledger row in the period (`cc:msg:<id>`,
-    /// `cc:<request id>`) — what a gateway request id is matched against.
-    pub keys: HashSet<String>,
+    /// Every id the ledger's rows in the period carry, bare: the request id
+    /// a row is keyed on (`cc:<request id>` → `<request id>`, `cc:msg:<id>`
+    /// → `<id>`) and the provider's message id recorded beside it. A
+    /// gateway request is accounted for when its id is one of them.
+    pub ids: HashSet<String>,
+}
+
+/// A ledger dedupe key without its `cc:` / `cc:msg:` prefix — the bare
+/// provider id. Keys of other shapes come back unchanged.
+pub fn bare_ledger_id(key: &str) -> &str {
+    key.strip_prefix("cc:msg:").or_else(|| key.strip_prefix("cc:")).unwrap_or(key)
 }
 
 /// Pure: fold the two sides into the report. Tested without a network.
@@ -272,11 +281,15 @@ pub fn reconcile(
     let ledger_cost_usd: f64 = ledger_by.values().map(|v| v.0).sum();
     let ledger_calls: i64 = ledger_by.values().map(|v| v.1).sum();
     let ledger_tokens: i64 = ledger_by.values().map(|v| v.2).sum();
+    // On the `key` basis the gateway's figure is the key's running total
+    // since its last budget reset, not this period's spend: there is no gap
+    // to compute, and claiming one would colour the page over nothing.
+    let comparable = spend.basis != "key";
 
     // Request-level matching, when the gateway gave us rows: a gateway id
-    // is accounted for when a ledger row carries it as `cc:msg:<id>` or
-    // `cc:<id>`; every other successful request is spend the ledger never
-    // saw (service calls, cache upkeep, retries).
+    // is accounted for when a ledger row carries it (as its request id or
+    // its message id); every other successful request is spend the ledger
+    // never saw (service calls, cache upkeep, retries).
     let (unmatched_requests, unmatched_cost_usd, unmatched_by_model) = match &spend.requests_detail {
         Some(rows) => {
             let mut n = 0i64;
@@ -286,9 +299,7 @@ pub fn reconcile(
                 if !r.success {
                     continue;
                 }
-                let matched =
-                    ledger.keys.contains(&format!("cc:msg:{}", r.id)) || ledger.keys.contains(&format!("cc:{}", r.id));
-                if matched {
+                if ledger.ids.contains(&r.id) {
                     continue;
                 }
                 n += 1;
@@ -317,8 +328,8 @@ pub fn reconcile(
         ledger_cost_usd,
         ledger_calls,
         ledger_tokens,
-        unaccounted_cost_usd: (spend.cost_usd - ledger_cost_usd).max(0.0),
-        unaccounted_requests: (spend.requests - ledger_calls).max(0),
+        unaccounted_cost_usd: if comparable { (spend.cost_usd - ledger_cost_usd).max(0.0) } else { 0.0 },
+        unaccounted_requests: if comparable { (spend.requests - ledger_calls).max(0) } else { 0 },
         by_model,
         ledger_only_models: ledger_only,
         unmatched_requests,
@@ -348,11 +359,21 @@ const IDENTITY_TTL: Duration = Duration::from_secs(10 * 60);
 const SPEND_TTL: Duration = Duration::from_secs(60);
 
 /// Session-lived memory of which providers are gateways and the last
-/// reconciliation per period start.
+/// reconciliation per period.
 #[derive(Default)]
 pub struct GatewayCache {
     identities: parking_lot::Mutex<HashMap<String, (Instant, Option<GatewayIdentity>)>>,
-    spends: parking_lot::Mutex<HashMap<(String, String), (Instant, GatewayReconciliation)>>,
+    spends: parking_lot::Mutex<HashMap<(String, String, String), (Instant, GatewayReconciliation)>>,
+}
+
+/// The cache key of a period: its start, and its end to the minute. A
+/// preset's end is "now" and moves with every 10s poll; truncating it
+/// keeps the poll on the cached answer within the minute the TTL allows,
+/// while a changed custom range (a different end day) is never served
+/// the previous range's figures.
+fn period_key(provider: &str, start: &str, end: &str) -> (String, String, String) {
+    let end_minute: String = end.chars().take("2026-09-30T22:59".len()).collect();
+    (provider.to_string(), start.to_string(), end_minute)
 }
 
 impl GatewayCache {
@@ -373,17 +394,15 @@ impl GatewayCache {
         self.spends.lock().clear();
     }
 
-    pub fn cached_spend(&self, provider: &str, start: &str) -> Option<GatewayReconciliation> {
+    pub fn cached_spend(&self, provider: &str, start: &str, end: &str) -> Option<GatewayReconciliation> {
         let map = self.spends.lock();
-        map.get(&(provider.to_string(), start.to_string()))
+        map.get(&period_key(provider, start, end))
             .filter(|(at, _)| at.elapsed() < SPEND_TTL)
             .map(|(_, r)| r.clone())
     }
 
-    pub fn remember_spend(&self, provider: &str, start: &str, r: GatewayReconciliation) {
-        self.spends
-            .lock()
-            .insert((provider.to_string(), start.to_string()), (Instant::now(), r));
+    pub fn remember_spend(&self, provider: &str, start: &str, end: &str, r: GatewayReconciliation) {
+        self.spends.lock().insert(period_key(provider, start, end), (Instant::now(), r));
     }
 }
 
@@ -509,7 +528,7 @@ mod tests {
                 ledger_model("claude-sonnet-5", 7.28, 75, 15_400_000),
                 ledger_model("local-llm", 0.0, 3, 1000),
             ],
-            keys: ["cc:msg:msg_a".to_string()].into_iter().collect(),
+            ids: ["msg_a".to_string()].into_iter().collect(),
         };
         let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
         assert_eq!(r.gateway_requests, 114);
@@ -542,13 +561,46 @@ mod tests {
         };
         let ledger = LedgerSide {
             by_model: vec![ledger_model("claude-sonnet-5", 6.0, 12, 100)],
-            keys: HashSet::new(),
+            ids: HashSet::new(),
         };
         let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
         assert_eq!(r.unmatched_requests, None);
         assert_eq!(r.unaccounted_cost_usd, 0.0);
         assert_eq!(r.unaccounted_requests, 0);
         assert_eq!(r.note.as_deref(), Some("UTC days"));
+    }
+
+    #[test]
+    fn key_basis_is_a_running_total_so_it_reports_no_gap() {
+        // The key's total since its last reset dwarfs any period's ledger;
+        // that difference is not a gap and must not be shown as one.
+        let spend = GatewaySpend { cost_usd: 7061.0, basis: "key".into(), ..Default::default() };
+        let ledger = LedgerSide { by_model: vec![ledger_model("claude-sonnet-5", 40.0, 12, 100)], ids: HashSet::new() };
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        assert_eq!(r.gateway_cost_usd, 7061.0, "the total itself is still shown");
+        assert_eq!(r.unaccounted_cost_usd, 0.0);
+        assert_eq!(r.unaccounted_requests, 0);
+        assert_eq!(r.basis, "key");
+    }
+
+    #[test]
+    fn bare_ids_drop_the_ledger_prefixes() {
+        assert_eq!(bare_ledger_id("cc:req_1"), "req_1");
+        assert_eq!(bare_ledger_id("cc:msg:msg_1"), "msg_1");
+        assert_eq!(bare_ledger_id("direct:abc"), "direct:abc");
+    }
+
+    #[test]
+    fn spend_cache_is_per_period_with_the_end_to_the_minute() {
+        let cache = GatewayCache::default();
+        let spend = GatewaySpend { basis: "logs".into(), ..Default::default() };
+        let r = reconcile(identity(), "s", "e", &spend, &LedgerSide::default(), "now");
+        cache.remember_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-30T22:59:11.000Z", r);
+        // Same minute, later second: the poll is served from memory.
+        assert!(cache.cached_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-30T22:59:41.000Z").is_some());
+        // The next minute, or a different end day: asked again.
+        assert!(cache.cached_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-30T23:00:01.000Z").is_none());
+        assert!(cache.cached_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-05T22:59:59.999Z").is_none());
     }
 
     #[test]

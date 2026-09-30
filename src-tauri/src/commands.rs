@@ -211,9 +211,10 @@ pub async fn get_usage_report(
 /// the same period against what the ledger recorded, per model and — when
 /// the gateway's request logs are readable — per request. `None` when no
 /// provider is a gateway (or the gateway could not be reached): the page
-/// simply has no such section. Detection and the gateway's answer are
-/// cached (`AppState.gateways`) so the page's 10s poll asks the gateway at
-/// most once a minute.
+/// simply has no such section. The ledger side is every mode, whatever the
+/// page's Mode filter shows. Detection and the gateway's answer are cached
+/// (`AppState.gateways`) so the page's 10s poll asks the gateway at most
+/// once a minute.
 #[tauri::command]
 pub async fn get_gateway_reconciliation(
     state: State<'_, AppState>,
@@ -222,8 +223,11 @@ pub async fn get_gateway_reconciliation(
     utc_offset_minutes: Option<i32>,
 ) -> AppResult<Option<crate::gateway::GatewayReconciliation>> {
     use crate::gateway::{self, LedgerSide, ProviderEndpoint};
-    // Enabled cloud providers with a key, in catalog order; the base URL as
-    // the calls use it (settings override first).
+    // Enabled cloud providers with a key, resolved the way the calls resolve
+    // them: the settings file first, then the provider's env var; the base
+    // URL as the calls use it (settings override first). Settings are read
+    // once — this runs on every 10s poll.
+    let settings = crate::settings::load_settings().unwrap_or_default();
     let endpoints: Vec<ProviderEndpoint> = {
         let router = state.router.lock();
         let mut eps: Vec<ProviderEndpoint> = router
@@ -231,8 +235,24 @@ pub async fn get_gateway_reconciliation(
             .into_iter()
             .filter(|p| p.enabled && !p.local)
             .filter_map(|p| {
-                let key = crate::settings::get_provider_key(&p.name)?;
-                let base_url = crate::settings::get_provider_base_url(&p.name).unwrap_or_else(|| p.api_base.clone());
+                let key = settings
+                    .provider_keys
+                    .get(&p.name)
+                    .cloned()
+                    .filter(|k| !k.trim().is_empty())
+                    .or_else(|| {
+                        if p.api_key_env.is_empty() {
+                            None
+                        } else {
+                            std::env::var(&p.api_key_env).ok().filter(|k| !k.trim().is_empty())
+                        }
+                    })?;
+                let base_url = settings
+                    .provider_base_urls
+                    .get(&p.name)
+                    .cloned()
+                    .filter(|u| !u.trim().is_empty())
+                    .unwrap_or_else(|| p.api_base.clone());
                 Some(ProviderEndpoint { provider: p.name.clone(), base_url, api_key: key })
             })
             .collect();
@@ -242,7 +262,7 @@ pub async fn get_gateway_reconciliation(
     let Some((ep, identity)) = gateway::detect(&state.gateways, &endpoints).await else {
         return Ok(None);
     };
-    if let Some(cached) = state.gateways.cached_spend(&ep.provider, &start_iso) {
+    if let Some(cached) = state.gateways.cached_spend(&ep.provider, &start_iso, &end_iso) {
         return Ok(Some(cached));
     }
     let spend = match gateway::fetch_spend(&ep, &identity, &start_iso, &end_iso).await {
@@ -252,16 +272,18 @@ pub async fn get_gateway_reconciliation(
             return Ok(None);
         }
     };
+    // The ledger side is always every mode: the gateway saw every request,
+    // so a per-mode slice would read as a gap that is only the filter.
     let ledger = {
         let db = state.db.lock();
         let report = db.usage_report(&start_iso, &end_iso, None, utc_offset_minutes.unwrap_or(0))?;
         LedgerSide {
             by_model: report.by_model,
-            keys: db.ledger_keys_between(&start_iso, &end_iso)?.into_iter().collect(),
+            ids: db.ledger_request_ids_between(&start_iso, &end_iso)?.into_iter().collect(),
         }
     };
     let r = gateway::reconcile(identity, &start_iso, &end_iso, &spend, &ledger, &Utc::now().to_rfc3339());
-    state.gateways.remember_spend(&ep.provider, &start_iso, r.clone());
+    state.gateways.remember_spend(&ep.provider, &start_iso, &end_iso, r.clone());
     Ok(Some(r))
 }
 

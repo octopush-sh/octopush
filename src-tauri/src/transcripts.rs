@@ -84,6 +84,9 @@ pub struct TranscriptUsage {
     /// The ledger idempotency key: `cc:<requestId>`, else `cc:msg:<message id>`
     /// — one per billed API call, unique across sessions and files.
     pub key: String,
+    /// The provider's message id (`msg_…`), kept beside the key so a
+    /// gateway's request log can be matched whichever id it recorded.
+    pub message_id: Option<String>,
     /// RFC3339 UTC.
     pub ts_utc: String,
     pub cwd: Option<String>,
@@ -137,9 +140,10 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
     if model.starts_with('<') {
         return None;
     }
+    let message_id = message.get("id").and_then(|i| i.as_str()).filter(|k| !k.is_empty()).map(str::to_string);
     let key = match v.get("requestId").and_then(|r| r.as_str()).filter(|k| !k.is_empty()) {
         Some(req) => format!("cc:{req}"),
-        None => format!("cc:msg:{}", message.get("id").and_then(|i| i.as_str()).filter(|k| !k.is_empty())?),
+        None => format!("cc:msg:{}", message_id.as_deref()?),
     };
     let session_id = v
         .get("sessionId")
@@ -155,6 +159,7 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
     Some(TranscriptUsage {
         session_id,
         key,
+        message_id,
         ts_utc,
         cwd,
         model,
@@ -456,7 +461,11 @@ impl TranscriptIngestor {
                     thread_id: None,
                     origin: None,
                 };
-                if db.upsert_spend_event_by_key(&ev)? {
+                let new_row = db.upsert_spend_event_by_key(&ev)?;
+                if let Some(msg) = &u.message_id {
+                    db.set_spend_provider_msg_id(&u.key, msg)?;
+                }
+                if new_row {
                     inserted += 1;
                     // Only a message from the last few minutes says anything
                     // about the session or the mission *now*.
