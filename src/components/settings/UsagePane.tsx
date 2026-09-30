@@ -12,8 +12,9 @@ import { Plus, RefreshCw, X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { useBudgetsStore } from "../../stores/budgetsStore";
 import type {
-  Budget, BudgetPeriod, BudgetScope, SourceUsage, UsageBreakdown, UsageReport,
+  Budget, BudgetPeriod, BudgetScope, GatewayReconciliation, SourceUsage, UsageBreakdown, UsageReport,
 } from "../../lib/types";
+import { GatewaySection } from "./GatewaySection";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
@@ -138,6 +139,8 @@ export function UsagePane() {
   const [report, setReport] = useState<UsageReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [breakdown, setBreakdown] = useState<UsageBreakdown | null>(null);
+  // What the gateway billed vs the ledger — only when a provider is one.
+  const [gateway, setGateway] = useState<GatewayReconciliation | null>(null);
 
   // The range is computed on every load, never memoised: a preset ends
   // *now*, so each 10s poll must move its end (and "today" must roll over
@@ -158,6 +161,12 @@ export function UsagePane() {
     }
     // Cloud vs local is a side figure; a failure just hides it.
     ipc.getUsageBreakdown(range.start, range.end).then(setBreakdown).catch(() => {});
+    // The gateway's side of the ledger: absent when no provider is one, and
+    // never a reason to fail the page. Backend-cached, so the poll is cheap.
+    ipc
+      .getGatewayReconciliation(range.start, range.end, -new Date().getTimezoneOffset())
+      .then(setGateway)
+      .catch(() => {});
   }, [period, custom, mode]);
 
   useEffect(() => {
@@ -505,6 +514,8 @@ export function UsagePane() {
               Cache hit is cache read over all prompt tokens (input + cache read + cache write). A write is a miss: it is billed at a premium and only pays off when a later call reads it.
             </p>
           </div>
+
+          {gateway && <GatewaySection report={gateway} />}
 
           {breakdown && breakdown.localTokens > 0 && (
             <div className="mt-8 max-w-[860px]">

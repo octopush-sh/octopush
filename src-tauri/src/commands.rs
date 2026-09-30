@@ -206,6 +206,65 @@ pub async fn get_usage_report(
     Ok(report)
 }
 
+/// The Usage page's gateway reconciliation: when a provider's base URL
+/// fronts an LLM gateway (LiteLLM), what the gateway billed the key over
+/// the same period against what the ledger recorded, per model and — when
+/// the gateway's request logs are readable — per request. `None` when no
+/// provider is a gateway (or the gateway could not be reached): the page
+/// simply has no such section. Detection and the gateway's answer are
+/// cached (`AppState.gateways`) so the page's 10s poll asks the gateway at
+/// most once a minute.
+#[tauri::command]
+pub async fn get_gateway_reconciliation(
+    state: State<'_, AppState>,
+    start_iso: String,
+    end_iso: String,
+    utc_offset_minutes: Option<i32>,
+) -> AppResult<Option<crate::gateway::GatewayReconciliation>> {
+    use crate::gateway::{self, LedgerSide, ProviderEndpoint};
+    // Enabled cloud providers with a key, in catalog order; the base URL as
+    // the calls use it (settings override first).
+    let endpoints: Vec<ProviderEndpoint> = {
+        let router = state.router.lock();
+        let mut eps: Vec<ProviderEndpoint> = router
+            .list_providers()
+            .into_iter()
+            .filter(|p| p.enabled && !p.local)
+            .filter_map(|p| {
+                let key = crate::settings::get_provider_key(&p.name)?;
+                let base_url = crate::settings::get_provider_base_url(&p.name).unwrap_or_else(|| p.api_base.clone());
+                Some(ProviderEndpoint { provider: p.name.clone(), base_url, api_key: key })
+            })
+            .collect();
+        eps.sort_by(|a, b| a.provider.cmp(&b.provider));
+        eps
+    };
+    let Some((ep, identity)) = gateway::detect(&state.gateways, &endpoints).await else {
+        return Ok(None);
+    };
+    if let Some(cached) = state.gateways.cached_spend(&ep.provider, &start_iso) {
+        return Ok(Some(cached));
+    }
+    let spend = match gateway::fetch_spend(&ep, &identity, &start_iso, &end_iso).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(gateway = %identity.host, error = %e, "gateway spend unavailable");
+            return Ok(None);
+        }
+    };
+    let ledger = {
+        let db = state.db.lock();
+        let report = db.usage_report(&start_iso, &end_iso, None, utc_offset_minutes.unwrap_or(0))?;
+        LedgerSide {
+            by_model: report.by_model,
+            keys: db.ledger_keys_between(&start_iso, &end_iso)?.into_iter().collect(),
+        }
+    };
+    let r = gateway::reconcile(identity, &start_iso, &end_iso, &spend, &ledger, &Utc::now().to_rfc3339());
+    state.gateways.remember_spend(&ep.provider, &start_iso, r.clone());
+    Ok(Some(r))
+}
+
 #[tauri::command]
 pub async fn record_token_event(
     state: State<'_, AppState>,
@@ -3590,8 +3649,11 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
 }
 
 #[tauri::command]
-pub async fn save_settings(settings: crate::settings::AppSettings) -> AppResult<()> {
-    crate::settings::save_settings(&settings)
+pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
+    crate::settings::save_settings(&settings)?;
+    // A key or base URL may have changed: re-detect gateways on the next read.
+    state.gateways.invalidate();
+    Ok(())
 }
 
 #[tauri::command]
@@ -3613,6 +3675,7 @@ pub async fn save_providers(
     // app restart — which strands genesis's inline-key readiness check).
     let updated = crate::provider_router::ProviderRouter::load()?;
     *state.router.lock() = updated;
+    state.gateways.invalidate();
     Ok(())
 }
 

@@ -407,6 +407,7 @@ import type {
   TokenReport,
   UsageBreakdown,
   UsageReport,
+  GatewayReconciliation,
   Workspace,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
@@ -802,6 +803,11 @@ export const ipc = {
    *  buckets follow `utcOffsetMinutes` (the viewer's local offset). */
   getUsageReport: (startIso: string, endIso: string, surface: string | null, utcOffsetMinutes: number) =>
     invoke<UsageReport>("get_usage_report", { startIso, endIso, surface, utcOffsetMinutes }),
+
+  /** The Usage page's gateway reconciliation for a period; `null` when no
+   *  provider fronts a gateway (or it could not be reached). */
+  getGatewayReconciliation: (startIso: string, endIso: string, utcOffsetMinutes: number) =>
+    invoke<GatewayReconciliation | null>("get_gateway_reconciliation", { startIso, endIso, utcOffsetMinutes }),
 
   refreshPricing: () =>
     invoke<RefreshPricingResult>("refresh_pricing"),

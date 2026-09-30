@@ -1847,6 +1847,20 @@ impl Db {
     /// `utc_offset_minutes` is the viewer's local offset (JS
     /// `-getTimezoneOffset()`): day buckets and the active-day count follow
     /// the user's calendar, not UTC's.
+    /// Every dedupe key of a billed row in `[start, end]` — the provider
+    /// ids the ledger knows (`cc:msg:<id>` / `cc:<request id>` for RUN), for
+    /// matching a gateway's request log against what was recorded.
+    pub fn ledger_keys_between(&self, start_iso: &str, end_iso: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idempotency_key FROM spend_events
+             WHERE ts_utc >= ?1 AND ts_utc <= ?2 AND idempotency_key IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![start_iso, end_iso], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn usage_report(
         &self,
         start_iso: &str,

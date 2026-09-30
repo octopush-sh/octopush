@@ -11,10 +11,12 @@ import type { UsageReport } from "../../lib/types";
 const getUsageReport = vi.fn();
 const getUsageBreakdown = vi.fn();
 const refreshPricing = vi.fn();
+const getGatewayReconciliation = vi.fn();
 vi.mock("../../lib/ipc", () => ({
   ipc: {
     getUsageReport: (...a: unknown[]) => getUsageReport(...a),
     getUsageBreakdown: (...a: unknown[]) => getUsageBreakdown(...a),
+    getGatewayReconciliation: (...a: unknown[]) => getGatewayReconciliation(...a),
     refreshPricing: (...a: unknown[]) => refreshPricing(...a),
     exportTokenEventsCsv: vi.fn().mockResolvedValue(""),
     writeFile: vi.fn().mockResolvedValue(undefined),
@@ -75,6 +77,7 @@ beforeEach(() => {
   getUsageReport.mockReset().mockResolvedValue(REPORT);
   getUsageBreakdown.mockReset().mockResolvedValue({ cloudCostUsd: 12.5, cloudTokens: 12_000, localTokens: 0, estimatedLocalSavingsUsd: 0 });
   refreshPricing.mockReset().mockResolvedValue({ modelsUpdated: 3, modelsTotal: 5, fetchedAt: new Date().toISOString() });
+  getGatewayReconciliation.mockReset().mockResolvedValue(null);
 });
 
 describe("periodRange", () => {
@@ -168,12 +171,14 @@ describe("UsagePane", () => {
       fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "Custom" }));
     });
     expect(screen.getByLabelText("From")).toBeInTheDocument();
+    // A date the default range (the last 30 days) can never start on, so
+    // the change is a real one whatever today is.
     await act(async () => {
-      fireEvent.change(screen.getByLabelText("From"), { target: { value: "2026-09-01" } });
+      fireEvent.change(screen.getByLabelText("From"), { target: { value: "2024-01-15" } });
     });
     await waitFor(() => expect(getUsageReport.mock.calls.length).toBeGreaterThanOrEqual(4));
     const last = getUsageReport.mock.calls.at(-1) as string[];
-    expect(new Date(last[0]).getTime()).toBe(new Date(2026, 8, 1).getTime());
+    expect(new Date(last[0]).getTime()).toBe(new Date(2024, 0, 15).getTime());
   });
 
   it("nudges to refresh stale pricing and reloads after the refresh", async () => {
@@ -208,5 +213,56 @@ describe("UsagePane", () => {
     expect(screen.getByText(/3 calls carried tokens but no price/)).toBeInTheDocument();
     expect(within(screen.getByTestId("usage-stat-cache")).getByText("—")).toBeInTheDocument();
     expect(screen.getByTestId("usage-pricing-stale").textContent).toMatch(/never been refreshed/);
+  });
+});
+
+describe("UsagePane — gateway reconciliation", () => {
+  const RECON = {
+    gateway: { kind: "litellm", label: "LiteLLM", host: "llm.corp", provider: "anthropic", keyAlias: "me@corp", keyHash: "330d5a", keySpendUsd: 7061.18, keyMaxBudgetUsd: 5400, budgetResetAt: null },
+    start: "s", end: "e",
+    gatewayCostUsd: 9.85, gatewayRequests: 114, gatewayTokens: 21_280_627,
+    ledgerCostUsd: 7.28, ledgerCalls: 75, ledgerTokens: 15_400_000,
+    unaccountedCostUsd: 2.57, unaccountedRequests: 39,
+    byModel: [
+      { model: "claude-sonnet-5", gatewayCostUsd: 9.43, gatewayRequests: 100, ledgerCostUsd: 7.28, ledgerCalls: 75 },
+      { model: "moonshotai.kimi-k2.5", gatewayCostUsd: 0.42, gatewayRequests: 14, ledgerCostUsd: 0, ledgerCalls: 0 },
+    ],
+    ledgerOnlyModels: [],
+    unmatchedRequests: 39, unmatchedCostUsd: 2.57,
+    unmatchedByModel: [{ model: "claude-sonnet-5", costUsd: 2.15, requests: 25, promptTokens: 1, completionTokens: 1 }],
+    basis: "logs" as const, note: null, fetchedAt: "now",
+  };
+
+  it("has no gateway section when no provider is a gateway", async () => {
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    await waitFor(() => expect(getGatewayReconciliation).toHaveBeenCalled());
+    const [start, end, offset] = getGatewayReconciliation.mock.calls[0];
+    expect(typeof start).toBe("string");
+    expect(typeof end).toBe("string");
+    expect(offset).toBe(-new Date().getTimezoneOffset());
+    expect(screen.queryByTestId("usage-gateway")).toBeNull();
+  });
+
+  it("shows what the gateway billed against the ledger, per model, with the key budget", async () => {
+    getGatewayReconciliation.mockResolvedValue(RECON);
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    const section = await screen.findByTestId("usage-gateway");
+    expect(section.textContent).toContain("LiteLLM");
+    expect(section.textContent).toContain("llm.corp");
+    expect(within(screen.getByTestId("usage-gateway-billed")).getByText("$9.85")).toBeInTheDocument();
+    expect(within(screen.getByTestId("usage-gateway-ledger")).getByText("$7.28")).toBeInTheDocument();
+    expect(within(screen.getByTestId("usage-gateway-unaccounted")).getByText("$2.57")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-gateway-gap").textContent).toContain("26% not in the ledger");
+    expect(screen.getByTestId("usage-gateway-budget").textContent).toContain("Key budget exhausted · $7061 of $5400");
+    const models = within(screen.getByTestId("usage-gateway-models")).getAllByRole("listitem");
+    expect(models[0].textContent).toContain("claude-sonnet-5");
+    expect(models[0].textContent).toContain("gateway 100 · ledger 75");
+    expect(models[0].textContent).toContain("+$2.15");
+    expect(models[1].textContent).toContain("gateway 14 · ledger 0");
+    expect(screen.getByTestId("usage-gateway-unmatched").textContent).toContain("39 gateway requests match no ledger row ($2.57): 25 × claude-sonnet-5 $2.15");
   });
 });

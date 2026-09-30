@@ -554,6 +554,69 @@ export interface UsageReport {
   pricingRefreshedAt: string | null;
 }
 
+// ─── Gateway reconciliation (Settings → Usage) ────────────────────
+
+export interface GatewayIdentity {
+  /** `litellm` — the implementation's id. */
+  kind: string;
+  /** What the UI calls it (`LiteLLM`). */
+  label: string;
+  host: string;
+  /** The Octopush provider whose base URL is this gateway. */
+  provider: string;
+  keyAlias: string | null;
+  keyHash: string | null;
+  /** The key's running spend since its last budget reset. */
+  keySpendUsd: number | null;
+  keyMaxBudgetUsd: number | null;
+  budgetResetAt: string | null;
+}
+
+export interface GatewayModelSpend {
+  model: string;
+  costUsd: number;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+export interface ReconciledModel {
+  model: string;
+  gatewayCostUsd: number;
+  gatewayRequests: number;
+  ledgerCostUsd: number;
+  ledgerCalls: number;
+}
+
+/** What the gateway billed the key over the page's period against what the
+ *  ledger recorded. `null` from the IPC when no provider is a gateway. */
+export interface GatewayReconciliation {
+  gateway: GatewayIdentity;
+  start: string;
+  end: string;
+  gatewayCostUsd: number;
+  gatewayRequests: number;
+  /** Prompt + completion as the gateway counts them (cache included). */
+  gatewayTokens: number;
+  ledgerCostUsd: number;
+  ledgerCalls: number;
+  /** All four buckets, comparable with the gateway's count. */
+  ledgerTokens: number;
+  unaccountedCostUsd: number;
+  unaccountedRequests: number;
+  byModel: ReconciledModel[];
+  /** Ledger models with no gateway counterpart — left out of the totals. */
+  ledgerOnlyModels: string[];
+  /** With `logs` basis: gateway requests whose id is in no ledger row. */
+  unmatchedRequests: number | null;
+  unmatchedCostUsd: number | null;
+  unmatchedByModel: GatewayModelSpend[];
+  /** `logs` (per request) · `daily` (whole UTC days) · `key` (running total only). */
+  basis: "logs" | "daily" | "key";
+  note: string | null;
+  fetchedAt: string;
+}
+
 // ─── Usage breakdown (cloud vs local) ─────────────────────────────
 
 export interface UsageBreakdown {
