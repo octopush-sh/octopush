@@ -947,6 +947,10 @@ impl Db {
         // spent it — the Companion's conversation cost reads these.
         add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN thread_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN origin TEXT")?;
+        // The provider's message id beside the request id a RUN row is keyed
+        // on: a gateway logs one or the other, and reconciliation matches
+        // its rows against both. NULL on rows ingested before this column.
+        add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN provider_msg_id TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_thread ON spend_events(thread_id, ts_utc);",
         )?;
@@ -1832,6 +1836,39 @@ impl Db {
     }
 
     // ─── Usage report (Settings → Usage) ──────────────────────────
+
+    /// Record the provider's message id beside a ledger row's dedupe key
+    /// (RUN rows are keyed on Claude Code's request id; a gateway may log
+    /// either). A no-op for a key the ledger does not have.
+    pub fn set_spend_provider_msg_id(&self, idempotency_key: &str, msg_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE spend_events SET provider_msg_id = ?2 WHERE idempotency_key = ?1",
+            params![idempotency_key, msg_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every provider id the billed rows in `[start, end]` carry, bare: the
+    /// id in each row's dedupe key (`cc:<request id>` / `cc:msg:<id>` for
+    /// RUN, without the prefix) and its recorded message id — what a
+    /// gateway's request log is matched against.
+    pub fn ledger_request_ids_between(&self, start_iso: &str, end_iso: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idempotency_key, provider_msg_id FROM spend_events
+             WHERE ts_utc >= ?1 AND ts_utc <= ?2 AND idempotency_key IS NOT NULL",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![start_iso, end_iso], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })? {
+            let (key, msg) = row?;
+            out.push(crate::gateway::bare_ledger_id(&key).to_string());
+            if let Some(m) = msg.filter(|m| !m.is_empty()) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
 
     /// The Usage page's report over one date range, optionally one surface
     /// (`talk` / `run` / `review` / `direct` / `adhoc`). Reads the canonical

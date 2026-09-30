@@ -14,6 +14,7 @@ pub mod context_guard;
 pub mod db;
 pub mod entitlement;
 pub mod error;
+pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
@@ -139,6 +140,7 @@ pub fn run() {
             // Tokens
             commands::get_token_report,
             commands::get_usage_report,
+            commands::get_gateway_reconciliation,
             commands::record_token_event,
             commands::get_budget_status,
             commands::set_token_budget,

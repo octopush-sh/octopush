@@ -256,6 +256,12 @@ export function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** A dollar figure at the page's precision: cents under $100, whole
+ *  dollars from there — one rule for every Usage figure. */
+export function usd(n: number): string {
+  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
+}
+
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;

@@ -12,14 +12,15 @@ import { Plus, RefreshCw, X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { useBudgetsStore } from "../../stores/budgetsStore";
 import type {
-  Budget, BudgetPeriod, BudgetScope, SourceUsage, UsageBreakdown, UsageReport,
+  Budget, BudgetPeriod, BudgetScope, GatewayReconciliation, SourceUsage, UsageBreakdown, UsageReport,
 } from "../../lib/types";
+import { GatewaySection } from "./GatewaySection";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
 import {
-  PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, useChartColors,
+  PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, usd, useChartColors,
   type ChartColors,
 } from "./shared";
 
@@ -106,10 +107,6 @@ export function pricingAgeDays(refreshedAt: string | null, now: Date = new Date(
   return Math.max(0, Math.floor((now.getTime() - t) / 86_400_000));
 }
 
-function usd(n: number): string {
-  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
-}
-
 function hitPct(slice: { cacheHitPct: number | null; cacheTracked: boolean }): string {
   return slice.cacheHitPct == null ? "—" : `${slice.cacheHitPct.toFixed(0)}%`;
 }
@@ -138,6 +135,8 @@ export function UsagePane() {
   const [report, setReport] = useState<UsageReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [breakdown, setBreakdown] = useState<UsageBreakdown | null>(null);
+  // What the gateway billed vs the ledger — only when a provider is one.
+  const [gateway, setGateway] = useState<GatewayReconciliation | null>(null);
 
   // The range is computed on every load, never memoised: a preset ends
   // *now*, so each 10s poll must move its end (and "today" must roll over
@@ -165,6 +164,23 @@ export function UsagePane() {
     const id = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(id);
   }, [load]);
+
+  // The gateway's side of the ledger: absent when no provider is one, and
+  // never a reason to fail the page. It compares every mode (the gateway
+  // saw every request), so the Mode filter neither scopes nor re-fetches
+  // it; it follows the period, on the same cadence, backend-cached.
+  useEffect(() => {
+    const fetch = () => {
+      const range = periodRange(period, custom);
+      ipc
+        .getGatewayReconciliation(range.start, range.end, -new Date().getTimezoneOffset())
+        .then(setGateway)
+        .catch(() => {});
+    };
+    fetch();
+    const id = setInterval(fetch, POLL_MS);
+    return () => clearInterval(id);
+  }, [period, custom]);
 
   useEffect(() => {
     loadBudgets();
@@ -505,6 +521,8 @@ export function UsagePane() {
               Cache hit is cache read over all prompt tokens (input + cache read + cache write). A write is a miss: it is billed at a premium and only pays off when a later call reads it.
             </p>
           </div>
+
+          {gateway && <GatewaySection report={gateway} filtered={mode !== "all"} />}
 
           {breakdown && breakdown.localTokens > 0 && (
             <div className="mt-8 max-w-[860px]">

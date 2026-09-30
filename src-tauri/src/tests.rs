@@ -11553,6 +11553,7 @@ mod transcript_tests {
         let l = line("assistant", "req_1", "us.anthropic.claude-opus-5", 2, 38_271, 31_477, 201, "2026-09-18T20:50:46.418Z", "/w");
         let u = parse_transcript_line(&l, "file-sess").unwrap();
         assert_eq!(u.key, "cc:req_1", "keyed by the globally unique request id");
+        assert_eq!(u.message_id.as_deref(), Some("msg_req_1"), "the message id rides along for gateway matching");
         assert_eq!(u.session_id, "cc-sess");
         assert_eq!(u.model, "us.anthropic.claude-opus-5");
         assert_eq!((u.input_tokens, u.cache_read_tokens, u.cache_creation_tokens, u.output_tokens), (2, 38_271, 31_477, 201));
@@ -11564,6 +11565,46 @@ mod transcript_tests {
         assert!(parse_transcript_line("not json", "f").is_none());
         assert!(parse_transcript_line(&line("assistant", "r", "<synthetic>", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
         assert!(parse_transcript_line(&line("assistant", "r", "m", 0, 0, 0, 0, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
+    }
+
+    #[test]
+    fn ledger_ids_carry_both_the_request_id_and_the_message_id() {
+        // A RUN row keyed on the request id, whose message id was recorded
+        // beside it; a row keyed on the message id alone; a row of another
+        // surface. The gateway may have logged any of those ids.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let mk = |ts: &str, key: &str| crate::db::SpendEvent {
+            ts_utc: ts.into(),
+            surface: "run".into(),
+            project_id: None,
+            workspace_id: None,
+            mission_id: None,
+            source_id: None,
+            attempt: 1,
+            model_raw: "m".into(),
+            model: "m".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(0.1),
+            cost_usd: 0.1,
+            cost_basis: "computed".into(),
+            idempotency_key: Some(key.into()),
+            thread_id: None,
+            origin: None,
+        };
+        db.insert_spend_event(&mk("2026-09-30T10:00:00+00:00", "cc:req_1")).unwrap();
+        db.set_spend_provider_msg_id("cc:req_1", "msg_1").unwrap();
+        db.set_spend_provider_msg_id("cc:nope", "msg_x").unwrap(); // unknown key: a no-op
+        db.insert_spend_event(&mk("2026-09-30T11:00:00+00:00", "cc:msg:msg_2")).unwrap();
+        db.insert_spend_event(&mk("2026-09-30T12:00:00+00:00", "direct:abc")).unwrap();
+        db.insert_spend_event(&mk("2026-09-29T12:00:00+00:00", "cc:req_old")).unwrap();
+        let mut ids = db.ledger_request_ids_between("2026-09-30T00:00:00+00:00", "2026-09-30T23:59:59+00:00").unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["direct:abc", "msg_1", "msg_2", "req_1"]);
     }
 
     #[test]

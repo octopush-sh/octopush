@@ -18,6 +18,9 @@ pub struct AppState {
     pub transcripts: Arc<crate::transcripts::TranscriptIngestor>,
     pub router: Mutex<ProviderRouter>,
     pub chat: ChatEngine,
+    /// Which providers front an LLM gateway, and the last reconciliation
+    /// per period (see `gateway.rs`).
+    pub gateways: crate::gateway::GatewayCache,
     /// The shared daemon client — kept alive for the app lifetime.
     pub daemon_client: Option<Arc<DaemonClient>>,
 }
@@ -51,6 +54,7 @@ impl AppState {
             transcripts,
             router: Mutex::new(router),
             chat,
+            gateways: crate::gateway::GatewayCache::default(),
             daemon_client,
         })
     }
