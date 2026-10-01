@@ -24,6 +24,8 @@ describe("gapSummary / budgetLine", () => {
     expect(gapSummary(base)).toBe("in step with the ledger");
     expect(gapSummary({ ...base, unaccountedCostUsd: 2.5, unaccountedRequests: 10 })).toBe("$2.50 · 25% not in the ledger");
     expect(gapSummary({ ...base, basis: "key" })).toBe("running total only");
+    // A gateway reading below the ledger is a disagreement, not agreement.
+    expect(gapSummary({ ...base, gatewayCostUsd: 0, gatewayRequests: 0, ledgerCostUsd: 14.08 })).toBe("$14.08 in the ledger the gateway did not bill");
   });
 
   it("names the key budget only when the gateway enforces one", () => {

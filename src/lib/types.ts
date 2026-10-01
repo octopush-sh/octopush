@@ -611,7 +611,9 @@ export interface GatewayReconciliation {
   unmatchedRequests: number | null;
   unmatchedCostUsd: number | null;
   unmatchedByModel: GatewayModelSpend[];
-  /** `logs` (per request) · `daily` (whole UTC days) · `key` (running total only). */
+  /** `logs` (per request) · `daily` (whole UTC days — the gateway's daily
+   *  tables or its per-day summary of the logs; `note` says which and what is
+   *  missing) · `key` (running total only). */
   basis: "logs" | "daily" | "key";
   note: string | null;
   fetchedAt: string;

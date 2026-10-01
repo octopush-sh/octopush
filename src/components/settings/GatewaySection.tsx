@@ -25,6 +25,10 @@ function pct(part: number, whole: number): string {
  *  the wording is tested. */
 export function gapSummary(r: GatewayReconciliation): string {
   if (r.basis === "key") return "running total only";
+  // The ledger above the gateway is a disagreement too (rows billed through
+  // another key, or a gateway reading that missed the period).
+  const over = r.ledgerCostUsd - r.gatewayCostUsd;
+  if (over >= 0.005) return `${usd(over)} in the ledger the gateway did not bill`;
   if (r.unaccountedCostUsd < 0.005 && r.unaccountedRequests === 0) return "in step with the ledger";
   return `${usd(r.unaccountedCostUsd)} · ${pct(r.unaccountedCostUsd, r.gatewayCostUsd)} not in the ledger`;
 }
@@ -56,7 +60,7 @@ export function GatewaySection({ report, filtered = false }: { report: GatewayRe
         </SectionLabel>
         <span
           className="octo-tabular mb-3 font-mono text-[9px] uppercase tracking-[0.2em]"
-          style={{ color: report.unaccountedCostUsd >= 0.005 ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
+          style={{ color: report.basis !== "key" && Math.abs(report.gatewayCostUsd - report.ledgerCostUsd) >= 0.005 ? "var(--color-octo-brass)" : "var(--color-octo-mute)" }}
           data-testid="usage-gateway-gap"
         >
           {gapSummary(report)}

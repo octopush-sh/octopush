@@ -265,7 +265,7 @@ pub async fn get_gateway_reconciliation(
     if let Some(cached) = state.gateways.cached_spend(&ep.provider, &start_iso, &end_iso) {
         return Ok(Some(cached));
     }
-    let spend = match gateway::fetch_spend(&ep, &identity, &start_iso, &end_iso, utc_offset_minutes.unwrap_or(0)).await {
+    let spend = match gateway::fetch_spend(&ep, &identity, &start_iso, &end_iso).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(gateway = %identity.host, error = %e, "gateway spend unavailable");
