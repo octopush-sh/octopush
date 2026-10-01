@@ -105,6 +105,9 @@ pub trait SpendGateway: Send + Sync {
         provider: &str,
     ) -> Option<GatewayIdentity>;
     /// The key's spend between two RFC3339 UTC instants.
+    /// `utc_offset_minutes` is the viewer's local offset (JS
+    /// `-getTimezoneOffset()`), for a gateway that can bucket days on
+    /// their calendar.
     async fn spend(
         &self,
         client: &reqwest::Client,
@@ -113,6 +116,7 @@ pub trait SpendGateway: Send + Sync {
         identity: &GatewayIdentity,
         start_utc: &str,
         end_utc: &str,
+        utc_offset_minutes: i32,
     ) -> Result<GatewaySpend, String>;
 }
 
@@ -246,11 +250,15 @@ pub fn reconcile(
         e.prompt_tokens += m.prompt_tokens;
         e.completion_tokens += m.completion_tokens;
     }
+    // A reading with no model breakdown (the key's total, or a gateway that
+    // only gave totals) is compared against the whole ledger: there is no
+    // model to leave out, and leaving them all out would compare nothing.
+    let compare_all = gw.is_empty();
     let mut ledger_by: HashMap<String, (f64, i64, i64)> = HashMap::new();
     let mut ledger_only: Vec<String> = Vec::new();
     for m in &ledger.by_model {
         let key = canonical_model(&m.model);
-        if !gw.contains_key(&key) {
+        if !compare_all && !gw.contains_key(&key) {
             ledger_only.push(m.model.clone());
             continue;
         }
@@ -265,6 +273,7 @@ pub fn reconcile(
     ledger_only.sort();
     let mut by_model: Vec<ReconciledModel> = gw
         .values()
+        .filter(|_| !compare_all)
         .map(|g| {
             let l = ledger_by.get(&g.model).copied().unwrap_or((0.0, 0, 0));
             ReconciledModel {
@@ -453,13 +462,14 @@ pub async fn fetch_spend(
     identity: &GatewayIdentity,
     start_utc: &str,
     end_utc: &str,
+    utc_offset_minutes: i32,
 ) -> Result<GatewaySpend, String> {
     let client = http_client();
     let gw = gateways()
         .into_iter()
         .find(|g| g.kind() == identity.kind)
         .ok_or_else(|| format!("unknown gateway kind {}", identity.kind))?;
-    gw.spend(client, &ep.base_url, &ep.api_key, identity, start_utc, end_utc).await
+    gw.spend(client, &ep.base_url, &ep.api_key, identity, start_utc, end_utc, utc_offset_minutes).await
 }
 
 #[cfg(test)]
@@ -568,6 +578,23 @@ mod tests {
         assert_eq!(r.unaccounted_cost_usd, 0.0);
         assert_eq!(r.unaccounted_requests, 0);
         assert_eq!(r.note.as_deref(), Some("UTC days"));
+    }
+
+    #[test]
+    fn a_reading_without_models_is_compared_against_the_whole_ledger() {
+        // Nothing to match models against: the ledger side is every row,
+        // not an empty set with every model "not compared".
+        let spend = GatewaySpend { cost_usd: 9.85, requests: 114, basis: "daily".into(), ..Default::default() };
+        let ledger = LedgerSide {
+            by_model: vec![ledger_model("claude-sonnet-5", 7.28, 75, 100), ledger_model("claude-opus-5-5", 6.80, 31, 50)],
+            ids: HashSet::new(),
+        };
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        assert!((r.ledger_cost_usd - 14.08).abs() < 1e-9);
+        assert_eq!(r.ledger_calls, 106);
+        assert!(r.ledger_only_models.is_empty());
+        assert!(r.by_model.is_empty());
+        assert_eq!(r.unaccounted_requests, 8);
     }
 
     #[test]
