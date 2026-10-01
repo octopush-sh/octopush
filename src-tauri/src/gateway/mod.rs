@@ -82,8 +82,9 @@ pub struct GatewaySpend {
     pub by_model: Vec<GatewayModelSpend>,
     /// Per-request rows, when the gateway's logs were readable.
     pub requests_detail: Option<Vec<GatewayRequest>>,
-    /// `logs` (per request) · `daily` (whole UTC days) · `key` (the key's
-    /// running total only).
+    /// `logs` (per request) · `daily` (whole UTC days: the gateway's daily
+    /// tables, or its per-day summary of the logs — `note` says which and
+    /// what is missing) · `key` (the key's running total only).
     pub basis: String,
     /// A caveat the UI should show with the figures.
     pub note: Option<String>,
@@ -155,6 +156,22 @@ pub fn worth_probing(base_url: &str) -> bool {
         return false;
     }
     !(name == "localhost" || name == "127.0.0.1" || name == "0.0.0.0")
+}
+
+/// Sum per-model rows that share a name, most expensive first — the one
+/// fold every reading and the reconciliation use.
+pub fn fold_models<I: IntoIterator<Item = GatewayModelSpend>>(items: I) -> Vec<GatewayModelSpend> {
+    let mut by: HashMap<String, GatewayModelSpend> = HashMap::new();
+    for m in items {
+        let e = by.entry(m.model.clone()).or_insert_with(|| GatewayModelSpend { model: m.model.clone(), ..Default::default() });
+        e.cost_usd += m.cost_usd;
+        e.requests += m.requests;
+        e.prompt_tokens += m.prompt_tokens;
+        e.completion_tokens += m.completion_tokens;
+    }
+    let mut out: Vec<GatewayModelSpend> = by.into_values().collect();
+    out.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 /// The name both sides are compared under: the last path segment of a
@@ -237,20 +254,22 @@ pub fn reconcile(
 ) -> GatewayReconciliation {
     // Gateway models, keyed by canonical name (several gateway routes can
     // fold into one: `bedrock/eu.…-sonnet-5` and `claude-sonnet-5`).
-    let mut gw: HashMap<String, GatewayModelSpend> = HashMap::new();
-    for m in &spend.by_model {
-        let key = canonical_model(&m.model);
-        let e = gw.entry(key.clone()).or_insert_with(|| GatewayModelSpend { model: key, ..Default::default() });
-        e.cost_usd += m.cost_usd;
-        e.requests += m.requests;
-        e.prompt_tokens += m.prompt_tokens;
-        e.completion_tokens += m.completion_tokens;
-    }
+    let gw: HashMap<String, GatewayModelSpend> = fold_models(spend.by_model.iter().map(|m| GatewayModelSpend {
+        model: canonical_model(&m.model),
+        ..m.clone()
+    }))
+    .into_iter()
+    .map(|m| (m.model.clone(), m))
+    .collect();
+    // A reading with no model breakdown (the key's total, or a gateway that
+    // only gave totals) is compared against the whole ledger: there is no
+    // model to leave out, and leaving them all out would compare nothing.
+    let compare_all = gw.is_empty();
     let mut ledger_by: HashMap<String, (f64, i64, i64)> = HashMap::new();
     let mut ledger_only: Vec<String> = Vec::new();
     for m in &ledger.by_model {
         let key = canonical_model(&m.model);
-        if !gw.contains_key(&key) {
+        if !compare_all && !gw.contains_key(&key) {
             ledger_only.push(m.model.clone());
             continue;
         }
@@ -265,6 +284,7 @@ pub fn reconcile(
     ledger_only.sort();
     let mut by_model: Vec<ReconciledModel> = gw
         .values()
+        .filter(|_| !compare_all)
         .map(|g| {
             let l = ledger_by.get(&g.model).copied().unwrap_or((0.0, 0, 0));
             ReconciledModel {
@@ -292,27 +312,16 @@ pub fn reconcile(
     // never saw (service calls, cache upkeep, retries).
     let (unmatched_requests, unmatched_cost_usd, unmatched_by_model) = match &spend.requests_detail {
         Some(rows) => {
-            let mut n = 0i64;
-            let mut cost = 0.0f64;
-            let mut by: HashMap<String, GatewayModelSpend> = HashMap::new();
-            for r in rows {
-                if !r.success {
-                    continue;
-                }
-                if ledger.ids.contains(&r.id) {
-                    continue;
-                }
-                n += 1;
-                cost += r.cost_usd;
-                let key = canonical_model(&r.model);
-                let e = by.entry(key.clone()).or_insert_with(|| GatewayModelSpend { model: key, ..Default::default() });
-                e.cost_usd += r.cost_usd;
-                e.requests += 1;
-                e.prompt_tokens += r.prompt_tokens;
-                e.completion_tokens += r.completion_tokens;
-            }
-            let mut v: Vec<GatewayModelSpend> = by.into_values().collect();
-            v.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+            let unmatched: Vec<&GatewayRequest> = rows.iter().filter(|r| r.success && !ledger.ids.contains(&r.id)).collect();
+            let n = unmatched.len() as i64;
+            let cost: f64 = unmatched.iter().map(|r| r.cost_usd).sum();
+            let v = fold_models(unmatched.iter().map(|r| GatewayModelSpend {
+                model: canonical_model(&r.model),
+                cost_usd: r.cost_usd,
+                requests: 1,
+                prompt_tokens: r.prompt_tokens,
+                completion_tokens: r.completion_tokens,
+            }));
             (Some(n), Some(cost), v)
         }
         None => (None, None, Vec::new()),
@@ -571,6 +580,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reading_without_models_is_compared_against_the_whole_ledger() {
+        // Nothing to match models against: the ledger side is every row,
+        // not an empty set with every model "not compared".
+        let spend = GatewaySpend { cost_usd: 9.85, requests: 114, basis: "daily".into(), ..Default::default() };
+        let ledger = LedgerSide {
+            by_model: vec![ledger_model("claude-sonnet-5", 7.28, 75, 100), ledger_model("claude-opus-5-5", 6.80, 31, 50)],
+            ids: HashSet::new(),
+        };
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        assert!((r.ledger_cost_usd - 14.08).abs() < 1e-9);
+        assert_eq!(r.ledger_calls, 106);
+        assert!(r.ledger_only_models.is_empty());
+        assert!(r.by_model.is_empty());
+        assert_eq!(r.unaccounted_requests, 8);
+    }
+
+    #[test]
     fn key_basis_is_a_running_total_so_it_reports_no_gap() {
         // The key's total since its last reset dwarfs any period's ledger;
         // that difference is not a gap and must not be shown as one.
@@ -581,6 +607,19 @@ mod tests {
         assert_eq!(r.unaccounted_cost_usd, 0.0);
         assert_eq!(r.unaccounted_requests, 0);
         assert_eq!(r.basis, "key");
+    }
+
+    #[test]
+    fn fold_models_sums_same_names_most_expensive_first() {
+        let v = fold_models(vec![
+            GatewayModelSpend { model: "a".into(), cost_usd: 1.0, requests: 1, prompt_tokens: 10, completion_tokens: 1 },
+            GatewayModelSpend { model: "b".into(), cost_usd: 5.0, requests: 2, ..Default::default() },
+            GatewayModelSpend { model: "a".into(), cost_usd: 2.0, requests: 1, prompt_tokens: 5, completion_tokens: 2 },
+        ]);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].model.as_str(), v[0].cost_usd), ("b", 5.0));
+        assert_eq!((v[1].requests, v[1].prompt_tokens, v[1].completion_tokens), (2, 15, 3));
+        assert!(fold_models(Vec::new()).is_empty());
     }
 
     #[test]

@@ -5,20 +5,26 @@
 //! - `GET /key/info` — who the key is (its hash, alias, running spend and
 //!   budget). Answering this with an `info` object is what identifies a
 //!   base URL as LiteLLM.
-//! - `GET /spend/logs?api_key=<hash>&start_date&end_date` — one row per
-//!   request, with the provider's response id: the reading that lets a
-//!   request be matched against the ledger. Readable by the key for its own
-//!   rows; an admin-only deployment answers 401/403 and we fall through.
-//! - `GET /user/daily/activity?start_date&end_date` — per-day, per-model
-//!   totals for the key's user. Whole UTC days, so the period is approximate.
+//! - `GET /spend/logs?api_key=<hash>&start_date&end_date&summarize=false` —
+//!   one row per request, with the provider's response id: the reading that
+//!   lets a request be matched against the ledger. Without `summarize=false`
+//!   the same endpoint answers per-day totals (its legacy default), which is
+//!   recognised and never mistaken for an empty log. Readable by the key for
+//!   its own rows; an admin-only deployment answers 401/403 and we fall
+//!   through.
+//! - `GET /user/daily/activity?start_date&end_date&api_key=<hash>` — per-day,
+//!   per-model totals for the key. The tables are keyed on UTC dates
+//!   whatever is asked, so the period is approximate at its edges.
+//! - The summarized `/spend/logs` answer, when a deployment too old to know
+//!   `summarize` gave it in the first reading — per-day spend per model, no
+//!   request counts or tokens. Taken when the two above gave nothing.
 //!
 //! Every field is read tolerantly: a deployment a version ahead or behind
 //! degrades to fewer figures, never to an error.
 
-use super::{GatewayIdentity, GatewayModelSpend, GatewayRequest, GatewaySpend, SpendGateway};
+use super::{fold_models, GatewayIdentity, GatewayModelSpend, GatewayRequest, GatewaySpend, SpendGateway};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
 
 pub struct LiteLlm;
 
@@ -43,7 +49,16 @@ pub fn root_url(base_url: &str) -> String {
     base.to_string()
 }
 
-async fn get_json(client: &reqwest::Client, url: &str, api_key: &str) -> Result<(u16, Value), String> {
+/// A management-endpoint answer: status, body, and whether LiteLLM said it
+/// cut the rows (`x-litellm-spend-logs-truncated: true` — `/spend/logs`
+/// serves at most its 10,000 most recent rows).
+struct Answer {
+    status: u16,
+    body: Value,
+    truncated: bool,
+}
+
+async fn get_json(client: &reqwest::Client, url: &str, api_key: &str) -> Result<Answer, String> {
     let resp = client
         .get(url)
         .header("authorization", format!("Bearer {api_key}"))
@@ -52,8 +67,14 @@ async fn get_json(client: &reqwest::Client, url: &str, api_key: &str) -> Result<
         .await
         .map_err(|e| format!("{e}"))?;
     let status = resp.status().as_u16();
+    let truncated = resp
+        .headers()
+        .get("x-litellm-spend-logs-truncated")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    Ok((status, body))
+    Ok(Answer { status, body, truncated })
 }
 
 fn f64_of(v: Option<&Value>) -> Option<f64> {
@@ -121,9 +142,20 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// `/spend/logs` rows → requests within `[start, end]`.
+/// Whether a `/spend/logs` body is the legacy per-day summary (`startTime`,
+/// `spend`, `users`, `models` per row) rather than request rows.
+fn is_spend_summary(rows: &[Value]) -> bool {
+    !rows.is_empty() && rows.iter().all(|r| r.get("request_id").is_none() && r.get("models").is_some())
+}
+
+/// `/spend/logs` request rows → requests within `[start, end]`. `None` for
+/// a body that is not request rows — an error, or the per-day summary the
+/// endpoint answers when not asked for individual logs.
 pub fn parse_spend_logs(body: &Value, start: DateTime<Utc>, end: DateTime<Utc>) -> Option<Vec<GatewayRequest>> {
     let rows = body.as_array().or_else(|| body.get("data").and_then(|d| d.as_array()))?;
+    if is_spend_summary(rows) {
+        return None;
+    }
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let Some(id) = str_of(r.get("request_id")).or_else(|| str_of(r.get("id"))) else { continue };
@@ -151,24 +183,62 @@ pub fn parse_spend_logs(body: &Value, start: DateTime<Utc>, end: DateTime<Utc>) 
 /// Fold request rows into a spend (successful requests only — a failed
 /// request carries no tokens and no charge).
 pub fn spend_from_requests(rows: Vec<GatewayRequest>) -> GatewaySpend {
-    let mut by: HashMap<String, GatewayModelSpend> = HashMap::new();
     let mut total = GatewaySpend { basis: "logs".into(), ..Default::default() };
     for r in rows.iter().filter(|r| r.success) {
         total.cost_usd += r.cost_usd;
         total.requests += 1;
         total.prompt_tokens += r.prompt_tokens;
         total.completion_tokens += r.completion_tokens;
-        let e = by.entry(r.model.clone()).or_insert_with(|| GatewayModelSpend { model: r.model.clone(), ..Default::default() });
-        e.cost_usd += r.cost_usd;
-        e.requests += 1;
-        e.prompt_tokens += r.prompt_tokens;
-        e.completion_tokens += r.completion_tokens;
     }
-    let mut by_model: Vec<GatewayModelSpend> = by.into_values().collect();
-    by_model.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
-    total.by_model = by_model;
+    total.by_model = fold_models(rows.iter().filter(|r| r.success).map(|r| GatewayModelSpend {
+        model: r.model.clone(),
+        cost_usd: r.cost_usd,
+        requests: 1,
+        prompt_tokens: r.prompt_tokens,
+        completion_tokens: r.completion_tokens,
+    }));
     total.requests_detail = Some(rows);
     total
+}
+
+/// The legacy `/spend/logs` summary (`[{startTime, spend, users, models:
+/// {model: spend}}]`) → a per-day spend over `[start_day, end_day]`: cost
+/// per model only, no request counts or tokens. `None` when the body is
+/// not that shape.
+pub fn parse_spend_summary(body: &Value, start_day: &str, end_day: &str) -> Option<GatewaySpend> {
+    let rows = body.as_array()?;
+    if !is_spend_summary(rows) {
+        return None;
+    }
+    let mut spend = GatewaySpend {
+        basis: "daily".into(),
+        note: Some(
+            "The gateway's logs were only readable as per-day totals: spend per model, without request counts or tokens."
+                .into(),
+        ),
+        ..Default::default()
+    };
+    let mut items: Vec<GatewayModelSpend> = Vec::new();
+    for row in rows {
+        let Some(day) = str_of(row.get("startTime")) else { continue };
+        let day: String = day.chars().take(10).collect();
+        if day.as_str() < start_day || day.as_str() > end_day {
+            continue;
+        }
+        spend.cost_usd += f64_of(row.get("spend")).unwrap_or(0.0);
+        if let Some(models) = row.get("models").and_then(|m| m.as_object()) {
+            for (name, cost) in models {
+                items.push(GatewayModelSpend { model: name.clone(), cost_usd: f64_of(Some(cost)).unwrap_or(0.0), ..Default::default() });
+            }
+        }
+    }
+    spend.by_model = fold_models(items);
+    Some(spend)
+}
+
+/// Whether a reading says anything at all: a request, or a cent.
+fn has_figures(s: &GatewaySpend) -> bool {
+    s.requests > 0 || s.cost_usd > 0.0 || !s.by_model.is_empty()
 }
 
 /// `/user/daily/activity` → a spend over the UTC days that overlap the
@@ -180,7 +250,7 @@ pub fn parse_daily_activity(body: &Value, start_day: &str, end_day: &str) -> Opt
         note: Some("The gateway reports whole UTC days; the ledger follows your local day, so the edges of the period can differ.".into()),
         ..Default::default()
     };
-    let mut by: HashMap<String, GatewayModelSpend> = HashMap::new();
+    let mut items: Vec<GatewayModelSpend> = Vec::new();
     let mut any = false;
     for day in results {
         let Some(date) = str_of(day.get("date")) else { continue };
@@ -196,20 +266,20 @@ pub fn parse_daily_activity(body: &Value, start_day: &str, end_day: &str) -> Opt
         if let Some(models) = day.get("breakdown").and_then(|b| b.get("models")).and_then(|x| x.as_object()) {
             for (name, entry) in models {
                 let mm = entry.get("metrics").cloned().unwrap_or_else(|| entry.clone());
-                let e = by.entry(name.clone()).or_insert_with(|| GatewayModelSpend { model: name.clone(), ..Default::default() });
-                e.cost_usd += f64_of(mm.get("spend")).unwrap_or(0.0);
-                e.requests += billed_requests_of(&mm);
-                e.prompt_tokens += i64_of(mm.get("prompt_tokens"));
-                e.completion_tokens += i64_of(mm.get("completion_tokens"));
+                items.push(GatewayModelSpend {
+                    model: name.clone(),
+                    cost_usd: f64_of(mm.get("spend")).unwrap_or(0.0),
+                    requests: billed_requests_of(&mm),
+                    prompt_tokens: i64_of(mm.get("prompt_tokens")),
+                    completion_tokens: i64_of(mm.get("completion_tokens")),
+                });
             }
         }
     }
     if !any {
         return Some(spend);
     }
-    let mut by_model: Vec<GatewayModelSpend> = by.into_values().collect();
-    by_model.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
-    spend.by_model = by_model;
+    spend.by_model = fold_models(items);
     Some(spend)
 }
 
@@ -224,11 +294,11 @@ impl SpendGateway for LiteLlm {
 
     async fn identify(&self, client: &reqwest::Client, base_url: &str, api_key: &str, provider: &str) -> Option<GatewayIdentity> {
         let root = root_url(base_url);
-        let (status, body) = get_json(client, &format!("{root}/key/info"), api_key).await.ok()?;
-        if status != 200 {
+        let a = get_json(client, &format!("{root}/key/info"), api_key).await.ok()?;
+        if a.status != 200 {
             return None;
         }
-        parse_key_info(&body, &super::host_of(base_url), provider)
+        parse_key_info(&a.body, &super::host_of(base_url), provider)
     }
 
     async fn spend(
@@ -247,21 +317,68 @@ impl SpendGateway for LiteLlm {
         // and cut to the instant here.
         let day_before = (start - Duration::days(1)).format("%Y-%m-%d").to_string();
         let day_after = (end + Duration::days(1)).format("%Y-%m-%d").to_string();
-        if let Some(hash) = identity.key_hash.as_deref() {
-            let url = format!("{root}/spend/logs?api_key={hash}&start_date={day_before}&end_date={day_after}");
-            if let Ok((200, body)) = get_json(client, &url, api_key).await {
-                if let Some(rows) = parse_spend_logs(&body, start, end) {
-                    return Ok(spend_from_requests(rows));
+        let key_filter = identity.key_hash.as_deref().map(|h| format!("&api_key={h}")).unwrap_or_default();
+        // A reading that was readable but reported nothing is kept aside:
+        // the next table may still know the period, and if none does, a
+        // quiet period is what the section should say — not that only the
+        // key's running total was readable.
+        let mut quiet: Option<GatewaySpend> = None;
+        // A deployment too old to know `summarize` answers the per-day
+        // summary to the first request; it is kept for the third reading.
+        let mut summary_body: Option<Value> = None;
+        // 1. Individual request rows — the reading that matches per request.
+        if !key_filter.is_empty() {
+            let url = format!("{root}/spend/logs?start_date={day_before}&end_date={day_after}&summarize=false{key_filter}");
+            if let Ok(a) = get_json(client, &url, api_key).await {
+                if a.status == 200 {
+                    match parse_spend_logs(&a.body, start, end) {
+                        Some(rows) => {
+                            let mut spend = spend_from_requests(rows);
+                            if a.truncated {
+                                spend.note = Some(
+                                    "The gateway returned only its 10,000 most recent rows for the period; these figures are a lower bound."
+                                        .into(),
+                                );
+                            }
+                            if has_figures(&spend) {
+                                return Ok(spend);
+                            }
+                            quiet = Some(spend);
+                        }
+                        None => summary_body = Some(a.body),
+                    }
                 }
             }
         }
+        // 2. Per-day totals for the key. The tables are keyed on UTC dates.
         let start_day = start.format("%Y-%m-%d").to_string();
         let end_day = end.format("%Y-%m-%d").to_string();
-        let url = format!("{root}/user/daily/activity?start_date={start_day}&end_date={end_day}");
-        if let Ok((200, body)) = get_json(client, &url, api_key).await {
-            if let Some(spend) = parse_daily_activity(&body, &start_day, &end_day) {
-                return Ok(spend);
+        let url = format!("{root}/user/daily/activity?start_date={start_day}&end_date={end_day}{key_filter}");
+        if let Ok(a) = get_json(client, &url, api_key).await {
+            if a.status == 200 {
+                if let Some(spend) = parse_daily_activity(&a.body, &start_day, &end_day) {
+                    if has_figures(&spend) {
+                        return Ok(spend);
+                    }
+                    quiet.get_or_insert(spend);
+                }
             }
+        }
+        // 3. The summary the first reading may have answered: spend per
+        //    model per day, cut to the period's days.
+        if let Some(body) = &summary_body {
+            if let Some(spend) = parse_spend_summary(body, &start_day, &end_day) {
+                if has_figures(&spend) {
+                    return Ok(spend);
+                }
+                quiet.get_or_insert(spend);
+            }
+        }
+        // Something was readable and simply empty: the gateway billed
+        // nothing to this key in the period.
+        if let Some(mut spend) = quiet {
+            spend.note = Some("The gateway logged no requests for this key in the period.".into());
+            return Ok(spend);
         }
         // Last resort: the key's running total, with no period at all.
         Ok(GatewaySpend {
@@ -351,6 +468,30 @@ mod tests {
         // A wrapped body works too.
         assert!(parse_spend_logs(&json!({"data": []}), start, end).is_some());
         assert!(parse_spend_logs(&json!({"error": "forbidden"}), start, end).is_none());
+        // The endpoint's legacy default answers per-day totals: not rows,
+        // never an empty log.
+        let summary = json!([{"startTime": "2026-09-30", "spend": 9.85, "users": {"u": 9.85}, "models": {"claude-sonnet-5": 9.43}}]);
+        assert!(parse_spend_logs(&summary, start, end).is_none());
+    }
+
+    #[test]
+    fn the_legacy_summary_gives_spend_per_model_and_nothing_else() {
+        let body = json!([
+            {"startTime": "2026-09-29", "spend": 102.7, "users": {}, "models": {"claude-sonnet-5": 102.7}},
+            {"startTime": "2026-09-30T00:00:00", "spend": 9.85, "users": {"u": 9.85}, "models": {"bedrock/eu.anthropic.claude-sonnet-5": 9.43, "kimi-k2-5": 0.42}},
+            {"startTime": "2026-10-01", "spend": 0, "users": {}, "models": {}}
+        ]);
+        let s = parse_spend_summary(&body, "2026-09-30", "2026-10-01").expect("summary");
+        assert_eq!(s.basis, "daily");
+        assert!((s.cost_usd - 9.85).abs() < 1e-9);
+        assert_eq!(s.requests, 0, "the summary has no request counts");
+        assert_eq!(s.by_model[0].model, "bedrock/eu.anthropic.claude-sonnet-5");
+        assert!((s.by_model[1].cost_usd - 0.42).abs() < 1e-9);
+        assert!(s.note.as_deref().unwrap().contains("per-day totals"));
+        assert!(has_figures(&s));
+        assert!(parse_spend_summary(&json!([{"request_id": "msg_a"}]), "a", "b").is_none());
+        assert!(parse_spend_summary(&json!([]), "a", "b").is_none());
+        assert!(!has_figures(&GatewaySpend::default()));
     }
 
     #[test]
