@@ -141,4 +141,62 @@ describe("ReviewSidebar", () => {
     await screen.findByTestId("files-tree");
     await waitFor(() => expect(treeLocateSpy).toHaveBeenCalledWith("/repo/src/lib/modeMeta.ts"));
   });
+
+  describe("resize", () => {
+    it("drags the right edge to widen, clamps, and persists on release", () => {
+      render(<ReviewSidebar changedCount={0} {...baseProps} />);
+      const sidebar = screen.getByTestId("review-sidebar");
+      const handle = screen.getByRole("separator", { name: /resize changes & files/i });
+      expect(sidebar.style.width).toBe("280px");
+
+      act(() => {
+        handle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 280 }));
+        window.dispatchEvent(new MouseEvent("mousemove", { clientX: 400 }));
+      });
+      expect(sidebar.style.width).toBe("400px");
+
+      act(() => {
+        window.dispatchEvent(new MouseEvent("mousemove", { clientX: 5000 }));
+        window.dispatchEvent(new MouseEvent("mouseup"));
+      });
+      expect(sidebar.style.width).toBe("640px");
+      expect(localStorage.getItem("reviewSidebarWidth")).toBe("640");
+    });
+
+    it("an unmount mid-drag releases the body and the window listeners", () => {
+      const { unmount } = render(<ReviewSidebar changedCount={0} {...baseProps} />);
+      const handle = screen.getByRole("separator", { name: /resize changes & files/i });
+      act(() => {
+        handle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 280 }));
+      });
+      expect(document.body.style.cursor).toBe("col-resize");
+      const removeSpy = vi.spyOn(window, "removeEventListener");
+      unmount();
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+      expect(removeSpy).toHaveBeenCalledWith("mousemove", expect.any(Function));
+      expect(removeSpy).toHaveBeenCalledWith("mouseup", expect.any(Function));
+      removeSpy.mockRestore();
+    });
+
+    it("restores the stored width and double-click resets it", async () => {
+      localStorage.setItem("reviewSidebarWidth", "420");
+      render(<ReviewSidebar changedCount={0} {...baseProps} />);
+      const sidebar = screen.getByTestId("review-sidebar");
+      expect(sidebar.style.width).toBe("420px");
+      await userEvent.dblClick(screen.getByRole("separator", { name: /resize changes & files/i }));
+      expect(sidebar.style.width).toBe("280px");
+      expect(localStorage.getItem("reviewSidebarWidth")).toBe("280");
+    });
+
+    it("resizes from the keyboard with the arrow keys", async () => {
+      render(<ReviewSidebar changedCount={0} {...baseProps} />);
+      const handle = screen.getByRole("separator", { name: /resize changes & files/i });
+      handle.focus();
+      await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+      expect(screen.getByTestId("review-sidebar").style.width).toBe("312px");
+      await userEvent.keyboard("{Home}");
+      expect(screen.getByTestId("review-sidebar").style.width).toBe("200px");
+    });
+  });
 });
