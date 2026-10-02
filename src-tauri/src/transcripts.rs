@@ -17,7 +17,9 @@
 //! Mechanics:
 //! - Only project directories that correspond to an Octopush RUN session's
 //!   `project_root` or a workspace's worktree path are read; Claude Code use
-//!   elsewhere on the machine is not Octopush spend.
+//!   elsewhere on the machine is not Octopush spend. Claude Code caps a
+//!   directory name at 200 characters and appends a hash; a long worktree
+//!   path is resolved to that capped name too (`project_dirs_for`).
 //! - Files are read incrementally: a per-file byte offset in `app_meta`
 //!   (`cc_transcript:<path>`) advances past every complete line consumed, so
 //!   a poll costs one `stat` per file when nothing changed.
@@ -64,15 +66,91 @@ pub fn projects_root() -> PathBuf {
         .join("projects")
 }
 
+/// Claude Code caps a project directory name at this many characters and
+/// appends `-<6-char hash>` to one that would be longer — a worktree named
+/// after a ticket summary gets there easily.
+pub const DIR_NAME_CAP: usize = 200;
+
+/// The names of the directories directly under `root` — one listing a
+/// pass, for [`project_dirs_among`].
+pub fn project_dir_listing(root: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    rd.flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect()
+}
+
+/// The transcript directories Claude Code may have created for `cwd` under
+/// `root`, by name: the exact sanitized name, and — when that name is over
+/// the cap — a directory carrying its first [`DIR_NAME_CAP`] characters
+/// plus a `-<hash>` suffix **whose transcripts were written from `cwd`**.
+/// Two long paths can share their first 200 characters, and the hash is
+/// Claude Code's to compute, so a capped candidate is claimed by what its
+/// lines say, never by its name alone. Only directories that exist.
+pub fn project_dirs_among(root: &Path, listing: &[String], cwd: &str) -> Vec<String> {
+    let full = project_dir_name(cwd);
+    let mut out = Vec::new();
+    if listing.iter().any(|n| n == &full) {
+        out.push(full.clone());
+    }
+    if full.chars().count() > DIR_NAME_CAP {
+        let prefix: String = full.chars().take(DIR_NAME_CAP).collect();
+        for name in listing {
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            if rest.len() > 1 && rest.starts_with('-') && name != &full && !out.contains(name) && transcripts_written_from(&root.join(name), cwd) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// [`project_dirs_among`] over a fresh listing of `root`.
+pub fn project_dirs_for(root: &Path, cwd: &str) -> Vec<String> {
+    project_dirs_among(root, &project_dir_listing(root), cwd)
+}
+
+/// Whether the transcripts under `dir` were written from `cwd`: the first
+/// line carrying a `cwd` field, in any of its first few files, says so.
+/// A directory with no such line claims nothing (and has nothing to meter).
+fn transcripts_written_from(dir: &Path, cwd: &str) -> bool {
+    let mut files = Vec::new();
+    jsonl_files(dir, 0, &mut files);
+    files.sort();
+    for file in files.iter().take(4) {
+        let Ok(f) = std::fs::File::open(file) else { continue };
+        let mut reader = BufReader::new(f);
+        let mut buf: Vec<u8> = Vec::new();
+        for _ in 0..50 {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if !buf.windows(5).any(|w| w == b"\"cwd\"") {
+                continue;
+            }
+            let line = String::from_utf8_lossy(&buf);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                    return c == cwd;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Whether Claude Code has a transcript directory for `cwd` (created the
 /// moment `claude` first runs there). Checked by the PTY scanner before it
 /// records a screen-scraped summary.
 pub fn has_transcript_dir(cwd: &str) -> bool {
     let root = projects_root();
-    root.join(project_dir_name(cwd)).is_dir()
+    !project_dirs_for(&root, cwd).is_empty()
         || std::fs::canonicalize(cwd)
             .ok()
-            .map(|c| root.join(project_dir_name(&c.to_string_lossy())).is_dir())
+            .map(|c| !project_dirs_for(&root, &c.to_string_lossy()).is_empty())
             .unwrap_or(false)
 }
 
@@ -282,16 +360,25 @@ impl TranscriptIngestor {
 
     /// Attribution map: Claude Code project dir name → where the spend goes.
     /// A path is keyed both as written and canonicalized (Claude Code records
-    /// the physical cwd, so a symlinked root would otherwise never match).
+    /// the physical cwd, so a symlinked root would otherwise never match),
+    /// and by the capped `<200 chars>-<hash>` name Claude Code uses for a
+    /// long path, when such a directory exists.
     fn targets(&self) -> AppResult<HashMap<String, Target>> {
         let mut targets: HashMap<String, Target> = HashMap::new();
+        let listing = project_dir_listing(&self.root);
         let keys_for = |path: &str| -> Vec<String> {
-            let mut keys = vec![project_dir_name(path)];
-            if let Ok(c) = std::fs::canonicalize(path) {
-                let k = project_dir_name(&c.to_string_lossy());
+            let mut keys: Vec<String> = Vec::new();
+            let mut push = |k: String| {
                 if !keys.contains(&k) {
                     keys.push(k);
                 }
+            };
+            push(project_dir_name(path));
+            project_dirs_among(&self.root, &listing, path).into_iter().for_each(&mut push);
+            if let Ok(c) = std::fs::canonicalize(path) {
+                let c = c.to_string_lossy().to_string();
+                push(project_dir_name(&c));
+                project_dirs_among(&self.root, &listing, &c).into_iter().for_each(&mut push);
             }
             keys
         };

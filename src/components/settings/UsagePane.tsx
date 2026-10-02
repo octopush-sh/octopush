@@ -6,7 +6,7 @@
 // models, and the prompt-token split behind the honest cache-hit ratio.
 // Budgets and the CSV export live at the bottom. Charts read their colors
 // from live theme tokens (useChartColors) so they follow the active theme.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { Plus, RefreshCw, X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
@@ -124,7 +124,7 @@ export function UsagePane() {
   const { budgets, spend, loadAll: loadBudgets, refreshAllSpend } = useBudgetsStore();
   const chart = useChartColors();
 
-  const [period, setPeriod] = useState<UsagePeriod>("30d");
+  const [period, setPeriod] = useState<UsagePeriod>("today");
   const [custom, setCustom] = useState(() => {
     const to = new Date();
     const from = new Date();
@@ -138,11 +138,18 @@ export function UsagePane() {
   // What the gateway billed vs the ledger — only when a provider is one.
   const [gateway, setGateway] = useState<GatewayReconciliation | null>(null);
 
+  // Every request carries its sequence number; an answer that is not the
+  // latest request's is dropped. Switching from a slow period to a fast
+  // one must never show the slow period's figures when they land last.
+  const reportSeq = useRef(0);
+  const gatewaySeq = useRef(0);
+
   // The range is computed on every load, never memoised: a preset ends
   // *now*, so each 10s poll must move its end (and "today" must roll over
   // at midnight) or new spend would never appear.
   const load = useCallback(async () => {
     const range = periodRange(period, custom);
+    const seq = ++reportSeq.current;
     try {
       const r = await ipc.getUsageReport(
         range.start,
@@ -150,13 +157,21 @@ export function UsagePane() {
         mode === "all" ? null : mode,
         -new Date().getTimezoneOffset(),
       );
+      if (seq !== reportSeq.current) return;
       setReport(r);
       setError(null);
     } catch (e) {
+      if (seq !== reportSeq.current) return;
       setError(String(e));
     }
-    // Cloud vs local is a side figure; a failure just hides it.
-    ipc.getUsageBreakdown(range.start, range.end).then(setBreakdown).catch(() => {});
+    // Cloud vs local is a side figure; a failure just hides it. Same
+    // sequence as the report: a late answer never lands over a newer one.
+    ipc
+      .getUsageBreakdown(range.start, range.end)
+      .then((b) => {
+        if (seq === reportSeq.current) setBreakdown(b);
+      })
+      .catch(() => {});
   }, [period, custom, mode]);
 
   useEffect(() => {
@@ -170,11 +185,17 @@ export function UsagePane() {
   // saw every request), so the Mode filter neither scopes nor re-fetches
   // it; it follows the period, on the same cadence, backend-cached.
   useEffect(() => {
+    // A new period starts from nothing: the previous period's figures are
+    // not an estimate of this one.
+    setGateway(null);
     const fetch = () => {
       const range = periodRange(period, custom);
+      const seq = ++gatewaySeq.current;
       ipc
         .getGatewayReconciliation(range.start, range.end, -new Date().getTimezoneOffset())
-        .then(setGateway)
+        .then((r) => {
+          if (seq === gatewaySeq.current) setGateway(r);
+        })
         .catch(() => {});
     };
     fetch();

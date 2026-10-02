@@ -1848,23 +1848,24 @@ impl Db {
         Ok(())
     }
 
-    /// Every provider id the billed rows in `[start, end]` carry, bare: the
-    /// id in each row's dedupe key (`cc:<request id>` / `cc:msg:<id>` for
-    /// RUN, without the prefix) and its recorded message id — what a
-    /// gateway's request log is matched against.
-    pub fn ledger_request_ids_between(&self, start_iso: &str, end_iso: &str) -> AppResult<Vec<String>> {
+    /// Every provider id the billed rows in `[start, end]` carry, bare, with
+    /// the row's model: the id in each row's dedupe key (`cc:<request id>` /
+    /// `cc:msg:<id>` for RUN, without the prefix) and its recorded message
+    /// id — what a gateway's request log is matched against, and what tells
+    /// a gateway's model name from the ledger's.
+    pub fn ledger_ids_with_model_between(&self, start_iso: &str, end_iso: &str) -> AppResult<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idempotency_key, provider_msg_id FROM spend_events
+            "SELECT idempotency_key, provider_msg_id, model FROM spend_events
              WHERE ts_utc >= ?1 AND ts_utc <= ?2 AND idempotency_key IS NOT NULL",
         )?;
         let mut out = Vec::new();
         for row in stmt.query_map(params![start_iso, end_iso], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
         })? {
-            let (key, msg) = row?;
-            out.push(crate::gateway::bare_ledger_id(&key).to_string());
+            let (key, msg, model) = row?;
+            out.push((crate::gateway::bare_ledger_id(&key).to_string(), model.clone()));
             if let Some(m) = msg.filter(|m| !m.is_empty()) {
-                out.push(m);
+                out.push((m, model));
             }
         }
         Ok(out)
@@ -4433,6 +4434,32 @@ impl Db {
             .query_row("SELECT value FROM app_meta WHERE key = ?1", params![key], |r| r.get(0))
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Every `app_meta` row whose key starts with `prefix`, as (key, value).
+    pub fn meta_list_prefix(&self, prefix: &str) -> AppResult<Vec<(String, String)>> {
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM app_meta WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")?;
+        let rows = stmt
+            .query_map(params![format!("{escaped}%")], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Upsert several `app_meta` scalars in one transaction: all or none.
+    pub fn meta_set_many(&self, pairs: &[(String, String)]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (k, v) in pairs {
+            tx.execute(
+                "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![k, v],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Upsert a scalar into `app_meta`.

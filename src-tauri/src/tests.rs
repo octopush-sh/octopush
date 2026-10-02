@@ -11549,6 +11549,49 @@ mod transcript_tests {
     }
 
     #[test]
+    fn a_long_path_resolves_to_claude_codes_capped_directory() {
+        use crate::transcripts::{project_dirs_for, DIR_NAME_CAP};
+        let root = TempDir::new().unwrap();
+        let cwd = format!("/Users/j/IdeaProjects/.octopus-worktrees/{}-631974be", "word-".repeat(34));
+        let full = project_dir_name(&cwd);
+        assert!(full.chars().count() > DIR_NAME_CAP);
+        let prefix: String = full.chars().take(DIR_NAME_CAP).collect();
+        // Claude Code wrote the first 200 characters plus a hash, and its
+        // transcripts say which cwd they came from.
+        let capped = format!("{prefix}-9stamg");
+        std::fs::create_dir_all(root.path().join(&capped)).unwrap();
+        std::fs::write(
+            root.path().join(&capped).join("s.jsonl"),
+            format!("{}\n", line("assistant", "req_x", "m", 1, 0, 0, 1, "2026-10-02T10:00:00Z", &cwd)),
+        )
+        .unwrap();
+        // A second long worktree sharing the first 200 characters: its own
+        // capped directory is claimed by its own cwd, never by this one.
+        let twin_cwd = format!("/Users/j/IdeaProjects/.octopus-worktrees/{}-a1b2c3d4", "word-".repeat(34));
+        let twin = format!("{prefix}-q7rt2k");
+        std::fs::create_dir_all(root.path().join(&twin)).unwrap();
+        std::fs::write(
+            root.path().join(&twin).join("s.jsonl"),
+            format!("{}\n", line("assistant", "req_y", "m", 1, 0, 0, 1, "2026-10-02T10:00:00Z", &twin_cwd)),
+        )
+        .unwrap();
+        // A capped-looking directory with no transcripts claims nothing; a
+        // bare prefix without the hash shape, and a file, never match.
+        std::fs::create_dir_all(root.path().join(format!("{prefix}-empty1"))).unwrap();
+        std::fs::create_dir_all(root.path().join(&prefix)).unwrap();
+        std::fs::write(root.path().join(format!("{prefix}-file")), "x").unwrap();
+        assert_eq!(project_dirs_for(root.path(), &cwd), vec![capped.clone()]);
+        assert_eq!(project_dirs_for(root.path(), &twin_cwd), vec![twin]);
+        // The exact name, when it exists, comes first; both are returned.
+        std::fs::create_dir_all(root.path().join(&full)).unwrap();
+        assert_eq!(project_dirs_for(root.path(), &cwd), vec![full.clone(), capped]);
+        // A short path is only ever its exact name.
+        std::fs::create_dir_all(root.path().join("-home-u-repo")).unwrap();
+        assert_eq!(project_dirs_for(root.path(), "/home/u/repo"), vec!["-home-u-repo".to_string()]);
+        assert!(project_dirs_for(root.path(), "/home/u/absent").is_empty());
+    }
+
+    #[test]
     fn parses_only_billed_assistant_lines() {
         let l = line("assistant", "req_1", "us.anthropic.claude-opus-5", 2, 38_271, 31_477, 201, "2026-09-18T20:50:46.418Z", "/w");
         let u = parse_transcript_line(&l, "file-sess").unwrap();
@@ -11602,9 +11645,22 @@ mod transcript_tests {
         db.insert_spend_event(&mk("2026-09-30T11:00:00+00:00", "cc:msg:msg_2")).unwrap();
         db.insert_spend_event(&mk("2026-09-30T12:00:00+00:00", "direct:abc")).unwrap();
         db.insert_spend_event(&mk("2026-09-29T12:00:00+00:00", "cc:req_old")).unwrap();
-        let mut ids = db.ledger_request_ids_between("2026-09-30T00:00:00+00:00", "2026-09-30T23:59:59+00:00").unwrap();
+        let mut ids = db.ledger_ids_with_model_between("2026-09-30T00:00:00+00:00", "2026-09-30T23:59:59+00:00").unwrap();
         ids.sort();
-        assert_eq!(ids, vec!["direct:abc", "msg_1", "msg_2", "req_1"]);
+        let m = |s: &str| (s.to_string(), "m".to_string());
+        assert_eq!(ids, vec![m("direct:abc"), m("msg_1"), m("msg_2"), m("req_1")]);
+    }
+
+    #[test]
+    fn meta_list_prefix_returns_only_that_prefix_literally() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.meta_set("gateway_alias:litellm:a", "x").unwrap();
+        db.meta_set("gateway_alias:litellm:b", "y").unwrap();
+        db.meta_set("gateway_alias:other:a", "z").unwrap();
+        db.meta_set("gateway_aliasXlitellm:c", "w").unwrap(); // `_` is literal, not a wildcard
+        let rows = db.meta_list_prefix("gateway_alias:litellm:").unwrap();
+        assert_eq!(rows, vec![("gateway_alias:litellm:a".to_string(), "x".to_string()), ("gateway_alias:litellm:b".to_string(), "y".to_string())]);
     }
 
     #[test]

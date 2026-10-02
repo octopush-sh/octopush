@@ -107,7 +107,7 @@ describe("pricingAgeDays", () => {
 });
 
 describe("UsagePane", () => {
-  it("fetches 30 days for every mode with the viewer's offset and renders the honest figures", async () => {
+  it("opens on today for every mode with the viewer's offset and renders the honest figures", async () => {
     await act(async () => {
       render(<UsagePane />);
     });
@@ -115,7 +115,9 @@ describe("UsagePane", () => {
     const [start, end, surface, offset] = getUsageReport.mock.calls[0];
     expect(surface).toBeNull();
     expect(offset).toBe(-new Date().getTimezoneOffset());
-    expect(Date.parse(end) - Date.parse(start)).toBeGreaterThan(29 * 86_400_000);
+    const from = new Date(start);
+    expect([from.getHours(), from.getMinutes()]).toEqual([0, 0]);
+    expect(Date.parse(end) - Date.parse(start)).toBeLessThanOrEqual(86_400_000);
 
     expect(within(screen.getByTestId("usage-stat-cost")).getByText("$12.50")).toBeInTheDocument();
     expect(within(screen.getByTestId("usage-stat-per-day")).getByText("5 days with spend")).toBeInTheDocument();
@@ -155,24 +157,25 @@ describe("UsagePane", () => {
     expect(getUsageReport.mock.calls[2][2]).toBeNull();
   });
 
-  it("'Today' starts at local midnight and 'Custom' reveals the date inputs", async () => {
+  it("'30 days' spans a month from local midnight and 'Custom' reveals the date inputs", async () => {
     await act(async () => {
       render(<UsagePane />);
     });
     await waitFor(() => expect(getUsageReport).toHaveBeenCalledTimes(1));
     await act(async () => {
-      fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "Today" }));
+      fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "30 days" }));
     });
     await waitFor(() => expect(getUsageReport).toHaveBeenCalledTimes(2));
-    const start = new Date(getUsageReport.mock.calls[1][0] as string);
-    expect(start.getHours()).toBe(0);
-    expect(start.getMinutes()).toBe(0);
+    const [start, end] = getUsageReport.mock.calls[1] as string[];
+    expect(new Date(start).getHours()).toBe(0);
+    expect(new Date(start).getMinutes()).toBe(0);
+    expect(Date.parse(end) - Date.parse(start)).toBeGreaterThan(29 * 86_400_000);
     await act(async () => {
       fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "Custom" }));
     });
     expect(screen.getByLabelText("From")).toBeInTheDocument();
-    // A date the default range (the last 30 days) can never start on, so
-    // the change is a real one whatever today is.
+    // A date no preset can start on, so the change is a real one whatever
+    // today is.
     await act(async () => {
       fireEvent.change(screen.getByLabelText("From"), { target: { value: "2024-01-15" } });
     });
@@ -232,6 +235,33 @@ describe("UsagePane — gateway reconciliation", () => {
     unmatchedByModel: [{ model: "claude-sonnet-5", costUsd: 2.15, requests: 25, promptTokens: 1, completionTokens: 1 }],
     basis: "logs" as const, note: null, fetchedAt: "now",
   };
+
+  it("drops a gateway answer that belongs to a period no longer selected", async () => {
+    // Today's answer is pending when the user switches to 30 days; 30 days
+    // answers at once, today's slow answer lands after it. The section
+    // must show 30 days and never flash today's figures over it.
+    const pending: Array<(r: unknown) => void> = [];
+    getGatewayReconciliation.mockReset().mockImplementation(
+      () => new Promise((resolve) => { pending.push(resolve); }),
+    );
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    await waitFor(() => expect(pending.length).toBe(1));
+    await act(async () => {
+      fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "30 days" }));
+    });
+    await waitFor(() => expect(pending.length).toBe(2));
+    await act(async () => {
+      pending[1]({ ...RECON, gateway: { ...RECON.gateway, host: "month.corp" } });
+    });
+    expect((await screen.findByTestId("usage-gateway")).textContent).toContain("month.corp");
+    await act(async () => {
+      pending[0]({ ...RECON, gateway: { ...RECON.gateway, host: "stale.corp" } });
+    });
+    expect(screen.getByTestId("usage-gateway").textContent).toContain("month.corp");
+    expect(screen.getByTestId("usage-gateway").textContent).not.toContain("stale.corp");
+  });
 
   it("has no gateway section when no provider is a gateway", async () => {
     await act(async () => {
