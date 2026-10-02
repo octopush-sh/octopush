@@ -9,6 +9,7 @@ import type { PrInfo } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useMissionsStore } from "../stores/missionsStore";
+import { BRANCH_NAME_MAX, DIR_SLUG_MAX, branchFromTask, shortenSlug } from "../lib/branchName";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
@@ -68,16 +69,8 @@ function worktreeDisplayPath(projectPath: string, branch: string): string {
   // The backend appends a short per-workspace id (`-<id>`) so two workspaces can
   // never share a directory, whatever their branch names look like. It's assigned
   // at creation time, so preview it as a placeholder suffix rather than a lie.
-  return `${parent}/.octopus-worktrees/${worktreeDirName(branch)}-<id>`;
-}
-
-function slugify(text: string): string {
-  return text
-    .toLowerCase()
-    .trim()
-    .replace(/[^\w\s-]/g, "")
-    .replace(/[\s_]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  // The branch part is capped the way the backend caps it.
+  return `${parent}/.octopus-worktrees/${shortenSlug(worktreeDirName(branch), DIR_SLUG_MAX)}-<id>`;
 }
 
 const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: string }> = {
@@ -199,7 +192,10 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     return () => window.removeEventListener("keydown", onKey);
   }, [step, intent]);
 
-  const branch = branchOverride ?? (slugify(task) || "new-mission");
+  // The suggested branch: the ticket key first when there is one, then up to
+  // four words of the task, never over the cap — a long branch becomes a long
+  // worktree path, which Claude Code's transcripts cannot follow.
+  const branch = branchOverride ?? (branchFromTask(task, linkIssueKeyOnCreate) || "new-mission");
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
   const branchCollides = branches.includes(branch);
@@ -391,6 +387,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     // slugified. Matches octopush-mcp's verbatim behaviour.
                     setBranchOverride(branchOverride.trim() || null);
                   }}
+                  maxLength={BRANCH_NAME_MAX}
                   title="Branch name — edit to set an exact name (e.g. feat/Foo)"
                   aria-label="Branch name"
                   className="rounded-none border-b border-transparent bg-transparent font-mono text-[10px] normal-case tracking-[0.2em] text-octo-brass outline-none transition-colors duration-[220ms] focus:border-octo-brass"

@@ -54,6 +54,85 @@ pub fn slugify(text: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// The longest branch the app derives from a task. Mirrors the frontend's
+/// `BRANCH_NAME_MAX` in `lib/branchName.ts`.
+pub const BRANCH_NAME_MAX: usize = 60;
+/// How many words of a task make it into a derived branch.
+pub const BRANCH_WORDS: usize = 4;
+/// The longest branch-derived part of a worktree directory name; `-<id8>`
+/// follows. Mirrors the frontend's `DIR_SLUG_MAX`.
+pub const DIR_SLUG_MAX: usize = 60;
+/// Claude Code names a session's transcript directory after the worktree
+/// path (`transcripts::project_dir_name`) and caps that name at this many
+/// characters, appending a hash past it. A worktree path must stay within
+/// it or the ledger cannot follow the session.
+pub const CLAUDE_DIR_NAME_CAP: usize = 200;
+
+/// Filler words dropped when deriving a branch from a task — the frontend's
+/// `GENESIS_STOPWORDS`, kept identical so the MCP derives the branch the
+/// wizard would.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "i", "me", "my", "we", "our", "you", "your", "it", "its",
+    "this", "that", "these", "to", "of", "in", "into", "on", "for", "from", "and",
+    "or", "with", "without", "so", "as", "at", "by", "is", "are", "be", "am",
+    "build", "builds", "make", "makes", "create", "creates", "write", "develop",
+    "want", "wants", "would", "like", "need", "needs", "please", "help", "let",
+    "lets", "some", "new", "app", "apps", "application", "project", "program",
+    "software", "tool", "thing", "something", "which", "can", "will", "should",
+    "us",
+];
+
+/// Cut a `-`-joined slug to at most `max` characters on a word boundary —
+/// never mid-word, never leaving a trailing dash; cut hard when no boundary
+/// comes before the limit. Mirrors the frontend's `shortenSlug`.
+pub fn shorten_slug(slug: &str, max: usize) -> String {
+    if slug.chars().count() <= max {
+        return slug.to_string();
+    }
+    let head: String = slug.chars().take(max).collect();
+    let cut = match head.rfind('-') {
+        Some(i) if i > 0 => head[..i].to_string(),
+        _ => head,
+    };
+    cut.trim_end_matches('-').to_string()
+}
+
+fn clean_token(t: &str) -> String {
+    t.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(|c| c.to_lowercase()).take(24).collect()
+}
+
+/// `<KEY>-<up to four significant words>`, at most [`BRANCH_NAME_MAX`]
+/// characters, cut on a word boundary and never inside the key. The key is
+/// the one given or the first found in the task; a token that is the key
+/// itself never repeats. Empty when nothing is left — the caller picks its
+/// fallback. Mirrors the frontend's `branchFromTask`, example for example.
+pub fn branch_from_task(task: &str, issue_key: Option<&str>) -> String {
+    let key = issue_key
+        .map(str::to_string)
+        .or_else(|| crate::issue_tracker::detect_issue_key(task))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let key_token = clean_token(&key);
+    let tokens: Vec<String> = task
+        .split_whitespace()
+        .map(clean_token)
+        .filter(|t| !t.is_empty() && *t != key_token)
+        .collect();
+    let significant: Vec<&String> = tokens.iter().filter(|t| !STOPWORDS.contains(&t.as_str())).collect();
+    let picked: Vec<&String> = if significant.is_empty() { tokens.iter().collect() } else { significant };
+    let body = picked.into_iter().take(BRANCH_WORDS).cloned().collect::<Vec<_>>().join("-");
+    if key.is_empty() {
+        return shorten_slug(&body, BRANCH_NAME_MAX);
+    }
+    if body.is_empty() {
+        return key;
+    }
+    let room = BRANCH_NAME_MAX.saturating_sub(key.len() + 1);
+    let tail = if room > 0 { shorten_slug(&body, room) } else { String::new() };
+    if tail.is_empty() { key } else { format!("{key}-{tail}") }
+}
+
 /// What `create` did, so callers can tell the user (and the MCP can report it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateOutcome {
@@ -240,12 +319,9 @@ fn provision_worktree(
     // slashes (a `feat/foo` branch must NOT nest as `.octopus-worktrees/feat/foo`),
     // and the id suffix guarantees two workspaces never share one directory — so a
     // later workspace can never rm -rf an earlier one's tree.
-    let dir_name = worktree_dir_name(branch, workspace_id);
-    let desired = project_path
-        .parent()
-        .unwrap_or(project_path)
-        .join(".octopus-worktrees")
-        .join(&dir_name);
+    let worktrees = project_path.parent().unwrap_or(project_path).join(".octopus-worktrees");
+    let dir_name = worktree_dir_name_under(&worktrees, branch, workspace_id);
+    let desired = worktrees.join(&dir_name);
     // create_worktree returns where the worktree ACTUALLY landed.
     let actual = crate::git_ops::create_worktree(project_path, branch, &desired)?;
 
@@ -253,12 +329,30 @@ fn provision_worktree(
 }
 
 /// The directory basename for a workspace's worktree: `<branch-slug>-<id8>`.
-/// Unique per workspace by construction (the id suffix), and filesystem-safe /
-/// flat (the slug). Mirrored on the frontend by `worktreeDirName` for the path
-/// preview.
+/// Unique per workspace by construction (the id suffix), filesystem-safe /
+/// flat (the slug), and the slug never over [`DIR_SLUG_MAX`] — a typed branch
+/// can be long, the directory is not. Mirrored on the frontend by
+/// `worktreeDirName` + `shortenSlug` for the path preview.
 fn worktree_dir_name(branch: &str, workspace_id: &str) -> String {
+    worktree_dir_name_within(branch, workspace_id, DIR_SLUG_MAX)
+}
+
+fn worktree_dir_name_within(branch: &str, workspace_id: &str, slug_max: usize) -> String {
     let id8: String = workspace_id.chars().take(8).collect();
-    format!("{}-{}", crate::git_ops::slot_name_for(branch), id8)
+    let slug = shorten_slug(&crate::git_ops::slot_name_for(branch), slug_max);
+    let slug = if slug.is_empty() { "workspace".to_string() } else { slug };
+    format!("{slug}-{id8}")
+}
+
+/// [`worktree_dir_name`] fitted to where it will live: Claude Code names its
+/// transcript directory after the whole worktree path, capped at 200
+/// characters ([`CLAUDE_DIR_NAME_CAP`]), so under a deep parent the
+/// slug gives way until the path fits — else the session's spend would be
+/// unreadable. Never shorter than eight characters of slug.
+fn worktree_dir_name_under(worktrees_dir: &Path, branch: &str, workspace_id: &str) -> String {
+    let base = crate::transcripts::project_dir_name(&format!("{}/", worktrees_dir.to_string_lossy()));
+    let room = CLAUDE_DIR_NAME_CAP.saturating_sub(base.chars().count() + 1 + 8);
+    worktree_dir_name_within(branch, workspace_id, DIR_SLUG_MAX.min(room).max(8))
 }
 
 /// Hand back the existing workspace for this branch, made usable — and, crucially,
@@ -363,12 +457,9 @@ pub fn heal_worktree(
         // Rebuild at this workspace's unique directory. The branch already exists,
         // so create_branch reuses it (created_branch is irrelevant here — we don't
         // change branch ownership on a heal). A rebuilt tree is ours → managed.
-        let dir_name = worktree_dir_name(&ws.branch, &ws.id);
-        let desired = project_path
-            .parent()
-            .unwrap_or(project_path)
-            .join(".octopus-worktrees")
-            .join(&dir_name);
+        let worktrees = project_path.parent().unwrap_or(project_path).join(".octopus-worktrees");
+        let dir_name = worktree_dir_name_under(&worktrees, &ws.branch, &ws.id);
+        let desired = worktrees.join(&dir_name);
         let actual = crate::git_ops::create_worktree(project_path, &ws.branch, &desired)?;
         let actual_str = actual.to_string_lossy().to_string();
         let d = db.lock();
@@ -428,6 +519,59 @@ mod tests {
         // Literal hyphens are preserved, never collapsed — must match the
         // frontend exactly so the same task yields the same branch.
         assert_eq!(slugify("Add login - logout flow"), "add-login---logout-flow");
+    }
+
+    #[test]
+    fn branch_from_task_mirrors_the_wizard_example_for_example() {
+        assert_eq!(branch_from_task("Add dark mode", None), "add-dark-mode");
+        assert_eq!(branch_from_task("Fix checkout bug", None), "fix-checkout-bug");
+        let summary = "Add a GitLab group preview endpoint that returns the subgroup/project tree for the connect modal, refusing overlaps before the user selects anything";
+        assert_eq!(branch_from_task(summary, Some("GUIDE-3753")), "GUIDE-3753-add-gitlab-group-preview");
+        assert_eq!(branch_from_task("GUIDE-3753: scan the AGP docker image", None), "GUIDE-3753-scan-agp-docker-image");
+        assert_eq!(branch_from_task("Only the key: GUIDE-3753", Some("GUIDE-3753")), "GUIDE-3753-only-key");
+        assert_eq!(branch_from_task("Build me a new app to track my daily tasks", None), "track-daily-tasks");
+        assert_eq!(branch_from_task("the a an", None), "the-a-an");
+        assert_eq!(branch_from_task("***", None), "");
+        assert_eq!(branch_from_task("", Some("OCT-12")), "OCT-12");
+        let long = branch_from_task(
+            "supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis floccinaucinihilipilification",
+            Some("VERYLONGPROJECTKEY-123456"),
+        );
+        assert!(long.len() <= BRANCH_NAME_MAX, "{long}");
+        assert!(long.starts_with("VERYLONGPROJECTKEY-123456"));
+        assert!(!long.ends_with('-'));
+    }
+
+    #[test]
+    fn shorten_slug_cuts_on_a_dash_and_hard_only_without_one() {
+        assert_eq!(shorten_slug("one-two-three", 9), "one-two");
+        assert_eq!(shorten_slug("one-two-three", 13), "one-two-three");
+        assert_eq!(shorten_slug("abcdefghijklmnop", 5), "abcde");
+        assert_eq!(shorten_slug("one-two", 4), "one");
+    }
+
+    #[test]
+    fn worktree_directory_names_are_capped_and_fit_claude_codes_limit() {
+        let long_branch = format!("GUIDE-3753-{}", "word-".repeat(40));
+        let name = worktree_dir_name(&long_branch, "abcdefgh-rest");
+        assert!(name.len() <= DIR_SLUG_MAX + 9, "{name}");
+        assert!(name.ends_with("-abcdefgh"));
+        assert!(name.starts_with("GUIDE-3753-word-"));
+        // A short branch is left alone.
+        assert_eq!(worktree_dir_name("feat/foo", "12345678x"), "feat-foo-12345678");
+        // Under a deep parent, the slug gives way so the sanitized path stays
+        // within Claude Code's 200 characters.
+        let deep_s = format!("/Users/j/{}/.octopus-worktrees", "deep/".repeat(28));
+        let deep = Path::new(&deep_s);
+        let fitted = worktree_dir_name_under(deep, &long_branch, "abcdefgh");
+        let sanitized = crate::transcripts::project_dir_name(&format!("{}/{}", deep.to_string_lossy(), fitted));
+        assert!(sanitized.chars().count() <= CLAUDE_DIR_NAME_CAP, "{sanitized}");
+        assert!(fitted.len() < DIR_SLUG_MAX + 9, "shortened below the usual cap: {fitted}");
+        assert!(fitted.ends_with("-abcdefgh"));
+        // A parent so deep nothing fits still keeps up to eight characters of
+        // slug, cut on a word boundary like any other.
+        let absurd_s = format!("/{}/.octopus-worktrees", "x/".repeat(120));
+        assert_eq!(worktree_dir_name_under(Path::new(&absurd_s), &long_branch, "abcdefgh"), "GUIDE-abcdefgh");
     }
 
     #[test]

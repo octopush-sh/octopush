@@ -798,7 +798,9 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
             b
         }
         None => {
-            let s = octopush_lib::workspace::slugify(&task);
+            // The same short name the wizard would derive: the ticket key
+            // found in the task first, then up to four words, never long.
+            let s = octopush_lib::workspace::branch_from_task(&task, None);
             if s.is_empty() { "new-workspace".to_string() } else { s }
         }
     };
