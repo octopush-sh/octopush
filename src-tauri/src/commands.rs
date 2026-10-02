@@ -274,15 +274,30 @@ pub async fn get_gateway_reconciliation(
     };
     // The ledger side is always every mode: the gateway saw every request,
     // so a per-mode slice would read as a gap that is only the filter.
-    let ledger = {
+    // Model equivalences learned from earlier matched requests are kept per
+    // gateway kind in `app_meta` (`gateway_alias:<kind>:<gateway name>`).
+    let alias_prefix = format!("gateway_alias:{}:", identity.kind);
+    let (ledger, aliases) = {
         let db = state.db.lock();
         let report = db.usage_report(&start_iso, &end_iso, None, utc_offset_minutes.unwrap_or(0))?;
-        LedgerSide {
+        let ledger = LedgerSide {
             by_model: report.by_model,
-            ids: db.ledger_request_ids_between(&start_iso, &end_iso)?.into_iter().collect(),
-        }
+            ids: db.ledger_ids_with_model_between(&start_iso, &end_iso)?.into_iter().collect(),
+        };
+        let aliases: gateway::ModelAliases = db
+            .meta_list_prefix(&alias_prefix)?
+            .into_iter()
+            .map(|(k, v)| (k[alias_prefix.len()..].to_string(), v))
+            .collect();
+        (ledger, aliases)
     };
-    let r = gateway::reconcile(identity, &start_iso, &end_iso, &spend, &ledger, &Utc::now().to_rfc3339());
+    let r = gateway::reconcile(identity, &start_iso, &end_iso, &spend, &ledger, &aliases, &Utc::now().to_rfc3339());
+    if !r.learned_aliases.is_empty() {
+        let db = state.db.lock();
+        for (g, l) in &r.learned_aliases {
+            db.meta_set(&format!("{alias_prefix}{g}"), l)?;
+        }
+    }
     state.gateways.remember_spend(&ep.provider, &start_iso, &end_iso, r.clone());
     Ok(Some(r))
 }

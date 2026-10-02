@@ -20,7 +20,7 @@
 use crate::db::ModelUsage;
 use crate::token_engine::normalize_model_id;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -48,14 +48,20 @@ pub struct GatewayIdentity {
 }
 
 /// One billed request as the gateway logged it.
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayRequest {
     /// The request's id as the gateway logged it — matched against the
     /// ledger's request and message ids.
     pub id: String,
     pub ts_utc: String,
+    /// The model name the client asked for, when the gateway records it
+    /// (that is the name the ledger knows); else the one it served.
     pub model: String,
+    /// The deployment that actually served it, when the gateway tells the
+    /// two apart and they differ (`bedrock/eu.anthropic.claude-sonnet-5`
+    /// behind `claude-sonnet-5`).
+    pub served_model: Option<String>,
     pub cost_usd: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -65,6 +71,8 @@ pub struct GatewayRequest {
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayModelSpend {
+    /// The name the client asked for when the gateway records it, else the
+    /// served one — see [`GatewayRequest::model`].
     pub model: String,
     pub cost_usd: f64,
     pub requests: i64,
@@ -224,18 +232,29 @@ pub struct GatewayReconciliation {
     pub basis: String,
     pub note: Option<String>,
     pub fetched_at: String,
+    /// Model equivalences this reconciliation established from matched
+    /// requests (canonical gateway name → canonical ledger name), for the
+    /// caller to remember. Not part of the page's data.
+    #[serde(skip)]
+    pub learned_aliases: Vec<(String, String)>,
 }
 
 /// The ledger's side of the comparison, as the command gathers it.
 #[derive(Clone, Debug, Default)]
 pub struct LedgerSide {
     pub by_model: Vec<ModelUsage>,
-    /// Every id the ledger's rows in the period carry, bare: the request id
+    /// Every id the ledger's rows in the period carry, bare — the request id
     /// a row is keyed on (`cc:<request id>` → `<request id>`, `cc:msg:<id>`
-    /// → `<id>`) and the provider's message id recorded beside it. A
-    /// gateway request is accounted for when its id is one of them.
-    pub ids: HashSet<String>,
+    /// → `<id>`) and the provider's message id recorded beside it — with the
+    /// row's model. A gateway request is accounted for when its id is one of
+    /// them, and the pair of names is how a gateway's name for a model is
+    /// learned.
+    pub ids: HashMap<String, String>,
 }
+
+/// Model equivalences known before this reconciliation: canonical gateway
+/// name → canonical ledger name, learned from earlier matched requests.
+pub type ModelAliases = HashMap<String, String>;
 
 /// A ledger dedupe key without its `cc:` / `cc:msg:` prefix — the bare
 /// provider id. Keys of other shapes come back unchanged.
@@ -244,18 +263,50 @@ pub fn bare_ledger_id(key: &str) -> &str {
 }
 
 /// Pure: fold the two sides into the report. Tested without a network.
+///
+/// Model names are compared three ways, best first: the name the gateway
+/// says the client asked for (the ledger's own name, when the gateway
+/// records it); an equivalence learned from a matched request (a gateway
+/// id found in a ledger row pairs the two names, whatever either side
+/// calls the model — `aliases` carries the ones learned before, and
+/// `learned_aliases` the new ones); and last the canonical form (region
+/// and vendor prefixes, dated snapshots, bracket suffixes stripped).
 pub fn reconcile(
     gateway: GatewayIdentity,
     start: &str,
     end: &str,
     spend: &GatewaySpend,
     ledger: &LedgerSide,
+    aliases: &ModelAliases,
     fetched_at: &str,
 ) -> GatewayReconciliation {
-    // Gateway models, keyed by canonical name (several gateway routes can
-    // fold into one: `bedrock/eu.…-sonnet-5` and `claude-sonnet-5`).
+    // What this period's matched requests teach: a gateway name whose
+    // canonical form still differs from the ledger's for the same request.
+    let mut learned: Vec<(String, String)> = Vec::new();
+    if let Some(rows) = &spend.requests_detail {
+        for r in rows {
+            let Some(ledger_model) = ledger.ids.get(&r.id) else { continue };
+            let g = canonical_model(&r.model);
+            let l = canonical_model(ledger_model);
+            if g != l && aliases.get(&g) != Some(&l) && !learned.iter().any(|(a, _)| a == &g) {
+                learned.push((g, l));
+            }
+        }
+    }
+    let gw_name = |model: &str| -> String {
+        let c = canonical_model(model);
+        learned
+            .iter()
+            .find(|(g, _)| g == &c)
+            .map(|(_, l)| l.clone())
+            .or_else(|| aliases.get(&c).cloned())
+            .unwrap_or(c)
+    };
+    // Gateway models, keyed by the name the ledger would use (several
+    // gateway routes can fold into one: `bedrock/eu.…-sonnet-5` and
+    // `claude-sonnet-5`).
     let gw: HashMap<String, GatewayModelSpend> = fold_models(spend.by_model.iter().map(|m| GatewayModelSpend {
-        model: canonical_model(&m.model),
+        model: gw_name(&m.model),
         ..m.clone()
     }))
     .into_iter()
@@ -312,11 +363,12 @@ pub fn reconcile(
     // never saw (service calls, cache upkeep, retries).
     let (unmatched_requests, unmatched_cost_usd, unmatched_by_model) = match &spend.requests_detail {
         Some(rows) => {
-            let unmatched: Vec<&GatewayRequest> = rows.iter().filter(|r| r.success && !ledger.ids.contains(&r.id)).collect();
+            let unmatched: Vec<&GatewayRequest> =
+                rows.iter().filter(|r| r.success && !ledger.ids.contains_key(&r.id)).collect();
             let n = unmatched.len() as i64;
             let cost: f64 = unmatched.iter().map(|r| r.cost_usd).sum();
             let v = fold_models(unmatched.iter().map(|r| GatewayModelSpend {
-                model: canonical_model(&r.model),
+                model: gw_name(&r.model),
                 cost_usd: r.cost_usd,
                 requests: 1,
                 prompt_tokens: r.prompt_tokens,
@@ -347,6 +399,7 @@ pub fn reconcile(
         basis: spend.basis.clone(),
         note: spend.note.clone(),
         fetched_at: fetched_at.to_string(),
+        learned_aliases: learned,
     }
 }
 
@@ -524,10 +577,10 @@ mod tests {
                 GatewayModelSpend { model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.42, requests: 14, prompt_tokens: 630_035, completion_tokens: 20_592 },
             ],
             requests_detail: Some(vec![
-                GatewayRequest { id: "msg_a".into(), ts_utc: "2026-09-30T18:00:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.10, prompt_tokens: 1, completion_tokens: 1, success: true },
-                GatewayRequest { id: "msg_b".into(), ts_utc: "2026-09-30T18:01:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.06, prompt_tokens: 1, completion_tokens: 1, success: true },
-                GatewayRequest { id: "msg_c".into(), ts_utc: "2026-09-30T18:02:00Z".into(), model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.03, prompt_tokens: 1, completion_tokens: 1, success: true },
-                GatewayRequest { id: "msg_fail".into(), ts_utc: "2026-09-30T18:03:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.0, prompt_tokens: 0, completion_tokens: 0, success: false },
+                GatewayRequest { id: "msg_a".into(), ts_utc: "2026-09-30T18:00:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.10, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
+                GatewayRequest { id: "msg_b".into(), ts_utc: "2026-09-30T18:01:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.06, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
+                GatewayRequest { id: "msg_c".into(), ts_utc: "2026-09-30T18:02:00Z".into(), model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.03, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
+                GatewayRequest { id: "msg_fail".into(), ts_utc: "2026-09-30T18:03:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.0, prompt_tokens: 0, completion_tokens: 0, success: false, served_model: None },
             ]),
             basis: "logs".into(),
             note: None,
@@ -537,9 +590,9 @@ mod tests {
                 ledger_model("claude-sonnet-5", 7.28, 75, 15_400_000),
                 ledger_model("local-llm", 0.0, 3, 1000),
             ],
-            ids: ["msg_a".to_string()].into_iter().collect(),
+            ids: [("msg_a".to_string(), "claude-sonnet-5".to_string())].into_iter().collect(),
         };
-        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
         assert_eq!(r.gateway_requests, 114);
         assert_eq!(r.ledger_calls, 75);
         assert_eq!(r.ledger_tokens, 15_400_000);
@@ -570,13 +623,48 @@ mod tests {
         };
         let ledger = LedgerSide {
             by_model: vec![ledger_model("claude-sonnet-5", 6.0, 12, 100)],
-            ids: HashSet::new(),
+            ids: HashMap::new(),
         };
-        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
         assert_eq!(r.unmatched_requests, None);
         assert_eq!(r.unaccounted_cost_usd, 0.0);
         assert_eq!(r.unaccounted_requests, 0);
         assert_eq!(r.note.as_deref(), Some("UTC days"));
+    }
+
+    #[test]
+    fn a_matched_request_teaches_the_gateway_name_of_a_ledger_model() {
+        // The gateway calls it one thing, the ledger another, and no rule
+        // relates the two — but one request id is in both, so they are the
+        // same model from then on, for aggregates and unmatched rows alike.
+        let spend = GatewaySpend {
+            cost_usd: 3.0,
+            requests: 3,
+            by_model: vec![GatewayModelSpend { model: "vendor/odd-name-v1:0".into(), cost_usd: 3.0, requests: 3, ..Default::default() }],
+            requests_detail: Some(vec![
+                GatewayRequest { id: "r1".into(), model: "vendor/odd-name-v1:0".into(), cost_usd: 1.0, success: true, ..Default::default() },
+                GatewayRequest { id: "r2".into(), model: "vendor/odd-name-v1:0".into(), cost_usd: 1.0, success: true, ..Default::default() },
+                GatewayRequest { id: "r3".into(), model: "vendor/odd-name-v1:0".into(), cost_usd: 1.0, success: true, ..Default::default() },
+            ]),
+            basis: "logs".into(),
+            ..Default::default()
+        };
+        let ledger = LedgerSide {
+            by_model: vec![ledger_model("claude-haiku-4-5", 2.0, 2, 10)],
+            ids: [("r1".to_string(), "claude-haiku-4-5".to_string())].into_iter().collect(),
+        };
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
+        assert_eq!(r.learned_aliases, vec![("odd-name-v1:0".to_string(), "claude-haiku-4-5".to_string())]);
+        assert!(r.ledger_only_models.is_empty(), "the ledger model is now compared");
+        assert_eq!(r.by_model[0].model, "claude-haiku-4-5");
+        assert_eq!((r.by_model[0].gateway_requests, r.by_model[0].ledger_calls), (3, 2));
+        assert_eq!(r.unmatched_by_model[0].model, "claude-haiku-4-5");
+        assert_eq!(r.unmatched_requests, Some(2));
+        // Known beforehand: applied, and not learned again.
+        let known: ModelAliases = [("odd-name-v1:0".to_string(), "claude-haiku-4-5".to_string())].into_iter().collect();
+        let again = reconcile(identity(), "s", "e", &spend, &ledger, &known, "now");
+        assert!(again.learned_aliases.is_empty());
+        assert_eq!(again.by_model[0].model, "claude-haiku-4-5");
     }
 
     #[test]
@@ -586,9 +674,9 @@ mod tests {
         let spend = GatewaySpend { cost_usd: 9.85, requests: 114, basis: "daily".into(), ..Default::default() };
         let ledger = LedgerSide {
             by_model: vec![ledger_model("claude-sonnet-5", 7.28, 75, 100), ledger_model("claude-opus-5-5", 6.80, 31, 50)],
-            ids: HashSet::new(),
+            ids: HashMap::new(),
         };
-        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
         assert!((r.ledger_cost_usd - 14.08).abs() < 1e-9);
         assert_eq!(r.ledger_calls, 106);
         assert!(r.ledger_only_models.is_empty());
@@ -601,8 +689,8 @@ mod tests {
         // The key's total since its last reset dwarfs any period's ledger;
         // that difference is not a gap and must not be shown as one.
         let spend = GatewaySpend { cost_usd: 7061.0, basis: "key".into(), ..Default::default() };
-        let ledger = LedgerSide { by_model: vec![ledger_model("claude-sonnet-5", 40.0, 12, 100)], ids: HashSet::new() };
-        let r = reconcile(identity(), "s", "e", &spend, &ledger, "now");
+        let ledger = LedgerSide { by_model: vec![ledger_model("claude-sonnet-5", 40.0, 12, 100)], ids: HashMap::new() };
+        let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
         assert_eq!(r.gateway_cost_usd, 7061.0, "the total itself is still shown");
         assert_eq!(r.unaccounted_cost_usd, 0.0);
         assert_eq!(r.unaccounted_requests, 0);
@@ -633,7 +721,7 @@ mod tests {
     fn spend_cache_is_per_period_with_the_end_to_the_minute() {
         let cache = GatewayCache::default();
         let spend = GatewaySpend { basis: "logs".into(), ..Default::default() };
-        let r = reconcile(identity(), "s", "e", &spend, &LedgerSide::default(), "now");
+        let r = reconcile(identity(), "s", "e", &spend, &LedgerSide::default(), &HashMap::new(), "now");
         cache.remember_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-30T22:59:11.000Z", r);
         // Same minute, later second: the poll is served from memory.
         assert!(cache.cached_spend("anthropic", "2026-09-01T00:00:00Z", "2026-09-30T22:59:41.000Z").is_some());

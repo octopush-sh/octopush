@@ -17,7 +17,9 @@
 //! Mechanics:
 //! - Only project directories that correspond to an Octopush RUN session's
 //!   `project_root` or a workspace's worktree path are read; Claude Code use
-//!   elsewhere on the machine is not Octopush spend.
+//!   elsewhere on the machine is not Octopush spend. Claude Code caps a
+//!   directory name at 200 characters and appends a hash; a long worktree
+//!   path is resolved to that capped name too (`project_dirs_for`).
 //! - Files are read incrementally: a per-file byte offset in `app_meta`
 //!   (`cc_transcript:<path>`) advances past every complete line consumed, so
 //!   a poll costs one `stat` per file when nothing changed.
@@ -64,15 +66,45 @@ pub fn projects_root() -> PathBuf {
         .join("projects")
 }
 
+/// Claude Code caps a project directory name at this many characters and
+/// appends `-<6-char hash>` to one that would be longer — a worktree named
+/// after a ticket summary gets there easily.
+pub const DIR_NAME_CAP: usize = 200;
+
+/// The transcript directories Claude Code may have created for `cwd` under
+/// `root`, by name: the exact sanitized name, and — when that name is over
+/// the cap — any directory carrying its first [`DIR_NAME_CAP`] characters
+/// plus a `-<hash>` suffix. Only directories that exist.
+pub fn project_dirs_for(root: &Path, cwd: &str) -> Vec<String> {
+    let full = project_dir_name(cwd);
+    let mut out = Vec::new();
+    if root.join(&full).is_dir() {
+        out.push(full.clone());
+    }
+    if full.chars().count() > DIR_NAME_CAP {
+        let prefix: String = full.chars().take(DIR_NAME_CAP).collect();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(rest) = name.strip_prefix(&prefix) else { continue };
+                if rest.len() > 1 && rest.starts_with('-') && name != full && e.path().is_dir() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether Claude Code has a transcript directory for `cwd` (created the
 /// moment `claude` first runs there). Checked by the PTY scanner before it
 /// records a screen-scraped summary.
 pub fn has_transcript_dir(cwd: &str) -> bool {
     let root = projects_root();
-    root.join(project_dir_name(cwd)).is_dir()
+    !project_dirs_for(&root, cwd).is_empty()
         || std::fs::canonicalize(cwd)
             .ok()
-            .map(|c| root.join(project_dir_name(&c.to_string_lossy())).is_dir())
+            .map(|c| !project_dirs_for(&root, &c.to_string_lossy()).is_empty())
             .unwrap_or(false)
 }
 
@@ -282,16 +314,24 @@ impl TranscriptIngestor {
 
     /// Attribution map: Claude Code project dir name → where the spend goes.
     /// A path is keyed both as written and canonicalized (Claude Code records
-    /// the physical cwd, so a symlinked root would otherwise never match).
+    /// the physical cwd, so a symlinked root would otherwise never match),
+    /// and by the capped `<200 chars>-<hash>` name Claude Code uses for a
+    /// long path, when such a directory exists.
     fn targets(&self) -> AppResult<HashMap<String, Target>> {
         let mut targets: HashMap<String, Target> = HashMap::new();
         let keys_for = |path: &str| -> Vec<String> {
-            let mut keys = vec![project_dir_name(path)];
-            if let Ok(c) = std::fs::canonicalize(path) {
-                let k = project_dir_name(&c.to_string_lossy());
+            let mut keys: Vec<String> = Vec::new();
+            let mut push = |k: String| {
                 if !keys.contains(&k) {
                     keys.push(k);
                 }
+            };
+            push(project_dir_name(path));
+            project_dirs_for(&self.root, path).into_iter().for_each(&mut push);
+            if let Ok(c) = std::fs::canonicalize(path) {
+                let c = c.to_string_lossy().to_string();
+                push(project_dir_name(&c));
+                project_dirs_for(&self.root, &c).into_iter().for_each(&mut push);
             }
             keys
         };
