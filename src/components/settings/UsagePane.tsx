@@ -164,8 +164,14 @@ export function UsagePane() {
       if (seq !== reportSeq.current) return;
       setError(String(e));
     }
-    // Cloud vs local is a side figure; a failure just hides it.
-    ipc.getUsageBreakdown(range.start, range.end).then(setBreakdown).catch(() => {});
+    // Cloud vs local is a side figure; a failure just hides it. Same
+    // sequence as the report: a late answer never lands over a newer one.
+    ipc
+      .getUsageBreakdown(range.start, range.end)
+      .then((b) => {
+        if (seq === reportSeq.current) setBreakdown(b);
+      })
+      .catch(() => {});
   }, [period, custom, mode]);
 
   useEffect(() => {

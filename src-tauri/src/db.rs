@@ -4448,6 +4448,20 @@ impl Db {
         Ok(rows)
     }
 
+    /// Upsert several `app_meta` scalars in one transaction: all or none.
+    pub fn meta_set_many(&self, pairs: &[(String, String)]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (k, v) in pairs {
+            tx.execute(
+                "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![k, v],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Upsert a scalar into `app_meta`.
     pub fn meta_set(&self, key: &str, value: &str) -> AppResult<()> {
         self.conn.execute(

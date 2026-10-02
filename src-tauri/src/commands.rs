@@ -292,10 +292,13 @@ pub async fn get_gateway_reconciliation(
         (ledger, aliases)
     };
     let r = gateway::reconcile(identity, &start_iso, &end_iso, &spend, &ledger, &aliases, &Utc::now().to_rfc3339());
+    // Remembering what was learned is best effort: the answer is ready, and
+    // a busy database must not cost the page its section.
     if !r.learned_aliases.is_empty() {
-        let db = state.db.lock();
-        for (g, l) in &r.learned_aliases {
-            db.meta_set(&format!("{alias_prefix}{g}"), l)?;
+        let pairs: Vec<(String, String)> =
+            r.learned_aliases.iter().map(|(g, l)| (format!("{alias_prefix}{g}"), l.clone())).collect();
+        if let Err(e) = state.db.lock().meta_set_many(&pairs) {
+            tracing::warn!(error = %e, "could not remember gateway model aliases");
         }
     }
     state.gateways.remember_spend(&ep.provider, &start_iso, &end_iso, r.clone());

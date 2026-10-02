@@ -165,16 +165,14 @@ pub fn parse_spend_logs(body: &Value, start: DateTime<Utc>, end: DateTime<Utc>) 
         }
         // `model_group` is the alias the client asked for — the ledger's
         // name; `model` the deployment that served it.
-        let served = str_of(r.get("model"));
-        let requested = str_of(r.get("model_group"));
-        let served_model = served.clone().filter(|s| requested.as_ref().is_some_and(|q| q != s));
-        let model = requested.or(served).unwrap_or_else(|| "unknown".into());
+        let model = str_of(r.get("model_group"))
+            .or_else(|| str_of(r.get("model")))
+            .unwrap_or_else(|| "unknown".into());
         let status = str_of(r.get("status")).unwrap_or_else(|| "success".into());
         out.push(GatewayRequest {
             id,
             ts_utc: ts.to_rfc3339(),
             model,
-            served_model,
             cost_usd: f64_of(r.get("spend")).or_else(|| f64_of(r.get("cost"))).unwrap_or(0.0),
             prompt_tokens: i64_of(r.get("prompt_tokens")),
             completion_tokens: i64_of(r.get("completion_tokens")),
@@ -333,20 +331,21 @@ impl SpendGateway for LiteLlm {
         let start_day = start.format("%Y-%m-%d").to_string();
         let end_day = end.format("%Y-%m-%d").to_string();
         // The two readings are independent requests; the logs one can be
-        // large (a month is thousands of rows), so both go out at once and
-        // the better one is taken when both are back.
+        // large (a month is thousands of rows). The daily read is started
+        // in the background so it is already under way if the logs turn
+        // out empty or unreadable, and dropped unread when they suffice.
         let logs_url = format!("{root}/spend/logs?start_date={day_before}&end_date={day_after}&summarize=false{key_filter}");
         let daily_url = format!("{root}/user/daily/activity?start_date={start_day}&end_date={end_day}{key_filter}");
-        let (logs, daily) = tokio::join!(
-            async {
-                if key_filter.is_empty() {
-                    None
-                } else {
-                    get_json(client, &logs_url, api_key).await.ok().filter(|a| a.status == 200)
-                }
-            },
-            async { get_json(client, &daily_url, api_key).await.ok().filter(|a| a.status == 200) },
-        );
+        let daily_task = {
+            let key = api_key.to_string();
+            let client = client.clone(); // a handle on the shared pool, not a new one
+            tokio::spawn(async move { get_json(&client, &daily_url, &key).await.ok().filter(|a| a.status == 200) })
+        };
+        let logs = if key_filter.is_empty() {
+            None
+        } else {
+            get_json(client, &logs_url, api_key).await.ok().filter(|a| a.status == 200)
+        };
         // A reading that was readable but reported nothing is kept aside:
         // the next table may still know the period, and if none does, a
         // quiet period is what the section should say — not that only the
@@ -367,6 +366,7 @@ impl SpendGateway for LiteLlm {
                         );
                     }
                     if has_figures(&spend) {
+                        daily_task.abort();
                         return Ok(spend);
                     }
                     quiet = Some(spend);
@@ -375,6 +375,7 @@ impl SpendGateway for LiteLlm {
             }
         }
         // 2. Per-day totals for the key. The tables are keyed on UTC dates.
+        let daily = daily_task.await.ok().flatten();
         if let Some(a) = daily {
             if let Some(spend) = parse_daily_activity(&a.body, &start_day, &end_day) {
                 if has_figures(&spend) {
@@ -485,9 +486,8 @@ mod tests {
         assert_eq!(spend.by_model[1].model, "bedrock/eu-north-1/moonshotai.kimi-k2.5");
         let detail = spend.requests_detail.as_ref().unwrap();
         assert_eq!(detail.len(), 3);
-        // The alias is the name; the deployment rides along only when it differs.
-        assert_eq!(detail[0].served_model.as_deref(), Some("bedrock/eu.anthropic.claude-sonnet-5"));
-        assert_eq!(detail[1].served_model, None);
+        // The alias the client asked for is the name; the deployment is not.
+        assert_eq!(detail[0].model, "claude-sonnet-5");
         // A wrapped body works too.
         assert!(parse_spend_logs(&json!({"data": []}), start, end).is_some());
         assert!(parse_spend_logs(&json!({"error": "forbidden"}), start, end).is_none());

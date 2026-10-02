@@ -58,10 +58,6 @@ pub struct GatewayRequest {
     /// The model name the client asked for, when the gateway records it
     /// (that is the name the ledger knows); else the one it served.
     pub model: String,
-    /// The deployment that actually served it, when the gateway tells the
-    /// two apart and they differ (`bedrock/eu.anthropic.claude-sonnet-5`
-    /// behind `claude-sonnet-5`).
-    pub served_model: Option<String>,
     pub cost_usd: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -281,15 +277,31 @@ pub fn reconcile(
     fetched_at: &str,
 ) -> GatewayReconciliation {
     // What this period's matched requests teach: a gateway name whose
-    // canonical form still differs from the ledger's for the same request.
+    // canonical form differs from the ledger's for the same request. Only
+    // an unambiguous lesson is kept — a gateway name that pairs with two
+    // ledger models in the period (an alias load-balanced across models)
+    // teaches nothing, a name already known is never overwritten, and a
+    // row with no model name at all (`unknown`) is not a name.
     let mut learned: Vec<(String, String)> = Vec::new();
     if let Some(rows) = &spend.requests_detail {
+        let mut pairs: HashMap<String, Vec<String>> = HashMap::new();
         for r in rows {
             let Some(ledger_model) = ledger.ids.get(&r.id) else { continue };
             let g = canonical_model(&r.model);
             let l = canonical_model(ledger_model);
-            if g != l && aliases.get(&g) != Some(&l) && !learned.iter().any(|(a, _)| a == &g) {
-                learned.push((g, l));
+            if g.is_empty() || g == "unknown" || l.is_empty() || l == "unknown" || g == l {
+                continue;
+            }
+            let seen = pairs.entry(g).or_default();
+            if !seen.contains(&l) {
+                seen.push(l);
+            }
+        }
+        let mut names: Vec<(String, Vec<String>)> = pairs.into_iter().collect();
+        names.sort();
+        for (g, ls) in names {
+            if ls.len() == 1 && !aliases.contains_key(&g) {
+                learned.push((g, ls.into_iter().next().unwrap()));
             }
         }
     }
@@ -577,10 +589,10 @@ mod tests {
                 GatewayModelSpend { model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.42, requests: 14, prompt_tokens: 630_035, completion_tokens: 20_592 },
             ],
             requests_detail: Some(vec![
-                GatewayRequest { id: "msg_a".into(), ts_utc: "2026-09-30T18:00:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.10, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
-                GatewayRequest { id: "msg_b".into(), ts_utc: "2026-09-30T18:01:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.06, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
-                GatewayRequest { id: "msg_c".into(), ts_utc: "2026-09-30T18:02:00Z".into(), model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.03, prompt_tokens: 1, completion_tokens: 1, success: true, served_model: None },
-                GatewayRequest { id: "msg_fail".into(), ts_utc: "2026-09-30T18:03:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.0, prompt_tokens: 0, completion_tokens: 0, success: false, served_model: None },
+                GatewayRequest { id: "msg_a".into(), ts_utc: "2026-09-30T18:00:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.10, prompt_tokens: 1, completion_tokens: 1, success: true },
+                GatewayRequest { id: "msg_b".into(), ts_utc: "2026-09-30T18:01:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.06, prompt_tokens: 1, completion_tokens: 1, success: true },
+                GatewayRequest { id: "msg_c".into(), ts_utc: "2026-09-30T18:02:00Z".into(), model: "bedrock/eu-north-1/moonshotai.kimi-k2.5".into(), cost_usd: 0.03, prompt_tokens: 1, completion_tokens: 1, success: true },
+                GatewayRequest { id: "msg_fail".into(), ts_utc: "2026-09-30T18:03:00Z".into(), model: "bedrock/eu.anthropic.claude-sonnet-5".into(), cost_usd: 0.0, prompt_tokens: 0, completion_tokens: 0, success: false },
             ]),
             basis: "logs".into(),
             note: None,
@@ -665,6 +677,22 @@ mod tests {
         let again = reconcile(identity(), "s", "e", &spend, &ledger, &known, "now");
         assert!(again.learned_aliases.is_empty());
         assert_eq!(again.by_model[0].model, "claude-haiku-4-5");
+        // Known as something else: the stored equivalence stands, never flipped.
+        let other: ModelAliases = [("odd-name-v1:0".to_string(), "claude-sonnet-5".to_string())].into_iter().collect();
+        assert!(reconcile(identity(), "s", "e", &spend, &ledger, &other, "now").learned_aliases.is_empty());
+        // Ambiguous in the period (one gateway name, two ledger models): nothing learned.
+        let two = LedgerSide {
+            by_model: ledger.by_model.clone(),
+            ids: [("r1".to_string(), "claude-haiku-4-5".to_string()), ("r2".to_string(), "claude-sonnet-5".to_string())].into_iter().collect(),
+        };
+        assert!(reconcile(identity(), "s", "e", &spend, &two, &HashMap::new(), "now").learned_aliases.is_empty());
+        // A row without a model name teaches nothing.
+        let nameless = GatewaySpend {
+            requests_detail: Some(vec![GatewayRequest { id: "r1".into(), model: "unknown".into(), success: true, ..Default::default() }]),
+            basis: "logs".into(),
+            ..Default::default()
+        };
+        assert!(reconcile(identity(), "s", "e", &nameless, &ledger, &HashMap::new(), "now").learned_aliases.is_empty());
     }
 
     #[test]

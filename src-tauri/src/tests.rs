@@ -11555,13 +11555,33 @@ mod transcript_tests {
         let cwd = format!("/Users/j/IdeaProjects/.octopus-worktrees/{}-631974be", "word-".repeat(34));
         let full = project_dir_name(&cwd);
         assert!(full.chars().count() > DIR_NAME_CAP);
-        // Claude Code wrote the first 200 characters plus a hash.
-        let capped = format!("{}-9stamg", full.chars().take(DIR_NAME_CAP).collect::<String>());
+        let prefix: String = full.chars().take(DIR_NAME_CAP).collect();
+        // Claude Code wrote the first 200 characters plus a hash, and its
+        // transcripts say which cwd they came from.
+        let capped = format!("{prefix}-9stamg");
         std::fs::create_dir_all(root.path().join(&capped)).unwrap();
-        // A sibling that merely shares the prefix without the hash shape, and a file, never match.
-        std::fs::create_dir_all(root.path().join(format!("{}", full.chars().take(DIR_NAME_CAP).collect::<String>()))).unwrap();
-        std::fs::write(root.path().join(format!("{}-file", full.chars().take(DIR_NAME_CAP).collect::<String>())), "x").unwrap();
+        std::fs::write(
+            root.path().join(&capped).join("s.jsonl"),
+            format!("{}\n", line("assistant", "req_x", "m", 1, 0, 0, 1, "2026-10-02T10:00:00Z", &cwd)),
+        )
+        .unwrap();
+        // A second long worktree sharing the first 200 characters: its own
+        // capped directory is claimed by its own cwd, never by this one.
+        let twin_cwd = format!("/Users/j/IdeaProjects/.octopus-worktrees/{}-a1b2c3d4", "word-".repeat(34));
+        let twin = format!("{prefix}-q7rt2k");
+        std::fs::create_dir_all(root.path().join(&twin)).unwrap();
+        std::fs::write(
+            root.path().join(&twin).join("s.jsonl"),
+            format!("{}\n", line("assistant", "req_y", "m", 1, 0, 0, 1, "2026-10-02T10:00:00Z", &twin_cwd)),
+        )
+        .unwrap();
+        // A capped-looking directory with no transcripts claims nothing; a
+        // bare prefix without the hash shape, and a file, never match.
+        std::fs::create_dir_all(root.path().join(format!("{prefix}-empty1"))).unwrap();
+        std::fs::create_dir_all(root.path().join(&prefix)).unwrap();
+        std::fs::write(root.path().join(format!("{prefix}-file")), "x").unwrap();
         assert_eq!(project_dirs_for(root.path(), &cwd), vec![capped.clone()]);
+        assert_eq!(project_dirs_for(root.path(), &twin_cwd), vec![twin]);
         // The exact name, when it exists, comes first; both are returned.
         std::fs::create_dir_all(root.path().join(&full)).unwrap();
         assert_eq!(project_dirs_for(root.path(), &cwd), vec![full.clone(), capped]);
