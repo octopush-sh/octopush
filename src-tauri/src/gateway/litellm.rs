@@ -163,6 +163,8 @@ pub fn parse_spend_logs(body: &Value, start: DateTime<Utc>, end: DateTime<Utc>) 
         if ts < start || ts > end {
             continue;
         }
+        // `model_group` is the alias the client asked for — the ledger's
+        // name; `model` the deployment that served it.
         let model = str_of(r.get("model_group"))
             .or_else(|| str_of(r.get("model")))
             .unwrap_or_else(|| "unknown".into());
@@ -263,7 +265,15 @@ pub fn parse_daily_activity(body: &Value, start_day: &str, end_day: &str) -> Opt
         spend.requests += billed_requests_of(&m);
         spend.prompt_tokens += i64_of(m.get("prompt_tokens"));
         spend.completion_tokens += i64_of(m.get("completion_tokens"));
-        if let Some(models) = day.get("breakdown").and_then(|b| b.get("models")).and_then(|x| x.as_object()) {
+        // The breakdown by the names clients asked for (`model_groups`)
+        // when the deployment reports it, else by served deployment.
+        let breakdown = day.get("breakdown");
+        let groups = breakdown
+            .and_then(|b| b.get("model_groups"))
+            .and_then(|x| x.as_object())
+            .filter(|m| !m.is_empty())
+            .or_else(|| breakdown.and_then(|b| b.get("models")).and_then(|x| x.as_object()));
+        if let Some(models) = groups {
             for (name, entry) in models {
                 let mm = entry.get("metrics").cloned().unwrap_or_else(|| entry.clone());
                 items.push(GatewayModelSpend {
@@ -318,6 +328,24 @@ impl SpendGateway for LiteLlm {
         let day_before = (start - Duration::days(1)).format("%Y-%m-%d").to_string();
         let day_after = (end + Duration::days(1)).format("%Y-%m-%d").to_string();
         let key_filter = identity.key_hash.as_deref().map(|h| format!("&api_key={h}")).unwrap_or_default();
+        let start_day = start.format("%Y-%m-%d").to_string();
+        let end_day = end.format("%Y-%m-%d").to_string();
+        // The two readings are independent requests; the logs one can be
+        // large (a month is thousands of rows). The daily read is started
+        // in the background so it is already under way if the logs turn
+        // out empty or unreadable, and dropped unread when they suffice.
+        let logs_url = format!("{root}/spend/logs?start_date={day_before}&end_date={day_after}&summarize=false{key_filter}");
+        let daily_url = format!("{root}/user/daily/activity?start_date={start_day}&end_date={end_day}{key_filter}");
+        let daily_task = {
+            let key = api_key.to_string();
+            let client = client.clone(); // a handle on the shared pool, not a new one
+            tokio::spawn(async move { get_json(&client, &daily_url, &key).await.ok().filter(|a| a.status == 200) })
+        };
+        let logs = if key_filter.is_empty() {
+            None
+        } else {
+            get_json(client, &logs_url, api_key).await.ok().filter(|a| a.status == 200)
+        };
         // A reading that was readable but reported nothing is kept aside:
         // the next table may still know the period, and if none does, a
         // quiet period is what the section should say — not that only the
@@ -327,41 +355,33 @@ impl SpendGateway for LiteLlm {
         // summary to the first request; it is kept for the third reading.
         let mut summary_body: Option<Value> = None;
         // 1. Individual request rows — the reading that matches per request.
-        if !key_filter.is_empty() {
-            let url = format!("{root}/spend/logs?start_date={day_before}&end_date={day_after}&summarize=false{key_filter}");
-            if let Ok(a) = get_json(client, &url, api_key).await {
-                if a.status == 200 {
-                    match parse_spend_logs(&a.body, start, end) {
-                        Some(rows) => {
-                            let mut spend = spend_from_requests(rows);
-                            if a.truncated {
-                                spend.note = Some(
-                                    "The gateway returned only its 10,000 most recent rows for the period; these figures are a lower bound."
-                                        .into(),
-                                );
-                            }
-                            if has_figures(&spend) {
-                                return Ok(spend);
-                            }
-                            quiet = Some(spend);
-                        }
-                        None => summary_body = Some(a.body),
+        if let Some(a) = logs {
+            match parse_spend_logs(&a.body, start, end) {
+                Some(rows) => {
+                    let mut spend = spend_from_requests(rows);
+                    if a.truncated {
+                        spend.note = Some(
+                            "The gateway returned only its 10,000 most recent rows for the period; these figures are a lower bound."
+                                .into(),
+                        );
                     }
+                    if has_figures(&spend) {
+                        daily_task.abort();
+                        return Ok(spend);
+                    }
+                    quiet = Some(spend);
                 }
+                None => summary_body = Some(a.body),
             }
         }
         // 2. Per-day totals for the key. The tables are keyed on UTC dates.
-        let start_day = start.format("%Y-%m-%d").to_string();
-        let end_day = end.format("%Y-%m-%d").to_string();
-        let url = format!("{root}/user/daily/activity?start_date={start_day}&end_date={end_day}{key_filter}");
-        if let Ok(a) = get_json(client, &url, api_key).await {
-            if a.status == 200 {
-                if let Some(spend) = parse_daily_activity(&a.body, &start_day, &end_day) {
-                    if has_figures(&spend) {
-                        return Ok(spend);
-                    }
-                    quiet.get_or_insert(spend);
+        let daily = daily_task.await.ok().flatten();
+        if let Some(a) = daily {
+            if let Some(spend) = parse_daily_activity(&a.body, &start_day, &end_day) {
+                if has_figures(&spend) {
+                    return Ok(spend);
                 }
+                quiet.get_or_insert(spend);
             }
         }
         // 3. The summary the first reading may have answered: spend per
@@ -464,7 +484,10 @@ mod tests {
         assert_eq!(spend.prompt_tokens, 271465 + 42000);
         assert_eq!(spend.by_model[0].model, "claude-sonnet-5");
         assert_eq!(spend.by_model[1].model, "bedrock/eu-north-1/moonshotai.kimi-k2.5");
-        assert_eq!(spend.requests_detail.as_ref().unwrap().len(), 3);
+        let detail = spend.requests_detail.as_ref().unwrap();
+        assert_eq!(detail.len(), 3);
+        // The alias the client asked for is the name; the deployment is not.
+        assert_eq!(detail[0].model, "claude-sonnet-5");
         // A wrapped body works too.
         assert!(parse_spend_logs(&json!({"data": []}), start, end).is_some());
         assert!(parse_spend_logs(&json!({"error": "forbidden"}), start, end).is_none());
@@ -500,18 +523,30 @@ mod tests {
             "results": [
                 {"date": "2026-09-29", "metrics": {"spend": 102.7, "prompt_tokens": 1, "completion_tokens": 1, "api_requests": 613, "successful_requests": 613}},
                 {"date": "2026-09-30", "metrics": {"spend": 9.85, "prompt_tokens": 21130035, "completion_tokens": 150592, "api_requests": 119, "successful_requests": 113, "failed_requests": 6},
-                 "breakdown": {"models": {
-                    "claude-sonnet-5": {"metrics": {"spend": 9.43, "successful_requests": 99, "prompt_tokens": 20500000, "completion_tokens": 130000}},
-                    "kimi-k2-5": {"metrics": {"spend": 0.42, "successful_requests": 14, "prompt_tokens": 630035, "completion_tokens": 20592}}
-                 }}}
+                 "breakdown": {
+                    "models": {
+                        "bedrock/eu.anthropic.claude-sonnet-5": {"metrics": {"spend": 9.43, "successful_requests": 99, "prompt_tokens": 20500000, "completion_tokens": 130000}},
+                        "bedrock/eu-north-1/moonshotai.kimi-k2.5": {"metrics": {"spend": 0.42, "successful_requests": 14, "prompt_tokens": 630035, "completion_tokens": 20592}}
+                    },
+                    "model_groups": {
+                        "claude-sonnet-5": {"metrics": {"spend": 9.43, "successful_requests": 99, "prompt_tokens": 20500000, "completion_tokens": 130000}},
+                        "kimi-k2-5": {"metrics": {"spend": 0.42, "successful_requests": 14, "prompt_tokens": 630035, "completion_tokens": 20592}}
+                    }
+                 }}
             ]
         });
         let s = parse_daily_activity(&body, "2026-09-30", "2026-09-30").expect("results");
         assert_eq!(s.basis, "daily");
         assert!((s.cost_usd - 9.85).abs() < 1e-9);
         assert_eq!(s.requests, 113);
+        // Named as the client asked (`model_groups`), not as served.
         assert_eq!(s.by_model[0].model, "claude-sonnet-5");
+        assert_eq!(s.by_model[1].model, "kimi-k2-5");
         assert_eq!(s.by_model[1].requests, 14);
+        // Without `model_groups`, the served names are all there is.
+        let served_only = json!({"results": [{"date": "2026-09-30", "metrics": {"spend": 1.0, "successful_requests": 1},
+            "breakdown": {"models": {"bedrock/x": {"metrics": {"spend": 1.0, "successful_requests": 1}}}}}]});
+        assert_eq!(parse_daily_activity(&served_only, "2026-09-30", "2026-09-30").unwrap().by_model[0].model, "bedrock/x");
         assert!(s.note.is_some());
         // A day that reports zero successful requests billed nothing: its
         // failed requests are never counted as billed ones.

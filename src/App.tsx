@@ -2256,6 +2256,7 @@ function App() {
                   <MissionCreator
                     projectId={targetProject.id}
                     projectPath={targetProject.path}
+                    projectJiraKey={targetProject.jiraProjectKey}
                     onCreated={() => {
                       setShowCreator(false);
                       setCreatorProjectId(null);
@@ -2827,6 +2828,7 @@ function App() {
               key={creatorForTicket.linkIssueKeyOnCreate}
               projectId={targetProject.id}
               projectPath={targetProject.path}
+              projectJiraKey={targetProject.jiraProjectKey}
               initialTask={creatorForTicket.initialTask}
               linkIssueKeyOnCreate={creatorForTicket.linkIssueKeyOnCreate}
               onCreated={() => setCreatorForTicket(null)}

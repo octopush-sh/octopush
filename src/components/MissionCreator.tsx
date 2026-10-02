@@ -9,6 +9,7 @@ import type { PrInfo } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useMissionsStore } from "../stores/missionsStore";
+import { BRANCH_NAME_MAX, branchFromTask, shortenSlug, uniqueBranch, worktreeSlugMax } from "../lib/branchName";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
@@ -22,6 +23,9 @@ interface Props {
   initialTask?: string;
   /** After successful creation, link this issue key to the new workspace. */
   linkIssueKeyOnCreate?: string | null;
+  /** The project's Jira key: only a ticket of this project found in the task
+   *  text leads the suggested branch (a bare `UTF-8` is never a ticket). */
+  projectJiraKey?: string | null;
 }
 
 type Step = 1 | 2 | 3;
@@ -68,16 +72,9 @@ function worktreeDisplayPath(projectPath: string, branch: string): string {
   // The backend appends a short per-workspace id (`-<id>`) so two workspaces can
   // never share a directory, whatever their branch names look like. It's assigned
   // at creation time, so preview it as a placeholder suffix rather than a lie.
-  return `${parent}/.octopus-worktrees/${worktreeDirName(branch)}-<id>`;
-}
-
-function slugify(text: string): string {
-  return text
-    .toLowerCase()
-    .trim()
-    .replace(/[^\w\s-]/g, "")
-    .replace(/[\s_]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  // The branch part is capped the way the backend caps it, deep paths included.
+  const worktrees = `${parent}/.octopus-worktrees`;
+  return `${worktrees}/${shortenSlug(worktreeDirName(branch), worktreeSlugMax(worktrees))}-<id>`;
 }
 
 const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: string }> = {
@@ -88,7 +85,7 @@ const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: strin
   perf: { icon: Gauge, title: "Chase a regression", desc: "Profile & find what got slow. Read-only." },
 };
 
-export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate }: Props) {
+export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [intent, setIntent] = useState<Intent>("build");
   const [task, setTask] = useState(initialTask ?? "");
@@ -199,7 +196,13 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     return () => window.removeEventListener("keydown", onKey);
   }, [step, intent]);
 
-  const branch = branchOverride ?? (slugify(task) || "new-mission");
+  // The suggested branch: the ticket key first when there is one, then up to
+  // four words of the task, never over the cap — a long branch becomes a long
+  // worktree path, which Claude Code's transcripts cannot follow. Two tasks
+  // sharing their first words get `-2`, `-3`: never another mission's branch.
+  const branch =
+    branchOverride ??
+    uniqueBranch(branchFromTask(task, linkIssueKeyOnCreate, projectJiraKey) || "new-mission", (b) => branches.includes(b));
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
   const branchCollides = branches.includes(branch);
@@ -391,6 +394,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     // slugified. Matches octopush-mcp's verbatim behaviour.
                     setBranchOverride(branchOverride.trim() || null);
                   }}
+                  maxLength={Math.max(BRANCH_NAME_MAX, branchOverride === null ? branch.length : 0)}
                   title="Branch name — edit to set an exact name (e.g. feat/Foo)"
                   aria-label="Branch name"
                   className="rounded-none border-b border-transparent bg-transparent font-mono text-[10px] normal-case tracking-[0.2em] text-octo-brass outline-none transition-colors duration-[220ms] focus:border-octo-brass"
