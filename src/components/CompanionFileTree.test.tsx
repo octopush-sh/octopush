@@ -76,6 +76,15 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.getByText(/Files/i)).toBeInTheDocument());
   });
 
+  it("never truncates deep names — the tree scrolls horizontally instead", async () => {
+    render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
+    const label = await screen.findByText("pom.xml");
+    expect(label.className).not.toMatch(/truncate/);
+    expect(label.className).toMatch(/whitespace-nowrap/);
+    const tree = screen.getByRole("tree", { name: "Workspace files" });
+    expect(tree.className).toMatch(/overflow-auto/);
+  });
+
   it("renders root label in serif", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     await waitFor(() => {

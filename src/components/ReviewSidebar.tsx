@@ -20,6 +20,26 @@ type Tab = "changes" | "files";
 
 const COLLAPSE_KEY = "reviewSidebarCollapsed";
 const TAB_KEY = "reviewSidebarTab";
+const WIDTH_KEY = "reviewSidebarWidth";
+
+/** Drag-resize bounds for the expanded sidebar. Deep trees (Java packages,
+ *  monorepos) need room; the canvas still keeps the majority of the window. */
+export const SIDEBAR_DEFAULT_WIDTH = 280;
+export const SIDEBAR_MIN_WIDTH = 200;
+export const SIDEBAR_MAX_WIDTH = 640;
+
+function clampWidth(w: number): number {
+  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, w));
+}
+
+function readStoredWidth(): number {
+  try {
+    const parsed = Number(localStorage.getItem(WIDTH_KEY));
+    return Number.isFinite(parsed) && parsed > 0 ? clampWidth(parsed) : SIDEBAR_DEFAULT_WIDTH;
+  } catch {
+    return SIDEBAR_DEFAULT_WIDTH;
+  }
+}
 
 interface FileTreeProps {
   rootPath: string;
@@ -96,6 +116,67 @@ export function ReviewSidebar({
       /* storage unavailable — keep the in-memory value */
     }
   }, []);
+
+  // ── Width (drag the right edge; double-click resets) ────────────
+  const [width, setWidth] = useState<number>(readStoredWidth);
+  const [resizing, setResizing] = useState(false);
+
+  const persistWidth = useCallback((next: number) => {
+    try {
+      localStorage.setItem(WIDTH_KEY, String(next));
+    } catch {
+      /* storage unavailable — keep the in-memory value */
+    }
+  }, []);
+
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = width;
+      let latest = startWidth;
+      setResizing(true);
+      const onMove = (ev: MouseEvent) => {
+        // The sidebar sits on the left; moving the cursor RIGHT widens it.
+        latest = clampWidth(startWidth + ev.clientX - startX);
+        setWidth(latest);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        setResizing(false);
+        persistWidth(latest);
+      };
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [width, persistWidth],
+  );
+
+  const resetWidth = useCallback(() => {
+    setWidth(SIDEBAR_DEFAULT_WIDTH);
+    persistWidth(SIDEBAR_DEFAULT_WIDTH);
+  }, [persistWidth]);
+
+  const onResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      const step = e.shiftKey ? 64 : 16;
+      let next: number | null = null;
+      if (e.key === "ArrowLeft") next = clampWidth(width - step);
+      else if (e.key === "ArrowRight") next = clampWidth(width + step);
+      else if (e.key === "Home") next = SIDEBAR_MIN_WIDTH;
+      else if (e.key === "End") next = SIDEBAR_MAX_WIDTH;
+      if (next === null) return;
+      e.preventDefault();
+      setWidth(next);
+      persistWidth(next);
+    },
+    [width, persistWidth],
+  );
 
   // ── Focus-commit orchestration (the `c` shortcut) ───────────────
   // ChangesPanel is now only mounted on the Changes tab, so the shortcut must
@@ -225,7 +306,32 @@ export function ReviewSidebar({
   );
 
   return (
-    <div className="flex w-[280px] shrink-0 flex-col border-r border-octo-hairline transition-all duration-[220ms]">
+    <div
+      className={`relative flex shrink-0 flex-col border-r border-octo-hairline ${
+        // Animate collapse/expand, never the live drag — a transition on
+        // width would make the edge lag behind the cursor.
+        resizing ? "" : "transition-all duration-[220ms]"
+      }`}
+      style={{ width }}
+      data-testid="review-sidebar"
+    >
+      {/* Resize handle on the right edge — the mirror of the Companion's. */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize changes & files"
+        aria-valuenow={width}
+        aria-valuemin={SIDEBAR_MIN_WIDTH}
+        aria-valuemax={SIDEBAR_MAX_WIDTH}
+        tabIndex={0}
+        title="Drag to resize · Double-click to reset"
+        onMouseDown={startResize}
+        onDoubleClick={resetWidth}
+        onKeyDown={onResizeKeyDown}
+        className={`absolute -right-[2px] top-0 bottom-0 z-10 w-[4px] cursor-col-resize transition-colors hover:bg-octo-brass focus-visible:bg-octo-brass focus-visible:outline-none ${
+          resizing ? "bg-octo-brass" : "bg-transparent"
+        }`}
+      />
       <FadeSwap swapKey={tab} className="flex min-h-0 flex-1 flex-col">
         {tab === "changes" ? (
           <ChangesPanel
