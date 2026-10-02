@@ -163,6 +163,22 @@ describe("ReviewSidebar", () => {
       expect(localStorage.getItem("reviewSidebarWidth")).toBe("640");
     });
 
+    it("an unmount mid-drag releases the body and the window listeners", () => {
+      const { unmount } = render(<ReviewSidebar changedCount={0} {...baseProps} />);
+      const handle = screen.getByRole("separator", { name: /resize changes & files/i });
+      act(() => {
+        handle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 280 }));
+      });
+      expect(document.body.style.cursor).toBe("col-resize");
+      const removeSpy = vi.spyOn(window, "removeEventListener");
+      unmount();
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+      expect(removeSpy).toHaveBeenCalledWith("mousemove", expect.any(Function));
+      expect(removeSpy).toHaveBeenCalledWith("mouseup", expect.any(Function));
+      removeSpy.mockRestore();
+    });
+
     it("restores the stored width and double-click resets it", async () => {
       localStorage.setItem("reviewSidebarWidth", "420");
       render(<ReviewSidebar changedCount={0} {...baseProps} />);

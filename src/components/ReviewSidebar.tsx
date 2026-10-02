@@ -27,6 +27,9 @@ const WIDTH_KEY = "reviewSidebarWidth";
 export const SIDEBAR_DEFAULT_WIDTH = 280;
 export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 640;
+/** The canvas always keeps at least this much room, whatever the stored
+ *  width — a wide sidebar on a narrow window must not crush the diff. */
+const MIN_CANVAS_WIDTH = 360;
 
 function clampWidth(w: number): number {
   return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, w));
@@ -120,6 +123,11 @@ export function ReviewSidebar({
   // ── Width (drag the right edge; double-click resets) ────────────
   const [width, setWidth] = useState<number>(readStoredWidth);
   const [resizing, setResizing] = useState(false);
+  // Tears down an in-flight drag. Held in a ref so an unmount mid-drag (a
+  // mode switch via shortcut, a workspace change) can't leak window
+  // listeners or leave the body stuck in col-resize / no-select.
+  const endDragRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => endDragRef.current?.(), []);
 
   const persistWidth = useCallback((next: number) => {
     try {
@@ -141,14 +149,19 @@ export function ReviewSidebar({
         latest = clampWidth(startWidth + ev.clientX - startX);
         setWidth(latest);
       };
-      const onUp = () => {
+      const teardown = () => {
         window.removeEventListener("mousemove", onMove);
         window.removeEventListener("mouseup", onUp);
         document.body.style.userSelect = "";
         document.body.style.cursor = "";
+        endDragRef.current = null;
+      };
+      const onUp = () => {
+        teardown();
         setResizing(false);
         persistWidth(latest);
       };
+      endDragRef.current = teardown;
       document.body.style.userSelect = "none";
       document.body.style.cursor = "col-resize";
       window.addEventListener("mousemove", onMove);
@@ -312,7 +325,7 @@ export function ReviewSidebar({
         // width would make the edge lag behind the cursor.
         resizing ? "" : "transition-all duration-[220ms]"
       }`}
-      style={{ width }}
+      style={{ width, maxWidth: `calc(100% - ${MIN_CANVAS_WIDTH}px)` }}
       data-testid="review-sidebar"
     >
       {/* Resize handle on the right edge — the mirror of the Companion's. */}
