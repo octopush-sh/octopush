@@ -1,35 +1,21 @@
 import { describe, it, expect } from "vitest";
-import { BRANCH_NAME_MAX, branchFromTask, shortenSlug } from "./branchName";
+import fixtures from "./branchName.fixtures.json";
+import { BRANCH_NAME_MAX, DIR_SLUG_MAX, DIR_SLUG_MIN, branchFromTask, shortenSlug, uniqueBranch, worktreeSlugMax } from "./branchName";
 
 describe("branchFromTask", () => {
-  it("keeps a short task as it was", () => {
-    expect(branchFromTask("Add dark mode")).toBe("add-dark-mode");
-    expect(branchFromTask("Fix checkout bug")).toBe("fix-checkout-bug");
-  });
-
-  it("starts with the ticket key and keeps four significant words of the summary", () => {
-    const summary = "Add a GitLab group preview endpoint that returns the subgroup/project tree for the connect modal, refusing overlaps before the user selects anything";
-    expect(branchFromTask(summary, "GUIDE-3753")).toBe("GUIDE-3753-add-gitlab-group-preview");
-    expect(branchFromTask(summary, "GUIDE-3753").length).toBeLessThanOrEqual(BRANCH_NAME_MAX);
-  });
-
-  it("finds the key in the task when none is given, and never repeats it", () => {
-    expect(branchFromTask("GUIDE-3753: scan the AGP docker image")).toBe("GUIDE-3753-scan-agp-docker-image");
-    expect(branchFromTask("Only the key: GUIDE-3753", "GUIDE-3753")).toBe("GUIDE-3753-only-key");
-  });
-
-  it("drops filler words, falling back to them when nothing else is left", () => {
-    expect(branchFromTask("Build me a new app to track my daily tasks")).toBe("track-daily-tasks");
-    expect(branchFromTask("the a an")).toBe("the-a-an");
-    expect(branchFromTask("***")).toBe("");
-    expect(branchFromTask("", "OCT-12")).toBe("OCT-12");
+  it("satisfies every shared case, the ones the Rust mirror is pinned to", () => {
+    for (const c of fixtures.cases) {
+      expect(branchFromTask(c.task, c.key, c.projectKey), `${c.task} · key=${c.key} · project=${c.projectKey}`).toBe(c.expect);
+    }
   });
 
   it("never exceeds the cap and never cuts inside a word or the key", () => {
-    const long = branchFromTask("supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis floccinaucinihilipilification", "VERYLONGPROJECTKEY-123456");
-    expect(long.length).toBeLessThanOrEqual(BRANCH_NAME_MAX);
-    expect(long.startsWith("VERYLONGPROJECTKEY-123456")).toBe(true);
-    expect(long).not.toMatch(/-$/);
+    for (const c of fixtures.cases) {
+      const out = branchFromTask(c.task, c.key, c.projectKey);
+      expect(out.length).toBeLessThanOrEqual(Math.max(BRANCH_NAME_MAX, (c.key ?? "").length));
+      expect(out).not.toMatch(/-$/);
+      if (c.key) expect(out.startsWith(c.key)).toBe(true);
+    }
   });
 });
 
@@ -39,5 +25,21 @@ describe("shortenSlug", () => {
     expect(shortenSlug("one-two-three", 13)).toBe("one-two-three");
     expect(shortenSlug("abcdefghijklmnop", 5)).toBe("abcde");
     expect(shortenSlug("one-two", 4)).toBe("one");
+  });
+});
+
+describe("uniqueBranch", () => {
+  it("suffixes a taken name with the first free number", () => {
+    const taken = new Set(["fix-login-form-validation", "fix-login-form-validation-2"]);
+    expect(uniqueBranch("fix-login-form-validation", (b) => taken.has(b))).toBe("fix-login-form-validation-3");
+    expect(uniqueBranch("free", (b) => taken.has(b))).toBe("free");
+  });
+});
+
+describe("worktreeSlugMax", () => {
+  it("keeps the usual cap under a normal path and gives way under a deep one", () => {
+    expect(worktreeSlugMax("/Users/j/IdeaProjects/.octopus-worktrees")).toBe(DIR_SLUG_MAX);
+    expect(worktreeSlugMax(`/Users/j/${"deep/".repeat(28)}.octopus-worktrees`)).toBeLessThan(DIR_SLUG_MAX);
+    expect(worktreeSlugMax(`/${"x/".repeat(120)}.octopus-worktrees`)).toBe(DIR_SLUG_MIN);
   });
 });

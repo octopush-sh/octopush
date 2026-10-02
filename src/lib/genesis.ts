@@ -21,12 +21,22 @@ export const GENESIS_STOPWORDS = new Set([
 ]);
 
 /** Keep ASCII word chars only, lowercased, and bounded so a giant no-whitespace
- *  paste (URL, hash) can't blow past the filesystem's ~255-byte name limit. */
-function cleanToken(t: string): string {
+ *  paste (URL, hash) can't blow past the filesystem's ~255-byte name limit.
+ *  Mirrored by `workspace::clean_token` in Rust. */
+export function cleanToken(t: string): string {
   return t
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "")
     .slice(0, 24);
+}
+
+/** The first `n` significant words of a text (filler dropped), or its first
+ *  `n` words when everything is filler. The one word-picking rule behind
+ *  project names and branch names; mirrored by `workspace::pick_words`. */
+export function pickWords(text: string, n: number): string[] {
+  const words = text.split(/\s+/).map(cleanToken).filter(Boolean);
+  const significant = words.filter((w) => !GENESIS_STOPWORDS.has(w));
+  return (significant.length > 0 ? significant : words).slice(0, n);
 }
 
 /**
@@ -36,8 +46,5 @@ function cleanToken(t: string): string {
  * raw tokens (then "new-project") when everything is filler.
  */
 export function deriveProjectName(prompt: string): string {
-  const words = prompt.split(/\s+/).map(cleanToken).filter(Boolean);
-  const significant = words.filter((w) => !GENESIS_STOPWORDS.has(w));
-  const picked = (significant.length > 0 ? significant : words).slice(0, 4);
-  return picked.join("-") || "new-project";
+  return pickWords(prompt, 4).join("-") || "new-project";
 }

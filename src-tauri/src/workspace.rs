@@ -21,38 +21,6 @@ use parking_lot::Mutex;
 use crate::db::{Db, WorkspaceRow};
 use crate::error::{AppError, AppResult};
 
-/// Turn free text into a git-branch-safe slug, byte-for-byte matching the
-/// frontend's `slugify` in `WorkspaceCreator.tsx` so a workspace created from
-/// the MCP gets the exact branch name the UI would have produced. The frontend
-/// is: lowercase → drop everything except ASCII word chars, whitespace and
-/// `-` → collapse runs of whitespace/`_` (NOT `-`) to a single `-` → trim
-/// leading/trailing `-`. Note literal hyphens are preserved, never collapsed.
-pub fn slugify(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut sep_run = false; // inside a run of whitespace/underscore
-    for ch in text.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            if sep_run {
-                out.push('-');
-                sep_run = false;
-            }
-            out.push(ch);
-        } else if ch.is_whitespace() || ch == '_' {
-            sep_run = true; // becomes a single '-' before the next kept char
-        } else if ch == '-' {
-            // A literal hyphen is kept verbatim (frontend's char class allows
-            // '-' and its collapse step only targets [\s_]). Flush a pending
-            // separator run first so spacing around it is preserved.
-            if sep_run {
-                out.push('-');
-                sep_run = false;
-            }
-            out.push('-');
-        }
-        // Any other character (punctuation, non-ASCII) is dropped.
-    }
-    out.trim_matches('-').to_string()
-}
 
 /// The longest branch the app derives from a task. Mirrors the frontend's
 /// `BRANCH_NAME_MAX` in `lib/branchName.ts`.
@@ -97,31 +65,44 @@ pub fn shorten_slug(slug: &str, max: usize) -> String {
     cut.trim_end_matches('-').to_string()
 }
 
+/// Lowercase, then ASCII letters and digits only, at most 24 — the
+/// frontend's `cleanToken`, in that order (`İstanbul` → `istanbul`).
 fn clean_token(t: &str) -> String {
-    t.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(|c| c.to_lowercase()).take(24).collect()
+    t.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).take(24).collect()
+}
+
+/// The first `n` significant words of a text (filler dropped), or its first
+/// `n` words when everything is filler. The frontend's `pickWords`.
+fn pick_words(text: &str, n: usize) -> Vec<String> {
+    let words: Vec<String> = text.split_whitespace().map(clean_token).filter(|t| !t.is_empty()).collect();
+    let significant: Vec<String> = words.iter().filter(|w| !STOPWORDS.contains(&w.as_str())).cloned().collect();
+    let picked = if significant.is_empty() { words } else { significant };
+    picked.into_iter().take(n).collect()
 }
 
 /// `<KEY>-<up to four significant words>`, at most [`BRANCH_NAME_MAX`]
 /// characters, cut on a word boundary and never inside the key. The key is
-/// the one given or the first found in the task; a token that is the key
-/// itself never repeats. Empty when nothing is left — the caller picks its
-/// fallback. Mirrors the frontend's `branchFromTask`, example for example.
-pub fn branch_from_task(task: &str, issue_key: Option<&str>) -> String {
+/// the one given or, only when the project has a Jira key, that project's
+/// first key found in the task — a bare `UTF-8` is never a ticket. The key's
+/// text is removed from the task before its words are picked, so it never
+/// repeats, glued to punctuation or not. Empty when nothing is left — the
+/// caller picks its fallback. Mirrors the frontend's `branchFromTask`;
+/// `src/lib/branchName.fixtures.json` pins both to the same cases.
+pub fn branch_from_task(task: &str, issue_key: Option<&str>, project_key: Option<&str>) -> String {
     let key = issue_key
         .map(str::to_string)
-        .or_else(|| crate::issue_tracker::detect_issue_key(task))
+        .or_else(|| {
+            let project = project_key?.trim();
+            if project.is_empty() {
+                return None;
+            }
+            crate::issue_tracker::detect_issue_key(task).filter(|k| k.starts_with(&format!("{project}-")))
+        })
         .unwrap_or_default()
         .trim()
         .to_string();
-    let key_token = clean_token(&key);
-    let tokens: Vec<String> = task
-        .split_whitespace()
-        .map(clean_token)
-        .filter(|t| !t.is_empty() && *t != key_token)
-        .collect();
-    let significant: Vec<&String> = tokens.iter().filter(|t| !STOPWORDS.contains(&t.as_str())).collect();
-    let picked: Vec<&String> = if significant.is_empty() { tokens.iter().collect() } else { significant };
-    let body = picked.into_iter().take(BRANCH_WORDS).cloned().collect::<Vec<_>>().join("-");
+    let text = if key.is_empty() { task.to_string() } else { remove_ignoring_case(task, &key) };
+    let body = pick_words(&text, BRANCH_WORDS).join("-");
     if key.is_empty() {
         return shorten_slug(&body, BRANCH_NAME_MAX);
     }
@@ -131,6 +112,43 @@ pub fn branch_from_task(task: &str, issue_key: Option<&str>) -> String {
     let room = BRANCH_NAME_MAX.saturating_sub(key.len() + 1);
     let tail = if room > 0 { shorten_slug(&body, room) } else { String::new() };
     if tail.is_empty() { key } else { format!("{key}-{tail}") }
+}
+
+/// `text` with every occurrence of `needle` (any case) replaced by a space.
+fn remove_ignoring_case(text: &str, needle: &str) -> String {
+    let lower = text.to_lowercase();
+    let needle_l = needle.to_lowercase();
+    if needle_l.is_empty() || lower.len() != text.len() {
+        // A lowercase that changes byte length cannot be mapped back; fall
+        // back to a case-sensitive removal.
+        return text.replace(needle, " ");
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if lower[i..].starts_with(&needle_l) {
+            out.push(' ');
+            i += needle_l.len();
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// `base`, or `base-2`, `base-3`, … — the first `is_taken` refuses. Two
+/// tasks that share their first four words must not share a branch, or the
+/// second mission would silently reuse the first one's workspace.
+pub fn unique_branch(base: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    if !is_taken(base) {
+        return base.to_string();
+    }
+    (2..1000)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !is_taken(c))
+        .unwrap_or_else(|| format!("{base}-{}", chrono::Utc::now().timestamp()))
 }
 
 /// What `create` did, so callers can tell the user (and the MCP can report it).
@@ -350,8 +368,20 @@ fn worktree_dir_name_within(branch: &str, workspace_id: &str, slug_max: usize) -
 /// slug gives way until the path fits — else the session's spend would be
 /// unreadable. Never shorter than eight characters of slug.
 fn worktree_dir_name_under(worktrees_dir: &Path, branch: &str, workspace_id: &str) -> String {
-    let base = crate::transcripts::project_dir_name(&format!("{}/", worktrees_dir.to_string_lossy()));
-    let room = CLAUDE_DIR_NAME_CAP.saturating_sub(base.chars().count() + 1 + 8);
+    // Claude Code records the physical cwd, so a symlinked parent counts at
+    // its resolved length — whichever of the two is longer bounds the slug.
+    let as_written = format!("{}/", worktrees_dir.to_string_lossy());
+    let resolved = worktrees_dir
+        .parent()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .and_then(|p| worktrees_dir.file_name().map(|n| format!("{}/{}/", p.to_string_lossy(), n.to_string_lossy())));
+    let base = [Some(as_written), resolved]
+        .into_iter()
+        .flatten()
+        .map(|p| crate::transcripts::project_dir_name(&p).chars().count())
+        .max()
+        .unwrap_or(0);
+    let room = CLAUDE_DIR_NAME_CAP.saturating_sub(base + 1 + 8);
     worktree_dir_name_within(branch, workspace_id, DIR_SLUG_MAX.min(room).max(8))
 }
 
@@ -510,36 +540,44 @@ mod tests {
     }
 
     #[test]
-    fn slugify_matches_frontend_rules() {
-        assert_eq!(slugify("Scan AGP Docker image"), "scan-agp-docker-image");
-        assert_eq!(slugify("feat: do the thing"), "feat-do-the-thing");
-        assert_eq!(slugify("  trailing  and __mixed-- "), "trailing-and-mixed");
-        assert_eq!(slugify("GUIDE-2887"), "guide-2887");
-        assert_eq!(slugify("***"), "");
-        // Literal hyphens are preserved, never collapsed — must match the
-        // frontend exactly so the same task yields the same branch.
-        assert_eq!(slugify("Add login - logout flow"), "add-login---logout-flow");
+    fn branch_from_task_satisfies_the_shared_cases_the_wizard_is_pinned_to() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/branchName.fixtures.json")).expect("fixtures");
+        let cases = fixtures["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 10);
+        for c in cases {
+            let task = c["task"].as_str().unwrap();
+            let key = c["key"].as_str();
+            let project = c["projectKey"].as_str();
+            let out = branch_from_task(task, key, project);
+            assert_eq!(out, c["expect"].as_str().unwrap(), "{task} · key={key:?} · project={project:?}");
+            assert!(out.len() <= BRANCH_NAME_MAX.max(key.map_or(0, str::len)), "{out}");
+            assert!(!out.ends_with('-'));
+        }
     }
 
     #[test]
-    fn branch_from_task_mirrors_the_wizard_example_for_example() {
-        assert_eq!(branch_from_task("Add dark mode", None), "add-dark-mode");
-        assert_eq!(branch_from_task("Fix checkout bug", None), "fix-checkout-bug");
-        let summary = "Add a GitLab group preview endpoint that returns the subgroup/project tree for the connect modal, refusing overlaps before the user selects anything";
-        assert_eq!(branch_from_task(summary, Some("GUIDE-3753")), "GUIDE-3753-add-gitlab-group-preview");
-        assert_eq!(branch_from_task("GUIDE-3753: scan the AGP docker image", None), "GUIDE-3753-scan-agp-docker-image");
-        assert_eq!(branch_from_task("Only the key: GUIDE-3753", Some("GUIDE-3753")), "GUIDE-3753-only-key");
-        assert_eq!(branch_from_task("Build me a new app to track my daily tasks", None), "track-daily-tasks");
-        assert_eq!(branch_from_task("the a an", None), "the-a-an");
-        assert_eq!(branch_from_task("***", None), "");
-        assert_eq!(branch_from_task("", Some("OCT-12")), "OCT-12");
-        let long = branch_from_task(
-            "supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis floccinaucinihilipilification",
-            Some("VERYLONGPROJECTKEY-123456"),
-        );
-        assert!(long.len() <= BRANCH_NAME_MAX, "{long}");
-        assert!(long.starts_with("VERYLONGPROJECTKEY-123456"));
-        assert!(!long.ends_with('-'));
+    fn stopwords_are_the_frontends_word_for_word() {
+        // The list is copied from `lib/genesis.ts`; this keeps the copy honest.
+        let src = include_str!("../../src/lib/genesis.ts");
+        let start = src.find("GENESIS_STOPWORDS = new Set([").expect("list") + "GENESIS_STOPWORDS = new Set([".len();
+        let end = src[start..].find("])").expect("end") + start;
+        let frontend: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
+        let mut ours: Vec<&str> = STOPWORDS.to_vec();
+        let mut theirs: Vec<&str> = frontend;
+        ours.sort_unstable();
+        ours.dedup();
+        theirs.sort_unstable();
+        theirs.dedup();
+        assert_eq!(ours, theirs);
+    }
+
+    #[test]
+    fn unique_branch_suffixes_a_taken_name_with_the_first_free_number() {
+        let taken = ["fix-login-form-validation", "fix-login-form-validation-2"];
+        let is_taken = |b: &str| taken.contains(&b);
+        assert_eq!(unique_branch("fix-login-form-validation", is_taken), "fix-login-form-validation-3");
+        assert_eq!(unique_branch("free", is_taken), "free");
     }
 
     #[test]
@@ -560,7 +598,8 @@ mod tests {
         // A short branch is left alone.
         assert_eq!(worktree_dir_name("feat/foo", "12345678x"), "feat-foo-12345678");
         // Under a deep parent, the slug gives way so the sanitized path stays
-        // within Claude Code's 200 characters.
+        // within Claude Code's 200 characters. (A path that does not exist
+        // cannot be canonicalized; its written form is the bound.)
         let deep_s = format!("/Users/j/{}/.octopus-worktrees", "deep/".repeat(28));
         let deep = Path::new(&deep_s);
         let fitted = worktree_dir_name_under(deep, &long_branch, "abcdefgh");
@@ -572,6 +611,21 @@ mod tests {
         // slug, cut on a word boundary like any other.
         let absurd_s = format!("/{}/.octopus-worktrees", "x/".repeat(120));
         assert_eq!(worktree_dir_name_under(Path::new(&absurd_s), &long_branch, "abcdefgh"), "GUIDE-abcdefgh");
+        // A symlinked parent counts at its resolved length.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join(format!("{}real", "very-long-directory-name/".repeat(4)));
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("s");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let via_link = link.join(".octopus-worktrees");
+            let fitted = worktree_dir_name_under(&via_link, &long_branch, "abcdefgh");
+            let physical = format!("{}/.octopus-worktrees/{}", real.canonicalize().unwrap().to_string_lossy(), fitted);
+            assert!(crate::transcripts::project_dir_name(&physical).chars().count() <= CLAUDE_DIR_NAME_CAP, "{physical}");
+            // The short path through the link alone would have allowed the full slug.
+            assert!(fitted.len() < DIR_SLUG_MAX + 9, "the resolved length bounded it: {fitted}");
+        }
     }
 
     #[test]
