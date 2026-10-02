@@ -798,8 +798,24 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
             b
         }
         None => {
-            let s = octopush_lib::workspace::slugify(&task);
-            if s.is_empty() { "new-workspace".to_string() } else { s }
+            // The same short name the wizard would derive: the project's
+            // ticket key found in the task first, then up to four words, never
+            // long — and never another workspace's branch: a name already
+            // taken (as a git branch or by a workspace) gets `-2`, `-3`.
+            let jira_key = db
+                .lock()
+                .get_project(&project_id)
+                .ok()
+                .flatten()
+                .and_then(|p| p.jira_project_key);
+            let base = octopush_lib::workspace::branch_from_task(&task, None, jira_key.as_deref());
+            let base = if base.is_empty() { "new-workspace".to_string() } else { base };
+            let git_branches =
+                octopush_lib::git_ops::list_branches(std::path::Path::new(&project_path)).unwrap_or_default();
+            octopush_lib::workspace::unique_branch(&base, |b| {
+                git_branches.iter().any(|g| g == b)
+                    || db.lock().find_workspace_by_branch(&project_id, b).ok().flatten().is_some()
+            })
         }
     };
     let name = opt_str(args, "name")

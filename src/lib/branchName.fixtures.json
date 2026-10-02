@@ -1,0 +1,21 @@
+{
+  "note": "Cases branchFromTask (lib/branchName.ts) and workspace::branch_from_task (Rust) must both satisfy, example for example. projectKey scopes detection of a key in the task; key is an explicit one.",
+  "cases": [
+    { "task": "Add dark mode", "key": null, "projectKey": null, "expect": "add-dark-mode" },
+    { "task": "Fix checkout bug", "key": null, "projectKey": null, "expect": "fix-checkout-bug" },
+    { "task": "Add a GitLab group preview endpoint that returns the subgroup/project tree for the connect modal, refusing overlaps before the user selects anything", "key": "GUIDE-3753", "projectKey": null, "expect": "GUIDE-3753-add-gitlab-group-preview" },
+    { "task": "GUIDE-3753: scan the AGP docker image", "key": null, "projectKey": "GUIDE", "expect": "GUIDE-3753-scan-agp-docker-image" },
+    { "task": "GUIDE-3753/scan docker image", "key": null, "projectKey": "GUIDE", "expect": "GUIDE-3753-scan-docker-image" },
+    { "task": "[GUIDE-3753]fix the thing", "key": null, "projectKey": "GUIDE", "expect": "GUIDE-3753-fix" },
+    { "task": "GUIDE-3753: scan the AGP docker image", "key": null, "projectKey": null, "expect": "guide3753-scan-agp-docker" },
+    { "task": "Fix UTF-8 decoding in the login flow", "key": null, "projectKey": "GUIDE", "expect": "fix-utf8-decoding-login" },
+    { "task": "Fix UTF-8 decoding in the login flow", "key": null, "projectKey": null, "expect": "fix-utf8-decoding-login" },
+    { "task": "Only the key: GUIDE-3753", "key": "GUIDE-3753", "projectKey": null, "expect": "GUIDE-3753-only-key" },
+    { "task": "Build me a new app to track my daily tasks", "key": null, "projectKey": null, "expect": "track-daily-tasks" },
+    { "task": "the a an", "key": null, "projectKey": null, "expect": "the-a-an" },
+    { "task": "***", "key": null, "projectKey": null, "expect": "" },
+    { "task": "", "key": "OCT-12", "projectKey": null, "expect": "OCT-12" },
+    { "task": "İstanbul café naïve résumé", "key": null, "projectKey": null, "expect": "istanbul-caf-nave-rsum" },
+    { "task": "supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis floccinaucinihilipilification", "key": "VERYLONGPROJECTKEY-123456", "projectKey": null, "expect": "VERYLONGPROJECTKEY-123456-supercalifragilisticexpi" }
+  ]
+}
