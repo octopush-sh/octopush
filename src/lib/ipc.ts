@@ -320,6 +320,22 @@ export interface FileMeta {
   size: number;
 }
 
+/** A workspace whose worktree contains a given file (Open With routing). */
+export interface WorkspaceMatch {
+  projectId: string;
+  workspaceId: string;
+  workspaceName: string;
+  root: string;
+}
+
+/** Payload of `octo://open-in-workspace` (Quick View → main window). */
+export interface OpenInWorkspacePayload {
+  projectId: string;
+  workspaceId: string;
+  /** Relative to the workspace root. */
+  relativePath: string;
+}
+
 export type PullKind = "ok" | "diverged" | "conflict" | "error";
 export interface PullOutcome { kind: PullKind; output: string }
 
@@ -357,6 +373,7 @@ export interface StashInfo {
 }
 
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   AdapterInfo,
   AppSettings,
@@ -776,6 +793,35 @@ export const ipc = {
   writeFile: (path: string, content: string) =>
     invoke<{ mtime: number }>("write_file", { path, content }),
   fileMeta: (path: string) => invoke<FileMeta | null>("file_meta", { path }),
+
+  // ─── Open With / Quick View ────────────────────────────────────
+  /** The file this Quick View window was opened for (null outside one). */
+  quickviewPath: () => invoke<string | null>("quickview_path"),
+  /** Open a file in its own Quick View window. */
+  openQuickView: (path: string) => invoke<void>("open_quickview_window", { path }),
+  /** The workspace whose worktree contains `path`, if any. */
+  workspaceForPath: (path: string) =>
+    invoke<WorkspaceMatch | null>("workspace_for_path", { path }),
+  /** Bring the main window forward and open `path` in its workspace's
+   *  editor. Resolves false when no workspace contains the file. */
+  openPathInWorkspace: (path: string) =>
+    invoke<boolean>("open_path_in_workspace", { path }),
+  showMainWindow: () => invoke<void>("show_main_window"),
+  /** Label of the window this webview runs in ("main" outside Tauri). */
+  currentWindowLabel: (): string => {
+    try {
+      return getCurrentWindow().label;
+    } catch {
+      return "main";
+    }
+  },
+  /** Intercept this window's close. The handler returns true to let it close;
+   *  false keeps it open (the caller then closes it via `destroyCurrentWindow`). */
+  onCloseRequested: (handler: () => boolean) =>
+    getCurrentWindow().onCloseRequested((event) => {
+      if (!handler()) event.preventDefault();
+    }),
+  destroyCurrentWindow: () => getCurrentWindow().destroy(),
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string, showIgnored?: boolean) =>

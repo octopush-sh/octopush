@@ -7,17 +7,9 @@ import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirror/commands";
 import { indentOnInput, bracketMatching, foldGutter, indentUnit } from "@codemirror/language";
 import { search, searchKeymap, setSearchQuery, SearchQuery } from "@codemirror/search";
-import { javascript } from "@codemirror/lang-javascript";
-import { rust } from "@codemirror/lang-rust";
-import { python } from "@codemirror/lang-python";
-import { java } from "@codemirror/lang-java";
-import { json } from "@codemirror/lang-json";
-import { markdown } from "@codemirror/lang-markdown";
-import { html } from "@codemirror/lang-html";
-import { css } from "@codemirror/lang-css";
-import { xml } from "@codemirror/lang-xml";
-import { yaml } from "@codemirror/lang-yaml";
 import { buildEditorTheme } from "./editor/atelierTheme";
+import { languageSupport } from "../lib/editorLanguages";
+import type { LangId } from "../lib/editorLang";
 import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
 import { blameGutter } from "./editor/blameGutter";
@@ -47,22 +39,6 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
   diffText: string;
-}
-
-function langExtension(lang: string) {
-  switch (lang) {
-    case "javascript": return javascript({ typescript: true, jsx: true });
-    case "rust":       return rust();
-    case "python":     return python();
-    case "java":       return java();
-    case "json":       return json();
-    case "markdown":   return markdown();
-    case "html":       return html();
-    case "css":        return css();
-    case "xml":        return xml();
-    case "yaml":       return yaml();
-    default:           return [];
-  }
 }
 
 // ── Live-reconfigurable preference compartments (module-level, stable) ──
@@ -148,7 +124,7 @@ function buildState(opts: {
         ...defaultKeymap,
         ...historyKeymap,
       ]),
-      langExtension(lang),
+      languageSupport(lang as LangId),
       themeComp.of(buildEditorTheme()),
       diffGutter(markers),
       EditorView.updateListener.of((update) => {

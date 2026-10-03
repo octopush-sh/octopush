@@ -19,9 +19,26 @@ export type LangId =
   | "css"
   | "xml"
   | "yaml"
+  | "shell"
+  | "toml"
+  | "go"
+  | "sql"
+  | "dockerfile"
+  | "properties"
+  | "ruby"
+  | "swift"
+  | "c"
+  | "cpp"
+  | "csharp"
+  | "kotlin"
+  | "lua"
   | "plaintext";
 
 export function langForExtension(path: string): LangId {
+  // Extension-less files known by name.
+  const base = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  if (base === "dockerfile" || base.startsWith("dockerfile.")) return "dockerfile";
+
   const ext = getExtension(path);
   if (ext === "") return "plaintext";
 
@@ -56,6 +73,43 @@ export function langForExtension(path: string): LangId {
     case "yaml":
     case "yml":
       return "yaml";
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "shell";
+    case "toml":
+      return "toml";
+    case "go":
+      return "go";
+    case "sql":
+      return "sql";
+    case "dockerfile":
+      return "dockerfile";
+    case "ini":
+    case "cfg":
+    case "conf":
+    case "env":
+    case "properties":
+      return "properties";
+    case "rb":
+      return "ruby";
+    case "swift":
+      return "swift";
+    case "c":
+    case "h":
+      return "c";
+    case "cpp":
+    case "cc":
+    case "cxx":
+    case "hpp":
+      return "cpp";
+    case "cs":
+      return "csharp";
+    case "kt":
+    case "kts":
+      return "kotlin";
+    case "lua":
+      return "lua";
     default:
       return "plaintext";
   }

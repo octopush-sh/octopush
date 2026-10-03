@@ -14,6 +14,7 @@ pub mod context_guard;
 pub mod db;
 pub mod entitlement;
 pub mod error;
+mod file_open;
 pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
@@ -119,7 +120,17 @@ pub fn run() {
 
     let app_state = AppState::init(daemon_client).expect("failed to initialize app state");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // Must be the first plugin: a second launch (Windows/Linux "Open
+        // With") hands its argv to this instance instead of starting anew.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let files = file_open::file_args(argv, std::path::Path::new(&cwd));
+            if files.is_empty() {
+                file_open::show_main(app);
+            } else {
+                file_open::open_all(app, files);
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -128,7 +139,14 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(app_state)
         .manage(perf::PerfState::new())
+        .manage(file_open::QuickViews::default())
         .invoke_handler(tauri::generate_handler![
+            // Open With / Quick View
+            file_open::quickview_path,
+            file_open::open_quickview_window,
+            file_open::workspace_for_path,
+            file_open::open_path_in_workspace,
+            file_open::show_main_window,
             // Sessions
             commands::create_session,
             commands::list_sessions,
@@ -395,6 +413,16 @@ pub fn run() {
             commands::billing_checkout_url,
         ])
         .setup(|app| {
+            // Windows/Linux cold start: files arrive in argv. (macOS delivers
+            // them as `RunEvent::Opened` below instead.)
+            {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let files = file_open::file_args(std::env::args(), &cwd);
+                if !files.is_empty() {
+                    file_open::open_all(app.handle(), files);
+                }
+            }
+
             // Restore sessions that were active when the app last closed.
             let state = app.state::<AppState>();
             restore_active_sessions(app.handle().clone(), &state);
@@ -445,8 +473,63 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let label = window.label();
+                if !label.starts_with(file_open::QUICKVIEW_PREFIX) {
+                    return;
+                }
+                let app = window.app_handle();
+                let views = app.state::<file_open::QuickViews>();
+                views.forget(label);
+                // A file-launch never showed the main window. Once its last
+                // Quick View closes, nothing visible is left: on Windows/Linux
+                // that would be an invisible zombie process, so quit. macOS
+                // keeps running in the Dock (Reopen shows main) like any app.
+                if cfg!(not(target_os = "macos"))
+                    && views.is_empty()
+                    && !file_open::main_visible(app)
+                {
+                    app.exit(0);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| match event {
+        // The main window starts hidden so a file-launch shows only Quick
+        // View. Give a launch-time file a short grace to arrive, then show
+        // main as usual.
+        tauri::RunEvent::Ready => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(file_open::MAIN_GRACE_MS));
+                if !app.state::<file_open::QuickViews>().opened_any() {
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || file_open::show_main(&handle));
+                }
+            });
+        }
+        // macOS: Finder "Open With" / double-click, cold or warm.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        tauri::RunEvent::Opened { urls } => {
+            let files = urls
+                .into_iter()
+                .filter_map(|u| u.to_file_path().ok())
+                .filter(|p| p.is_file())
+                .collect();
+            file_open::open_all(app, files);
+        }
+        // macOS: Dock click with nothing on screen brings the main window.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+            if !has_visible_windows {
+                file_open::show_main(app);
+            }
+        }
+        _ => {}
+    });
 }
 
 /// Re-spawn PTYs for sessions that were `active` or `idle` on last shutdown.

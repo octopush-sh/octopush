@@ -5741,7 +5741,7 @@ pub async fn fs_delete(workspace_path: String, target: String) -> AppResult<()> 
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Expand `~/...` to the user's home directory.
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     if path == "~" {
         dirs::home_dir()
             .map(|h| h.to_string_lossy().into_owned())
