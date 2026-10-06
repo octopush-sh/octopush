@@ -18,7 +18,12 @@ function lineAttr(node: PositionedNode): { "data-md-line"?: number } {
  *  Onyx & Brass tokens. Separate from ChatMessage's chat-tuned map (which
  *  renders h3 as a brass eyebrow; both maps render hr as a solid hairline —
  *  the brass gradient rule is retired). */
-export function markdownComponents(): Components {
+/** True for an image source that would be fetched from the network. */
+export function isRemoteSrc(src: string): boolean {
+  return /^(https?:)?\/\//i.test(src.trim());
+}
+
+export function markdownComponents(opts: { blockRemoteImages?: boolean } = {}): Components {
   return {
     h1: ({ children, node }) => (
       <h1 {...lineAttr(node)} className="mb-3 mt-5 font-serif text-[22px] leading-tight tracking-[-0.01em] text-octo-ivory first:mt-0">{children}</h1>
@@ -107,8 +112,19 @@ export function markdownComponents(): Components {
     td: ({ children }) => (
       <td className="border-b border-octo-hairline px-3 py-2 text-octo-sage">{children}</td>
     ),
-    img: ({ src, alt, node }) => (
-      <img {...lineAttr(node)} src={typeof src === "string" ? src : undefined} alt={alt ?? ""} className="my-3 max-w-full rounded-md" />
-    ),
+    img: ({ src, alt, node }) =>
+      // A file opened from anywhere (Quick View) may be untrusted: a remote
+      // image would phone home (tracking pixel), so it's named, not fetched.
+      opts.blockRemoteImages && typeof src === "string" && isRemoteSrc(src) ? (
+        <span
+          {...lineAttr(node)}
+          title={src}
+          className="my-1 inline-block rounded-sm border border-octo-hairline px-1.5 py-0.5 font-mono text-[11px] text-octo-mute"
+        >
+          remote image not loaded{alt ? ` · ${alt}` : ""}
+        </span>
+      ) : (
+        <img {...lineAttr(node)} src={typeof src === "string" ? src : undefined} alt={alt ?? ""} className="my-3 max-w-full rounded-md" />
+      ),
   };
 }

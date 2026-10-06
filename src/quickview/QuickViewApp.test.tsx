@@ -4,6 +4,9 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 
 const hoisted = vi.hoisted(() => ({
   doc: "",
+  eol: "",
+  onChange: null as null | (() => void),
+  confirmClose: null as null | (() => void),
   ipc: {
     quickviewPath: vi.fn(),
     readFileChecked: vi.fn(),
@@ -13,6 +16,13 @@ const hoisted = vi.hoisted(() => ({
     revealInFinder: vi.fn(),
     openPathInWorkspace: vi.fn(),
     onCloseRequested: vi.fn(() => Promise.resolve(() => {})),
+    onConfirmCloseRequest: vi.fn((h: () => void) => {
+      hoisted.confirmClose = h;
+      return Promise.resolve(() => {});
+    }),
+    onThemeBroadcast: vi.fn(() => Promise.resolve(() => {})),
+    quickviewSetDirty: vi.fn(() => Promise.resolve()),
+    showMainWindow: vi.fn(() => Promise.resolve()),
     destroyCurrentWindow: vi.fn(),
     getTheme: vi.fn(() => Promise.resolve(null)),
     listThemes: vi.fn(() => Promise.resolve([])),
@@ -22,21 +32,40 @@ const hoisted = vi.hoisted(() => ({
 vi.mock("../lib/ipc", () => ({ ipc: hoisted.ipc }));
 
 // JSDOM can't run CodeMirror; a textarea stands in, exposing the same
-// view-shaped handle Quick View reads the document through.
+// view-shaped handle Quick View reads the document through. Docs compare by
+// content, like CodeMirror's `Text.eq`.
+function fakeDoc(text: string) {
+  return {
+    text,
+    length: text.length,
+    lines: text.split("\n").length,
+    eq: (o: { text: string }) => o.text === text,
+  };
+}
+const fakeView = {
+  get state() {
+    return { doc: fakeDoc(hoisted.doc), lineBreak: hoisted.eol || "\n" };
+  },
+};
+
 vi.mock("./QuickViewEditor", () => ({
   QuickViewEditor: ({
     doc,
+    eol,
     onChange,
     onReady,
   }: {
     doc: string;
-    onChange: (d: string) => void;
+    eol: string;
+    onChange: () => void;
     onReady: (v: unknown) => void;
   }) => {
+    hoisted.eol = eol;
+    hoisted.onChange = onChange;
     // Like the real editor, the `doc` prop seeds the buffer once.
     useState(() => {
       hoisted.doc = doc;
-      onReady({ state: { doc: { toString: () => hoisted.doc } } });
+      onReady(fakeView);
       return null;
     });
     return (
@@ -45,13 +74,15 @@ vi.mock("./QuickViewEditor", () => ({
         defaultValue={doc}
         onChange={(e) => {
           hoisted.doc = e.target.value;
-          onChange(e.target.value);
+          onChange();
         }}
       />
     );
   },
+  docText: () => hoisted.doc,
   replaceDoc: (_v: unknown, text: string) => {
     hoisted.doc = text;
+    hoisted.onChange?.();
   },
 }));
 
@@ -148,12 +179,56 @@ describe("QuickViewApp", () => {
     expect(hoisted.ipc.openPathInWorkspace).toHaveBeenCalledWith("/code/app/src/a.ts");
   });
 
+  it("clears the unsaved mark when edits are undone back to the original", async () => {
+    openFile("/src/a.ts", "one");
+    render(<QuickViewApp />);
+    const editor = await screen.findByTestId("editor");
+    fireEvent.change(editor, { target: { value: "two" } });
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
+    await waitFor(() => expect(hoisted.ipc.quickviewSetDirty).toHaveBeenLastCalledWith(true));
+    fireEvent.change(editor, { target: { value: "one" } });
+    expect(screen.queryByLabelText("Unsaved changes")).toBeNull();
+    await waitFor(() => expect(hoisted.ipc.quickviewSetDirty).toHaveBeenLastCalledWith(false));
+  });
+
+  it("keeps a CRLF file's line endings", async () => {
+    openFile("/w/notes.txt", "a\r\nb\r\n");
+    render(<QuickViewApp />);
+    await screen.findByTestId("editor");
+    expect(hoisted.eol).toBe("\r\n");
+  });
+
+  it("formats JSON in the file's own line endings", async () => {
+    openFile("/c/x.json", '{"a":1}\r\n');
+    render(<QuickViewApp />);
+    await screen.findByTestId("editor");
+    fireEvent.click(screen.getByRole("button", { name: "Format JSON" }));
+    expect(hoisted.doc).toBe('{\r\n  "a": 1\r\n}\r\n');
+  });
+
+  it("asks before an app quit drops unsaved edits", async () => {
+    openFile("/src/a.ts", "x");
+    render(<QuickViewApp />);
+    fireEvent.change(await screen.findByTestId("editor"), { target: { value: "y" } });
+    act(() => hoisted.confirmClose?.());
+    expect(await screen.findByText("Unsaved changes")).toBeInTheDocument();
+  });
+
+  it("always offers the way back to the main window", async () => {
+    openFile("/notes/a.md", "x");
+    render(<QuickViewApp />);
+    await screen.findByTestId("md");
+    fireEvent.click(screen.getByRole("button", { name: "Open Octopush" }));
+    expect(hoisted.ipc.showMainWindow).toHaveBeenCalled();
+  });
+
   it("explains files it cannot show", async () => {
     hoisted.ipc.quickviewPath.mockResolvedValue("/bin/tool");
     hoisted.ipc.readFileChecked.mockResolvedValue({ kind: "binary", size: 10, mtime: 1 });
     render(<QuickViewApp />);
     expect(await screen.findByText("Nothing to show here.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Show it in Finder" }));
+    const reveal = screen.getAllByRole("button", { name: /Finder|Explorer|folder/ });
+    fireEvent.click(reveal[reveal.length - 1]);
     expect(hoisted.ipc.revealInFinder).toHaveBeenCalledWith("/bin/tool");
   });
 });

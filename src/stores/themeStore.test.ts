@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ThemeConfig } from "../lib/types";
 
 const { ipcMock } = vi.hoisted(() => ({
-  ipcMock: { getTheme: vi.fn(), setTheme: vi.fn(), listThemes: vi.fn() },
+  ipcMock: {
+    getTheme: vi.fn(),
+    setTheme: vi.fn(),
+    listThemes: vi.fn(),
+    broadcastTheme: vi.fn(() => Promise.resolve()),
+  },
 }));
 vi.mock("../lib/ipc", () => ({ ipc: ipcMock }));
 
@@ -144,6 +149,18 @@ describe("themeStore · stored choice vs system preference", () => {
   it("an explicit choice is persisted", async () => {
     await useThemeStore.getState().apply(VELLUM);
     expect(ipcMock.setTheme).toHaveBeenCalledWith(VELLUM);
+  });
+
+  it("tells other windows (Quick View) about an explicit choice", async () => {
+    await useThemeStore.getState().apply(VELLUM);
+    expect(ipcMock.broadcastTheme).toHaveBeenCalledWith(VELLUM);
+  });
+
+  it("adopts a theme chosen elsewhere without persisting or re-broadcasting it", () => {
+    useThemeStore.getState().adopt(VELLUM);
+    expect(useThemeStore.getState().theme).toEqual(VELLUM);
+    expect(ipcMock.setTheme).not.toHaveBeenCalled();
+    expect(ipcMock.broadcastTheme).not.toHaveBeenCalled();
   });
 
   it("does not let an in-flight load overwrite a choice when a theme IS stored", async () => {

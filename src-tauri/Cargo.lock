@@ -3056,6 +3056,7 @@ dependencies = [
  "chrono",
  "ctrlc",
  "dirs 5.0.1",
+ "dunce",
  "futures-util",
  "git2",
  "globset",

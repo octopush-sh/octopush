@@ -2539,6 +2539,24 @@ pub async fn reveal_in_finder(path: String) -> AppResult<()> {
             .spawn()
             .map_err(|e| AppError::Other(format!("Failed to reveal: {e}")))?;
     }
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,` needs a plain path (no `\\?\` prefix) and one argument.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.replace('/', "\\")))
+            .spawn()
+            .map_err(|e| AppError::Other(format!("Failed to reveal: {e}")))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No portable "select this file" on Linux: open the containing folder.
+        let p = std::path::Path::new(&path);
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| AppError::Other(format!("Failed to reveal: {e}")))?;
+    }
     Ok(())
 }
 

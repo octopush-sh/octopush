@@ -18,7 +18,8 @@
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -33,8 +34,12 @@ pub const MAIN_GRACE_MS: u64 = 400;
 pub struct QuickViews {
     by_label: Mutex<HashMap<String, PathBuf>>,
     next_id: AtomicU64,
-    /// Set once any file was opened — suppresses the main-window grace show.
+    /// Set once a Quick View window was actually built — suppresses the
+    /// main-window grace show.
     opened_any: AtomicBool,
+    /// Quick View windows holding unsaved edits (reported by the frontend), so
+    /// an app quit can stop and ask instead of dropping them.
+    dirty: Mutex<HashSet<String>>,
 }
 
 impl QuickViews {
@@ -52,6 +57,12 @@ impl QuickViews {
 
     pub fn forget(&self, label: &str) {
         self.by_label.lock().remove(label);
+        self.dirty.lock().remove(label);
+    }
+
+    /// A Quick View window with unsaved edits, if any.
+    pub fn first_dirty(&self) -> Option<String> {
+        self.dirty.lock().iter().next().cloned()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -62,20 +73,35 @@ impl QuickViews {
 /// Pick the file paths out of a process's argv (skipping argv[0] and flags).
 /// Relative paths resolve against `cwd`; `file://` URLs are accepted. Only
 /// paths that exist as regular files survive — a directory or a typo never
-/// opens an empty viewer.
-pub fn file_args<I: IntoIterator<Item = String>>(args: I, cwd: &Path) -> Vec<PathBuf> {
+/// opens an empty viewer. Takes `OsStr`-like items so a non-UTF-8 file name
+/// is handled rather than panicking (`std::env::args` would).
+pub fn file_args<I, S>(args: I, cwd: &Path) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     args.into_iter()
         .skip(1)
-        .filter(|a| !a.starts_with('-'))
         .filter_map(|a| {
-            let p = match a.strip_prefix("file://") {
-                Some(rest) => PathBuf::from(percent_decode(rest)),
-                None => PathBuf::from(&a),
+            let a = a.as_ref();
+            let p = match a.to_str() {
+                Some(s) if s.starts_with('-') => return None,
+                Some(s) => match s.strip_prefix("file://") {
+                    Some(rest) => PathBuf::from(percent_decode(rest)),
+                    None => PathBuf::from(s),
+                },
+                None => PathBuf::from(a),
             };
             let p = if p.is_absolute() { p } else { cwd.join(p) };
-            p.is_file().then(|| std::fs::canonicalize(&p).unwrap_or(p))
+            p.is_file().then(|| canonical(&p))
         })
         .collect()
+}
+
+/// Canonical form of a path without Windows' `\\?\` verbatim prefix (which
+/// Explorer rejects and which never matches paths stored elsewhere).
+pub fn canonical(p: &Path) -> PathBuf {
+    dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Minimal `%XX` decoder for `file://` argv entries (Linux desktop launchers).
@@ -102,6 +128,7 @@ fn percent_decode(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct WorkspaceRoot {
     pub project_id: String,
+    pub project_path: String,
     pub workspace_id: String,
     pub workspace_name: String,
     pub root: PathBuf,
@@ -109,42 +136,57 @@ pub struct WorkspaceRoot {
 
 /// The workspace whose root most specifically contains `path` (longest
 /// matching root wins, so a worktree nested under its project root beats the
-/// project's default workspace).
+/// project's default workspace). Among workspaces sharing one root, the first
+/// listed wins — `list_workspaces` orders by creation, so that is the
+/// project's original (default) workspace, deterministically.
 pub fn match_workspace<'a>(path: &Path, roots: &'a [WorkspaceRoot]) -> Option<&'a WorkspaceRoot> {
-    roots
-        .iter()
-        .filter(|r| !r.root.as_os_str().is_empty() && path.starts_with(&r.root))
-        .max_by_key(|r| r.root.components().count())
+    let mut best: Option<&WorkspaceRoot> = None;
+    for r in roots {
+        if r.root.as_os_str().is_empty() || !path.starts_with(&r.root) {
+            continue;
+        }
+        let depth = r.root.components().count();
+        if best.map_or(true, |b| depth > b.root.components().count()) {
+            best = Some(r);
+        }
+    }
+    best
 }
 
 fn workspace_roots(state: &AppState) -> AppResult<Vec<WorkspaceRoot>> {
-    let db = state.db.lock();
-    let mut out = Vec::new();
-    for (project_id, _name, project_path, ..) in db.list_projects()? {
-        for ws in db.list_workspaces(&project_id)? {
-            let root = ws
-                .worktree_path
-                .clone()
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| project_path.clone());
-            let root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
-            out.push(WorkspaceRoot {
-                project_id: project_id.clone(),
-                workspace_id: ws.id,
-                workspace_name: ws.name,
-                root,
-            });
+    // Read under the DB lock; canonicalize (filesystem I/O) after releasing it.
+    let raw = {
+        let db = state.db.lock();
+        let mut raw = Vec::new();
+        for (project_id, _name, project_path, ..) in db.list_projects()? {
+            for ws in db.list_workspaces(&project_id)? {
+                let root = ws
+                    .worktree_path
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| project_path.clone());
+                raw.push((project_id.clone(), project_path.clone(), ws.id, ws.name, root));
+            }
         }
-    }
-    Ok(out)
+        raw
+    };
+    Ok(raw
+        .into_iter()
+        .map(|(project_id, project_path, workspace_id, workspace_name, root)| WorkspaceRoot {
+            project_id,
+            project_path,
+            workspace_id,
+            workspace_name,
+            root: canonical(Path::new(&root)),
+        })
+        .collect())
 }
 
 /// Open `path` in a Quick View window, focusing the existing one if that file
 /// is already showing.
 pub fn open_quickview(app: &AppHandle, path: PathBuf) -> AppResult<()> {
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let path = canonical(&path);
     let views = app.state::<QuickViews>();
-    views.opened_any.store(true, Ordering::SeqCst);
 
     if let Some(label) = views.label_for(&path) {
         if let Some(win) = app.get_webview_window(&label) {
@@ -178,6 +220,9 @@ pub fn open_quickview(app: &AppHandle, path: PathBuf) -> AppResult<()> {
         views.forget(&label);
         return Err(AppError::Other(format!("open quick view: {e}")));
     }
+    // Only a window that actually exists may keep main hidden: a failed build
+    // must not leave an invisible process behind.
+    views.opened_any.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -190,11 +235,37 @@ pub fn open_all(app: &AppHandle, paths: Vec<PathBuf>) {
     }
 }
 
-pub fn show_main(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
+/// Show and focus the main window. False if it no longer exists.
+pub fn show_main(app: &AppHandle) -> bool {
+    let Some(win) = app.get_webview_window("main") else {
+        return false;
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
+    true
+}
+
+/// App quit requested: if a Quick View holds unsaved edits, bring it forward
+/// and ask it to confirm (it shows its own close dialog). Returns true when
+/// the quit should be held.
+pub fn hold_exit_for_unsaved(app: &AppHandle) -> bool {
+    let views = app.state::<QuickViews>();
+    let Some(label) = views.first_dirty() else {
+        return false;
+    };
+    match app.get_webview_window(&label) {
+        Some(win) => {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+            let _ = app.emit_to(label.as_str(), "octo://confirm-close", ());
+            true
+        }
+        None => {
+            views.forget(&label);
+            false
+        }
     }
 }
 
@@ -219,6 +290,22 @@ pub async fn quickview_path(
         .map(|p| p.to_string_lossy().into_owned()))
 }
 
+/// A Quick View window reports whether it holds unsaved edits.
+#[tauri::command]
+pub async fn quickview_set_dirty(
+    window: tauri::WebviewWindow,
+    views: State<'_, QuickViews>,
+    dirty: bool,
+) -> AppResult<()> {
+    let label = window.label().to_string();
+    if dirty {
+        views.dirty.lock().insert(label);
+    } else {
+        views.dirty.lock().remove(&label);
+    }
+    Ok(())
+}
+
 /// Open a file in Quick View from inside the app.
 #[tauri::command]
 pub async fn open_quickview_window(app: AppHandle, path: String) -> AppResult<()> {
@@ -232,6 +319,7 @@ pub struct WorkspaceMatch {
     pub workspace_id: String,
     pub workspace_name: String,
     pub root: String,
+    pub project_path: String,
 }
 
 /// The workspace (if any) whose worktree contains `path`.
@@ -240,14 +328,14 @@ pub async fn workspace_for_path(
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<Option<WorkspaceMatch>> {
-    let p = PathBuf::from(&path);
-    let p = std::fs::canonicalize(&p).unwrap_or(p);
+    let p = canonical(Path::new(&path));
     let roots = workspace_roots(&state)?;
     Ok(match_workspace(&p, &roots).map(|r| WorkspaceMatch {
         project_id: r.project_id.clone(),
         workspace_id: r.workspace_id.clone(),
         workspace_name: r.workspace_name.clone(),
         root: r.root.to_string_lossy().into_owned(),
+        project_path: r.project_path.clone(),
     }))
 }
 
@@ -255,9 +343,13 @@ pub async fn workspace_for_path(
 #[serde(rename_all = "camelCase")]
 pub struct OpenInWorkspacePayload {
     pub project_id: String,
+    /// Lets the main window open the project even when its recent-projects
+    /// list hasn't loaded it yet.
+    pub project_path: String,
     pub workspace_id: String,
-    /// Path relative to the workspace root, so the main window resolves it
-    /// against its own (possibly non-canonical) worktree path.
+    /// Path relative to the workspace root, always `/`-separated, so the
+    /// main window resolves it against its own (possibly non-canonical)
+    /// worktree path.
     pub relative_path: String,
 }
 
@@ -272,18 +364,24 @@ pub async fn open_path_in_workspace(
     let Some(m) = workspace_for_path(state, path.clone()).await? else {
         return Ok(false);
     };
-    let p = PathBuf::from(&path);
-    let p = std::fs::canonicalize(&p).unwrap_or(p);
-    let relative_path = p
-        .strip_prefix(&m.root)
-        .map(|r| r.to_string_lossy().into_owned())
-        .unwrap_or(path);
-    show_main(&app);
+    let p = canonical(Path::new(&path));
+    let Ok(rel) = p.strip_prefix(&m.root) else {
+        return Ok(false);
+    };
+    let relative_path = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    if !show_main(&app) {
+        return Ok(false);
+    }
     app.emit_to(
         "main",
         "octo://open-in-workspace",
         OpenInWorkspacePayload {
             project_id: m.project_id,
+            project_path: m.project_path,
             workspace_id: m.workspace_id,
             relative_path,
         },
@@ -306,6 +404,7 @@ mod tests {
     fn root(ws: &str, p: &str) -> WorkspaceRoot {
         WorkspaceRoot {
             project_id: "p".into(),
+            project_path: "/code/app".into(),
             workspace_id: ws.into(),
             workspace_name: ws.into(),
             root: PathBuf::from(p),
@@ -318,6 +417,13 @@ mod tests {
         let m = match_workspace(Path::new("/code/app/.worktrees/feat/src/a.ts"), &roots).unwrap();
         assert_eq!(m.workspace_id, "wt");
         let m = match_workspace(Path::new("/code/app/src/a.ts"), &roots).unwrap();
+        assert_eq!(m.workspace_id, "default");
+    }
+
+    #[test]
+    fn match_workspace_breaks_ties_on_first_listed() {
+        let roots = vec![root("default", "/code/app"), root("same-root", "/code/app")];
+        let m = match_workspace(Path::new("/code/app/a.md"), &roots).unwrap();
         assert_eq!(m.workspace_id, "default");
     }
 
@@ -341,7 +447,7 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
         ];
         let got = file_args(args, dir.path());
-        assert_eq!(got, vec![std::fs::canonicalize(&f).unwrap()]);
+        assert_eq!(got, vec![canonical(&f)]);
     }
 
     #[test]
@@ -351,6 +457,20 @@ mod tests {
         std::fs::write(&f, "x").unwrap();
         let url = format!("file://{}", f.to_string_lossy().replace(' ', "%20"));
         let got = file_args(vec!["octopush".to_string(), url], dir.path());
-        assert_eq!(got, vec![std::fs::canonicalize(&f).unwrap()]);
+        assert_eq!(got, vec![canonical(&f)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_args_tolerates_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = OsStr::from_bytes(b"caf\xe9.txt");
+        let f = dir.path().join(name);
+        if std::fs::write(&f, "x").is_err() {
+            return; // filesystem refuses non-UTF-8 names
+        }
+        let args = vec![std::ffi::OsString::from("octopush"), name.to_os_string()];
+        assert_eq!(file_args(args, dir.path()), vec![canonical(&f)]);
     }
 }

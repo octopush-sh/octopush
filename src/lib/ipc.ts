@@ -323,6 +323,7 @@ export interface FileMeta {
 /** A workspace whose worktree contains a given file (Open With routing). */
 export interface WorkspaceMatch {
   projectId: string;
+  projectPath: string;
   workspaceId: string;
   workspaceName: string;
   root: string;
@@ -331,8 +332,9 @@ export interface WorkspaceMatch {
 /** Payload of `octo://open-in-workspace` (Quick View → main window). */
 export interface OpenInWorkspacePayload {
   projectId: string;
+  projectPath: string;
   workspaceId: string;
-  /** Relative to the workspace root. */
+  /** Relative to the workspace root, `/`-separated. */
   relativePath: string;
 }
 
@@ -374,6 +376,7 @@ export interface StashInfo {
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AdapterInfo,
   AppSettings,
@@ -822,6 +825,16 @@ export const ipc = {
       if (!handler()) event.preventDefault();
     }),
   destroyCurrentWindow: () => getCurrentWindow().destroy(),
+  /** Tell Rust whether this Quick View holds unsaved edits, so quitting the
+   *  app (⌘Q) can stop and ask instead of dropping them. */
+  quickviewSetDirty: (dirty: boolean) => invoke<void>("quickview_set_dirty", { dirty }),
+  /** Rust asks this window to confirm closing (an app quit hit unsaved edits). */
+  onConfirmCloseRequest: (handler: () => void) =>
+    listen("octo://confirm-close", () => handler()),
+  /** Theme changes cross windows (the DOM `octo:theme` event does not). */
+  broadcastTheme: (theme: ThemeConfig) => emit("octo://theme", theme),
+  onThemeBroadcast: (handler: (theme: ThemeConfig) => void) =>
+    listen<ThemeConfig>("octo://theme", (ev) => handler(ev.payload)),
 
   // ─── Directory listing ─────────────────────────────────────────
   readDirectory: (path: string, showIgnored?: boolean) =>

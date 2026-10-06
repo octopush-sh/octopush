@@ -1416,10 +1416,12 @@ function App() {
     [activeWorkspace, project, openFileInEditor, setMode, confirmLargeFile],
   );
 
-  // ── Open With → "Open in workspace" (from a Quick View window) ──
+  // ── Open With → "Continue in the workspace" (from a Quick View window) ──
   // Rust shows this window and emits the target; switch to its project and
   // workspace (the same path as a rail click), then open the file once that
-  // workspace is the active one.
+  // workspace is the active one. A request that can't land (the switch never
+  // happens) expires instead of ambushing a later, unrelated workspace switch.
+  const PENDING_OPEN_TTL_MS = 10_000;
   const [pendingWorkspaceOpen, setPendingWorkspaceOpen] =
     useState<OpenInWorkspacePayload | null>(null);
   const openInWorkspaceRef = useRef<(p: OpenInWorkspacePayload) => void>(() => {});
@@ -1429,13 +1431,10 @@ function App() {
       selectWorkspace(p.workspaceId);
       return;
     }
-    const targetPath = recentProjects.find((r) => r.id === p.projectId)?.path;
-    if (!targetPath) {
-      selectWorkspace(p.workspaceId);
-      return;
-    }
+    // The payload carries the project path, so this works even before the
+    // recent-projects list has loaded (or when it's stale).
     rememberActiveForProject(p.projectId, p.workspaceId);
-    void openProject(targetPath);
+    void openProject(p.projectPath);
   };
   useEffect(() => {
     const unlisten = listen<OpenInWorkspacePayload>("octo://open-in-workspace", (ev) =>
@@ -1446,10 +1445,19 @@ function App() {
     };
   }, []);
   useEffect(() => {
-    if (!pendingWorkspaceOpen || activeWorkspace?.id !== pendingWorkspaceOpen.workspaceId) return;
+    if (!pendingWorkspaceOpen) return;
+    const t = window.setTimeout(() => setPendingWorkspaceOpen(null), PENDING_OPEN_TTL_MS);
+    return () => window.clearTimeout(t);
+  }, [pendingWorkspaceOpen]);
+  useEffect(() => {
+    if (!pendingWorkspaceOpen || !activeWorkspace) return;
+    if (activeWorkspace.id !== pendingWorkspaceOpen.workspaceId) return;
     setPendingWorkspaceOpen(null);
-    navigateToFile(pendingWorkspaceOpen.relativePath, "editor");
-  }, [pendingWorkspaceOpen, activeWorkspace?.id, navigateToFile]);
+    // Absolute, so navigateToFile never mistakes a top-level `a/` or `b/`
+    // directory for a git diff prefix.
+    const root = activeWorkspace.worktreePath || project!.path;
+    navigateToFile(`${root}/${pendingWorkspaceOpen.relativePath}`, "editor");
+  }, [pendingWorkspaceOpen, activeWorkspace, project, navigateToFile]);
 
   // Companion provenance chips jump into the diff at the file (best-effort line).
   const handleJumpToFile = useCallback(

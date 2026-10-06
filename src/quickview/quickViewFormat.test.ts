@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   defaultLayout,
+  detectEol,
   fileName,
   formatJson,
   hasPreview,
@@ -41,9 +42,36 @@ describe("formatJson", () => {
     });
   });
 
+  it("never rewrites values: big integers, number spelling, duplicate keys", () => {
+    const src = '{"id":12345678901234567890,"x":1.0,"y":1e3,"k":1,"k":2,"s":"a,b:{c}\\"q\\"","e":{},"l":[ ]}';
+    const r = formatJson(src);
+    expect(r).toEqual({
+      ok: true,
+      text: [
+        "{",
+        '  "id": 12345678901234567890,',
+        '  "x": 1.0,',
+        '  "y": 1e3,',
+        '  "k": 1,',
+        '  "k": 2,',
+        '  "s": "a,b:{c}\\"q\\"",',
+        '  "e": {},',
+        '  "l": []',
+        "}",
+      ].join("\n"),
+    });
+  });
+
   it("reports parse errors instead of dropping content", () => {
     const r = formatJson("{ // comment\n}");
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("detectEol", () => {
+  it("keeps CRLF files CRLF", () => {
+    expect(detectEol("a\r\nb")).toBe("\r\n");
+    expect(detectEol("a\nb")).toBe("\n");
   });
 });
 
@@ -76,6 +104,7 @@ describe("paths", () => {
     expect(relativeTo("/code/app", "/code/app/src/a.ts")).toBe("src/a.ts");
     expect(relativeTo("/code/app/", "/code/app/a.ts")).toBe("a.ts");
     expect(relativeTo("/code/app", "/code/application/a.ts")).toBe("/code/application/a.ts");
+    expect(relativeTo("C:\\code\\app", "C:\\code\\app\\src\\a.ts")).toBe("src/a.ts");
   });
 
   it("takes the file name", () => {

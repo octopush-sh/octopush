@@ -6,6 +6,7 @@ import { markdownComponents } from "../../lib/markdownComponents";
 // Stable across renders: the component map has no per-render inputs and the
 // plugin list never changes, so build both once at module load.
 const COMPONENTS = markdownComponents();
+const COMPONENTS_NO_REMOTE = markdownComponents({ blockRemoteImages: true });
 const REMARK_PLUGINS = [remarkGfm];
 
 interface Props {
@@ -14,6 +15,8 @@ interface Props {
    *  Omitted (e.g. in a preview with no editor beside it) disables the
    *  margin marker and the ⌘/Ctrl-click shortcut entirely. */
   onJumpToLine?: (line: number) => void;
+  /** Don't fetch remote images (for files of unknown origin). */
+  blockRemoteImages?: boolean;
 }
 
 /** The rendered block under `target` and the 1-based source line it came from,
@@ -39,14 +42,17 @@ function blockFor(
  *  ⌘/Ctrl-click anywhere in a block (the editor idiom). Both are opt-in via
  *  `onJumpToLine` — a plain click, a drag-selection and a link all keep
  *  behaving as they do anywhere else, which is what makes the prose copyable. */
-export function MarkdownPreview({ source, onJumpToLine }: Props) {
+export function MarkdownPreview({ source, onJumpToLine, blockRemoteImages = false }: Props) {
   const rendered = useMemo(
     () => (
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        components={blockRemoteImages ? COMPONENTS_NO_REMOTE : COMPONENTS}
+      >
         {source}
       </ReactMarkdown>
     ),
-    [source],
+    [source, blockRemoteImages],
   );
 
   const bodyRef = useRef<HTMLDivElement>(null);

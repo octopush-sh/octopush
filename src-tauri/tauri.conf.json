@@ -127,9 +127,7 @@
           "cfg",
           "conf",
           "env",
-          "properties",
-          "editorconfig",
-          "gitignore"
+          "properties"
         ],
         "name": "Config",
         "description": "Configuration file",
@@ -203,8 +201,7 @@
           "sh",
           "bash",
           "zsh",
-          "fish",
-          "dockerfile"
+          "fish"
         ],
         "name": "Source code",
         "description": "Source code",

@@ -32,7 +32,13 @@ interface Props {
    *  and the caret survive re-renders. */
   doc: string;
   lang: LangId;
-  onChange: (doc: string) => void;
+  /** The file's line separator. CodeMirror normalizes every break to `\n`
+   *  unless told otherwise, which would silently convert a CRLF file to LF on
+   *  its first save. */
+  eol: "\r\n" | "\n";
+  /** Fires on every edit. Read the text through the view (`docText`) only
+   *  when it's needed — materializing a large file per keystroke is costly. */
+  onChange: (view: EditorView) => void;
   onSave: () => void;
   onReady: (view: EditorView | null) => void;
 }
@@ -40,7 +46,7 @@ interface Props {
 /** CodeMirror for Quick View: the Review editor's theme, language support,
  *  find overlay and preferences (wrap, font size, tab width, line numbers),
  *  without the workspace-bound extras (blame, diff gutter, go-to-definition). */
-export function QuickViewEditor({ doc, lang, onChange, onSave, onReady }: Props) {
+export function QuickViewEditor({ doc, lang, eol, onChange, onSave, onReady }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState<EditorView | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -62,6 +68,7 @@ export function QuickViewEditor({ doc, lang, onChange, onSave, onReady }: Props)
     const state = EditorState.create({
       doc,
       extensions: [
+        eol === "\r\n" ? EditorState.lineSeparator.of("\r\n") : [],
         prefs.lineNumbers ? [lineNumbers(), foldGutter(), highlightActiveLineGutter()] : [],
         highlightActiveLine(),
         drawSelection(),
@@ -92,7 +99,7 @@ export function QuickViewEditor({ doc, lang, onChange, onSave, onReady }: Props)
         themeComp.of(buildEditorTheme()),
         layout,
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) handlers.current.onChange(u.state.doc.toString());
+          if (u.docChanged) handlers.current.onChange(u.view);
         }),
       ],
     });
@@ -106,9 +113,10 @@ export function QuickViewEditor({ doc, lang, onChange, onSave, onReady }: Props)
       setView(null);
       onReady(null);
     };
-    // Built once per file/language; edits flow out through the listener.
+    // Built once per file/language/line ending; edits flow out through the
+    // listener.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lang]);
+  }, [lang, eol]);
 
   useEffect(() => {
     const onTheme = () =>
@@ -132,7 +140,14 @@ export function QuickViewEditor({ doc, lang, onChange, onSave, onReady }: Props)
   );
 }
 
-/** Replace the whole document as one undoable change. */
+/** The document as it goes to disk: joined with the file's own line
+ *  separator (`doc.toString()` would always join with `\n`). */
+export function docText(view: EditorView): string {
+  return view.state.sliceDoc();
+}
+
+/** Replace the whole document as one undoable change. `text` is split on the
+ *  editor's line separator, so callers pass text in the file's own endings. */
 export function replaceDoc(view: EditorView, text: string) {
   view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
 }

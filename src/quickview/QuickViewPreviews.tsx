@@ -68,13 +68,28 @@ export function SvgPreview({ source }: { source: string }) {
   );
 }
 
-/** HTML in a fully sandboxed frame: no scripts, no same-origin access. */
+/** Prepended to previewed HTML: the sandbox already blocks scripts; this also
+ *  stops network fetches (remote images, stylesheets, fonts), so opening an
+ *  untrusted file can't phone home. Inline styles and data: URIs still work. */
+export const HTML_PREVIEW_CSP =
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:">`;
+
+/** `source` with the CSP inserted — after a leading doctype, so the page keeps
+ *  standards mode. */
+export function withPreviewCsp(source: string): string {
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(source);
+  if (!doctype) return HTML_PREVIEW_CSP + source;
+  return doctype[0] + HTML_PREVIEW_CSP + source.slice(doctype[0].length);
+}
+
+/** HTML in a fully sandboxed frame: no scripts, no same-origin access, no
+ *  network. */
 export function HtmlPreview({ source }: { source: string }) {
   return (
     <iframe
       title="HTML preview"
       sandbox=""
-      srcDoc={source}
+      srcDoc={withPreviewCsp(source)}
       className="min-h-0 w-full flex-1 border-0 bg-octo-ivory"
     />
   );
@@ -84,7 +99,7 @@ export function HtmlPreview({ source }: { source: string }) {
 export function QuickViewPreview({ kind, source }: { kind: QuickViewKind; source: string }) {
   switch (kind) {
     case "markdown":
-      return <MarkdownPreview source={source} />;
+      return <MarkdownPreview source={source} blockRemoteImages />;
     case "csv":
       return <DelimitedTable source={source} delimiter="," />;
     case "tsv":

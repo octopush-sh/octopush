@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EditorView } from "@codemirror/view";
-import { Braces, Code2, Eye, FolderOpen, Save } from "lucide-react";
+import type { Text } from "@codemirror/state";
+import { AppWindow, Braces, Code2, Eye, FolderOpen, Save } from "lucide-react";
 import { ipc, type WorkspaceMatch } from "../lib/ipc";
 import { langForExtension, type LangId } from "../lib/editorLang";
-import { isMac, modKeyLabel } from "../lib/platform";
+import { isMac, modKeyLabel, revealLabel } from "../lib/platform";
 import { useThemeStore } from "../stores/themeStore";
 import { OctoMark } from "../components/icons/OctoMark";
 import { IconButton } from "../components/controls/IconButton";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { QuickViewEditor, replaceDoc } from "./QuickViewEditor";
+import { QuickViewEditor, docText, replaceDoc } from "./QuickViewEditor";
 import { QuickViewPreview } from "./QuickViewPreviews";
 import {
   defaultLayout,
+  detectEol,
   fileName,
   formatJson,
   hasPreview,
@@ -26,6 +28,11 @@ type Loaded =
   | { status: "ready"; path: string; initial: string };
 
 type Conflict = null | "changed" | "deleted";
+
+/** Above this size, dirty-checking and preview refresh wait for a pause in
+ *  typing instead of running on every keystroke. */
+const LARGE_DOC = 1_000_000;
+const SETTLE_MS = 150;
 
 const LANG_LABEL: Partial<Record<LangId, string>> = {
   javascript: "TypeScript / JavaScript",
@@ -50,8 +57,12 @@ function formatBytes(n: number): string {
 export function QuickViewApp() {
   const loadTheme = useThemeStore((s) => s.load);
   const [loaded, setLoaded] = useState<Loaded>({ status: "loading" });
-  const [content, setContent] = useState("");
-  const [saved, setSaved] = useState("");
+  // The editor owns the document. React only tracks a change counter, the
+  // dirty flag, and — while Preview is showing — the text it renders.
+  const [version, setVersion] = useState(0);
+  const [dirty, setDirty] = useState(false);
+  const [previewSource, setPreviewSource] = useState("");
+  const [eol, setEol] = useState<"\r\n" | "\n">("\n");
   const [saving, setSaving] = useState(false);
   const [conflict, setConflict] = useState<Conflict>(null);
   const [jsonError, setJsonError] = useState<string | null>(null);
@@ -63,10 +74,12 @@ export function QuickViewApp() {
   const [layout, setLayout] = useState<"preview" | "source">("source");
 
   const viewRef = useRef<EditorView | null>(null);
+  // The document as last read from / written to disk, compared structurally.
+  const savedDocRef = useRef<Text | null>(null);
   const mtimeRef = useRef(0);
-  const dirty = loaded.status === "ready" && content !== saved;
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
+  const savingRef = useRef(false);
 
   const path = loaded.status === "ready" || loaded.status === "unreadable" ? loaded.path : null;
   const kind = useMemo(() => (path ? quickViewKind(path) : "code"), [path]);
@@ -75,6 +88,20 @@ export function QuickViewApp() {
   useEffect(() => {
     void loadTheme();
   }, [loadTheme]);
+
+  // Follow theme changes made in the main window.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    ipc
+      .onThemeBroadcast((t) => useThemeStore.getState().adopt(t))
+      .then((u) => (disposed ? u() : (unlisten = u)))
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // ── Load ──
   useEffect(() => {
@@ -94,8 +121,8 @@ export function QuickViewApp() {
         setWorkspace(ws);
         if (read.kind === "text") {
           mtimeRef.current = read.mtime;
-          setContent(read.content);
-          setSaved(read.content);
+          setEol(detectEol(read.content));
+          setPreviewSource(read.content);
           setLayout(defaultLayout(quickViewKind(p)));
           setLoaded({ status: "ready", path: p, initial: read.content });
         } else {
@@ -119,8 +146,13 @@ export function QuickViewApp() {
   // ── Save ──
   const save = useCallback(
     async (force = false) => {
-      if (loaded.status !== "ready" || saving) return false;
-      const text = viewRef.current?.state.doc.toString() ?? content;
+      const view = viewRef.current;
+      if (loaded.status !== "ready" || !view || savingRef.current) return false;
+      // Snapshot what is written; edits typed while the write is in flight
+      // stay dirty against it.
+      const doc = view.state.doc;
+      const text = docText(view);
+      savingRef.current = true;
       setSaving(true);
       try {
         if (!force) {
@@ -132,7 +164,8 @@ export function QuickViewApp() {
         }
         const r = await ipc.writeFile(loaded.path, text);
         mtimeRef.current = r.mtime;
-        setSaved(text);
+        savedDocRef.current = doc;
+        setDirty(!(viewRef.current?.state.doc.eq(doc) ?? true));
         setConflict(null);
         setNotice(null);
         return true;
@@ -140,10 +173,11 @@ export function QuickViewApp() {
         setNotice(`Could not save: ${String(e)}`);
         return false;
       } finally {
+        savingRef.current = false;
         setSaving(false);
       }
     },
-    [loaded, saving, content],
+    [loaded],
   );
 
   const reload = useCallback(async () => {
@@ -151,11 +185,47 @@ export function QuickViewApp() {
     const read = await ipc.readFileChecked(loaded.path);
     if (read.kind !== "text") return;
     mtimeRef.current = read.mtime;
-    if (viewRef.current) replaceDoc(viewRef.current, read.content);
-    setContent(read.content);
-    setSaved(read.content);
     setConflict(null);
-  }, [loaded]);
+    setDirty(false);
+    setPreviewSource(read.content);
+    const nextEol = detectEol(read.content);
+    if (nextEol !== eol) {
+      // Line endings changed on disk: rebuild the editor around the new
+      // separator (onReady re-baselines the saved document).
+      setLoaded({ status: "ready", path: loaded.path, initial: read.content });
+      setEol(nextEol);
+      return;
+    }
+    const view = viewRef.current;
+    if (view) {
+      replaceDoc(view, read.content);
+      savedDocRef.current = view.state.doc;
+    }
+  }, [loaded, eol]);
+
+  // Dirty flag + preview text follow the editor — at once for normal files,
+  // after a pause for very large ones.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || version === 0) return;
+    const settle = () => {
+      const v = viewRef.current;
+      if (!v) return;
+      setDirty(!(savedDocRef.current && v.state.doc.eq(savedDocRef.current)));
+      if (layout === "preview" && hasPreview(kind)) setPreviewSource(docText(v));
+    };
+    if (view.state.doc.length < LARGE_DOC) {
+      settle();
+      return;
+    }
+    const t = window.setTimeout(settle, SETTLE_MS);
+    return () => window.clearTimeout(t);
+  }, [version, layout, kind]);
+
+  // Rust holds an app quit while any Quick View is dirty.
+  useEffect(() => {
+    ipc.quickviewSetDirty(dirty).catch(() => {});
+  }, [dirty]);
 
   // ⌘S while the preview has focus (the editor's own keymap covers source).
   useEffect(() => {
@@ -188,35 +258,44 @@ export function QuickViewApp() {
     return () => window.removeEventListener("focus", onFocus);
   }, [loaded, reload]);
 
-  // ── Closing with unsaved edits asks first ──
+  // ── Closing with unsaved edits asks first — on the window's close button
+  // and when an app quit (⌘Q) is held for this window. ──
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    const unlisteners: Array<() => void> = [];
     let disposed = false;
+    const keep = (u: () => void) => {
+      // Unmounted before registration landed (StrictMode's dry run).
+      if (disposed) u();
+      else unlisteners.push(u);
+    };
     ipc
       .onCloseRequested(() => {
         if (!dirtyRef.current) return true;
         setConfirmClose(true);
         return false;
       })
-      .then((u) => {
-        // Unmounted before registration landed (StrictMode's dry run).
-        if (disposed) u();
-        else unlisten = u;
+      .then(keep)
+      .catch(() => {});
+    ipc
+      .onConfirmCloseRequest(() => {
+        if (dirtyRef.current) setConfirmClose(true);
       })
+      .then(keep)
       .catch(() => {});
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisteners.forEach((u) => u());
     };
   }, []);
 
   const onFormatJson = useCallback(() => {
     const view = viewRef.current;
     if (!view) return;
-    const r = formatJson(view.state.doc.toString());
+    const r = formatJson(docText(view));
     if (r.ok) {
       setJsonError(null);
-      replaceDoc(view, r.text);
+      // The formatter emits `\n`; hand the editor the file's own endings.
+      replaceDoc(view, r.text.replace(/\n/g, view.state.lineBreak));
     } else {
       setJsonError(r.error);
     }
@@ -229,12 +308,19 @@ export function QuickViewApp() {
     if (!ok) setNotice("No workspace holds this file any more.");
   }, [path, save]);
 
-  const onChange = useCallback((doc: string) => {
-    setContent(doc);
+  const onChange = useCallback(() => {
+    setVersion((n) => n + 1);
     setJsonError(null);
   }, []);
   const onReady = useCallback((v: EditorView | null) => {
     viewRef.current = v;
+    // A freshly built editor holds exactly what was read from disk.
+    if (v) savedDocRef.current = v.state.doc;
+  }, []);
+
+  const switchLayout = useCallback((next: "preview" | "source") => {
+    if (next === "preview" && viewRef.current) setPreviewSource(docText(viewRef.current));
+    setLayout(next);
   }, []);
 
   const name = path ? fileName(path) : "Quick View";
@@ -243,8 +329,12 @@ export function QuickViewApp() {
       ? `${workspace.workspaceName} · ${relativeTo(workspace.root, path)}`
       : path
     : "";
-  const lines = useMemo(() => content.split("\n").length, [content]);
+  // `version` re-renders this on every edit.
+  const lines = viewRef.current?.state.doc.lines ?? previewSource.split("\n").length;
   const showPreview = hasPreview(kind) && layout === "preview";
+  const lastConflictRef = useRef<Conflict>(null);
+  if (conflict) lastConflictRef.current = conflict;
+  const shownConflict = conflict ?? lastConflictRef.current;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-octo-onyx text-octo-ivory">
@@ -290,7 +380,7 @@ export function QuickViewApp() {
               <button
                 key={value}
                 type="button"
-                onClick={() => setLayout(value)}
+                onClick={() => switchLayout(value)}
                 aria-label={title}
                 aria-pressed={layout === value}
                 title={title}
@@ -316,10 +406,14 @@ export function QuickViewApp() {
           </IconButton>
         )}
         {path && (
-          <IconButton label="Reveal in Finder" onClick={() => void ipc.revealInFinder(path)}>
+          <IconButton label={revealLabel()} onClick={() => void ipc.revealInFinder(path)}>
             <FolderOpen size={13} />
           </IconButton>
         )}
+        {/* The way back to the full app — a file-launch starts with main hidden. */}
+        <IconButton label="Open Octopush" onClick={() => void ipc.showMainWindow()}>
+          <AppWindow size={13} />
+        </IconButton>
         {workspace && (
           <button
             type="button"
@@ -332,35 +426,46 @@ export function QuickViewApp() {
         )}
       </header>
 
-      {/* External change / deletion */}
-      {conflict && (
-        <div
-          role="alert"
-          className="octo-rise-in flex shrink-0 items-center gap-3 border-b border-octo-hairline bg-octo-panel px-4 py-2 font-mono text-[11px]"
-        >
-          <span className="flex-1 text-octo-warning">
-            {conflict === "deleted"
-              ? "This file was deleted on disk. Saving will recreate it."
-              : "This file changed on disk since you opened it."}
-          </span>
-          {conflict === "changed" && (
-            <button
-              type="button"
-              onClick={() => void reload()}
-              className="font-serif text-[13px] text-octo-sage hover:text-octo-ivory"
+      {/* External change / deletion — collapses calmly (grid-rows 0fr↔1fr),
+          keeping its last message while it closes. */}
+      <div
+        className="grid shrink-0 transition-[grid-template-rows] duration-[var(--dur-quick)] ease-[var(--ease-octo)]"
+        style={{ gridTemplateRows: conflict ? "1fr" : "0fr" }}
+      >
+        <div className="min-h-0 overflow-hidden">
+          {shownConflict && (
+            <div
+              role={conflict ? "alert" : undefined}
+              aria-hidden={!conflict}
+              className="flex items-center gap-3 border-b border-octo-hairline bg-octo-panel px-4 py-2 font-mono text-[11px]"
             >
-              Take the version on disk
-            </button>
+              <span className="flex-1 text-octo-warning">
+                {shownConflict === "deleted"
+                  ? "This file was deleted on disk. Saving will recreate it."
+                  : "This file changed on disk since you opened it."}
+              </span>
+              {shownConflict === "changed" && (
+                <button
+                  type="button"
+                  tabIndex={conflict ? 0 : -1}
+                  onClick={() => void reload()}
+                  className="font-serif text-[13px] text-octo-sage hover:text-octo-ivory"
+                >
+                  Take the version on disk
+                </button>
+              )}
+              <button
+                type="button"
+                tabIndex={conflict ? 0 : -1}
+                onClick={() => void save(true)}
+                className="font-serif text-[13px] text-octo-brass hover:text-octo-brass-hi"
+              >
+                {shownConflict === "deleted" ? "Save it again" : "Keep my edits"}
+              </button>
+            </div>
           )}
-          <button
-            type="button"
-            onClick={() => void save(true)}
-            className="font-serif text-[13px] text-octo-brass hover:text-octo-brass-hi"
-          >
-            {conflict === "deleted" ? "Save it again" : "Keep my edits"}
-          </button>
         </div>
-      )}
+      </div>
 
       {/* Body */}
       <main className="relative flex min-h-0 flex-1 flex-col">
@@ -386,7 +491,7 @@ export function QuickViewApp() {
               onClick={() => void ipc.revealInFinder(loaded.path)}
               className="mt-2 font-serif text-[14px] text-octo-brass hover:text-octo-brass-hi"
             >
-              Show it in Finder
+              {revealLabel()}
             </button>
           </div>
         )}
@@ -395,12 +500,13 @@ export function QuickViewApp() {
             {/* The editor never unmounts, so undo history and the caret
                 survive switching to Preview and back. */}
             <div
-              className="flex min-h-0 flex-1 flex-col"
+              className="octo-fade-in flex min-h-0 flex-1 flex-col"
               style={{ visibility: showPreview ? "hidden" : "visible" }}
             >
               <QuickViewEditor
                 doc={loaded.initial}
                 lang={lang}
+                eol={eol}
                 onChange={onChange}
                 onSave={() => void save()}
                 onReady={onReady}
@@ -408,7 +514,7 @@ export function QuickViewApp() {
             </div>
             {showPreview && (
               <div key={layout} className="octo-fade-in absolute inset-0 flex flex-col overflow-hidden bg-octo-onyx">
-                <QuickViewPreview kind={kind} source={content} />
+                <QuickViewPreview kind={kind} source={previewSource} />
               </div>
             )}
           </>
