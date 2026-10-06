@@ -40,6 +40,9 @@ interface ThemeState {
 
   load: () => Promise<void>;
   apply: (theme: ThemeConfig) => Promise<void>;
+  /** Paint a theme chosen in another window (Quick View follows main). Does
+   *  not persist or re-broadcast — the window that chose it already did. */
+  adopt: (theme: ThemeConfig) => void;
 }
 
 /** The built-in theme to seed with when the user has no stored preference.
@@ -115,6 +118,13 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
     set({ theme, followingSystem: false });
     applyThemeToDom(theme);
     await ipc.setTheme(theme);
+    // `octo:theme` is a DOM event, local to this window; tell the others.
+    ipc.broadcastTheme(theme).catch(() => {});
+  },
+
+  adopt: (theme) => {
+    set({ theme, followingSystem: false });
+    applyThemeToDom(theme);
   },
 }));
 

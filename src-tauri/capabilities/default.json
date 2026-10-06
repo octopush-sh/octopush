@@ -1,11 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability granted to the main window",
-  "windows": ["main"],
+  "description": "Default capability granted to the main window and Quick View windows",
+  "windows": [
+    "main",
+    "quickview-*"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-destroy",
     "core:event:default",
     "shell:default",
     "dialog:allow-open",

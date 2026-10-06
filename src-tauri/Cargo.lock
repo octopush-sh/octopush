@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "octopush"
-version = "0.4.86"
+version = "0.4.87"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3056,6 +3056,7 @@ dependencies = [
  "chrono",
  "ctrlc",
  "dirs 5.0.1",
+ "dunce",
  "futures-util",
  "git2",
  "globset",
@@ -3079,6 +3080,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-process",
  "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tempfile",
  "thiserror 1.0.69",
@@ -5224,6 +5226,22 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db817fe9295e19b7d8357e900af31edb93703dd9fb6de524b007b47b6afc63b0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "windows-sys 0.60.2",
+ "zbus",
 ]
 
 [[package]]
