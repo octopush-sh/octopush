@@ -556,7 +556,9 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### File explorer (Files tab in review)
 - **Changes ⇄ Files navigator** — Tab switcher (+ changed-count badge); collapses to a 44px icon strip (persisted). _Support:_ `ReviewSidebar.tsx`.
+- **Resizable navigator** — A 4px `separator` on the sidebar's right edge (mirror of the Companion's): drag to resize between 200–640px (default 280), double-click to reset, or focus it and use ←/→ (Shift = larger step), Home/End for min/max. The canvas always keeps at least 360px (CSS `max-width`), whatever the stored width. Width persists in `localStorage` (`reviewSidebarWidth`); an unmount mid-drag releases the body cursor and window listeners; the width transition is suspended during a live drag so the edge tracks the cursor. _Support:_ `ReviewSidebar.tsx`.
 - **Lazy windowed file tree** — Flat-row model, per-folder lazy load (`readDirectory`), virtualized 24px rows; expansion/focus cached per workspace. _Support:_ `CompanionFileTree.tsx`, `lib/useVirtualRows`.
+- **No truncated names — horizontal scroll** — Labels never ellipsize; deep nesting makes the tree scroll horizontally. Because only windowed rows are mounted, the content width is pinned to an estimate of the widest row across the whole flat list (`contentMinWidth`), so the horizontal scrollbar stays stable while rows mount/unmount. _Support:_ `CompanionFileTree.tsx`.
 - **File-type icons + tints** — Category-based lucide icon + Atelier tint; changed files override to brass. _Support:_ `lib/fileIcons.ts`.
 - **Show-ignored toggle** — Reveals `.gitignore`d files (persisted per root). _Support:_ `reviewPrefsStore.showIgnoredFiles`.
 - **Tree filter** — Case-insensitive substring over loaded folders, keeps ancestors, highlights matches, count; Esc clears. _Support:_ `CompanionFileTree.tsx`.

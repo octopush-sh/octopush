@@ -15,6 +15,14 @@ import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 /** Every row (node or placeholder) renders at exactly this height — the
  *  fixed-row contract the windowing math depends on. */
 const ROW_HEIGHT = 24;
+/** Indent per tree level. */
+const INDENT = 14;
+/** Upper-bound glyph advance (px) for the 11px mono label — used to estimate
+ *  the widest row so the horizontal scroll extent stays stable while the
+ *  virtual window mounts and unmounts rows. */
+const LABEL_CHAR_PX = 7;
+/** Chevron/icon + gap + right padding + breathing room around a label. */
+const ROW_CHROME_PX = 32;
 
 interface Props {
   rootPath: string;
@@ -479,6 +487,19 @@ export function CompanionFileTree({
     ROW_HEIGHT,
   );
   const windowRows = useMemo(() => flatRows.slice(start, end), [flatRows, start, end]);
+  // Deep nesting must never hide a name: rows keep their full label and the
+  // tree scrolls horizontally instead. Only the windowed rows are in the DOM,
+  // so the scroll extent is pinned to the widest row in the WHOLE flat list —
+  // otherwise the horizontal scrollbar would twitch as rows (un)mount.
+  const contentMinWidth = useMemo(() => {
+    let max = 0;
+    for (const r of flatRows) {
+      const len = r.kind === "node" ? r.label.length : 24;
+      const w = r.depth * INDENT + 4 + ROW_CHROME_PX + len * LABEL_CHAR_PX;
+      if (w > max) max = w;
+    }
+    return max;
+  }, [flatRows]);
 
   // Mark every path currently in the (full) flat list as seen — from the
   // next commit on, mounting such a row is windowing, not new data.
@@ -742,8 +763,9 @@ export function CompanionFileTree({
         ref={treeRef}
         role="tree"
         aria-label="Workspace files"
-        className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+        className="min-h-0 flex-1 overflow-auto px-2 py-2"
       >
+        <div className="w-max" style={{ minWidth: `max(100%, ${contentMinWidth}px)` }}>
         {topPad > 0 && <div aria-hidden="true" style={{ height: `${topPad}px` }} />}
         {windowRows.map((row) =>
           row.kind === "node" ? (
@@ -768,6 +790,7 @@ export function CompanionFileTree({
           ),
         )}
         {bottomPad > 0 && <div aria-hidden="true" style={{ height: `${bottomPad}px` }} />}
+        </div>
       </div>
 
       {menu && (
@@ -880,7 +903,7 @@ function TreeRow({
       }`}
       style={{
         height: `${ROW_HEIGHT}px`,
-        paddingLeft: `${depth * 14 + 4}px`,
+        paddingLeft: `${depth * INDENT + 4}px`,
         // The open file keeps a resting tint; hover has to step ABOVE it
         // rather than replace it, and leaving must fall back to it — not to
         // transparent, which would wipe the mark off the row on mouse-out.
@@ -934,9 +957,9 @@ function TreeRow({
 
       {/* Label */}
       {isRoot ? (
-        <span className="min-w-0 truncate font-serif text-[13px] text-octo-ivory">{label}</span>
+        <span className="whitespace-nowrap font-serif text-[13px] text-octo-ivory">{label}</span>
       ) : (
-        <span className={`min-w-0 truncate font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}>
+        <span className={`whitespace-nowrap font-mono text-[11px] ${depthColorClass(depth, isChanged)}`}>
           {match ? <HighlightedLabel label={label} match={match} /> : label}
         </span>
       )}
@@ -948,10 +971,10 @@ function PlaceholderLine({ row }: { row: PlaceholderRow }) {
   const text = row.state === "loading" ? "loading…" : row.state === "error" ? "error reading directory." : "empty.";
   return (
     <div
-      className={`flex items-center font-serif text-[11px] ${
+      className={`flex items-center whitespace-nowrap font-serif text-[11px] ${
         row.state === "error" ? "text-octo-rouge" : "text-octo-mute"
       }`}
-      style={{ height: `${ROW_HEIGHT}px`, paddingLeft: `${row.depth * 14 + 4}px` }}
+      style={{ height: `${ROW_HEIGHT}px`, paddingLeft: `${row.depth * INDENT + 4}px` }}
     >
       {text}
     </div>
