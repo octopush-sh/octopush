@@ -60,7 +60,12 @@ parking_lot = "0.12"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# `rustls-tls-no-provider` lets `tls.rs` hand reqwest a rustls config that
+# runs the OS trust store behind the eMudhra compromised-key denylist; the
+# default (native-tls) backend stays compiled in as the fallback.
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.6"
 futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"

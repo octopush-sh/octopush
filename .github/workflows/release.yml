@@ -99,9 +99,12 @@ jobs:
             echo "::warning::This is expected until the Apple Developer account is set up."
           fi
 
+      # Node 22 (maintenance LTS). Node 20 is end-of-life and never received
+      # the October 2026 eMudhra CA fix (22.23.4 / 24.22.1 / 26.12.1), and this
+      # job's npm fetches run on Node's bundled root store, not the runner's.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Add Rust targets (universal build needs both slices)
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
