@@ -485,10 +485,10 @@ impl GatewayCache {
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::tls::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|_| crate::tls::client())
     })
 }
 
