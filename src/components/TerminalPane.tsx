@@ -5,6 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
+import { decodeOsc52 } from "../lib/osc52";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -138,6 +139,16 @@ export function TerminalPane({
       theme: getXtermTheme(),
       allowProposedApi: true,
       scrollback: 10000,
+      // When a program owns the mouse (Claude Code's fullscreen renderer,
+      // tmux with mouse on, vim `mouse=a`) a plain drag goes to the program
+      // and xterm makes no selection of its own. On macOS xterm offers NO
+      // modifier to override that unless this is on — Shift only works on
+      // other platforms (xterm's SelectionService.shouldForceSelection) — so
+      // Option-drag is the escape hatch back to a native selection and the
+      // clipboard bridge below. Cost: Option-click no longer reaches a
+      // mouse-mode program. Plain clicks, and mouse-mode-off shells, are
+      // untouched.
+      macOptionClickForcesSelection: true,
     });
 
     const fit = new FitAddon();
@@ -220,6 +231,38 @@ export function TerminalPane({
       }
     };
     copyEl.addEventListener("contextmenu", onContextMenu);
+
+    // ── OSC 52: a program copies to the clipboard ──────────────────────
+    // `ESC ] 52 ; Pc ; Pd ST` lets a program in the PTY set the system
+    // clipboard — Claude Code's fullscreen renderer (copy-on-select over SSH,
+    // and OSC-52-only in some builds), tmux `set-clipboard`, neovim, helix.
+    // xterm drops it unless something registers for it. Write-only: a `?`
+    // query (read the clipboard back into the PTY) is swallowed, never
+    // answered — see lib/osc52.ts.
+    //
+    // Replay guard. The daemon replays this terminal's scrollback on attach,
+    // and an OSC 52 inside that history would overwrite the clipboard with
+    // stale text on every app restart. Two facts make the guard exact:
+    //  1. replay always precedes any output this pane's own input causes — it
+    //     is queued on the daemon's FIFO connection before the attach response
+    //     reaches us, let alone a later write — and a copy gesture inside a
+    //     TUI IS input (the mouse report / Ctrl-Shift-C reaches the PTY
+    //     through `term.onData`), so arming on the first input never delays a
+    //     legitimate copy;
+    //  2. xterm parses writes in order and runs a write's callback once that
+    //     chunk is parsed, so counting the chunks queued before the arm tells
+    //     us when the last pre-arm byte is behind us.
+    // An OSC 52 is honored only once both hold, and only while this pane is
+    // the one on screen (a hidden workspace must not swap the clipboard).
+    let oscArmed = false; // this pane has sent input to its PTY
+    let unarmedChunksPending = 0; // chunks queued before arming, not yet parsed
+    const oscDisp = term.parser.registerOscHandler(52, (data) => {
+      if (oscArmed && unarmedChunksPending === 0 && visibleRef.current) {
+        const text = decodeOsc52(data);
+        if (text !== null) void copyToClipboard(text); // implicit copy — silent on success
+      }
+      return true; // handled either way — never fall through
+    });
 
     // Ctrl + mouse wheel zoom. `passive: false` so we can preventDefault and
     // stop the browser's own pinch-zoom from firing underneath.
@@ -326,7 +369,17 @@ export function TerminalPane({
 
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
-      term.write(new Uint8Array(ev.payload.bytes));
+      const bytes = new Uint8Array(ev.payload.bytes);
+      if (oscArmed) {
+        term.write(bytes);
+        return;
+      }
+      // A pre-arm chunk (replayed scrollback, or output before any input):
+      // hold the OSC 52 gate until xterm has parsed it — see the replay guard.
+      unarmedChunksPending++;
+      term.write(bytes, () => {
+        unarmedChunksPending--;
+      });
     }).then((u) => {
       unlistenData = u;
     });
@@ -394,6 +447,10 @@ export function TerminalPane({
     listen<PtyReattachedEvent>("pty://reattached", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
       onReattachRef.current?.();
+      // The replay that follows must not reach the clipboard (see the OSC 52
+      // guard). Defensive: today a reattach only happens at mount, where the
+      // gate is still closed.
+      oscArmed = false;
       // Apps that own the screen via alt-screen + sticky status bars
       // (Claude Code, htop, vim, etc.) don't recover cleanly from a
       // replayed byte stream because xterm starts in a fresh state but
@@ -437,6 +494,7 @@ export function TerminalPane({
     const dataDisp = term.onData((data) => {
       const ptyId = ptySessionIdRef.current;
       if (!ptyId) return;
+      oscArmed = true; // first input opens the OSC 52 gate (see above)
       ipc.writeTextToSession(ptyId, data).catch(() => {});
     });
 
@@ -486,6 +544,7 @@ export function TerminalPane({
       dataDisp.dispose();
       resizeDisp.dispose();
       bellDisp.dispose();
+      oscDisp.dispose();
       ro.disconnect();
       unlistenData?.();
       unlistenExit?.();

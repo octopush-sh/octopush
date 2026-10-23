@@ -43,24 +43,49 @@ const xtermHoisted = vi.hoisted(() => ({
     getSelection: ReturnType<typeof vi.fn>;
     options: { fontSize: number };
     attachCustomKeyEventHandler: ReturnType<typeof vi.fn>;
+    write: ReturnType<typeof vi.fn>;
+    /** OSC handlers the component registered, by identifier (52 = clipboard). */
+    oscHandlers: Record<number, (data: string) => boolean>;
+    /** The `term.onData` callback — what a keystroke or mouse report invokes. */
+    dataHandler: ((data: string) => void) | null;
+    /** The options passed to `new Terminal(...)`. */
+    ctorOptions: Record<string, unknown>;
   } | null,
 }));
 
 vi.mock("@xterm/xterm", () => {
   class Terminal {
+    ctorOptions: Record<string, unknown>;
+    oscHandlers: Record<number, (data: string) => boolean> = {};
+    dataHandler: ((data: string) => void) | null = null;
     loadAddon = vi.fn();
     open = vi.fn();
-    onData = vi.fn(() => ({ dispose: vi.fn() }));
+    onData = vi.fn((cb: (data: string) => void) => {
+      this.dataHandler = cb;
+      return { dispose: vi.fn() };
+    });
     onResize = vi.fn(() => ({ dispose: vi.fn() }));
     onBell = vi.fn(() => ({ dispose: vi.fn() }));
     writeln = vi.fn();
-    write = vi.fn();
+    // xterm runs a write's callback once that chunk has been parsed; the
+    // default mock "parses" instantly. Tests that need a chunk to stay
+    // pending override the implementation.
+    write = vi.fn((_data: unknown, cb?: () => void) => {
+      cb?.();
+    });
     focus = vi.fn();
     dispose = vi.fn();
     getSelection = vi.fn(() => "");
     attachCustomKeyEventHandler = vi.fn();
+    parser = {
+      registerOscHandler: vi.fn((ident: number, cb: (data: string) => boolean) => {
+        this.oscHandlers[ident] = cb;
+        return { dispose: vi.fn() };
+      }),
+    };
     options = { fontSize: 13 };
-    constructor() {
+    constructor(opts: Record<string, unknown>) {
+      this.ctorOptions = opts;
       xtermHoisted.last = this;
     }
   }
@@ -170,6 +195,114 @@ describe("TerminalPane — clipboard", () => {
 
     expect(writeText).not.toHaveBeenCalled();
     expect(ev.defaultPrevented).toBe(false);
+  });
+});
+
+// ─── OSC 52 ───────────────────────────────────────────────────────
+// `ESC ] 52 ; Pc ; Pd ST`: a program in the PTY asks the terminal to put
+// base64(Pd) on the clipboard. The component registers for it through
+// `term.parser.registerOscHandler(52, …)`; these tests drive that handler
+// directly with the body xterm would pass it (`Pc;Pd`).
+
+/** What a program sends: base64 of the UTF-8 bytes. */
+function osc52(text: string, pc = "c"): string {
+  let bin = "";
+  new TextEncoder().encode(text).forEach((b) => {
+    bin += String.fromCharCode(b);
+  });
+  return `${pc};${btoa(bin)}`;
+}
+
+async function mountForOsc(id: string, visible = true) {
+  const writeText = vi.fn();
+  Object.assign(navigator, { clipboard: { writeText } });
+  render(
+    <TerminalPane terminalId={id} workspaceId="ws" workspacePath="/p" label="L" visible={visible} />,
+  );
+  await act(async () => { await Promise.resolve(); });
+  const term = xtermHoisted.last!;
+  const handler = term.oscHandlers[52];
+  expect(handler).toBeTypeOf("function");
+  return { writeText, term, handler };
+}
+
+describe("TerminalPane — OSC 52", () => {
+  it("copies a program's payload as UTF-8 once the pane has sent input, and consumes the sequence", async () => {
+    const { writeText, term, handler } = await mountForOsc("osc1");
+
+    // Output before any input (this is where replayed scrollback lands):
+    // consumed, but never copied.
+    expect(handler(osc52("stale"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+
+    // The user's first gesture — a keystroke, or the mouse report a TUI gets
+    // when they drag-select inside it — opens the gate.
+    term.dataHandler!("x");
+    expect(handler(osc52("información — Móvil ✓"))).toBe(true);
+    expect(writeText).toHaveBeenCalledWith("información — Móvil ✓");
+  });
+
+  it("keeps the gate closed until every chunk queued before the first input has been parsed", async () => {
+    const { writeText, term, handler } = await mountForOsc("osc2");
+    const pending: Array<() => void> = [];
+    term.write.mockImplementation((_data: unknown, cb?: () => void) => {
+      if (cb) pending.push(cb);
+    });
+
+    // Replay arrives (queued before any input), then the user clicks.
+    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x1b, 0x5d] });
+    term.dataHandler!("x");
+    expect(pending).toHaveLength(1);
+
+    // xterm is still parsing that pre-input chunk → still ignored.
+    expect(handler(osc52("stale"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+
+    // Chunks written after arming don't hold the gate.
+    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x41] });
+    expect(pending).toHaveLength(1);
+
+    // xterm finished the pre-input chunk → live output may copy.
+    pending[0]();
+    expect(handler(osc52("fresh"))).toBe(true);
+    expect(writeText).toHaveBeenCalledWith("fresh");
+  });
+
+  it("swallows queries, clears and malformed payloads without touching the clipboard", async () => {
+    const { writeText, term, handler } = await mountForOsc("osc3");
+    term.dataHandler!("x");
+    expect(handler("c;?")).toBe(true); // a read request: never answered
+    expect(handler("c;")).toBe(true);
+    expect(handler("c;%%%not-base64")).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("ignores OSC 52 from a pane that is not on screen", async () => {
+    const { writeText, term, handler } = await mountForOsc("osc4", false);
+    term.dataHandler!("x");
+    expect(handler(osc52("hidden"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("closes the gate again on reattach so the replay cannot copy", async () => {
+    const { writeText, term, handler } = await mountForOsc("osc5");
+    term.dataHandler!("x");
+    emitEvent("pty://reattached", { sessionId: "osc5" });
+    expect(handler(osc52("replayed"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+    term.dataHandler!("y");
+    expect(handler(osc52("live"))).toBe(true);
+    expect(writeText).toHaveBeenCalledWith("live");
+  });
+});
+
+describe("TerminalPane — native selection override", () => {
+  it("lets Option-drag force a native xterm selection while a program owns the mouse", async () => {
+    render(
+      <TerminalPane terminalId="sel1" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    expect(xtermHoisted.last!.ctorOptions.macOptionClickForcesSelection).toBe(true);
   });
 });
 
