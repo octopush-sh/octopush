@@ -11,7 +11,7 @@
  * NOTE: xterm DOM-rendering behaviour (canvas, scroll, font) is skipped here
  * because it requires a real browser environment. Verify those in Playwright/e2e.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, act } from "@testing-library/react";
 
 // ─── JSDOM shims ──────────────────────────────────────────────────
@@ -41,7 +41,10 @@ Object.defineProperty(globalThis, "requestAnimationFrame", {
 const xtermHoisted = vi.hoisted(() => ({
   last: null as unknown as {
     getSelection: ReturnType<typeof vi.fn>;
-    options: { fontSize: number };
+    options: { fontSize: number; altClickMovesCursor: boolean };
+    /** What xterm's `term.modes` reports — set by tests to simulate a program
+     *  that turned mouse tracking on. */
+    modes: { mouseTrackingMode: string };
     attachCustomKeyEventHandler: ReturnType<typeof vi.fn>;
     write: ReturnType<typeof vi.fn>;
     /** OSC handlers the component registered, by identifier (52 = clipboard). */
@@ -83,7 +86,8 @@ vi.mock("@xterm/xterm", () => {
         return { dispose: vi.fn() };
       }),
     };
-    options = { fontSize: 13 };
+    options = { fontSize: 13, altClickMovesCursor: true };
+    modes = { mouseTrackingMode: "none" };
     constructor(opts: Record<string, unknown>) {
       this.ctorOptions = opts;
       xtermHoisted.last = this;
@@ -147,6 +151,11 @@ const mockIpc = {
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
+// ─── Mock toasts ──────────────────────────────────────────────────
+// `copyToClipboard` announces program-initiated copies through pushToast.
+const toastsMock = vi.hoisted(() => ({ pushToast: vi.fn() }));
+vi.mock("./Toasts", () => ({ pushToast: toastsMock.pushToast }));
+
 // ─── Import component after mocks ─────────────────────────────────
 
 const { TerminalPane } = await import("./TerminalPane");
@@ -200,9 +209,10 @@ describe("TerminalPane — clipboard", () => {
 
 // ─── OSC 52 ───────────────────────────────────────────────────────
 // `ESC ] 52 ; Pc ; Pd ST`: a program in the PTY asks the terminal to put
-// base64(Pd) on the clipboard. The component registers for it through
-// `term.parser.registerOscHandler(52, …)`; these tests drive that handler
-// directly with the body xterm would pass it (`Pc;Pd`).
+// base64(Pd) on the clipboard. The gate's mechanics are proven against the
+// real xterm in lib/osc52.test.ts; here we check the pane's wiring and its
+// policy, driving the registered handler with the body xterm would pass it
+// (`Pc;Pd`).
 
 /** What a program sends: base64 of the UTF-8 bytes. */
 function osc52(text: string, pc = "c"): string {
@@ -216,6 +226,7 @@ function osc52(text: string, pc = "c"): string {
 async function mountForOsc(id: string, visible = true) {
   const writeText = vi.fn();
   Object.assign(navigator, { clipboard: { writeText } });
+  vi.spyOn(document, "hasFocus").mockReturnValue(true);
   render(
     <TerminalPane terminalId={id} workspaceId="ws" workspacePath="/p" label="L" visible={visible} />,
   );
@@ -227,50 +238,62 @@ async function mountForOsc(id: string, visible = true) {
 }
 
 describe("TerminalPane — OSC 52", () => {
-  it("copies a program's payload as UTF-8 once the pane has sent input, and consumes the sequence", async () => {
-    const { writeText, term, handler } = await mountForOsc("osc1");
-
-    // Output before any input (this is where replayed scrollback lands):
-    // consumed, but never copied.
-    expect(handler(osc52("stale"))).toBe(true);
-    expect(writeText).not.toHaveBeenCalled();
-
-    // The user's first gesture — a keystroke, or the mouse report a TUI gets
-    // when they drag-select inside it — opens the gate.
-    term.dataHandler!("x");
-    expect(handler(osc52("información — Móvil ✓"))).toBe(true);
-    expect(writeText).toHaveBeenCalledWith("información — Móvil ✓");
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it("keeps the gate closed until every chunk queued before the first input has been parsed", async () => {
+  it("copies a program's payload as UTF-8 from live output, consumes the sequence, and says so", async () => {
+    const { writeText, handler } = await mountForOsc("osc1");
+    emitEvent("pty://data", { sessionId: "osc1", bytes: [0x41] }); // live output
+    expect(handler(osc52("información — Móvil ✓"))).toBe(true);
+    expect(writeText).toHaveBeenCalledWith("información — Móvil ✓");
+    // Nothing was pressed in Octopush, so the copy is announced.
+    await vi.waitFor(() =>
+      expect(toastsMock.pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ level: "success", title: "Copied from the terminal" }),
+      ),
+    );
+  });
+
+  it("never copies while replayed scrollback is still being parsed", async () => {
     const { writeText, term, handler } = await mountForOsc("osc2");
     const pending: Array<() => void> = [];
     term.write.mockImplementation((_data: unknown, cb?: () => void) => {
       if (cb) pending.push(cb);
     });
 
-    // Replay arrives (queued before any input), then the user clicks.
-    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x1b, 0x5d] });
-    term.dataHandler!("x");
-    expect(pending).toHaveLength(1);
-
-    // xterm is still parsing that pre-input chunk → still ignored.
-    expect(handler(osc52("stale"))).toBe(true);
-    expect(writeText).not.toHaveBeenCalled();
-
-    // Chunks written after arming don't hold the gate.
+    // The backend tags the replay; a live chunk queued behind it carries no
+    // callback and never holds the gate by itself.
+    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x1b, 0x5d], replay: true });
     emitEvent("pty://data", { sessionId: "osc2", bytes: [0x41] });
     expect(pending).toHaveLength(1);
 
-    // xterm finished the pre-input chunk → live output may copy.
+    // xterm is inside the replayed chunk → this OSC 52 is history → ignored.
+    expect(handler(osc52("stale"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+
+    // xterm finished the replay → the live chunk's OSC 52 may copy.
     pending[0]();
     expect(handler(osc52("fresh"))).toBe(true);
     expect(writeText).toHaveBeenCalledWith("fresh");
   });
 
-  it("swallows queries, clears and malformed payloads without touching the clipboard", async () => {
+  it("stays shut on a pane whose every chunk is history (a daemon that never marks the replay done)", async () => {
     const { writeText, term, handler } = await mountForOsc("osc3");
-    term.dataHandler!("x");
+    const pending: Array<() => void> = [];
+    term.write.mockImplementation((_data: unknown, cb?: () => void) => {
+      if (cb) pending.push(cb);
+    });
+    emitEvent("pty://data", { sessionId: "osc3", bytes: [0x41], replay: true });
+    expect(handler(osc52("one"))).toBe(true);
+    pending.shift()!();
+    emitEvent("pty://data", { sessionId: "osc3", bytes: [0x42], replay: true });
+    expect(handler(osc52("two"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("swallows queries, clears and malformed payloads without touching the clipboard", async () => {
+    const { writeText, handler } = await mountForOsc("osc4");
     expect(handler("c;?")).toBe(true); // a read request: never answered
     expect(handler("c;")).toBe(true);
     expect(handler("c;%%%not-base64")).toBe(true);
@@ -278,21 +301,16 @@ describe("TerminalPane — OSC 52", () => {
   });
 
   it("ignores OSC 52 from a pane that is not on screen", async () => {
-    const { writeText, term, handler } = await mountForOsc("osc4", false);
-    term.dataHandler!("x");
+    const { writeText, handler } = await mountForOsc("osc5", false);
     expect(handler(osc52("hidden"))).toBe(true);
     expect(writeText).not.toHaveBeenCalled();
   });
 
-  it("closes the gate again on reattach so the replay cannot copy", async () => {
-    const { writeText, term, handler } = await mountForOsc("osc5");
-    term.dataHandler!("x");
-    emitEvent("pty://reattached", { sessionId: "osc5" });
-    expect(handler(osc52("replayed"))).toBe(true);
+  it("ignores OSC 52 while the Octopush window is not focused", async () => {
+    const { writeText, handler } = await mountForOsc("osc6");
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    expect(handler(osc52("background"))).toBe(true);
     expect(writeText).not.toHaveBeenCalled();
-    term.dataHandler!("y");
-    expect(handler(osc52("live"))).toBe(true);
-    expect(writeText).toHaveBeenCalledWith("live");
   });
 });
 
@@ -303,6 +321,26 @@ describe("TerminalPane — native selection override", () => {
     );
     await act(async () => { await Promise.resolve(); });
     expect(xtermHoisted.last!.ctorOptions.macOptionClickForcesSelection).toBe(true);
+  });
+
+  it("switches alt-click cursor moves off only while a program tracks the mouse", async () => {
+    const { container } = render(
+      <TerminalPane terminalId="sel2" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    const term = xtermHoisted.last!;
+    const el = container.querySelector(".xterm-container") as HTMLElement;
+
+    // A TUI turned mouse tracking on: an Option+click must not become a
+    // burst of arrow keys into the program.
+    term.modes.mouseTrackingMode = "any";
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, altKey: true }));
+    expect(term.options.altClickMovesCursor).toBe(false);
+
+    // Back at a plain prompt the shell feature is restored.
+    term.modes.mouseTrackingMode = "none";
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, altKey: true }));
+    expect(term.options.altClickMovesCursor).toBe(true);
   });
 });
 

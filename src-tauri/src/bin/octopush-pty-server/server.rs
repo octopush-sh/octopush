@@ -600,6 +600,11 @@ fn cmd_attach(
         }
     }
 
+    // End of history for this attachment: everything after this is live
+    // output. See `Event::ReplayDone`.
+    let done = crate::protocol::Event::ReplayDone { id: id.clone() };
+    let _ = replay_tx.send(done.to_line());
+
     // Return SentDirectly so handle_connection doesn't send a duplicate Ok{}.
     ResponsePayload::SentDirectly
 }

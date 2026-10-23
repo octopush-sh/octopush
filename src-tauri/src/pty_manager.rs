@@ -32,6 +32,10 @@ struct PtyDataEvent {
     session_id: String,
     /// Raw bytes read from the PTY.
     bytes: Vec<u8>,
+    /// True while the chunk is replayed scrollback (history shown again after
+    /// a reattach), false for live output. The frontend's OSC 52 clipboard
+    /// guard refuses to act on history. See `TermEvent::ReplayDone`.
+    replay: bool,
 }
 
 /// Event payload for `pty://exit`
@@ -278,6 +282,16 @@ fn start_reader_thread(
                 );
             }
 
+            // Until the daemon marks the replay done, every chunk of a
+            // reattach is history. A fresh spawn starts live: its ring holds
+            // at most the shell's own first prompt at attach time, and this
+            // also keeps a daemon that predates `replay_done` fully working
+            // for new terminals. For a reattach to such a daemon the flag
+            // never clears and that pane's output stays tagged as history —
+            // the safe failure: OSC 52 is ignored there until the daemon is
+            // replaced, never a stale clipboard.
+            let mut replaying = is_reattach;
+
             loop {
                 match rx.recv() {
                     Ok(TermEvent::Data { seq, bytes }) => {
@@ -286,6 +300,7 @@ fn start_reader_thread(
                             PtyDataEvent {
                                 session_id: id.clone(),
                                 bytes: bytes.clone(),
+                                replay: replaying,
                             },
                         );
                         if let Some(ref hook) = on_output {
@@ -334,6 +349,9 @@ fn start_reader_thread(
                                 command,
                             },
                         );
+                    }
+                    Ok(TermEvent::ReplayDone) => {
+                        replaying = false;
                     }
                     Err(_) => {
                         // The event channel was closed because this attach was

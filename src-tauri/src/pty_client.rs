@@ -46,6 +46,10 @@ pub enum TermEvent {
         busy: bool,
         command: Option<String>,
     },
+    /// The daemon finished replaying scrollback for this attachment: every
+    /// `Data` after this is live output. Daemons that predate the marker never
+    /// send it — see `pty_manager::start_reader_thread` for the fail-safe.
+    ReplayDone,
 }
 
 /// Minimal terminal descriptor returned by `list_terminals`.
@@ -509,6 +513,7 @@ fn run_reader(
                     let command = v["command"].as_str().map(str::to_string);
                     TermEvent::Foreground { busy, command }
                 }
+                Some("replay_done") => TermEvent::ReplayDone,
                 _ => continue,
             };
 
@@ -618,19 +623,47 @@ where
 }
 
 /// `env` as the daemon should receive it for a spawn: the caller's variables,
-/// plus a UTF-8 locale when neither they nor this process's environment supply
-/// one (see [`utf8_locale_fixup`]). This process's environment stands in for
-/// the daemon's pass-through set — the daemon was spawned from it, or from an
-/// equivalent launch — since the daemon does not report its own.
+/// this process's own `LANG`/`LC_ALL`/`LC_CTYPE` where the caller set none,
+/// and a UTF-8 locale when the result still names none (see
+/// [`utf8_locale_fixup`]).
 ///
-/// Done here, on the app side, rather than only in the daemon's `cmd_spawn`:
-/// the daemon merges caller env *after* its own pass-through, so the fix lands
-/// even on a daemon binary that predates it — and the daemon deliberately
-/// survives app updates, so that is the common case right after one.
+/// Forwarding the app's own locale matters because the shell otherwise
+/// inherits the *daemon's* environment, and the daemon — spawned by whichever
+/// app launch came first and kept alive across updates — may have been started
+/// with a different one (a Finder launch has none; a dev launch from a
+/// terminal has the user's). Caller env wins in the daemon
+/// (`server.rs::cmd_spawn` merges it last), so sending the variables
+/// explicitly makes the outcome depend on this app, not on history. The one
+/// thing this can't beat is an `LC_ALL` in the daemon's own environment; that
+/// daemon was launched with it on purpose.
+///
+/// Done here, on the app side, rather than only in the daemon's `cmd_spawn`,
+/// so the fix also lands on a daemon binary that predates it — the daemon
+/// deliberately survives app updates, so that is the common case right after
+/// one.
 pub(crate) fn with_utf8_locale(env: &HashMap<String, String>) -> HashMap<String, String> {
+    with_utf8_locale_from(env, |k| std::env::var(k).ok())
+}
+
+/// [`with_utf8_locale`] with the process environment injected, so tests don't
+/// depend on the runner's own locale.
+pub(crate) fn with_utf8_locale_from<F>(
+    env: &HashMap<String, String>,
+    process_var: F,
+) -> HashMap<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut env = env.clone();
-    let fixup = utf8_locale_fixup(|k| env.get(k).cloned().or_else(|| std::env::var(k).ok()));
-    if let Some((k, v)) = fixup {
+    for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if env.contains_key(key) {
+            continue;
+        }
+        if let Some(v) = process_var(key).filter(|v| !v.trim().is_empty()) {
+            env.insert(key.to_string(), v);
+        }
+    }
+    if let Some((k, v)) = utf8_locale_fixup(|k| env.get(k).cloned()) {
         env.insert(k.to_string(), v.to_string());
     }
     env
@@ -781,6 +814,9 @@ mod tests {
                 }
                 Ok(TermEvent::Foreground { .. }) => {
                     // Foreground busy transitions — not under test here.
+                }
+                Ok(TermEvent::ReplayDone) => {
+                    // End-of-replay marker — not under test here.
                 }
                 Err(_) => {}
             }
