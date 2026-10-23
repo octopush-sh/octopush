@@ -422,7 +422,7 @@ impl LiveRun {
                     push(&tail, &mut full, &mut on_chunk);
                     break;
                 }
-                Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) | Ok(TermEvent::ReplayDone) | Err(RecvTimeoutError::Timeout) => {}
             }
         }
 
@@ -506,7 +506,7 @@ fn probe(rx: &Receiver<TermEvent>, timeout: Duration, nonce: &str) -> Probe {
                 // partial OCTO_DONE marker that clean_output alone wouldn't remove.
                 return Probe::Dead { output: strip_octo_markers(&clean_output(&buf), nonce) };
             }
-            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
+            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) | Ok(TermEvent::ReplayDone) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Probe::Dead { output: strip_octo_markers(&clean_output(&buf), nonce) };
@@ -630,7 +630,7 @@ fn init_and_wait_ready(
             Ok(TermEvent::Exit { .. }) | Ok(TermEvent::Error { .. }) => {
                 return Err(AppError::Other("talk shell exited during init".into()));
             }
-            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) => {}
+            Ok(TermEvent::Attention) | Ok(TermEvent::Foreground { .. }) | Ok(TermEvent::ReplayDone) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(AppError::Other("talk shell channel closed during init".into()));

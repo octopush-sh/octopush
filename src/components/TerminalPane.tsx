@@ -5,6 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
+import { attachOsc52Clipboard } from "../lib/osc52";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -138,6 +139,16 @@ export function TerminalPane({
       theme: getXtermTheme(),
       allowProposedApi: true,
       scrollback: 10000,
+      // When a program owns the mouse (Claude Code's fullscreen renderer,
+      // tmux with mouse on, vim `mouse=a`) a plain drag goes to the program
+      // and xterm makes no selection of its own. On macOS xterm offers NO
+      // modifier to override that unless this is on — Shift only works on
+      // other platforms (xterm's SelectionService.shouldForceSelection) — so
+      // Option-drag is the escape hatch back to a native selection and the
+      // clipboard bridge below. Cost: Option-click no longer reaches a
+      // mouse-mode program. Plain clicks, and mouse-mode-off shells, are
+      // untouched.
+      macOptionClickForcesSelection: true,
     });
 
     const fit = new FitAddon();
@@ -220,6 +231,37 @@ export function TerminalPane({
       }
     };
     copyEl.addEventListener("contextmenu", onContextMenu);
+
+    // ── OSC 52: a program copies to the clipboard ──────────────────────
+    // `ESC ] 52 ; Pc ; Pd ST` lets a program in the PTY set the system
+    // clipboard — Claude Code's fullscreen renderer (copy-on-select over SSH,
+    // and OSC-52-only in some builds), tmux `set-clipboard`, neovim, helix.
+    // xterm drops it unless something registers for it. The mechanics —
+    // write-only, UTF-8 decoding, the history gate, the pacing — live in
+    // lib/osc52.ts; the backend tags replayed scrollback on `pty://data` so
+    // history can never reach the clipboard. This pane only sets the policy.
+    const osc52 = attachOsc52Clipboard(term, {
+      // Only the pane the user is looking at, in a focused window: a hidden
+      // workspace, or an Octopush sitting behind another app, must not swap
+      // the clipboard under them.
+      canCopy: () => visibleRef.current && document.hasFocus(),
+      // Announced, unlike the user's own Cmd-C: nothing was pressed in
+      // Octopush, so the toast is how they learn their clipboard changed.
+      copy: (text) => void copyToClipboard(text, "Copied from the terminal"),
+    });
+
+    // Option+click, mouse-mode aware. xterm's alt-click-moves-cursor (on by
+    // default) turns a quick Option+click into a burst of arrow-key presses
+    // that walk the cursor to the clicked cell — handy at a prompt, but with
+    // `macOptionClickForcesSelection` the same mouseup path now also runs
+    // while a program tracks the mouse, where those arrows would land in the
+    // program (Claude Code's composer, vim) as real keystrokes. xterm reads
+    // the option at mouseup, so decide per gesture: on only while no program
+    // has mouse tracking on.
+    const onMouseDownCapture = () => {
+      term.options.altClickMovesCursor = term.modes.mouseTrackingMode === "none";
+    };
+    copyEl.addEventListener("mousedown", onMouseDownCapture, true);
 
     // Ctrl + mouse wheel zoom. `passive: false` so we can preventDefault and
     // stop the browser's own pinch-zoom from firing underneath.
@@ -326,7 +368,9 @@ export function TerminalPane({
 
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
-      term.write(new Uint8Array(ev.payload.bytes));
+      // `replay` marks scrollback the daemon is showing again after a
+      // reattach; the OSC 52 gate must not act on it.
+      osc52.write(new Uint8Array(ev.payload.bytes), ev.payload.replay === true);
     }).then((u) => {
       unlistenData = u;
     });
@@ -486,6 +530,7 @@ export function TerminalPane({
       dataDisp.dispose();
       resizeDisp.dispose();
       bellDisp.dispose();
+      osc52.dispose();
       ro.disconnect();
       unlistenData?.();
       unlistenExit?.();
@@ -495,6 +540,7 @@ export function TerminalPane({
       if (busyOffTimerRef.current) clearTimeout(busyOffTimerRef.current);
       window.removeEventListener("octo:theme", onThemeChange);
       copyEl.removeEventListener("contextmenu", onContextMenu);
+      copyEl.removeEventListener("mousedown", onMouseDownCapture, true);
       copyEl.removeEventListener("wheel", onWheel);
       term.dispose();
       termRef.current = null;

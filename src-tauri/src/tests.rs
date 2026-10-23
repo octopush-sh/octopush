@@ -11951,3 +11951,161 @@ mod thread_ledger_tests {
         assert_eq!(listed[0].context_tokens, Some(1050));
     }
 }
+
+/// Tests for the UTF-8 locale default every PTY spawn carries
+/// ([`crate::pty_client::utf8_locale_fixup`] / [`crate::pty_client::with_utf8_locale`]).
+///
+/// Background: a Finder-launched app has no `LANG`/`LC_*`, so its shells ran in
+/// the `C` locale and `pbcopy` (Claude Code's copy-on-select path in the
+/// fullscreen renderer) wrote non-ASCII text to the clipboard as Mac Roman
+/// mojibake (`ó` → `√≥`).
+#[cfg(test)]
+mod pty_locale_tests {
+    use crate::pty_client::{utf8_locale_fixup, with_utf8_locale_from, UTF8_LOCALE};
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn utf8_locale_constant_names_a_utf8_codeset() {
+        assert!(UTF8_LOCALE.to_ascii_lowercase().contains("utf-8"));
+    }
+
+    #[test]
+    fn bare_gui_environment_gets_lang() {
+        // The Finder/Dock launch: nothing set at all.
+        assert_eq!(utf8_locale_fixup(env(&[])), Some(("LANG", UTF8_LOCALE)));
+    }
+
+    #[test]
+    fn utf8_lang_is_left_alone() {
+        assert_eq!(utf8_locale_fixup(env(&[("LANG", "es_ES.UTF-8")])), None);
+        // glibc spelling, lower-case, no hyphen.
+        assert_eq!(utf8_locale_fixup(env(&[("LANG", "en_US.utf8")])), None);
+    }
+
+    #[test]
+    fn macos_bare_utf8_ctype_is_left_alone() {
+        // What Terminal.app sets when no `xx_YY.UTF-8` matches the user's region.
+        assert_eq!(utf8_locale_fixup(env(&[("LC_CTYPE", "UTF-8")])), None);
+    }
+
+    #[test]
+    fn lc_all_is_respected_whatever_it_says() {
+        assert_eq!(utf8_locale_fixup(env(&[("LC_ALL", "en_US.UTF-8")])), None);
+        // An explicit global override is the user's call, even a non-UTF-8 one.
+        assert_eq!(utf8_locale_fixup(env(&[("LC_ALL", "C")])), None);
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])),
+            None
+        );
+    }
+
+    #[test]
+    fn non_utf8_lang_gets_only_ctype() {
+        // Keep their LANG for messages/formats; fix just the codeset.
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LANG", "C")])),
+            Some(("LC_CTYPE", UTF8_LOCALE))
+        );
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LANG", "es_ES.ISO8859-1")])),
+            Some(("LC_CTYPE", UTF8_LOCALE))
+        );
+    }
+
+    #[test]
+    fn non_utf8_ctype_is_overridden_even_with_utf8_lang() {
+        // LC_CTYPE beats LANG in setlocale, so a `C` ctype would still break pbcopy.
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LC_CTYPE", "C"), ("LANG", "es_ES.UTF-8")])),
+            Some(("LC_CTYPE", UTF8_LOCALE))
+        );
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LC_CTYPE", "POSIX")])),
+            Some(("LC_CTYPE", UTF8_LOCALE))
+        );
+    }
+
+    #[test]
+    fn empty_values_count_as_unset() {
+        assert_eq!(
+            utf8_locale_fixup(env(&[("LANG", ""), ("LC_ALL", "  ")])),
+            Some(("LANG", UTF8_LOCALE))
+        );
+    }
+
+    fn caller(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // `with_utf8_locale_from` takes the process environment as a closure, so
+    // every case below is deterministic whatever the runner's own locale is.
+
+    #[test]
+    fn with_utf8_locale_finder_launch_gets_the_default() {
+        // App launched from Finder/Dock: no locale anywhere.
+        let out = with_utf8_locale_from(&caller(&[("PATH", "/usr/bin")]), env(&[]));
+        assert_eq!(out, caller(&[("PATH", "/usr/bin"), ("LANG", UTF8_LOCALE)]));
+    }
+
+    #[test]
+    fn with_utf8_locale_forwards_the_apps_own_locale() {
+        // Dev launch from a terminal: the app's locale travels with the spawn
+        // so the shell follows this app, not whatever the long-lived daemon
+        // was started with.
+        let out = with_utf8_locale_from(
+            &caller(&[]),
+            env(&[("LANG", "es_ES.UTF-8"), ("LC_CTYPE", "es_ES.UTF-8")]),
+        );
+        assert_eq!(
+            out,
+            caller(&[("LANG", "es_ES.UTF-8"), ("LC_CTYPE", "es_ES.UTF-8")])
+        );
+        // An explicit LC_ALL in the app's env is forwarded and respected as is.
+        let out = with_utf8_locale_from(&caller(&[]), env(&[("LC_ALL", "C")]));
+        assert_eq!(out, caller(&[("LC_ALL", "C")]));
+    }
+
+    #[test]
+    fn with_utf8_locale_caller_values_win_over_the_process() {
+        let out = with_utf8_locale_from(
+            &caller(&[("LANG", "fr_FR.UTF-8")]),
+            env(&[("LANG", "C"), ("LC_CTYPE", "C")]),
+        );
+        // The process's non-UTF-8 LC_CTYPE is still forwarded (the caller set
+        // none) and still beats LANG, so it is the one overridden.
+        assert_eq!(
+            out,
+            caller(&[("LANG", "fr_FR.UTF-8"), ("LC_CTYPE", UTF8_LOCALE)])
+        );
+    }
+
+    #[test]
+    fn with_utf8_locale_adds_ctype_beside_a_non_utf8_caller_lang() {
+        let out = with_utf8_locale_from(&caller(&[("LANG", "C"), ("PATH", "/usr/bin")]), env(&[]));
+        assert_eq!(
+            out,
+            caller(&[
+                ("LANG", "C"),
+                ("PATH", "/usr/bin"),
+                ("LC_CTYPE", UTF8_LOCALE)
+            ])
+        );
+    }
+
+    #[test]
+    fn with_utf8_locale_ignores_empty_process_values() {
+        let out = with_utf8_locale_from(&caller(&[]), env(&[("LANG", ""), ("LC_ALL", " ")]));
+        assert_eq!(out, caller(&[("LANG", UTF8_LOCALE)]));
+    }
+}

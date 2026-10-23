@@ -215,6 +215,15 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,
     },
+    /// Sent once per `attach`, after the last replayed scrollback chunk:
+    /// every `Data` event the attachment receives after it is live output.
+    /// Lets the app tell history from new output (its OSC 52 clipboard guard
+    /// refuses to act on history). The replay is queued on this connection's
+    /// FIFO before this marker, so no history can follow it; live output
+    /// produced in the instant of the attach can *precede* it (the PTY reader
+    /// enqueues it concurrently), which only ever errs toward treating live
+    /// output as history — never the reverse.
+    ReplayDone { id: String },
 }
 
 // ---------------------------------------------------------------------------
