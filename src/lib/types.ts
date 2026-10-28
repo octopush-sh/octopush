@@ -56,6 +56,9 @@ export interface CreateSessionArgs {
 export interface PtyDataEvent {
   sessionId: string;
   bytes: number[];
+  /** True while the chunk is replayed scrollback (history shown again after a
+   *  reattach) rather than live output; absent from builds that predate it. */
+  replay?: boolean;
 }
 
 export interface PtyExitEvent {

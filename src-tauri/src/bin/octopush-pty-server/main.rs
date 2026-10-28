@@ -536,6 +536,27 @@ mod tests {
             "expected MARKER_FIRST in scrollback replay, got: {text:?}");
         assert!(text.contains("MARKER_SECOND"), "expected MARKER_SECOND in scrollback");
         assert!(text.contains("MARKER_THIRD"),  "expected MARKER_THIRD in scrollback");
+
+        // The replay is followed by one `replay_done` marker so the app can
+        // tell history from live output (its OSC 52 clipboard guard depends
+        // on it). All three markers were written before attach B, so they
+        // are history and the marker must still be ahead of us.
+        let mut saw_replay_done = false;
+        loop {
+            let mut line = String::new();
+            match eb_r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v, Err(_) => continue,
+            };
+            if v["event"] == "replay_done" && v["id"] == "t-scroll" {
+                saw_replay_done = true;
+                break;
+            }
+        }
+        assert!(saw_replay_done, "expected a replay_done event after the scrollback replay");
     }
 
     // -----------------------------------------------------------------------

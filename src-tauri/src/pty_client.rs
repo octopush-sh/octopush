@@ -46,6 +46,10 @@ pub enum TermEvent {
         busy: bool,
         command: Option<String>,
     },
+    /// The daemon finished replaying scrollback for this attachment: every
+    /// `Data` after this is live output. Daemons that predate the marker never
+    /// send it — see `pty_manager::start_reader_thread` for the fail-safe.
+    ReplayDone,
 }
 
 /// Minimal terminal descriptor returned by `list_terminals`.
@@ -204,6 +208,7 @@ impl DaemonClient {
         rows: u16,
         cols: u16,
     ) -> AppResult<u32> {
+        let env = with_utf8_locale(env);
         let resp = self.send_request(serde_json::json!({
             "method": "spawn",
             "id": id,
@@ -508,6 +513,7 @@ fn run_reader(
                     let command = v["command"].as_str().map(str::to_string);
                     TermEvent::Foreground { busy, command }
                 }
+                Some("replay_done") => TermEvent::ReplayDone,
                 _ => continue,
             };
 
@@ -555,6 +561,112 @@ fn run_reader(
             "message": "daemon connection closed"
         }));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Locale default for spawned shells
+// ---------------------------------------------------------------------------
+
+/// The UTF-8 locale a PTY shell falls back to when nothing else names one.
+/// `en_US.UTF-8` ships with every macOS; `C.UTF-8` with every modern glibc/musl.
+pub(crate) const UTF8_LOCALE: &str = if cfg!(target_os = "macos") {
+    "en_US.UTF-8"
+} else {
+    "C.UTF-8"
+};
+
+/// Which locale variable (if any) a PTY shell must be handed so its effective
+/// `LC_CTYPE` is UTF-8. `get` looks a variable up in the environment the shell
+/// is about to inherit.
+///
+/// Why this exists: a GUI app launched from Finder/Dock gets no `LANG`/`LC_*`
+/// at all (only Terminal.app/iTerm2 set them, for their own shells), the PTY
+/// daemon only passes those variables through when they exist, and a login
+/// `zsh` does not invent them. The shell then runs in the `C` locale, where
+/// locale-aware tools treat bytes as the legacy system encoding (Mac Roman):
+/// `pbcopy` — which Claude Code's fullscreen renderer runs for its
+/// copy-on-select — turns `ó` into `√≥` on the clipboard, in every app.
+///
+/// Rules, mirroring `setlocale` precedence (`LC_ALL` > `LC_CTYPE` > `LANG`;
+/// an empty value counts as unset, as libc treats it):
+/// - `LC_ALL` set → leave everything alone: it is an explicit global override
+///   and would beat anything set here anyway.
+/// - effective ctype (`LC_CTYPE`, else `LANG`) already names UTF-8 → nothing.
+/// - neither set → set `LANG` (what Terminal.app does), so messages and
+///   formats follow too.
+/// - otherwise → set only `LC_CTYPE`, the narrowest fix: a non-UTF-8 `LANG`
+///   keeps governing messages/formats, and a non-UTF-8 `LC_CTYPE` is
+///   overridden because it breaks every byte→text boundary in the shell.
+pub(crate) fn utf8_locale_fixup<F>(get: F) -> Option<(&'static str, &'static str)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    fn is_utf8(v: &str) -> bool {
+        let v = v.to_ascii_lowercase();
+        v.contains("utf-8") || v.contains("utf8")
+    }
+    let var = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+
+    if var("LC_ALL").is_some() {
+        return None;
+    }
+    let ctype = var("LC_CTYPE");
+    let lang = var("LANG");
+    if ctype.as_deref().or(lang.as_deref()).is_some_and(is_utf8) {
+        return None;
+    }
+    if ctype.is_none() && lang.is_none() {
+        Some(("LANG", UTF8_LOCALE))
+    } else {
+        Some(("LC_CTYPE", UTF8_LOCALE))
+    }
+}
+
+/// `env` as the daemon should receive it for a spawn: the caller's variables,
+/// this process's own `LANG`/`LC_ALL`/`LC_CTYPE` where the caller set none,
+/// and a UTF-8 locale when the result still names none (see
+/// [`utf8_locale_fixup`]).
+///
+/// Forwarding the app's own locale matters because the shell otherwise
+/// inherits the *daemon's* environment, and the daemon — spawned by whichever
+/// app launch came first and kept alive across updates — may have been started
+/// with a different one (a Finder launch has none; a dev launch from a
+/// terminal has the user's). Caller env wins in the daemon
+/// (`server.rs::cmd_spawn` merges it last), so sending the variables
+/// explicitly makes the outcome depend on this app, not on history. The one
+/// thing this can't beat is an `LC_ALL` in the daemon's own environment; that
+/// daemon was launched with it on purpose.
+///
+/// Done here, on the app side, rather than only in the daemon's `cmd_spawn`,
+/// so the fix also lands on a daemon binary that predates it — the daemon
+/// deliberately survives app updates, so that is the common case right after
+/// one.
+pub(crate) fn with_utf8_locale(env: &HashMap<String, String>) -> HashMap<String, String> {
+    with_utf8_locale_from(env, |k| std::env::var(k).ok())
+}
+
+/// [`with_utf8_locale`] with the process environment injected, so tests don't
+/// depend on the runner's own locale.
+pub(crate) fn with_utf8_locale_from<F>(
+    env: &HashMap<String, String>,
+    process_var: F,
+) -> HashMap<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut env = env.clone();
+    for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if env.contains_key(key) {
+            continue;
+        }
+        if let Some(v) = process_var(key).filter(|v| !v.trim().is_empty()) {
+            env.insert(key.to_string(), v);
+        }
+    }
+    if let Some((k, v)) = utf8_locale_fixup(|k| env.get(k).cloned()) {
+        env.insert(k.to_string(), v.to_string());
+    }
+    env
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +814,9 @@ mod tests {
                 }
                 Ok(TermEvent::Foreground { .. }) => {
                     // Foreground busy transitions — not under test here.
+                }
+                Ok(TermEvent::ReplayDone) => {
+                    // End-of-replay marker — not under test here.
                 }
                 Err(_) => {}
             }
