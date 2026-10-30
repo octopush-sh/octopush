@@ -157,7 +157,7 @@ function applyOne(gh, digest, action, ids) {
     if (stable && !newer(action.version, stable)) return `promote ${action.version}: not newer than stable ${stable}`;
     try {
       gh.send("POST", `repos/${APP_REPO}/actions/workflows/promote.yml/dispatches`, { ref: "main", inputs: { version: action.version } });
-      return `promotion of ${action.version} to stable started`;
+      return `promotion of ${action.version} to stable started — approve it in GitHub (the \`stable\` environment asks you) and it ships`;
     } catch (e) {
       return `promote ${action.version}: could not start the promote workflow (${String(e.message).split("\n")[0]})`;
     }
