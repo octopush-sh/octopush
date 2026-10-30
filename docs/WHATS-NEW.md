@@ -51,6 +51,28 @@ Ids are kebab-case, scoped by surface (`settings-account-sync`, `direct-launcher
 changesets that use it, so `check` catches it. The registry of surfaces and the tour runner
 live in `src/lib/tour/`.
 
+An id assigned through a variable (one per mode, one per settings tab) is written as
+`tourId("mode-run")` (`src/lib/tour/ids.ts`, the identity function) so `check` still sees it.
+
+Current anchors:
+
+| Id | Element | Where |
+|---|---|---|
+| `rail` | The workspace rail | `WorkspaceRail.tsx` |
+| `rail-search` | Rail search ("Find a project or mission") | `WorkspaceRail.tsx` |
+| `rail-add-project` | Rail "Add project" button | `WorkspaceRail.tsx` |
+| `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
+| `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
+| `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
+| `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
+| `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
+| `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
+| `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
+| `palette-input` | Command palette input | `CommandPalette.tsx` |
+
+A target only counts as found when it is visible; the tour waits up to 2s for it after
+opening the step's surface, then skips the step.
+
 ## 3. Named surfaces (`open:`)
 
 `open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
@@ -75,8 +97,23 @@ screen.
    a **Maintenance** line listing merged PRs without a changeset;
 3. the clip recorder then records `<slug>.webm` for every app changeset with `steps`.
 
-The app bundles `whats-new/*/` at build time. After an update, the What's new modal shows
-the `highlight` tips of every version newer than the last one the user saw.
+The app bundles the released `whats-new/X.Y.Z/` directories at build time (`unreleased/` is
+never shipped; dev builds can preview it from the palette). After an update, the What's new
+modal shows the `highlight` tips of every version in (last seen, installed]; a fresh install
+only records the version. Implementation: `src/lib/whatsNew.ts` (model),
+`src/lib/whatsNewLaunch.ts` (launch rule), `src/components/WhatsNewModal.tsx`.
+
+The clip recorder drives the tour through `window.__octoTour` (dev builds, or the page loaded
+with `?octo-record=1`):
+
+```ts
+window.__octoTour.play(steps, { mode: "interactive" | "record", stepMs?: number }): Promise<void>
+```
+
+In `record` mode each step shows its caption, performs its `action` at `stepMs / 2`
+(`click` → `element.click()`; `hover` → pointerover/pointerenter/mouseover/mouseenter;
+`type` → sets the value of the target, or the first input/textarea inside it, and fires
+`input`), and advances at `stepMs` (default 2200). The promise resolves when the tour ends.
 
 ## 6. Update channels
 

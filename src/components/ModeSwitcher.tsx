@@ -3,6 +3,15 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { GitCompare, MessageSquare, SquareTerminal, Waypoints, type LucideIcon } from "lucide-react";
 import { MODES, MODE_LABELS, MODE_SHORTCUTS, type WorkspaceMode } from "../lib/modes";
 import { useAttentionStore } from "../stores/attentionStore";
+import { tourId } from "../lib/tour/ids";
+
+// `data-tour` ids for the segments (docs/WHATS-NEW.md §2).
+const MODE_TOUR: Record<WorkspaceMode, string> = {
+  talk: tourId("mode-talk"),
+  run: tourId("mode-run"),
+  review: tourId("mode-review"),
+  direct: tourId("mode-direct"),
+};
 
 /** One glyph per mode, because the words alone carry culture: "Run" reads as
  *  *execute something* to one developer and *where my shells are* to another.
@@ -73,6 +82,7 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
   return (
     <div
       ref={groupRef}
+      data-tour="mode-switcher"
       role="group"
       aria-label="Workspace mode"
       // A segmented-control shell: the group now sits in a band of its own
@@ -109,6 +119,7 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
               else btnRefs.current.delete(m);
             }}
             type="button"
+            data-tour={MODE_TOUR[m]}
             onClick={() => onChange(m)}
             aria-pressed={active}
             title={

@@ -59,6 +59,7 @@ import { useSyncPrefsStore } from "./stores/syncPrefsStore";
 import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
+import { WhatsNewHost } from "./components/WhatsNewHost";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
@@ -2056,6 +2057,7 @@ function App() {
           onSketch={handleSketch}
         />
         <ToastContainer />
+        <WhatsNewHost />
       </div>
     );
   }
@@ -2906,6 +2908,7 @@ function App() {
 
       <ToastContainer />
       <UpdateNotifier />
+      <WhatsNewHost />
       <UpgradeSheet />
       <HistorySheet />
       {/* Mounted only while open — the room subscribes to the whole runs
