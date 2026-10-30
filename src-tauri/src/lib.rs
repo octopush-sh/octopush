@@ -47,6 +47,8 @@ pub mod mcp_setup;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod claude_code_contract;
 
 use state::AppState;
 use tauri::Manager;

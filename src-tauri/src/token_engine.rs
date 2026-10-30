@@ -505,6 +505,16 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
 fn try_parse_claude_code_summary(session_id: &str, text: &str) -> Option<TokenEvent> {
     // Look for pattern like: "Total cost: $X.XX"
     // And optionally "Input: NNK" / "Output: NNK"
+    // Claude Code's TUI positions words with cursor moves (`ESC[<col>G`)
+    // rather than spaces, so the raw PTY bytes never contain the literal
+    // "Total cost:" — match against the text as the screen shows it.
+    let screen;
+    let text = if text.contains('\x1b') {
+        screen = screen_text(text);
+        screen.as_str()
+    } else {
+        text
+    };
     let cost_idx = text.find("Total cost:")?;
     let line = text[cost_idx..].lines().next()?;
 
@@ -524,6 +534,48 @@ fn try_parse_claude_code_summary(session_id: &str, text: &str) -> Option<TokenEv
         model: "unknown".to_string(),
         cost_usd: cost,
     })
+}
+
+/// PTY bytes → the text a terminal would show, roughly: CSI sequences are
+/// dropped, except horizontal cursor moves (`ESC[<n>G` absolute column,
+/// `ESC[<n>C` forward), which Claude Code's renderer uses between words and
+/// which become one space; OSC sequences (`ESC]…BEL` / `ESC]…ESC\\`) and other
+/// two-byte escapes are dropped.
+pub(crate) fn screen_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameter/intermediate bytes, then one final byte 0x40–0x7E.
+                for f in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&f) {
+                        if f == 'G' || f == 'C' {
+                            out.push(' ');
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(f) = chars.next() {
+                    if f == '\x07' {
+                        break;
+                    }
+                    if f == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn extract_json_object(s: &str) -> Option<&str> {
