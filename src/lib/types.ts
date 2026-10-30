@@ -496,6 +496,10 @@ export interface AppSettings {
   historySyncEnabled?: boolean;
   /** Cloud Library sync opt-in (default off). Owned by `set_sync_pref`. */
   librarySyncEnabled?: boolean;
+  /** Update channel. Owned by `set_update_channel` — carried through saves. */
+  updateChannel?: "stable" | "beta";
+  /** Version skipped in the launch alert. Owned by `set_skipped_update_version`. */
+  skippedUpdateVersion?: string | null;
   /** @deprecated use providerKeys.anthropic */
   anthropicApiKey?: string | null;
   /** @deprecated use providerKeys.openai */
