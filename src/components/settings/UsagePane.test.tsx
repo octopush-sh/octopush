@@ -217,6 +217,26 @@ describe("UsagePane", () => {
     expect(within(screen.getByTestId("usage-stat-cache")).getByText("—")).toBeInTheDocument();
     expect(screen.getByTestId("usage-pricing-stale").textContent).toMatch(/never been refreshed/);
   });
+
+  it("shows an unpriced model as unpriced, never $0.00", async () => {
+    getUsageReport.mockResolvedValue({
+      ...REPORT,
+      byModel: [
+        { model: "claude-opus-5", ...slice() },
+        { model: "claude-mythos-1", ...slice({ costUsd: 0, calls: 4 }), unpricedCalls: 4 },
+      ],
+      unpricedCalls: 4,
+    });
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    const models = await screen.findByTestId("usage-models");
+    const cell = within(models).getByTestId("usage-model-unpriced");
+    expect(cell.textContent).toBe("unpriced");
+    expect(cell.getAttribute("title")).toContain("claude-mythos-1");
+    const row = cell.closest("li")!;
+    expect(row.textContent).not.toContain("$0.00");
+  });
 });
 
 describe("UsagePane — gateway reconciliation", () => {

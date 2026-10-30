@@ -556,7 +556,7 @@ mod tests {
     }
 
     fn ledger_model(model: &str, cost: f64, calls: i64, tokens: i64) -> ModelUsage {
-        ModelUsage { model: model.into(), usage: UsageSlice::new(tokens, 0, 0, 0, cost, calls) }
+        ModelUsage { model: model.into(), usage: UsageSlice::new(tokens, 0, 0, 0, cost, calls), unpriced_calls: 0 }
     }
 
     #[test]

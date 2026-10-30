@@ -1658,7 +1658,14 @@ impl Db {
             provider_cost_usd: None,
             computed_cost_usd: Some(ev.cost_usd),
             cost_usd: ev.cost_usd,
-            cost_basis: "computed".into(),
+            // 'unpriced' when the model has no price (tokens at $0) — the
+            // Usage page flags it and savings leave it out.
+            cost_basis: crate::token_engine::ledger_cost_basis(
+                &ev.model,
+                ev.cost_usd,
+                (ev.input_tokens + ev.output_tokens + ev.cache_read_tokens + ev.cache_creation_tokens) as i64,
+            )
+            .into(),
             // No idempotency key: these are distinct billed calls (the PTY scanner
             // already deduped via its seq high-water before we get here).
             idempotency_key: None,
@@ -1941,12 +1948,14 @@ impl Db {
 
         let by_model = {
             let sql = format!(
-                "SELECT model, {slice_cols} FROM spend_events
+                "SELECT model, {slice_cols},
+                        COALESCE(SUM(CASE WHEN cost_basis = 'unpriced' THEN 1 ELSE 0 END), 0)
+                 FROM spend_events
                  WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
                  GROUP BY model ORDER BY 6 DESC LIMIT 30"
             );
             let map = |r: &rusqlite::Row| -> rusqlite::Result<ModelUsage> {
-                Ok(ModelUsage { model: r.get(0)?, usage: slice_of(r, 1)? })
+                Ok(ModelUsage { model: r.get(0)?, usage: slice_of(r, 1)?, unpriced_calls: r.get(7)? })
             };
             let mut stmt = self.conn.prepare(&sql)?;
             if surface.is_some() {
@@ -2096,16 +2105,16 @@ impl Db {
             }
         };
 
-        // Rows the ledger could not price (unknown model / $0 catalog) — the
-        // same set `reprice_unpriced` can price, so the notice and its
-        // "Price them now" agree; a subscription-covered or provider-reported
-        // $0 is a real price, not a gap.
+        // Rows the ledger could not price (unknown model / unpriced cloud
+        // catalog entry), marked `cost_basis = 'unpriced'` at record time or
+        // by `reprice_unpriced` (which also classifies legacy rows). A local
+        // model's $0, a subscription-covered or a provider-reported $0 is a
+        // real price, not a gap.
         let unpriced_calls: i64 = {
             let sql = format!(
                 "SELECT COUNT(*) FROM spend_events
                  WHERE ts_utc >= ?1 AND ts_utc <= ?2 {surface_and}
-                   AND cost_usd = 0 AND cost_basis IN ('computed', 'unpriced')
-                   AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0"
+                   AND cost_basis = 'unpriced'"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             if surface.is_some() {
@@ -3708,7 +3717,8 @@ impl Db {
     /// baseline the economy director is judged against.
     pub fn thread_cost(&self, thread_id: &str, strong: Option<&crate::token_engine::ModelPrices>) -> AppResult<ThreadCost> {
         let mut stmt = self.conn.prepare(
-            "SELECT origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd
+            "SELECT origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
+                    cost_basis, model
              FROM spend_events WHERE thread_id = ?1",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -3719,20 +3729,32 @@ impl Db {
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, f64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
         let mut out = ThreadCost::default();
         let (mut input, mut read, mut create) = (0i64, 0i64, 0i64);
         for row in rows {
-            let (origin, i, o, cr, cc, cost) = row?;
+            let (origin, i, o, cr, cc, cost, basis, model) = row?;
             out.calls += 1;
+            input += i;
+            read += cr;
+            create += cc;
+            if basis == "unpriced" {
+                // No price: its real cost is unknown, so it is neither spend
+                // nor saving — leave it out of the baseline (it would count
+                // as 100% saved) and name the model for the UI.
+                out.unpriced_calls += 1;
+                if !out.unpriced_models.contains(&model) {
+                    out.unpriced_models.push(model);
+                }
+                continue;
+            }
             out.spent_usd += cost;
             if origin.as_deref().is_some_and(|o| o.starts_with("subagent:")) {
                 out.subagents_usd += cost;
             }
-            input += i;
-            read += cr;
-            create += cc;
             if let Some(p) = strong {
                 out.baseline_usd += p.cost(i.max(0) as u64, o.max(0) as u64, cr.max(0) as u64, cc.max(0) as u64);
             }
@@ -3744,9 +3766,11 @@ impl Db {
     }
 
     /// Give a price to rows that were billed at $0 because their model was
-    /// unpriced at the time (`cost_basis = 'computed'`, tokens but no cost).
-    /// `price` resolves a model to its current prices; rows whose model is
-    /// still unpriced stay untouched. Returns rows updated.
+    /// unpriced at the time (`cost_basis = 'unpriced'`, or a legacy
+    /// `'computed'` row with tokens but no cost). `price` resolves a model to
+    /// its current prices; rows whose model is still unpriced are marked
+    /// `'unpriced'` and keep $0; an explicit $0 price (local model) leaves
+    /// the row `'computed'`. Returns rows that got a price.
     pub fn reprice_unpriced(
         &self,
         price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
@@ -3765,7 +3789,16 @@ impl Db {
             std::collections::HashMap::new();
         for (id, model, i, o, cr, cc) in rows {
             let prices = cache.entry(model.clone()).or_insert_with(|| price(&model));
-            let Some(p) = prices.as_ref() else { continue };
+            let Some(p) = prices.as_ref() else {
+                // Still no price: mark it unpriced (classifies rows recorded
+                // before the ledger told unknown from free) so the Usage
+                // notice counts it and savings leave it out.
+                self.conn.execute(
+                    "UPDATE spend_events SET cost_basis = 'unpriced' WHERE id = ?1 AND cost_basis <> 'unpriced'",
+                    params![id],
+                )?;
+                continue;
+            };
             let cost = p.cost(i.max(0) as u64, o.max(0) as u64, cr.max(0) as u64, cc.max(0) as u64);
             if cost <= 0.0 {
                 continue;
@@ -5482,6 +5515,11 @@ impl Db {
         };
         // Logbook: a stage that burned spend is active DIRECT work on the mission.
         let _ = self.record_activity(&workspace_id, "direct", "stage");
+        let cost_basis = crate::token_engine::ledger_cost_basis(
+            &model,
+            cost_usd,
+            input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
+        );
         self.insert_spend_event(&SpendEvent {
             ts_utc: ts_utc.to_string(),
             surface: "direct".into(),
@@ -5499,7 +5537,7 @@ impl Db {
             provider_cost_usd: None,
             computed_cost_usd: Some(cost_usd),
             cost_usd,
-            cost_basis: "computed".into(),
+            cost_basis: cost_basis.into(),
             idempotency_key: Some(format!("direct:{stage_id}:{ts_utc}")),
             thread_id: None,
             origin: None,
@@ -6228,6 +6266,10 @@ pub struct ThreadCost {
     pub strong_priced: bool,
     pub calls: i64,
     pub cache_hit_pct: Option<f64>,
+    /// Rows whose model had no price — excluded from `spent_usd` and
+    /// `baseline_usd` (so from the saving), counted and named here.
+    pub unpriced_calls: i64,
+    pub unpriced_models: Vec<String>,
 }
 
 // ─── Usage report types ────────────────────────────────────────────────
@@ -6302,6 +6344,9 @@ pub struct ModelUsage {
     pub model: String,
     #[serde(flatten)]
     pub usage: UsageSlice,
+    /// Rows of this model the ledger could not price (`cost_basis =
+    /// 'unpriced'`) — the UI shows "unpriced" rather than "$0.00".
+    pub unpriced_calls: i64,
 }
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq)]

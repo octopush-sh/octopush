@@ -125,8 +125,8 @@ mod db_tests {
     #[test]
     fn pricing_known_models() {
         let cost = compute_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
-        // $15 input + $7.50 output = $22.50
-        assert!((cost - 22.5).abs() < 0.01);
+        // Opus 4.6 is $5 in / $25 out: $5 input + $2.50 output = $7.50.
+        assert!((cost - 7.5).abs() < 0.01);
 
         let free = compute_cost("llama-3-local", 1_000_000, 1_000_000, 0, 0);
         assert_eq!(free, 0.0);
@@ -2715,9 +2715,9 @@ mod cost_tests {
 
     #[test]
     fn stage_cost_matches_token_engine() {
-        // claude-opus-4-6: $15/M input, $75/M output.
+        // claude-opus-4-6: $5/M input, $25/M output.
         let c = stage_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
-        assert!((c - (15.0 + 7.5)).abs() < 0.01);
+        assert!((c - (5.0 + 2.5)).abs() < 0.01);
     }
 
     #[test]
@@ -12107,5 +12107,235 @@ mod pty_locale_tests {
     fn with_utf8_locale_ignores_empty_process_values() {
         let out = with_utf8_locale_from(&caller(&[]), env(&[("LANG", ""), ("LC_ALL", " ")]));
         assert_eq!(out, caller(&[("LANG", UTF8_LOCALE)]));
+    }
+}
+
+#[cfg(test)]
+mod pricing_table_tests {
+    use crate::token_engine::{builtin_prices, ledger_cost_basis, prices_for, ModelPrices};
+
+    /// (input, cache write 5m, cache hit, output) per million, from
+    /// https://platform.claude.com/docs/en/about-claude/pricing (2026-10-29).
+    fn assert_prices(model: &str, input: f64, write: f64, hit: f64, output: f64) {
+        let p = builtin_prices(model).unwrap_or_else(|| panic!("{model} is unpriced"));
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            near(p.input_per_m, input)
+                && near(p.cache_creation_per_m, write)
+                && near(p.cache_read_per_m, hit)
+                && near(p.output_per_m, output),
+            "{model}: {p:?}"
+        );
+        assert!(p.cost(1, 1, 1, 1) > 0.0, "{model} priced to $0");
+    }
+
+    #[test]
+    fn current_models_are_priced_at_the_official_rates() {
+        assert_prices("claude-fable-5-1", 10.0, 12.50, 0.25, 50.0);
+        assert_prices("claude-opus-5-5", 4.0, 5.0, 0.20, 20.0);
+        assert_prices("claude-sonnet-5-5", 2.0, 2.50, 0.10, 10.0);
+        // Haiku 5.5: the <=100K-token prompt tier (see `builtin_prices`).
+        assert_prices("claude-haiku-5-5", 0.10, 0.125, 0.01, 0.50);
+        assert_prices("claude-fable-5", 10.0, 12.50, 1.0, 50.0);
+        assert_prices("claude-opus-5", 5.0, 6.25, 0.50, 25.0);
+    }
+
+    #[test]
+    fn corrected_prices_for_opus_4_6_and_sonnet_5() {
+        // Opus 4.6 was $15/$75 (Opus 4.1's tier); Sonnet 5 was $3/$15.
+        assert_prices("claude-opus-4-6", 5.0, 6.25, 0.50, 25.0);
+        assert_prices("claude-sonnet-5", 2.0, 2.50, 0.20, 10.0);
+    }
+
+    #[test]
+    fn older_models_keep_pricing_including_dated_ids() {
+        for m in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-5", "claude-opus-4-5-20251101"] {
+            assert_prices(m, 5.0, 6.25, 0.50, 25.0);
+        }
+        for m in ["claude-opus-4-1", "claude-opus-4-1-20250805", "claude-opus-4", "claude-opus-4-20250514"] {
+            assert_prices(m, 15.0, 18.75, 1.50, 75.0);
+        }
+        for m in ["claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929", "claude-sonnet-4", "claude-sonnet-4-20250514"] {
+            assert_prices(m, 3.0, 3.75, 0.30, 15.0);
+        }
+        assert_prices("claude-haiku-4-5", 1.0, 1.25, 0.10, 5.0);
+        assert_prices("claude-haiku-4-5-20251001", 1.0, 1.25, 0.10, 5.0);
+        assert_prices("claude-3-5-haiku-20241022", 0.80, 1.0, 0.08, 4.0);
+        assert!(builtin_prices("gpt-4o").is_some() && builtin_prices("gpt-4o-mini").is_some());
+    }
+
+    #[test]
+    fn new_ids_price_through_normalization() {
+        assert_prices("us.anthropic.claude-opus-5-5", 4.0, 5.0, 0.20, 20.0);
+        assert_prices("eu.anthropic.claude-sonnet-5-5", 2.0, 2.50, 0.10, 10.0);
+        assert_prices("anthropic.claude-haiku-5-5", 0.10, 0.125, 0.01, 0.50);
+        assert_prices("claude-fable-5-1[1m]", 10.0, 12.50, 0.25, 50.0);
+        assert_prices("claude-opus-5-5@20261001", 4.0, 5.0, 0.20, 20.0);
+        assert_prices("claude-sonnet-5-5-20261001", 2.0, 2.50, 0.10, 10.0);
+        assert_prices("apac.anthropic.claude-opus-5[1m]", 5.0, 6.25, 0.50, 25.0);
+    }
+
+    #[test]
+    fn unknown_models_are_unpriced_not_free() {
+        for m in ["claude-mythos-1", "totally-unknown-model-xyz", "claude-opus-9-9"] {
+            assert!(builtin_prices(m).is_none(), "{m}");
+            assert!(prices_for(m).is_none(), "{m}");
+        }
+        assert_eq!(ledger_cost_basis("claude-mythos-1", 0.0, 1_000), "unpriced");
+        // A $0 row with no tokens, or a row that carries a cost, is computed.
+        assert_eq!(ledger_cost_basis("claude-mythos-1", 0.0, 0), "computed");
+        assert_eq!(ledger_cost_basis("claude-mythos-1", 0.12, 1_000), "computed");
+    }
+
+    #[test]
+    fn local_models_stay_explicitly_free() {
+        // Ollama is a `local` catalog provider priced at $0: free, not unknown.
+        let p = prices_for("llama3.3").expect("local model is priced");
+        assert_eq!(p, ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 });
+        assert_eq!(ledger_cost_basis("llama3.3", 0.0, 1_000), "computed");
+    }
+
+    #[test]
+    fn builtin_catalog_matches_pricing_table() {
+        // Every builtin catalog model must price exactly like the table, so
+        // the catalog-first and table paths never disagree.
+        let providers = crate::provider_router::builtin_providers();
+        for name in ["anthropic", "openai"] {
+            for m in &providers[name].models {
+                let t = builtin_prices(&m.id).unwrap_or_else(|| panic!("{} missing from the table", m.id));
+                assert_eq!(t.input_per_m, m.input_cost_per_m, "{}", m.id);
+                assert_eq!(t.output_per_m, m.output_cost_per_m, "{}", m.id);
+                if m.cache_read_cost_per_m > 0.0 {
+                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{}", m.id);
+                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{}", m.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_builtin_prices_on_disk_are_corrected_but_edits_kept() {
+        use crate::provider_router::{builtin_providers, migrate_stale_builtin_prices};
+        let defaults = builtin_providers();
+        let mut list: Vec<_> = vec![defaults["anthropic"].clone()];
+        for m in &mut list[0].models {
+            match m.id.as_str() {
+                // Exactly the old shipped default → corrected.
+                "claude-opus-4-6" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (15.0, 75.0, 1.5, 18.75);
+                }
+                // A user edit → left alone.
+                "claude-sonnet-5" => {
+                    (m.input_cost_per_m, m.output_cost_per_m) = (2.2, 11.0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 1);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().clone();
+        assert_eq!((get("claude-opus-4-6").input_cost_per_m, get("claude-opus-4-6").output_cost_per_m), (5.0, 25.0));
+        assert_eq!(get("claude-opus-4-6").cache_read_cost_per_m, 0.50);
+        assert_eq!((get("claude-sonnet-5").input_cost_per_m, get("claude-sonnet-5").output_cost_per_m), (2.2, 11.0));
+    }
+}
+
+#[cfg(test)]
+mod unpriced_ledger_tests {
+    use crate::db::Db;
+    use crate::token_engine::{ModelPrices, TokenEngine, TokenEvent};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn ev(model: &str, input: u64, output: u64, cost: f64) -> TokenEvent {
+        TokenEvent {
+            id: None,
+            session_id: "ws-1".into(),
+            timestamp: "2026-10-29T10:00:00+00:00".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: model.into(),
+            cost_usd: cost,
+        }
+    }
+
+    #[test]
+    fn unpriced_usage_is_excluded_from_savings_and_flagged() {
+        let db = Arc::new(Mutex::new(test_db()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        engine.record_in_thread(ev("claude-sonnet-5-5", 1_000, 100, 0.0), "talk", Some("t-1"), Some("director")).unwrap();
+        // Unknown model: $0 and tokens → unpriced.
+        engine.record_in_thread(ev("claude-mythos-1", 50_000, 5_000, 0.0), "talk", Some("t-1"), Some("director")).unwrap();
+
+        let strong = ModelPrices { input_per_m: 4.0, output_per_m: 20.0, cache_read_per_m: 0.2, cache_creation_per_m: 5.0 };
+        let c = db.lock().thread_cost("t-1", Some(&strong)).unwrap();
+        assert_eq!(c.calls, 2);
+        assert_eq!(c.unpriced_calls, 1);
+        assert_eq!(c.unpriced_models, vec!["claude-mythos-1".to_string()]);
+        // Sonnet 5.5 is priced (not $0): $2/M in, $10/M out.
+        let sonnet = 1_000.0 * 2.0 / 1e6 + 100.0 * 10.0 / 1e6;
+        assert!((c.spent_usd - sonnet).abs() < 1e-12, "{}", c.spent_usd);
+        // Baseline covers the priced row only — the unpriced one would
+        // otherwise count as 100% saved.
+        let expected = strong.cost(1_000, 100, 0, 0);
+        assert!((c.baseline_usd - expected).abs() < 1e-12, "{} vs {expected}", c.baseline_usd);
+
+        let rep = db
+            .lock()
+            .usage_report("2026-10-01T00:00:00+00:00", "2026-10-31T23:59:59+00:00", None, 0)
+            .unwrap();
+        assert_eq!(rep.unpriced_calls, 1);
+        let mythos = rep.by_model.iter().find(|m| m.model == "claude-mythos-1").unwrap();
+        assert_eq!(mythos.unpriced_calls, 1);
+        let sonnet = rep.by_model.iter().find(|m| m.model == "claude-sonnet-5-5").unwrap();
+        assert_eq!(sonnet.unpriced_calls, 0);
+    }
+
+    #[test]
+    fn reprice_marks_legacy_zero_rows_unpriced_and_leaves_free_rows_alone() {
+        let db = test_db();
+        let mk = |model: &str, key: &str| crate::db::SpendEvent {
+            ts_utc: "2026-10-29T10:00:00+00:00".into(),
+            surface: "run".into(),
+            project_id: None,
+            workspace_id: None,
+            mission_id: None,
+            source_id: Some("s".into()),
+            attempt: 1,
+            model_raw: model.into(),
+            model: model.into(),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(0.0),
+            cost_usd: 0.0,
+            // Recorded before the ledger told unknown from free.
+            cost_basis: "computed".into(),
+            idempotency_key: Some(key.into()),
+            thread_id: None,
+            origin: None,
+        };
+        db.insert_spend_event(&mk("mystery", "a")).unwrap();
+        db.insert_spend_event(&mk("local-free", "b")).unwrap();
+        let price = |m: &str| -> Option<ModelPrices> {
+            (m == "local-free").then_some(ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 })
+        };
+        assert_eq!(db.reprice_unpriced(&price).unwrap(), 0);
+        let rep = db
+            .usage_report("2026-10-01T00:00:00+00:00", "2026-10-31T23:59:59+00:00", None, 0)
+            .unwrap();
+        assert_eq!(rep.unpriced_calls, 1);
+        assert_eq!(rep.by_model.iter().find(|m| m.model == "mystery").unwrap().unpriced_calls, 1);
+        assert_eq!(rep.by_model.iter().find(|m| m.model == "local-free").unwrap().unpriced_calls, 0);
     }
 }

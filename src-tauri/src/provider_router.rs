@@ -184,6 +184,10 @@ impl ProviderRouter {
                 }
             }
 
+            // Migration: correct builtin prices earlier releases shipped wrong
+            // (left untouched when the user has edited them).
+            migrate_stale_builtin_prices(&mut list, &defaults);
+
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
             // provider is absent, so a pre-existing "anthropic" block would
@@ -360,6 +364,47 @@ pub fn validate_providers(list: &[ProviderConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// Builtin prices earlier releases shipped wrong and wrote to users'
+/// `providers.json`: `(model id, [input, output, cache read, cache write])`
+/// per million tokens. On load, an on-disk model still carrying exactly one
+/// of these is reset to the current builtin price; any other value is a
+/// user edit (or a LiteLLM refresh) and is left alone.
+const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
+    // Opus 4.6 was priced like Opus 4.1 ($15/$75); it is $5/$25.
+    ("claude-opus-4-6", [15.0, 75.0, 1.5, 18.75]),
+    // Sonnet 5 was priced like Sonnet 4.6 ($3/$15); it is $2/$10.
+    ("claude-sonnet-5", [3.0, 15.0, 0.3, 3.75]),
+];
+
+/// Reset models whose on-disk price is a known-stale builtin default (see
+/// [`STALE_BUILTIN_PRICES`]) to the current builtin price. Returns how many
+/// models changed.
+pub(crate) fn migrate_stale_builtin_prices(
+    list: &mut [ProviderConfig],
+    defaults: &HashMap<String, ProviderConfig>,
+) -> usize {
+    let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let mut n = 0;
+    for p in list.iter_mut() {
+        let Some(def) = defaults.get(&p.name) else { continue };
+        for m in &mut p.models {
+            let Some((_, stale)) = STALE_BUILTIN_PRICES.iter().find(|(id, _)| *id == m.id) else { continue };
+            let on_disk = [m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m];
+            if !on_disk.iter().zip(stale.iter()).all(|(a, b)| same(*a, *b)) {
+                continue;
+            }
+            if let Some(d) = def.models.iter().find(|x| x.id == m.id) {
+                m.input_cost_per_m = d.input_cost_per_m;
+                m.output_cost_per_m = d.output_cost_per_m;
+                m.cache_read_cost_per_m = d.cache_read_cost_per_m;
+                m.cache_creation_cost_per_m = d.cache_creation_cost_per_m;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
     let mut map = HashMap::new();
 
@@ -397,10 +442,10 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 ModelInfo {
                     id: "claude-sonnet-5".into(),
                     display_name: "Claude Sonnet 5".into(),
-                    input_cost_per_m: 3.0,
-                    output_cost_per_m: 15.0,
-                    cache_read_cost_per_m: 3.0 * 0.10,    // $0.30 / M
-                    cache_creation_cost_per_m: 3.0 * 1.25, // $3.75 / M
+                    input_cost_per_m: 2.0,
+                    output_cost_per_m: 10.0,
+                    cache_read_cost_per_m: 0.20,
+                    cache_creation_cost_per_m: 2.50,
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -422,10 +467,10 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 ModelInfo {
                     id: "claude-opus-4-6".into(),
                     display_name: "Claude Opus 4.6".into(),
-                    input_cost_per_m: 15.0,
-                    output_cost_per_m: 75.0,
-                    cache_read_cost_per_m: 15.0 * 0.10,    // $1.50 / M
-                    cache_creation_cost_per_m: 15.0 * 1.25, // $18.75 / M
+                    input_cost_per_m: 5.0,
+                    output_cost_per_m: 25.0,
+                    cache_read_cost_per_m: 0.50,
+                    cache_creation_cost_per_m: 6.25,
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,

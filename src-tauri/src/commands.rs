@@ -2483,6 +2483,10 @@ pub async fn estimate_run_cost(
     let reference = crate::orchestrator::cost::pick_reference_model();
     let mut cost = 0.0;
     let mut baseline = 0.0;
+    // Stage models with no price: their cost is unknown, so the estimate
+    // leaves them out of both sides (never "free", never "saved") and names
+    // them for the UI.
+    let mut unpriced_models: Vec<String> = Vec::new();
     for s in &stages {
         // Token estimates come from the role's definition in the DB; fall back to
         // (4000, 1000) when the role is absent (custom/deleted roles).
@@ -2495,6 +2499,12 @@ pub async fn estimate_run_cost(
             .find(|(pos, _)| *pos == s.position)
             .map(|(_, m)| m.as_str())
             .unwrap_or(s.agent_model.as_str());
+        if !crate::token_engine::is_priced(model) {
+            if !unpriced_models.iter().any(|m| m == model) {
+                unpriced_models.push(model.to_string());
+            }
+            continue;
+        }
         cost += crate::orchestrator::cost::stage_cost(model, tok_in, tok_out, 0, 0);
         if let Some(ref_model) = &reference {
             baseline += crate::orchestrator::cost::baseline_cost(ref_model, tok_in, tok_out);
@@ -2503,7 +2513,7 @@ pub async fn estimate_run_cost(
     if reference.is_none() || baseline < cost {
         baseline = cost;
     }
-    Ok(serde_json::json!({ "estimateUsd": cost, "baselineUsd": baseline }))
+    Ok(serde_json::json!({ "estimateUsd": cost, "baselineUsd": baseline, "unpricedModels": unpriced_models }))
 }
 
 // ─── File operations ──────────────────────────────────────────────
@@ -3631,8 +3641,8 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
 }
 
 /// Price every ledger row recorded at $0 with the catalog as it stands
-/// now. Rows whose model is still unpriced stay at $0.
-fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
+/// now. Rows whose model is still unpriced stay at $0, marked unpriced.
+pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
     db.lock().reprice_unpriced(&crate::token_engine::prices_for)
 }
 

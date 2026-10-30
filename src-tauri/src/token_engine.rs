@@ -115,58 +115,72 @@ pub fn normalize_model_id(model: &str) -> String {
     m.to_string()
 }
 
-/// Per-million-token pricing. Returns $/token (i.e. already divided by 1M).
+/// Builtin per-million-token prices for a normalized model id, or `None` when
+/// the id is not in the table.
 ///
-/// Interim catalog (Phase 0): kept in sync with the ProviderRouter builtin
-/// catalog so both pricing paths agree until Phase 1 unifies them. Cache prices
-/// follow Anthropic's standard economics — cache-read ≈ 0.1× input, cache-write
-/// (5-minute TTL) ≈ 1.25× input. Older ids are retained so historical events
-/// still re-price correctly.
+/// Source: Anthropic's official pricing page
+/// (<https://platform.claude.com/docs/en/about-claude/pricing>, fetched
+/// 2026-10-29). Columns are input / 5-minute cache write / cache hit / output.
+/// Every ProviderRouter builtin catalog model must appear here at the same
+/// price (asserted by `builtin_catalog_matches_pricing_table` in `tests.rs`);
+/// this table additionally carries current models the catalog does not list
+/// and older ids, so historical events still re-price correctly.
+///
+/// A model that is not here (and not in the catalog) is *unpriced* — callers
+/// get `None` from [`prices_for`] and must not treat it as free. Explicitly
+/// free local models (Ollama) are priced at $0 by the catalog, not here.
+pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
+    // (input, cache write 5m, cache hit, output) — USD per million tokens.
+    let (input, cache_write, cache_hit, output) = match normalize_model_id(model).as_str() {
+        // Claude Fable
+        "claude-fable-5-1" => (10.0, 12.50, 0.25, 50.0),
+        "claude-fable-5" => (10.0, 12.50, 1.0, 50.0),
+        // Claude Opus
+        "claude-opus-5-5" => (4.0, 5.0, 0.20, 20.0),
+        "claude-opus-5" => (5.0, 6.25, 0.50, 25.0),
+        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" | "claude-opus-4-5" => {
+            (5.0, 6.25, 0.50, 25.0)
+        }
+        "claude-opus-4-1" | "claude-opus-4" => (15.0, 18.75, 1.50, 75.0),
+        // Claude Sonnet
+        "claude-sonnet-5-5" => (2.0, 2.50, 0.10, 10.0),
+        "claude-sonnet-5" => (2.0, 2.50, 0.20, 10.0),
+        "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4" => (3.0, 3.75, 0.30, 15.0),
+        // Claude Haiku
+        //
+        // Haiku 5.5 is tiered per request: prompts over 100,000 tokens (input
+        // + cache reads + cache writes) cost 0.50 / 0.625 / 0.05 / 2.50. The
+        // cost paths here price aggregated usage (a DIRECT stage, a Talk
+        // turn, a re-priced ledger row) as well as single requests, so the
+        // per-request prompt size is not reliably known — we price the
+        // <=100K tier. Long-prompt Haiku 5.5 requests are under-counted.
+        "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
+        "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
+        "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
+        // OpenAI
+        "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
+        "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
+        // Anything else is unknown — unpriced, not free.
+        _ => return None,
+    };
+    Some(ModelPrices {
+        input_per_m: input,
+        output_per_m: output,
+        cache_read_per_m: cache_hit,
+        cache_creation_per_m: cache_write,
+    })
+}
+
+/// Builtin price of one token type, in $/token (already divided by 1M).
+/// Returns `0.0` for a model the builtin table does not know — callers that
+/// must tell "unknown" from "free" use [`builtin_prices`] / [`prices_for`].
 pub fn cost_per_token(model: &str, tt: TokenType) -> f64 {
-    let model = normalize_model_id(model);
-    let per_m = match (model.as_str(), tt) {
-        // Claude Fable 5
-        ("claude-fable-5", TokenType::Input) => 10.0,
-        ("claude-fable-5", TokenType::Output) => 50.0,
-        ("claude-fable-5", TokenType::CacheRead) => 1.0,
-        ("claude-fable-5", TokenType::CacheCreation) => 12.5,
-        // Claude Opus 4.8 / 4.7 (same price tier)
-        ("claude-opus-4-8", TokenType::Input) | ("claude-opus-4-7", TokenType::Input) => 5.0,
-        ("claude-opus-4-8", TokenType::Output) | ("claude-opus-4-7", TokenType::Output) => 25.0,
-        ("claude-opus-4-8", TokenType::CacheRead) | ("claude-opus-4-7", TokenType::CacheRead) => 0.5,
-        ("claude-opus-4-8", TokenType::CacheCreation) | ("claude-opus-4-7", TokenType::CacheCreation) => 6.25,
-        // Claude Opus 4.6 (legacy)
-        ("claude-opus-4-6", TokenType::Input) => 15.0,
-        ("claude-opus-4-6", TokenType::Output) => 75.0,
-        ("claude-opus-4-6", TokenType::CacheRead) => 1.5,
-        ("claude-opus-4-6", TokenType::CacheCreation) => 18.75,
-        // Claude Sonnet 5 (standard sticker; intro discount not modeled)
-        ("claude-sonnet-5", TokenType::Input) => 3.0,
-        ("claude-sonnet-5", TokenType::Output) => 15.0,
-        ("claude-sonnet-5", TokenType::CacheRead) => 0.3,
-        ("claude-sonnet-5", TokenType::CacheCreation) => 3.75,
-        // Claude Sonnet 4.6 (legacy)
-        ("claude-sonnet-4-6", TokenType::Input) => 3.0,
-        ("claude-sonnet-4-6", TokenType::Output) => 15.0,
-        ("claude-sonnet-4-6", TokenType::CacheRead) => 0.3,
-        ("claude-sonnet-4-6", TokenType::CacheCreation) => 3.75,
-        // Claude Haiku 4.5
-        ("claude-haiku-4-5", TokenType::Input) => 1.0,
-        ("claude-haiku-4-5", TokenType::Output) => 5.0,
-        ("claude-haiku-4-5", TokenType::CacheRead) => 0.10,
-        ("claude-haiku-4-5", TokenType::CacheCreation) => 1.25,
-        // GPT-4o
-        ("gpt-4o", TokenType::Input) => 2.50,
-        ("gpt-4o", TokenType::Output) => 10.0,
-        ("gpt-4o", TokenType::CacheRead) => 1.25,
-        ("gpt-4o", TokenType::CacheCreation) => 2.50,
-        // GPT-4o-mini
-        ("gpt-4o-mini", TokenType::Input) => 0.15,
-        ("gpt-4o-mini", TokenType::Output) => 0.60,
-        ("gpt-4o-mini", TokenType::CacheRead) => 0.075,
-        ("gpt-4o-mini", TokenType::CacheCreation) => 0.15,
-        // Unknown / local models — free
-        (_, _) => 0.0,
+    let Some(p) = builtin_prices(model) else { return 0.0 };
+    let per_m = match tt {
+        TokenType::Input => p.input_per_m,
+        TokenType::Output => p.output_per_m,
+        TokenType::CacheRead => p.cache_read_per_m,
+        TokenType::CacheCreation => p.cache_creation_per_m,
     };
     per_m / 1_000_000.0
 }
@@ -244,33 +258,47 @@ impl ModelPrices {
 }
 
 /// Resolve a model's prices, catalog-first. `None` means the model is unknown
-/// to both the ProviderRouter catalog and the builtin table (so its spend is
-/// genuinely unpriced — distinct from a known local model priced at $0, which
-/// the catalog returns as `Some(zeros)`).
+/// to both the ProviderRouter catalog and the builtin table (or the catalog
+/// lists it on a cloud provider with no price) — its spend is genuinely
+/// unpriced, distinct from a local model priced at $0, which the catalog
+/// returns as `Some(zeros)`.
 pub fn prices_for(model: &str) -> Option<ModelPrices> {
     if let Ok(router) = crate::provider_router::ProviderRouter::load() {
-        if let Some((_, mi)) = router.find_model(model) {
-            return Some(ModelPrices {
+        if let Some((provider, mi)) = router.find_model(model) {
+            let p = ModelPrices {
                 input_per_m: mi.input_cost_per_m,
                 output_per_m: mi.output_cost_per_m,
                 cache_read_per_m: mi.cache_read_cost_per_m,
                 cache_creation_per_m: mi.cache_creation_cost_per_m,
-            });
+            };
+            // A local provider's $0 is an explicit price (free). A cloud
+            // catalog entry with no price at all is a gap, not a gift: fall
+            // through to the builtin table, then to unpriced.
+            if provider.local || p.input_per_m > 0.0 || p.output_per_m > 0.0 {
+                return Some(p);
+            }
         }
     }
-    // Hardcoded fallback: a positive input price is the "known" discriminator
-    // (every builtin entry is nonzero; unknown/local ids fall through to $0).
-    let norm = normalize_model_id(model);
-    let input_per_m = cost_per_token(&norm, TokenType::Input) * 1_000_000.0;
-    if input_per_m > 0.0 {
-        return Some(ModelPrices {
-            input_per_m,
-            output_per_m: cost_per_token(&norm, TokenType::Output) * 1_000_000.0,
-            cache_read_per_m: cost_per_token(&norm, TokenType::CacheRead) * 1_000_000.0,
-            cache_creation_per_m: cost_per_token(&norm, TokenType::CacheCreation) * 1_000_000.0,
-        });
+    // Builtin table fallback; `None` here means genuinely unknown.
+    builtin_prices(model)
+}
+
+/// Whether a model resolves to a price (catalog or builtin table). A local
+/// catalog model priced at $0 is priced — explicitly free, not unknown.
+pub fn is_priced(model: &str) -> bool {
+    prices_for(model).is_some()
+}
+
+/// The ledger `cost_basis` for a computed spend row: `'unpriced'` when the
+/// row carries tokens, came out at $0 and its model has no price — so the
+/// Usage page can flag it and savings can leave it out — else `'computed'`.
+/// Only consults the catalog in the (rare) $0-with-tokens case.
+pub fn ledger_cost_basis(model: &str, cost_usd: f64, tokens: i64) -> &'static str {
+    if cost_usd == 0.0 && tokens > 0 && !is_priced(model) {
+        "unpriced"
+    } else {
+        "computed"
     }
-    None
 }
 
 /// Canonical cost for a usage tuple, via [`prices_for`]. An unpriced model

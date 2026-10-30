@@ -511,12 +511,15 @@ impl TranscriptIngestor {
         db.execute_batch("SAVEPOINT cc_ingest")?;
         let result = (|| -> AppResult<()> {
             for u in entries {
-                let cost = prices
+                let priced = prices
                     .entry(u.model.clone())
                     .or_insert_with(|| prices_for(&u.model))
                     .as_ref()
-                    .map(|p| p.cost(u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens))
-                    .unwrap_or(0.0);
+                    .map(|p| p.cost(u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens));
+                let cost = priced.unwrap_or(0.0);
+                // An unknown model is unpriced, not free.
+                let tokens = u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_creation_tokens;
+                let cost_basis = if priced.is_none() && tokens > 0 { "unpriced" } else { "computed" };
                 let live = chrono::DateTime::parse_from_rfc3339(&u.ts_utc)
                     .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().abs() <= LIVE_WINDOW_SECS)
                     .unwrap_or(false);
@@ -543,7 +546,7 @@ impl TranscriptIngestor {
                     provider_cost_usd: None,
                     computed_cost_usd: Some(cost),
                     cost_usd: cost,
-                    cost_basis: "computed".into(),
+                    cost_basis: cost_basis.into(),
                     idempotency_key: Some(u.key.clone()),
                     thread_id: None,
                     origin: None,

@@ -1248,7 +1248,7 @@ export const ipc = {
     invoke<StageIteration[]>("list_stage_iterations", { stageId }),
 
   estimateRunCost: (pipelineId: string, stageOverrides?: [number, string][]) =>
-    invoke<{ estimateUsd: number; baselineUsd: number }>("estimate_run_cost", {
+    invoke<{ estimateUsd: number; baselineUsd: number; unpricedModels?: string[] }>("estimate_run_cost", {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
