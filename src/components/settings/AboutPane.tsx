@@ -176,12 +176,12 @@ export function AboutPane() {
           <li>
             ·{" "}
             <a
-              href="https://github.com/johnatan-velez/octopush"
+              href="https://github.com/octopush-sh/octopush"
               target="_blank"
               rel="noopener"
               className="text-octo-brass underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
             >
-              github.com/johnatan-velez/octopush
+              github.com/octopush-sh/octopush
             </a>
           </li>
           <li>· Last checked for updates: <span className="font-mono text-octo-ivory">{lastChecked}</span></li>

@@ -89,9 +89,11 @@ pub enum DownloadEvent {
     Finished,
 }
 
-/// The update found by the last check, kept for `updater_install`.
+/// The update found by the last check, with the channel it came from, kept
+/// for `updater_install`. Cleared whenever the channel changes, so a late
+/// result from the previous channel can never be installed.
 #[derive(Default)]
-pub struct PendingUpdate(pub Mutex<Option<tauri_plugin_updater::Update>>);
+pub struct PendingUpdate(pub Mutex<Option<(UpdateChannel, tauri_plugin_updater::Update)>>);
 
 /// `pub_date` read straight from the manifest (avoids a date-format dep).
 pub fn manifest_date(raw: &serde_json::Value) -> Option<String> {

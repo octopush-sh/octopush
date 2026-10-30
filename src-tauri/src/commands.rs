@@ -3850,10 +3850,14 @@ pub async fn get_update_channel() -> AppResult<String> {
 
 /// Persist the update channel. Only writer of `updateChannel`.
 #[tauri::command]
-pub async fn set_update_channel(channel: String) -> AppResult<String> {
+pub async fn set_update_channel(
+    channel: String,
+    pending: State<'_, crate::updater::PendingUpdate>,
+) -> AppResult<String> {
     let parsed = crate::updater::UpdateChannel::parse(&channel)
         .ok_or_else(|| AppError::Other(format!("unknown update channel: {channel}")))?;
     crate::settings::set_update_channel(parsed)?;
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = None;
     Ok(parsed.as_str().to_string())
 }
 
@@ -3899,7 +3903,12 @@ pub async fn updater_check(
         body: u.body.clone(),
         channel,
     });
-    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = found;
+    // The channel may have changed while the check was in flight: drop a
+    // result that no longer matches, so it can't be shown or installed.
+    if crate::settings::update_channel() != channel {
+        return Ok(None);
+    }
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = found.map(|u| (channel, u));
     Ok(info)
 }
 
@@ -3917,6 +3926,10 @@ pub async fn updater_install(
         .map_err(|e| AppError::Other(e.to_string()))?
         .clone()
         .ok_or_else(|| AppError::Other("No update to install — check again".into()))?;
+    let (found_on, update) = update;
+    if found_on != crate::settings::update_channel() {
+        return Err(AppError::Other("The update channel changed — check again".into()));
+    }
     let mut started = false;
     let progress = on_event.clone();
     update

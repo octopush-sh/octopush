@@ -174,3 +174,52 @@ describe("updaterStore — launch alert", () => {
     expect(useUpdaterStore.getState().alertPending).toBe(false);
   });
 });
+
+describe("updaterStore — races between checks and channel changes", () => {
+  it("a beta check that finishes after switching to stable is ignored", async () => {
+    useUpdaterStore.setState({ channel: "beta" });
+    let resolveBeta!: (u: UpdateInfo) => void;
+    ipcMock.updaterCheck.mockImplementationOnce(() => new Promise((r) => { resolveBeta = r; }));
+    const betaCheck = useUpdaterStore.getState().checkForUpdates(false);
+    ipcMock.updaterCheck.mockResolvedValueOnce(null); // stable: nothing newer
+    await useUpdaterStore.getState().setChannel("stable");
+    resolveBeta({ ...UPDATE, version: "1.5.0-beta", channel: "beta" });
+    await betaCheck;
+    const s = useUpdaterStore.getState();
+    expect(s.channel).toBe("stable");
+    expect(s.update).toBeNull();
+    expect(s.phase).toBe("no-update");
+  });
+
+  it("concurrent checks share one IPC call", async () => {
+    const a = useUpdaterStore.getState().checkForUpdates(false);
+    const b = useUpdaterStore.getState().checkForUpdates(true);
+    await Promise.all([a, b]);
+    expect(ipcMock.updaterCheck).toHaveBeenCalledTimes(1);
+  });
+
+  it("the launch check alerts even when another check was already running", async () => {
+    const running = useUpdaterStore.getState().checkForUpdates(false);
+    await useUpdaterStore.getState().launchCheck();
+    await running;
+    const s = useUpdaterStore.getState();
+    expect(s.alertOpen || s.alertPending).toBe(true);
+  });
+
+  it("a skipped version stays quiet on background checks after a channel switch", async () => {
+    useUpdaterStore.setState({ skippedVersion: "1.4.0", channel: "beta" });
+    await useUpdaterStore.getState().setChannel("stable");
+    expect(useUpdaterStore.getState().update?.version).toBe("1.4.0");
+    expect(useUpdaterStore.getState().dismissed).toBe(true);
+  });
+
+  it("a slow prefs read does not undo a channel the user just chose", async () => {
+    let resolveRead!: (c: string) => void;
+    ipcMock.getUpdateChannel.mockImplementationOnce(() => new Promise((r) => { resolveRead = r; }));
+    const load = useUpdaterStore.getState().loadPrefs();
+    await useUpdaterStore.getState().setChannel("beta");
+    resolveRead("stable");
+    await load;
+    expect(useUpdaterStore.getState().channel).toBe("beta");
+  });
+});

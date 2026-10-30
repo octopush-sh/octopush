@@ -1,5 +1,4 @@
 import { defineConfig } from "vite";
-import { configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
@@ -38,8 +37,9 @@ export default defineConfig(async () => ({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
-    // scripts/*.test.mjs are `node --test` suites (node:test), not Vitest.
-    exclude: [...configDefaults.exclude, "scripts/**/*.test.mjs"],
+    // scripts/**/*.test.mjs are `node --test` suites (CI runs them in repo-rules);
+    // Vitest can't load node:test, so keep its scope to the app.
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 
   // Vite options tailored for Tauri development

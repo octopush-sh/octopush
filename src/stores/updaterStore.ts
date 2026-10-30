@@ -91,6 +91,14 @@ interface UpdaterState {
   skipVersion: () => Promise<void>;
 }
 
+/** Bumped when the channel changes: a check started under an older
+ *  generation finishes into the void instead of overwriting newer state. */
+let checkGeneration = 0;
+/** The running check, so concurrent callers share it instead of racing. */
+let inflight: Promise<void> | null = null;
+/** Bumped by every local prefs change, so a slower disk read can't undo it. */
+let prefsEpoch = 0;
+
 export const useUpdaterStore = create<UpdaterState>((set, get) => ({
   phase: "idle",
   update: null,
@@ -104,15 +112,13 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
   alertPending: false,
   alertOpen: false,
 
-  checkForUpdates: async (interactive) => {
-    // Avoid stacked checks if the user mashes the button.
-    if (
-      get().phase === "checking" ||
-      get().phase === "downloading" ||
-      get().phase === "installing"
-    ) {
-      return;
-    }
+  checkForUpdates: (interactive) => {
+    // Never check while installing; share a check that is already running
+    // (button mashing, the About mount check and the launch check overlap).
+    if (get().phase === "downloading" || get().phase === "installing") return Promise.resolve();
+    if (inflight) return inflight;
+    const gen = checkGeneration;
+    const run = (async () => {
     set({ phase: "checking", error: null });
     // Best-effort version lookup; harmless if it fails.
     if (!get().currentVersion) {
@@ -122,19 +128,25 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
     }
     try {
       const result = await ipc.updaterCheck();
+      if (gen !== checkGeneration) return; // the channel changed meanwhile
       const now = Date.now();
-      if (result) {
+      if (result && result.channel !== get().channel) {
+        set({ phase: "no-update", update: null, lastCheckedAt: now });
+      } else if (result) {
         const isNew = get().update?.version !== result.version;
+        // A skipped version stays quiet unless the user asked to check.
+        const skipped = !interactive && result.version === get().skippedVersion;
         set({
           phase: "available",
           update: result,
-          dismissed: isNew ? false : get().dismissed,
+          dismissed: isNew ? skipped : get().dismissed,
           lastCheckedAt: now,
         });
       } else {
         set({ phase: "no-update", update: null, lastCheckedAt: now });
       }
     } catch (e) {
+      if (gen !== checkGeneration) return;
       if (interactive) {
         set({ phase: "error", error: String(e) });
       } else {
@@ -143,6 +155,11 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
         set({ phase: "idle", error: null });
       }
     }
+    })().finally(() => {
+      if (inflight === run) inflight = null;
+    });
+    inflight = run;
+    return run;
   },
 
   installAndRelaunch: async () => {
@@ -180,21 +197,27 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
   dismiss: () => set({ dismissed: true }),
 
   loadPrefs: async () => {
+    const epoch = prefsEpoch;
     const [channel, skippedVersion] = await Promise.all([
       ipc.getUpdateChannel().catch(() => "stable" as UpdateChannel),
       ipc.getSkippedUpdateVersion().catch(() => null),
     ]);
+    if (epoch !== prefsEpoch) return; // changed locally while reading
     set({ channel: channel === "beta" ? "beta" : "stable", skippedVersion });
   },
 
   setChannel: async (channel) => {
     if (get().channel === channel) return;
     const previous = get().channel;
+    prefsEpoch++;
+    // Results of checks against the old channel are now stale.
+    checkGeneration++;
+    inflight = null;
     set({ channel });
     try {
       await ipc.setUpdateChannel(channel);
     } catch (e) {
-      set({ channel: previous, phase: "error", error: String(e) });
+      set({ channel: previous, phase: "error", error: String(e), update: null });
       return;
     }
     const busy = get().phase === "downloading" || get().phase === "installing";
@@ -238,6 +261,7 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
 
   skipVersion: async () => {
     const version = get().update?.version ?? null;
+    prefsEpoch++;
     set({ alertOpen: false, alertPending: false, dismissed: true, skippedVersion: version });
     try {
       await ipc.setSkippedUpdateVersion(version);

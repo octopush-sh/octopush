@@ -24,7 +24,7 @@ import { Download, X, Loader2, ExternalLink } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { ipc } from "../lib/ipc";
 
-const RELEASES_URL = "https://github.com/johnatan-velez/octopush/releases/tag";
+const RELEASES_URL = "https://github.com/octopush-sh/octopush/releases/tag";
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Let the window settle before the launch check. */
@@ -188,7 +188,7 @@ export function UpdateNotifier() {
             ? "Installing…"
             : phase === "downloading"
               ? "Downloading…"
-              : "Install & restart"}
+              : "Install and relaunch"}
         </button>
       </div>
     </div>
