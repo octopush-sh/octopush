@@ -78,3 +78,5 @@ jobs:
           node-version: 22
       - name: AGENTS.md mirrors CLAUDE.md
         run: node scripts/check-agents-md.mjs
+      - name: routine scripts parse
+        run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
