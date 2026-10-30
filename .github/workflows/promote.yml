@@ -1,0 +1,135 @@
+# Octopush — promote a beta release to stable.
+#
+# Every tag is published as a GitHub prerelease on the beta channel
+# (release.yml → scripts/release.mjs --channel beta). Running this workflow
+# turns v<version> into the latest full release, which makes it the stable
+# updater manifest (releases/latest/download/latest.json) and the
+# octopush.sh/download DMG. Owner-only: VISION.md §8, docs/RELEASING.md.
+#
+#   gh workflow run promote.yml -f version=0.4.90
+#
+# (The daily digest's `promote <version>` answer dispatches exactly this.)
+#
+# OWNER-ONLY, ENFORCED: the job runs in the `stable` environment, which must
+# require the owner's approval (repo → Settings → Environments → stable →
+# Required reviewers: the owner; and the repo variable OCTOPUSH_OWNER_LOGIN set
+# to the owner's login). The first step refuses to run unless that protection
+# is in place, so a dispatch by a bot or collaborator waits for the owner's
+# click — and fails closed if the environment was never protected.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Beta version to promote to stable (X.Y.Z, e.g. 0.4.90)'
+        required: true
+
+permissions:
+  contents: write # edit the release (prerelease → latest)
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: stable
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      VERSION: ${{ github.event.inputs.version }}
+      OWNER: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+    steps:
+      - name: Owner gate — the stable environment must require the owner
+        run: |
+          set -euo pipefail
+          if [ -z "$OWNER" ]; then
+            echo "::error::repo variable OCTOPUSH_OWNER_LOGIN is not set — refusing to promote"; exit 1
+          fi
+          # Public repo: the environment's protection rules are readable.
+          reviewers="$(gh api "repos/$REPO/environments/stable" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")')"
+          case " ${reviewers,,} " in
+            *" ${OWNER,,} "*) echo "stable environment requires $OWNER's approval ✓" ;;
+            *) echo "::error::environment 'stable' must list $OWNER as a required reviewer (got: '${reviewers:-none}')"; exit 1 ;;
+          esac
+
+      - name: Validate the version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z (got '$VERSION')"; exit 1
+          fi
+
+      - name: Verify the version is a complete beta
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          if ! rel="$(gh api "repos/$REPO/releases/tags/$TAG")"; then
+            echo "::error::release $TAG does not exist"; exit 1
+          fi
+          if [ "$(jq -r .draft <<<"$rel")" = "true" ]; then
+            echo "::error::$TAG is a draft"; exit 1
+          fi
+          if [ "$(jq -r .prerelease <<<"$rel")" != "true" ]; then
+            echo "::error::$TAG is not a prerelease (already promoted, or not a beta)"; exit 1
+          fi
+          missing=0
+          for a in Octopush.dmg "Octopush_${VERSION}_universal.dmg" Octopush.app.tar.gz Octopush.app.tar.gz.sig latest.json; do
+            if jq -e --arg a "$a" '[.assets[] | select(.name == $a and .state == "uploaded" and .size > 0)] | length > 0' <<<"$rel" >/dev/null; then
+              echo "  asset ok: $a"
+            else
+              echo "::error::$TAG is missing asset $a"; missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          # The manifest must describe this version, or stable users would be
+          # offered something else.
+          gh release download "$TAG" --repo "$REPO" --pattern latest.json --output latest.json
+          mv="$(jq -r .version latest.json)"
+          if [ "$mv" != "$VERSION" ]; then
+            echo "::error::$TAG/latest.json reports version '$mv', expected $VERSION"; exit 1
+          fi
+
+      - name: Refuse to go backwards
+        run: |
+          set -euo pipefail
+          # Only a 404 means "no stable yet"; any other error must not skip the check.
+          code="$(gh api -i "repos/$REPO/releases/latest" 2>/dev/null | head -n1 | awk '{print $2}' || true)"
+          if [ "$code" = "404" ]; then
+            echo "no stable release yet"
+          elif stable="$(gh api "repos/$REPO/releases/latest" --jq .tag_name)"; then
+            stable="${stable#v}"
+            echo "current stable: $stable"
+            if [ "$stable" = "$VERSION" ]; then
+              echo "::error::$VERSION is already the stable release"; exit 1
+            fi
+            newest="$(printf '%s\n%s\n' "$stable" "$VERSION" | sort -V | tail -n 1)"
+            if [ "$newest" != "$VERSION" ]; then
+              echo "::error::v$VERSION is older than the current stable v$stable — refusing to promote"; exit 1
+            fi
+          else
+            echo "::error::could not read the current stable release (HTTP ${code:-?})"; exit 1
+          fi
+
+      - name: Promote
+        run: gh release edit "v$VERSION" --repo "$REPO" --prerelease=false --latest
+
+      - name: Confirm the stable manifest
+        run: |
+          set -euo pipefail
+          url="https://github.com/$REPO/releases/latest/download/latest.json"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            got="$(curl -fsSL "$url" | jq -r .version 2>/dev/null || true)"
+            if [ "$got" = "$VERSION" ]; then
+              echo "stable manifest now reports $got ✓"
+              echo "Promoted **v$VERSION** to stable: $url" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $i: stable manifest reports '${got:-unreadable}', waiting…"
+            sleep 15
+          done
+          echo "::error::releases/latest/download/latest.json still does not report $VERSION"
+          exit 1
