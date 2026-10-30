@@ -13,6 +13,10 @@ to `scripts/routines/`), `gh` authenticated, Node via nvm or Homebrew. The scrip
 `~/.local/bin`, Homebrew and nvm to `PATH` themselves, because Octopush runs fire conditions
 with the minimal GUI `PATH` (see #247). State lives in `~/.local/state/octopush-routines/`.
 
+**Exit codes:** a condition exits 0 to fire and 1 when there is nothing to do; 2 means the
+check itself failed (e.g. `gh` not authenticated). Octopush currently shows both 1 and 2 as
+"condition not met" (#247), so if a routine never fires, run its condition by hand.
+
 **Testing a routine:** use *Run now* in Settings → Routines — it goes through the same fire
 condition and reports whether it dispatched or skipped, and why. To run a condition by hand:
 `env -i HOME="$HOME" PATH=/usr/bin:/bin bash scripts/routines/<script>.sh check; echo $?`.
@@ -29,7 +33,7 @@ new release before it reaches users' machines.
 
 | Field | Value |
 |---|---|
-| Project · workspace | `octopush` · **Fixed** → the main workspace |
+| Project · workspace | `octopush` · **Fresh** (its own worktree, so a fix PR never touches your checkout) |
 | Schedule | Custom → Every day → Once at **09:40** |
 | Fire only if… | `bash scripts/routines/claude-code-release.sh check` |
 | Pipeline | one stage, Sonnet, CLI substrate (needs shell + `gh`) |
@@ -40,16 +44,18 @@ Brief:
 ```text
 Claude Code release watch. Read VISION.md §6 and §8 first.
 1. Run `bash scripts/routines/claude-code-release.sh show`. VERSION = its "latest on npm" value.
+   If it prints "NO CHANGELOG SECTION", stop now without acking (it retries tomorrow).
 2. For every changelog entry, decide whether it can affect a fragile surface in VISION.md §6
    (stream-json events, transcript JSONL, --resume, `claude mcp add`, skills/agents frontmatter,
    the `Total cost:` line, CLI flags Octopush passes). Open the source files to check — don't guess.
-3. If src-tauri/tests/fixtures/claude-code/ exists and `claude --version` is VERSION, run
-   `bash scripts/record-claude-fixtures.sh`, then `cd src-tauri && cargo test claude_code_contract`.
-   Record the results.
+3. If scripts/record-claude-fixtures.sh exists, OCTOPUSH_FIXTURE_ANTHROPIC_KEY is set and
+   `claude --version` is VERSION, run `bash scripts/record-claude-fixtures.sh`, then
+   `cd src-tauri && cargo test claude_code_contract`, and record the results. Otherwise say in the
+   issue that fixtures were not re-recorded. Never read or write ~/.claude yourself.
 4. Open ONE issue labelled `claude-code-update`, titled
    "Claude Code VERSION: impact none | review | breaking", with the relevant changelog lines, a
    verdict per surface (with file paths), the test results and a proposed fix. If a fix is needed
-   and small, also open a PR from branch agent/claude-code-VERSION whose body starts with
+   and small, commit it on this workspace's branch and open a PR whose body starts with
    "Closes #<issue>". Never merge.
 5. Only after the issue exists, run `bash scripts/routines/claude-code-release.sh ack VERSION`.
 ```
@@ -73,11 +79,13 @@ Backlog → PR. Read VISION.md (especially §8) and CLAUDE.md first.
 1. Run `bash scripts/routines/backlog.sh next` to get the issue (number, title, url), then read it
    fully with `gh issue view <number> --comments`.
 2. If it touches a human-only area in VISION.md §8 and has no `agent-ok` label, or it is too
-   ambiguous to implement safely: comment your plan and questions on the issue and stop.
+   ambiguous to implement safely: comment your plan and questions on the issue, then park it with
+   `gh issue edit <number> --remove-label ready --add-label needs-owner`, and stop. (Parking is
+   what keeps the routine from picking the same issue again tomorrow.)
 3. Otherwise implement it on this workspace's branch with tests; update docs/FEATURES.md if it is
    user-facing; run `npm run typecheck`, `npm test`, and `cd src-tauri && cargo test` for Rust.
-4. Push and open a PR whose body starts with "Closes #<number>" and explains the change and its
-   tests. Wait for CI (`gh pr checks <pr> --watch`) and fix until it is green.
+4. Push and open a PR whose body starts with "Closes #<number>" (exactly — the routine uses it to
+   know the issue is taken) and explains the change and its tests. Wait for CI (`gh pr checks <pr> --watch`) and fix until it is green.
 5. Comment the PR link on the issue. Never merge, never deploy, never work on another issue.
 ```
 
@@ -88,8 +96,8 @@ ones are safe and fixes the small breakages.
 
 | Field | Value |
 |---|---|
-| Project · workspace | `octopush` · **Fixed** → the main workspace |
-| Schedule | Custom → Days of week: Mon → Once at **15:20** |
+| Project · workspace | `octopush` · **Fixed** → the main workspace (comment-only: it never switches branches) |
+| Schedule | Custom → Weekdays → Once at **15:20** (fires only when a PR has finished CI and isn't triaged yet) |
 | Fire only if… | `bash scripts/routines/deps.sh check` |
 | Pipeline | one stage, Sonnet, CLI substrate |
 | Budget | $2 |
@@ -97,17 +105,20 @@ ones are safe and fixes the small breakages.
 Brief:
 
 ```text
-Weekly dependency triage. Read VISION.md §8 first.
-1. Run `bash scripts/routines/deps.sh list`: every open Dependabot PR in octopush, octopush-api and
-   octopush-web, with its CI state.
-2. CI success: read the release notes for the bumped range (linked in the PR body) and comment on
-   the PR either "Safe to merge: <one line why>" or "Needs owner review: <why>" (majors, breaking
-   changes, anything touching Tauri, the updater, signing, auth or payments).
-3. CI failure: read the failing check's annotations
-   (`gh api repos/<owner>/<repo>/check-runs/<id>/annotations`). For PRs in THIS repo, if the fix
-   only adapts our code to the new version and is small, push a commit to the Dependabot branch;
-   otherwise, and for the other repos, comment the diagnosis.
-4. Never merge or close PRs. Finish with a short summary of what you commented or pushed.
+Dependency triage. Read VISION.md §8 first. You only comment: never check out, switch or push
+branches, never merge or close PRs (a push to a Dependabot branch would stop Dependabot from
+rebasing it).
+1. Run `bash scripts/routines/deps.sh list`: the Dependabot PRs in octopush, octopush-api and
+   octopush-web whose CI has finished and that haven't been triaged on their current commit.
+2. For each, comment once on the PR, ending the comment with `<!-- octopush-triage:<head-sha> -->`
+   (the sha is the third column; the marker is how the routine knows it's done):
+   - CI success: read the release notes for the bumped range (linked in the PR body) and say
+     "Safe to merge: <one line why>" or "Needs owner review: <why>" (majors, breaking changes,
+     anything touching Tauri, the updater, signing, auth or payments).
+   - CI failure: read the failing check's annotations
+     (`gh api repos/<owner>/<repo>/check-runs/<id>/annotations`) and explain the cause and the
+     smallest code change that would fix it.
+3. Finish with a one-line summary per PR.
 ```
 
 ## 4. Weekly report — Fridays

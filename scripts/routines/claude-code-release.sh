@@ -46,7 +46,14 @@ case "${1:-}" in
     echo "installed here:  $(claude --version 2>/dev/null || echo 'not installed')"
     echo
     echo "---- upstream CHANGELOG ($v back to $p) ----"
-    changelog | section_between "$v" "$p" | head -n 400 || echo "(changelog unavailable — read https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)"
+    notes="$(changelog | section_between "$v" "$p" | head -n 400 || true)"
+    if [[ -z "$notes" ]]; then
+      # npm can publish before the changelog has a section: never let that look
+      # like "nothing changed".
+      echo "NO CHANGELOG SECTION FOR $v YET — do not ack; the routine retries tomorrow."
+    else
+      echo "$notes"
+    fi
     ;;
   ack)
     [[ -n "${2:-}" ]] || die "usage: ack <version>"

@@ -5,8 +5,11 @@
 # Octopush (like any macOS GUI app / launchd job) runs fire conditions with a
 # minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin): add gh/claude (~/.local/bin,
 # Homebrew) and nvm's node/npm — same fix as octopush-web#10.
-NVM_BIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -n 1 || true)"
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${NVM_BIN:+:$NVM_BIN}:$PATH"
+# (OCTOPUSH_ROUTINES_KEEP_PATH=1 skips this — used by tests with stubbed tools.)
+if [[ "${OCTOPUSH_ROUTINES_KEEP_PATH:-0}" != 1 ]]; then
+  NVM_BIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -n 1 || true)"
+  export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${NVM_BIN:+:$NVM_BIN}:$PATH"
+fi
 
 ROUTINES_STATE_DIR="${OCTOPUSH_ROUTINES_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/octopush-routines}"
 DEPLOY_STATE_DIR="${OCTOPUSH_DEPLOY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/octopush-deploy}"

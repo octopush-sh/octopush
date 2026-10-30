@@ -3,7 +3,8 @@
 # docs/ROUTINES.md.
 #
 #   check   exit 0 when this repo has an open issue labelled `ready` that no open
-#           PR already claims ("Closes/Fixes/Resolves #N"); else 1; errors: 2
+#           PR already claims ("Closes/Fixes/Resolves #N") and that isn't parked
+#           with `needs-owner` or `proposal`; else 1; errors: 2
 #   next    print the oldest such issue: number<TAB>title<TAB>url
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -15,10 +16,11 @@ candidates() {
   # Issue numbers referenced by a closing keyword in any open PR's title or body.
   claimed="$(gh api "repos/$REPO/pulls?state=open&per_page=100" --jq '
     [.[] | ((.title // "") + "\n" + (.body // ""))
-     | scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#([0-9]+)") | .[0]] | unique | join(" ")')" \
+     | scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+#([0-9]+)") | .[0]] | unique | join(" ")')" \
     || die "could not list PRs for $REPO"
   gh api "repos/$REPO/issues?labels=ready&state=open&sort=created&direction=asc&per_page=100" --jq "
     [.[] | select(.pull_request == null)
+         | select([.labels[].name] | index(\"needs-owner\") == null and index(\"proposal\") == null)
          | .number as \$n
          | select((\" $claimed \" | contains(\" \(\$n) \")) | not)]
     | .[] | \"\(.number)\t\(.title)\t\(.html_url)\"" \
