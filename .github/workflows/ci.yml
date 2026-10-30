@@ -43,6 +43,11 @@ jobs:
       # tauri::generate_context! expects build.frontendDist (../dist) to exist;
       # the Rust tests don't need the real bundle.
       - run: mkdir -p dist && touch dist/index.html
+      # The PTY/talk-shell tests spawn the real octopush-pty-server daemon, and
+      # build.rs only stages empty placeholders until the sidecars are built.
+      - name: build sidecar binaries
+        working-directory: src-tauri
+        run: cargo build --locked --bins
       - name: cargo test
         working-directory: src-tauri
         shell: bash
