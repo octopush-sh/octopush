@@ -45,7 +45,17 @@ jobs:
       - run: mkdir -p dist && touch dist/index.html
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --locked
+        shell: bash
+        # Failures are also surfaced as an annotation: agents read CI through the
+        # API (annotations), not through raw log downloads.
+        run: |
+          set -o pipefail
+          if ! cargo test --locked 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"; then
+            summary="$(grep -E '^(error(\[E[0-9]+\])?:|test .* \.\.\. FAILED|thread .* panicked|failures:|    [a-z_:]+$|  --> |assertion|^  left|^ right|^called `Result::unwrap\(\)`)' "$RUNNER_TEMP/cargo-test.log" | head -n 80)"
+            summary="${summary//'%'/'%25'}"
+            echo "::error title=cargo test failed::${summary//$'\n'/'%0A'}"
+            exit 1
+          fi
       - name: cargo clippy
         working-directory: src-tauri
         # Warnings are reported, not fatal, until the existing ones are cleaned up.
