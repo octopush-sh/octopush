@@ -59,6 +59,7 @@ import {
   bumpVersionFiles,
   channelCreateArgs,
   ciPublishDecision,
+  pendingChangesets,
   parseChannel,
   releaseBody,
   shouldRefreshBetaManifest,
@@ -163,6 +164,16 @@ if (!CI) {
   const ref = process.env.GITHUB_REF_NAME;
   if (process.env.GITHUB_REF_TYPE === "tag" && ref && ref !== `v${newVersion}`) {
     die(`Tag ${ref} does not match tauri.conf.json version v${newVersion} — refusing to publish.`);
+  }
+  // Changesets still in unreleased/ with no whats-new/<version>/ means the
+  // notes were never collected: the release would ship without its tips, and
+  // the in-app What's new would skip them for good.
+  const pending = pendingChangesets(join(REPO, "whats-new"));
+  if (pending.length && !existsSync(join(REPO, "whats-new", newVersion))) {
+    die(
+      `whats-new/unreleased/ has ${pending.length} changeset(s) but whats-new/${newVersion}/ doesn't exist — ` +
+        `run \`node scripts/whats-new.mjs collect ${newVersion}\` and commit it before tagging.`,
+    );
   }
 }
 

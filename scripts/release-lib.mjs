@@ -5,7 +5,7 @@
 // CLI (used by the nightly beta routine to bump versions exactly like a manual
 // release commit does — one line per file, formatting untouched):
 //   node scripts/release-lib.mjs bump <version> [<repo-root>]
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -47,6 +47,13 @@ export function ciPublishDecision(ci, existing, channel) {
   if (!ci || !existing) return "create";
   if (!existing.draft && !existing.prerelease) return "refuse";
   return channel === "beta" ? "reupload" : "refuse";
+}
+
+/** Changeset files waiting in `<whatsNewDir>/unreleased/` (README excluded). */
+export function pendingChangesets(whatsNewDir) {
+  const dir = join(whatsNewDir, "unreleased");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => f.endsWith(".md") && f.toLowerCase() !== "readme.md");
 }
 
 /** -1 / 0 / 1 for X.Y.Z strings (a leading "v" is ignored). */

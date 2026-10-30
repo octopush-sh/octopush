@@ -176,7 +176,7 @@ test("run: collect → bump → PR → wait → merge → tag, then nothing left
   // The release commit (on the PR branch, merged into main) has notes + bump.
   const files = git(fx.origin, "show", "--name-only", "--format=%s%n%b", "main^2");
   assert.match(files, /^chore: release v0\.4\.90/);
-  assert.match(files, /Co-Authored-By: Claude Opus 5\.5/);
+  assert.doesNotMatch(files, /Co-Authored-By/, "no trailers unless OCTOPUSH_RELEASE_TRAILERS is set");
   assert.match(files, /whats-new\/0\.4\.90\/notes\.md/);
   assert.match(files, /whats-new\/0\.4\.90\/a-nicer-thing\.md/);
   for (const f of ["package.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json"]) {

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ciPublishDecision,
+  pendingChangesets,
   NOTES_MAX,
   NOTES_SUFFIX,
   buildManifest,
@@ -102,4 +103,17 @@ test("CI re-runs only re-upload into a beta, never over a stable release", () =>
   assert.equal(ciPublishDecision(true, { draft: false, prerelease: true }, "beta"), "reupload");
   assert.equal(ciPublishDecision(true, { draft: false, prerelease: false }, "beta"), "refuse");
   assert.equal(ciPublishDecision(true, { draft: false, prerelease: true }, "stable"), "refuse");
+});
+
+test("pending changesets ignore the README", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = mkdtempSync(join(tmpdir(), "wn-"));
+  assert.deepEqual(pendingChangesets(root), []);
+  mkdirSync(join(root, "unreleased"));
+  writeFileSync(join(root, "unreleased", "README.md"), "x");
+  assert.deepEqual(pendingChangesets(root), []);
+  writeFileSync(join(root, "unreleased", "a-thing.md"), "x");
+  assert.deepEqual(pendingChangesets(root), ["a-thing.md"]);
 });
