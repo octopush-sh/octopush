@@ -1,5 +1,10 @@
 import { create } from "zustand";
 import { ipc, type SyncedRun, type SyncedRunDetail } from "../lib/ipc";
+import { useSyncPrefsStore } from "./syncPrefsStore";
+
+/** History sync is opt-in (off by default). With it off this store never
+ *  touches the network — the sheet shows a "turned off" state instead. */
+const historySyncOn = () => useSyncPrefsStore.getState().historySync;
 
 /** Cross-machine run history (Pro-real Part B). Holds the read-only mirror of
  *  the signed-in Pro user's Direct-run history synced from the cloud (B1), the
@@ -8,7 +13,8 @@ import { ipc, type SyncedRun, type SyncedRunDetail } from "../lib/ipc";
  *
  *  The Pro-vs-upgrade decision lives at the trigger (the top-bar button) — this
  *  store is only opened once the user is entitled, so its network calls never hit
- *  the upgrade path in the normal flow. */
+ *  the upgrade path in the normal flow. Every network call is additionally
+ *  skipped while the user's history-sync opt-in is off. */
 interface HistoryState {
   open: boolean;
   runs: SyncedRun[];
@@ -65,6 +71,10 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   close: () => set({ open: false, viewedRunId: null, detailError: null }),
 
   refresh: async () => {
+    if (!historySyncOn()) {
+      set({ loading: false, error: null });
+      return;
+    }
     set({ loading: true, error: null });
     try {
       const runs = await ipc.historySyncPull();
@@ -75,6 +85,7 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   },
 
   syncOnLaunch: async () => {
+    if (!historySyncOn()) return;
     try {
       await ipc.historySyncPushAll();
       const runs = await ipc.historySyncPull();
@@ -87,6 +98,10 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   openRun: async (runId) => {
     set({ viewedRunId: runId, detailError: null });
     if (runId in get().detailByRun) return; // cached (incl. a cached "none")
+    if (!historySyncOn()) {
+      set({ detailError: "History sync is off." });
+      return;
+    }
     set({ detailLoading: runId });
     try {
       const detail = await ipc.historyRunDetail(runId);

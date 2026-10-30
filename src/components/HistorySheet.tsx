@@ -1,5 +1,6 @@
 import { RefreshCw, X, Laptop, ChevronLeft } from "lucide-react";
 import { useHistoryStore } from "../stores/historyStore";
+import { useSyncPrefsStore } from "../stores/syncPrefsStore";
 import { runStatusMeta, stageStatusWord } from "../lib/runStatus";
 import { formatRelTime } from "../lib/relTime";
 import { labelForRole } from "../lib/stageMeta";
@@ -27,6 +28,7 @@ export function HistorySheet() {
   const close = useHistoryStore((s) => s.close);
   const closeRun = useHistoryStore((s) => s.closeRun);
   const refresh = useHistoryStore((s) => s.refresh);
+  const syncOn = useSyncPrefsStore((s) => s.historySync);
 
   if (!open) return null;
 
@@ -62,9 +64,9 @@ export function HistorySheet() {
               <button
                 type="button"
                 onClick={() => void refresh()}
-                disabled={loading}
+                disabled={loading || !syncOn}
                 aria-label="Refresh history"
-                title="Refresh from the cloud"
+                title={syncOn ? "Refresh from the cloud" : "History sync is off"}
                 className="rounded p-1.5 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass disabled:opacity-50"
               >
                 <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
@@ -89,15 +91,39 @@ export function HistorySheet() {
         )}
 
         <FadeSwap swapKey={viewedRun ? viewedRun.run_id : "list"} className="min-h-0 flex-1 overflow-y-auto">
-          {viewedRun ? <RunDetailView run={viewedRun} /> : <RunList runs={runs} loading={loading} error={error} />}
+          {viewedRun ? (
+            <RunDetailView run={viewedRun} />
+          ) : (
+            <RunList runs={runs} loading={loading} error={error} syncOn={syncOn} />
+          )}
         </FadeSwap>
       </div>
     </ModalShell>
   );
 }
 
-function RunList({ runs, loading, error }: { runs: SyncedRun[]; loading: boolean; error: string | null }) {
+function RunList({
+  runs,
+  loading,
+  error,
+  syncOn,
+}: {
+  runs: SyncedRun[];
+  loading: boolean;
+  error: string | null;
+  syncOn: boolean;
+}) {
   const openRun = useHistoryStore((s) => s.openRun);
+  if (!syncOn) {
+    return (
+      <div className="px-6 py-12 text-center" data-testid="history-sync-off">
+        <p className="text-[13px] text-octo-sage">History sync is off.</p>
+        <p className="mt-1.5 text-[12px] text-octo-mute">
+          Turn it on in Settings › Account to see your runs from every Mac.
+        </p>
+      </div>
+    );
+  }
   if (runs.length === 0) {
     return (
       <div className="px-6 py-12 text-center">

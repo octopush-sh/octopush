@@ -12109,3 +12109,114 @@ mod pty_locale_tests {
         assert_eq!(out, caller(&[("LANG", UTF8_LOCALE)]));
     }
 }
+
+// ── Cloud sync is opt-in (off by default) ─────────────────────────────
+#[cfg(test)]
+mod sync_opt_in_tests {
+    use crate::settings::{test_sync_override, AppSettings, SyncPrefs};
+    use crate::sync::{PushOutcome, SyncKind};
+
+    fn off_both() {
+        test_sync_override::set(SyncKind::History, Some(false));
+        test_sync_override::set(SyncKind::Library, Some(false));
+    }
+
+    fn a_run() -> crate::sync::SyncRun {
+        crate::sync::SyncRun {
+            run_id: "r1".into(),
+            machine_id: "m1".into(),
+            machine_name: None,
+            workspace_name: None,
+            task: "t".into(),
+            status: "completed".into(),
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            stages: vec![],
+        }
+    }
+
+    #[test]
+    fn both_syncs_default_off_for_new_and_existing_settings() {
+        assert_eq!(AppSettings::default().sync_prefs(), SyncPrefs::default());
+        assert_eq!(
+            SyncPrefs::default(),
+            SyncPrefs { history_sync: false, library_sync: false }
+        );
+        let empty: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!empty.history_sync_enabled && !empty.library_sync_enabled);
+        // A settings.json written before the opt-in existed (an existing Pro
+        // user's) must come back OFF — sync never turns itself on.
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"providerKeys":{"anthropic":"sk-x"},"editorCommand":"code","modelTiers":{}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.sync_opted_in(SyncKind::History));
+        assert!(!legacy.sync_opted_in(SyncKind::Library));
+    }
+
+    #[test]
+    fn opt_in_round_trips_through_settings_json() {
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in(SyncKind::History, true);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""historySyncEnabled":true"#), "{json}");
+        assert!(json.contains(r#""librarySyncEnabled":false"#), "{json}");
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sync_prefs(), SyncPrefs { history_sync: true, library_sync: false });
+        // The IPC shape is camelCase.
+        let wire = serde_json::to_value(back.sync_prefs()).unwrap();
+        assert_eq!(wire["historySync"], true);
+        assert_eq!(wire["librarySync"], false);
+    }
+
+    #[test]
+    fn sync_kind_parses_and_maps_to_its_pro_feature() {
+        assert_eq!(SyncKind::parse("history"), Some(SyncKind::History));
+        assert_eq!(SyncKind::parse("library"), Some(SyncKind::Library));
+        assert_eq!(SyncKind::parse("everything"), None);
+        assert_eq!(SyncKind::History.feature(), crate::entitlement::feature::HISTORY_SYNC);
+        assert_eq!(SyncKind::Library.feature(), crate::entitlement::feature::LIBRARY_SYNC);
+    }
+
+    #[test]
+    fn gate_is_closed_when_off_and_kinds_are_independent() {
+        off_both();
+        assert!(!crate::sync::opted_in(SyncKind::History));
+        assert!(!crate::sync::sync_active(SyncKind::History));
+        assert!(!crate::sync::sync_active(SyncKind::Library));
+        test_sync_override::set(SyncKind::History, Some(true));
+        assert!(crate::sync::opted_in(SyncKind::History));
+        assert!(!crate::sync::opted_in(SyncKind::Library));
+    }
+
+    #[tokio::test]
+    async fn history_network_calls_short_circuit_when_off() {
+        off_both();
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run()]).await, PushOutcome::Disabled);
+        let detail = crate::sync::SyncRunDetail { run_id: "r1".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::Disabled);
+        let pulled = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(pulled.contains("History sync is off"), "{pulled}");
+        let fetched = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(fetched.contains("History sync is off"), "{fetched}");
+    }
+
+    #[tokio::test]
+    async fn library_network_calls_short_circuit_when_off() {
+        off_both();
+        // History ON must not open the library gate.
+        test_sync_override::set(SyncKind::History, Some(true));
+        let client = reqwest::Client::new();
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(
+            crate::sync::push_library_items(&client, vec![item]).await,
+            PushOutcome::Disabled
+        );
+        let pulled = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(pulled.contains("Library sync is off"), "{pulled}");
+    }
+}

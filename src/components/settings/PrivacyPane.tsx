@@ -1,5 +1,18 @@
-// Settings → Privacy — a read-only statement of what stays local and what leaves.
+// Settings → Privacy — a read-only statement of what stays local and what
+// leaves. Every line here must stay EXACTLY true: when a feature adds a new
+// outbound destination, add it to OUTBOUND in the same change (the website
+// quotes this copy).
 import { PaneHeader } from "./shared";
+
+/** Every place this app sends traffic. Exported for the copy test. */
+export const OUTBOUND: readonly string[] = [
+  "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models.",
+  "Clerk for sign-in and Dodo Payments for checkout, when you use your account.",
+  "Octopush's sync service, only if you turn on sync in Account.",
+  "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes.",
+  "Update checks — octopush.sh/update/latest.json and GitHub releases.",
+  "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
+];
 
 export function PrivacyPane() {
   return (
@@ -7,13 +20,34 @@ export function PrivacyPane() {
       <PaneHeader
         eyebrow="Privacy"
         title="What stays, what leaves."
-        subtitle="Octopush stores all chat history, API keys, and tokens locally. Provider API requests go directly to Anthropic/OpenAI from this machine."
+        subtitle="Your work stays on this Mac. Requests to AI providers go straight from this machine to the provider, never through Octopush."
       />
 
       <ul className="max-w-[640px] space-y-2 text-[13px] leading-[1.6] text-octo-sage">
-        <li>· <span className="font-serif text-octo-ivory">Local-only data:</span> projects, workspaces, chat messages, tool executions, token usage. Stored in <span className="font-mono text-octo-brass">~/Library/Application Support/octopush/octopush.db</span>.</li>
-        <li>· <span className="font-serif text-octo-ivory">API keys:</span> stored in <span className="font-mono text-octo-brass">~/.octopush/settings.json</span>.</li>
-        <li>· <span className="font-serif text-octo-ivory">Outbound traffic:</span> only to providers you configure (Anthropic, OpenAI). No analytics, no telemetry.</li>
+        <li>
+          · <span className="font-serif text-octo-ivory">Stored on this Mac:</span> projects,
+          workspaces, chats, tool executions, Direct runs, token usage — in{" "}
+          <span className="font-mono text-octo-brass">
+            ~/Library/Application Support/octopush/octopush.db
+          </span>
+          . Runs and custom pipelines leave it only if you turn on sync.
+        </li>
+        <li>
+          · <span className="font-serif text-octo-ivory">API keys:</span> stored in{" "}
+          <span className="font-mono text-octo-brass">~/.octopush/settings.json</span>. Your
+          account session lives in the macOS Keychain.
+        </li>
+        <li>
+          · <span className="font-serif text-octo-ivory">Outbound traffic, only to:</span>
+          <ul className="mt-1 space-y-1 pl-4" data-testid="privacy-outbound">
+            {OUTBOUND.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </li>
+        <li>
+          · <span className="font-serif text-octo-ivory">No analytics, no telemetry.</span>
+        </li>
       </ul>
     </>
   );

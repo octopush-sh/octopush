@@ -44,16 +44,26 @@ export function ToggleRow({
   checked,
   onChange,
   testId,
+  disabled = false,
+  title,
 }: {
   label: string;
   description?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   testId?: string;
+  /** Not actionable right now (e.g. a Pro-only setting on Free) — dimmed,
+   *  the switch ignores clicks; pair with `title` to say why. */
+  disabled?: boolean;
+  title?: string;
 }) {
   return (
     <label
-      className="flex cursor-pointer items-start justify-between gap-4 rounded-lg px-4 py-3"
+      title={title}
+      aria-disabled={disabled || undefined}
+      className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[180ms] ${
+        disabled ? "cursor-default opacity-55" : "cursor-pointer"
+      }`}
       style={{
         border: "1px solid var(--color-octo-hairline)",
         background: "var(--color-octo-panel)",
@@ -69,7 +79,7 @@ export function ToggleRow({
           </div>
         )}
       </div>
-      <Switch checked={checked} onChange={onChange} testId={testId} />
+      <Switch checked={checked} onChange={onChange} testId={testId} disabled={disabled} />
     </label>
   );
 }
@@ -82,11 +92,13 @@ export function Switch({
   onChange,
   testId,
   ariaLabel,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   testId?: string;
   ariaLabel?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -95,8 +107,9 @@ export function Switch({
       aria-checked={checked}
       aria-label={ariaLabel}
       data-testid={testId}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors"
+      className="relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors disabled:cursor-default"
       style={{
         background: checked ? "var(--brass-ghost)" : "var(--color-octo-onyx)",
         border: `1px solid ${checked ? "var(--brass-dim)" : "var(--color-octo-border-strong)"}`,

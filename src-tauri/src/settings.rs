@@ -63,6 +63,19 @@ pub struct AppSettings {
     #[serde(default)]
     pub model_tiers: HashMap<String, String>,
 
+    /// Opt-in: replicate finished Direct runs — metadata AND detail (per-stage
+    /// journals, artifact texts, capped diff snapshots) — to Octopush's sync
+    /// service so they appear on the user's other Macs. **Off by default**,
+    /// including for every settings file written before this field existed
+    /// (`serde(default)` ⇒ `false`). Pro-only on top (`history.sync`).
+    #[serde(default)]
+    pub history_sync_enabled: bool,
+
+    /// Opt-in: replicate custom pipelines & roles via Library sync. **Off by
+    /// default** (same rule as above). Pro-only on top (`library.sync`).
+    #[serde(default)]
+    pub library_sync_enabled: bool,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -105,6 +118,80 @@ pub fn save_settings(settings: &AppSettings) -> AppResult<()> {
     }
     std::fs::write(path, serde_json::to_string_pretty(settings)?)?;
     Ok(())
+}
+
+/// The two cloud-sync opt-ins as one value — the wire shape of
+/// `get_sync_prefs` / `set_sync_pref`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPrefs {
+    pub history_sync: bool,
+    pub library_sync: bool,
+}
+
+impl AppSettings {
+    pub fn sync_prefs(&self) -> SyncPrefs {
+        SyncPrefs {
+            history_sync: self.history_sync_enabled,
+            library_sync: self.library_sync_enabled,
+        }
+    }
+
+    pub fn sync_opted_in(&self, kind: crate::sync::SyncKind) -> bool {
+        match kind {
+            crate::sync::SyncKind::History => self.history_sync_enabled,
+            crate::sync::SyncKind::Library => self.library_sync_enabled,
+        }
+    }
+
+    pub fn set_sync_opted_in(&mut self, kind: crate::sync::SyncKind, enabled: bool) {
+        match kind {
+            crate::sync::SyncKind::History => self.history_sync_enabled = enabled,
+            crate::sync::SyncKind::Library => self.library_sync_enabled = enabled,
+        }
+    }
+}
+
+/// Has the user opted in to this kind of cloud sync? Reads `settings.json`
+/// fresh each call (a toggle takes effect on the very next push/pull). Any
+/// read/parse failure answers **no** — sync never turns itself on.
+pub fn sync_opted_in(kind: crate::sync::SyncKind) -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_sync_override::get(kind) {
+        return v;
+    }
+    load_settings().map(|s| s.sync_opted_in(kind)).unwrap_or(false)
+}
+
+/// Persist one sync opt-in (read-modify-write) and return the new pair.
+pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
+    let mut settings = load_settings()?;
+    settings.set_sync_opted_in(kind, enabled);
+    save_settings(&settings)?;
+    Ok(settings.sync_prefs())
+}
+
+/// Test-only, per-thread override of [`sync_opted_in`] so gating tests never
+/// read (or depend on) the developer's real `~/.octopush/settings.json`.
+#[cfg(test)]
+pub mod test_sync_override {
+    use std::cell::Cell;
+    thread_local! {
+        static HISTORY: Cell<Option<bool>> = const { Cell::new(None) };
+        static LIBRARY: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub fn get(kind: crate::sync::SyncKind) -> Option<bool> {
+        match kind {
+            crate::sync::SyncKind::History => HISTORY.with(|c| c.get()),
+            crate::sync::SyncKind::Library => LIBRARY.with(|c| c.get()),
+        }
+    }
+    pub fn set(kind: crate::sync::SyncKind, v: Option<bool>) {
+        match kind {
+            crate::sync::SyncKind::History => HISTORY.with(|c| c.set(v)),
+            crate::sync::SyncKind::Library => LIBRARY.with(|c| c.set(v)),
+        }
+    }
 }
 
 /// Get the API key for a named provider (settings file first, then well-known env vars).

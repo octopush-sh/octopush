@@ -1661,9 +1661,7 @@ pub async fn save_pipeline(
     let saved_id = state.db.lock().save_pipeline(pipeline_id, &name, &description, &stages)?;
     // Library sync (Pro): fire-and-forget the edited item to the cloud so it
     // follows the user to their other machines. Never affects the save.
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         // Best-effort from here: the save already COMMITTED — a bookkeeping
         // read failure must never turn a successful save into an error.
         let item = {
@@ -1692,9 +1690,7 @@ pub async fn delete_pipeline(
     state.db.lock().delete_pipeline(&pipeline_id)?;
     // Tombstone so the deletion follows the user (an edit made LATER on
     // another machine revives the item — newest intent wins).
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         let item = crate::sync::SyncLibraryItem::tombstone("pipeline", &pipeline_id);
         tokio::spawn(async move {
             let client = crate::chat_engine::shared_http_client();
@@ -1937,8 +1933,40 @@ fn require_feature_gate(feature: &str) -> AppResult<()> {
     }
 }
 
+/// Gate for a sync pull/fetch: Pro first (so a Free user still gets the
+/// upgrade sheet), then the user's opt-in — off ⇒ an error and **no network**.
+fn require_sync(kind: crate::sync::SyncKind) -> AppResult<()> {
+    require_feature_gate(kind.feature())?;
+    if crate::sync::opted_in(kind) {
+        Ok(())
+    } else {
+        Err(crate::sync::sync_off_error(kind))
+    }
+}
+
 fn require_history_sync() -> AppResult<()> {
-    require_feature_gate(crate::entitlement::feature::HISTORY_SYNC)
+    require_sync(crate::sync::SyncKind::History)
+}
+
+/// The user's two cloud-sync opt-ins (both default **off**). Local read only.
+#[tauri::command]
+pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
+    Ok(crate::settings::load_settings()?.sync_prefs())
+}
+
+/// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
+/// the new pair. Turning ON requires the matching Pro feature (the UI disables
+/// the toggle for Free; this is the backstop). Turning OFF is always allowed and
+/// only stops future uploads/downloads — nothing is deleted server-side. The
+/// frontend runs the existing one-shot backfill after a successful turn-on.
+#[tauri::command]
+pub async fn set_sync_pref(kind: String, enabled: bool) -> AppResult<crate::settings::SyncPrefs> {
+    let kind = crate::sync::SyncKind::parse(&kind)
+        .ok_or_else(|| AppError::Other(format!("unknown sync kind: {kind}")))?;
+    if enabled {
+        require_feature_gate(kind.feature())?;
+    }
+    crate::settings::set_sync_opted_in(kind, enabled)
 }
 
 /// Cross-mission Logbook rollups + export are Pro; per-mission is free.
@@ -1983,13 +2011,13 @@ pub async fn history_sync_pull(
 
 /// One-shot backfill: push this machine's terminal runs (newest first, capped at
 /// [`crate::sync::MAX_PUSH`]) so a Pro user's existing history is populated
-/// immediately — not only from the next run onward. No-op for non-Pro; the server
+/// immediately — not only from the next run onward. Runs when the user turns
+/// history sync ON (and on launch while it stays on). No-op unless opted in
+/// AND Pro; the server
 /// upserts by run id so re-running it is idempotent. Returns the count attempted.
 #[tauri::command]
 pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
-    if !crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
-    {
+    if !crate::sync::sync_active(crate::sync::SyncKind::History) {
         return Ok(0);
     }
     let runs = {
@@ -2050,12 +2078,11 @@ pub async fn history_run_detail(
 /// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
 /// heal for edits made offline or whose fire-and-forget push failed. The server
 /// does per-item LWW, so re-pushing is idempotent and never regresses a newer
-/// edit from another machine. No-op for non-Pro. Returns the count pushed.
+/// edit from another machine. No-op unless library sync is turned on AND Pro.
+/// Returns the count pushed.
 #[tauri::command]
 pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
-    if !crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if !crate::sync::sync_active(crate::sync::SyncKind::Library) {
         return Ok(0);
     }
     let items: Vec<crate::sync::SyncLibraryItem> = {
@@ -2084,7 +2111,7 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
 /// the number of items applied.
 #[tauri::command]
 pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
-    require_feature_gate(crate::entitlement::feature::LIBRARY_SYNC)?;
+    require_sync(crate::sync::SyncKind::Library)?;
     let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
     let mut applied = 0usize;
 
@@ -5827,9 +5854,7 @@ pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::ro
         .map(|(updated_at, _)| crate::sync::SyncLibraryItem::role(&role, &updated_at));
     drop(db);
     // Library sync (Pro): the edited role follows the user. Best-effort.
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         if let Some(item) = sync_item {
             tokio::spawn(async move {
                 let client = crate::chat_engine::shared_http_client();
@@ -5851,9 +5876,7 @@ pub async fn delete_role(state: State<'_, AppState>, key: String) -> AppResult<(
     if db.role_in_use(&key)? { return Err(crate::error::AppError::Other(format!("role '{key}' is used by a pipeline"))); }
     db.delete_role(&key)?;
     drop(db);
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         let item = crate::sync::SyncLibraryItem::tombstone("role", &key);
         tokio::spawn(async move {
             let client = crate::chat_engine::shared_http_client();

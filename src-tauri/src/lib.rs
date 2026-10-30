@@ -401,6 +401,8 @@ pub fn run() {
             commands::run_routine_now,
             commands::preview_routine_schedule,
             // Cross-machine run history (Pro-real Part B / B1)
+            commands::get_sync_prefs,
+            commands::set_sync_pref,
             commands::history_list,
             commands::history_sync_pull,
             commands::history_sync_push_all,
