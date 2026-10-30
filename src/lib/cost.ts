@@ -70,3 +70,37 @@ export function estimateNextTurnTokens(
   const total = historyTokens + pendingTokens;
   return total > 0 ? total : 0;
 }
+
+/**
+ * Tooltip for spend whose model has no price: its real cost is unknown, so
+ * it is left out of totals and savings rather than shown as free.
+ */
+export function unpricedTitle(models: string[]): string {
+  const names = models.length > 0 ? models.join(", ") : "this model";
+  return `No price for ${names} — its calls are not counted as spend or as savings. Add a price in Settings › Models, then re-price.`;
+}
+
+/**
+ * The cost cell of one model in a usage table. A model whose calls are all
+ * unpriced reads "unpriced", never "$0.00"; a model with some unpriced
+ * calls keeps its priced figure and says so in the tooltip.
+ */
+export function modelCostCell(
+  m: { model: string; costUsd: number; unpricedCalls?: number },
+  fmt: (n: number) => string,
+): { text: string; unpriced: boolean; title: string | undefined } {
+  const unpricedCalls = m.unpricedCalls ?? 0;
+  if (unpricedCalls <= 0) return { text: fmt(m.costUsd), unpriced: false, title: undefined };
+  const calls = unpricedCalls === 1 ? "1 call" : `${unpricedCalls} calls`;
+  if (m.costUsd === 0) return { text: "unpriced", unpriced: true, title: unpricedTitle([m.model]) };
+  return { text: fmt(m.costUsd), unpriced: true, title: `${calls} unpriced — ${unpricedTitle([m.model])}` };
+}
+
+/**
+ * A run's budget gate compares billed cost, and an unpriced stage bills $0 —
+ * so a budget cannot stop spend it cannot see. "" when every stage is priced.
+ */
+export function budgetUnenforceableNote(unpricedStages: number): string {
+  if (unpricedStages <= 0) return "";
+  return `budget not enforceable: ${unpricedStages === 1 ? "1 stage" : `${unpricedStages} stages`} unpriced`;
+}

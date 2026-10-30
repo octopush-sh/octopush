@@ -64,6 +64,21 @@ describe("costLines", () => {
     expect(costLines(cost({ subagentsUsd: 0 })).map((l) => l.key)).toEqual(["spent", "saved"]);
   });
 
+  it("names unpriced models and never shows their cost as $0.00", () => {
+    const mixed = costLines(cost({ unpricedCalls: 2, unpricedModels: ["claude-mythos-1"] }));
+    expect(mixed.map((l) => [l.label, l.value])).toEqual([
+      ["spent", "$1.25"],
+      ["of which sub-agents", "$0.40"],
+      ["saved vs all-strong", "$1.75 · 58%"],
+      ["unpriced", "claude-mythos-1"],
+    ]);
+    const all = costLines(cost({ spentUsd: 0, subagentsUsd: 0, baselineUsd: 0, calls: 3, unpricedCalls: 3, unpricedModels: ["claude-mythos-1"] }));
+    expect(all.map((l) => [l.label, l.value])).toEqual([
+      ["spent", "unpriced"],
+      ["unpriced", "claude-mythos-1"],
+    ]);
+  });
+
   it("never rounds a cheap turn down to free", () => {
     expect(usd(0.004)).toBe("$0.004");
     expect(usd(0.5)).toBe("$0.50");

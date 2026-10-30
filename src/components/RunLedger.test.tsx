@@ -51,6 +51,21 @@ describe("RunLedger", () => {
     expect(screen.getByText(/budget \$0\.05/).className).toContain("text-octo-rouge");
   });
 
+  it("shows unpriced stages as unpriced and says the budget cannot see them", () => {
+    const withUnpriced = [
+      ...stages,
+      { id: "s3", role: "review", agentModel: "claude-mythos-1", costUsd: 0, inputTokens: 5000, outputTokens: 400, unpricedModel: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={withUnpriced} />);
+    const note = screen.getByTestId("ledger-budget-unenforceable");
+    expect(note.textContent).toBe("· budget not enforceable: 1 stage unpriced");
+    expect(note.getAttribute("title")).toContain("claude-mythos-1");
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    const cell = screen.getByText("unpriced");
+    expect(cell.getAttribute("title")).toContain("claude-mythos-1");
+    expect(cell.parentElement!.textContent).not.toContain("$0.00");
+  });
+
   it("omits the budget fragment when the run has no budget", () => {
     render(<RunLedger run={{ ...baseRun, budgetUsd: null, detached: false } as Run} stages={stages} />);
     expect(screen.queryByText(/budget/)).not.toBeInTheDocument();

@@ -14,6 +14,7 @@ import { Github } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
 import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
+import { budgetUnenforceableNote, unpricedTitle } from "../lib/cost";
 
 /** Builtin pipelines a mission's intent should default-select in the launcher
  *  (a `perf` mission lands on the Perf probe crew). */
@@ -72,7 +73,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const [overrides, setOverrides] = useState<Record<number, string>>({});
   const [budgetText, setBudgetText] = useState("");
   const [showIssuePicker, setShowIssuePicker] = useState(false);
-  const [estimate, setEstimate] = useState<{ estimateUsd: number; baselineUsd: number } | null>(null);
+  const [estimate, setEstimate] = useState<{ estimateUsd: number; baselineUsd: number; unpricedModels?: string[]; unpricedStages?: number } | null>(null);
 
   // The active mission's intent — a `perf` mission default-selects Perf probe.
   const missionIntent = useMissionsStore((s) =>
@@ -340,6 +341,24 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                     <span className="octo-tabular text-octo-mute">
                       · runs at <span className="text-octo-brass">~${estimate.estimateUsd.toFixed(2)}</span>
                     </span>
+                    {(estimate.unpricedModels?.length ?? 0) > 0 && (
+                      <span
+                        className="octo-tabular truncate text-octo-mute"
+                        title={unpricedTitle(estimate.unpricedModels ?? [])}
+                        data-testid="estimate-unpriced"
+                      >
+                        · {(estimate.unpricedModels ?? []).join(", ")} unpriced
+                      </span>
+                    )}
+                    {parseBudget(budgetText) != null && (estimate.unpricedStages ?? 0) > 0 && (
+                      <span
+                        className="octo-tabular truncate text-octo-rouge"
+                        title="The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend."
+                        data-testid="estimate-budget-unenforceable"
+                      >
+                        · {budgetUnenforceableNote(estimate.unpricedStages ?? 0)}
+                      </span>
+                    )}
                   </>
                 ) : (
                   <span className="text-octo-mute">estimating…</span>

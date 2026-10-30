@@ -5,6 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
+import { unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 
 interface Props {
@@ -37,8 +38,11 @@ export function usd(n: number): string {
  *  priced and the saving is real. */
 export function costLines(cost: ThreadCost | null): Array<{ key: string; label: string; value: string; tone: "brass" | "sage" | "verdigris" }> {
   if (!cost || cost.calls <= 0) return [];
+  const unpricedCalls = cost.unpricedCalls ?? 0;
+  const allUnpriced = unpricedCalls > 0 && unpricedCalls >= cost.calls;
   const lines: Array<{ key: string; label: string; value: string; tone: "brass" | "sage" | "verdigris" }> = [
-    { key: "spent", label: "spent", value: usd(cost.spentUsd), tone: "brass" },
+    // Every call unpriced: the cost is unknown, never "$0.00".
+    { key: "spent", label: "spent", value: allUnpriced ? "unpriced" : usd(cost.spentUsd), tone: allUnpriced ? "sage" : "brass" },
   ];
   if (cost.subagentsUsd > 0) {
     lines.push({ key: "agents", label: "of which sub-agents", value: usd(cost.subagentsUsd), tone: "sage" });
@@ -47,6 +51,10 @@ export function costLines(cost: ThreadCost | null): Array<{ key: string; label: 
     const saved = cost.baselineUsd - cost.spentUsd;
     const pct = Math.round((saved / cost.baselineUsd) * 100);
     lines.push({ key: "saved", label: "saved vs all-strong", value: `${usd(saved)} · ${pct}%`, tone: "verdigris" });
+  }
+  if (unpricedCalls > 0) {
+    // Named so the gap is visible; these calls are in neither figure above.
+    lines.push({ key: "unpriced", label: "unpriced", value: (cost.unpricedModels ?? []).join(", ") || `${unpricedCalls} calls`, tone: "sage" });
   }
   return lines;
 }
@@ -129,7 +137,9 @@ export function CompanionContext({
                     ? `${cost.calls} model calls · ${Math.round(cost.cacheHitPct)}% of the prompt served from the cache`
                     : l.key === "saved"
                       ? "What the same tokens would have cost with every call on the strong tier"
-                      : undefined
+                      : l.key === "unpriced" || (l.key === "spent" && l.value === "unpriced")
+                        ? unpricedTitle(cost?.unpricedModels ?? [])
+                        : undefined
                 }
               />
             ))}

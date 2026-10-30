@@ -86,23 +86,67 @@ pub enum TokenType {
     CacheCreation,
 }
 
-/// Normalize a raw model id to its base catalog id for pricing lookups:
-/// strips provider prefixes (Bedrock/Vertex `us.anthropic.…` / `anthropic.…`),
-/// a bracketed capability suffix (`claude-opus-4-8[1m]`), a Vertex `@`-version
-/// separator, and a trailing dated snapshot (`-YYYYMMDD`). Exact-match pricing
-/// tables would otherwise silently price these variants at $0.
+/// Normalize a raw model id to its base catalog id for pricing lookups.
+/// In order, it strips:
+/// - a `provider/` path prefix (LiteLLM `bedrock/…`, `anthropic/…`,
+///   `ollama/…`; an inference-profile ARN's `…/` too) — everything up to the
+///   last `/`;
+/// - a cross-region Bedrock prefix (`us.` / `eu.` / `apac.` / `global.` /
+///   `jp.` / `au.` / `ca.` / `us-gov.`) in front of `anthropic.`, and the
+///   `anthropic.` vendor prefix itself;
+/// - a bracketed capability suffix (`claude-opus-4-8[1m]`) and a Vertex
+///   `@`-version;
+/// - a Bedrock model version (`-v1:0`; a bare `-v1` only on an
+///   `anthropic.` id);
+/// - an Ollama `:tag` (`qwen2.5-coder:7b`, `llama3.3:latest`);
+/// - a trailing dated snapshot (`-YYYYMMDD`).
+///
+/// Lookups stay exact-match on the result: `us.anthropic.claude-opus-5-5-20261001-v1:0`
+/// and `bedrock/us.anthropic.claude-sonnet-5-5-v1:0` price as their base model,
+/// while an id that is merely similar does not.
 pub fn normalize_model_id(model: &str) -> String {
     let mut m = model.trim();
-    for prefix in ["us.anthropic.", "eu.anthropic.", "apac.anthropic.", "anthropic."] {
-        if let Some(rest) = m.strip_prefix(prefix) {
-            m = rest;
-            break;
+    if let Some(idx) = m.rfind('/') {
+        m = &m[idx + 1..];
+    }
+    for region in ["us.", "eu.", "apac.", "global.", "jp.", "au.", "ca.", "us-gov."] {
+        if let Some(rest) = m.strip_prefix(region) {
+            if rest.starts_with("anthropic.") {
+                m = rest;
+                break;
+            }
         }
+    }
+    let bedrock = m.starts_with("anthropic.");
+    if let Some(rest) = m.strip_prefix("anthropic.") {
+        m = rest;
     }
     if let Some(idx) = m.find('[') {
         m = &m[..idx];
     }
     if let Some(idx) = m.find('@') {
+        m = &m[..idx];
+    }
+    // Bedrock version: `-v<digits>:<digits>`, or a bare `-v<digits>` on a
+    // Bedrock `anthropic.` id (a bare `-v3` elsewhere is part of the name —
+    // `deepseek-v3`).
+    if let Some(idx) = m.rfind("-v") {
+        let ver = &m[idx + 2..];
+        let (major, minor) = match ver.split_once(':') {
+            Some((a, b)) => (a, Some(b)),
+            None => (ver, None),
+        };
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        let versioned = match minor {
+            Some(minor) => digits(major) && digits(minor),
+            None => bedrock && digits(major),
+        };
+        if versioned {
+            m = &m[..idx];
+        }
+    }
+    // Ollama tag.
+    if let Some(idx) = m.find(':') {
         m = &m[..idx];
     }
     // Trailing `-YYYYMMDD` (dash + exactly 8 digits at the very end).
@@ -115,58 +159,75 @@ pub fn normalize_model_id(model: &str) -> String {
     m.to_string()
 }
 
-/// Per-million-token pricing. Returns $/token (i.e. already divided by 1M).
+/// Builtin per-million-token prices for a normalized model id, or `None` when
+/// the id is not in the table.
 ///
-/// Interim catalog (Phase 0): kept in sync with the ProviderRouter builtin
-/// catalog so both pricing paths agree until Phase 1 unifies them. Cache prices
-/// follow Anthropic's standard economics — cache-read ≈ 0.1× input, cache-write
-/// (5-minute TTL) ≈ 1.25× input. Older ids are retained so historical events
-/// still re-price correctly.
+/// Source: Anthropic's official pricing page
+/// (<https://platform.claude.com/docs/en/about-claude/pricing>, fetched
+/// 2026-10-29). Columns are input / 5-minute cache write / cache hit / output.
+/// Every ProviderRouter builtin catalog model must appear here at the same
+/// price (asserted by `builtin_catalog_matches_pricing_table` in `tests.rs`);
+/// this table additionally carries older ids the catalog does not list, so
+/// historical events still re-price correctly.
+///
+/// A model that is not here (and not in the catalog) is *unpriced* — callers
+/// get `None` from [`prices_for`] and must not treat it as free. Explicitly
+/// free models (Ollama, or a catalog entry priced at $0) come from the
+/// catalog, not here.
+pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
+    // (input, cache write 5m, cache hit, output) — USD per million tokens.
+    let (input, cache_write, cache_hit, output) = match normalize_model_id(model).as_str() {
+        // Claude Fable
+        "claude-fable-5-1" => (10.0, 12.50, 0.25, 50.0),
+        "claude-fable-5" => (10.0, 12.50, 1.0, 50.0),
+        // Claude Opus
+        "claude-opus-5-5" => (4.0, 5.0, 0.20, 20.0),
+        "claude-opus-5" => (5.0, 6.25, 0.50, 25.0),
+        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" | "claude-opus-4-5" => {
+            (5.0, 6.25, 0.50, 25.0)
+        }
+        "claude-opus-4-1" | "claude-opus-4" => (15.0, 18.75, 1.50, 75.0),
+        // Claude Sonnet
+        "claude-sonnet-5-5" => (2.0, 2.50, 0.10, 10.0),
+        "claude-sonnet-5" => (2.0, 2.50, 0.20, 10.0),
+        "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4" => (3.0, 3.75, 0.30, 15.0),
+        // Claude Haiku
+        //
+        // Haiku 5.5 is tiered per request: prompts over 100,000 tokens (input
+        // + cache reads + cache writes) cost 0.50 / 0.625 / 0.05 / 2.50. This
+        // is the <=100K tier; per-request paths (Talk director rounds, one-shot
+        // AI calls, Claude Code transcripts, the PTY usage block) apply the
+        // long tier via `request_prices`. Aggregated usage (DIRECT stages,
+        // sub-agent attempts) keeps this tier — the size of each request
+        // inside it is unknown — so long-prompt requests there are
+        // under-counted.
+        "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
+        "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
+        "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
+        // OpenAI
+        "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
+        "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
+        // Anything else is unknown — unpriced, not free.
+        _ => return None,
+    };
+    Some(ModelPrices {
+        input_per_m: input,
+        output_per_m: output,
+        cache_read_per_m: cache_hit,
+        cache_creation_per_m: cache_write,
+    })
+}
+
+/// Builtin price of one token type, in $/token (already divided by 1M).
+/// Returns `0.0` for a model the builtin table does not know — callers that
+/// must tell "unknown" from "free" use [`builtin_prices`] / [`prices_for`].
 pub fn cost_per_token(model: &str, tt: TokenType) -> f64 {
-    let model = normalize_model_id(model);
-    let per_m = match (model.as_str(), tt) {
-        // Claude Fable 5
-        ("claude-fable-5", TokenType::Input) => 10.0,
-        ("claude-fable-5", TokenType::Output) => 50.0,
-        ("claude-fable-5", TokenType::CacheRead) => 1.0,
-        ("claude-fable-5", TokenType::CacheCreation) => 12.5,
-        // Claude Opus 4.8 / 4.7 (same price tier)
-        ("claude-opus-4-8", TokenType::Input) | ("claude-opus-4-7", TokenType::Input) => 5.0,
-        ("claude-opus-4-8", TokenType::Output) | ("claude-opus-4-7", TokenType::Output) => 25.0,
-        ("claude-opus-4-8", TokenType::CacheRead) | ("claude-opus-4-7", TokenType::CacheRead) => 0.5,
-        ("claude-opus-4-8", TokenType::CacheCreation) | ("claude-opus-4-7", TokenType::CacheCreation) => 6.25,
-        // Claude Opus 4.6 (legacy)
-        ("claude-opus-4-6", TokenType::Input) => 15.0,
-        ("claude-opus-4-6", TokenType::Output) => 75.0,
-        ("claude-opus-4-6", TokenType::CacheRead) => 1.5,
-        ("claude-opus-4-6", TokenType::CacheCreation) => 18.75,
-        // Claude Sonnet 5 (standard sticker; intro discount not modeled)
-        ("claude-sonnet-5", TokenType::Input) => 3.0,
-        ("claude-sonnet-5", TokenType::Output) => 15.0,
-        ("claude-sonnet-5", TokenType::CacheRead) => 0.3,
-        ("claude-sonnet-5", TokenType::CacheCreation) => 3.75,
-        // Claude Sonnet 4.6 (legacy)
-        ("claude-sonnet-4-6", TokenType::Input) => 3.0,
-        ("claude-sonnet-4-6", TokenType::Output) => 15.0,
-        ("claude-sonnet-4-6", TokenType::CacheRead) => 0.3,
-        ("claude-sonnet-4-6", TokenType::CacheCreation) => 3.75,
-        // Claude Haiku 4.5
-        ("claude-haiku-4-5", TokenType::Input) => 1.0,
-        ("claude-haiku-4-5", TokenType::Output) => 5.0,
-        ("claude-haiku-4-5", TokenType::CacheRead) => 0.10,
-        ("claude-haiku-4-5", TokenType::CacheCreation) => 1.25,
-        // GPT-4o
-        ("gpt-4o", TokenType::Input) => 2.50,
-        ("gpt-4o", TokenType::Output) => 10.0,
-        ("gpt-4o", TokenType::CacheRead) => 1.25,
-        ("gpt-4o", TokenType::CacheCreation) => 2.50,
-        // GPT-4o-mini
-        ("gpt-4o-mini", TokenType::Input) => 0.15,
-        ("gpt-4o-mini", TokenType::Output) => 0.60,
-        ("gpt-4o-mini", TokenType::CacheRead) => 0.075,
-        ("gpt-4o-mini", TokenType::CacheCreation) => 0.15,
-        // Unknown / local models — free
-        (_, _) => 0.0,
+    let Some(p) = builtin_prices(model) else { return 0.0 };
+    let per_m = match tt {
+        TokenType::Input => p.input_per_m,
+        TokenType::Output => p.output_per_m,
+        TokenType::CacheRead => p.cache_read_per_m,
+        TokenType::CacheCreation => p.cache_creation_per_m,
     };
     per_m / 1_000_000.0
 }
@@ -243,12 +304,43 @@ impl ModelPrices {
     }
 }
 
-/// Resolve a model's prices, catalog-first. `None` means the model is unknown
-/// to both the ProviderRouter catalog and the builtin table (so its spend is
-/// genuinely unpriced — distinct from a known local model priced at $0, which
-/// the catalog returns as `Some(zeros)`).
-pub fn prices_for(model: &str) -> Option<ModelPrices> {
-    if let Ok(router) = crate::provider_router::ProviderRouter::load() {
+/// The provider catalog, loaded once and reused until `providers.json`
+/// changes on disk (modified time + size), keyed by path. Pricing used to
+/// call `ProviderRouter::load()` — a read, migrations and a write-back of the
+/// file — on every lookup, including under the DB lock; this makes a lookup a
+/// `stat` plus a map read.
+pub fn catalog() -> Option<Arc<crate::provider_router::ProviderRouter>> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    type Stamp = (Option<std::time::SystemTime>, u64);
+    type Entry = (Stamp, Arc<crate::provider_router::ProviderRouter>);
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, Entry>>> = std::sync::OnceLock::new();
+    let path = crate::provider_router::config_path();
+    let stamp = |p: &PathBuf| -> Option<Stamp> {
+        let md = std::fs::metadata(p).ok()?;
+        Some((md.modified().ok(), md.len()))
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(now) = stamp(&path) {
+        let hit = cache.lock().get(&path).filter(|(s, _)| *s == now).map(|(_, r)| Arc::clone(r));
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    let router = Arc::new(crate::provider_router::ProviderRouter::load().ok()?);
+    if let Some(after) = stamp(&path) {
+        cache.lock().insert(path, (after, Arc::clone(&router)));
+    }
+    Some(router)
+}
+
+/// Resolve a model's prices against a given catalog (or none): a catalog
+/// entry is an explicit price — `$0` included (a local Ollama model, or one
+/// the user deliberately priced at zero). A `provider/model` id whose prefix
+/// names a **local** catalog provider is free even when the model itself is
+/// not listed. Then the builtin table; `None` means genuinely unknown.
+pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model: &str) -> Option<ModelPrices> {
+    if let Some(router) = router {
         if let Some((_, mi)) = router.find_model(model) {
             return Some(ModelPrices {
                 input_per_m: mi.input_cost_per_m,
@@ -257,25 +349,91 @@ pub fn prices_for(model: &str) -> Option<ModelPrices> {
                 cache_creation_per_m: mi.cache_creation_cost_per_m,
             });
         }
+        if router.provider_for_prefix(model).is_some_and(|p| p.local) {
+            return Some(ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 });
+        }
     }
-    // Hardcoded fallback: a positive input price is the "known" discriminator
-    // (every builtin entry is nonzero; unknown/local ids fall through to $0).
-    let norm = normalize_model_id(model);
-    let input_per_m = cost_per_token(&norm, TokenType::Input) * 1_000_000.0;
-    if input_per_m > 0.0 {
-        return Some(ModelPrices {
-            input_per_m,
-            output_per_m: cost_per_token(&norm, TokenType::Output) * 1_000_000.0,
-            cache_read_per_m: cost_per_token(&norm, TokenType::CacheRead) * 1_000_000.0,
-            cache_creation_per_m: cost_per_token(&norm, TokenType::CacheCreation) * 1_000_000.0,
-        });
-    }
-    None
+    builtin_prices(model)
 }
 
-/// Canonical cost for a usage tuple, via [`prices_for`]. An unpriced model
-/// yields `0.0` — callers that care about the distinction should consult
-/// [`prices_for`] directly.
+/// Resolve a model's prices, catalog-first (see [`prices_in`]). `None` means
+/// the model is unknown to both the catalog and the builtin table — its
+/// spend is unpriced, distinct from an explicit `$0`.
+pub fn prices_for(model: &str) -> Option<ModelPrices> {
+    prices_in(catalog().as_deref(), model)
+}
+
+/// Whether a model resolves to a price (catalog or builtin table). A local
+/// or deliberately-$0 catalog model is priced — explicitly free, not unknown.
+pub fn is_priced(model: &str) -> bool {
+    prices_for(model).is_some()
+}
+
+/// Per-request price tiers: `(prompt-token threshold, multiplier)`. Above the
+/// threshold — prompt = input + cache reads + cache writes of ONE request —
+/// every column costs `multiplier`× the base price (official pricing,
+/// 2026-10-29: Haiku 5.5 prompts over 100K tokens cost 5× — 0.50 / 0.625 /
+/// 0.05 / 2.50). Applied as a multiplier so a user-edited base price scales.
+fn long_prompt_tier(model: &str) -> Option<(u64, f64)> {
+    match normalize_model_id(model).as_str() {
+        "claude-haiku-5-5" => Some((100_000, 5.0)),
+        _ => None,
+    }
+}
+
+/// The prices that apply to ONE request of `prompt_tokens` (input + cache
+/// read + cache write). Only per-request callers use this; aggregated usage
+/// (a DIRECT stage, a sub-agent attempt) keeps the base tier, since the
+/// size of each request inside the aggregate is unknown.
+pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> ModelPrices {
+    match long_prompt_tier(model) {
+        Some((threshold, k)) if prompt_tokens > threshold => ModelPrices {
+            input_per_m: base.input_per_m * k,
+            output_per_m: base.output_per_m * k,
+            cache_read_per_m: base.cache_read_per_m * k,
+            cache_creation_per_m: base.cache_creation_per_m * k,
+        },
+        _ => base,
+    }
+}
+
+/// Cost of ONE request with [`request_prices`] on top of `base`.
+pub fn request_cost(model: &str, base: ModelPrices, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+    request_prices(model, base, input + cache_read + cache_creation).cost(input, output, cache_read, cache_creation)
+}
+
+/// [`cost_for`] for ONE provider request: applies per-request price tiers.
+pub fn request_cost_for(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+    prices_for(model)
+        .map(|p| request_cost(model, p, input, output, cache_read, cache_creation))
+        .unwrap_or(0.0)
+}
+
+/// The ledger `cost_basis` of a computed row, from whether its model had a
+/// price: `'unpriced'` when it carries tokens at $0 with no price — so the
+/// Usage page can flag it and savings leave it out — else `'computed'`.
+pub fn basis_for(priced: bool, cost_usd: f64, tokens: i64) -> &'static str {
+    if !priced && cost_usd == 0.0 && tokens > 0 {
+        "unpriced"
+    } else {
+        "computed"
+    }
+}
+
+/// [`basis_for`] resolving the model's price (cached catalog lookup — no
+/// `providers.json` reload). Only consults the catalog in the rare
+/// $0-with-tokens case.
+pub fn ledger_cost_basis(model: &str, cost_usd: f64, tokens: i64) -> &'static str {
+    if cost_usd == 0.0 && tokens > 0 {
+        basis_for(is_priced(model), cost_usd, tokens)
+    } else {
+        "computed"
+    }
+}
+
+/// Canonical cost for a usage tuple, via [`prices_for`], at the base tier
+/// (safe for aggregated usage). An unpriced model yields `0.0` — callers
+/// that care about the distinction consult [`prices_for`] directly.
 pub fn cost_for(
     model: &str,
     input: u64,
@@ -311,28 +469,66 @@ impl TokenEngine {
     /// [`record`](Self::record) with Talk attribution: the thread the spend
     /// belongs to and whether the director or a sub-agent
     /// (`subagent:<call id>`) spent it.
+    ///
+    /// The event may aggregate several requests (a sub-agent attempt), so a
+    /// $0 event is priced at the base tier; use
+    /// [`record_request_in_thread`](Self::record_request_in_thread) for ONE
+    /// provider response.
     pub fn record_in_thread(
+        &self,
+        event: TokenEvent,
+        surface: &str,
+        thread_id: Option<&str>,
+        origin: Option<&str>,
+    ) -> AppResult<()> {
+        self.record_priced(event, surface, thread_id, origin, false)
+    }
+
+    /// [`record_in_thread`](Self::record_in_thread) for an event that is ONE
+    /// provider request: a $0 event is priced with per-request tiers (Haiku
+    /// 5.5's >100K-prompt tier).
+    pub fn record_request_in_thread(
+        &self,
+        event: TokenEvent,
+        surface: &str,
+        thread_id: Option<&str>,
+        origin: Option<&str>,
+    ) -> AppResult<()> {
+        self.record_priced(event, surface, thread_id, origin, true)
+    }
+
+    fn record_priced(
         &self,
         mut event: TokenEvent,
         surface: &str,
         thread_id: Option<&str>,
         origin: Option<&str>,
+        single_request: bool,
     ) -> AppResult<()> {
-        if event.cost_usd == 0.0 {
-            // Single pricing authority (catalog-first, cache-aware).
-            event.cost_usd = cost_for(
-                &event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_creation_tokens,
-            );
+        let tokens = (event.input_tokens + event.output_tokens + event.cache_read_tokens + event.cache_creation_tokens) as i64;
+        // Resolve the price ONCE, before the DB lock (single pricing
+        // authority, catalog-first, cache-aware); its absence is what marks
+        // the row unpriced.
+        let mut priced = true;
+        if event.cost_usd == 0.0 && tokens > 0 {
+            match prices_for(&event.model) {
+                Some(p) => {
+                    let (i, o, cr, cc) = (event.input_tokens, event.output_tokens, event.cache_read_tokens, event.cache_creation_tokens);
+                    event.cost_usd = if single_request {
+                        request_cost(&event.model, p, i, o, cr, cc)
+                    } else {
+                        p.cost(i, o, cr, cc)
+                    };
+                }
+                None => priced = false,
+            }
         }
+        let basis = basis_for(priced, event.cost_usd, tokens);
         if event.timestamp.is_empty() {
             event.timestamp = Utc::now().to_rfc3339();
         }
         let db = self.db.lock();
-        db.record_token_spend_in_thread(&event, surface, thread_id, origin)?;
+        db.record_token_spend_with_basis(&event, surface, thread_id, origin, basis)?;
         db.increment_session_tokens(
             &event.session_id,
             event.input_tokens,
@@ -553,8 +749,9 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
         cache_creation_tokens: cache_create,
         model: model.clone(),
         // Price via the single authority (catalog-first) rather than the raw
-        // hardcoded table, matching every other ledger path.
-        cost_usd: cost_for(&model, input, output, cache_read, cache_create),
+        // hardcoded table, matching every other ledger path. One API
+        // response = one request, so per-request tiers apply.
+        cost_usd: request_cost_for(&model, input, output, cache_read, cache_create),
     })
 }
 

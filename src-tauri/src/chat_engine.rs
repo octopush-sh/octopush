@@ -731,7 +731,8 @@ impl TurnUsage {
         self.output += r.output_tokens;
         self.cache_read += r.cache_read_tokens;
         self.cache_creation += r.cache_creation_tokens;
-        self.cost += token_engine::cost_for(
+        // One provider response = one request: per-request price tiers apply.
+        self.cost += token_engine::request_cost_for(
             model,
             r.input_tokens,
             r.output_tokens,
@@ -1736,7 +1737,7 @@ impl ChatEngine {
     fn record_usage(&self, workspace_id: &str, thread_id: &str, model: &str, response: &crate::providers::LlmResponse) {
         if response.input_tokens > 0 || response.output_tokens > 0 {
             let engine = token_engine::TokenEngine::new(std::sync::Arc::clone(&self.db));
-            if let Err(e) = engine.record_in_thread(token_engine::TokenEvent {
+            if let Err(e) = engine.record_request_in_thread(token_engine::TokenEvent {
                 id: None,
                 session_id: workspace_id.to_string(),
                 timestamp: String::new(),
