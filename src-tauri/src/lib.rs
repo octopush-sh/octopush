@@ -35,6 +35,7 @@ pub mod workspace;
 pub mod mission;
 pub mod template;
 pub mod theme;
+pub mod updater;
 pub mod token_engine;
 pub mod transcripts;
 pub mod perf;
@@ -145,6 +146,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(app_state)
         .manage(perf::PerfState::new())
+        .manage(updater::PendingUpdate::default())
         .manage(file_open::QuickViews::default())
         .invoke_handler(tauri::generate_handler![
             // Open With / Quick View
@@ -405,6 +407,13 @@ pub fn run() {
             // Cross-machine run history (Pro-real Part B / B1)
             commands::get_sync_prefs,
             commands::set_sync_pref,
+            // Updater (channels + launch alert)
+            commands::get_update_channel,
+            commands::set_update_channel,
+            commands::get_skipped_update_version,
+            commands::set_skipped_update_version,
+            commands::updater_check,
+            commands::updater_install,
             commands::history_list,
             commands::history_sync_pull,
             commands::history_sync_push_all,

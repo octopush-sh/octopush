@@ -5,17 +5,21 @@
  * button in Settings (and any future surface) shares the same state.
  *
  * Background behavior:
- *   - Triggers one check on mount (fresh app launch).
- *   - Re-checks every 6 hours.
+ *   - On launch, once the window is visible and after a short delay, runs
+ *     the silent launch check (`launchCheck`), which opens the release-notes
+ *     alert (`UpdateAlert`) unless the version was skipped. The alert waits
+ *     while any other dialog is open (polled via `flushAlert`).
+ *   - Re-checks every 6 hours (toast only — the alert is a launch moment).
  *   - Silent on failure for background checks.
  *
- * Toast shows only when `phase === "available"` and the user hasn't
- * dismissed the current version. "no-update" / "error" states from
+ * Toast shows only when `phase === "available"`, the alert isn't up or
+ * queued, and the user hasn't dismissed (or skipped) the current version. "no-update" / "error" states from
  * background checks stay invisible — Settings is where the user
  * inspects those.
  */
 
 import { useEffect } from "react";
+import { UpdateAlert } from "./UpdateAlert";
 import { Download, X, Loader2, ExternalLink } from "lucide-react";
 import { useUpdaterStore } from "../stores/updaterStore";
 import { ipc } from "../lib/ipc";
@@ -23,6 +27,10 @@ import { ipc } from "../lib/ipc";
 const RELEASES_URL = "https://github.com/johnatan-velez/octopush/releases/tag";
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** Let the window settle before the launch check. */
+export const LAUNCH_CHECK_DELAY_MS = 1500;
+/** How often a queued alert retries while another dialog is open. */
+export const ALERT_RETRY_MS = 1000;
 
 export function UpdateNotifier() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -34,23 +42,52 @@ export function UpdateNotifier() {
   const installAndRelaunch = useUpdaterStore((s) => s.installAndRelaunch);
   const dismiss = useUpdaterStore((s) => s.dismiss);
 
+  const alertOpen = useUpdaterStore((s) => s.alertOpen);
+  const alertPending = useUpdaterStore((s) => s.alertPending);
+  const launchCheck = useUpdaterStore((s) => s.launchCheck);
+  const flushAlert = useUpdaterStore((s) => s.flushAlert);
+
+  // Launch check: after the (initially hidden) window is shown + a delay.
   useEffect(() => {
-    checkForUpdates(false);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const arm = () => {
+      if (timer || document.visibilityState !== "visible") return;
+      document.removeEventListener("visibilitychange", arm);
+      timer = setTimeout(() => void launchCheck(), LAUNCH_CHECK_DELAY_MS);
+    };
+    document.addEventListener("visibilitychange", arm);
+    arm();
     const id = setInterval(() => checkForUpdates(false), CHECK_INTERVAL_MS);
+    return () => {
+      document.removeEventListener("visibilitychange", arm);
+      if (timer) clearTimeout(timer);
+      clearInterval(id);
+    };
+  }, [checkForUpdates, launchCheck]);
+
+  // A queued alert opens as soon as no other dialog is on screen.
+  useEffect(() => {
+    if (!alertPending) return;
+    if (flushAlert()) return;
+    const id = setInterval(() => {
+      if (flushAlert()) clearInterval(id);
+    }, ALERT_RETRY_MS);
     return () => clearInterval(id);
-  }, [checkForUpdates]);
+  }, [alertPending, flushAlert]);
 
   const installing = phase === "downloading" || phase === "installing";
   const visible =
-    (phase === "available" && !dismissed) || installing || phase === "error";
+    !alertOpen &&
+    !alertPending &&
+    ((phase === "available" && !dismissed) || installing || phase === "error");
 
-  if (!visible || !update) return null;
+  if (!visible || !update) return <UpdateAlert />;
 
   return (
     <div
       role="status"
       aria-live="polite"
-      className="fixed bottom-4 right-4 z-50 w-[340px] rounded-xl bg-octo-panel"
+      className="fixed bottom-4 right-4 z-50 w-[340px] rounded-xl bg-octo-panel octo-rise-in"
       style={{
         border: "1px solid var(--brass-dim)",
         boxShadow:
@@ -85,11 +122,6 @@ export function UpdateNotifier() {
             What's new
             <ExternalLink size={9} aria-hidden />
           </button>
-          {error && (
-            <div className="mt-1.5 text-[11px] leading-[1.45] text-octo-rouge">
-              Install failed: {error}
-            </div>
-          )}
           {error && (
             <div className="mt-1.5 text-[11px] leading-[1.45] text-octo-rouge">
               Install failed: {error}
