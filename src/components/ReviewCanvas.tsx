@@ -454,6 +454,7 @@ export function ReviewCanvas({
             <>
               <button
                 onClick={() => setAiOpen((v) => !v)}
+                data-tour="review-ai-pass"
                 aria-label="Review with AI"
                 aria-pressed={aiOpen}
                 title="Review this change with AI"

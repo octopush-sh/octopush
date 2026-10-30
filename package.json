@@ -59,6 +59,7 @@
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
     "remark-gfm": "^4.0.1",
+    "yaml": "^2.9.1",
     "zustand": "^5.0.2"
   },
   "devDependencies": {
@@ -74,7 +75,6 @@
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.3",
-    "vitest": "^4.1.4",
-    "yaml": "^2.9.1"
+    "vitest": "^4.1.4"
   }
 }

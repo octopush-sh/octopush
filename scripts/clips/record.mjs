@@ -184,9 +184,10 @@ async function recordOne(browser, url, item, tmp, verbose) {
     const hasTour = await page.evaluate(() => typeof window.__octoTour?.play === "function");
     if (hasTour) {
       if (verbose) log("  using the app's tour runner (window.__octoTour.play)");
-      await page.evaluate((steps) => window.__octoTour.play(steps, { mode: "record" }), item.steps);
+      // play() resolves with how many steps' targets were actually shown.
+      const played = await page.evaluate((steps) => window.__octoTour.play(steps, { mode: "record" }), item.steps);
       await page.waitForTimeout(600);
-      shown = item.steps.length;
+      shown = typeof played === "number" ? played : item.steps.length;
     } else {
       shown = await driveSteps(page, item.steps, verbose);
     }

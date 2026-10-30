@@ -6,6 +6,7 @@ import {
   SETTINGS_TAB_LABELS,
   type SettingsTab,
 } from "../lib/settingsTabs";
+import { tourId } from "../lib/tour/ids";
 import { OctoMark } from "./icons/OctoMark";
 import { GeneralPane } from "./settings/GeneralPane";
 import { EditorPane } from "./settings/EditorPane";
@@ -59,23 +60,15 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
               <div className="mb-1.5 px-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
                 {group.label}
               </div>
-              {group.tabs.map((t) => {
-                const button = (
-                  <TabButton
-                    key={t}
-                    label={SETTINGS_TAB_LABELS[t]}
-                    active={tab === t}
-                    onClick={() => setTab(t)}
-                  />
-                );
-                // Tour / demo-clip anchor (docs/WHATS-NEW.md §2). A static
-                // literal so `whats-new check` can see the id.
-                return t === "about" ? (
-                  <div key={t} data-tour="settings-nav-about">{button}</div>
-                ) : (
-                  button
-                );
-              })}
+              {group.tabs.map((t) => (
+                <TabButton
+                  key={t}
+                  label={SETTINGS_TAB_LABELS[t]}
+                  tour={SETTINGS_NAV_TOUR[t]}
+                  active={tab === t}
+                  onClick={() => setTab(t)}
+                />
+              ))}
             </div>
           ))}
         </aside>
@@ -100,14 +93,31 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
   );
 }
 
-function TabButton({ label, active, onClick }: {
+// `data-tour` ids for the nav items (docs/WHATS-NEW.md §2).
+const SETTINGS_NAV_TOUR: Record<SettingsTab, string> = {
+  general: tourId("settings-nav-general"),
+  editor: tourId("settings-nav-editor"),
+  models: tourId("settings-nav-models"),
+  routines: tourId("settings-nav-routines"),
+  appearance: tourId("settings-nav-appearance"),
+  usage: tourId("settings-nav-usage"),
+  shortcuts: tourId("settings-nav-shortcuts"),
+  privacy: tourId("settings-nav-privacy"),
+  integrations: tourId("settings-nav-integrations"),
+  account: tourId("settings-nav-account"),
+  about: tourId("settings-nav-about"),
+};
+
+function TabButton({ label, tour, active, onClick }: {
   label: string;
+  tour: string;
   active: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
+      data-tour={tour}
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className="mb-0.5 flex w-full items-baseline rounded-md px-3 py-1.5 text-left transition"

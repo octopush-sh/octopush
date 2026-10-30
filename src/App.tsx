@@ -59,6 +59,7 @@ import { useSyncPrefsStore } from "./stores/syncPrefsStore";
 import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
+import { WhatsNewHost } from "./components/WhatsNewHost";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
@@ -829,6 +830,9 @@ function App() {
       switch (d?.kind) {
         case "settings": setSettingsTab(d.tab); break;
         case "close-settings": setSettingsTab(null); break;
+        case "close-overlays":
+          setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
+          break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
         case "palette": setShowPalette(true); break;
         case "mission-control": setMissionControlOpen(true); break;
@@ -2056,6 +2060,7 @@ function App() {
           onSketch={handleSketch}
         />
         <ToastContainer />
+        <WhatsNewHost />
       </div>
     );
   }
@@ -2906,6 +2911,7 @@ function App() {
 
       <ToastContainer />
       <UpdateNotifier />
+      <WhatsNewHost />
       <UpgradeSheet />
       <HistorySheet />
       {/* Mounted only while open — the room subscribes to the whole runs

@@ -14,6 +14,8 @@ export const NAVIGATE_EVENT = "octo:navigate";
 export type NavigateDetail =
   | { kind: "settings"; tab: SettingsTab }
   | { kind: "close-settings" }
+  /** Close everything a tour may have opened (Settings, palette, rooms). */
+  | { kind: "close-overlays" }
   | { kind: "mode"; mode: WorkspaceMode }
   | { kind: "palette" }
   | { kind: "mission-control" }
