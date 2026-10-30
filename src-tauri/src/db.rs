@@ -1602,13 +1602,30 @@ impl Db {
     }
 
     /// [`record_token_spend`](Self::record_token_spend) with Talk attribution:
-    /// the thread and whether the director or a sub-agent spent it.
+    /// the thread and whether the director or a sub-agent spent it. Records
+    /// `cost_basis = 'computed'`; callers that resolved the price (and so
+    /// know when it is missing) use
+    /// [`record_token_spend_with_basis`](Self::record_token_spend_with_basis).
     pub fn record_token_spend_in_thread(
         &self,
         ev: &TokenEvent,
         surface: &str,
         thread_id: Option<&str>,
         origin: Option<&str>,
+    ) -> AppResult<()> {
+        self.record_token_spend_with_basis(ev, surface, thread_id, origin, "computed")
+    }
+
+    /// Record with the `cost_basis` the caller resolved before taking the DB
+    /// lock (`'computed'` or `'unpriced'`, see `token_engine::basis_for`) —
+    /// the DB layer never loads the pricing catalog itself.
+    pub fn record_token_spend_with_basis(
+        &self,
+        ev: &TokenEvent,
+        surface: &str,
+        thread_id: Option<&str>,
+        origin: Option<&str>,
+        cost_basis: &str,
     ) -> AppResult<()> {
         // A workspace id names the workspace; a workspace TERMINAL id (the
         // RUN-mode PTY hook scans under it) resolves to its workspace, so
@@ -1660,12 +1677,7 @@ impl Db {
             cost_usd: ev.cost_usd,
             // 'unpriced' when the model has no price (tokens at $0) — the
             // Usage page flags it and savings leave it out.
-            cost_basis: crate::token_engine::ledger_cost_basis(
-                &ev.model,
-                ev.cost_usd,
-                (ev.input_tokens + ev.output_tokens + ev.cache_read_tokens + ev.cache_creation_tokens) as i64,
-            )
-            .into(),
+            cost_basis: cost_basis.to_string(),
             // No idempotency key: these are distinct billed calls (the PTY scanner
             // already deduped via its seq high-water before we get here).
             idempotency_key: None,
@@ -3765,51 +3777,164 @@ impl Db {
         Ok(out)
     }
 
+    /// Rows the re-pricer looks at: `'unpriced'` rows with tokens, plus —
+    /// when `include_legacy` — `'computed'` rows at $0 with tokens (recorded
+    /// before the ledger told unknown from free; a one-time pass, gated by
+    /// the caller with an `app_meta` flag, so free local rows are not
+    /// rescanned on every launch).
+    pub fn reprice_candidates(&self, include_legacy: bool) -> AppResult<Vec<RepriceCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+             FROM spend_events
+             WHERE cost_usd = 0
+               AND (cost_basis = 'unpriced' OR (?1 AND cost_basis = 'computed'))
+               AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0",
+        )?;
+        let rows = stmt.query_map(params![include_legacy], RepriceCandidate::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// `'computed'` rows (not provider-reported) whose model id may be one
+    /// an earlier release priced wrong (see
+    /// `provider_router::STALE_BUILTIN_PRICES`). A LIKE pre-filter; the
+    /// caller matches the normalized id exactly.
+    pub fn stale_price_candidates(&self, like_patterns: &[&str]) -> AppResult<Vec<RepriceCandidate>> {
+        let mut out = Vec::new();
+        for pat in like_patterns {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+                 FROM spend_events
+                 WHERE cost_basis = 'computed' AND provider_cost_usd IS NULL AND cost_usd > 0
+                   AND model LIKE ?1",
+            )?;
+            let rows = stmt.query_map(params![pat], RepriceCandidate::from_row)?;
+            for r in rows {
+                let r = r?;
+                if !out.iter().any(|c: &RepriceCandidate| c.id == r.id) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply a [`RepricePlan`] in one savepoint: per-row new costs, then the
+    /// `'unpriced'` / back-to-`'computed'` classifications in bulk
+    /// (`WHERE id IN (…)`). Returns how many rows got a (new) price.
+    pub fn apply_reprice(&self, plan: &RepricePlan) -> AppResult<usize> {
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute_batch("SAVEPOINT reprice")?;
+        let result = self.apply_reprice_inner(plan);
+        match result {
+            Ok(_) => self.conn.execute_batch("RELEASE reprice")?,
+            Err(_) => self.conn.execute_batch("ROLLBACK TO reprice; RELEASE reprice")?,
+        }
+        result
+    }
+
+    fn apply_reprice_inner(&self, plan: &RepricePlan) -> AppResult<usize> {
+        let mut n = 0usize;
+        {
+            let mut stmt = self.conn.prepare(
+                "UPDATE spend_events SET cost_usd = ?2, computed_cost_usd = ?2, cost_basis = 'computed' WHERE id = ?1",
+            )?;
+            for (id, cost) in &plan.priced {
+                n += stmt.execute(params![id, cost])?;
+            }
+        }
+        self.update_basis_in("unpriced", "cost_basis <> 'unpriced'", &plan.unpriced)?;
+        self.update_basis_in("computed", "cost_basis = 'unpriced'", &plan.free)?;
+        Ok(n)
+    }
+
+    /// `UPDATE spend_events SET cost_basis = ?basis WHERE {guard} AND id IN (…)`,
+    /// chunked to stay under SQLite's bound-parameter limit.
+    fn update_basis_in(&self, basis: &str, guard: &str, ids: &[i64]) -> AppResult<()> {
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let sql = format!("UPDATE spend_events SET cost_basis = '{basis}' WHERE {guard} AND id IN ({marks})");
+            self.conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        }
+        Ok(())
+    }
+
     /// Give a price to rows that were billed at $0 because their model was
     /// unpriced at the time (`cost_basis = 'unpriced'`, or a legacy
     /// `'computed'` row with tokens but no cost). `price` resolves a model to
     /// its current prices; rows whose model is still unpriced are marked
-    /// `'unpriced'` and keep $0; an explicit $0 price (local model) leaves
-    /// the row `'computed'`. Returns rows that got a price.
+    /// `'unpriced'` and keep $0; an explicit $0 price (a local or
+    /// deliberately-free model) marks the row `'computed'`. Returns rows that
+    /// got a price. (The app's own path splits this around the DB lock —
+    /// `commands::reprice_ledger`; this one-call form is for tests.)
     pub fn reprice_unpriced(
         &self,
         price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
     ) -> AppResult<usize> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
-             FROM spend_events
-             WHERE cost_usd = 0 AND cost_basis IN ('computed', 'unpriced')
-               AND (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) > 0",
-        )?;
-        let rows: Vec<(i64, String, i64, i64, i64, i64)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut n = 0usize;
-        let mut cache: std::collections::HashMap<String, Option<crate::token_engine::ModelPrices>> =
-            std::collections::HashMap::new();
-        for (id, model, i, o, cr, cc) in rows {
-            let prices = cache.entry(model.clone()).or_insert_with(|| price(&model));
-            let Some(p) = prices.as_ref() else {
-                // Still no price: mark it unpriced (classifies rows recorded
-                // before the ledger told unknown from free) so the Usage
-                // notice counts it and savings leave it out.
-                self.conn.execute(
-                    "UPDATE spend_events SET cost_basis = 'unpriced' WHERE id = ?1 AND cost_basis <> 'unpriced'",
-                    params![id],
-                )?;
-                continue;
-            };
-            let cost = p.cost(i.max(0) as u64, o.max(0) as u64, cr.max(0) as u64, cc.max(0) as u64);
-            if cost <= 0.0 {
-                continue;
-            }
-            self.conn.execute(
-                "UPDATE spend_events SET cost_usd = ?2, computed_cost_usd = ?2, cost_basis = 'computed' WHERE id = ?1",
-                params![id, cost],
-            )?;
-            n += 1;
+        let candidates = self.reprice_candidates(true)?;
+        self.apply_reprice(&plan_reprice(&candidates, price))
+    }
+
+    /// One-time correction of DIRECT run figures billed at a known-wrong
+    /// builtin price: every `run_stages` row whose model normalizes to one
+    /// of `ratios`' ids has its cost scaled by that ratio (stages persist no
+    /// cache split, and those prices were wrong by one uniform factor), each
+    /// affected run's `cost_usd` drops by the difference, and a run whose
+    /// reference model is one of those ids has its baseline scaled too
+    /// (then clamped to ≥ cost, like `recompute_run_cost`). Retired attempts
+    /// carry no model and are left as they are. Returns stages changed.
+    pub fn fix_stale_direct_prices(&self, ratios: &[(String, f64)]) -> AppResult<usize> {
+        if ratios.is_empty() {
+            return Ok(0);
         }
-        Ok(n)
+        let ratio_of = |model: &str| {
+            let norm = crate::token_engine::normalize_model_id(model);
+            ratios.iter().find(|(id, _)| *id == norm).map(|(_, r)| *r)
+        };
+        let stages: Vec<(String, String, String, f64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, run_id, agent_model, cost_usd FROM run_stages WHERE cost_usd > 0",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let runs: Vec<(String, f64, f64, Option<String>)> = {
+            let mut stmt = self.conn.prepare("SELECT id, cost_usd, baseline_usd, reference_model FROM runs")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        self.conn.execute_batch("SAVEPOINT stale_direct")?;
+        let result = (|| -> AppResult<usize> {
+            let mut changed = 0usize;
+            let mut delta: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            for (id, run_id, model, cost) in &stages {
+                let Some(r) = ratio_of(model) else { continue };
+                let new = cost * r;
+                self.conn.execute("UPDATE run_stages SET cost_usd = ?2 WHERE id = ?1", params![id, new])?;
+                *delta.entry(run_id.clone()).or_insert(0.0) += cost - new;
+                changed += 1;
+            }
+            for (id, cost, baseline, reference) in &runs {
+                let d = delta.get(id).copied().unwrap_or(0.0);
+                let ref_ratio = reference.as_deref().and_then(ratio_of);
+                if d == 0.0 && ref_ratio.is_none() {
+                    continue;
+                }
+                let new_cost = (cost - d).max(0.0);
+                let new_baseline = (baseline * ref_ratio.unwrap_or(1.0)).max(new_cost);
+                self.conn.execute(
+                    "UPDATE runs SET cost_usd = ?2, baseline_usd = ?3 WHERE id = ?1",
+                    params![id, new_cost, new_baseline],
+                )?;
+            }
+            Ok(changed)
+        })();
+        match result {
+            Ok(_) => self.conn.execute_batch("RELEASE stale_direct")?,
+            Err(_) => self.conn.execute_batch("ROLLBACK TO stale_direct; RELEASE stale_direct")?,
+        }
+        result
     }
 
     /// List a single thread's messages in chronological order. (Scoped by
@@ -5814,6 +5939,15 @@ impl Db {
         input_tokens: i64,
         output_tokens: i64,
     ) -> AppResult<()> {
+        // The retired token counters feed only the run's all-premium
+        // baseline. An attempt that burned tokens at $0 (an unpriced model —
+        // or a free one; both have no cost to save against) must not count
+        // as saved, so its tokens stay out of them.
+        let (input_tokens, output_tokens) = if cost_usd == 0.0 && input_tokens + output_tokens > 0 {
+            (0, 0)
+        } else {
+            (input_tokens, output_tokens)
+        };
         self.conn.execute(
             "UPDATE runs
              SET retired_cost_usd = retired_cost_usd + ?2,
@@ -5825,7 +5959,10 @@ impl Db {
         Ok(())
     }
 
-    /// `(retired_cost_usd, retired_input_tokens, retired_output_tokens)` for the run.
+    /// `(retired_cost_usd, retired_input_tokens, retired_output_tokens)` for
+    /// the run. The token counters hold only attempts that carried a cost
+    /// (see `retire_stage_cost`), so baseline math over them never counts an
+    /// unpriced attempt as saved.
     pub fn get_retired_cost(&self, run_id: &str) -> AppResult<(f64, i64, i64)> {
         self.conn
             .query_row(
@@ -6252,6 +6389,96 @@ pub struct ChatAgentRun {
     pub spec_json: String,
     pub transcript_json: String,
     pub model: String,
+}
+
+/// A ledger row the re-pricer may change (see `Db::reprice_candidates`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepriceCandidate {
+    pub id: i64,
+    pub model: String,
+    pub surface: String,
+    pub origin: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+impl RepriceCandidate {
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            model: r.get(1)?,
+            surface: r.get(2)?,
+            origin: r.get(3)?,
+            input_tokens: r.get(4)?,
+            output_tokens: r.get(5)?,
+            cache_read_tokens: r.get(6)?,
+            cache_creation_tokens: r.get(7)?,
+        })
+    }
+
+    /// Whether the row is ONE provider request (so per-request price tiers
+    /// apply): RUN transcript lines, one-shot REVIEW/adhoc calls and Talk
+    /// director rounds are; DIRECT stages and sub-agent attempts aggregate.
+    pub fn single_request(&self) -> bool {
+        match self.surface.as_str() {
+            "run" | "review" | "adhoc" => true,
+            "talk" => !self.origin.as_deref().is_some_and(|o| o.starts_with("subagent:")),
+            _ => false,
+        }
+    }
+}
+
+/// What `Db::apply_reprice` writes: new costs, rows to mark `'unpriced'`,
+/// and rows whose model now has an explicit $0 price (back to `'computed'`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RepricePlan {
+    pub priced: Vec<(i64, f64)>,
+    pub unpriced: Vec<i64>,
+    pub free: Vec<i64>,
+}
+
+impl RepricePlan {
+    pub fn is_empty(&self) -> bool {
+        self.priced.is_empty() && self.unpriced.is_empty() && self.free.is_empty()
+    }
+}
+
+/// Plan a re-price without touching the DB: resolve each distinct model
+/// once with `price` (callers resolve OUTSIDE the DB lock), apply
+/// per-request tiers to single-request rows.
+pub fn plan_reprice(
+    rows: &[RepriceCandidate],
+    price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
+) -> RepricePlan {
+    let mut book: std::collections::HashMap<&str, Option<crate::token_engine::ModelPrices>> =
+        std::collections::HashMap::new();
+    let mut plan = RepricePlan::default();
+    for r in rows {
+        let prices = *book.entry(r.model.as_str()).or_insert_with(|| price(&r.model));
+        let Some(p) = prices else {
+            plan.unpriced.push(r.id);
+            continue;
+        };
+        let (i, o, cr, cc) = (
+            r.input_tokens.max(0) as u64,
+            r.output_tokens.max(0) as u64,
+            r.cache_read_tokens.max(0) as u64,
+            r.cache_creation_tokens.max(0) as u64,
+        );
+        let cost = if r.single_request() {
+            crate::token_engine::request_cost(&r.model, p, i, o, cr, cc)
+        } else {
+            p.cost(i, o, cr, cc)
+        };
+        if cost > 0.0 {
+            plan.priced.push((r.id, cost));
+        } else {
+            plan.free.push(r.id);
+        }
+    }
+    plan
 }
 
 /// One Talk thread's cost from the ledger (see `thread_cost`).

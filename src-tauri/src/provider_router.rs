@@ -198,9 +198,13 @@ impl ProviderRouter {
             // manual edits).
             for p in &mut list {
                 let Some(def) = defaults.get(&p.name) else { continue };
-                for def_model in &def.models {
+                for (idx, def_model) in def.models.iter().enumerate() {
                     if !p.models.iter().any(|m| m.id == def_model.id) {
-                        p.models.push(def_model.clone());
+                        // Keep the builtin order (current models first) so a
+                        // newly shipped model leads its provider's list and
+                        // the picker's tag-based Recommended rows.
+                        let at = idx.min(p.models.len());
+                        p.models.insert(at, def_model.clone());
                     }
                 }
             }
@@ -254,11 +258,27 @@ impl ProviderRouter {
         out
     }
 
+    /// Providers in a deterministic lookup order, so an id two providers
+    /// both expose always resolves to the same one: enabled before disabled,
+    /// the user's own providers before the builtins (a custom gateway entry
+    /// reflects what the user is actually billed), then by name.
+    fn providers_in_lookup_order(&self) -> Vec<&ProviderConfig> {
+        let builtin = ["anthropic", "openai", "deepseek", "ollama"];
+        let mut v: Vec<&ProviderConfig> = self.providers.values().collect();
+        v.sort_by(|a, b| {
+            (!a.enabled, builtin.contains(&a.name.as_str()), &a.name)
+                .cmp(&(!b.enabled, builtin.contains(&b.name.as_str()), &b.name))
+        });
+        v
+    }
+
     pub fn find_model(&self, model_id: &str) -> Option<(&ProviderConfig, &ModelInfo)> {
         // Exact match first; then retry against the normalized id so a dated
-        // snapshot / Bedrock-prefixed / bracket-suffixed variant still resolves
-        // to its base catalog entry instead of falling through to $0 pricing.
-        for p in self.providers.values() {
+        // snapshot / Bedrock- or LiteLLM-prefixed / bracket-suffixed / Ollama-
+        // tagged variant still resolves to its base catalog entry instead of
+        // falling through to unpriced. Exact-match semantics either way.
+        let order = self.providers_in_lookup_order();
+        for p in order.iter().copied() {
             for m in &p.models {
                 if m.id == model_id {
                     return Some((p, m));
@@ -267,7 +287,7 @@ impl ProviderRouter {
         }
         let normalized = crate::token_engine::normalize_model_id(model_id);
         if normalized != model_id {
-            for p in self.providers.values() {
+            for p in order.iter().copied() {
                 for m in &p.models {
                     if m.id == normalized {
                         return Some((p, m));
@@ -276,6 +296,13 @@ impl ProviderRouter {
             }
         }
         None
+    }
+
+    /// The provider named by a `provider/model` id prefix (LiteLLM style,
+    /// e.g. `ollama/llama3`), if the catalog has one by that name.
+    pub fn provider_for_prefix(&self, model_id: &str) -> Option<&ProviderConfig> {
+        let (prefix, _) = model_id.split_once('/')?;
+        self.providers.get(prefix)
     }
 
     pub fn suggest_model(&self, task: &TaskType) -> ModelSuggestion {
@@ -311,11 +338,69 @@ pub struct ModelWithProvider {
 
 // ─── Defaults ─────────────────────────────────────────────────────
 
-fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".octopush")
-        .join("providers.json")
+/// Where the provider catalog lives: `$OCTOPUSH_CONFIG_DIR/providers.json`
+/// when that variable is set (non-empty), else `~/.octopush/providers.json`.
+///
+/// Under `cfg(test)` the real home is never used: a test either injects its
+/// own directory for the current thread ([`TestConfigDir`]) or falls back to
+/// a per-process temp directory, so no test reads or rewrites the owner's
+/// catalog.
+pub(crate) fn config_path() -> PathBuf {
+    config_dir().join("providers.json")
+}
+
+#[cfg(not(test))]
+fn config_dir() -> PathBuf {
+    config_dir_from(std::env::var_os("OCTOPUSH_CONFIG_DIR"), dirs::home_dir())
+}
+
+#[cfg(test)]
+fn config_dir() -> PathBuf {
+    TEST_CONFIG_DIR.with(|d| d.borrow().clone()).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("octopush-test-config-{}", std::process::id()))
+    })
+}
+
+/// `OCTOPUSH_CONFIG_DIR` (when set and non-empty) wins over `~/.octopush`.
+pub(crate) fn config_dir_from(env_dir: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = env_dir.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    home.unwrap_or_else(|| PathBuf::from(".")).join(".octopush")
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test guard: points this thread's [`config_path`] at a fresh temp
+/// directory for its lifetime, then restores the previous one.
+#[cfg(test)]
+pub(crate) struct TestConfigDir {
+    dir: tempfile::TempDir,
+    prev: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl TestConfigDir {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("temp config dir");
+        let prev = TEST_CONFIG_DIR.with(|d| d.replace(Some(dir.path().to_path_buf())));
+        Self { dir, prev }
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestConfigDir {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        TEST_CONFIG_DIR.with(|d| *d.borrow_mut() = prev);
+    }
 }
 
 /// Default providers as a list (for "reset to defaults" in the UI).
@@ -369,31 +454,42 @@ pub fn validate_providers(list: &[ProviderConfig]) -> Result<(), String> {
 /// per million tokens. On load, an on-disk model still carrying exactly one
 /// of these is reset to the current builtin price; any other value is a
 /// user edit (or a LiteLLM refresh) and is left alone.
-const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
+pub(crate) const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
     // Opus 4.6 was priced like Opus 4.1 ($15/$75); it is $5/$25.
     ("claude-opus-4-6", [15.0, 75.0, 1.5, 18.75]),
+    // …and the shape the cache backfill can leave: stale input/output with
+    // the current cache prices.
+    ("claude-opus-4-6", [15.0, 75.0, 0.5, 6.25]),
     // Sonnet 5 was priced like Sonnet 4.6 ($3/$15); it is $2/$10.
     ("claude-sonnet-5", [3.0, 15.0, 0.3, 3.75]),
+    ("claude-sonnet-5", [3.0, 15.0, 0.2, 2.5]),
 ];
 
 /// Reset models whose on-disk price is a known-stale builtin default (see
-/// [`STALE_BUILTIN_PRICES`]) to the current builtin price. Returns how many
-/// models changed.
+/// [`STALE_BUILTIN_PRICES`]) to the current builtin price — on any provider,
+/// builtin or custom (a custom gateway provider may have copied the old
+/// default). Returns how many models changed.
 pub(crate) fn migrate_stale_builtin_prices(
     list: &mut [ProviderConfig],
     defaults: &HashMap<String, ProviderConfig>,
 ) -> usize {
     let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let current = |id: &str| -> Option<ModelInfo> {
+        let mut names: Vec<&String> = defaults.keys().collect();
+        names.sort();
+        names.into_iter().find_map(|n| defaults[n].models.iter().find(|x| x.id == id).cloned())
+    };
     let mut n = 0;
     for p in list.iter_mut() {
-        let Some(def) = defaults.get(&p.name) else { continue };
         for m in &mut p.models {
-            let Some((_, stale)) = STALE_BUILTIN_PRICES.iter().find(|(id, _)| *id == m.id) else { continue };
             let on_disk = [m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m];
-            if !on_disk.iter().zip(stale.iter()).all(|(a, b)| same(*a, *b)) {
+            let is_stale = STALE_BUILTIN_PRICES
+                .iter()
+                .any(|(id, stale)| *id == m.id && on_disk.iter().zip(stale.iter()).all(|(a, b)| same(*a, *b)));
+            if !is_stale {
                 continue;
             }
-            if let Some(d) = def.models.iter().find(|x| x.id == m.id) {
+            if let Some(d) = current(&m.id) {
                 m.input_cost_per_m = d.input_cost_per_m;
                 m.output_cost_per_m = d.output_cost_per_m;
                 m.cache_read_cost_per_m = d.cache_read_cost_per_m;
@@ -415,6 +511,60 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.anthropic.com".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
             models: vec![
+                // Current lineup (platform.claude.com model overview, fetched
+                // 2026-10-29): 1M-token context, 128K max output. Prices must
+                // match `token_engine::builtin_prices`.
+                ModelInfo {
+                    id: "claude-fable-5-1".into(),
+                    display_name: "Claude Fable 5.1".into(),
+                    input_cost_per_m: 10.0,
+                    output_cost_per_m: 50.0,
+                    cache_read_cost_per_m: 0.25,
+                    cache_creation_cost_per_m: 12.50,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["most capable".into(), "largest ctx".into()],
+                },
+                ModelInfo {
+                    id: "claude-opus-5-5".into(),
+                    display_name: "Claude Opus 5.5".into(),
+                    input_cost_per_m: 4.0,
+                    output_cost_per_m: 20.0,
+                    cache_read_cost_per_m: 0.20,
+                    cache_creation_cost_per_m: 5.0,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["best reasoning".into(), "largest ctx".into()],
+                },
+                ModelInfo {
+                    id: "claude-sonnet-5-5".into(),
+                    display_name: "Claude Sonnet 5.5".into(),
+                    input_cost_per_m: 2.0,
+                    output_cost_per_m: 10.0,
+                    cache_read_cost_per_m: 0.10,
+                    cache_creation_cost_per_m: 2.50,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["balanced".into(), "coding".into()],
+                },
+                ModelInfo {
+                    // Priced at its <=100K-token prompt tier here; the
+                    // per-request paths apply the >100K tier
+                    // (`token_engine::request_prices`).
+                    id: "claude-haiku-5-5".into(),
+                    display_name: "Claude Haiku 5.5".into(),
+                    input_cost_per_m: 0.10,
+                    output_cost_per_m: 0.50,
+                    cache_read_cost_per_m: 0.01,
+                    cache_creation_cost_per_m: 0.125,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["fast".into(), "cheap".into()],
+                },
                 ModelInfo {
                     id: "claude-fable-5".into(),
                     display_name: "Claude Fable 5".into(),
@@ -641,11 +791,15 @@ mod tests {
         assert!(providers.contains_key("anthropic"));
         assert!(providers.contains_key("openai"));
         let anthropic = &providers["anthropic"];
-        // 4 current (fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy (opus-4-6, sonnet-4-6).
-        assert_eq!(anthropic.models.len(), 6);
+        // 4 current (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5) + 4 previous
+        // (fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy (opus-4-6, sonnet-4-6).
+        assert_eq!(anthropic.models.len(), 10);
         assert!(anthropic.enabled);
         // Current-generation ids must be present and priced (regression F2).
-        for id in ["claude-opus-4-8", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5"] {
+        for id in [
+            "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+            "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5",
+        ] {
             assert!(anthropic.models.iter().any(|m| m.id == id), "missing {id}");
         }
     }

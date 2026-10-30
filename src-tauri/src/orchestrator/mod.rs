@@ -1322,18 +1322,15 @@ impl Orchestrator {
         if let Some(p) = &ref_prices {
             baseline += p.cost(retired_in as u64, retired_out as u64, 0, 0);
         }
-        // A stage on an unpriced model billed $0 only because its price is
-        // unknown — re-pricing its tokens at the reference model would report
-        // the whole stage as saved. Leave such stages out of the baseline.
-        let mut priced: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        // A stage that burned tokens at $0 has no cost to save against: an
+        // unpriced model billed $0 only because its price is unknown, and an
+        // old run recomputed today may predate the unpriced marker. Either
+        // way, re-pricing its tokens at the reference model would report the
+        // whole stage as saved — so it stays out of the baseline. (Retired
+        // attempts at $0 are already kept out of the retired counters.)
         for s in &stages {
             cost += s.cost_usd;
-            let unpriced = s.cost_usd == 0.0
-                && s.input_tokens + s.output_tokens > 0
-                && !*priced
-                    .entry(s.agent_model.clone())
-                    .or_insert_with(|| crate::token_engine::is_priced(&s.agent_model));
-            if unpriced {
+            if s.cost_usd == 0.0 && s.input_tokens + s.output_tokens > 0 {
                 continue;
             }
             if let Some(p) = &ref_prices {

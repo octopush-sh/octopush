@@ -502,7 +502,13 @@ impl TranscriptIngestor {
         // reloads the catalog from disk).
         let (entries, consumed) = read_new_entries(path, offset)?;
         let earliest = entries.iter().map(|u| u.ts_utc.clone()).min();
+        // Resolve each distinct model's price before taking the DB lock.
         let mut prices: HashMap<String, Option<ModelPrices>> = HashMap::new();
+        for u in &entries {
+            if !prices.contains_key(&u.model) {
+                prices.insert(u.model.clone(), prices_for(&u.model));
+            }
+        }
         let mut inserted = 0usize;
         let now = chrono::Utc::now();
         let db = self.db.lock();
@@ -515,7 +521,8 @@ impl TranscriptIngestor {
                     .entry(u.model.clone())
                     .or_insert_with(|| prices_for(&u.model))
                     .as_ref()
-                    .map(|p| p.cost(u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens));
+                    // One transcript line = one API request: per-request tiers.
+                    .map(|p| crate::token_engine::request_cost(&u.model, *p, u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens));
                 let cost = priced.unwrap_or(0.0);
                 // An unknown model is unpriced, not free.
                 let tokens = u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_creation_tokens;

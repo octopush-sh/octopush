@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { modelCostCell, unpricedTitle } from "./cost";
+import { budgetUnenforceableNote, modelCostCell, unpricedTitle } from "./cost";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -32,5 +32,13 @@ describe("unpricedTitle", () => {
   it("names the models and says they are not counted", () => {
     expect(unpricedTitle(["a", "b"])).toMatch(/^No price for a, b — its calls are not counted as spend or as savings/);
     expect(unpricedTitle([])).toContain("this model");
+  });
+});
+
+describe("budgetUnenforceableNote", () => {
+  it("is empty when nothing is unpriced and counts stages otherwise", () => {
+    expect(budgetUnenforceableNote(0)).toBe("");
+    expect(budgetUnenforceableNote(1)).toBe("budget not enforceable: 1 stage unpriced");
+    expect(budgetUnenforceableNote(3)).toBe("budget not enforceable: 3 stages unpriced");
   });
 });

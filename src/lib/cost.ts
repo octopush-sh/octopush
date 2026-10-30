@@ -95,3 +95,12 @@ export function modelCostCell(
   if (m.costUsd === 0) return { text: "unpriced", unpriced: true, title: unpricedTitle([m.model]) };
   return { text: fmt(m.costUsd), unpriced: true, title: `${calls} unpriced — ${unpricedTitle([m.model])}` };
 }
+
+/**
+ * A run's budget gate compares billed cost, and an unpriced stage bills $0 —
+ * so a budget cannot stop spend it cannot see. "" when every stage is priced.
+ */
+export function budgetUnenforceableNote(unpricedStages: number): string {
+  if (unpricedStages <= 0) return "";
+  return `budget not enforceable: ${unpricedStages === 1 ? "1 stage" : `${unpricedStages} stages`} unpriced`;
+}

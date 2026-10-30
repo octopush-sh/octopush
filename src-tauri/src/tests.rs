@@ -123,7 +123,10 @@ mod db_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn pricing_known_models() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         let cost = compute_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
         // Opus 4.6 is $5 in / $25 out: $5 input + $2.50 output = $7.50.
         assert!((cost - 7.5).abs() < 0.01);
@@ -185,7 +188,10 @@ mod db_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn pricing_authority_unknown_is_none() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         use crate::token_engine::{cost_for, prices_for};
         // Genuinely-unknown model → None (so callers can flag unpriced), and
         // cost_for yields 0 rather than a fabricated price.
@@ -194,7 +200,10 @@ mod db_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn cost_for_prices_current_and_dated_models() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         use crate::token_engine::cost_for;
         // Catalog-or-hardcoded, a current model must price > 0 (regression F2),
         // and a dated snapshot normalizes to its base and prices too (F20).
@@ -2368,7 +2377,6 @@ mod provider_catalog_tests {
         default_providers_list, validate_providers, write_providers, ProviderRouter, ProviderConfig, ModelInfo,
     };
     use serial_test::serial;
-    use tempfile::TempDir;
 
     fn prov(name: &str, protocol: &str, local: bool, models: Vec<ModelInfo>) -> ProviderConfig {
         ProviderConfig {
@@ -2403,8 +2411,9 @@ mod provider_catalog_tests {
     #[test]
     #[serial]
     fn write_then_load_roundtrips() {
-        let tmp = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp.path());
+        // A per-thread catalog directory — never the real home, and no global
+        // HOME change leaking into other tests.
+        let cfg = crate::provider_router::TestConfigDir::new();
         let list = vec![prov("sonatype", "anthropic", false, vec![model("claude-x")])];
         write_providers(&list).unwrap();
         let router = ProviderRouter::load().unwrap();
@@ -2412,6 +2421,7 @@ mod provider_catalog_tests {
         assert!(names.contains(&"sonatype".to_string()));
         // The built-ins are also re-seeded by load(); our custom one persists.
         assert!(router.find_model("claude-x").is_some());
+        assert!(cfg.path().join("providers.json").exists());
     }
 
     #[test]
@@ -2714,14 +2724,20 @@ mod cost_tests {
     use crate::orchestrator::cost::{baseline_cost, stage_cost};
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn stage_cost_matches_token_engine() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         // claude-opus-4-6: $5/M input, $25/M output.
         let c = stage_cost("claude-opus-4-6", 1_000_000, 100_000, 0, 0);
         assert!((c - (5.0 + 2.5)).abs() < 0.01);
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn baseline_uses_reference_prices_on_actual_tokens() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         // Same tokens, premium reference model → baseline >= actual for a cheaper model.
         let actual = stage_cost("claude-haiku-4-5", 1_000_000, 100_000, 0, 0);
         let base = baseline_cost("claude-opus-4-6", 1_000_000, 100_000);
@@ -3538,6 +3554,42 @@ mod run_crud_tests {
 
         let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
         assert_eq!(db.list_run_stages(&run).unwrap()[0].max_iterations, 40);
+    }
+
+    #[test]
+    fn retired_attempts_at_zero_cost_stay_out_of_the_baseline_counters() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.retire_stage_cost(&run, 0.5, 100, 40).unwrap();
+        // An unpriced (or free) attempt: tokens at $0 — nothing to save against.
+        db.retire_stage_cost(&run, 0.0, 90_000, 9_000).unwrap();
+        assert_eq!(db.get_retired_cost(&run).unwrap(), (0.5, 100, 40));
+    }
+
+    #[test]
+    fn stale_direct_prices_are_scaled_on_stages_runs_and_baselines() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-haiku-4-5", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", Some("claude-opus-4-6"), None, &[]).unwrap();
+        let stages = db.list_run_stages(&run).unwrap();
+        db.complete_run_stage(&stages[0].id, "done", 10_000, 2_000, 0, 0, 0.30, None).unwrap();
+        db.complete_run_stage(&stages[1].id, "done", 10_000, 2_000, 0, 0, 0.02, None).unwrap();
+        db.set_run_cost(&run, 0.32, 0.60).unwrap();
+
+        assert_eq!(db.fix_stale_direct_prices(&[("claude-opus-4-6".into(), 1.0 / 3.0)]).unwrap(), 1);
+        let st = db.list_run_stages(&run).unwrap();
+        assert!((st[0].cost_usd - 0.10).abs() < 1e-9, "{}", st[0].cost_usd);
+        assert!((st[1].cost_usd - 0.02).abs() < 1e-9, "other models untouched");
+        let r = db.get_run(&run).unwrap().unwrap();
+        assert!((r.cost_usd - 0.12).abs() < 1e-9, "{}", r.cost_usd);
+        // The reference was the stale model too: its baseline scales.
+        assert!((r.baseline_usd - 0.20).abs() < 1e-9, "{}", r.baseline_usd);
     }
 
     #[test]
@@ -11852,7 +11904,10 @@ mod thread_ledger_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn thread_cost_splits_director_from_subagents_and_prices_the_strong_baseline() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         let db = Arc::new(Mutex::new(test_db()));
         let engine = TokenEngine::new(Arc::clone(&db));
         // Director: 2 rounds, mostly cached. Sub-agent: one attempt.
@@ -11884,7 +11939,10 @@ mod thread_ledger_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn reprice_unpriced_prices_zero_cost_rows_once_their_model_has_a_price() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         let db = Arc::new(Mutex::new(test_db()));
         let engine = TokenEngine::new(Arc::clone(&db));
         // Cost 0 and a model the catalog does not know → recorded at $0.
@@ -12130,6 +12188,100 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn bedrock_and_litellm_ids_normalize_to_their_base_model() {
+        use crate::token_engine::normalize_model_id as n;
+        assert_eq!(n("us.anthropic.claude-opus-5-5-20261001-v1:0"), "claude-opus-5-5");
+        assert_eq!(n("bedrock/us.anthropic.claude-sonnet-5-5-v1:0"), "claude-sonnet-5-5");
+        assert_eq!(n("global.anthropic.claude-haiku-5-5-v1:0"), "claude-haiku-5-5");
+        assert_eq!(n("eu.anthropic.claude-fable-5-1-v2"), "claude-fable-5-1");
+        assert_eq!(n("apac.anthropic.claude-sonnet-4-5-20250929-v1:0"), "claude-sonnet-4-5");
+        assert_eq!(n("anthropic.claude-opus-4-1-20250805-v1:0"), "claude-opus-4-1");
+        assert_eq!(n("anthropic/claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(n("bedrock/converse/us.anthropic.claude-opus-5-5-v1:0"), "claude-opus-5-5");
+        assert_eq!(
+            n("arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-5-5-v1:0"),
+            "claude-sonnet-5-5"
+        );
+        // Ollama tags.
+        assert_eq!(n("qwen2.5-coder:7b"), "qwen2.5-coder");
+        assert_eq!(n("ollama/llama3.3:latest"), "llama3.3");
+        // Not a version suffix / not a region prefix: left alone, so lookups
+        // stay exact.
+        assert_eq!(n("claude-opus-5-5-vision"), "claude-opus-5-5-vision");
+        assert_eq!(n("us.other.model"), "us.other.model");
+        assert_eq!(n("deepseek-v3"), "deepseek-v3");
+        assert_eq!(n("claude-haiku-4-5"), "claude-haiku-4-5");
+        for id in [
+            "us.anthropic.claude-opus-5-5-20261001-v1:0",
+            "bedrock/us.anthropic.claude-sonnet-5-5-v1:0",
+            "global.anthropic.claude-haiku-5-5-v1:0",
+        ] {
+            assert!(builtin_prices(id).is_some(), "{id}");
+        }
+        assert!(builtin_prices("claude-opus-5-5-vision").is_none());
+    }
+
+    #[test]
+    fn haiku_5_5_long_prompt_tier_applies_per_request() {
+        use crate::token_engine::{request_cost, request_prices};
+        let base = builtin_prices("claude-haiku-5-5").unwrap();
+        // <=100K prompt (input + cache read + cache write): base tier.
+        assert_eq!(request_prices("claude-haiku-5-5", base, 100_000), base);
+        // >100K: 0.50 / 0.625 / 0.05 / 2.50.
+        let long = request_prices("claude-haiku-5-5", base, 100_001);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(long.input_per_m, 0.50) && near(long.cache_creation_per_m, 0.625));
+        assert!(near(long.cache_read_per_m, 0.05) && near(long.output_per_m, 2.50));
+        // Cache reads count toward the prompt size.
+        let c = request_cost("us.anthropic.claude-haiku-5-5-v1:0", base, 1_000, 1_000_000, 150_000, 0);
+        assert!(near(c, (1_000.0 * 0.50 + 1_000_000.0 * 2.50 + 150_000.0 * 0.05) / 1e6), "{c}");
+        // Other models have no tier.
+        let opus = builtin_prices("claude-opus-5-5").unwrap();
+        assert_eq!(request_prices("claude-opus-5-5", opus, 900_000), opus);
+    }
+
+    #[test]
+    fn config_dir_env_override_wins_over_home() {
+        use crate::provider_router::config_dir_from;
+        use std::path::PathBuf;
+        assert_eq!(config_dir_from(Some("/tmp/octo-cfg".into()), Some(PathBuf::from("/home/x"))), PathBuf::from("/tmp/octo-cfg"));
+        assert_eq!(config_dir_from(Some("".into()), Some(PathBuf::from("/home/x"))), PathBuf::from("/home/x/.octopush"));
+        assert_eq!(config_dir_from(None, Some(PathBuf::from("/home/x"))), PathBuf::from("/home/x/.octopush"));
+    }
+
+    #[test]
+    fn find_model_resolves_shared_ids_deterministically_and_free_by_provider() {
+        use crate::provider_router::{builtin_providers, ProviderRouter};
+        use crate::token_engine::prices_in;
+        let mut map = builtin_providers();
+        // A custom gateway exposing a builtin id at its own price wins over the builtin.
+        let mut gw = map["anthropic"].clone();
+        gw.name = "corp-gateway".into();
+        for m in &mut gw.models {
+            m.input_cost_per_m = 1.0;
+        }
+        map.insert("corp-gateway".into(), gw);
+        // A model deliberately priced at $0 on a cloud provider is free, not unpriced.
+        let mut free = map["openai"].clone();
+        free.name = "zero-co".into();
+        free.models.truncate(1);
+        free.models[0].id = "house-model".into();
+        free.models[0].input_cost_per_m = 0.0;
+        free.models[0].output_cost_per_m = 0.0;
+        map.insert("zero-co".into(), free);
+        let router = ProviderRouter::from_map(map);
+        for _ in 0..20 {
+            assert_eq!(router.find_model("claude-opus-5-5").unwrap().0.name, "corp-gateway");
+        }
+        assert_eq!(prices_in(Some(&router), "house-model").unwrap().input_per_m, 0.0);
+        // Ollama, tagged or routed by provider prefix: explicitly free.
+        assert_eq!(prices_in(Some(&router), "qwen2.5-coder:7b").unwrap().output_per_m, 0.0);
+        assert_eq!(prices_in(Some(&router), "ollama/mistral-nemo").unwrap().output_per_m, 0.0);
+        // Unknown cloud ids stay unpriced.
+        assert!(prices_in(Some(&router), "openai/gpt-9").is_none());
+    }
+
+    #[test]
     fn current_models_are_priced_at_the_official_rates() {
         assert_prices("claude-fable-5-1", 10.0, 12.50, 0.25, 50.0);
         assert_prices("claude-opus-5-5", 4.0, 5.0, 0.20, 20.0);
@@ -12176,7 +12328,10 @@ mod pricing_table_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn unknown_models_are_unpriced_not_free() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         for m in ["claude-mythos-1", "totally-unknown-model-xyz", "claude-opus-9-9"] {
             assert!(builtin_prices(m).is_none(), "{m}");
             assert!(prices_for(m).is_none(), "{m}");
@@ -12188,7 +12343,10 @@ mod pricing_table_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn local_models_stay_explicitly_free() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         // Ollama is a `local` catalog provider priced at $0: free, not unknown.
         let p = prices_for("llama3.3").expect("local model is priced");
         assert_eq!(p, ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 });
@@ -12232,7 +12390,19 @@ mod pricing_table_tests {
                 _ => {}
             }
         }
-        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 1);
+        // A custom provider holding the post-cache-backfill stale shape.
+        let mut custom = defaults["anthropic"].clone();
+        custom.name = "my-gateway".into();
+        for m in &mut custom.models {
+            if m.id == "claude-sonnet-5" {
+                (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                    (3.0, 15.0, 0.2, 2.5);
+            }
+        }
+        list.push(custom);
+        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 2);
+        let gw_sonnet = list[1].models.iter().find(|m| m.id == "claude-sonnet-5").unwrap();
+        assert_eq!((gw_sonnet.input_cost_per_m, gw_sonnet.output_cost_per_m), (2.0, 10.0));
         let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().clone();
         assert_eq!((get("claude-opus-4-6").input_cost_per_m, get("claude-opus-4-6").output_cost_per_m), (5.0, 25.0));
         assert_eq!(get("claude-opus-4-6").cache_read_cost_per_m, 0.50);
@@ -12268,7 +12438,10 @@ mod unpriced_ledger_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn unpriced_usage_is_excluded_from_savings_and_flagged() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
         let db = Arc::new(Mutex::new(test_db()));
         let engine = TokenEngine::new(Arc::clone(&db));
         engine.record_in_thread(ev("claude-sonnet-5-5", 1_000, 100, 0.0), "talk", Some("t-1"), Some("director")).unwrap();
@@ -12297,6 +12470,116 @@ mod unpriced_ledger_tests {
         assert_eq!(mythos.unpriced_calls, 1);
         let sonnet = rep.by_model.iter().find(|m| m.model == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet.unpriced_calls, 0);
+    }
+
+    fn spend(model: &str, key: &str, surface: &str, origin: Option<&str>, cost: f64, basis: &str, i: i64, cr: i64) -> crate::db::SpendEvent {
+        crate::db::SpendEvent {
+            ts_utc: "2026-10-29T10:00:00+00:00".into(),
+            surface: surface.into(),
+            project_id: None,
+            workspace_id: None,
+            mission_id: None,
+            source_id: Some("s".into()),
+            attempt: 1,
+            model_raw: model.into(),
+            model: model.into(),
+            input_tokens: i,
+            output_tokens: 100,
+            cache_read_tokens: cr,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(cost),
+            cost_usd: cost,
+            cost_basis: basis.into(),
+            idempotency_key: Some(key.into()),
+            thread_id: None,
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    fn cost_of(db: &Db, key: &str) -> (f64, String) {
+        db.conn_ref()
+            .query_row("SELECT cost_usd, cost_basis FROM spend_events WHERE idempotency_key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn startup_reprice_runs_its_one_time_passes_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        {
+            let d = db.lock();
+            // Legacy $0 rows: unknown model, a local model, a model priced now.
+            d.insert_spend_event(&spend("claude-mythos-1", "a", "run", None, 0.0, "computed", 1_000, 0)).unwrap();
+            d.insert_spend_event(&spend("llama3.3", "b", "talk", Some("director"), 0.0, "computed", 1_000, 0)).unwrap();
+            d.insert_spend_event(&spend("claude-opus-5-5", "c", "run", None, 0.0, "unpriced", 1_000, 0)).unwrap();
+            // Billed at the stale Opus 4.6 price ($15/$75): 1000 in + 100 out.
+            d.insert_spend_event(&spend("claude-opus-4-6-20260101", "d", "talk", Some("director"), 0.0225, "computed", 1_000, 0)).unwrap();
+            // A local model's row once marked unpriced goes back to computed.
+            d.insert_spend_event(&spend("qwen2.5-coder:7b", "e", "talk", Some("director"), 0.0, "unpriced", 1_000, 0)).unwrap();
+        }
+        let n = crate::commands::reprice_ledger(&db).unwrap();
+        assert_eq!(n, 1, "only the Opus 5.5 row got a new price from $0");
+        let d = db.lock();
+        assert_eq!(cost_of(&d, "a"), (0.0, "unpriced".into()));
+        assert_eq!(cost_of(&d, "b"), (0.0, "computed".into()));
+        let (c, basis) = cost_of(&d, "c");
+        assert!((c - (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12 && basis == "computed");
+        let (c, _) = cost_of(&d, "d");
+        assert!((c - (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6).abs() < 1e-12, "stale Opus 4.6 row corrected: {c}");
+        assert_eq!(cost_of(&d, "e"), (0.0, "computed".into()));
+        assert!(d.meta_get("ledger_unpriced_classify_v1").unwrap().is_some());
+        assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        // Flags set: a later legacy $0 row is no longer scanned, and the stale
+        // pass never re-runs.
+        d.insert_spend_event(&spend("claude-mythos-2", "f", "run", None, 0.0, "computed", 1_000, 0)).unwrap();
+        d.insert_spend_event(&spend("claude-opus-4-6", "g", "run", None, 0.0225, "computed", 1_000, 0)).unwrap();
+        drop(d);
+        assert_eq!(crate::commands::reprice_ledger(&db).unwrap(), 0);
+        let d = db.lock();
+        assert_eq!(cost_of(&d, "f"), (0.0, "computed".into()));
+        assert!((cost_of(&d, "g").0 - 0.0225).abs() < 1e-12);
+    }
+
+    #[test]
+    fn plan_applies_the_per_request_tier_only_to_single_request_rows() {
+        use crate::db::{plan_reprice, RepriceCandidate};
+        let row = |id: i64, surface: &str, origin: Option<&str>| RepriceCandidate {
+            id,
+            model: "claude-haiku-5-5".into(),
+            surface: surface.into(),
+            origin: origin.map(str::to_string),
+            input_tokens: 150_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let rows = vec![row(1, "run", None), row(2, "talk", Some("director")), row(3, "talk", Some("subagent:x")), row(4, "direct", None)];
+        let plan = plan_reprice(&rows, &crate::token_engine::builtin_prices);
+        let long = (150_000.0 * 0.50 + 1_000.0 * 2.50) / 1e6;
+        let base = (150_000.0 * 0.10 + 1_000.0 * 0.50) / 1e6;
+        let got: Vec<f64> = plan.priced.iter().map(|(_, c)| *c).collect();
+        for (g, want) in got.iter().zip([long, long, base, base]) {
+            assert!((g - want).abs() < 1e-12, "{got:?}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_single_request_on_haiku_5_5_over_100k_bills_the_long_tier() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let mut e = ev("claude-haiku-5-5", 20_000, 1_000, 0.0);
+        e.cache_read_tokens = 90_000;
+        engine.record_request_in_thread(e.clone(), "talk", Some("t-9"), Some("director")).unwrap();
+        // The same tokens as an aggregate (a sub-agent attempt) keep the base tier.
+        engine.record_in_thread(e, "talk", Some("t-9"), Some("subagent:x")).unwrap();
+        let c = db.lock().thread_cost("t-9", None).unwrap();
+        let long = (20_000.0 * 0.50 + 1_000.0 * 2.50 + 90_000.0 * 0.05) / 1e6;
+        let base = (20_000.0 * 0.10 + 1_000.0 * 0.50 + 90_000.0 * 0.01) / 1e6;
+        assert!((c.spent_usd - (long + base)).abs() < 1e-12, "{}", c.spent_usd);
     }
 
     #[test]

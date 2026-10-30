@@ -4,6 +4,7 @@ import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 import { OctoMark } from "./icons/OctoMark";
+import { budgetUnenforceableNote, unpricedTitle } from "../lib/cost";
 
 interface Props {
   run: Run;
@@ -36,7 +37,9 @@ export function RunLedger({ run, stages }: Props) {
     prevStatus.current = run.status;
   }, [run.status, run.baselineUsd]);
 
-  const billed = stages.filter((s) => s.costUsd > 0);
+  const billed = stages.filter((s) => s.costUsd > 0 || (s.unpricedModel && s.inputTokens + s.outputTokens > 0));
+  const unpriced = stages.filter((s) => s.unpricedModel);
+  const unpricedModels = [...new Set(unpriced.map((s) => s.agentModel))];
 
   return (
     <div className="border-t border-octo-hairline bg-octo-panel">
@@ -66,6 +69,15 @@ export function RunLedger({ run, stages }: Props) {
             · budget ${run.budgetUsd.toFixed(2)}
           </span>
         )}
+        {run.budgetUsd != null && unpriced.length > 0 && (
+          <span
+            className="octo-tabular text-octo-rouge"
+            title={`The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend. ${unpricedTitle(unpricedModels)}`}
+            data-testid="ledger-budget-unenforceable"
+          >
+            · {budgetUnenforceableNote(unpriced.length)}
+          </span>
+        )}
         {(tokIn > 0 || tokOut > 0) && (
           <span className="octo-tabular text-octo-mute" title="input / output tokens">
             · ↑{fmtTokens(tokIn)} ↓{fmtTokens(tokOut)}
@@ -83,7 +95,12 @@ export function RunLedger({ run, stages }: Props) {
         <div className="flex flex-wrap gap-x-5 gap-y-1 px-4 py-2 font-mono text-[10px] text-octo-mute">
           {billed.map((s) => (
             <span key={s.id}>
-              {labelForRole(s.role)} <span className="octo-tabular text-octo-sage">${s.costUsd.toFixed(2)}</span>
+              {labelForRole(s.role)}{" "}
+              {s.unpricedModel && s.costUsd === 0 ? (
+                <span className="text-octo-mute" title={unpricedTitle([s.agentModel])}>unpriced</span>
+              ) : (
+                <span className="octo-tabular text-octo-sage">${s.costUsd.toFixed(2)}</span>
+              )}
               {(s.inputTokens > 0 || s.outputTokens > 0) && (
                 <span className="octo-tabular text-octo-mute"> · ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}</span>
               )}
