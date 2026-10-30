@@ -19,6 +19,7 @@ beforeEach(() => {
     loaded: false,
     saving: null,
     error: null,
+    justEnabled: {},
   });
   getSyncPrefs.mockReset();
   setSyncPref.mockReset();
@@ -51,5 +52,30 @@ describe("syncPrefsStore", () => {
     expect(await useSyncPrefsStore.getState().setPref("history", true)).toBe(false);
     expect(useSyncPrefsStore.getState().historySync).toBe(false);
     expect(useSyncPrefsStore.getState().error).toContain("UpgradeRequired");
+  });
+
+  it("a load that resolves after a write never overwrites the written value", async () => {
+    let resolveLoad: (v: unknown) => void = () => {};
+    getSyncPrefs.mockReturnValue(new Promise((r) => (resolveLoad = r)));
+    setSyncPref.mockResolvedValue({ historySync: true, librarySync: false });
+    const loading = useSyncPrefsStore.getState().load();
+    await useSyncPrefsStore.getState().setPref("history", true);
+    resolveLoad({ historySync: false, librarySync: false }); // stale answer
+    await loading;
+    expect(useSyncPrefsStore.getState().historySync).toBe(true);
+  });
+
+  it("load is skipped while a write is in flight", async () => {
+    useSyncPrefsStore.setState({ saving: "history" });
+    await useSyncPrefsStore.getState().load();
+    expect(getSyncPrefs).not.toHaveBeenCalled();
+  });
+
+  it("marks a kind just enabled exactly once (drives the first-backfill toast)", async () => {
+    setSyncPref.mockResolvedValue({ historySync: true, librarySync: false });
+    await useSyncPrefsStore.getState().setPref("history", true);
+    expect(useSyncPrefsStore.getState().consumeJustEnabled("history")).toBe(true);
+    expect(useSyncPrefsStore.getState().consumeJustEnabled("history")).toBe(false);
+    expect(useSyncPrefsStore.getState().consumeJustEnabled("library")).toBe(false);
   });
 });

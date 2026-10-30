@@ -55,8 +55,8 @@ import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
 import { initGenesisRename } from "./lib/genesisRename";
 import { deriveProjectName } from "./lib/genesis";
-import { useHistoryStore } from "./stores/historyStore";
 import { useSyncPrefsStore } from "./stores/syncPrefsStore";
+import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { Settings } from "./components/Settings";
@@ -69,7 +69,6 @@ import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
-import { useRolesStore } from "./stores/rolesStore";
 import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
@@ -185,7 +184,10 @@ function App() {
   );
   const historySyncOn = useSyncPrefsStore((s) => s.historySync);
   useEffect(() => {
-    if (historySyncEntitled && historySyncOn) void useHistoryStore.getState().syncOnLaunch();
+    if (!historySyncEntitled || !historySyncOn) return;
+    // Toast the outcome only for the first backfill after the user turned it on.
+    const announce = useSyncPrefsStore.getState().consumeJustEnabled("history");
+    void runSyncBackfill("history", { announce });
   }, [historySyncEntitled, historySyncOn]);
 
   // Library sync (Pro, opt-in): heal-push the whole custom library, pull +
@@ -198,18 +200,8 @@ function App() {
   const librarySyncOn = useSyncPrefsStore((s) => s.librarySync);
   useEffect(() => {
     if (!librarySyncEntitled || !librarySyncOn) return;
-    void (async () => {
-      try {
-        await ipc.librarySyncPushAll();
-        const applied = await ipc.librarySyncPull();
-        if (applied > 0) {
-          await usePipelineStore.getState().load();
-          await useRolesStore.getState().load();
-        }
-      } catch {
-        // Offline / transient — the local library is untouched.
-      }
-    })();
+    const announce = useSyncPrefsStore.getState().consumeJustEnabled("library");
+    void runSyncBackfill("library", { announce });
   }, [librarySyncEntitled, librarySyncOn]);
   const terminalBusyIds = useTerminalsStore(
     useShallow((s) =>

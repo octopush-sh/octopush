@@ -1948,14 +1948,16 @@ fn require_history_sync() -> AppResult<()> {
     require_sync(crate::sync::SyncKind::History)
 }
 
-/// The user's two cloud-sync opt-ins (both default **off**). Local read only.
+/// The signed-in user's two cloud-sync opt-ins (both default **off**; both
+/// read OFF for anyone but the account that granted them). Local read only.
 #[tauri::command]
 pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
-    Ok(crate::settings::load_settings()?.sync_prefs())
+    crate::settings::current_sync_prefs()
 }
 
 /// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
-/// the new pair. Turning ON requires the matching Pro feature (the UI disables
+/// the new pair. The opt-in is bound to the signed-in Clerk user. Turning ON
+/// requires the matching Pro feature (the UI disables
 /// the toggle for Free; this is the backstop). Turning OFF is always allowed and
 /// only stops future uploads/downloads — nothing is deleted server-side. The
 /// frontend runs the existing one-shot backfill after a successful turn-on.
@@ -2014,7 +2016,8 @@ pub async fn history_sync_pull(
 /// immediately — not only from the next run onward. Runs when the user turns
 /// history sync ON (and on launch while it stays on). No-op unless opted in
 /// AND Pro; the server
-/// upserts by run id so re-running it is idempotent. Returns the count attempted.
+/// upserts by run id so re-running it is idempotent. Returns the count pushed;
+/// errors when the metadata push itself failed (the detail heal stays silent).
 #[tauri::command]
 pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
     if !crate::sync::sync_active(crate::sync::SyncKind::History) {
@@ -2034,7 +2037,11 @@ pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
     };
     let count = runs.len();
     let client = crate::chat_engine::shared_http_client();
-    crate::sync::push_runs(client, runs).await;
+    // Report a failed metadata push (offline / 5xx / no session) so the first
+    // backfill after turning sync on can say so; the launch caller ignores it.
+    if crate::sync::push_runs(client, runs).await.is_failure() {
+        return Err(AppError::Other("Couldn't reach Octopush's sync service".into()));
+    }
 
     // Heal the B2 detail for the MOST RECENT terminal runs. The terminal-time
     // detail push is fire-and-forget with no retry — a run finishing offline
@@ -2100,7 +2107,12 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
         items
     };
     let count = items.len();
-    crate::sync::push_library_items(crate::chat_engine::shared_http_client(), items).await;
+    if crate::sync::push_library_items(crate::chat_engine::shared_http_client(), items)
+        .await
+        .is_failure()
+    {
+        return Err(AppError::Other("Couldn't reach Octopush's sync service".into()));
+    }
     Ok(count)
 }
 
@@ -2206,6 +2218,9 @@ pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
 #[tauri::command]
 pub async fn auth_sign_out(state: State<'_, AppState>) -> AppResult<()> {
     crate::auth::sign_out()?;
+    // The sync opt-ins belong to the account that granted them — forget them
+    // so whoever signs in next starts with sync OFF.
+    let _ = crate::settings::clear_sync_opt_ins();
     let _ = state.db.lock().clear_synced_runs();
     Ok(())
 }
@@ -3735,7 +3750,9 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
 
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
-    crate::settings::save_settings(&settings)?;
+    // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
+    // from a settings pane must never flip them — carried over from disk.
+    crate::settings::save_settings_from_ui(settings)?;
     // A key or base URL may have changed: re-detect gateways on the next read.
     state.gateways.invalidate();
     Ok(())

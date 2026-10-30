@@ -61,7 +61,7 @@ export function ToggleRow({
     <label
       title={title}
       aria-disabled={disabled || undefined}
-      className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[180ms] ${
+      className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[var(--dur-quick)] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
         disabled ? "cursor-default opacity-55" : "cursor-pointer"
       }`}
       style={{

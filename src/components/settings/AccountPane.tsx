@@ -16,13 +16,14 @@ import { PaneHeader, SectionLabel, ToggleRow } from "./shared";
 export const SYNC_COPY = {
   historyLabel: "Sync run history across your Macs",
   historyDescription:
-    "Each finished Direct run uploads to Octopush's sync service: its task, status, cost and tokens, plus every stage's journal, artifacts and diff snapshots of your code (size-capped).",
+    "Finished Direct runs upload to Octopush's sync service: task, status, cost, tokens, timestamps, workspace and machine name, and each stage's role and model, plus each stage's journal, artifacts and size-capped diff snapshots of your code. Turning this on also uploads up to 500 past runs from this Mac, with full detail for the 10 most recent.",
   libraryLabel: "Sync custom pipelines & roles",
   libraryDescription:
     "Your custom pipelines and roles upload to Octopush's sync service and follow you to your other Macs. Built-ins never travel.",
-  note: "Both are off until you turn them on. Turning this off stops future uploads. Data already synced stays on Octopush's servers.",
+  note: "Both are off until you turn them on, and apply only to the account that turned them on; signing out turns both off. Turning this off stops future uploads. Data already synced stays on Octopush's servers.",
   requiresPro: "Requires Pro",
   requiresSignIn: "Sign in with a Pro account to sync",
+  offOnly: "Requires Pro to turn on. You can still turn it off.",
 } as const;
 
 export function AccountPane() {
@@ -38,10 +39,14 @@ export function AccountPane() {
   const canHistorySync = status.signedIn && hasFeature("history.sync");
   const canLibrarySync = status.signedIn && hasFeature("library.sync");
   const lockedTitle = status.signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
+  // Turning OFF is always allowed (the backend agrees) — a user who lost Pro or
+  // signed out must still be able to stop uploads before re-subscribing.
+  const titleFor = (can: boolean, on: boolean) =>
+    can ? undefined : on ? SYNC_COPY.offOnly : lockedTitle;
 
   useEffect(() => {
     void loadSyncPrefs();
-  }, [loadSyncPrefs]);
+  }, [loadSyncPrefs, status.signedIn]);
 
   // On opening the pane while signed in, re-fetch identity (to pick up a plan
   // change after a just-completed checkout) and reload the entitlement.
@@ -177,8 +182,8 @@ export function AccountPane() {
             label={SYNC_COPY.historyLabel}
             description={SYNC_COPY.historyDescription}
             checked={historySync}
-            disabled={!canHistorySync || syncSaving === "history"}
-            title={canHistorySync ? undefined : lockedTitle}
+            disabled={(!canHistorySync && !historySync) || syncSaving === "history"}
+            title={titleFor(canHistorySync, historySync)}
             onChange={(v) => void setSyncPref("history", v)}
             testId="sync-history-toggle"
           />
@@ -186,8 +191,8 @@ export function AccountPane() {
             label={SYNC_COPY.libraryLabel}
             description={SYNC_COPY.libraryDescription}
             checked={librarySync}
-            disabled={!canLibrarySync || syncSaving === "library"}
-            title={canLibrarySync ? undefined : lockedTitle}
+            disabled={(!canLibrarySync && !librarySync) || syncSaving === "library"}
+            title={titleFor(canLibrarySync, librarySync)}
             onChange={(v) => void setSyncPref("library", v)}
             testId="sync-library-toggle"
           />

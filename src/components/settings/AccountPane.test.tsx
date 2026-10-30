@@ -68,8 +68,21 @@ describe("AccountPane — Sync (opt-in)", () => {
       "Turning this off stops future uploads. Data already synced stays on Octopush's servers.",
     );
     // The history description names the heavy detail honestly.
-    expect(SYNC_COPY.historyDescription).toMatch(/journal/);
-    expect(SYNC_COPY.historyDescription).toMatch(/diff snapshots/);
+    for (const field of [
+      "task",
+      "status",
+      "cost",
+      "tokens",
+      "timestamps",
+      "workspace and machine name",
+      "role and model",
+      "journal",
+      "artifacts",
+      "diff snapshots",
+      "500 past runs",
+    ]) {
+      expect(SYNC_COPY.historyDescription).toContain(field);
+    }
   });
 
   it("turning history sync on calls the setter and reflects the result", async () => {
@@ -108,6 +121,23 @@ describe("AccountPane — Sync (opt-in)", () => {
     fireEvent.click(toggle);
     expect(setSyncPref).not.toHaveBeenCalled();
     expect(screen.getByText("Upgrade to Pro")).toBeInTheDocument();
+  });
+
+  it("a user who lost Pro can still turn an ON toggle OFF (never re-arms silently)", async () => {
+    setup("free");
+    getSyncPrefs.mockResolvedValue({ historySync: true, librarySync: false });
+    setSyncPref.mockResolvedValue({ historySync: false, librarySync: false });
+    render(<AccountPane />);
+    const toggle = screen.getByTestId("sync-history-toggle");
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    expect(toggle).not.toBeDisabled();
+    expect(toggle.closest("label")).toHaveAttribute("title", SYNC_COPY.offOnly);
+    // The OFF library toggle stays locked for a Free user.
+    expect(screen.getByTestId("sync-library-toggle")).toBeDisabled();
+    fireEvent.click(toggle);
+    expect(setSyncPref).toHaveBeenCalledWith("history", false);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(toggle).toBeDisabled(); // off again ⇒ locked again
   });
 
   it("a failed write keeps the toggle off and says why", async () => {

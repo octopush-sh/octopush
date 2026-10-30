@@ -14,13 +14,17 @@ export const OUTBOUND: readonly string[] = [
   "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
 ];
 
+/** Third-party tools Octopush launches but doesn't control. */
+export const AGENT_CLI_NOTE =
+  "Agent CLIs Octopush launches for you (Claude Code, Codex) talk to their own services and follow their own telemetry policies.";
+
 export function PrivacyPane() {
   return (
     <>
       <PaneHeader
         eyebrow="Privacy"
         title="What stays, what leaves."
-        subtitle="Your work stays on this Mac. Requests to AI providers go straight from this machine to the provider, never through Octopush."
+        subtitle="Your work stays on this Mac, unless you turn on sync. Requests to AI providers go straight from this machine to the provider, never through Octopush."
       />
 
       <ul className="max-w-[640px] space-y-2 text-[13px] leading-[1.6] text-octo-sage">
@@ -48,6 +52,7 @@ export function PrivacyPane() {
         <li>
           · <span className="font-serif text-octo-ivory">No analytics, no telemetry.</span>
         </li>
+        <li data-testid="privacy-agent-cli">· {AGENT_CLI_NOTE}</li>
       </ul>
     </>
   );

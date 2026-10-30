@@ -38,6 +38,10 @@ interface HistoryState {
   /** Once-per-launch backfill push + pull. Best-effort/silent; Pro-only (the
    *  caller gates on the entitlement). */
   syncOnLaunch: () => Promise<void>;
+  /** The backfill push + pull itself, THROWING on failure (so the first
+   *  backfill after turning sync on can report it). Returns the count pushed;
+   *  0 without a call when sync is off. */
+  backfill: () => Promise<number>;
   /** Drill into one run — serves the cached detail instantly, else fetches. */
   openRun: (runId: string) => Promise<void>;
   /** Back to the list (keeps the cache). */
@@ -84,12 +88,17 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
     }
   },
 
+  backfill: async () => {
+    if (!historySyncOn()) return 0;
+    const pushed = await ipc.historySyncPushAll();
+    const runs = await ipc.historySyncPull();
+    set({ runs, loaded: true });
+    return pushed;
+  },
+
   syncOnLaunch: async () => {
-    if (!historySyncOn()) return;
     try {
-      await ipc.historySyncPushAll();
-      const runs = await ipc.historySyncPull();
-      set({ runs, loaded: true });
+      await get().backfill();
     } catch {
       // Offline / not entitled → leave the mirror as-is; History opens on demand.
     }

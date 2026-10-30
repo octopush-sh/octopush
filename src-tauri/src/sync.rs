@@ -86,10 +86,21 @@ pub fn sync_off_error(kind: SyncKind) -> AppError {
 pub enum PushOutcome {
     /// The user has not opted in — nothing was read or sent.
     Disabled,
-    /// Nothing to send, or signed out — no request made.
-    Skipped,
-    /// A request was attempted (success or logged failure).
-    Attempted,
+    /// Nothing to send — no request made.
+    Empty,
+    /// No valid session — no request made.
+    SignedOut,
+    /// Every request succeeded.
+    Sent,
+    /// A request failed (network or non-2xx); logged.
+    Failed,
+}
+
+impl PushOutcome {
+    /// Whether the caller should report the push as having failed.
+    pub fn is_failure(self) -> bool {
+        matches!(self, PushOutcome::Failed | PushOutcome::SignedOut)
+    }
 }
 
 /// Cap a single push batch to the server's documented limit.
@@ -326,18 +337,24 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
         return PushOutcome::Disabled;
     }
     let Some(token) = crate::auth::current_access_token().await else {
-        return PushOutcome::Skipped; // signed out → skip silently
+        return PushOutcome::SignedOut; // signed out → skip silently
     };
     let body = serde_json::json!({ "run_id": detail.run_id, "data": detail });
     let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
     match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed run detail");
+            PushOutcome::Sent
         }
-        Ok(resp) => tracing::warn!("history sync detail push failed: HTTP {}", resp.status()),
-        Err(e) => tracing::warn!("history sync detail push error: {e}"),
+        Ok(resp) => {
+            tracing::warn!("history sync detail push failed: HTTP {}", resp.status());
+            PushOutcome::Failed
+        }
+        Err(e) => {
+            tracing::warn!("history sync detail push error: {e}");
+            PushOutcome::Failed
+        }
     }
-    PushOutcome::Attempted
 }
 
 /// GET one run's detail. `Ok(None)` when the server has none (a run synced
@@ -424,10 +441,10 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
         return PushOutcome::Disabled;
     }
     if runs.is_empty() {
-        return PushOutcome::Skipped;
+        return PushOutcome::Empty;
     }
     let Some(token) = crate::auth::current_access_token().await else {
-        return PushOutcome::Skipped; // signed out / no valid token → skip silently
+        return PushOutcome::SignedOut; // signed out / no valid token → skip silently
     };
     let batch: Vec<SyncRun> = runs.into_iter().take(MAX_PUSH).collect();
     let count = batch.len();
@@ -436,11 +453,17 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
     match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed {count} run(s)");
+            PushOutcome::Sent
         }
-        Ok(resp) => tracing::warn!("history sync push failed: HTTP {}", resp.status()),
-        Err(e) => tracing::warn!("history sync push error: {e}"),
+        Ok(resp) => {
+            tracing::warn!("history sync push failed: HTTP {}", resp.status());
+            PushOutcome::Failed
+        }
+        Err(e) => {
+            tracing::warn!("history sync push error: {e}");
+            PushOutcome::Failed
+        }
     }
-    PushOutcome::Attempted
 }
 
 /// GET the signed-in user's full run history from the sync API. Parses leniently
@@ -564,23 +587,34 @@ pub async fn push_library_items(
         return PushOutcome::Disabled;
     }
     if items.is_empty() {
-        return PushOutcome::Skipped;
+        return PushOutcome::Empty;
     }
     let Some(token) = crate::auth::current_access_token().await else {
-        return PushOutcome::Skipped; // signed out → skip silently
+        return PushOutcome::SignedOut; // signed out → skip silently
     };
     let url = format!("{SYNC_API_BASE}/api/sync-library");
+    let mut outcome = PushOutcome::Sent;
     for chunk in items.chunks(LIBRARY_PUSH_CHUNK) {
+        // Re-check between chunks: turning sync off mid-heal stops the rest.
+        if !opted_in(SyncKind::Library) {
+            return PushOutcome::Disabled;
+        }
         let body = serde_json::json!({ "items": chunk });
         match client.post(&url).bearer_auth(token.clone()).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!("library sync: pushed {} item(s)", chunk.len());
             }
-            Ok(resp) => tracing::warn!("library sync push failed: HTTP {}", resp.status()),
-            Err(e) => tracing::warn!("library sync push error: {e}"),
+            Ok(resp) => {
+                tracing::warn!("library sync push failed: HTTP {}", resp.status());
+                outcome = PushOutcome::Failed;
+            }
+            Err(e) => {
+                tracing::warn!("library sync push error: {e}");
+                outcome = PushOutcome::Failed;
+            }
         }
     }
-    PushOutcome::Attempted
+    outcome
 }
 
 /// GET the user's whole library (items + tombstones). Lenient: an item this

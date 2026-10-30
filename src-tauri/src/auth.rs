@@ -278,6 +278,8 @@ fn html_escape(s: &str) -> String {
 /// The branded page the browser shows after the OAuth redirect (Atelier in Onyx
 /// & Brass). The dynamic `body` — which may carry the provider's `error` query
 /// param — is HTML-escaped to prevent reflected injection on the loopback page.
+/// Fully self-contained: no web fonts or other third-party requests (the font
+/// stacks fall back to locally installed faces) — see Settings › Privacy.
 fn callback_html(title: &str, body: &str, hint: &str, is_error: bool) -> String {
     const TEMPLATE: &str = r##"<!doctype html>
 <html lang="en">
@@ -285,9 +287,6 @@ fn callback_html(title: &str, body: &str, hint: &str, is_error: bool) -> String 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ · Octopush</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
     --onyx:#0c0a08;--panel:#14110d;--hairline:#2a2419;
@@ -843,6 +842,18 @@ async fn refresh_identity_inner(force_token_refresh: bool) -> AppResult<AuthStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_page_makes_no_third_party_requests() {
+        // Settings › Privacy promises the sign-in page loads nothing external.
+        for page in [
+            callback_html("Signed in", "ok", "Return to Octopush", false),
+            callback_html("Sign-in didn't complete", "<x>", "Try again", true),
+        ] {
+            assert!(!page.contains("http://") && !page.contains("https://"), "{page}");
+            assert!(!page.contains("<link"), "no external stylesheets");
+        }
+    }
 
     #[test]
     fn s256_matches_rfc7636_vector() {

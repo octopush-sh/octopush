@@ -76,6 +76,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub library_sync_enabled: bool,
 
+    /// The Clerk user id (`sub`) the opt-ins above were granted by. The opt-in
+    /// is **per account, not per Mac**: when a different user is signed in (or
+    /// nobody is) both opt-ins read as OFF, so a second person signing in on
+    /// this Mac can never trigger a backfill of the first person's runs into
+    /// their own account. Cleared (with both flags) on sign-out.
+    #[serde(default)]
+    pub sync_owner: Option<String>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -130,6 +138,7 @@ pub struct SyncPrefs {
 }
 
 impl AppSettings {
+    /// The opt-ins as stored, ignoring who granted them.
     pub fn sync_prefs(&self) -> SyncPrefs {
         SyncPrefs {
             history_sync: self.history_sync_enabled,
@@ -137,38 +146,122 @@ impl AppSettings {
         }
     }
 
-    pub fn sync_opted_in(&self, kind: crate::sync::SyncKind) -> bool {
+    /// The opt-ins as they apply to `current_sub` (the signed-in Clerk user):
+    /// both OFF unless that user is the one who granted them.
+    pub fn sync_prefs_for(&self, current_sub: Option<&str>) -> SyncPrefs {
+        SyncPrefs {
+            history_sync: self.sync_opted_in_for(crate::sync::SyncKind::History, current_sub),
+            library_sync: self.sync_opted_in_for(crate::sync::SyncKind::Library, current_sub),
+        }
+    }
+
+    fn flag(&self, kind: crate::sync::SyncKind) -> bool {
         match kind {
             crate::sync::SyncKind::History => self.history_sync_enabled,
             crate::sync::SyncKind::Library => self.library_sync_enabled,
         }
     }
 
-    pub fn set_sync_opted_in(&mut self, kind: crate::sync::SyncKind, enabled: bool) {
+    /// Opted in for `kind` AND granted by `current_sub`. Signed out (`None`),
+    /// an unowned flag, or a different owner ⇒ `false`.
+    pub fn sync_opted_in_for(&self, kind: crate::sync::SyncKind, current_sub: Option<&str>) -> bool {
+        match (current_sub, self.sync_owner.as_deref()) {
+            (Some(me), Some(owner)) if !me.is_empty() && me == owner => self.flag(kind),
+            _ => false,
+        }
+    }
+
+    /// Set one opt-in on behalf of `sub`. Enabling under a different owner
+    /// first clears the previous owner's flags (they never carry over), then
+    /// binds the opt-ins to `sub`.
+    pub fn set_sync_opted_in_by(&mut self, kind: crate::sync::SyncKind, enabled: bool, sub: &str) {
+        if enabled && self.sync_owner.as_deref() != Some(sub) {
+            self.history_sync_enabled = false;
+            self.library_sync_enabled = false;
+            self.sync_owner = Some(sub.to_string());
+        }
+        self.set_flag(kind, enabled);
+    }
+
+    fn set_flag(&mut self, kind: crate::sync::SyncKind, enabled: bool) {
         match kind {
             crate::sync::SyncKind::History => self.history_sync_enabled = enabled,
             crate::sync::SyncKind::Library => self.library_sync_enabled = enabled,
         }
     }
+
+    /// Forget every opt-in (sign-out).
+    pub fn clear_sync_opt_ins(&mut self) {
+        self.history_sync_enabled = false;
+        self.library_sync_enabled = false;
+        self.sync_owner = None;
+    }
+
+    /// `set_sync_pref` is the ONLY writer of the opt-ins: a whole-file save
+    /// from the frontend (read-modify-write in several panes) must never flip
+    /// them, so carry the on-disk values over whatever the payload says.
+    pub fn preserve_sync_fields_from(&mut self, on_disk: &AppSettings) {
+        self.history_sync_enabled = on_disk.history_sync_enabled;
+        self.library_sync_enabled = on_disk.library_sync_enabled;
+        self.sync_owner = on_disk.sync_owner.clone();
+    }
 }
 
-/// Has the user opted in to this kind of cloud sync? Reads `settings.json`
-/// fresh each call (a toggle takes effect on the very next push/pull). Any
-/// read/parse failure answers **no** — sync never turns itself on.
+/// Has the signed-in user opted in to this kind of cloud sync? Reads
+/// `settings.json` fresh each call (a toggle takes effect on the very next
+/// push/pull); only when a flag is set is the session consulted for the
+/// owner check. Any read/parse failure answers **no** — sync never turns
+/// itself on.
 pub fn sync_opted_in(kind: crate::sync::SyncKind) -> bool {
     #[cfg(test)]
     if let Some(v) = test_sync_override::get(kind) {
         return v;
     }
-    load_settings().map(|s| s.sync_opted_in(kind)).unwrap_or(false)
+    let Ok(settings) = load_settings() else { return false };
+    if !settings.flag(kind) {
+        return false; // fast path: off ⇒ no keychain read
+    }
+    let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    settings.sync_opted_in_for(kind, sub.as_deref())
 }
 
-/// Persist one sync opt-in (read-modify-write) and return the new pair.
+/// The opt-ins as they apply to whoever is signed in now.
+pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
+    let settings = load_settings()?;
+    let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    Ok(settings.sync_prefs_for(sub.as_deref()))
+}
+
+/// Persist one sync opt-in for the signed-in user (read-modify-write) and
+/// return the new effective pair. Enabling requires a signed-in user (the
+/// opt-in is bound to their Clerk id); disabling always succeeds.
 pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
     let mut settings = load_settings()?;
-    settings.set_sync_opted_in(kind, enabled);
+    let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    match sub.as_deref() {
+        Some(me) if !me.is_empty() => settings.set_sync_opted_in_by(kind, enabled, me),
+        _ if enabled => {
+            return Err(crate::error::AppError::Other("Sign in to turn on sync".into()))
+        }
+        _ => settings.set_flag(kind, false),
+    }
     save_settings(&settings)?;
-    Ok(settings.sync_prefs())
+    Ok(settings.sync_prefs_for(sub.as_deref()))
+}
+
+/// Sign-out: drop both opt-ins and their owner.
+pub fn clear_sync_opt_ins() -> AppResult<()> {
+    let mut settings = load_settings()?;
+    settings.clear_sync_opt_ins();
+    save_settings(&settings)
+}
+
+/// A whole-settings save coming from the frontend: everything but the sync
+/// opt-ins (owned by `set_sync_pref`), which are carried over from disk.
+pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
+    let on_disk = load_settings()?;
+    incoming.preserve_sync_fields_from(&on_disk);
+    save_settings(&incoming)
 }
 
 /// Test-only, per-thread override of [`sync_opted_in`] so gating tests never

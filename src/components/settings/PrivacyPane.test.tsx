@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { PrivacyPane, OUTBOUND } from "./PrivacyPane";
+import { PrivacyPane, OUTBOUND, AGENT_CLI_NOTE } from "./PrivacyPane";
 
 describe("PrivacyPane", () => {
   it("lists every outbound destination", () => {
@@ -37,5 +37,15 @@ describe("PrivacyPane", () => {
     expect(screen.getByText("No analytics, no telemetry.")).toBeInTheDocument();
     expect(container.textContent).not.toContain("only to providers you configure");
     expect(container.textContent).toContain("leave it only if you turn on sync");
+  });
+
+  it("says work leaves only with sync on, and that agent CLIs have their own policies", () => {
+    render(<PrivacyPane />);
+    expect(
+      screen.getByText(/^Your work stays on this Mac, unless you turn on sync\. /),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("privacy-agent-cli")).toHaveTextContent(AGENT_CLI_NOTE);
+    expect(AGENT_CLI_NOTE).toContain("Claude Code");
+    expect(AGENT_CLI_NOTE).toContain("Codex");
   });
 });
