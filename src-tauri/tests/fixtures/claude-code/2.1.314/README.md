@@ -21,8 +21,8 @@ is tested, so a new recording is covered as soon as it is committed.
 | `cli-help.txt` | `claude --help` (flags Octopush passes) | **real** |
 | `mcp/*` | `claude mcp add --help`, `mcp add`, `mcp get`, the `mcpServers` entry written | **real** |
 | `definitions/skills/fixture-skill/SKILL.md`, `definitions/agents/fixture-reviewer.md` | frontmatter incl. the custom `effort:` key | hand-written; **loaded by the real CLI** (see `init-with-definitions.jsonl`) |
-| `pty/tui-render-sample.ansi` | raw TUI bytes from an interactive start | **real** (the session could not connect, so it shows the error screen) |
-| `pty/total-cost-tail.ansi`, `pty/total-cost-tail.txt` | the `Total cost:` summary | **synthetic** — the `/cost` layout, rendered with the cursor-move encoding observed in `tui-render-sample.ansi` |
+| `pty/tui-render-sample.ansi` | raw TUI bytes: the `Welcome to Claude Code v2.1.314` banner line only | **real** (the interactive session could not connect; the rest of the screen was dropped) |
+| `pty/total-cost-tail.ansi`, `pty/total-cost-tail.txt` | the `Total cost:` summary | **synthetic** — the `/cost` layout as documented, rendered with the cursor-move encoding observed in `tui-render-sample.ansi`. Whether the real summary is encoded the same way is likely but not yet proven; replace these with a real capture when one is made. |
 
 Recorded in a Linux container (not the owner's Mac) on 2026-10-29 with
 `claude-haiku-4-5`. Recording-environment notes:
@@ -35,19 +35,29 @@ Recorded in a Linux container (not the owner's Mac) on 2026-10-29 with
 - The host pinned one session id for every run, so all runs share one
   session and one transcript file. On a normal machine each fresh `-p` run
   gets its own id; the tests don't depend on either.
+- These fixtures were recorded before the recorder ran every call under a
+  temp HOME with an explicit API key (the container's own auth was used);
+  the output shapes are the same. `entrypoint` in the transcript is
+  normalised to `cli`.
 - `--max-turns` is not listed in `claude --help` but is accepted (every
   recording above passed it); the argv test allows it explicitly.
 
 ## Re-recording
 
-On a machine with a logged-in `claude`:
+On any machine with `claude` installed and an Anthropic API key for this
+purpose:
 
 ```sh
-scripts/record-claude-fixtures.sh          # writes tests/fixtures/claude-code/<claude --version>/
+OCTOPUSH_FIXTURE_ANTHROPIC_KEY=sk-ant-… scripts/record-claude-fixtures.sh [--force]
 cd src-tauri && cargo test claude_code_contract
 ```
 
-It runs exactly these (in a fresh temp directory containing `note.txt`):
+Without the variable it exits 3 and touches nothing. **It never reads or
+writes your real `~/.claude` or `~/.claude.json`:** every `claude` call runs
+with `HOME` set to a fresh temp directory (deleted on exit), `CLAUDE_CONFIG_DIR`
+unset and only the given key as `ANTHROPIC_API_KEY`; the `-p` runs also pass
+`--strict-mcp-config --setting-sources project`. It runs exactly these (in a
+fresh temp cwd containing `note.txt`):
 
 ```sh
 claude -p "Reply with exactly: ok" --output-format stream-json --verbose --model claude-haiku-4-5 --tools "" --max-turns 1
@@ -57,14 +67,17 @@ claude -p "Reply with exactly: ok" --output-format stream-json --verbose --model
 # …again with .claude/skills/fixture-skill/SKILL.md and .claude/agents/fixture-reviewer.md present
 claude --help
 claude mcp add --help
-HOME=<throwaway> claude mcp add octopush -s user -- /Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp
-HOME=<throwaway> claude mcp get octopush
+claude mcp add octopush -s user -- /Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp
+claude mcp get octopush
 ```
 
-then copies `~/.claude/projects/<cwd, non-alphanumerics → '-'>/<tool-use session_id>.jsonl`
-— the only file it reads under `~/.claude` — makes a best-effort interactive
-capture (`/cost`, `/exit`) and runs the scrubber. Three of the calls are
-billed (a few cents); the nonexistent-model calls fail before any tokens.
+then copies `<temp HOME>/.claude/projects/<cwd, non-alphanumerics → '-'>/<tool-use session_id>.jsonl`,
+makes a best-effort interactive capture (`/cost`, `/exit`), scrubs everything
+into a staging directory and moves it into place only after the leak check
+passes (with `--force`, the old directory is replaced only then). A cost tail
+that was not re-captured is carried forward and labelled as such in the new
+version's generated README. Three calls are billed (a few cents); the
+nonexistent-model calls fail before any tokens.
 
 ## Scrubbing rules
 
@@ -83,6 +96,10 @@ directory by hand) applies them, then refuses to finish if a leak survives:
   characters (the prompts are tiny test strings anyway). The `system/init`
   `agents`/`skills` lists keep only `fixture-*` entries; its `tools` drop
   `mcp__*` (those come from the recording machine's config).
-- Leak check: no `/home/`, `/root`, `/tmp/`, `/private/`, `/var/folders`,
-  `$HOME`, `sk-ant`, `org_` or `@` anywhere. Review the diff yourself anyway
-  before committing.
+- A TUI capture keeps only the banner line and the `Total cost:` region.
+- `entrypoint` → `cli`.
+- Leak check (fails closed, prints only which kind of value hit, never the
+  value): `/home/`, `/root`, `/tmp/`, `/private/`, `/var/folders`, `$HOME`,
+  the temp HOME, any `/Users/<name>` but `/Users/dev`, `sk-ant`, `org_`, `@`,
+  your user name, host name, git `user.name`/`user.email`, and the account
+  name/email/org from the temp HOME's config. Review the diff yourself anyway.

@@ -72,22 +72,53 @@ impl Rec {
     }
 }
 
-/// All recorded versions. At least one must exist.
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-code")
+}
+
+/// `2.1.10` → `[2, 1, 10]`, so versions sort numerically (2.1.9 < 2.1.10).
+fn semver_key(v: &str) -> Vec<u64> {
+    v.split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+/// All recorded versions, oldest first. Every directory under the fixture
+/// root is a recording: one without a `VERSION` file, or whose `VERSION`
+/// disagrees with its name, is a broken recording and fails here.
 fn recordings() -> Vec<Rec> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-code");
+    let root = fixture_root();
     let mut out: Vec<Rec> = std::fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("fixture root {} unreadable: {e}", root.display()))
         .flatten()
-        .filter(|e| e.path().join("VERSION").is_file())
+        .filter(|e| e.path().is_dir())
         .map(|e| {
             let dir = e.path();
-            let version = std::fs::read_to_string(dir.join("VERSION")).unwrap_or_default().trim().to_string();
+            let name = e.file_name().to_string_lossy().to_string();
+            let version = std::fs::read_to_string(dir.join("VERSION"))
+                .unwrap_or_else(|_| panic!("[claude-code/{name}] recording has no VERSION file"))
+                .trim()
+                .to_string();
+            assert_eq!(version, name, "[claude-code/{name}/VERSION] says `{version}`, but the directory is `{name}`");
             Rec { dir, version }
         })
         .collect();
-    out.sort_by(|a, b| a.version.cmp(&b.version));
+    out.sort_by_key(|r| semver_key(&r.version));
     assert!(!out.is_empty(), "no Claude Code fixture versions under {}", root.display());
     out
+}
+
+/// One specific recording (for tests about a fixture known to have a shape).
+fn recording(version: &str) -> Rec {
+    recordings()
+        .into_iter()
+        .find(|r| r.version == version)
+        .unwrap_or_else(|| panic!("[claude-code/{version}] recording not found"))
+}
+
+#[test]
+fn versions_sort_numerically() {
+    let mut v = vec!["2.1.10", "2.1.9", "2.0.100", "10.0.0"];
+    v.sort_by_key(|s| semver_key(s));
+    assert_eq!(v, ["2.0.100", "2.1.9", "2.1.10", "10.0.0"]);
 }
 
 /// Walk a dotted path (`message.usage.input_tokens`, `message.content.0.id`).
@@ -496,7 +527,9 @@ fn pty_total_cost_tail_is_scraped() {
 
 #[test]
 fn pty_tail_without_the_cost_line_scrapes_nothing() {
-    let rec = recordings().pop().unwrap();
+    // Pinned to the recording whose TUI sample is known to hold no summary
+    // (a later real capture may well contain one).
+    let rec = recording("2.1.314");
     let tail = rec.text("pty/total-cost-tail.ansi");
     let no_label = tail.replace("cost:", "spend:");
     assert!(crate::token_engine::scan_pty_output("s", no_label.as_bytes()).is_none());
@@ -618,6 +651,21 @@ fn mcp_add_argv_matches_the_recorded_registration() {
         let get = rec.text("mcp/mcp-get.txt");
         assert!(get.contains("octopush:") && get.contains("Scope: User"), "[{}] {get}", rec.label("mcp/mcp-get.txt"));
     }
+}
+
+#[test]
+fn the_recorder_registers_with_the_same_argv() {
+    // `scripts/record-claude-fixtures.sh` cannot call into Rust cheaply, so
+    // it spells the argv out; this keeps the two from drifting apart.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/record-claude-fixtures.sh");
+    let text = std::fs::read_to_string(&script).expect("scripts/record-claude-fixtures.sh");
+    let argv = mcp_add_argv();
+    let spelled = format!("{} \"$MCP_BIN\"", argv[..argv.len() - 1].join(" "));
+    assert!(
+        text.contains(&spelled),
+        "scripts/record-claude-fixtures.sh must record `claude {spelled}` (mcp_setup::mcp_add_args)"
+    );
+    assert!(text.contains(&format!("MCP_BIN=\"{MCP_BINARY}\"")), "recorder's MCP_BIN must be {MCP_BINARY}");
 }
 
 #[test]
