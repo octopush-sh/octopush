@@ -8,12 +8,45 @@ import { useEntitlement } from "../../hooks/useEntitlement";
 import { ipc } from "../../lib/ipc";
 import { awaitProAfterCheckout } from "../../lib/awaitPro";
 import { pushToast } from "../Toasts";
-import { PaneHeader, SectionLabel } from "./shared";
+import { useSyncPrefsStore } from "../../stores/syncPrefsStore";
+import { PaneHeader, SectionLabel, ToggleRow } from "./shared";
+
+/** Toggle + helper copy for the two cloud syncs. Exported so the website and
+ *  tests quote the exact same words. */
+export const SYNC_COPY = {
+  historyLabel: "Sync run history across your Macs",
+  historyDescription:
+    "Finished Direct runs upload to Octopush's sync service: task, status, cost, tokens, timestamps, workspace and machine name, and each stage's role and model, plus each stage's journal, artifacts and size-capped diff snapshots of your code. Turning this on also uploads up to 500 past runs from this Mac, with full detail for the 10 most recent.",
+  libraryLabel: "Sync custom pipelines & roles",
+  libraryDescription:
+    "Your custom pipelines and roles upload to Octopush's sync service and follow you to your other Macs. Built-ins never travel.",
+  note: "Both are off until you turn them on, and apply only to the account that turned them on; signing out turns both off. Turning this off stops future uploads. Data already synced stays on Octopush's servers.",
+  requiresPro: "Requires Pro",
+  requiresSignIn: "Sign in with a Pro account to sync",
+  offOnly: "Requires Pro to turn on. You can still turn it off.",
+} as const;
 
 export function AccountPane() {
   const { status, signingIn, error, signIn, cancelSignIn, signOut, refresh } = useAuth();
-  const { plan, reload } = useEntitlement();
+  const { plan, reload, hasFeature } = useEntitlement();
   const isPro = plan === "pro";
+  const historySync = useSyncPrefsStore((s) => s.historySync);
+  const librarySync = useSyncPrefsStore((s) => s.librarySync);
+  const syncSaving = useSyncPrefsStore((s) => s.saving);
+  const syncError = useSyncPrefsStore((s) => s.error);
+  const loadSyncPrefs = useSyncPrefsStore((s) => s.load);
+  const setSyncPref = useSyncPrefsStore((s) => s.setPref);
+  const canHistorySync = status.signedIn && hasFeature("history.sync");
+  const canLibrarySync = status.signedIn && hasFeature("library.sync");
+  const lockedTitle = status.signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
+  // Turning OFF is always allowed (the backend agrees) — a user who lost Pro or
+  // signed out must still be able to stop uploads before re-subscribing.
+  const titleFor = (can: boolean, on: boolean) =>
+    can ? undefined : on ? SYNC_COPY.offOnly : lockedTitle;
+
+  useEffect(() => {
+    void loadSyncPrefs();
+  }, [loadSyncPrefs, status.signedIn]);
 
   // On opening the pane while signed in, re-fetch identity (to pick up a plan
   // change after a just-completed checkout) and reload the entitlement.
@@ -51,7 +84,7 @@ export function AccountPane() {
       <PaneHeader
         eyebrow="Account"
         title="Your account."
-        subtitle="Octopush is free and local-first. An account unlocks premium — the multi-agent orchestration harness — and, later, sync across machines. Your provider keys and local data never leave this device."
+        subtitle="Octopush is free and local-first. An account unlocks Pro — the multi-agent orchestration harness and optional sync across your Macs. Your provider keys never leave this device; your runs and library stay local unless you turn on sync."
       />
 
       <div className="max-w-[640px] space-y-8">
@@ -142,6 +175,36 @@ export function AccountPane() {
             {error && <p className="font-mono text-xs text-octo-rouge">{error}</p>}
           </div>
         )}
+
+        <div className="space-y-2" data-testid="sync-section">
+          <SectionLabel>Sync</SectionLabel>
+          <ToggleRow
+            label={SYNC_COPY.historyLabel}
+            description={SYNC_COPY.historyDescription}
+            checked={historySync}
+            disabled={(!canHistorySync && !historySync) || syncSaving === "history"}
+            title={titleFor(canHistorySync, historySync)}
+            onChange={(v) => void setSyncPref("history", v)}
+            testId="sync-history-toggle"
+          />
+          <ToggleRow
+            label={SYNC_COPY.libraryLabel}
+            description={SYNC_COPY.libraryDescription}
+            checked={librarySync}
+            disabled={(!canLibrarySync && !librarySync) || syncSaving === "library"}
+            title={titleFor(canLibrarySync, librarySync)}
+            onChange={(v) => void setSyncPref("library", v)}
+            testId="sync-library-toggle"
+          />
+          <p className="pt-1 text-[12px] leading-[1.55] text-octo-mute" data-testid="sync-note">
+            {SYNC_COPY.note}
+          </p>
+          {syncError && (
+            <p className="octo-fade-in font-mono text-xs text-octo-rouge">
+              Couldn't change sync: {syncError}
+            </p>
+          )}
+        </div>
       </div>
     </>
   );

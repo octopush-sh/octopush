@@ -12622,3 +12622,188 @@ mod unpriced_ledger_tests {
         assert_eq!(rep.by_model.iter().find(|m| m.model == "local-free").unwrap().unpriced_calls, 0);
     }
 }
+
+// ── Cloud sync is opt-in (off by default) ─────────────────────────────
+#[cfg(test)]
+mod sync_opt_in_tests {
+    use crate::settings::{test_sync_override, AppSettings, SyncPrefs};
+    use crate::sync::{PushOutcome, SyncKind};
+
+    fn off_both() {
+        test_sync_override::set(SyncKind::History, Some(false));
+        test_sync_override::set(SyncKind::Library, Some(false));
+    }
+
+    fn a_run() -> crate::sync::SyncRun {
+        crate::sync::SyncRun {
+            run_id: "r1".into(),
+            machine_id: "m1".into(),
+            machine_name: None,
+            workspace_name: None,
+            task: "t".into(),
+            status: "completed".into(),
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            stages: vec![],
+        }
+    }
+
+    #[test]
+    fn both_syncs_default_off_for_new_and_existing_settings() {
+        assert_eq!(AppSettings::default().sync_prefs(), SyncPrefs::default());
+        assert_eq!(
+            SyncPrefs::default(),
+            SyncPrefs { history_sync: false, library_sync: false }
+        );
+        let empty: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!empty.history_sync_enabled && !empty.library_sync_enabled);
+        assert!(empty.sync_owner.is_none());
+        // A settings.json written before the opt-in existed (an existing Pro
+        // user's) must come back OFF — sync never turns itself on.
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"providerKeys":{"anthropic":"sk-x"},"editorCommand":"code","modelTiers":{}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.sync_opted_in_for(SyncKind::History, Some("user_a")));
+        assert!(!legacy.sync_opted_in_for(SyncKind::Library, Some("user_a")));
+    }
+
+    #[test]
+    fn opt_in_round_trips_through_settings_json() {
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""historySyncEnabled":true"#), "{json}");
+        assert!(json.contains(r#""librarySyncEnabled":false"#), "{json}");
+        assert!(json.contains(r#""syncOwner":"user_a""#), "{json}");
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.sync_prefs_for(Some("user_a")),
+            SyncPrefs { history_sync: true, library_sync: false }
+        );
+        // The IPC shape is camelCase.
+        let wire = serde_json::to_value(back.sync_prefs()).unwrap();
+        assert_eq!(wire["historySync"], true);
+        assert_eq!(wire["librarySync"], false);
+    }
+
+    #[test]
+    fn opt_in_is_bound_to_the_account_that_granted_it() {
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        assert!(s.sync_opted_in_for(SyncKind::History, Some("user_a")));
+        // A different Pro user on the same Mac — or nobody — sees it OFF, so
+        // their sign-in can never backfill user_a's runs into their account.
+        assert!(!s.sync_opted_in_for(SyncKind::History, Some("user_b")));
+        assert!(!s.sync_opted_in_for(SyncKind::Library, Some("user_b")));
+        assert!(!s.sync_opted_in_for(SyncKind::History, None));
+        assert!(!s.sync_opted_in_for(SyncKind::History, Some("")));
+        assert_eq!(s.sync_prefs_for(Some("user_b")), SyncPrefs::default());
+        // user_b opting in to Library does NOT inherit user_a's History opt-in.
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        assert_eq!(
+            s.sync_prefs_for(Some("user_b")),
+            SyncPrefs { history_sync: false, library_sync: true }
+        );
+        assert_eq!(s.sync_prefs_for(Some("user_a")), SyncPrefs::default());
+        // Turning off never needs ownership and never turns anything on.
+        s.set_sync_opted_in_by(SyncKind::Library, false, "user_b");
+        assert_eq!(s.sync_prefs_for(Some("user_b")), SyncPrefs::default());
+    }
+
+    #[test]
+    fn sign_out_clears_both_opt_ins_and_the_owner() {
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        s.clear_sync_opt_ins();
+        assert!(!s.history_sync_enabled && !s.library_sync_enabled);
+        assert!(s.sync_owner.is_none());
+        assert_eq!(s.sync_prefs_for(Some("user_a")), SyncPrefs::default());
+    }
+
+    #[test]
+    fn ui_settings_save_cannot_flip_the_opt_ins() {
+        // On disk: the user turned history sync OFF a moment ago.
+        let mut on_disk = AppSettings::default();
+        on_disk.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        on_disk.set_sync_opted_in_by(SyncKind::History, false, "user_a");
+        // A pane saves a STALE read-modify-write copy that still says ON (and
+        // tries to claim another owner) along with its real change.
+        let mut incoming: AppSettings = serde_json::from_str(
+            r#"{"editorCommand":"zed","historySyncEnabled":true,"librarySyncEnabled":true,"syncOwner":"user_x"}"#,
+        )
+        .unwrap();
+        incoming.preserve_sync_fields_from(&on_disk);
+        assert_eq!(incoming.editor_command.as_deref(), Some("zed"), "the pane's own change lands");
+        assert!(!incoming.history_sync_enabled && !incoming.library_sync_enabled);
+        assert_eq!(incoming.sync_owner.as_deref(), Some("user_a"));
+        // And the reverse: a stale OFF copy can't turn an ON opt-in off either.
+        let mut on = AppSettings::default();
+        on.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        let mut stale_off = AppSettings::default();
+        stale_off.preserve_sync_fields_from(&on);
+        assert!(stale_off.sync_opted_in_for(SyncKind::Library, Some("user_a")));
+    }
+
+    #[test]
+    fn only_failed_or_signed_out_pushes_count_as_failures() {
+        assert!(PushOutcome::Failed.is_failure());
+        assert!(PushOutcome::SignedOut.is_failure());
+        assert!(!PushOutcome::Sent.is_failure());
+        assert!(!PushOutcome::Empty.is_failure());
+        assert!(!PushOutcome::Disabled.is_failure());
+    }
+
+    #[test]
+    fn sync_kind_parses_and_maps_to_its_pro_feature() {
+        assert_eq!(SyncKind::parse("history"), Some(SyncKind::History));
+        assert_eq!(SyncKind::parse("library"), Some(SyncKind::Library));
+        assert_eq!(SyncKind::parse("everything"), None);
+        assert_eq!(SyncKind::History.feature(), crate::entitlement::feature::HISTORY_SYNC);
+        assert_eq!(SyncKind::Library.feature(), crate::entitlement::feature::LIBRARY_SYNC);
+    }
+
+    #[test]
+    fn gate_is_closed_when_off_and_kinds_are_independent() {
+        off_both();
+        assert!(!crate::sync::opted_in(SyncKind::History));
+        assert!(!crate::sync::sync_active(SyncKind::History));
+        assert!(!crate::sync::sync_active(SyncKind::Library));
+        test_sync_override::set(SyncKind::History, Some(true));
+        assert!(crate::sync::opted_in(SyncKind::History));
+        assert!(!crate::sync::opted_in(SyncKind::Library));
+    }
+
+    #[tokio::test]
+    async fn history_network_calls_short_circuit_when_off() {
+        off_both();
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run()]).await, PushOutcome::Disabled);
+        let detail = crate::sync::SyncRunDetail { run_id: "r1".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::Disabled);
+        let pulled = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(pulled.contains("History sync is off"), "{pulled}");
+        let fetched = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(fetched.contains("History sync is off"), "{fetched}");
+    }
+
+    #[tokio::test]
+    async fn library_network_calls_short_circuit_when_off() {
+        off_both();
+        // History ON must not open the library gate.
+        test_sync_override::set(SyncKind::History, Some(true));
+        let client = reqwest::Client::new();
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(
+            crate::sync::push_library_items(&client, vec![item]).await,
+            PushOutcome::Disabled
+        );
+        let pulled = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(pulled.contains("Library sync is off"), "{pulled}");
+    }
+}

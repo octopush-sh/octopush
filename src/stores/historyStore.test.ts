@@ -26,6 +26,7 @@ vi.mock("../lib/ipc", () => ({
 }));
 
 const { useHistoryStore } = await import("./historyStore");
+const { useSyncPrefsStore } = await import("./syncPrefsStore");
 
 const mkRun = (id: string): SyncedRun => ({
   run_id: id,
@@ -43,6 +44,8 @@ const mkRun = (id: string): SyncedRun => ({
 });
 
 beforeEach(() => {
+  // These cases exercise an OPTED-IN user; the off path has its own block.
+  useSyncPrefsStore.setState({ historySync: true, librarySync: false, loaded: true });
   useHistoryStore.setState({
     open: false,
     runs: [],
@@ -147,5 +150,22 @@ describe("historyStore", () => {
     await useHistoryStore.getState().openRun("b"); // retry succeeds
     expect(useHistoryStore.getState().detailByRun["b"]).toBeTruthy();
     expect(useHistoryStore.getState().detailError).toBeNull();
+  });
+});
+
+describe("historyStore with history sync turned off (the default)", () => {
+  it("never calls the network — refresh, launch sync, and drill-in all short-circuit", async () => {
+    useSyncPrefsStore.setState({ historySync: false });
+    historySyncPullMock.mockClear();
+    historySyncPushAllMock.mockClear();
+    historyRunDetailMock.mockClear();
+    await useHistoryStore.getState().refresh();
+    await useHistoryStore.getState().syncOnLaunch();
+    await useHistoryStore.getState().openRun("r1");
+    expect(historySyncPullMock).not.toHaveBeenCalled();
+    expect(historySyncPushAllMock).not.toHaveBeenCalled();
+    expect(historyRunDetailMock).not.toHaveBeenCalled();
+    expect(useHistoryStore.getState().loading).toBe(false);
+    expect(useHistoryStore.getState().detailError).toBe("History sync is off.");
   });
 });

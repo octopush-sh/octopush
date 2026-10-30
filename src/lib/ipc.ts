@@ -384,6 +384,8 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AdapterInfo,
   AppSettings,
+  SyncPrefs,
+  SyncKind,
   Budget,
   BudgetPeriod,
   BudgetScope,
@@ -1264,6 +1266,12 @@ export const ipc = {
   hasEverStartedRun: () => invoke<boolean>("has_ever_started_run"),
 
   // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
+  /** The user's cloud-sync opt-ins (both off by default). Local read. */
+  getSyncPrefs: () => invoke<SyncPrefs>("get_sync_prefs"),
+  /** Turn one cloud sync on/off; returns the new pair. Turning on is Pro-gated
+   *  (throws `UpgradeRequired` for Free). Off never deletes server data. */
+  setSyncPref: (kind: SyncKind, enabled: boolean) =>
+    invoke<SyncPrefs>("set_sync_pref", { kind, enabled }),
   /** The local read-only history mirror (instant, no network). */
   historyList: () => invoke<SyncedRun[]>("history_list"),
   /** Pull the user's run history from the cloud, replace the mirror, return it.
