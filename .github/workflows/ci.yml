@@ -81,6 +81,9 @@ jobs:
       - run: npm ci
       - name: what's-new changesets are valid
         run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
+      - name: clip recorder logic
+        # Pure parts only (selection, size fitting). Browser recording is not run in CI.
+        run: node --test scripts/clips/lib.test.mjs
       - name: release helpers and the nightly beta routine
         run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs
       - name: routine scripts

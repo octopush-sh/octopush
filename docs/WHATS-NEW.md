@@ -88,6 +88,25 @@ are served through Tauri's IPC mocks when the recorder runs the frontend in a br
 tour itself always runs on the user's real data and skips steps whose target isn't on
 screen.
 
+**Recording clips.** `npm run clips:record -- <version|unreleased> [--slug <s>] [--force]
+[--verbose]` records `<slug>.webm` for each `area: app` changeset with `steps` and no clip
+yet (`--force` re-records). It serves the real frontend from `clips.html` (a harness
+entry that is never part of the app bundle) on a Vite dev server, mocks IPC from the
+changeset's scenario via `@tauri-apps/api/mocks`, and drives headless Chromium with
+Playwright at 1280×800: through the app's tour runner (`window.__octoTour.play(steps,
+{ mode: "record" })`) when present, otherwise with its own token-styled caption and
+spotlight. With ffmpeg it trims the blank lead-in and re-encodes to VP9 under 1.5 MB,
+lowering fps then bitrate; a clip that can't fit is skipped with a warning. It never
+commits. `--verbose` lists every command the app invoked that the scenario doesn't
+cover.
+
+| Scenario | State |
+|---|---|
+| `default` | Signed-in Pro user, one project with two workspaces, a finished Direct run with stages and costs, a short Talk thread, three providers. |
+| `empty` | Fresh install: no projects, signed out, free plan. |
+
+Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
+
 ## 5. At release time
 
 `node scripts/whats-new.mjs collect <version>` (run by the release routine):
