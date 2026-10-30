@@ -9,6 +9,13 @@
 #   gh workflow run promote.yml -f version=0.4.90
 #
 # (The daily digest's `promote <version>` answer dispatches exactly this.)
+#
+# OWNER-ONLY, ENFORCED: the job runs in the `stable` environment, which must
+# require the owner's approval (repo → Settings → Environments → stable →
+# Required reviewers: the owner; and the repo variable OCTOPUSH_OWNER_LOGIN set
+# to the owner's login). The first step refuses to run unless that protection
+# is in place, so a dispatch by a bot or collaborator waits for the owner's
+# click — and fails closed if the environment was never protected.
 name: promote
 
 on:
@@ -29,18 +36,34 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: stable
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
       VERSION: ${{ github.event.inputs.version }}
+      OWNER: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
     steps:
+      - name: Owner gate — the stable environment must require the owner
+        run: |
+          set -euo pipefail
+          if [ -z "$OWNER" ]; then
+            echo "::error::repo variable OCTOPUSH_OWNER_LOGIN is not set — refusing to promote"; exit 1
+          fi
+          # Public repo: the environment's protection rules are readable.
+          reviewers="$(gh api "repos/$REPO/environments/stable" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")')"
+          case " ${reviewers,,} " in
+            *" ${OWNER,,} "*) echo "stable environment requires $OWNER's approval ✓" ;;
+            *) echo "::error::environment 'stable' must list $OWNER as a required reviewer (got: '${reviewers:-none}')"; exit 1 ;;
+          esac
+
       - name: Validate the version
         run: |
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version must be X.Y.Z (got '$VERSION')"; exit 1
           fi
 
-      - name: Verify v${{ github.event.inputs.version }} is a complete beta
+      - name: Verify the version is a complete beta
         run: |
           set -euo pipefail
           TAG="v$VERSION"
@@ -73,7 +96,11 @@ jobs:
       - name: Refuse to go backwards
         run: |
           set -euo pipefail
-          if stable="$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null)"; then
+          # Only a 404 means "no stable yet"; any other error must not skip the check.
+          code="$(gh api -i "repos/$REPO/releases/latest" 2>/dev/null | head -n1 | awk '{print $2}' || true)"
+          if [ "$code" = "404" ]; then
+            echo "no stable release yet"
+          elif stable="$(gh api "repos/$REPO/releases/latest" --jq .tag_name)"; then
             stable="${stable#v}"
             echo "current stable: $stable"
             if [ "$stable" = "$VERSION" ]; then
@@ -84,7 +111,7 @@ jobs:
               echo "::error::v$VERSION is older than the current stable v$stable — refusing to promote"; exit 1
             fi
           else
-            echo "no stable release yet"
+            echo "::error::could not read the current stable release (HTTP ${code:-?})"; exit 1
           fi
 
       - name: Promote

@@ -36,12 +36,36 @@ on:
 permissions:
   contents: write # create releases + upload assets
 
+# One release at a time: the beta-channel manifest is read-compare-uploaded,
+# so two overlapping runs could roll it back.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     # Apple Silicon runner → the universal build's aarch64 slice is native.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the guard below needs main's history
+
+      # Before any secret is in reach: only build commits that are on main,
+      # with a well-formed version. A tag pushed on a side branch (or a
+      # dispatch with a crafted input) never sees the signing key.
+      - name: Guard — commit on main, version well-formed
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not on main — releases are built from main only"; exit 1
+          fi
+          if [ -n "$INPUT_VERSION" ] && ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z (got '$INPUT_VERSION')"; exit 1
+          fi
 
       - name: Preflight — updater signing key is mandatory
         env:
@@ -129,5 +153,7 @@ jobs:
           # see the comment there for why an empty one breaks the bundler.
           # `gh` in scripts/release.mjs uses this.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Validated by the guard step; never interpolated into the script.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         # Every tag publishes to the beta channel first; promote.yml promotes to stable.
-        run: node scripts/release.mjs --ci --channel beta ${{ github.event.inputs.version }}
+        run: node scripts/release.mjs --ci --channel beta ${INPUT_VERSION:+"$INPUT_VERSION"}

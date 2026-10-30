@@ -72,6 +72,18 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   --prerelease=false --latest`; and confirms `releases/latest/download/latest.json`
   now reports the version. Answering `promote <version>` in the daily ideas digest
   (VISION.md §9) dispatches exactly this workflow.
+
+  **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
+  Repo → Settings → Environments → New environment `stable` → *Required reviewers*:
+  you (leave "prevent self-review" off so your own dispatch works); and Settings →
+  Secrets and variables → Actions → *Variables* → `OCTOPUSH_OWNER_LOGIN` = your login.
+  Every promotion — yours or the digest's — then waits for your one-tap approval
+  (GitHub emails and notifies you), and the workflow refuses to run at all if the
+  environment isn't protected that way.
+- **Release builds are main-only.** `release.yml` refuses a tag whose commit is not
+  on `main` before any secret is loaded, refuses a tag that doesn't match
+  `tauri.conf.json`, runs one release at a time, and never re-uploads assets over a
+  release that is already stable.
 - Which manifest an installed app reads is chosen in the app (Settings › About ›
   Update channel); `tauri.conf.json`'s updater endpoints are the stable default.
 

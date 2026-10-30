@@ -36,6 +36,19 @@ export function channelCreateArgs(channel) {
   throw new Error(`unknown channel "${channel}"`);
 }
 
+/**
+ * What a publish run does when the release for its tag may already exist.
+ * `existing` is the GitHub release (or null when there is none).
+ *   "create"   — no release yet (or not CI): `gh release create`
+ *   "reupload" — a beta re-run: upload with --clobber, then publish as prerelease
+ *   "refuse"   — the tag is a published stable release: never overwrite it
+ */
+export function ciPublishDecision(ci, existing, channel) {
+  if (!ci || !existing) return "create";
+  if (!existing.draft && !existing.prerelease) return "refuse";
+  return channel === "beta" ? "reupload" : "refuse";
+}
+
 /** -1 / 0 / 1 for X.Y.Z strings (a leading "v" is ignored). */
 export function compareVersions(a, b) {
   const pa = String(a).replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);

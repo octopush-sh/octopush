@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  ciPublishDecision,
   NOTES_MAX,
   NOTES_SUFFIX,
   buildManifest,
@@ -92,4 +93,13 @@ test("version bump touches only the version line of each file", () => {
   assert.match(out.cargoLock, /name = "nom"\nversion = "7.1.3"/);
   assert.throws(() => bumpVersionTexts({ ...files, cargoLock: "" }, "0.4.90"), /cargoLock/);
   assert.throws(() => bumpVersionTexts(files, "0.4"), /X\.Y\.Z/);
+});
+
+test("CI re-runs only re-upload into a beta, never over a stable release", () => {
+  assert.equal(ciPublishDecision(false, { prerelease: true }, "beta"), "create");
+  assert.equal(ciPublishDecision(true, null, "beta"), "create");
+  assert.equal(ciPublishDecision(true, { draft: true, prerelease: false }, "beta"), "reupload");
+  assert.equal(ciPublishDecision(true, { draft: false, prerelease: true }, "beta"), "reupload");
+  assert.equal(ciPublishDecision(true, { draft: false, prerelease: false }, "beta"), "refuse");
+  assert.equal(ciPublishDecision(true, { draft: false, prerelease: true }, "stable"), "refuse");
 });

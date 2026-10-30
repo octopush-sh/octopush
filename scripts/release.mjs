@@ -58,6 +58,7 @@ import {
   buildManifest,
   bumpVersionFiles,
   channelCreateArgs,
+  ciPublishDecision,
   parseChannel,
   releaseBody,
   shouldRefreshBetaManifest,
@@ -158,12 +159,10 @@ if (!CI) {
   }
 } else {
   // Sanity-check the tag matches the version we're about to publish.
+  // On a tag push a mismatch would republish (and clobber) another version.
   const ref = process.env.GITHUB_REF_NAME;
-  if (ref && ref !== `v${newVersion}`) {
-    console.log(
-      `\x1b[33m▸\x1b[0m Tag ${ref} does not match tauri.conf.json version ` +
-        `v${newVersion}. Publishing v${newVersion}.`,
-    );
+  if (process.env.GITHUB_REF_TYPE === "tag" && ref && ref !== `v${newVersion}`) {
+    die(`Tag ${ref} does not match tauri.conf.json version v${newVersion} — refusing to publish.`);
   }
 }
 
@@ -423,19 +422,31 @@ const ghCmd = [
   ...channelCreateArgs(CHANNEL),
   ...assets.map((p) => `"${p}"`),
 ].join(" ");
-// In CI a release for the tag may already exist (e.g. a re-run) — fall back to
-// uploading assets with --clobber so a retry is idempotent.
-try {
-  run(ghCmd);
-} catch (e) {
-  if (CI) {
-    console.log("\x1b[33m▸\x1b[0m release create failed (may already exist) — uploading assets with --clobber");
-    run(
-      [`gh release upload v${newVersion}`, ...assets.map((p) => `"${p}"`), "--clobber"].join(" "),
+// In CI a release for the tag may already exist (a re-run). Re-upload only
+// into an existing *beta* (draft or prerelease) — never over a promoted stable
+// release — and make sure it ends up published as a prerelease.
+let existing = null;
+if (CI) {
+  try {
+    existing = JSON.parse(
+      execSync(`gh api repos/{owner}/{repo}/releases/tags/v${newVersion}`, {
+        cwd: REPO,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).toString(),
     );
-  } else {
-    throw e;
+  } catch {
+    existing = null; // 404: create it below
   }
+}
+const decision = ciPublishDecision(CI, existing, CHANNEL);
+if (decision === "refuse") {
+  die(`v${newVersion} is already a published stable release — refusing to overwrite its assets.`);
+} else if (decision === "reupload") {
+  console.log(`\x1b[33m▸\x1b[0m v${newVersion} already exists as a beta — re-uploading its assets`);
+  run([`gh release upload v${newVersion}`, ...assets.map((p) => `"${p}"`), "--clobber"].join(" "));
+  run(`gh release edit v${newVersion} --draft=false --prerelease --latest=false`);
+} else {
+  run(ghCmd);
 }
 
 // ── 7. Beta channel manifest ─────────────────────────────────────

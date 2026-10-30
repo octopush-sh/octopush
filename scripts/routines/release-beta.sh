@@ -21,8 +21,8 @@ REPO="${OCTOPUSH_ROUTINE_REPO:-$(cd "$ROOT" && this_repo)}"
 OWNER="${REPO%%/*}"
 CI_TIMEOUT="${OCTOPUSH_RELEASE_CI_TIMEOUT:-2700}"   # seconds (45 min)
 CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
-TRAILERS="Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01ULshnptM3Z9W3DBu6mU8sz"
+# Optional commit trailers (e.g. attribution), one per line; none by default.
+TRAILERS="${OCTOPUSH_RELEASE_TRAILERS:-}"
 
 g() { git -C "$ROOT" "$@"; }
 

@@ -171,8 +171,10 @@ Brief:
 ```text
 Nightly beta release. Read VISION.md §8 first. Never edit code, never commit, never tag or
 merge by hand — the script does all of it and re-checks every rule itself.
-1. Run `bash scripts/routines/release-beta.sh run` and wait for it to finish (it can take up to
-   an hour while it waits for CI).
+1. Run `bash scripts/routines/release-beta.sh run` as a background command with a long timeout
+   (it can take up to an hour while it waits for CI; a normal foreground call times out first)
+   and wait for it to finish. If it is ever interrupted, running it again is safe: it reuses the
+   open release PR.
 2. If it exits 0: report the version, the release PR and release URLs it printed, and the notes
    it printed under "whats-new/<version>/notes.md". The beta build publishes from the tag in
    GitHub Actions; promoting it to stable is the owner's call (`promote <version>`).
