@@ -30,7 +30,7 @@ jobs:
 
   backend:
     # Keychain, the seatbelt sandbox and PTY code are macOS-only.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5

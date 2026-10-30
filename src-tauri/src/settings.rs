@@ -84,6 +84,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub sync_owner: Option<String>,
 
+    /// Update channel (Settings › About): `stable` (default) or `beta`.
+    /// Owned by `set_update_channel` — whole-file saves carry it over.
+    #[serde(default)]
+    pub update_channel: crate::updater::UpdateChannel,
+
+    /// A version the user chose "Skip this version" for: the launch alert
+    /// stays quiet for it (a newer one alerts again). Owned by
+    /// `set_skipped_update_version`.
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
+
     #[serde(default, rename = "anthropicApiKey", skip_serializing)]
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
@@ -205,6 +216,37 @@ impl AppSettings {
         self.library_sync_enabled = on_disk.library_sync_enabled;
         self.sync_owner = on_disk.sync_owner.clone();
     }
+
+    /// Same rule for the updater prefs: `set_update_channel` /
+    /// `set_skipped_update_version` are their only writers.
+    pub fn preserve_update_fields_from(&mut self, on_disk: &AppSettings) {
+        self.update_channel = on_disk.update_channel;
+        self.skipped_update_version = on_disk.skipped_update_version.clone();
+    }
+}
+
+/// The persisted update channel (any read failure ⇒ stable).
+pub fn update_channel() -> crate::updater::UpdateChannel {
+    load_settings().map(|s| s.update_channel).unwrap_or_default()
+}
+
+/// Persist the update channel (read-modify-write).
+pub fn set_update_channel(channel: crate::updater::UpdateChannel) -> AppResult<()> {
+    let mut settings = load_settings()?;
+    settings.update_channel = channel;
+    save_settings(&settings)
+}
+
+/// The version the user skipped, if any.
+pub fn skipped_update_version() -> Option<String> {
+    load_settings().ok().and_then(|s| s.skipped_update_version)
+}
+
+/// Persist (or clear, with `None`) the skipped version.
+pub fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
+    let mut settings = load_settings()?;
+    settings.skipped_update_version = version.filter(|v| !v.trim().is_empty());
+    save_settings(&settings)
 }
 
 /// Has the signed-in user opted in to this kind of cloud sync? Reads
@@ -257,10 +299,13 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 }
 
 /// A whole-settings save coming from the frontend: everything but the sync
-/// opt-ins (owned by `set_sync_pref`), which are carried over from disk.
+/// opt-ins (owned by `set_sync_pref`) and the updater prefs (owned by
+/// `set_update_channel` / `set_skipped_update_version`), which are carried
+/// over from disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
     let on_disk = load_settings()?;
     incoming.preserve_sync_fields_from(&on_disk);
+    incoming.preserve_update_fields_from(&on_disk);
     save_settings(&incoming)
 }
 

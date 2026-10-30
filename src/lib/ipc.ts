@@ -1,5 +1,25 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 
+// ─── Updater — types ───────────────────────────────────────────────────────
+
+export type UpdateChannel = "stable" | "beta";
+
+/** An available update, as `updater_check` reports it. */
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  /** Manifest `pub_date` (RFC 3339), when present. */
+  date: string | null;
+  /** Manifest `notes` (Markdown), when present. */
+  body: string | null;
+  channel: UpdateChannel;
+}
+
+export type UpdateDownloadEvent =
+  | { event: "Started"; data: { contentLength: number | null } }
+  | { event: "Progress"; data: { chunkLength: number } }
+  | { event: "Finished" };
+
 // ─── Direct mode (orchestration) — types ──────────────────────────────────
 
 export type AgentSubstrate = "api" | "cli";
@@ -378,7 +398,7 @@ export interface StashInfo {
   timestampMs: number;
 }
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import type {
@@ -885,6 +905,26 @@ export const ipc = {
     invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
+  // ─── Updater (channels + launch alert) ─────────────────────────
+  /** The persisted update channel (`stable` by default). */
+  getUpdateChannel: () => invoke<UpdateChannel>("get_update_channel"),
+  /** Persist the update channel; returns the stored value. */
+  setUpdateChannel: (channel: UpdateChannel) =>
+    invoke<UpdateChannel>("set_update_channel", { channel }),
+  /** The version the user skipped in the launch alert, if any. */
+  getSkippedUpdateVersion: () => invoke<string | null>("get_skipped_update_version"),
+  /** Persist (or clear, with null) the skipped version. */
+  setSkippedUpdateVersion: (version: string | null) =>
+    invoke<void>("set_skipped_update_version", { version }),
+  /** Check the current channel's manifest; null when up to date. */
+  updaterCheck: () => invoke<UpdateInfo | null>("updater_check"),
+  /** Download + install the update found by the last check, with progress. */
+  updaterInstall: (onEvent: (event: UpdateDownloadEvent) => void) => {
+    const channel = new Channel<UpdateDownloadEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("updater_install", { onEvent: channel });
+  },
+
   saveGitCredentials: (host: string, username: string, token: string) =>
     invoke<void>("save_git_credentials", { host, username, token }),
 

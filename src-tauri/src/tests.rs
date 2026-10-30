@@ -12807,3 +12807,85 @@ mod sync_opt_in_tests {
         assert!(pulled.contains("Library sync is off"), "{pulled}");
     }
 }
+
+#[cfg(test)]
+mod updater_channel_tests {
+    use crate::settings::AppSettings;
+    use crate::updater::{endpoint_override, endpoints_for, manifest_date, UpdateChannel, BETA_ENDPOINTS};
+
+    #[test]
+    fn channel_defaults_to_stable_and_round_trips() {
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.update_channel, UpdateChannel::Stable);
+        assert!(s.skipped_update_version.is_none());
+
+        let mut s = AppSettings::default();
+        s.update_channel = UpdateChannel::Beta;
+        s.skipped_update_version = Some("1.4.0".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""updateChannel":"beta""#), "{json}");
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.update_channel, UpdateChannel::Beta);
+        assert_eq!(back.skipped_update_version.as_deref(), Some("1.4.0"));
+    }
+
+    #[test]
+    fn channel_parses_only_known_names() {
+        assert_eq!(UpdateChannel::parse("stable"), Some(UpdateChannel::Stable));
+        assert_eq!(UpdateChannel::parse("beta"), Some(UpdateChannel::Beta));
+        assert_eq!(UpdateChannel::parse("nightly"), None);
+        assert_eq!(UpdateChannel::Beta.as_str(), "beta");
+    }
+
+    #[test]
+    fn ui_settings_save_cannot_flip_the_update_prefs() {
+        let mut on_disk = AppSettings::default();
+        on_disk.update_channel = UpdateChannel::Beta;
+        on_disk.skipped_update_version = Some("1.4.0".into());
+        // A stale pane copy written before the channel existed (no fields)…
+        let mut incoming: AppSettings =
+            serde_json::from_str(r#"{"editorCommand":"zed"}"#).unwrap();
+        incoming.preserve_update_fields_from(&on_disk);
+        assert_eq!(incoming.editor_command.as_deref(), Some("zed"));
+        assert_eq!(incoming.update_channel, UpdateChannel::Beta);
+        assert_eq!(incoming.skipped_update_version.as_deref(), Some("1.4.0"));
+        // …and one that claims the opposite values.
+        let mut stale: AppSettings = serde_json::from_str(
+            r#"{"updateChannel":"beta","skippedUpdateVersion":"9.9.9"}"#,
+        )
+        .unwrap();
+        stale.preserve_update_fields_from(&AppSettings::default());
+        assert_eq!(stale.update_channel, UpdateChannel::Stable);
+        assert!(stale.skipped_update_version.is_none());
+    }
+
+    #[test]
+    fn endpoints_follow_the_channel() {
+        let configured = vec![
+            "https://octopush.sh/update/latest.json".to_string(),
+            "https://github.com/octopush-sh/octopush/releases/latest/download/latest.json".to_string(),
+        ];
+        assert_eq!(endpoints_for(UpdateChannel::Stable, &configured), configured);
+        assert!(endpoint_override(UpdateChannel::Stable).is_none());
+        let beta = endpoints_for(UpdateChannel::Beta, &configured);
+        assert_eq!(
+            beta,
+            vec![
+                "https://octopush.sh/update/beta.json".to_string(),
+                "https://github.com/octopush-sh/octopush/releases/download/beta-channel/latest.json"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(endpoint_override(UpdateChannel::Beta).unwrap(), BETA_ENDPOINTS.to_vec());
+        for e in BETA_ENDPOINTS {
+            assert!(tauri::Url::parse(e).is_ok(), "{e}");
+        }
+    }
+
+    #[test]
+    fn manifest_date_reads_pub_date() {
+        let raw = serde_json::json!({"version": "1.2.0", "pub_date": "2026-10-30T06:00:00Z"});
+        assert_eq!(manifest_date(&raw).as_deref(), Some("2026-10-30T06:00:00Z"));
+        assert_eq!(manifest_date(&serde_json::json!({})), None);
+    }
+}

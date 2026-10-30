@@ -164,7 +164,7 @@ sidecars are bundled → generate `latest.json` → commit, tag `v0.4.51`, push 
 ## CI release — tag and let Actions build
 
 `.github/workflows/release.yml` runs on any `v*` tag (or manual dispatch) on a
-`macos-14` runner:
+`macos-15` runner:
 
 1. Bump the version locally and land it on `main` (e.g. `npm version` or edit the
    three files), commit.
