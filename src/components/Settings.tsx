@@ -59,14 +59,23 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
               <div className="mb-1.5 px-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
                 {group.label}
               </div>
-              {group.tabs.map((t) => (
-                <TabButton
-                  key={t}
-                  label={SETTINGS_TAB_LABELS[t]}
-                  active={tab === t}
-                  onClick={() => setTab(t)}
-                />
-              ))}
+              {group.tabs.map((t) => {
+                const button = (
+                  <TabButton
+                    key={t}
+                    label={SETTINGS_TAB_LABELS[t]}
+                    active={tab === t}
+                    onClick={() => setTab(t)}
+                  />
+                );
+                // Tour / demo-clip anchor (docs/WHATS-NEW.md §2). A static
+                // literal so `whats-new check` can see the id.
+                return t === "about" ? (
+                  <div key={t} data-tour="settings-nav-about">{button}</div>
+                ) : (
+                  button
+                );
+              })}
             </div>
           ))}
         </aside>

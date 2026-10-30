@@ -81,5 +81,8 @@ jobs:
       - run: npm ci
       - name: what's-new changesets are valid
         run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
+      - name: clip recorder logic
+        # Pure parts only (selection, size fitting). Browser recording is not run in CI.
+        run: node --test scripts/clips/lib.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
