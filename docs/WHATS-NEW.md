@@ -1,0 +1,91 @@
+# What's new — the contract
+
+Every user-visible change ships with a **changeset**: a small Markdown file written in the
+same PR as the code. One file feeds four things, so they can never disagree:
+
+1. the **release notes** (GitHub release body and the updater's `latest.json` `notes`, which
+   the in-app update alert shows);
+2. the **What's new modal** shown after an update (tips);
+3. the **guided tour** behind each tip's *Show me* button (highlights the real UI);
+4. the **recorded clip** shown in the tip (the recorder performs the same steps on the real
+   frontend with mocked IPC).
+
+## 1. The changeset file
+
+Path: `whats-new/unreleased/<slug>.md` — `slug` is kebab-case, unique, ≤ 48 chars.
+PRs with no user-visible change (refactors, CI, tests, dependency bumps) add none.
+
+```markdown
+---
+title: Run history syncs only if you turn it on      # ≤ 60 chars, English, user-facing
+kind: feature            # feature | improvement | fix
+area: app                # app | api | web — only `app` entries reach the in-app modal
+highlight: true          # optional (default: false for fix, true otherwise). true ⇒ a tip in the modal
+scenario: default        # optional demo fixture the tour preview and clip recorder start from (§4)
+steps:                   # optional; drives the tour AND the clip. Omit for text-only tips.
+  - open: settings/account          # optional: a named surface to open first (§3)
+    target: settings-account-sync   # a data-tour id that exists in src/ (§2)
+    caption: Turn on run-history sync here — it's off until you do.
+    action: none                    # none | click | hover | type (the tour never acts; the recorder does)
+  - target: settings-account-sync-note
+    caption: Turning it off stops future uploads.
+---
+Cloud sync is now opt-in and off by default, per account. Turn on **Sync run history** in
+Settings › Account when you want your runs on your other Macs.
+```
+
+Rules (enforced by `node scripts/whats-new.mjs check`, which CI runs):
+
+- Frontmatter keys and enum values exactly as above; unknown keys are an error.
+- `title` ≤ 60 chars; body 1–3 sentences, ≤ 400 chars, Markdown inline only.
+- Every `target` must exist as `data-tour="<id>"` somewhere in `src/`; every `open` must be a
+  registered surface (§3); `text` is required when `action: type`.
+- At most 6 steps. A clip, if committed, lives next to the file as `<slug>.webm`, ≤ 1.5 MB.
+- UI copy rules from `CLAUDE.md` apply: English, calm, no hype.
+
+## 2. `data-tour` ids
+
+A tour or clip can only point at elements that carry a stable `data-tour="<id>"` attribute.
+Ids are kebab-case, scoped by surface (`settings-account-sync`, `direct-launcher-begin`,
+`review-ai-pass`). Adding an id to an element is cheap and encouraged; renaming one breaks
+changesets that use it, so `check` catches it. The registry of surfaces and the tour runner
+live in `src/lib/tour/`.
+
+## 3. Named surfaces (`open:`)
+
+`open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
+`settings/account`, `settings/privacy`, `mode/run`, `mode/direct`, `mode/review`,
+`palette`). Each entry is a function that navigates the real app there. The tour runner and
+the clip recorder both call it, so a demo never depends on clicking through menus.
+
+## 4. Scenarios
+
+A scenario is a named fixture of app state for demos: projects, workspaces, a finished
+Direct run, a signed-in Pro account, etc. Scenarios live in `scripts/clips/scenarios/` and
+are served through Tauri's IPC mocks when the recorder runs the frontend in a browser. The
+tour itself always runs on the user's real data and skips steps whose target isn't on
+screen.
+
+## 5. At release time
+
+`node scripts/whats-new.mjs collect <version>` (run by the release routine):
+
+1. moves `whats-new/unreleased/*` into `whats-new/<version>/`;
+2. writes `whats-new/<version>/notes.md` — grouped **Features / Improvements / Fixes**, then
+   a **Maintenance** line listing merged PRs without a changeset;
+3. the clip recorder then records `<slug>.webm` for every app changeset with `steps`.
+
+The app bundles `whats-new/*/` at build time. After an update, the What's new modal shows
+the `highlight` tips of every version newer than the last one the user saw.
+
+## 6. Update channels
+
+| Channel | Manifest | Who |
+|---|---|---|
+| Stable | `https://octopush.sh/update/latest.json` → GitHub `releases/latest/download/latest.json` | everyone (default) |
+| Beta | `https://octopush.sh/update/beta.json` → GitHub `releases/download/beta-channel/latest.json` | Settings › About › Update channel: Beta |
+
+Every tagged release `vX.Y.Z` is first published as a GitHub **prerelease** (beta) and its
+`latest.json` is also uploaded to the moving `beta-channel` release. **Promoting** a version
+(`.github/workflows/promote.yml`, owner-only) marks it as the latest full release, which makes
+it the stable manifest. Stable users skip unpromoted versions.

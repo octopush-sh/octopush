@@ -78,5 +78,8 @@ jobs:
           node-version: 22
       - name: AGENTS.md mirrors CLAUDE.md
         run: node scripts/check-agents-md.mjs
+      - run: npm ci
+      - name: what's-new changesets are valid
+        run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done

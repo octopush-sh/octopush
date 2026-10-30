@@ -83,46 +83,74 @@ Claude Code release-watch routine checks each new release against this list:
 
 ## 7. Current priorities — Q4 2026 (in order)
 
-1. **A safety net for autonomous work.** PR CI on all three repos, Dependabot, Claude Code
-   contract tests (§6). Nothing else is safe to delegate until it exists.
-2. **Trust correctness.** Cloud sync opt-in with exact privacy copy in app and site; correct model
+1. **A safety net for autonomous work** — done: PR CI on all three repos, Dependabot, Claude Code
+   contract tests (§6).
+2. **The nightly self-improvement loop** (§8–§9): beta channel and promotion, release notes in the
+   update alert, the What's new modal with guided tours and recorded clips, review + auto-merge,
+   the daily ideas digest and its answers.
+3. **Trust correctness.** Cloud sync opt-in with exact privacy copy in app and site; correct model
    prices with unknown models shown as unpriced; billing entitlement correctness (done:
    per-subscription ledger, octopush-api #3).
-3. **Discoverability.** Search-intent copy, comparison pages (Cursor, Claude Code GUI, Codex),
+4. **Discoverability.** Search-intent copy, comparison pages (Cursor, Claude Code GUI, Codex),
    docs for shipped-but-undocumented features (sandbox, Routines, detached runs, Mission Control,
    Logbook), a current changelog, the Homebrew tap.
-4. **Product depth** — chosen by the owner each week from user feedback, not by agents.
+5. **Product depth** — chosen by the owner each week from user feedback, not by agents.
 
 ## 8. Rules for autonomous agents
 
-- **Output is a PR, an issue or a comment. Never merge, never tag, never release, never deploy
-  by hand.** Production deploys of the website and the API happen only through the
-  `scripts/deploy-if-ready.sh` routine in `octopush-web` and `octopush-api`, which deploys
-  CI-green `main`. The app itself ships only through the owner's release process.
+**The owner's gate is the idea, not the pull request.** The owner approves *what* gets built
+(the daily ideas digest, §9); the nightly cycle builds, reviews, merges and ships it to a
+**beta channel only the owner follows**; the owner promotes a beta to stable. Code reaches
+other users only after that promotion.
+
+- **Output is a PR, an issue or a comment.** Agents never merge by hand, never tag, never
+  publish a release and never deploy by hand. Merging, releasing and deploying happen only
+  through the deterministic scripts in `scripts/routines/` and each repo's
+  `scripts/deploy-if-ready.sh`, which re-check every rule below before acting.
+- **App PRs (`octopush`) auto-merge** when *all* hold, verified by `scripts/routines/automerge.sh`
+  on the PR's current head commit: CI green; an approving review from the independent review
+  routine (a different agent than the author); the PR is labelled `agent`; it touches no
+  human-only path; it changes at most 800 lines; it carries a `whats-new/unreleased/` changeset
+  if it is user-visible. Anything else is labelled `needs-owner` and waits.
+- **Website and API PRs never auto-merge** — merging them publishes immediately. They are
+  listed in the daily digest and merge only when the owner answers `merge <repo>#<n>`.
+- **Releases go beta first, always.** Every tag publishes a GitHub prerelease on the beta
+  channel (`docs/WHATS-NEW.md` §6). Only the owner promotes a version to stable
+  (`promote <version>` in the digest, or `.github/workflows/promote.yml`).
 - **Human-only areas** — open an issue with a proposal (label `proposal`), never a PR, unless the
   issue carries the `agent-ok` label: billing (`billing.rs`, `entitlement.rs`,
-  `octopush-api/api/dodo-webhook.ts`, `api/_lib/billing.ts`), auth (`auth.rs`, Clerk), release and
-  signing (`release.yml`, `scripts/release.mjs`), deploy scripts, pricing and the Free/Pro
-  boundaries, privacy copy and data flows, legal pages, and §1–§5 of this file.
-- **Implementation work** only on issues labelled `ready`. One issue → one branch → one PR.
-  The only exception: the Claude Code release-watch routine may open a small fix PR for the
-  `claude-code-update` issue it filed itself. Maintenance routines (docs/ROUTINES.md) are
-  otherwise comment-only — in particular, never push to Dependabot branches.
+  `octopush-api/api/dodo-webhook.ts`, `api/_lib/billing.ts`), auth (`auth.rs`, Clerk), release,
+  signing and update channels (`.github/`, `scripts/release.mjs`, `scripts/routines/`, deploy
+  scripts, `tauri.conf.json` updater settings), pricing and the Free/Pro boundaries, privacy copy
+  and data flows, legal pages, and §1–§5 and §8 of this file. Even with `agent-ok`, such PRs never
+  auto-merge.
+- **Implementation work** only on issues labelled `ready`. One issue → one branch → one PR,
+  labelled `agent`, body starting with `Closes #<n>`. The Claude Code release-watch routine may
+  also open a small fix PR for the `claude-code-update` issue it filed itself. Other maintenance
+  routines are comment-only — in particular, never push to Dependabot branches.
+- **Every user-visible change ships its changeset** (`whats-new/unreleased/<slug>.md`,
+  `docs/WHATS-NEW.md`): the release note, the What's new tip and the demo steps — and the
+  `data-tour` ids those steps need.
 - If you stop on a `ready` issue (ambiguous, or a human-only area without `agent-ok`), comment
   why and move it from `ready` to `needs-owner`, so no routine picks it up again.
 - Every PR: CI green, tests for the change, `docs/FEATURES.md` updated if user-facing,
   `CLAUDE.md` rules followed, the cross-repo `octopush-web/scripts/consistency-check.mjs` passing
   when versions, pricing or model names change.
 - Keep `AGENTS.md` identical to `CLAUDE.md` (CI enforces it).
-- **Ideas are welcome, as issues.** Label new feature ideas `proposal`; the owner promotes them
-  to `ready` or closes them.
+- **Ideas are welcome, as issues** labelled `proposal` (+ `idea` when they come from the ideas
+  routine). The owner answers them in the digest: yes → `ready`, no → closed, not yet → `later`.
 - When unsure, stop and write the question in the PR or issue instead of guessing.
 
-## 9. Owner's weekly loop
+## 9. Owner's loop
 
-About two hours, once a week: read the Friday report issue (label `report`) → merge or reject
-open PRs → answer `needs-owner` issues → label 2–3 issues `ready` → adjust §7 here if
-priorities changed.
+**Every morning (minutes):** open Octopush → the update alert shows the overnight beta's notes →
+update if you want, and the What's new modal walks through the changes → open the day's ideas
+digest (label `digest`) and answer each line `yes` / `no` / `later` (Spanish works too: `sí`,
+`no`, `aún no`), `merge <repo>#<n>` for waiting website/API PRs, `promote <version>` when a beta
+should go to everyone, or `idea: …` to add your own.
+
+**Every Friday:** read the weekly report (label `report`), answer `needs-owner` issues, adjust §7
+here if priorities changed.
 
 ## 10. Decision log
 
@@ -133,3 +161,4 @@ priorities changed.
 | 2026-10-29 | Cloud sync (run history incl. journals/artifacts/diffs, and the pipeline/role library) becomes opt-in, off by default, with exact privacy copy in app and site |
 | 2026-10-29 | Dependency updates via Dependabot on all three repos. Agent P stays off until the repos are authorized in Sonatype Guide (its gate returns HTTP 401) |
 | 2026-10-29 | Production deploys of web and API run from the owner's Mac via Octopush Routines (`scripts/deploy-if-ready.sh`); Vercel has no Git integration (Hobby plan) |
+| 2026-10-30 | The owner's gate moves from reviewing PRs to approving ideas: agent app PRs auto-merge under §8's checks into nightly **beta** releases only the owner follows; the owner promotes to stable. Website/API PRs still need a one-word OK. A daily ideas digest (≥5 ranked suggestions across app, API and site) feeds the backlog. What's new = one changeset per change driving notes, tips, guided tours and recorded clips. The cycle runs as Octopush Routines on the owner's Mac |
