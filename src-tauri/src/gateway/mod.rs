@@ -300,7 +300,8 @@ pub fn reconcile(
         let mut names: Vec<(String, Vec<String>)> = pairs.into_iter().collect();
         names.sort();
         for (g, ls) in names {
-            if ls.len() == 1 && !aliases.contains_key(&g) {
+            let known = aliases.contains_key(&g) || aliases.keys().any(|k| canonical_model(k) == g);
+            if ls.len() == 1 && !known {
                 learned.push((g, ls.into_iter().next().unwrap()));
             }
         }
