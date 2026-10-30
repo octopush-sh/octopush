@@ -830,6 +830,9 @@ function App() {
       switch (d?.kind) {
         case "settings": setSettingsTab(d.tab); break;
         case "close-settings": setSettingsTab(null); break;
+        case "close-overlays":
+          setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
+          break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
         case "palette": setShowPalette(true); break;
         case "mission-control": setMissionControlOpen(true); break;

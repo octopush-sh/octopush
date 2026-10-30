@@ -18,6 +18,26 @@ beforeEach(() => {
 });
 
 describe("runLaunchCheck", () => {
+  it("an existing install without lastSeen still sees this version's tips", async () => {
+    localStorage.setItem("octo-workspace-prefs", "{}");
+    const r = await runLaunchCheck({ version: async () => "0.4.90", tips, canOpen: () => true });
+    expect(r).toBe("opened");
+    expect(useWhatsNewStore.getState().tips.map((t) => t.title)).toEqual(["B"]);
+  });
+
+  it("stops waiting once the user opened the dialog by hand", async () => {
+    useWhatsNewPrefs.setState({ lastSeenVersion: "0.4.89" });
+    let free = false;
+    const p = runLaunchCheck({ version: async () => "0.4.90", tips, canOpen: () => free, pollMs: 5 });
+    await new Promise((r) => setTimeout(r, 15));
+    useWhatsNewStore.getState().open(ALL[0].tips);
+    useWhatsNewStore.getState().close();
+    free = true;
+    expect(await p).toBe("silent");
+    expect(useWhatsNewStore.getState().phase).toBe("closed");
+    expect(useWhatsNewPrefs.getState().lastSeenVersion).toBe("0.4.90");
+  });
+
   it("fresh install: records the version, opens nothing", async () => {
     const r = await runLaunchCheck({ version: async () => "0.4.90", tips, canOpen: () => true });
     expect(r).toBe("silent");

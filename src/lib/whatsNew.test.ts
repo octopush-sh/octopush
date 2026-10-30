@@ -100,6 +100,11 @@ describe("buildTips", () => {
     it("fresh install: remember silently", () => {
       expect(decideLaunch(null, "0.4.10", all)).toEqual({ tips: [], markSeen: "0.4.10" });
     });
+    it("first version that records lastSeen, on an existing install: this version's tips", () => {
+      const d = decideLaunch(null, "0.4.10", all, true);
+      expect(d.tips.map((t) => t.version)).toEqual(["0.4.10", "0.4.10"]);
+      expect(d.markSeen).toBe("0.4.10");
+    });
     it("upgrade across two versions: tips of both", () => {
       const d = decideLaunch("0.4.8", "0.4.10", all);
       expect(d.tips.map((t) => t.version)).toEqual(["0.4.9", "0.4.10", "0.4.10"]);

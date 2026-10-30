@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Tip } from "../lib/whatsNew";
 import { playTour } from "../lib/tour/runner";
+import { navigate } from "../lib/tour/surfaces";
 
 /** The last version whose What's new the user has been shown. Persisted to
  *  localStorage (same class of app preference as the workspace and editor
@@ -72,6 +73,8 @@ export const useWhatsNewStore = create<WhatsNewState>((set, get) => ({
     if (phase !== "modal" || !tip || tip.steps.length === 0) return;
     set({ phase: "touring" });
     await playTour(tip.steps, { mode: "interactive" });
+    // Put the screen back: the tour may have opened Settings, the palette or a room.
+    if (tip.steps.some((st) => st.open)) navigate({ kind: "close-overlays" });
     // Closed meanwhile (e.g. replaced) — don't resurrect the dialog.
     if (get().phase !== "touring") return;
     set({ phase: "modal", index: clamp(index + 1, tips.length) });

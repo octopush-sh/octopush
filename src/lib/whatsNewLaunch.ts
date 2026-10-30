@@ -26,6 +26,25 @@ export function canAutoOpen(): boolean {
   );
 }
 
+/** Keys only an app that has already run writes (other stores' prefs). */
+const EARLIER_RUN_KEYS = [
+  "octo-first-run",
+  "octo-workspace-prefs",
+  "octo-editor-prefs",
+  "lastOpenedProjectPath",
+  "lastActiveWorkspacePerProject",
+];
+
+/** True when this isn't the first launch ever — Octopush ran before (an
+ *  upgrade from a version that didn't record `lastSeenVersion` yet). */
+export function ranBefore(): boolean {
+  try {
+    return EARLIER_RUN_KEYS.some((k) => window.localStorage.getItem(k) !== null);
+  } catch {
+    return false;
+  }
+}
+
 export interface LaunchDeps {
   version?: () => Promise<string>;
   tips?: () => VersionTips[];
@@ -33,6 +52,8 @@ export interface LaunchDeps {
   pollMs?: number;
   /** Override the "screen is free" rule (tests). */
   canOpen?: () => boolean;
+  /** Override the "Octopush ran before" probe (tests). */
+  ranBefore?: () => boolean;
 }
 
 /** The launch check: compare the installed version with the last one seen and,
@@ -48,18 +69,37 @@ export async function runLaunchCheck(deps: LaunchDeps = {}): Promise<"opened" | 
     return "silent";
   }
   const prefs = useWhatsNewPrefs.getState();
-  const { tips, markSeen } = decideLaunch(prefs.lastSeenVersion, current, (deps.tips ?? releasedTips)());
+  const { tips, markSeen } = decideLaunch(
+    prefs.lastSeenVersion,
+    current,
+    (deps.tips ?? releasedTips)(),
+    prefs.lastSeenVersion === null && (deps.ranBefore ?? ranBefore)(),
+  );
   if (tips.length === 0) {
     if (markSeen) prefs.setLastSeenVersion(markSeen);
     return "silent";
   }
   const canOpen = deps.canOpen ?? canAutoOpen;
   const pollMs = deps.pollMs ?? 500;
-  while (!canOpen()) await new Promise((r) => setTimeout(r, pollMs));
+  const opensBefore = opens;
+  while (!canOpen()) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    // Opened by hand meanwhile (⌘K, About): that counts as shown.
+    if (opens !== opensBefore) {
+      if (markSeen) useWhatsNewPrefs.getState().setLastSeenVersion(markSeen);
+      return "silent";
+    }
+  }
   useWhatsNewStore.getState().open(tips);
   if (markSeen) useWhatsNewPrefs.getState().setLastSeenVersion(markSeen);
   return "opened";
 }
+
+/** Counts every open of the dialog, so the launch wait can tell it happened. */
+let opens = 0;
+useWhatsNewStore.subscribe((s, prev) => {
+  if (s.phase === "modal" && prev.phase === "closed") opens++;
+});
 
 let launched = false;
 /** Run the launch check once per app session (StrictMode mounts twice). */

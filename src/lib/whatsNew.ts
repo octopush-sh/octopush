@@ -183,9 +183,16 @@ export interface LaunchDecision {
 
 /** What to do at launch, given the persisted last-seen version and the
  *  installed one. Fresh install ⇒ remember silently. Upgrade ⇒ the tips of
- *  every version in (lastSeen, current]. Same version or a downgrade ⇒ nothing. */
-export function decideLaunch(lastSeen: string | null, current: string, all: VersionTips[]): LaunchDecision {
-  if (!lastSeen) return { tips: [], markSeen: current };
+ *  every version in (lastSeen, current]. Same version or a downgrade ⇒ nothing.
+ *  `existingInstall` tells a real fresh install from someone upgrading to the
+ *  first version that records `lastSeenVersion`: they get this version's tips. */
+export function decideLaunch(
+  lastSeen: string | null,
+  current: string,
+  all: VersionTips[],
+  existingInstall = false,
+): LaunchDecision {
+  if (!lastSeen) return { tips: existingInstall ? tipsForVersion(all, current) : [], markSeen: current };
   if (compareSemver(current, lastSeen) <= 0) return { tips: [], markSeen: null };
   return { tips: tipsInRange(all, lastSeen, current), markSeen: current };
 }

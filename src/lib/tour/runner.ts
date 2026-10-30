@@ -112,7 +112,11 @@ interface Session {
   stepMs: number;
   waitMs: number;
   timers: ReturnType<typeof setTimeout>[];
-  resolve: () => void;
+  /** Bumped by every seek; an older seek that wakes up later stops. */
+  seekId: number;
+  /** Steps whose target was actually shown (the recorder skips empty clips). */
+  shown: Set<number>;
+  resolve: (shown: number) => void;
 }
 
 let current: Session | null = null;
@@ -130,7 +134,7 @@ function end(s: Session) {
   clearTimers(s);
   current = null;
   useTourStore.setState({ ...TOUR_IDLE });
-  s.resolve();
+  s.resolve(s.shown.size);
 }
 
 /** Seek from step `i` in direction `dir`, skipping steps whose target never
@@ -138,16 +142,18 @@ function end(s: Session) {
  *  with nothing visible before) restores the step that was showing. */
 async function seek(s: Session, i: number, dir: 1 | -1): Promise<void> {
   const prev = useTourStore.getState();
+  const me = ++s.seekId;
   clearTimers(s);
   while (i >= 0 && i < s.steps.length) {
     const step = s.steps[i];
     useTourStore.setState({ index: i, target: null });
     if (step.open) openSurface(step.open);
     const el = await waitForTarget(step.target, s.waitMs);
-    if (!alive(s)) return;
+    if (!alive(s) || me !== s.seekId) return; // stopped, or a newer Next/Back took over
     if (el) {
       el.scrollIntoView?.({ block: "nearest", inline: "nearest" });
       useTourStore.setState({ index: i, target: el });
+      s.shown.add(i);
       if (s.mode === "record") scheduleRecord(s, step, el, i);
       return;
     }
@@ -176,11 +182,12 @@ function scheduleRecord(s: Session, step: TourStep, el: HTMLElement, i: number) 
 }
 
 /** Play `steps`; resolves when the tour ends (finished, closed, or replaced by
- *  another `playTour`). An empty list resolves at once. */
-export function playTour(steps: TourStep[], opts: PlayOptions = {}): Promise<void> {
+ *  another `playTour`) with the number of steps whose target was shown. An
+ *  empty list resolves at once with 0. */
+export function playTour(steps: TourStep[], opts: PlayOptions = {}): Promise<number> {
   stopTour();
-  if (steps.length === 0) return Promise.resolve();
-  return new Promise<void>((resolve) => {
+  if (steps.length === 0) return Promise.resolve(0);
+  return new Promise<number>((resolve) => {
     const s: Session = {
       id: ++nextId,
       steps,
@@ -188,6 +195,8 @@ export function playTour(steps: TourStep[], opts: PlayOptions = {}): Promise<voi
       stepMs: opts.stepMs ?? DEFAULT_STEP_MS,
       waitMs: opts.waitMs ?? DEFAULT_WAIT_MS,
       timers: [],
+      seekId: 0,
+      shown: new Set(),
       resolve,
     };
     current = s;

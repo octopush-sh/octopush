@@ -5,7 +5,7 @@ import type { TourStep } from "../whatsNew";
 import { playTour } from "./runner";
 
 export interface OctoTourApi {
-  play(steps: TourStep[], opts?: { mode?: "interactive" | "record"; stepMs?: number }): Promise<void>;
+  play(steps: TourStep[], opts?: { mode?: "interactive" | "record"; stepMs?: number }): Promise<number>; // resolves with the number of steps shown
 }
 
 declare global {

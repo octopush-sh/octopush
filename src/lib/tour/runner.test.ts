@@ -109,7 +109,7 @@ describe("playTour (interactive)", () => {
     const done = playTour([{ target: "a", caption: "A" }], { waitMs: 30 });
     await until(() => useTourStore.getState().target !== null);
     stopTour();
-    await expect(done).resolves.toBeUndefined();
+    await expect(done).resolves.toBe(1);
     expect(useTourStore.getState()).toMatchObject({ active: false, target: null, steps: [] });
   });
 });
@@ -169,5 +169,45 @@ describe("__octoTour bridge", () => {
     btn.addEventListener("click", onClick);
     await window.__octoTour!.play([{ target: "btn", caption: "c", action: "click" }], { mode: "record", stepMs: 10 });
     expect(onClick).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("playTour — counting and concurrent seeks", () => {
+  it("resolves with the number of steps actually shown", async () => {
+    add("b");
+    const done = playTour(
+      [
+        { target: "missing", caption: "A" },
+        { target: "b", caption: "B" },
+      ],
+      { waitMs: 20 },
+    );
+    await until(() => useTourStore.getState().target !== null);
+    tourNext();
+    expect(await done).toBe(1);
+    expect(await playTour([{ target: "nowhere", caption: "x" }], { waitMs: 10 })).toBe(0);
+  });
+
+  it("a Next pressed while a step is still loading wins over the older seek", async () => {
+    add("a");
+    const done = playTour(
+      [
+        { target: "a", caption: "A" },
+        { target: "slow", caption: "B" },
+        { target: "c", caption: "C" },
+      ],
+      { waitMs: 200 },
+    );
+    await until(() => useTourStore.getState().target !== null);
+    tourNext(); // starts waiting for "slow"
+    await flush();
+    tourNext(); // user presses → again before it appears: jump to "c"
+    add("c");
+    await until(() => useTourStore.getState().index === 2 && useTourStore.getState().target !== null);
+    add("slow"); // the old seek wakes up — it must not take over
+    await new Promise((r) => setTimeout(r, 60));
+    expect(useTourStore.getState().index).toBe(2);
+    stopTour();
+    await done;
   });
 });
