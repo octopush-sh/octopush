@@ -3840,6 +3840,116 @@ pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings
     Ok(())
 }
 
+// ─── Updater (channels + launch alert) ────────────────────────────
+
+/// The persisted update channel: `"stable"` (default) or `"beta"`.
+#[tauri::command]
+pub async fn get_update_channel() -> AppResult<String> {
+    Ok(crate::settings::update_channel().as_str().to_string())
+}
+
+/// Persist the update channel. Only writer of `updateChannel`.
+#[tauri::command]
+pub async fn set_update_channel(
+    channel: String,
+    pending: State<'_, crate::updater::PendingUpdate>,
+) -> AppResult<String> {
+    let parsed = crate::updater::UpdateChannel::parse(&channel)
+        .ok_or_else(|| AppError::Other(format!("unknown update channel: {channel}")))?;
+    crate::settings::set_update_channel(parsed)?;
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = None;
+    Ok(parsed.as_str().to_string())
+}
+
+/// The version the user chose to skip in the launch alert, if any.
+#[tauri::command]
+pub async fn get_skipped_update_version() -> AppResult<Option<String>> {
+    Ok(crate::settings::skipped_update_version())
+}
+
+/// Persist (or clear) the skipped version. Only writer of `skippedUpdateVersion`.
+#[tauri::command]
+pub async fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
+    crate::settings::set_skipped_update_version(version)
+}
+
+/// Check the current channel's manifest. Stable reads the endpoints in
+/// `tauri.conf.json`; beta overrides them with `updater::BETA_ENDPOINTS`.
+/// The pubkey always comes from the plugin config. The found update is
+/// kept for `updater_install`.
+#[tauri::command]
+pub async fn updater_check(
+    app: AppHandle,
+    pending: State<'_, crate::updater::PendingUpdate>,
+) -> AppResult<Option<crate::updater::UpdateInfo>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let channel = crate::settings::update_channel();
+    let mut builder = app.updater_builder();
+    if let Some(eps) = crate::updater::endpoint_override(channel) {
+        let urls = eps
+            .into_iter()
+            .map(|e| tauri::Url::parse(e).map_err(|err| AppError::Other(err.to_string())))
+            .collect::<AppResult<Vec<_>>>()?;
+        builder = builder
+            .endpoints(urls)
+            .map_err(|e| AppError::Other(e.to_string()))?;
+    }
+    let updater = builder.build().map_err(|e| AppError::Other(e.to_string()))?;
+    let found = updater.check().await.map_err(|e| AppError::Other(e.to_string()))?;
+    let info = found.as_ref().map(|u| crate::updater::UpdateInfo {
+        version: u.version.clone(),
+        current_version: u.current_version.clone(),
+        date: crate::updater::manifest_date(&u.raw_json),
+        body: u.body.clone(),
+        channel,
+    });
+    // The channel may have changed while the check was in flight: drop a
+    // result that no longer matches, so it can't be shown or installed.
+    if crate::settings::update_channel() != channel {
+        return Ok(None);
+    }
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = found.map(|u| (channel, u));
+    Ok(info)
+}
+
+/// Download + install the update found by the last `updater_check`,
+/// streaming progress on `on_event`. The frontend relaunches afterwards.
+#[tauri::command]
+pub async fn updater_install(
+    pending: State<'_, crate::updater::PendingUpdate>,
+    on_event: tauri::ipc::Channel<crate::updater::DownloadEvent>,
+) -> AppResult<()> {
+    use crate::updater::DownloadEvent;
+    let update = pending
+        .0
+        .lock()
+        .map_err(|e| AppError::Other(e.to_string()))?
+        .clone()
+        .ok_or_else(|| AppError::Other("No update to install — check again".into()))?;
+    let (found_on, update) = update;
+    if found_on != crate::settings::update_channel() {
+        return Err(AppError::Other("The update channel changed — check again".into()));
+    }
+    let mut started = false;
+    let progress = on_event.clone();
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = progress.send(DownloadEvent::Started { content_length });
+                }
+                let _ = progress.send(DownloadEvent::Progress { chunk_length });
+            },
+            move || {
+                let _ = on_event.send(DownloadEvent::Finished);
+            },
+        )
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn save_git_credentials(host: String, username: String, token: String) -> AppResult<()> {
     crate::settings::save_git_credentials(&host, &username, &token)

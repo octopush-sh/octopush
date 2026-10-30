@@ -30,7 +30,7 @@ jobs:
 
   backend:
     # Keychain, the seatbelt sandbox and PTY code are macOS-only.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -81,5 +81,9 @@ jobs:
       - run: npm ci
       - name: what's-new changesets are valid
         run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
+      - name: release helpers and the nightly beta routine
+        run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs
+      - name: routine scripts
+        run: node --test scripts/routines/routines.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
