@@ -52,6 +52,10 @@ describe("DirectCanvas viewed-run routing", () => {
     useRunsStore.setState({
       runsByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
       selectedRunIdByWs: {}, liveByStage: {},
+      // The canvas loads runs/detail on mount; there's no IPC in jsdom, so the
+      // real actions reject (an unhandled error that fails `vitest run`).
+      loadRuns: vi.fn(async () => {}),
+      refreshDetail: vi.fn(async () => {}),
     });
   });
 

@@ -109,6 +109,9 @@ These complement the design rules above and govern all new surfaces:
 | `npm run typecheck`           | TypeScript check only |
 | `npm test`                    | Vitest |
 | `cd src-tauri && cargo test`  | Rust tests |
+| `node scripts/check-agents-md.mjs` | Checks `AGENTS.md` still mirrors this file |
+
+CI (`.github/workflows/ci.yml`) runs typecheck + Vitest (Linux), `cargo test` + `cargo clippy` (macOS) and the `AGENTS.md` mirror check on every pull request. **When you edit this file, copy it over `AGENTS.md`** (keep that file's line 3).
 
 ---
 

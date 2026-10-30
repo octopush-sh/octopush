@@ -1,0 +1,63 @@
+name: CI
+
+# Every PR (including the ones agents open) must pass this before review.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    # The frontend suite is platform-agnostic (jsdom), so it runs on Linux.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  backend:
+    # Keychain, the seatbelt sandbox and PTY code are macOS-only.
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # tauri::generate_context! expects build.frontendDist (../dist) to exist;
+      # the Rust tests don't need the real bundle.
+      - run: mkdir -p dist && touch dist/index.html
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+      - name: cargo clippy
+        working-directory: src-tauri
+        # Warnings are reported, not fatal, until the existing ones are cleaned up.
+        run: cargo clippy --locked --all-targets
+
+  repo-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: AGENTS.md mirrors CLAUDE.md
+        run: node scripts/check-agents-md.mjs
