@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { makeGh, APP_REPO, API_REPO, WEB_REPO, ALL_REPOS, ciStatus, labelsOf } from "./gh.mjs";
+import { loadIdentities, requireIdentities, assertActingAs, sameLogin } from "./identity.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const REPO_FOR_AREA = { app: APP_REPO, api: API_REPO, web: WEB_REPO };
@@ -43,7 +44,7 @@ export function validateIdeas(ideas) {
     if (!REPO_FOR_AREA[it?.area]) errs.push(`${at}.area: app | api | web`);
     if (!["feature", "improvement", "fix"].includes(it?.kind)) errs.push(`${at}.kind: feature | improvement | fix`);
     if (!Number.isInteger(it?.value) || it.value < 1 || it.value > 5) errs.push(`${at}.value: integer 1–5`);
-    if (!(it?.difficulty in DIFF_RANK)) errs.push(`${at}.difficulty: S | M | L`);
+    if (!Object.hasOwn(DIFF_RANK, it?.difficulty ?? "")) errs.push(`${at}.difficulty: S | M | L`);
     if (typeof it?.estimate !== "string" || !it.estimate.trim()) errs.push(`${at}.estimate: e.g. "2–4 h"`);
     for (const k of ["why", "proposal"]) if (typeof it?.[k] !== "string" || it[k].trim().length < 20) errs.push(`${at}.${k}: at least a sentence`);
     if (it?.evidence !== undefined && (!Array.isArray(it.evidence) || it.evidence.some((u) => !/^https?:\/\//.test(u)))) errs.push(`${at}.evidence: list of URLs`);
@@ -98,17 +99,18 @@ export function cmpVersion(a, b) {
 }
 
 /** Everything waiting for the owner besides ideas. */
-export function waitingItems(gh) {
+export function waitingItems(gh, ids) {
   const out = [];
   for (const repo of [API_REPO, WEB_REPO]) {
     for (const p of gh.list(`repos/${repo}/pulls?state=open`)) {
       if (!labelsOf(p).includes("agent") || p.draft) continue;
+      if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== repo || p.base?.ref !== "main") continue;
       const short = repo.endsWith("-web") ? "web" : "api";
       out.push(`\`merge ${short}#${p.number}\` — [${p.title}](${p.html_url}) · CI ${ciStatus(gh, repo, p.head.sha)}`);
     }
   }
   for (const p of gh.list(`repos/${APP_REPO}/pulls?state=open`)) {
-    if (labelsOf(p).includes("needs-owner")) out.push(`App PR parked for you: [#${p.number} ${p.title}](${p.html_url})`);
+    if (labelsOf(p).includes("needs-owner") && sameLogin(p.user?.login, ids.builder)) out.push(`App PR parked for you: [#${p.number} ${p.title}](${p.html_url})`);
   }
   for (const i of gh.list(`repos/${APP_REPO}/issues?state=open&labels=needs-owner`)) {
     if (!i.pull_request) out.push(`Issue needs your call: [#${i.number} ${i.title}](${i.html_url})`);
@@ -125,7 +127,15 @@ export function waitingItems(gh) {
   return out;
 }
 
-function context(gh, now) {
+const trustedAuthor = (i, ids) => [ids.owner, ids.builder].some((t) => sameLogin(t, i.user?.login));
+
+/** An idea may come back only if it's an open, trusted `idea` parked as `later`. */
+export function canResurface(issue, ids) {
+  const l = labelsOf(issue);
+  return !!issue && !issue.pull_request && issue.state === "open" && l.includes("later") && l.includes("idea") && trustedAuthor(issue, ids);
+}
+
+function context(gh, now, ids) {
   const vision = readFileSync(join(ROOT, "VISION.md"), "utf8");
   const pri = /## 7\.[\s\S]*?(?=\n## 8\.)/.exec(vision)?.[0] ?? "";
   const lines = ["# Context for today's ideas", "", pri.trim(), "", "## Every existing idea / proposal (do not repeat these)", ""];
@@ -135,7 +145,7 @@ function context(gh, now) {
       if (i.pull_request) continue;
       const l = labelsOf(i);
       lines.push(`- ${repo.split("/")[1]}#${i.number} [${i.state}${l.length ? `; ${l.join(", ")}` : ""}] ${i.title}`);
-      if (i.state === "open" && l.includes("later") && now - Date.parse(i.updated_at) > 30 * DAY) later.push(`- ${repo.split("/")[1]}#${i.number} ${i.title} (parked ${Math.round((now - Date.parse(i.updated_at)) / DAY)} days ago)`);
+      if (canResurface(i, ids) && now - Date.parse(i.updated_at) > 30 * DAY) later.push(`- ${repo.split("/")[1]}#${i.number} ${i.title} (parked ${Math.round((now - Date.parse(i.updated_at)) / DAY)} days ago)`);
     }
   }
   lines.push("", "## Parked as `later` for 30+ days — you may resurface (set `resurface`)", "", later.length ? [...new Set(later)].join("\n") : "- none");
@@ -146,17 +156,17 @@ function context(gh, now) {
       if (p.merged_at && p.merged_at >= since) lines.push(`- ${repo.split("/")[1]}#${p.number} ${p.title}`);
     }
   }
-  lines.push("", "## Waiting for the owner (will be listed in the digest automatically)", "", ...waitingItems(gh).map((w) => `- ${w}`));
+  lines.push("", "## Waiting for the owner (will be listed in the digest automatically)", "", ...waitingItems(gh, ids).map((w) => `- ${w}`));
   return lines.join("\n");
 }
 
-function post(gh, file, now) {
+function post(gh, file, now, ids) {
   const ideas = JSON.parse(readFileSync(file, "utf8"));
   const errs = validateIdeas(ideas);
   if (errs.length) { console.error(errs.join("\n")); return 2; }
   const date = localDate(now);
   const existing = gh.list(`repos/${APP_REPO}/issues?state=all&labels=digest`, 100);
-  if (existing.some((i) => i.title === digestTitle(date))) { console.error(`${digestTitle(date)} already exists`); return 1; }
+  if (existing.some((i) => i.title === digestTitle(date) && sameLogin(i.user?.login, ids.builder))) { console.error(`${digestTitle(date)} already exists`); return 1; }
 
   const rows = [];
   let n = 1;
@@ -165,11 +175,15 @@ function post(gh, file, now) {
     let issue;
     if (it.resurface) {
       issue = gh.get(`repos/${repo}/issues/${it.resurface}`);
+      if (!canResurface(issue, ids)) { console.error(`skipping resurface of ${repo}#${it.resurface}: not an open trusted idea parked as later`); continue; }
       gh.send("POST", `repos/${repo}/issues/${it.resurface}/labels`, { labels: ["proposal", "idea"] });
       try { gh.send("DELETE", `repos/${repo}/issues/${it.resurface}/labels/later`); } catch { /* not labelled */ }
       gh.send("POST", `repos/${repo}/issues/${it.resurface}/comments`, { body: `Resurfaced in ${digestTitle(date)}.\n\n${ideaBody(it, date)}` });
     } else {
-      issue = gh.send("POST", `repos/${repo}/issues`, { title: it.title, body: ideaBody(it, date), labels: ["proposal", "idea"] });
+      // Idempotent: a rerun after a partial failure reuses the open idea it already filed.
+      issue = gh.list(`repos/${repo}/issues?state=open&labels=idea`, 500)
+        .find((i) => !i.pull_request && i.title === it.title && sameLogin(i.user?.login, ids.builder))
+        ?? gh.send("POST", `repos/${repo}/issues`, { title: it.title, body: ideaBody(it, date), labels: ["proposal", "idea"] });
     }
     rows.push({ n: n++, ref: `${repo}#${issue.number}`, title: it.title, area: it.area, value: it.value, difficulty: it.difficulty, estimate: it.estimate, url: issue.html_url });
   }
@@ -178,29 +192,30 @@ function post(gh, file, now) {
   for (const repo of ALL_REPOS) {
     for (const i of gh.list(`repos/${repo}/issues?state=open&labels=idea,proposal&sort=created&direction=asc`, 20)) {
       const ref = `${repo}#${i.number}`;
-      if (i.pull_request || listed.has(ref) || rows.length >= 25) continue;
+      if (i.pull_request || listed.has(ref) || rows.length >= 25 || !trustedAuthor(i, ids)) continue;
       const m = /\*\*Value\*\* [●○]+ \((\d)\/5\) · \*\*Difficulty\*\* ([SML]) · \*\*Estimate\*\* ([^·]+?) ·/.exec(i.body ?? "");
       rows.push({ n: n++, ref, title: i.title, area: repo === APP_REPO ? "app" : repo === API_REPO ? "api" : "web", value: Number(m?.[1] ?? 3), difficulty: m?.[2] ?? "M", estimate: m?.[3]?.trim() ?? "?", url: i.html_url, earlier: true });
     }
   }
-  for (const old of existing.filter((i) => i.state === "open")) gh.send("PATCH", `repos/${APP_REPO}/issues/${old.number}`, { state: "closed", state_reason: "completed" });
-  const digest = gh.send("POST", `repos/${APP_REPO}/issues`, { title: digestTitle(date), body: digestBody({ date, rows, waiting: waitingItems(gh) }), labels: ["digest"] });
+  for (const old of existing.filter((i) => i.state === "open" && sameLogin(i.user?.login, ids.builder))) gh.send("PATCH", `repos/${APP_REPO}/issues/${old.number}`, { state: "closed", state_reason: "completed" });
+  const digest = gh.send("POST", `repos/${APP_REPO}/issues`, { title: digestTitle(date), body: digestBody({ date, rows, waiting: waitingItems(gh, ids) }), labels: ["digest"] });
   console.log(`posted ${digest.html_url} with ${rows.filter((r) => !r.earlier).length} new idea(s)`);
   return 0;
 }
 
 async function main() {
   const [cmd, arg] = process.argv.slice(2);
+  const ids = requireIdentities(loadIdentities());
   const gh = makeGh();
   const now = Date.now();
   if (cmd === "check") {
     const t = digestTitle(localDate(new Date(now)));
-    const has = gh.list(`repos/${APP_REPO}/issues?state=all&labels=digest`, 50).some((i) => i.title === t);
+    const has = gh.list(`repos/${APP_REPO}/issues?state=all&labels=digest`, 50).some((i) => i.title === t && sameLogin(i.user?.login, ids.builder));
     console.log(has ? `${t} already posted` : `${t} not posted yet`);
     return has ? 1 : 0;
   }
-  if (cmd === "context") { console.log(context(gh, now)); return 0; }
-  if (cmd === "post" && arg) return post(gh, arg, new Date(now));
+  if (cmd === "context") { console.log(context(gh, now, ids)); return 0; }
+  if (cmd === "post" && arg) { assertActingAs(gh, ids.builder, ids); return post(gh, arg, new Date(now), ids); }
   console.error("usage: ideas.mjs check | context | post <ideas.json>");
   return 64;
 }

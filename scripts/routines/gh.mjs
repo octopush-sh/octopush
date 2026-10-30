@@ -9,14 +9,18 @@ export const API_REPO = `${OWNER}/octopush-api`;
 export const ALL_REPOS = [APP_REPO, API_REPO, WEB_REPO];
 
 /** Default runner: `gh api ...` → stdout. Throws on non-zero exit. */
-export function ghRun(args, input) {
+export function ghRun(args, input, token) {
   return execFileSync("gh", ["api", ...args], {
     encoding: "utf8",
     input,
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: 64 * 1024 * 1024,
+    env: token ? { ...process.env, GH_TOKEN: token } : process.env,
   });
 }
+
+/** A runner that authenticates with `token` instead of the default gh login. */
+export const ghRunAs = (token) => (args, input) => ghRun(args, input, token);
 
 export function makeGh(run = ghRun) {
   const parse = (out) => (out && out.trim() ? JSON.parse(out) : null);
