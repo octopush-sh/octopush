@@ -9,10 +9,11 @@
 // server, with Tauri IPC mocked from a scenario (scripts/clips/scenarios/),
 // in headless Chromium via Playwright; performs the steps; writes
 // `<slug>.webm` (≤ 1.5 MB) next to the changeset. Never commits anything.
-// Exit code: 0 when every selected clip was written or cleanly skipped,
-// 1 on any failure (the release routine treats a failure as "no clips").
+// Exit code: 0 when every selected clip was written or already existed (no
+// --force); 1 when any clip failed — including "no step target on screen" and
+// "can't fit under the size cap" (the release routine treats 1 as "no clips").
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, copyFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -90,7 +91,11 @@ function readEntries(dir) {
     });
 }
 
+/** The scenarios' fixed "now" (scenarios/shared.ts), so relative times never drift between runs. */
+const FIXED_NOW = "2026-10-28T15:00:00Z";
+
 async function openHarness(page, url, scenario) {
+  await page.clock.setFixedTime(new Date(FIXED_NOW));
   await page.goto(`${url}?octo-record=1&scenario=${encodeURIComponent(scenario)}`, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => window.__octoClips && (window.__octoClips.ready || window.__octoClips.error), null, { timeout: 90_000 });
   const err = await page.evaluate(() => window.__octoClips.error);
@@ -112,7 +117,11 @@ async function driveSteps(page, steps, verbose) {
     }
     const loc = page.locator(`[data-tour="${st.target}"]`).first();
     try {
-      await loc.waitFor({ state: "visible", timeout: 6000 });
+      // Clear the previous caption first, so a missing target isn't seconds of a stale frame.
+      await loc.waitFor({ state: "visible", timeout: 300 }).catch(async () => {
+        await page.evaluate(() => { window.__octoClipOverlay.caption(null); window.__octoClipOverlay.spotlight(null); });
+        await loc.waitFor({ state: "visible", timeout: 2000 });
+      });
     } catch {
       warn(`step ${i + 1}: [data-tour="${st.target}"] not on screen — skipped`);
       continue;
@@ -272,7 +281,7 @@ async function main() {
           size = fitClip(r.raw, dest, r.leadSec, r.durationSec, tmp, opts.verbose);
         } else {
           const rawSize = statSync(r.raw).size;
-          size = fitDecision(rawSize, ENCODE_LADDER.length - 1) === "accept" ? (renameSync(r.raw, dest), rawSize) : null;
+          size = fitDecision(rawSize, ENCODE_LADDER.length - 1) === "accept" ? (copyFileSync(r.raw, dest), rawSize) : null;
         }
         if (size == null) { warn(`${item.slug}: could not fit under ${MAX_CLIP_BYTES / 1024 / 1024} MB — skipped`); failures++; continue; }
         log(`  ✓ ${relative(ROOT, dest)} · ${(size / 1024).toFixed(0)} KB · ${r.durationSec.toFixed(1)} s`);
