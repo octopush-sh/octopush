@@ -613,7 +613,15 @@ mod tests {
         assert_eq!(worktree_dir_name_under(Path::new(&absurd_s), &long_branch, "abcdefgh"), "GUIDE-abcdefgh");
         // A symlinked parent counts at its resolved length.
         let tmp = tempfile::TempDir::new().unwrap();
-        let real = tmp.path().join(format!("{}real", "very-long-directory-name/".repeat(4)));
+        // Size the resolved parent from the real temp dir instead of assuming
+        // macOS's long /var/folders path (CI runners use much shorter ones): the
+        // resolved path must be too long for the full slug, yet roomy enough
+        // that a shortened one fits.
+        let canon_tmp = tmp.path().canonicalize().unwrap().to_string_lossy().chars().count();
+        let resolved_len = |n: usize, slug: usize| canon_tmp + 1 + n * 25 + "real/.octopus-worktrees/".len() + slug;
+        let depth = (0..40).find(|&n| resolved_len(n, DIR_SLUG_MAX + 9) > CLAUDE_DIR_NAME_CAP).unwrap();
+        assert!(resolved_len(depth, "GUIDE-abcdefgh".len()) <= CLAUDE_DIR_NAME_CAP, "temp dir too long for this test");
+        let real = tmp.path().join(format!("{}real", "very-long-directory-name/".repeat(depth)));
         std::fs::create_dir_all(&real).unwrap();
         let link = tmp.path().join("s");
         #[cfg(unix)]

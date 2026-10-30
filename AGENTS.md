@@ -32,14 +32,34 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 5. **Atelier layout is the law.** Rail (left) · ContextHeader · ModeSwitcher (Talk/Run/Review) · Canvas · Companion (right) · Input bar. Don't introduce new top-level chrome. Don't bring back tabs.
 6. **No bouncing, no spring, no glitter.** Motion is calm. 220–320ms, `cubic‑bezier(0.2, 0.8, 0.3, 1)`. Brass rules *grow*; they don't *appear*. **Nothing appears or disappears abruptly:** overlay/dialog backdrops use `.octo-overlay-enter` and their dialogs use `.octo-modal-enter`; context menus use `.octo-menu-enter`; collapsible regions use the grid-rows `0fr↔1fr` idiom; tab/mode content crossfades with `.octo-fade-in`; status indicators reveal with `.octo-pop-in`; list rows with `.octo-rise-in`. Don't hand-roll one-off animations — reuse the primitives in `src/styles.css` (documented in `docs/design-system.md` §6). All motion respects `prefers-reduced-motion`. **For centered/top dialogs, use `<ModalShell>` (`src/components/ModalShell.tsx`)** — it bundles the canonical scrim, entrance motion, Escape, and optional click-outside; never hand-roll a dialog backdrop.
 7. **No new colors without spec update.** If a feature needs a hue not in the palette, propose updating the spec first — don't slip new accents in via a PR.
+8. **UI copy is English. Always. No exceptions.** Every visible string (labels, buttons, placeholders, helper text, empty states, error messages, aria-labels, tooltips, eyebrow text, modal titles) is English regardless of the developer's chat language. Mixing languages is a bug. The one exception is **user data** displayed verbatim from third-party APIs (e.g. Jira's `statusName` is whatever Jira returns in the user's account locale — we never translate it; if the user wants English statuses, they change their Jira profile language).
 
-### Five signature details — preserve these always
+### Signature details and decorative retirement (2026-06-16; extended app-wide by the Direct beauty redesign, 2026-07-11)
 
-- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
-- **`⟶` in brass** — the prompt glyph everywhere (terminal, palette, input nudges).
-- **`§` in brass** — every tool call card is prefixed with `§ TOOL_NAME`.
-- **Roman numerals** — multi-step wizards use `I · II · III` in brass mono.
-- **Italic-serif placeholders** — input placeholders are phrases in Spectral italic.
+> **Retired app-wide — not just for new surfaces:** the brass *rule* divider (28px gradient, `.animate-brass-grow`), `§` as a typographic mark, Roman numerals, the `✦` flourish, and `⟶` used as ornament or as the Direct run-track/Mission-Control connector glyph are **gone from the codebase**. There is no legacy allowance left for these five — `grep -rn "§ \|Roman numeral\|brass rule\|⟶" docs CLAUDE.md` should only surface retirement statements or the sanctioned-site list below. Any gradient used as a rule/divider/connector is banned outright; radial/mask washes (backgrounds, edge-fades) are unaffected.
+
+**Structural glyphs — keep these (the only survivors):**
+- **`⟜` in brass** — Direct/builder checkpoint gate. Renders on the gate card's own header, never on a connector line.
+- **`⟲` in brass** — loop badge (`⟲ {iter}/{max}`) on a looping run-track card; the builder's review-loop edge pill (`⟲ ×N`).
+- **`⟶`** — retired everywhere except three sanctioned structural sites: Composer's send-button glyph, `InlineTicketPicker`'s input prompt, `HunkRail`'s focus marker. Do not add a fourth.
+
+**Active branding details:**
+- **The Octo mark** — the octopus creature (`OctoMark`, `src/components/icons/OctoMark.tsx`) is the product logo and mascot: app icon, welcome hero, top-bar live status, thinking indicator, empty states, about. Body language mirrors app state (idle / working / pushed / blocked); the wordmark is Fraunces via `.brand-wordmark` (brand surfaces only — never a UI font). See `docs/design-system.md` "The Octo — mark & mascot".
+- **`&` in brass** — the ampersand is the one brass typographic accent (e.g. *"Onyx & Brass"*), used sparingly — typographic only; The Octo replaced its brief stint as the Welcome logomark. The *"Octopus & you"* tagline is **retired** (too consumer-y for a developer tool).
+- **`StageDots` + the single beacon** — the new signature mechanics for anything that used to be a roman-numeral micro-track or a bespoke pulse: `StageDots` (`src/components/direct/StageDots.tsx`) is the universal 5px-dot micro-track (launcher tickets, Companion, Mission Control); `src/lib/beacon.ts`'s `beaconAnchor()` guarantees exactly one brass-pulsing element per attention scope (fleet scope = the longest-waiting needs-you card, FIFO). See `docs/design-system.md` §6/§8 for the full mechanics and the PRM (static-halo) fallback.
+- **Arabic numerals** — every wizard and stage-position label now uses plain arabic (`STEP 1 OF 2`, `1 · 2`, `3 · sonnet · api`). No surface numbers steps in Roman.
+- **Upright-serif phrases** — CTAs and placeholders use upright serif phrases (no italics anywhere; `em, i { font-style: normal }` enforced globally).
+
+### Minimalism principles (binding)
+
+These complement the design rules above and govern all new surfaces:
+
+- **Theme-agnostic via tokens. Never hardcode.** Colors, fonts, and spacing go through `--color-octo-*` CSS variables and Tailwind token classes. No hex literals, no raw font strings outside `styles.css`.
+- **No decorative flourishes, anywhere.** The brass rule divider, `⟶` as ornament (or as a connector glyph), `§`, Roman numerals, and `✦` are retired app-wide, not just for new surfaces — see above.
+- **Icons over text where possible, with `title` tooltips.** Use a `lucide-react` icon + `title` attribute instead of a text label wherever the icon is unambiguous. Never ship an icon without a tooltip.
+- **Smooth, token-driven transitions.** Every element that mounts/unmounts uses the motion primitives in `src/styles.css` (§6 of the cheatsheet). Do not hand-roll or mount abruptly.
+- **Intuitive and professional.** Controls behave exactly as a developer expects. No surprising gestures, no undiscoverable interactions, no status requiring decoding.
+- **Minimal visual noise.** Every element earns its place. No redundant labels, no nested borders, no decorative chrome that isn't functional.
 
 ---
 
@@ -89,6 +109,9 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 | `npm run typecheck`           | TypeScript check only |
 | `npm test`                    | Vitest |
 | `cd src-tauri && cargo test`  | Rust tests |
+| `node scripts/check-agents-md.mjs` | Checks `AGENTS.md` still mirrors this file |
+
+CI (`.github/workflows/ci.yml`) runs typecheck + Vitest (Linux), `cargo test` + `cargo clippy` (macOS) and the `AGENTS.md` mirror check on every pull request. **When you edit this file, copy it over `AGENTS.md`** (keep that file's line 3).
 
 ---
 

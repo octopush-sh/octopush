@@ -1,0 +1,25 @@
+# Weekly dependency updates. Minor/patch bumps arrive grouped per ecosystem;
+# majors arrive one PR each so their changelogs get reviewed individually.
+# Every update PR runs through .github/workflows/ci.yml.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions:
+        patterns: ["*"]

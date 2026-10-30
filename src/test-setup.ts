@@ -1,4 +1,17 @@
 import "@testing-library/jest-dom";
+import { vi } from "vitest";
+
+// Several stores subscribe to backend events at import time (`void listen(...)`).
+// jsdom has no Tauri runtime, so the real `listen` rejects; Vitest reports each
+// rejection as an unhandled error and `vitest run` exits 1 even when every test
+// passes. Default to an inert subscription. A test that exercises events mocks
+// "@tauri-apps/api/event" itself, and its file-level mock takes precedence.
+vi.mock("@tauri-apps/api/event", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/event")>()),
+  listen: vi.fn(async () => () => {}),
+  once: vi.fn(async () => () => {}),
+  emit: vi.fn(async () => {}),
+}));
 import { setArchetypes } from "./components/builder/graph";
 import type { Role } from "./lib/ipc";
 

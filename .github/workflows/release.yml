@@ -101,7 +101,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Add Rust targets (universal build needs both slices)
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
