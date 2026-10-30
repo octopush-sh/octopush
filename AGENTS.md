@@ -6,6 +6,12 @@ This file is a mirror of [`CLAUDE.md`](CLAUDE.md) for AI tools that read `AGENTS
 
 ---
 
+## Direction — read before proposing or planning anything
+
+[`VISION.md`](VISION.md) holds who Octopush is for, its principles and non-goals, the current priorities, and the **rules for autonomous agents** (what you may open a PR for, what must stay a proposal issue, the `ready` / `proposal` / `agent-ok` labels). If a task conflicts with it, say so in the issue or PR and stop — don't resolve the conflict yourself.
+
+---
+
 ## Feature map — the source of truth for what Octopush does
 
 [`docs/FEATURES.md`](docs/FEATURES.md) is the canonical, exhaustive catalogue of **every** Octopush feature and **how** it is implemented (Tauri commands, Zustand stores, components, mechanisms, data model). Read it to learn what already exists before you add or change behaviour — it is the fastest way to understand the product surface end-to-end.
