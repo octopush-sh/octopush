@@ -35,11 +35,13 @@ The agent workflow is the product. The editor, terminal, diff and git tooling ex
 1. **The human directs, agents execute.** Checkpoints, the escape valve (`ask_director`) and
    review loops beat autonomy for its own sake. Never remove a human gate to look faster.
 2. **Cost is a first-class signal, and it must be true.** Every execution path reports tokens,
-   cost and savings. A model the app can't price is shown as *unpriced*, never as free.
+   cost and savings. A model the app can't price must show as *unpriced*, never as free, and
+   stay out of savings (rolling out with #250; Usage already flags unpriced calls).
 3. **Local-first and honest about traffic.** Code, keys and history stay on the Mac. Anything
-   that leaves it is opt-in (cloud sync is off by default) or is a service the user explicitly
-   configured, and every such flow is described exactly in the app's Privacy pane and on the
-   site. No analytics, no telemetry.
+   that leaves it must be opt-in or a service the user explicitly configured, and every such
+   flow is described exactly in the app's Privacy pane and on the site. No analytics, no
+   telemetry. (Cloud sync becomes opt-in, off by default, with #248; until that release ships it
+   still runs for every Pro user.)
 4. **Security is never paywalled.** Sandboxing and read-only review stay on Free.
 5. **Native and calm.** macOS-only, the *Atelier in Onyx & Brass* identity, calm motion. No new
    top-level layout without an owner-approved spec.
@@ -93,15 +95,21 @@ Claude Code release-watch routine checks each new release against this list:
 
 ## 8. Rules for autonomous agents
 
-- **Output is a PR or an issue. Never merge, never tag, never release, never deploy by hand.**
-  Production web/API deploys happen only through each repo's `scripts/deploy-if-ready.sh`
-  routine, which deploys CI-green `main`.
+- **Output is a PR, an issue or a comment. Never merge, never tag, never release, never deploy
+  by hand.** Production deploys of the website and the API happen only through the
+  `scripts/deploy-if-ready.sh` routine in `octopush-web` and `octopush-api`, which deploys
+  CI-green `main`. The app itself ships only through the owner's release process.
 - **Human-only areas** — open an issue with a proposal (label `proposal`), never a PR, unless the
   issue carries the `agent-ok` label: billing (`billing.rs`, `entitlement.rs`,
   `octopush-api/api/dodo-webhook.ts`, `api/_lib/billing.ts`), auth (`auth.rs`, Clerk), release and
   signing (`release.yml`, `scripts/release.mjs`), deploy scripts, pricing and the Free/Pro
   boundaries, privacy copy and data flows, legal pages, and §1–§5 of this file.
 - **Implementation work** only on issues labelled `ready`. One issue → one branch → one PR.
+  The only exception: the Claude Code release-watch routine may open a small fix PR for the
+  `claude-code-update` issue it filed itself. Maintenance routines (docs/ROUTINES.md) are
+  otherwise comment-only — in particular, never push to Dependabot branches.
+- If you stop on a `ready` issue (ambiguous, or a human-only area without `agent-ok`), comment
+  why and move it from `ready` to `needs-owner`, so no routine picks it up again.
 - Every PR: CI green, tests for the change, `docs/FEATURES.md` updated if user-facing,
   `CLAUDE.md` rules followed, the cross-repo `octopush-web/scripts/consistency-check.mjs` passing
   when versions, pricing or model names change.
@@ -113,7 +121,8 @@ Claude Code release-watch routine checks each new release against this list:
 ## 9. Owner's weekly loop
 
 About two hours, once a week: read the Friday report issue (label `report`) → merge or reject
-open PRs → label 2–3 issues `ready` → adjust §7 here if priorities changed.
+open PRs → answer `needs-owner` issues → label 2–3 issues `ready` → adjust §7 here if
+priorities changed.
 
 ## 10. Decision log
 
