@@ -171,6 +171,25 @@ describe("PipelineSetup designed states", () => {
     expect(saves.className).toContain("text-octo-verdigris");
   });
 
+  it("names unpriced stage models and, with a budget, says it cannot be enforced", async () => {
+    estimateMock.mockResolvedValue({
+      estimateUsd: 0.05, baselineUsd: 0.4, unpricedModels: ["claude-mythos-1"], unpricedStages: 2,
+    });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const tag = await screen.findByTestId("estimate-unpriced");
+    expect(tag.textContent).toBe("· claude-mythos-1 unpriced");
+    expect(tag.getAttribute("title")).toContain("claude-mythos-1");
+    expect(screen.queryByTestId("estimate-budget-unenforceable")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("no budget"), { target: { value: "2" } });
+    expect(screen.getByTestId("estimate-budget-unenforceable").textContent).toBe("· budget not enforceable: 2 stages unpriced");
+  });
+
+  it("shows no unpriced note when every stage is priced", async () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await screen.findAllByText(/saves ~\$0\.35/);
+    expect(screen.queryByTestId("estimate-unpriced")).not.toBeInTheDocument();
+  });
+
   it("the beacon lands on Begin only when ready (Law 2)", () => {
     const { container, rerender } = render(
       <PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />,

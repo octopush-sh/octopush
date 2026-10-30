@@ -1738,10 +1738,26 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let db = state.db.lock();
-    let run = db.get_run(&run_id)?;
-    let stages = db.list_run_stages(&run_id)?;
-    Ok(serde_json::json!({ "run": run, "stages": stages }))
+    let (run, stages) = {
+        let db = state.db.lock();
+        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?)
+    };
+    // Flag stages whose model has no price (resolved after the DB lock): the
+    // ledger shows them as unpriced and says the budget cannot see them.
+    let router = crate::token_engine::catalog();
+    let mut priced: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut stages_json = serde_json::to_value(&stages)?;
+    if let Some(arr) = stages_json.as_array_mut() {
+        for (v, s) in arr.iter_mut().zip(stages.iter()) {
+            let ok = *priced
+                .entry(s.agent_model.clone())
+                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
+            }
+        }
+    }
+    Ok(serde_json::json!({ "run": run, "stages": stages_json }))
 }
 
 #[tauri::command]
@@ -2520,32 +2536,33 @@ pub async fn estimate_run_cost(
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<serde_json::Value> {
     let overrides = stage_overrides.unwrap_or_default();
-    let db = state.db.lock();
-    let stages = db.get_pipeline_stages(&pipeline_id)?;
-    let reference = crate::orchestrator::cost::pick_reference_model();
-    let mut cost = 0.0;
-    let mut baseline = 0.0;
-    for s in &stages {
-        // Token estimates come from the role's definition in the DB; fall back to
-        // (4000, 1000) when the role is absent (custom/deleted roles).
-        let (tok_in, tok_out) = db
-            .get_role(&s.role)?
-            .map(|r| (r.token_est_in as u64, r.token_est_out as u64))
-            .unwrap_or((4_000, 1_000));
-        let model = overrides
-            .iter()
-            .find(|(pos, _)| *pos == s.position)
-            .map(|(_, m)| m.as_str())
-            .unwrap_or(s.agent_model.as_str());
-        cost += crate::orchestrator::cost::stage_cost(model, tok_in, tok_out, 0, 0);
-        if let Some(ref_model) = &reference {
-            baseline += crate::orchestrator::cost::baseline_cost(ref_model, tok_in, tok_out);
+    // Gather the stages' models and token estimates under the DB lock, then
+    // price them without it.
+    let plan: Vec<(String, u64, u64)> = {
+        let db = state.db.lock();
+        let stages = db.get_pipeline_stages(&pipeline_id)?;
+        let mut plan = Vec::with_capacity(stages.len());
+        for s in &stages {
+            // Token estimates come from the role's definition in the DB; fall back to
+            // (4000, 1000) when the role is absent (custom/deleted roles).
+            let (tok_in, tok_out) = db
+                .get_role(&s.role)?
+                .map(|r| (r.token_est_in as u64, r.token_est_out as u64))
+                .unwrap_or((4_000, 1_000));
+            let model = overrides
+                .iter()
+                .find(|(pos, _)| *pos == s.position)
+                .map(|(_, m)| m.clone())
+                .unwrap_or_else(|| s.agent_model.clone());
+            plan.push((model, tok_in, tok_out));
         }
-    }
-    if reference.is_none() || baseline < cost {
-        baseline = cost;
-    }
-    Ok(serde_json::json!({ "estimateUsd": cost, "baselineUsd": baseline }))
+        plan
+    };
+    let router = crate::token_engine::catalog();
+    let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
+    let reference = crate::orchestrator::cost::pick_reference_model().and_then(|m| price(&m));
+    let est = crate::orchestrator::cost::estimate_run(&plan, &price, reference);
+    Ok(serde_json::to_value(est)?)
 }
 
 // ─── File operations ──────────────────────────────────────────────
@@ -3597,10 +3614,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     let fetched_at = Utc::now().to_rfc3339();
 
     // Load the current provider config, update matching models, save.
-    let providers_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".octopush")
-        .join("providers.json");
+    let providers_path = crate::provider_router::config_path();
 
     let mut providers: Vec<crate::provider_router::ProviderConfig> = if providers_path.exists() {
         let content = std::fs::read_to_string(&providers_path)
@@ -3672,10 +3686,78 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     })
 }
 
-/// Price every ledger row recorded at $0 with the catalog as it stands
-/// now. Rows whose model is still unpriced stay at $0.
-fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
-    db.lock().reprice_unpriced(&crate::token_engine::prices_for)
+/// `app_meta` flag: legacy `'computed'` $0 rows have been classified once.
+const LEDGER_UNPRICED_CLASSIFIED: &str = "ledger_unpriced_classify_v1";
+/// `app_meta` flag: rows billed at a known-wrong builtin price were fixed.
+const LEDGER_STALE_PRICES_FIXED: &str = "ledger_stale_price_fix_2026_10_v1";
+
+/// Price every unpriced ledger row with the catalog as it stands now (rows
+/// whose model is still unpriced stay at $0, marked `'unpriced'`; an
+/// explicit $0 marks them `'computed'`). Runs once at startup, after a
+/// pricing refresh, and on demand. Prices are resolved WITHOUT the DB lock
+/// (one cached catalog load), each write batch is one transaction, and the
+/// two one-time passes — classifying legacy $0 rows and correcting spend
+/// billed at a known-wrong builtin price — are gated by `app_meta` flags so
+/// a launch does not rescan the whole ledger. Returns rows that got a price.
+pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
+    let router = crate::token_engine::catalog();
+    let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
+
+    if db.lock().meta_get(LEDGER_STALE_PRICES_FIXED)?.is_none() {
+        fix_stale_prices(db, &price)?;
+    }
+
+    let classify_legacy = db.lock().meta_get(LEDGER_UNPRICED_CLASSIFIED)?.is_none();
+    let candidates = db.lock().reprice_candidates(classify_legacy)?;
+    let plan = crate::db::plan_reprice(&candidates, &price);
+    let d = db.lock();
+    let n = d.apply_reprice(&plan)?;
+    if classify_legacy {
+        d.meta_set(LEDGER_UNPRICED_CLASSIFIED, "done")?;
+    }
+    Ok(n)
+}
+
+/// One-time: re-price `'computed'` ledger rows and DIRECT run figures of
+/// models an earlier release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at
+/// $3/$15 — `provider_router::STALE_BUILTIN_PRICES`) at today's price.
+/// Ledger rows are recomputed from their tokens; run stages (no cache split
+/// persisted) are scaled by the uniform correction factor, which is only
+/// applied when today's price is a uniform rescale of the stale one.
+fn fix_stale_prices(
+    db: &Arc<parking_lot::Mutex<crate::db::Db>>,
+    price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
+) -> AppResult<()> {
+    let mut ids: Vec<&str> = crate::provider_router::STALE_BUILTIN_PRICES.iter().map(|(id, _)| *id).collect();
+    ids.dedup();
+    let mut ratios: Vec<(String, f64)> = Vec::new();
+    for id in &ids {
+        // The first listed tuple is the full stale default.
+        let Some((_, stale)) = crate::provider_router::STALE_BUILTIN_PRICES.iter().find(|(i, _)| i == id) else { continue };
+        let Some(now) = price(id) else { continue };
+        let cols = [now.input_per_m, now.output_per_m, now.cache_read_per_m, now.cache_creation_per_m];
+        let r = cols[0] / stale[0];
+        if cols.iter().zip(stale.iter()).all(|(n, s)| (n / s - r).abs() < 1e-9) && r < 1.0 {
+            ratios.push((id.to_string(), r));
+        }
+    }
+    let patterns: Vec<String> = ids.iter().map(|id| format!("%{id}%")).collect();
+    let pattern_refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let rows: Vec<crate::db::RepriceCandidate> = db
+        .lock()
+        .stale_price_candidates(&pattern_refs)?
+        .into_iter()
+        .filter(|r| ids.contains(&crate::token_engine::normalize_model_id(&r.model).as_str()))
+        .collect();
+    let plan = crate::db::plan_reprice(&rows, price);
+    let d = db.lock();
+    let repriced = d.apply_reprice(&plan)?;
+    let stages = d.fix_stale_direct_prices(&ratios)?;
+    d.meta_set(LEDGER_STALE_PRICES_FIXED, "done")?;
+    if repriced + stages > 0 {
+        tracing::info!(rows = repriced, stages, "corrected spend billed at a stale builtin price");
+    }
+    Ok(())
 }
 
 /// Re-price the ledger's unpriced rows on demand (Settings › Usage, next to
@@ -5515,7 +5597,8 @@ pub async fn ai_complete(
     ensure_not_truncated(&resp.stop_reason)?;
     // Same pricing authority `record` uses, so the cost we return to the UI is
     // exactly the one persisted to the ledger (no hardcoded-vs-router drift).
-    let cost = crate::token_engine::cost_for(
+    // One response = one request: per-request price tiers apply.
+    let cost = crate::token_engine::request_cost_for(
         &model,
         resp.input_tokens,
         resp.output_tokens,

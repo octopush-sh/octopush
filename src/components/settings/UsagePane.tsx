@@ -19,6 +19,7 @@ import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
+import { modelCostCell } from "../../lib/cost";
 import {
   PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, usd, useChartColors,
   type ChartColors,
@@ -387,7 +388,7 @@ export function UsagePane() {
           {report.unpricedCalls > 0 && (
             <p className="mt-2 flex max-w-[860px] flex-wrap items-baseline gap-x-2 text-[11px] text-octo-mute">
               <span>
-                {report.unpricedCalls === 1 ? "1 call" : `${report.unpricedCalls} calls`} carried tokens but no price — a model the catalog did not know, or had no price for, when it ran.
+                {report.unpricedCalls === 1 ? "1 call" : `${report.unpricedCalls} calls`} carried tokens but no price — a model the catalog did not know, or had no price for, when it ran. They are left out of the totals and of any savings, not counted as free.
               </span>
               <button
                 type="button"
@@ -510,6 +511,7 @@ export function UsagePane() {
               <ul className="space-y-1.5" data-testid="usage-models">
                 {report.byModel.map((m) => {
                   const share = report.totals.costUsd > 0 ? (m.costUsd / report.totals.costUsd) * 100 : 0;
+                  const cell = modelCostCell(m, usd);
                   return (
                     <li key={m.model} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel px-3 py-2">
                       <div className="flex items-baseline gap-3">
@@ -517,7 +519,13 @@ export function UsagePane() {
                         <span className="octo-tabular shrink-0 font-mono text-[10px] text-octo-mute">
                           {m.calls.toLocaleString()} calls · {formatTokens(m.inputTokens + m.outputTokens)} · <span title={HIT_TITLE}>hit {hitPct(m)}</span>
                         </span>
-                        <span className="octo-tabular w-16 shrink-0 text-right font-mono text-[11px] text-octo-ivory">{usd(m.costUsd)}</span>
+                        <span
+                          className={`octo-tabular w-16 shrink-0 text-right font-mono text-[11px] ${cell.unpriced && m.costUsd === 0 ? "text-octo-mute" : "text-octo-ivory"}`}
+                          title={cell.title}
+                          data-testid={cell.unpriced ? "usage-model-unpriced" : undefined}
+                        >
+                          {cell.text}
+                        </span>
                       </div>
                       <div className="mt-1.5 h-[2px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }} title={`${share.toFixed(0)}% of the period's cost`}>
                         <div className="h-full rounded-sm transition-[width] duration-[320ms]" style={{ width: `${share}%`, background: "var(--color-octo-brass)" }} />

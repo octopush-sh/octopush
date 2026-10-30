@@ -56,8 +56,10 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo test --locked 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"; then
-            summary="$(grep -E '^(error(\[E[0-9]+\])?:|test .* \.\.\. FAILED|thread .* panicked|failures:|    [a-z_:]+$|  --> |assertion|^  left|^ right|^called `Result::unwrap\(\)`)' "$RUNNER_TEMP/cargo-test.log" | head -n 80)"
+            summary="$(grep -E '^(error(\[E[0-9]+\])?:|test .* \.\.\. FAILED|thread .* panicked|failures:|    [a-z_:]+$|  --> |assertion|^  left|^ right|^called `Result::unwrap\(\)`)' "$RUNNER_TEMP/cargo-test.log" | head -n 80 || true)"
+            [ -n "$summary" ] || summary="$(tail -n 40 "$RUNNER_TEMP/cargo-test.log")"
             summary="${summary//'%'/'%25'}"
+            summary="${summary//$'\r'/'%0D'}"
             echo "::error title=cargo test failed::${summary//$'\n'/'%0A'}"
             exit 1
           fi

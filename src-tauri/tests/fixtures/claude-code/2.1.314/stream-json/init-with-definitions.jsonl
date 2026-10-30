@@ -1,0 +1,1 @@
+{"type": "system", "subtype": "init", "session_id": "aaaaaaaa-0000-4000-8000-000000000001", "uuid": "00000000-0000-4000-8000-000000000045", "cwd": "/Users/dev/project", "model": "claude-nonexistent-model-0", "permissionMode": "default", "claude_code_version": "2.1.314", "tools": [], "output_style": "default", "agents": ["fixture-reviewer"], "skills": ["fixture-skill"]}

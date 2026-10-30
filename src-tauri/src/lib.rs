@@ -47,6 +47,8 @@ pub mod mcp_setup;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod claude_code_contract;
 
 use state::AppState;
 use tauri::Manager;
@@ -444,6 +446,20 @@ pub fn run() {
                         let i = std::sync::Arc::clone(&ingestor);
                         let _ = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
+
+            // Pricing: give $0 ledger rows a price if their model has one now
+            // (e.g. a model this release added to the table) and mark the
+            // rest unpriced, so neither counts as free spend or as savings.
+            {
+                let db = std::sync::Arc::clone(&state.db);
+                tauri::async_runtime::spawn_blocking(move || {
+                    match commands::reprice_ledger(&db) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(count = n, "re-priced ledger rows at startup"),
+                        Err(e) => tracing::warn!(error = %e, "startup ledger re-price failed"),
                     }
                 });
             }

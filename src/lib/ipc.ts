@@ -206,6 +206,10 @@ export interface RunStage {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** True when the stage's model has no price (set by `get_run`): its spend
+   *  reads "unpriced", is invisible to the run budget and never counts as
+   *  saved. */
+  unpricedModel?: boolean;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -1250,7 +1254,7 @@ export const ipc = {
     invoke<StageIteration[]>("list_stage_iterations", { stageId }),
 
   estimateRunCost: (pipelineId: string, stageOverrides?: [number, string][]) =>
-    invoke<{ estimateUsd: number; baselineUsd: number }>("estimate_run_cost", {
+    invoke<{ estimateUsd: number; baselineUsd: number; unpricedModels?: string[]; unpricedStages?: number }>("estimate_run_cost", {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),

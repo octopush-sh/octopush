@@ -325,7 +325,8 @@ export interface ChatMessage {
 
 /** What one Talk conversation has cost so far, from the ledger (director
  *  rounds + sub-agent runs, cache-aware). `baselineUsd` is the same tokens
- *  priced on the strong tier — 0 when that tier is unpriced. */
+ *  priced on the strong tier — 0 when that tier is unpriced; unpriced calls
+ *  are in neither figure. */
 export interface ThreadCost {
   spentUsd: number;
   subagentsUsd: number;
@@ -333,6 +334,10 @@ export interface ThreadCost {
   strongPriced: boolean;
   calls: number;
   cacheHitPct: number | null;
+  /** Calls whose model had no price — left out of `spentUsd` and
+   *  `baselineUsd` (so out of the saving), named in `unpricedModels`. */
+  unpricedCalls?: number;
+  unpricedModels?: string[];
 }
 
 export interface ChatStreamEvent {
@@ -535,6 +540,9 @@ export interface SurfaceUsage extends UsageSlice {
 
 export interface ModelUsage extends UsageSlice {
   model: string;
+  /** Calls of this model the ledger could not price (unknown model) —
+   *  shown as "unpriced", never "$0.00". */
+  unpricedCalls?: number;
 }
 
 export interface SourceUsage extends UsageSlice {

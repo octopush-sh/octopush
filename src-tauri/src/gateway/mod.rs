@@ -300,7 +300,8 @@ pub fn reconcile(
         let mut names: Vec<(String, Vec<String>)> = pairs.into_iter().collect();
         names.sort();
         for (g, ls) in names {
-            if ls.len() == 1 && !aliases.contains_key(&g) {
+            let known = aliases.contains_key(&g) || aliases.keys().any(|k| canonical_model(k) == g);
+            if ls.len() == 1 && !known {
                 learned.push((g, ls.into_iter().next().unwrap()));
             }
         }
@@ -312,6 +313,9 @@ pub fn reconcile(
             .find(|(g, _)| g == &c)
             .map(|(_, l)| l.clone())
             .or_else(|| aliases.get(&c).cloned())
+            // An alias saved before canonicalization learned Bedrock `-v1:0`
+            // versions / Ollama tags is keyed by its older form.
+            .or_else(|| aliases.iter().find(|(k, _)| canonical_model(k) == c).map(|(_, v)| v.clone()))
             .unwrap_or(c)
     };
     // Gateway models, keyed by the name the ledger would use (several
@@ -556,7 +560,7 @@ mod tests {
     }
 
     fn ledger_model(model: &str, cost: f64, calls: i64, tokens: i64) -> ModelUsage {
-        ModelUsage { model: model.into(), usage: UsageSlice::new(tokens, 0, 0, 0, cost, calls) }
+        ModelUsage { model: model.into(), usage: UsageSlice::new(tokens, 0, 0, 0, cost, calls), unpriced_calls: 0 }
     }
 
     #[test]
@@ -666,7 +670,9 @@ mod tests {
             ids: [("r1".to_string(), "claude-haiku-4-5".to_string())].into_iter().collect(),
         };
         let r = reconcile(identity(), "s", "e", &spend, &ledger, &HashMap::new(), "now");
-        assert_eq!(r.learned_aliases, vec![("odd-name-v1:0".to_string(), "claude-haiku-4-5".to_string())]);
+        // Learned under the canonical gateway name (the Bedrock-style `-v1:0`
+        // version is folded away, like every other gateway route).
+        assert_eq!(r.learned_aliases, vec![("odd-name".to_string(), "claude-haiku-4-5".to_string())]);
         assert!(r.ledger_only_models.is_empty(), "the ledger model is now compared");
         assert_eq!(r.by_model[0].model, "claude-haiku-4-5");
         assert_eq!((r.by_model[0].gateway_requests, r.by_model[0].ledger_calls), (3, 2));

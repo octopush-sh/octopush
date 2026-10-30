@@ -19,7 +19,7 @@ use crate::error::{AppError, AppResult};
 const MCP_BIN: &str = "octopush-mcp";
 /// The MCP server name registered with the client. Tools then surface as
 /// `mcp__octopush__<tool>`.
-const SERVER_NAME: &str = "octopush";
+pub(crate) const SERVER_NAME: &str = "octopush";
 
 /// Locate the bundled `octopush-mcp` binary. Mirrors the PTY daemon's resolver:
 /// sibling-of-exe first (production `.app` and `cargo run`), then `$PATH`, then
@@ -89,8 +89,21 @@ pub fn resolve_claude_cli() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// The argv (after `claude`) that registers the bundled server at user scope:
+/// `mcp add octopush -s user -- <binary>`. One source for the one-click
+/// connect and the contract test against Claude Code's recorded `mcp add`.
+pub(crate) fn mcp_add_args(binary: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        ["mcp", "add", SERVER_NAME, "-s", "user", "--"].iter().map(Into::into).collect();
+    args.push(binary.as_os_str().to_owned());
+    args
+}
+
+/// The argv (after `claude`) that removes a user-scope registration.
+pub(crate) const MCP_REMOVE_ARGS: [&str; 5] = ["mcp", "remove", SERVER_NAME, "-s", "user"];
+
 /// The terminal command a user can run to register the server by hand.
-fn manual_command(binary_path: Option<&str>) -> String {
+pub(crate) fn manual_command(binary_path: Option<&str>) -> String {
     let path = binary_path.unwrap_or("/path/to/octopush-mcp");
     format!("claude mcp add {SERVER_NAME} -s user -- \"{path}\"")
 }
@@ -175,12 +188,11 @@ pub fn connect() -> McpConnectResult {
     // Remove-then-add makes the operation idempotent; ignore remove failures
     // (it simply may not exist yet).
     let _ = Command::new(&claude)
-        .args(["mcp", "remove", SERVER_NAME, "-s", "user"])
+        .args(MCP_REMOVE_ARGS)
         .output();
 
     let out = Command::new(&claude)
-        .args(["mcp", "add", SERVER_NAME, "-s", "user", "--"])
-        .arg(&binary)
+        .args(mcp_add_args(&binary))
         .output();
 
     match out {

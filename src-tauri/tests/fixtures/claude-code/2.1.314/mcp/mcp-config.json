@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "octopush": {
+      "type": "stdio",
+      "command": "/Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
