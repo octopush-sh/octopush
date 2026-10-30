@@ -52,7 +52,7 @@ portable-pty = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-dirs = "5"
+dirs = "6"
 anyhow = "1"
 git2 = { version = "0.19", features = ["vendored-openssl", "vendored-libgit2"] }
 thiserror = "1"
