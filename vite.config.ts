@@ -37,6 +37,8 @@ export default defineConfig(async () => ({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
+    // scripts/*.test.mjs use node:test and run under `node --test` in CI.
+    exclude: ["**/node_modules/**", "scripts/**"],
   },
 
   // Vite options tailored for Tauri development
