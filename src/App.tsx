@@ -80,6 +80,7 @@ import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
+import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
@@ -819,6 +820,24 @@ function App() {
     },
     [activeWorkspaceId],
   );
+
+  // Named-surface navigation for guided tours and recorded demos
+  // (src/lib/tour/surfaces.ts, docs/WHATS-NEW.md §3).
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const d = (e as CustomEvent<NavigateDetail>).detail;
+      switch (d?.kind) {
+        case "settings": setSettingsTab(d.tab); break;
+        case "close-settings": setSettingsTab(null); break;
+        case "mode": setSettingsTab(null); setMode(d.mode); break;
+        case "palette": setShowPalette(true); break;
+        case "mission-control": setMissionControlOpen(true); break;
+        case "logbook": setLogbookOpen(true); break;
+      }
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [setMode]);
 
   // Cross-mode action (P9): take a chat tool's shell command to RUN mode.
   // Switches to the terminal and copies the command to the clipboard so the
