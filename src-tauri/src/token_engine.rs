@@ -367,7 +367,7 @@ impl TokenEngine {
         if seq <= last {
             return;
         }
-        if let Some(ev) = scan_pty_output(session_id, buf) {
+        if let Some((ev, cumulative)) = scan_pty_output_kind(session_id, buf) {
             // Once Claude Code's transcript meters this session (exact model
             // and cache split per API call — see `transcripts.rs`), the
             // screen-scraped summary would count the same run twice: honour
@@ -394,12 +394,31 @@ impl TokenEngine {
                 let _ = self.db.lock().meta_set(&key, &seq.to_string());
                 return;
             }
+            // The summary is the session's running total: record only what
+            // it adds over the last one seen for this source.
+            let total = cumulative.then(|| format!("{},{},{}", ev.cost_usd, ev.input_tokens, ev.output_tokens));
+            let ev = if cumulative {
+                let last = self.db.lock().meta_get(&pty_total_key(session_id)).ok().flatten();
+                match cumulative_delta(ev, last.as_deref()) {
+                    Some(ev) => ev,
+                    None => {
+                        let _ = self.db.lock().meta_set(&key, &seq.to_string());
+                        return;
+                    }
+                }
+            } else {
+                ev
+            };
             // PTY scraping is the RUN-mode (terminal CLI agent) path.
             if let Err(e) = self.record(ev, "run") {
                 tracing::warn!(session_id = %session_id, error = %e, "token scan record failed");
                 return;
             }
-            let _ = self.db.lock().meta_set(&key, &seq.to_string());
+            let db = self.db.lock();
+            if let Some(total) = total {
+                let _ = db.meta_set(&pty_total_key(session_id), &total);
+            }
+            let _ = db.meta_set(&key, &seq.to_string());
         }
     }
 
@@ -442,21 +461,58 @@ impl TokenEngine {
 /// Try to extract a `TokenEvent` from a chunk of PTY output.
 /// Returns `None` if no usage pattern is found.
 pub fn scan_pty_output(session_id: &str, buf: &[u8]) -> Option<TokenEvent> {
+    scan_pty_output_kind(session_id, buf).map(|(ev, _)| ev)
+}
+
+/// [`scan_pty_output`] plus whether the event is a session-CUMULATIVE
+/// total (Claude Code's `Total cost:` summary — printed again by every
+/// `/cost` and on a redraw) rather than one call's usage.
+fn scan_pty_output_kind(session_id: &str, buf: &[u8]) -> Option<(TokenEvent, bool)> {
     let text = std::str::from_utf8(buf).ok()?;
 
     // Pattern 1: JSON `"usage"` block from API response logging.
     // e.g. {"usage":{"input_tokens":1234,"output_tokens":567}}
     if let Some(ev) = try_parse_api_usage_json(session_id, text) {
-        return Some(ev);
+        return Some((ev, false));
     }
 
     // Pattern 2: Claude Code cost summary line.
     // e.g. "Total cost: $1.23 | Input: 45.2K | Output: 12.1K"
     if let Some(ev) = try_parse_claude_code_summary(session_id, text) {
-        return Some(ev);
+        return Some((ev, true));
     }
 
     None
+}
+
+/// Meta key holding the last cumulative `Total cost:` recorded for a source
+/// (`cost,input,output`), so a repeated summary records nothing and a grown
+/// one records only the growth.
+fn pty_total_key(session_id: &str) -> String {
+    format!("pty_scan_total:{session_id}")
+}
+
+/// Turn a cumulative summary into the spend not yet recorded: `None` when
+/// it repeats the last one (a second `/cost`, a redraw); the difference when
+/// it grew; the whole summary when it is lower (a new `claude` run in the
+/// same terminal starts again from zero).
+fn cumulative_delta(mut ev: TokenEvent, last: Option<&str>) -> Option<TokenEvent> {
+    let Some(last) = last else { return Some(ev) };
+    let mut parts = last.split(',').map(|p| p.trim().parse::<f64>().unwrap_or(0.0));
+    let (cost, input, output) = (
+        parts.next().unwrap_or(0.0),
+        parts.next().unwrap_or(0.0) as u64,
+        parts.next().unwrap_or(0.0) as u64,
+    );
+    if (ev.cost_usd - cost).abs() < 1e-9 {
+        return None;
+    }
+    if ev.cost_usd > cost {
+        ev.cost_usd -= cost;
+        ev.input_tokens = ev.input_tokens.saturating_sub(input);
+        ev.output_tokens = ev.output_tokens.saturating_sub(output);
+    }
+    Some(ev)
 }
 
 fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> {
@@ -505,6 +561,21 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
 fn try_parse_claude_code_summary(session_id: &str, text: &str) -> Option<TokenEvent> {
     // Look for pattern like: "Total cost: $X.XX"
     // And optionally "Input: NNK" / "Output: NNK"
+    // Claude Code's TUI positions words with cursor moves (`ESC[<col>G`)
+    // rather than spaces, so the raw PTY bytes never contain the literal
+    // "Total cost:" — match against the text as the screen shows it. The
+    // words themselves arrive intact, so a chunk without "Total" is skipped
+    // before any normalisation (the scan runs on every PTY chunk).
+    if !text.contains("Total") {
+        return None;
+    }
+    let screen;
+    let text = if text.contains('\x1b') {
+        screen = screen_text(text);
+        screen.as_str()
+    } else {
+        text
+    };
     let cost_idx = text.find("Total cost:")?;
     let line = text[cost_idx..].lines().next()?;
 
@@ -524,6 +595,54 @@ fn try_parse_claude_code_summary(session_id: &str, text: &str) -> Option<TokenEv
         model: "unknown".to_string(),
         cost_usd: cost,
     })
+}
+
+/// PTY bytes → the text a terminal would show, roughly: CSI sequences are
+/// dropped, except horizontal cursor moves (`ESC[<n>G` absolute column,
+/// `ESC[<n>C` forward), which Claude Code's renderer uses between words and
+/// which become one space. OSC (`ESC]…BEL`) and DCS/SOS/PM/APC strings
+/// (`ESC P|X|^|_ … ESC\\`) are dropped whole, charset designators
+/// (`ESC ( B`, `ESC ) 0`, `ESC * X`, `ESC + X`) with their final byte, and
+/// any other escape with its one following byte.
+pub(crate) fn screen_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameter/intermediate bytes, then one final byte 0x40–0x7E.
+                for f in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&f) {
+                        if f == 'G' || f == 'C' {
+                            out.push(' ');
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
+                // String sequences end at BEL (OSC) or ST (`ESC \\`).
+                while let Some(f) = chars.next() {
+                    if f == '\x07' {
+                        break;
+                    }
+                    if f == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some('(') | Some(')') | Some('*') | Some('+') => {
+                chars.next(); // the charset's final byte
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn extract_json_object(s: &str) -> Option<&str> {
@@ -600,4 +719,107 @@ fn parse_k_value(s: &str, prefix: &str) -> Option<u64> {
         raw.parse().ok()?
     };
     Some(value.min(MAX_EVENT_TOKENS))
+}
+
+#[cfg(test)]
+mod pty_scan_tests {
+    use super::*;
+    use crate::db::Db;
+    use tempfile::NamedTempFile;
+
+    const ALL: (&str, &str) = ("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00");
+
+    fn engine_with_terminal() -> (TokenEngine, Arc<Mutex<Db>>, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        {
+            let d = db.lock();
+            d.insert_project("p1", "Atlas", "/tmp/atlas-pty-scan").unwrap();
+            d.insert_workspace("w1", "p1", "ws", "", "main", Some("/tmp/atlas-pty-scan/wt/one"), "", None).unwrap();
+            d.conn_ref()
+                .execute(
+                    "INSERT INTO terminals (id, workspace_id, label, position, created_at) VALUES ('term-1','w1','Terminal',0,0)",
+                    [],
+                )
+                .unwrap();
+        }
+        (TokenEngine::new(Arc::clone(&db)), db, tmp)
+    }
+
+    fn totals(db: &Arc<Mutex<Db>>) -> (i64, f64) {
+        let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
+        (rep.totals.calls, rep.totals.cost_usd)
+    }
+
+    #[test]
+    fn a_repeated_cost_summary_is_recorded_once_and_growth_only_as_the_difference() {
+        let (engine, db, _tmp) = engine_with_terminal();
+        engine.scan_and_record("term-1", 1, b"Total cost: $1.00 | Input: 10K | Output: 1K");
+        assert_eq!(totals(&db).0, 1);
+        // A second `/cost` (or a redraw) prints the same running total.
+        engine.scan_and_record("term-1", 2, b"Total cost: $1.00 | Input: 10K | Output: 1K");
+        engine.scan_and_record("term-1", 3, b"\x1b[2GTotal\x1b[8Gcost:\x1b[24G$1.00");
+        assert_eq!(totals(&db).0, 1, "a repeated running total adds nothing");
+        // The total grew: only the growth is new spend.
+        engine.scan_and_record("term-1", 4, b"Total cost: $1.50 | Input: 15K | Output: 2K");
+        let (calls, cost) = totals(&db);
+        assert_eq!(calls, 2);
+        assert!((cost - 1.50).abs() < 1e-9, "ledger holds the running total, not the sum of summaries: {cost}");
+        // A lower total is a new `claude` run in the same terminal.
+        engine.scan_and_record("term-1", 5, b"Total cost: $0.20");
+        let (calls, cost) = totals(&db);
+        assert_eq!(calls, 3);
+        assert!((cost - 1.70).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn cumulative_delta_rules() {
+        let ev = |c: f64| TokenEvent {
+            id: None,
+            session_id: "s".into(),
+            timestamp: String::new(),
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "unknown".into(),
+            cost_usd: c,
+        };
+        assert!((cumulative_delta(ev(1.0), None).unwrap().cost_usd - 1.0).abs() < 1e-9);
+        assert!(cumulative_delta(ev(1.0), Some("1,100,10")).is_none());
+        let d = cumulative_delta(ev(1.25), Some("1,40,4")).unwrap();
+        assert!((d.cost_usd - 0.25).abs() < 1e-9);
+        assert_eq!((d.input_tokens, d.output_tokens), (60, 6));
+        assert!((cumulative_delta(ev(0.5), Some("1,100,10")).unwrap().cost_usd - 0.5).abs() < 1e-9);
+        // A garbled stored total never panics.
+        assert!(cumulative_delta(ev(0.5), Some("garbage")).is_some());
+    }
+
+    #[test]
+    fn screen_text_turns_cursor_moves_into_spaces() {
+        assert_eq!(screen_text("Total\x1b[8Gcost:\x1b[3C$1"), "Total cost: $1");
+        assert_eq!(screen_text("\x1b[31mred\x1b[39m \x1b[?25lx"), "red x");
+    }
+
+    #[test]
+    fn screen_text_drops_charset_designators_whole() {
+        assert_eq!(screen_text("\x1b(BTotal\x1b)0 cost"), "Total cost");
+        assert_eq!(screen_text("a\x1b*Ab\x1b+Bc"), "abc");
+    }
+
+    #[test]
+    fn screen_text_skips_dcs_and_osc_strings() {
+        assert_eq!(screen_text("a\x1bP1$r0m\x1b\\b"), "ab");
+        assert_eq!(screen_text("a\x1b]0;title\x07b\x1b]8;;http://x\x1b\\c"), "abc");
+        assert_eq!(screen_text("a\x1b_apc\x1b\\b\x1b^pm\x1b\\c"), "abc");
+        // Unterminated strings and a trailing ESC end quietly.
+        assert_eq!(screen_text("a\x1bPnever"), "a");
+        assert_eq!(screen_text("a\x1b"), "a");
+    }
+
+    #[test]
+    fn summary_scan_needs_the_word_total() {
+        assert!(scan_pty_output("s", b"\x1b[2Gcost:\x1b[8G$1.00").is_none());
+        assert!(scan_pty_output("s", b"\x1b[2GTotal\x1b[8Gcost:\x1b[24G$1.00").is_some());
+    }
 }

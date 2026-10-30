@@ -1,0 +1,10 @@
+octopush:
+  Scope: User config (available in all your projects)
+  Status: × Failed to connect
+  Issue: ENOENT: no such file or directory, posix_spawn '/Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp'
+  Type: stdio
+  Command: /Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp
+  Args:
+  Environment:
+
+To remove this server, run: claude mcp remove octopush -s user

@@ -1,0 +1,2 @@
+Added stdio MCP server octopush with command: /Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp  to user config
+File modified: /Users/dev/.claude.json
