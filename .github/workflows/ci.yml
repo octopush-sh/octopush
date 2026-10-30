@@ -83,5 +83,7 @@ jobs:
         run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
       - name: release helpers and the nightly beta routine
         run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs
+      - name: routine scripts
+        run: node --test scripts/routines/routines.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
