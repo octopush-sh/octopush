@@ -9,6 +9,7 @@ import { useUpdaterStore } from "../stores/updaterStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 import { ModalShell } from "./ModalShell";
+import { openWhatsNewForCurrentVersion, previewUnreleasedTips } from "../lib/whatsNewLaunch";
 
 interface Props {
   open: boolean;
@@ -67,6 +68,7 @@ export function CommandPalette({
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
+              data-tour="palette-input"
               autoFocus
               placeholder="Type a command, or search…"
               className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
@@ -185,6 +187,20 @@ export function CommandPalette({
                   })
                 }
               />
+              <Item
+                glyph="i"
+                label="What's new"
+                detail="this version"
+                onSelect={() => run(openWhatsNewForCurrentVersion)}
+              />
+              {import.meta.env.DEV && (
+                <Item
+                  glyph="i"
+                  label="Preview unreleased tips"
+                  detail="dev"
+                  onSelect={() => run(previewUnreleasedTips)}
+                />
+              )}
               <Item
                 glyph="&"
                 label="Open Settings · Usage"

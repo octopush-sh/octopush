@@ -250,6 +250,7 @@ export function WorkspaceRail({
 
   return (
     <aside
+      data-tour="rail"
       className={`flex h-full shrink-0 flex-col border-r border-octo-hairline bg-octo-panel pt-2 transition-[width] duration-[220ms] ${EASE} ${
         isCollapsed ? RAIL_WIDTH_COLLAPSED : RAIL_WIDTH_EXPANDED
       }`}
@@ -277,6 +278,7 @@ export function WorkspaceRail({
               turns brass on focus, and the one "Add project" icon button. */}
           <div className="flex h-9 shrink-0 items-center gap-1.5 pl-3.5 pr-2">
             <label
+              data-tour="rail-search"
               className="flex h-[26px] min-w-0 flex-1 items-center gap-2 border-b border-transparent text-octo-mute transition-colors duration-[220ms] focus-within:border-octo-brass focus-within:text-octo-brass"
               title="Find a project or mission"
             >
@@ -297,6 +299,7 @@ export function WorkspaceRail({
               <button
                 type="button"
                 onClick={onAddProject}
+                data-tour="rail-add-project"
                 title="Add project"
                 aria-label="Add project"
                 className={`${ICON_BTN} h-6 w-6`}

@@ -4,6 +4,7 @@ import { Download, RefreshCw, CheckCircle, Loader2 } from "lucide-react";
 import { useUpdaterStore, type UpdateChannel } from "../../stores/updaterStore";
 import { PaneHeader, SegmentedRow, formatRelative } from "./shared";
 import { OctoMark } from "../icons/OctoMark";
+import { openWhatsNewForCurrentVersion } from "../../lib/whatsNewLaunch";
 import { ReleaseNotes } from "../ReleaseNotes";
 import { installedNotes } from "../../lib/releaseNotes";
 
@@ -183,6 +184,17 @@ export function AboutPane() {
             >
               github.com/octopush-sh/octopush
             </a>
+          </li>
+          <li>
+            ·{" "}
+            <button
+              type="button"
+              data-tour="about-whats-new"
+              onClick={() => void openWhatsNewForCurrentVersion()}
+              className="font-serif text-[13px] text-octo-brass underline decoration-[var(--brass-dim)] underline-offset-2 transition-colors hover:decoration-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              What's in this version
+            </button>
           </li>
           <li>· Last checked for updates: <span className="font-mono text-octo-ivory">{lastChecked}</span></li>
           <li>· Updates are verified with an Ed25519 signature before install.</li>

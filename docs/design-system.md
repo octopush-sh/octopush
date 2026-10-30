@@ -235,6 +235,16 @@ Four rules:
 
 `<body>` is `user-select: none` (a native desktop feel). Any surface whose text a user legitimately wants to copy — chat, editor, run journals, the Markdown preview — opts back in with **`.octo-selectable`**. Do not re-derive this per component, and do not ship a read-only text surface without it: prose a user cannot copy reads as a bug, not as chrome.
 
+### Tour spotlight (guided tours — `TourOverlay`, 2026-10-30)
+
+The one way to point at a piece of the real UI (What's new → **Show me**, and the clip recorder). Source: `src/components/TourOverlay.tsx`, `.octo-tour-spot` in `src/styles.css`, runner in `src/lib/tour/runner.ts`.
+
+- **Scrim with a cut-out, one element.** `.octo-tour-spot` is a fixed box over the target (4px padding, 8px radius) whose `box-shadow: 0 0 0 200vmax` spread *is* the scrim — the same onyx/80 wash as `ModalShell` — so the target shows through untouched. Its edge is a **1px `--brass-dim` outline**: hairline brass, no glow, no pulse (the single-beacon rule stands — a tour adds no beacon).
+- **Glide, don't jump.** Moving between steps animates `top/left/width/height` on `--dur-standard` + `--ease-octo`; the overlay enters with `.octo-overlay-enter`, each caption crossfades with `.octo-fade-in`. Reduced motion: the global neutralizer collapses all of it to an instant move.
+- **Caption bubble** — panel + hairline border, 300px, body sans 13px ivory, mono `2 / 4` counter, ghost **Back**, brass-ghost **Next**/**Done** (upright serif), a quiet `X` icon button with `title`. Anchored below the target, flips above when it would overflow, clamped 12px inside the viewport (`placeBubble`).
+- **Look, don't touch.** A transparent click-catcher sits over the app; the interactive tour never performs a step's `action` (only the recorder does). Escape closes (captured, so the surface underneath doesn't also close), ←/→ page, focus is trapped in the bubble and handed back when the tour ends.
+- Record mode (`window.__octoTour`, dev or `?octo-record=1`) shows the caption and counter only — no controls in the clip.
+
 ---
 
 ## 5. Signature details — structural glyphs and active patterns

@@ -39,7 +39,7 @@ export function parseChangeset(text) {
   return { meta, body: m[2].trim() };
 }
 
-/** Every data-tour="id" in src/ (static string attributes only). */
+/** Every data-tour="id" in src/ (static string attributes, plus tourId("id") marks). */
 function knownTargets() {
   const ids = new Set();
   const walk = (dir) => {
@@ -47,7 +47,10 @@ function knownTargets() {
       const p = join(dir, e.name);
       if (e.isDirectory()) { if (e.name !== "node_modules") walk(p); continue; }
       if (!/\.(tsx?|jsx?)$/.test(e.name) || /\.test\./.test(e.name)) continue;
-      for (const m of readFileSync(p, "utf8").matchAll(/data-tour=["'`{]+([a-z0-9-]+)["'`}]/g)) ids.add(m[1]);
+      const text = readFileSync(p, "utf8");
+      for (const m of text.matchAll(/data-tour=["'`{]+([a-z0-9-]+)["'`}]/g)) ids.add(m[1]);
+      // Ids assigned through a variable are marked with tourId("id") (src/lib/tour/ids.ts).
+      for (const m of text.matchAll(/\btourId\(\s*["'`]([a-z0-9-]+)["'`]\s*\)/g)) ids.add(m[1]);
     }
   };
   if (existsSync(SRC)) walk(SRC);
