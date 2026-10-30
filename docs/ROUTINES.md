@@ -5,8 +5,10 @@ Mac. Each routine has a **fire condition** — a deterministic script in `script
 decides whether there is work (exit 0 ⇒ fire; non-zero ⇒ skip the window with no run and zero
 tokens) — and a **brief** for the crew. The brief's agent only does what needs judgement.
 
-All routines follow [`VISION.md`](../VISION.md) §8: output is a PR, an issue or a comment; never
-merge, release or deploy; human-only areas stay `proposal` issues.
+All routines follow [`VISION.md`](../VISION.md) §8: output is a PR, an issue or a comment; agents
+never merge, release or deploy by hand (merging and releasing happen only inside the deterministic
+scripts in `scripts/routines/`, such as the nightly beta release); human-only areas stay `proposal`
+issues.
 
 **Requirements on the Mac:** this repo cloned and up to date (`git pull` after merging changes
 to `scripts/routines/`), `gh` authenticated, Node via nvm or Homebrew. The scripts add
@@ -148,4 +150,33 @@ Weekly report.
      behind).
    Use only the facts from step 1 (confirm with `gh` if needed). Never invent; keep it scannable.
 3. Change nothing else.
+```
+
+## 5. Nightly beta release — daily
+
+Cuts the next patch version as a **beta** every night there is something to ship (VISION.md §8:
+releases go beta first; only the owner promotes to stable). Everything is done by the
+deterministic script — merging the release PR and tagging included — so the agent only reports.
+
+| Field | Value |
+|---|---|
+| Project · workspace | `octopush` · **Fixed** → the main workspace (the script works in its own temporary worktree of `origin/main`; your checkout is never switched) |
+| Schedule | Custom → Every day → Once at **05:00** |
+| Fire only if… | `bash scripts/routines/release-beta.sh check` |
+| Pipeline | one stage, Haiku, CLI substrate (needs shell + `gh`) |
+| Budget | $0.50 |
+
+Brief:
+
+```text
+Nightly beta release. Read VISION.md §8 first. Never edit code, never commit, never tag or
+merge by hand — the script does all of it and re-checks every rule itself.
+1. Run `bash scripts/routines/release-beta.sh run` and wait for it to finish (it can take up to
+   an hour while it waits for CI).
+2. If it exits 0: report the version, the release PR and release URLs it printed, and the notes
+   it printed under "whats-new/<version>/notes.md". The beta build publishes from the tag in
+   GitHub Actions; promoting it to stable is the owner's call (`promote <version>`).
+3. If it exits 1: say there was nothing to release and stop.
+4. If it fails (exit 2): report the exact reason it printed. Don't retry and don't try to fix
+   anything — the next night retries, and it is safe to re-run.
 ```

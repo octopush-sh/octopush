@@ -6,6 +6,12 @@
 # then publishes the GitHub Release with all assets (stable Octopush.dmg,
 # versioned DMG, updater tarball + .sig, latest.json).
 #
+# CHANNELS: every tag publishes to the BETA channel — a GitHub prerelease (never
+# GitHub "latest") whose latest.json is also uploaded to the moving
+# `beta-channel` release. The owner promotes a beta to stable with
+# .github/workflows/promote.yml. Release notes come from
+# whats-new/<version>/notes.md when present. See docs/RELEASING.md.
+#
 # GRACEFUL DEGRADATION (the Apple account does not exist yet):
 #   - Only TAURI_SIGNING_PRIVATE_KEY is REQUIRED (updater signing; without it
 #     in-app updates break). The workflow fails fast and loudly if it's missing.
@@ -123,4 +129,5 @@ jobs:
           # see the comment there for why an empty one breaks the bundler.
           # `gh` in scripts/release.mjs uses this.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/release.mjs --ci ${{ github.event.inputs.version }}
+        # Every tag publishes to the beta channel first; promote.yml promotes to stable.
+        run: node scripts/release.mjs --ci --channel beta ${{ github.event.inputs.version }}
