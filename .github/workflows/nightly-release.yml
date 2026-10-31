@@ -3,12 +3,13 @@
 # If main moved since the last tag and CI is green: collect the changesets,
 # bump, open the release PR, wait for CI, merge,
 # tag, and start release.yml on the tag — which publishes a beta (prerelease).
-# The owner promotes it to stable. No agent involved. 05:00 Bogotá.
+# The owner promotes it to stable. No agent involved. Twice a day: 05:13 and
+# 17:13 Bogotá.
 name: nightly-release
 
 on:
   schedule:
-    - cron: "13 10 * * *"
+    - cron: "13 10,22 * * *"
   workflow_dispatch:
 
 permissions:
