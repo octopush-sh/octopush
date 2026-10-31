@@ -4,12 +4,13 @@
 # reviewer agent (read-only tools, no GitHub access) judges the code and writes
 # a verdict file. A fixed step posts it as github-actions[bot], then
 # automerge.mjs re-checks every rule on that exact commit and merges — or parks
-# the PR for the owner. 03:00 Bogotá.
+# the PR for the owner. Every two hours at :47 on odd UTC hours, between the
+# builder's runs; nothing to review costs a minute and no agent.
 name: nightly-review
 
 on:
   schedule:
-    - cron: "23 8 * * *"
+    - cron: "47 1-23/2 * * *"
   workflow_dispatch:
 
 permissions:

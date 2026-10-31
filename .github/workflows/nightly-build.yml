@@ -4,13 +4,13 @@
 # `ready` issue — and has a Claude agent build it. The agent runs with no GitHub
 # credential: its checks run as a separate user, the checkout's .git is moved out
 # of its reach, and the publishing step runs a copy of scripts/routines taken
-# before it started. Two runs a night (01:07 and 01:47 Bogotá).
+# before it started. Runs every two hours (at :07, Bogotá even hours); an
+# empty queue costs a minute and no agent.
 name: nightly-build
 
 on:
   schedule:
-    - cron: "7 6 * * *"
-    - cron: "47 6 * * *"
+    - cron: "7 */2 * * *"
   workflow_dispatch:
 
 permissions:
