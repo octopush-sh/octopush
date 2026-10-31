@@ -16,6 +16,8 @@ import type {
 import { useAttentionStore } from "../stores/attentionStore";
 import { useTerminalsStore } from "../stores/terminalsStore";
 import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
+import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
+import { isMac } from "../lib/platform";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
 // pane opens at ZOOM_DEFAULT and resets on remount.
@@ -188,6 +190,16 @@ export function TerminalPane({
     // Cmd-C / Ctrl-Shift-C and on right-click-with-a-selection.
     if (typeof term.attachCustomKeyEventHandler === "function") {
       term.attachCustomKeyEventHandler((e) => {
+        // Option+Left/Right word jumps — xterm 6 no longer rewrites these
+        // itself (see lib/xtermAltArrow.ts). `input(…, true)` goes out through
+        // onData → PTY exactly like a typed key.
+        const altArrow = legacyAltArrowSequence(e, isMac());
+        if (altArrow) {
+          term.input(altArrow, true);
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        }
         // Zoom: Cmd/Ctrl with +, -, or 0. `+` is Shift+= on most layouts, so
         // we don't exclude Shift here. Handled keys are not forwarded to the PTY.
         if (e.type === "keydown" && (e.metaKey || e.ctrlKey) && !e.altKey) {

@@ -4,7 +4,7 @@ version = "0.4.89"
 description = "The IDE for Agentic Developers"
 authors = ["Octopush contributors"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.90"
 # `[[bin]]` adds octopush-pty-server below; with multiple binaries Tauri
 # needs to be told which one is the app shell.
 default-run = "octopush"
