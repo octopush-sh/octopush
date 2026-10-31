@@ -40,8 +40,15 @@ esac
 # sudo -n: the workflow prepared the user and the permissions beforehand
 # (agent-sandbox-setup.sh); never prompt.
 [[ -n "$NODE_DIR" && -x "$NODE_DIR/node" ]] || { echo "octo-check: node not configured" >&2; exit 2; }
-exec /usr/bin/sudo -n -u "$SANDBOX_USER" /usr/bin/env -i \
+# Not exec: after the checks, remove every symlink the sandbox created (one
+# into the runner's files would let the agent's file tools reach past cwd).
+set +e
+/usr/bin/sudo -n -u "$SANDBOX_USER" /usr/bin/env -i \
   PATH="$NODE_DIR:/usr/local/bin:/usr/bin:/bin" \
   HOME="/tmp/$SANDBOX_USER-home" \
   CI=true LANG=C.UTF-8 \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ROOT" "${cmd[@]}"
+rc=$?
+/usr/bin/sudo -n /usr/bin/pkill -KILL -u "$SANDBOX_USER" 2>/dev/null
+/usr/bin/sudo -n /usr/bin/find "$ROOT" -type l -user "$SANDBOX_USER" -delete 2>/dev/null
+exit "$rc"

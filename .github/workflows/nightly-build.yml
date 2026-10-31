@@ -129,6 +129,7 @@ jobs:
         # scanned and committed.
         run: |
           sudo pkill -KILL -u octo-sandbox || true
+          sudo find "$GITHUB_WORKSPACE" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE" || true
 
       - name: Publish

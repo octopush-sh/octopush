@@ -100,13 +100,16 @@ async function main() {
   const r = parsed.result;
   if (r.action === "stop") { park(gh, repo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
 
-  const paths = changedPaths(gitDir).filter((p) => !CACHE.some((re) => re.test(p)));
+  // Every check runs on ALL changed paths first; caches are dropped only after.
+  const all = changedPaths(gitDir);
   if (!paths.length) { park(gh, repo, kind, n, "It reported success but changed no files."); return 1; }
-  const bad = forbiddenPaths(paths);
+  const bad = forbiddenPaths(all);
   if (bad.length) { park(gh, repo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
-  const links = paths.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
+  const links = all.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
   if (links.length) { park(gh, repo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
+  const paths = all.filter((p) => !CACHE.some((re) => re.test(p)));
+  if (!paths.length) { park(gh, repo, kind, n, "It changed only cache files."); return 1; }
   const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
   if (leaks([...contents, r.title ?? "", r.summary ?? ""], secrets)) {
     park(gh, repo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
@@ -115,7 +118,8 @@ async function main() {
 
   const branch = kind === "pr" ? existingBranch : branchFor(n, r.title);
   if (!branch) throw new Error("a PR job needs its branch");
-  git(gitDir, ["add", "-A", "--", ...paths]);
+  // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
+  git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
   git(gitDir, [...BOT, "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\nCloses #${n}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
   git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, "push", "--quiet",
