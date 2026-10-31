@@ -444,7 +444,9 @@ test("builder results: valid actions per job kind", () => {
   assert.match(ok({ action: "pr", title: "Add X", summary: "Did X" }, "pr").error, /not valid/);
   assert.ok(ok({ action: "update", summary: "Fixed the points" }, "pr").result);
   assert.ok(ok({ action: "stop", reason: "Needs billing changes" }, "issue").result);
-  assert.match(ok({ action: "pr", title: "x".repeat(91), summary: "s" }, "issue").error, /title/);
+  const long = ok({ action: "pr", title: "Keep pipeline agents inside their worktree with blockWritesOutsideWorkingDirectories on every stage", summary: "s" }, "issue");
+  assert.ok(long.result && long.result.title.length <= 90 && long.result.title.endsWith("…"), "long titles are shortened, not rejected");
+  assert.match(ok({ action: "pr", title: "  ", summary: "s" }, "issue").error, /title/);
   assert.match(parseResult("{", "issue").error, /JSON/);
 });
 
