@@ -13,6 +13,19 @@ pub fn stage_cost(
     crate::token_engine::cost_for(model, input_tokens, output_tokens, cache_read, cache_creation)
 }
 
+/// [`stage_cost`] with `cache_creation_1h` of the writes at the 1-hour
+/// cache-write rate (Claude Code stream usage carries the TTL breakdown).
+pub fn stage_cost_split(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    cache_creation_1h: u64,
+) -> f64 {
+    crate::token_engine::cost_for_split(model, input_tokens, output_tokens, cache_read, cache_creation, cache_creation_1h)
+}
+
 /// Baseline cost: the same token counts priced at the reference (premium) model.
 /// Cache tokens are NOT re-priced here — run_stages only persists input/output, so
 /// the baseline re-prices the stored input/output counts. One-shot path (pre-run

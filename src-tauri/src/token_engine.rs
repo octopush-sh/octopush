@@ -165,6 +165,8 @@ pub fn normalize_model_id(model: &str) -> String {
 /// Source: Anthropic's official pricing page
 /// (<https://platform.claude.com/docs/en/about-claude/pricing>, fetched
 /// 2026-10-29). Columns are input / 5-minute cache write / cache hit / output.
+/// The 1-hour cache-write column is derived, not listed: see
+/// [`one_hour_write_per_m`].
 /// Every ProviderRouter builtin catalog model must appear here at the same
 /// price (asserted by `builtin_catalog_matches_pricing_table` in `tests.rs`);
 /// this table additionally carries older ids the catalog does not list, so
@@ -215,7 +217,35 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         output_per_m: output,
         cache_read_per_m: cache_hit,
         cache_creation_per_m: cache_write,
+        cache_creation_1h_per_m: one_hour_write_per_m(model, input, cache_write),
     })
+}
+
+/// The 1-hour cache-write price per million tokens. Anthropic's pricing page
+/// (fetched 2026-10-31): a 1-hour write costs 2× the model's base input
+/// price, a 5-minute write 1.25× — e.g. Fable 5.1 $20 vs $12.50. Derived
+/// from `input_per_m` so a user-edited catalog price scales with it. Models
+/// without a 1-hour tier (non-Claude) price every write at the 5-minute rate.
+pub fn one_hour_write_per_m(model: &str, input_per_m: f64, cache_creation_per_m: f64) -> f64 {
+    if normalize_model_id(model).starts_with("claude-") {
+        2.0 * input_per_m
+    } else {
+        cache_creation_per_m
+    }
+}
+
+/// `usage.cache_creation.ephemeral_1h_input_tokens` — the part of
+/// `cache_creation_input_tokens` written with a 1-hour TTL — clamped to that
+/// total. `0` when the breakdown is missing (older Claude Code, other
+/// providers): every write then prices at the 5-minute rate, as before.
+pub fn one_hour_cache_writes(usage: &serde_json::Value) -> u64 {
+    let total = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    usage
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(total)
 }
 
 /// Builtin price of one token type, in $/token (already divided by 1M).
@@ -286,12 +316,35 @@ pub struct ModelPrices {
     pub input_per_m: f64,
     pub output_per_m: f64,
     pub cache_read_per_m: f64,
+    /// 5-minute cache writes.
     pub cache_creation_per_m: f64,
+    /// 1-hour cache writes ([`one_hour_write_per_m`]); `0` falls back to the
+    /// 5-minute rate.
+    pub cache_creation_1h_per_m: f64,
 }
 
 impl ModelPrices {
+    /// An explicitly free model (local, or deliberately priced at $0).
+    pub const FREE: ModelPrices = ModelPrices {
+        input_per_m: 0.0,
+        output_per_m: 0.0,
+        cache_read_per_m: 0.0,
+        cache_creation_per_m: 0.0,
+        cache_creation_1h_per_m: 0.0,
+    };
+
+    /// Every cache write priced at the 5-minute rate — for usage without a
+    /// TTL breakdown. See [`cost_split`](Self::cost_split).
     pub fn cost(&self, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
-        compute_cost_with_prices(
+        self.cost_split(input, output, cache_read, cache_creation, 0)
+    }
+
+    /// Cost with `cache_creation_1h` of the `cache_creation` writes (a
+    /// subset, clamped to it) priced at the 1-hour rate, the rest at the
+    /// 5-minute rate.
+    pub fn cost_split(&self, input: u64, output: u64, cache_read: u64, cache_creation: u64, cache_creation_1h: u64) -> f64 {
+        let one_hour = cache_creation_1h.min(cache_creation);
+        let five_min = compute_cost_with_prices(
             self.input_per_m,
             self.output_per_m,
             self.cache_read_per_m,
@@ -299,8 +352,16 @@ impl ModelPrices {
             input,
             output,
             cache_read,
-            cache_creation,
-        )
+            cache_creation - one_hour,
+        );
+        let eff_1h_per_m = if self.cache_creation_1h_per_m > 0.0 {
+            self.cache_creation_1h_per_m
+        } else if self.cache_creation_per_m > 0.0 {
+            self.cache_creation_per_m
+        } else {
+            self.input_per_m
+        };
+        five_min + one_hour as f64 * eff_1h_per_m / 1_000_000.0
     }
 }
 
@@ -347,10 +408,11 @@ pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model:
                 output_per_m: mi.output_cost_per_m,
                 cache_read_per_m: mi.cache_read_cost_per_m,
                 cache_creation_per_m: mi.cache_creation_cost_per_m,
+                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, mi.cache_creation_cost_per_m),
             });
         }
         if router.provider_for_prefix(model).is_some_and(|p| p.local) {
-            return Some(ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 });
+            return Some(ModelPrices::FREE);
         }
     }
     builtin_prices(model)
@@ -392,6 +454,7 @@ pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> Mod
             output_per_m: base.output_per_m * k,
             cache_read_per_m: base.cache_read_per_m * k,
             cache_creation_per_m: base.cache_creation_per_m * k,
+            cache_creation_1h_per_m: base.cache_creation_1h_per_m * k,
         },
         _ => base,
     }
@@ -399,13 +462,33 @@ pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> Mod
 
 /// Cost of ONE request with [`request_prices`] on top of `base`.
 pub fn request_cost(model: &str, base: ModelPrices, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
-    request_prices(model, base, input + cache_read + cache_creation).cost(input, output, cache_read, cache_creation)
+    request_cost_split(model, base, input, output, cache_read, cache_creation, 0)
+}
+
+/// [`request_cost`] with `cache_creation_1h` of the writes at the 1-hour
+/// rate ([`ModelPrices::cost_split`]). Every write counts toward the prompt
+/// size, whatever its TTL.
+pub fn request_cost_split(
+    model: &str,
+    base: ModelPrices,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    cache_creation_1h: u64,
+) -> f64 {
+    request_prices(model, base, input + cache_read + cache_creation).cost_split(input, output, cache_read, cache_creation, cache_creation_1h)
 }
 
 /// [`cost_for`] for ONE provider request: applies per-request price tiers.
 pub fn request_cost_for(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+    request_cost_for_split(model, input, output, cache_read, cache_creation, 0)
+}
+
+/// [`request_cost_for`] with `cache_creation_1h` of the writes at the 1-hour rate.
+pub fn request_cost_for_split(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64, cache_creation_1h: u64) -> f64 {
     prices_for(model)
-        .map(|p| request_cost(model, p, input, output, cache_read, cache_creation))
+        .map(|p| request_cost_split(model, p, input, output, cache_read, cache_creation, cache_creation_1h))
         .unwrap_or(0.0)
 }
 
@@ -441,8 +524,13 @@ pub fn cost_for(
     cache_read: u64,
     cache_creation: u64,
 ) -> f64 {
+    cost_for_split(model, input, output, cache_read, cache_creation, 0)
+}
+
+/// [`cost_for`] with `cache_creation_1h` of the writes at the 1-hour rate.
+pub fn cost_for_split(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64, cache_creation_1h: u64) -> f64 {
     prices_for(model)
-        .map(|p| p.cost(input, output, cache_read, cache_creation))
+        .map(|p| p.cost_split(input, output, cache_read, cache_creation, cache_creation_1h))
         .unwrap_or(0.0)
 }
 
@@ -733,6 +821,7 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let cache_create_1h = one_hour_cache_writes(usage);
     let model = v
         .get("model")
         .and_then(|m| m.as_str())
@@ -751,7 +840,7 @@ fn try_parse_api_usage_json(session_id: &str, text: &str) -> Option<TokenEvent> 
         // Price via the single authority (catalog-first) rather than the raw
         // hardcoded table, matching every other ledger path. One API
         // response = one request, so per-request tiers apply.
-        cost_usd: request_cost_for(&model, input, output, cache_read, cache_create),
+        cost_usd: request_cost_for_split(&model, input, output, cache_read, cache_create, cache_create_1h),
     })
 }
 

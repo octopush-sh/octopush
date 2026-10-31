@@ -51,6 +51,16 @@ pub(crate) struct CliUsage {
     pub(crate) cache_read_input_tokens: u64,
     #[serde(default)]
     pub(crate) cache_creation_input_tokens: u64,
+    /// `cache_creation.ephemeral_1h_input_tokens`: the part of
+    /// `cache_creation_input_tokens` written with a 1-hour TTL (`0` without
+    /// the breakdown).
+    #[serde(default, rename = "cache_creation", deserialize_with = "one_hour_writes")]
+    pub(crate) cache_creation_1h_input_tokens: u64,
+}
+
+fn one_hour_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.get("ephemeral_1h_input_tokens").and_then(Value::as_u64).unwrap_or(0))
 }
 
 impl CliUsage {
@@ -59,6 +69,7 @@ impl CliUsage {
         self.output_tokens += other.output_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
     }
 }
 
@@ -84,6 +95,7 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
             output_tokens: g("output_tokens"),
             cache_read_input_tokens: g("cache_read_input_tokens"),
             cache_creation_input_tokens: g("cache_creation_input_tokens"),
+            cache_creation_1h_input_tokens: crate::token_engine::one_hour_cache_writes(u),
         },
     ))
 }
@@ -704,6 +716,7 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
             output_tokens: g("output_tokens"),
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
         },
     ))
 }
@@ -1242,12 +1255,13 @@ fn failed_stage_with_usage(msg: &str, model: &str, u: CliUsage) -> StageOutcome 
     out.output_tokens = u.output_tokens;
     out.cache_read_tokens = u.cache_read_input_tokens;
     out.cache_creation_tokens = u.cache_creation_input_tokens;
-    out.cost_usd = crate::orchestrator::cost::stage_cost(
+    out.cost_usd = crate::orchestrator::cost::stage_cost_split(
         model,
         u.input_tokens,
         u.output_tokens,
         u.cache_read_input_tokens,
         u.cache_creation_input_tokens,
+        u.cache_creation_1h_input_tokens,
     );
     out
 }
