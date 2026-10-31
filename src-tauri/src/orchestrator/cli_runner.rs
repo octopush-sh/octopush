@@ -321,7 +321,7 @@ pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 /// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
 /// as defence in depth). Since Claude Code 2.1.314, Write/Edit/NotebookEdit
 /// refuse paths outside the working directories in every permission mode,
-/// `bypassPermissions` included — so a stage can't write to the main checkout,
+/// `bypassPermissions` included — so a stage's file edits can't reach the main checkout,
 /// a sibling workspace or `~/`. Needs Claude Code >= 2.1.314: older CLIs
 /// ignore the unknown key, so the guard is off there. `Bash` is not covered
 /// and stays unconfined unless the mission's `exec_isolation` is `sandbox`

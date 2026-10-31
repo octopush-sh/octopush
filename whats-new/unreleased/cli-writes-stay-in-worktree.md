@@ -1,5 +1,5 @@
 ---
-title: Agents can no longer write outside their workspace
+title: Agents' file edits stay inside their workspace
 kind: improvement
 area: app
 steps:
