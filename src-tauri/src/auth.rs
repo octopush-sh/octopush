@@ -557,7 +557,7 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
 
     // One shared client (avoids a per-request connection pool and the panic path
     // of `Client::new()` on a TLS-init failure).
-    let http = reqwest::Client::builder()
+    let http = crate::tls::client_builder()
         .build()
         .map_err(|e| AppError::Other(format!("http client init failed: {e}")))?;
 
@@ -675,7 +675,7 @@ async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
         return RefreshOutcome::TokenRevoked; // nothing to refresh with → dead
     };
     let cfg = ClerkConfig::current();
-    let client = match reqwest::Client::builder().build() {
+    let client = match crate::tls::client_builder().build() {
         Ok(c) => c,
         Err(_) => return RefreshOutcome::TransientError,
     };
@@ -818,7 +818,7 @@ async fn refresh_identity_inner(force_token_refresh: bool) -> AppResult<AuthStat
         }
     }
     let cfg = ClerkConfig::current();
-    let client = match reqwest::Client::builder().build() {
+    let client = match crate::tls::client_builder().build() {
         Ok(c) => c,
         Err(_) => return Ok(here(&session)),
     };

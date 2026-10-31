@@ -20,7 +20,7 @@ pub struct JiraClient {
 
 impl JiraClient {
     pub fn new(cfg: JiraConfig) -> Self {
-        Self { cfg, http: reqwest::Client::new() }
+        Self { cfg, http: crate::tls::client() }
     }
 
     fn auth_header(&self) -> String {

@@ -65,8 +65,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 0.12's behaviour: native-tls (OS trust store) without ALPN, i.e. HTTP/1.1 over
 # TLS, as before, plus charset, http2 and the system proxy (0.12's
 # `macos-system-configuration`, now `system-proxy`).
+# `rustls-no-provider` lets `tls.rs` hand reqwest a rustls config (ring
+# provider) that runs the OS trust store behind the eMudhra compromised-key
+# denylist; native-tls stays compiled in as the fallback and stays reqwest's
+# default backend. tauri-plugin-updater already enables this feature on the
+# same reqwest, so it adds no crates.
 reqwest = { version = "0.13", default-features = false, features = [
     "native-tls-no-alpn",
+    "rustls-no-provider",
     "charset",
     "http2",
     "system-proxy",
@@ -75,6 +81,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
     "query",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.6"
 futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"

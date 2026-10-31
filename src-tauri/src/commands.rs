@@ -3596,7 +3596,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     const LITELLM_URL: &str =
         "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::Other(format!("failed to build http client: {e}")))?;
@@ -4937,7 +4937,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         "find_pr_for_branch: querying github",
     );
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .user_agent("octopush/0.1")
         .build()
         .map_err(|e| AppError::Other(format!("http client: {e}")))?;

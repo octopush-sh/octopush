@@ -35,6 +35,7 @@ pub mod workspace;
 pub mod mission;
 pub mod template;
 pub mod theme;
+pub mod tls;
 pub mod updater;
 pub mod token_engine;
 pub mod transcripts;
