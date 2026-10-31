@@ -110,8 +110,10 @@ trusted:
   user, without sudo, with an empty environment, that can't read the runner's processes — and the
   key is used only before the sandbox exists and after a step has killed every sandbox process and
   checked that none survived. The web audit's read token is revoked (`if: always()`) and proved dead
-  before the build; trusted scripts copied beforehand then serve `dist/` as static files to
-  Chromium; a separate job on a fresh runner mints an issues-only token and files the findings. Publishing to
+  before the build; the audit itself — whose Chromium runs the built site's JavaScript — also runs
+  as `octo-sandbox`, from scripts and a browser installed root-owned in `/opt/pw` before the
+  checkout, and only regular, size-capped `findings.json` and screenshots come back out of the
+  sandbox; a separate job on a fresh runner mints an issues-only token and files the findings. Publishing to
   octopush-web refuses its human-only paths (legal pages in any format, `src/legal-config.ts`,
   `src/data/release.ts`, `free-vs-pro`, analytics and `astro.config.mjs`, `src/content.config.ts`,
   `scripts/`, `vercel.json`, `.vercel/`, `api/`, `.github/`, agent docs, manifests, any page or

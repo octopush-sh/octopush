@@ -15,9 +15,11 @@
 # `octo-sandbox` user through the root-owned `octo-check` (no sudo, another
 # uid, an empty environment, only the site checkout open to it), after the
 # read token has been revoked, and every sandbox process is killed — and proved
-# gone — before anything else runs. Then trusted scripts (copied before the
-# checkout) serve dist/ as static files and render it. A separate job on a
-# fresh runner mints an issues-only token and files the findings.
+# gone — before anything else runs. The audit (whose Chromium runs the site's
+# JavaScript) runs as octo-sandbox too, from scripts and a browser installed
+# root-owned in /opt/pw before the checkout; only regular, size-capped result
+# files come back out. A separate job on a fresh runner mints an issues-only
+# token and files the findings.
 # 00:49 Bogotá, after the app audit.
 name: web-audit
 
@@ -57,12 +59,19 @@ jobs:
         with:
           node-version: 22
 
-      - name: Trusted copy of the scripts, and Chromium (before the site is checked out)
+      - name: Trusted scripts and Chromium, root-owned (before the site is checked out)
+        # /opt/pw: read-only for everyone else. The sandbox runs the audit from
+        # here and can't change a byte of it; the runner keeps its own copy of
+        # the routines for the sandbox setup.
         run: |
           set -euo pipefail
           cp -R scripts "$RUNNER_TEMP/scripts"
-          npm install --prefix "$RUNNER_TEMP/pw" --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
-          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+          sudo install -d -o root -g root -m 755 /opt/pw
+          sudo cp -R scripts /opt/pw/scripts
+          sudo npm install --prefix /opt/pw --no-save --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
+          sudo env PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers /opt/pw/node_modules/.bin/playwright install --with-deps chromium
+          sudo chown -R root:root /opt/pw
+          sudo chmod -R a+rX,go-w /opt/pw
 
       - name: Web token (check out — revoked before the build)
         id: read-token
@@ -114,21 +123,52 @@ jobs:
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
 
-      - name: Audit (Chromium over the static dist/, every page, three window sizes)
+      - name: Audit as octo-sandbox (Chromium over the static dist/, every page, three window sizes)
         id: audit
-        env:
-          NODE_PATH: ${{ runner.temp }}/pw/node_modules
+        # The built site's JavaScript runs in Chromium (which Playwright starts
+        # without its own sandbox on Linux): so the whole audit runs as
+        # octo-sandbox, with an empty environment, from the root-owned /opt/pw.
+        # A hard timeout, so nothing the site does can hang the job.
         run: |
           set +e
-          # Static files only: no code of the site runs on this side, only in the browser's sandbox.
-          node "$RUNNER_TEMP/scripts/web-audit/audit.mjs" --site site --out "$RUNNER_TEMP/web-audit"
+          node_dir="$(dirname "$(readlink -f "$(command -v node)")")"
+          timeout --kill-after=30 1800 sudo -n -u octo-sandbox /usr/bin/env -i \
+            PATH="$node_dir:/usr/bin:/bin" HOME=/tmp/octo-sandbox-home LANG=C.UTF-8 \
+            NODE_PATH=/opt/pw/node_modules PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers \
+            "$node_dir/node" /opt/pw/scripts/web-audit/audit.mjs --site "$GITHUB_WORKSPACE/site" --out /tmp/octo-sandbox-home/out
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          # The repo is private but this repo's artifacts are public: no
-          # screenshots of the legal pages (they are the owner's to publish).
-          find "$RUNNER_TEMP/web-audit/shots" -type f \( -name 'privacy--*' -o -name 'terms--*' -o -name 'refunds--*' \) -delete 2>/dev/null
           # 0 = clean, 1 = findings (filed by the next job); anything else is the audit failing.
           [ "$rc" -le 1 ] || exit "$rc"
+
+      - name: Nothing of the audit is still running
+        if: always()
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
+          fi
+
+      - name: Take the results out of the sandbox (regular files only, size-capped)
+        if: always() && steps.audit.outputs.rc != ''
+        # Nothing of the sandbox runs any more, so nothing can swap a file for a
+        # link between the check and the copy. find -P never follows links,
+        # starting point included; only findings.json and shots/*.png, by name.
+        run: |
+          set -euo pipefail
+          src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
+          mkdir -p "$dst/shots"
+          if ! sudo test -d "$src" || sudo test -L "$src"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          sudo find -P "$src" -maxdepth 2 -type f -size -20M -print0 | while IFS= read -r -d '' f; do
+            rel="${f#"$src"/}"
+            [[ "$rel" =~ ^(findings\.json|shots/[A-Za-z0-9._-]+\.png)$ ]] || continue
+            # The repo is private but this repo's artifacts are public: no
+            # screenshots of the legal pages (they are the owner's to publish).
+            [[ "$rel" =~ ^shots/(privacy|terms|refunds)-- ]] && continue
+            sudo cat -- "$f" > "$dst/$rel"
+          done
+          [ -f "$dst/findings.json" ] || echo "::warning::the audit left no findings.json"
 
       - name: Keep the findings and screenshots
         if: always()

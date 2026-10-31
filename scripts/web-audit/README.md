@@ -12,8 +12,12 @@ run against the built site. Runs nightly in `web-audit.yml`; no agent.
    and builds the site as the unprivileged `octo-sandbox` user (`octo-check
    install`, `octo-check site` — the website's code never runs as the runner
    user, which holds the job's secrets and has sudo) and kills every sandbox
-   process before going on. Findings and screenshots (3 days, none of the legal
-   pages) go to an artifact; a second job on a fresh runner files them.
+   process before going on. The audit runs as `octo-sandbox` too (Chromium
+   executes the site's JavaScript), from these scripts and a browser installed
+   root-owned in `/opt/pw` before the checkout; only `findings.json` and the
+   screenshots, as regular size-capped files, are copied out. They go to an
+   artifact (3 days, none of the legal pages); a second job on a fresh runner
+   files them.
 2. `audit.mjs` serves `dist/` on a local port and opens every page (every
    `.html` in `dist/`, without Pagefind's or Astro's assets) in Playwright
    **Chromium** at 1440×900, 1024×700 and 390×844, takes a screenshot and runs

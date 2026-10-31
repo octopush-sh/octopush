@@ -1000,7 +1000,13 @@ test("workflows: website code runs only as octo-sandbox, and the App key only ou
   assert.match(job, /skip-token-revoke: true/);
   assert.match(job, /Revoke the read token and prove it dead\n\s*if: always\(\)/);
   assert.match(job, /pgrep -u octo-sandbox/);
-  keyOutside(job, job.indexOf("agent-sandbox-setup.sh"), job.indexOf("pgrep -u octo-sandbox"));
+  // The audit itself (the site's JavaScript runs in Chromium) runs as octo-sandbox too, from root-owned /opt/pw.
+  assert.match(job, /timeout --kill-after=\d+ \d+ sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n[^\n]*\n[^\n]*\n\s*"\$node_dir\/node" \/opt\/pw\/scripts\/web-audit\/audit\.mjs/);
+  assert.equal((job.match(/web-audit\/audit\.mjs/g) ?? []).length, 1, "audit.mjs runs only that once, as the sandbox");
+  assert.match(job, /sudo chown -R root:root \/opt\/pw/);
+  assert.match(job, /find -P "\$src" -maxdepth 2 -type f -size -20M/, "only regular, size-capped files leave the sandbox");
+  assert.equal((job.match(/pgrep -u octo-sandbox/g) ?? []).length, 2, "a survivor check after the build and after the audit");
+  keyOutside(job, job.indexOf("agent-sandbox-setup.sh"), job.lastIndexOf("pgrep -u octo-sandbox"));
   assert.ok(job.indexOf("Trusted copy of the scripts") < job.indexOf("Check out octopush-web"), "trusted scripts are copied before the site arrives");
   assert.match(audit.slice(audit.indexOf("\n  file:\n")), /download-artifact/);
   // web-build: the same window, the sandbox's setup to the survivor check.
