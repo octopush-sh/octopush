@@ -18,6 +18,7 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+    branches: ["agent/**"]
 
 permissions:
   contents: write       # merge
@@ -39,9 +40,13 @@ jobs:
   review:
     # From workflow_run: only for a green CI on an agent branch (the queue
     # re-checks everything anyway; this just avoids empty runs).
+    # Builder CI is always dispatched by publish-build (never a pull_request
+    # run), from this repo: forks and human branches can't start a review.
     if: >-
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
        startsWith(github.event.workflow_run.head_branch, 'agent/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -141,13 +146,15 @@ jobs:
 
       - name: Keep the builder going
         # A "changes" verdict or a merge can leave work for the builder: start it
-        # now instead of waiting for its cron. jobs.mjs only reads.
-        if: always()
+        # now instead of waiting for its cron. `jobs.mjs check` only reads.
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if node scripts/routines/jobs.mjs next > /dev/null 2>&1; then
-            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-build.yml/dispatches" -f ref=main >/dev/null && echo "builder started"
+          R="$RUNNER_TEMP/routines"; [ -d "$R" ] || cp -R scripts/routines "$R"
+          if node "$R/jobs.mjs" check > /dev/null; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-build.yml/dispatches" -f ref=main >/dev/null \
+              && echo "builder started" || echo "::warning::builder dispatch failed"
           else
             echo "nothing for the builder"
           fi

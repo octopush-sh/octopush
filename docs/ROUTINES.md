@@ -18,7 +18,7 @@ separate routines in those repos (`scripts/deploy-if-ready.sh`, see their README
 
 ## The cycle (GitHub Actions)
 
-You approve ideas; everything else runs continuously (VISION.md §8–§9): the builder and the reviewer alternate every hour, betas go out twice a day. GitHub's scheduler can delay crons by hours, so the cycle also chains on events: an agent branch's green CI starts a review at once, and a review that leaves work for the builder starts it; the crons are the fallback, and the PM check-ins dispatch whatever is overdue. Times are Bogotá (UTC−5).
+You approve ideas; everything else runs continuously (VISION.md §8–§9): the builder and the reviewer alternate every hour, betas go out twice a day. GitHub's scheduler can delay crons by hours, so the cycle also chains on events: an agent branch's green CI starts a review at once, and a review that leaves work for the builder starts it; the crons are the fallback. Times are Bogotá (UTC−5).
 
 | Time | Workflow | What happens |
 |---|---|---|
