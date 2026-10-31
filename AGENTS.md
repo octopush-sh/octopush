@@ -33,8 +33,8 @@ If you're adding or modifying a frontend surface, **read at least the cheatsheet
 
 1. **Use design tokens. Never hardcode colors, fonts, or spacing literals.** Tokens live as CSS variables (`var(--brass)`) and TypeScript constants (`tokens.brass` from `src/lib/tokens.ts` once it exists). If a token is missing, add it to both places — don't invent inline.
 2. **Brass is quirurgical.** One accent, used for active states, eyebrow labels, signature details. Most of any screen is Onyx/Panel/Sage/Mute. If everything is brass, nothing is.
-3. **Three type families, three voices:** Spectral italic serif for *moments* (display, key phrases, ceremonial CTAs); system sans for body; JetBrains Mono for meta and code. No fourth font.
-4. **CTAs are italic‑serif phrases, not imperative labels.** `"Begin a new study"`, not `"+ Create Project"`. Each action has voice.
+3. **Three type families, three voices:** Spectral upright serif for *moments* (display, key phrases, ceremonial CTAs); system sans for body; JetBrains Mono for meta and code. No fourth font.
+4. **CTAs are upright‑serif phrases, not imperative labels.** `"Begin a new study"`, not `"+ Create Project"`. Each action has voice.
 5. **Atelier layout is the law.** Rail (left) · ContextHeader · ModeSwitcher (Talk/Run/Review) · Canvas · Companion (right) · Input bar. Don't introduce new top-level chrome. Don't bring back tabs.
 6. **No bouncing, no spring, no glitter.** Motion is calm. 220–320ms, `cubic‑bezier(0.2, 0.8, 0.3, 1)`. Brass rules *grow*; they don't *appear*. **Nothing appears or disappears abruptly:** overlay/dialog backdrops use `.octo-overlay-enter` and their dialogs use `.octo-modal-enter`; context menus use `.octo-menu-enter`; collapsible regions use the grid-rows `0fr↔1fr` idiom; tab/mode content crossfades with `.octo-fade-in`; status indicators reveal with `.octo-pop-in`; list rows with `.octo-rise-in`. Don't hand-roll one-off animations — reuse the primitives in `src/styles.css` (documented in `docs/design-system.md` §6). All motion respects `prefers-reduced-motion`. **For centered/top dialogs, use `<ModalShell>` (`src/components/ModalShell.tsx`)** — it bundles the canonical scrim, entrance motion, Escape, and optional click-outside; never hand-roll a dialog backdrop.
 7. **No new colors without spec update.** If a feature needs a hue not in the palette, propose updating the spec first — don't slip new accents in via a PR.
@@ -96,7 +96,7 @@ These complement the design rules above and govern all new surfaces:
 
 - [ ] Tokens, not literals. Grep your diff for hex colors (`#[0-9a-fA-F]{3,8}`) — should be empty.
 - [ ] Fonts via tokens. No `font-family: ...` strings except in `styles.css` itself.
-- [ ] CTAs written as phrases in italic serif where applicable.
+- [ ] CTAs written as phrases in upright serif where applicable (no `italic` classes — italics are retired app-wide).
 - [ ] No new layout chrome that breaks the Atelier surface contract.
 - [ ] No abrupt mount/unmount of overlays, menus, or panels — used the motion primitives (`.octo-modal-enter` / `.octo-menu-enter` / `.octo-fade-in` / grid-rows). Motion respects `prefers-reduced-motion`.
 - [ ] If you added a visual pattern not in the spec/cheatsheet, either reuse an existing one or propose extending the design system first.
