@@ -129,7 +129,7 @@ export function digestBody({ date, rows, waiting }) {
     `**${fresh.length} new idea${fresh.length === 1 ? "" : "s"}**, ranked by value, then difficulty. Reply in a comment, one line each:`,
     "",
     "`1 yes` · `2 no` · `3 later` (also `sí`, `aún no`; several at once: `1, 4 yes`) — add a note after it if you like.",
-    "`merge web#12` / `merge api#5` — merge a waiting website/API PR. `promote 0.4.91` — ship a beta to everyone. `idea: …` — add your own.",
+    "`promote 0.4.91` — ship a beta to everyone (you approve it in GitHub). `idea: …` — add your own. App ideas you approve are built tonight; website/API ones are queued until those repos get a builder.",
     "",
     "| # | Idea | Area | Value | Difficulty | Time |",
     "|---|---|---|---|---|---|",

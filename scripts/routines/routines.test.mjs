@@ -552,3 +552,14 @@ test("ideas: long titles are shortened, invalid entries dropped, ≥ 5 usable st
   assert.match(usableIdeas(good.slice(0, 4)).errors[0], /only 4 usable/);
   assert.match(usableIdeas({}).errors[0], /array/);
 });
+
+test("jobs: ready website/API ideas filed in the app repo aren't built here", () => {
+  const now = Date.parse("2026-10-31T12:00:00Z");
+  const a = { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT };
+  const { gh } = fakeGh([[/pulls\?state=open/, []], [/issues\?labels=ready/, [
+    { number: 1, labels: [{ name: "ready" }, { name: "area:app" }] },
+    { number: 2, labels: [{ name: "ready" }, { name: "area:web" }] },
+    { number: 3, labels: [{ name: "ready" }, { name: "area:api" }] },
+  ]]]);
+  assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1]);
+});
