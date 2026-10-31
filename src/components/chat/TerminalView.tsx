@@ -4,6 +4,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { useChatStore } from "../../stores/chatStore";
 import { ipc } from "../../lib/ipc";
 import { XTERM_FONT_FAMILY, getXtermTheme } from "../../lib/xtermTheme";
+import { legacyAltArrowSequence } from "../../lib/xtermAltArrow";
+import { isMac } from "../../lib/platform";
 
 interface Props {
   /** Correlates this view to its live process's buffered output. */
@@ -66,6 +68,16 @@ export function TerminalView({ callId, threadId, className }: Props) {
     const onData = term.onData((data) => {
       if (!useChatStore.getState().liveProcessByThread[threadIdRef.current]) return;
       void ipc.sendShellInput(threadIdRef.current, data).catch(() => {});
+    });
+    // Option+Left/Right word jumps, which xterm 6 no longer maps itself
+    // (lib/xtermAltArrow.ts); `input(…, true)` reaches onData above.
+    term.attachCustomKeyEventHandler((e) => {
+      const altArrow = legacyAltArrowSequence(e, isMac());
+      if (!altArrow) return true;
+      term.input(altArrow, true);
+      e.preventDefault();
+      e.stopPropagation();
+      return false;
     });
 
     let lastSize = { rows: 0, cols: 0 };

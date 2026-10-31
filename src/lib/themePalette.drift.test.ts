@@ -164,6 +164,8 @@ describe("static fallbacks track theme.rs", () => {
           rouge: a.danger,
           warning: a.warning,
           panel2: a.panel_2,
+          border: a.border,
+          borderStrong: a.border_strong,
         },
       ],
       [
