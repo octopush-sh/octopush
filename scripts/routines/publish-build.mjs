@@ -91,8 +91,14 @@ async function main() {
   const token = process.env.GH_TOKEN;
   if (!repo || !gitDir || !token) throw new Error("GITHUB_REPOSITORY, OCTOPUSH_GIT_DIR and GH_TOKEN are required");
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
-  const gh = makeGh();
+  return publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: makeGh() });
+}
 
+/**
+ * The whole publishing flow, run in the current directory (the agent's
+ * checkout). `pushUrl` is only for tests (a local bare repo).
+ */
+export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, pushUrl }) {
   const file = join(".agent-out", "result.json");
   const parsed = existsSync(file) ? parseResult(readFileSync(file, "utf8"), kind) : { error: "the agent wrote no .agent-out/result.json" };
   rmSync(".agent-out", { recursive: true, force: true });
@@ -102,7 +108,7 @@ async function main() {
 
   // Every check runs on ALL changed paths first; caches are dropped only after.
   const all = changedPaths(gitDir);
-  if (!paths.length) { park(gh, repo, kind, n, "It reported success but changed no files."); return 1; }
+  if (!all.length) { park(gh, repo, kind, n, "It reported success but changed no files."); return 1; }
   const bad = forbiddenPaths(all);
   if (bad.length) { park(gh, repo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
@@ -122,8 +128,8 @@ async function main() {
   git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
   git(gitDir, [...BOT, "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\nCloses #${n}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
-  git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, "push", "--quiet",
-    ...(kind === "issue" ? ["--force"] : []), `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`]);
+  git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, ...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
+    "push", "--quiet", ...(kind === "issue" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`]);
 
   let prNumber = n;
   if (kind === "issue") {

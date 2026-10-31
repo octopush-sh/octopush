@@ -568,3 +568,53 @@ test("answers: trailing punctuation is not a note", () => {
   const a = parseAnswers("1 sí.\n2 no — too big.\n3 sí!").actions;
   assert.deepEqual(a.map((x) => [x.n, x.note]), [[1, ""], [2, "too big."], [3, ""]]);
 });
+
+test("publish-build end to end: a real git repo, a fake GitHub — PR opened, CI dispatched, guards applied", async () => {
+  const { publish } = await import("./publish-build.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdirSync, symlinkSync } = await import("node:fs");
+  const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  const setup = () => {
+    const root = mkdtempSync(join(tmpdir(), "pub-"));
+    const bare = join(root, "origin.git"); sh(root, "init", "-q", "--bare", bare);
+    const work = join(root, "work"); mkdirSync(work); sh(work, "init", "-q");
+    writeFileSync(join(work, "README.md"), "x\n"); sh(work, "add", "."); sh(work, "commit", "-qm", "init");
+    const gitDir = join(root, "repo.git"); execFileSync("mv", [join(work, ".git"), gitDir]); // as the workflow does
+    return { root, bare, work, gitDir };
+  };
+  const run = async (prep, result, kind = "issue") => {
+    const t = setup();
+    prep(t.work);
+    mkdirSync(join(t.work, ".agent-out"));
+    writeFileSync(join(t.work, ".agent-out", "result.json"), JSON.stringify(result));
+    const f = fakeGh([[/pulls\?state=open/, []]]);
+    const cwd = process.cwd(); process.chdir(t.work);
+    try {
+      const code = await publish({ kind, n: 7, existingBranch: kind === "pr" ? "agent/x" : undefined, repo: "o/r", gitDir: t.gitDir, token: "gh-token", secrets: ["sk-very-secret-1"], gh: f.gh, pushUrl: t.bare });
+      return { code, writes: f.writes, branches: execFileSync("git", ["--git-dir", t.bare, "branch", "--list"], { encoding: "utf8" }) };
+    } finally { process.chdir(cwd); }
+  };
+  const ok = await run((w) => { mkdirSync(join(w, "src")); writeFileSync(join(w, "src", "a.ts"), "export const a = 1;\n"); mkdirSync(join(w, "coverage")); writeFileSync(join(w, "coverage", "x.json"), "{}"); writeFileSync(join(w, "src", "*"), "odd name"); },
+    { action: "pr", title: "Add a", summary: "Adds a. Fixes #9 too." });
+  assert.equal(ok.code, 0);
+  assert.match(ok.branches, /agent\/issue-7-add-a/);
+  const pr = ok.writes.find((w) => w.method === "POST" && /\/pulls$/.test(w.path));
+  assert.match(pr.body.body, /^Closes #7/);
+  assert.match(pr.body.body, /Fixes issue 9/, "closing keywords in agent text are defused");
+  assert.ok(ok.writes.some((w) => /ci\.yml\/dispatches$/.test(w.path) && w.body.ref === "agent/issue-7-add-a"));
+
+  const human = await run((w) => { mkdirSync(join(w, "scripts")); writeFileSync(join(w, "scripts", "x.mjs"), "x"); }, { action: "pr", title: "T", summary: "S" });
+  assert.equal(human.code, 1);
+  assert.doesNotMatch(human.branches, /agent\//, "nothing pushed");
+  assert.ok(human.writes.some((w) => /labels$/.test(w.path) && w.body.labels?.includes("needs-owner")));
+
+  const link = await run((w) => { mkdirSync(join(w, "src")); symlinkSync("/proc/self", join(w, "src", "p")); }, { action: "pr", title: "T", summary: "S" });
+  assert.equal(link.code, 1);
+
+  const leak = await run((w) => { mkdirSync(join(w, "src")); writeFileSync(join(w, "src", "a.ts"), "const t = 'sk-very-secret-1';"); }, { action: "pr", title: "T", summary: "S" });
+  assert.equal(leak.code, 1);
+  assert.doesNotMatch(leak.branches, /agent\//);
+
+  const none = await run(() => {}, { action: "pr", title: "T", summary: "S" });
+  assert.equal(none.code, 1, "no changes → parked, not a crash");
+});
