@@ -12,21 +12,36 @@ export default defineConfig(async () => ({
 
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
 
   build: {
-    rollupOptions: {
+    // Vite 8 bundles with Rolldown. The only build entry is index.html (the
+    // app); clips.html is a dev-only demo harness served by the dev server and
+    // is intentionally NOT listed as an input, so it never ships in dist/.
+    rolldownOptions: {
       output: {
-        manualChunks: {
-          "vendor-react": ["react", "react-dom"],
-          "vendor-xterm": [
-            "@xterm/xterm",
-            "@xterm/addon-fit",
-            "@xterm/addon-web-links",
+        // Rolldown has no object-form `manualChunks`; `codeSplitting.groups`
+        // is its replacement. Same three vendor chunks as before.
+        codeSplitting: {
+          groups: [
+            {
+              name: "vendor-react",
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+              priority: 30,
+            },
+            {
+              name: "vendor-xterm",
+              test: /[\\/]node_modules[\\/]@xterm[\\/](xterm|addon-fit|addon-web-links)[\\/]/,
+              priority: 20,
+            },
+            {
+              name: "vendor-charts",
+              test: /[\\/]node_modules[\\/]recharts[\\/]/,
+              priority: 10,
+            },
           ],
-          "vendor-charts": ["recharts"],
         },
       },
     },
