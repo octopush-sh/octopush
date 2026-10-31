@@ -67,7 +67,14 @@ jobs:
           NUM: ${{ steps.pick.outputs.num }}
         run: node scripts/routines/jobs.mjs claim "$KIND" "$NUM"
 
-      - name: Prepare the workspace and the brief
+      - name: Trusted copy of the routines (from main)
+        if: steps.pick.outputs.kind != ''
+        # Taken BEFORE any agent branch is checked out: everything that runs
+        # with a token from here on (context, sandbox setup, publishing,
+        # releasing the claim) comes from main, never from the agent's work.
+        run: cp -R scripts/routines "$RUNNER_TEMP/routines"
+
+      - name: Context and brief
         if: steps.pick.outputs.kind != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,17 +83,16 @@ jobs:
           BRANCH: ${{ steps.pick.outputs.branch }}
         run: |
           set -euo pipefail
+          R="$RUNNER_TEMP/routines"
           if [ "$KIND" = pr ]; then
-            [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "unexpected branch name"; exit 1; }
+            [[ "$BRANCH" =~ ^agent/[A-Za-z0-9._/-]+$ ]] || { echo "unexpected branch name"; exit 1; }
             git fetch --quiet origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
           fi
-          # The publishing step runs this copy, not files the agent could edit.
-          cp -R scripts/routines "$RUNNER_TEMP/routines"
           {
-            cat scripts/routines/briefs/builder.md
+            cat "$R/briefs/builder.md"
             echo
-            node scripts/routines/read.mjs "$KIND" "$NUM"
+            node "$R/read.mjs" "$KIND" "$NUM"
             if [ "$KIND" = pr ]; then
               echo; echo "## Failing CI checks on the PR's head (if any)"
               sha="$(git rev-parse HEAD)"
@@ -97,11 +103,18 @@ jobs:
               done
             fi
           } > "$RUNNER_TEMP/prompt.md"
-          npm ci --no-audit --no-fund
+
+      - name: Install and sandbox (no GitHub token in this step)
+        if: steps.pick.outputs.kind != ''
+        run: |
+          set -euo pipefail
+          # The branch's dependencies, without lifecycle scripts (manifests and
+          # lockfile are human-only, but nothing from the branch runs here).
+          npm ci --no-audit --no-fund --ignore-scripts
           npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
           # Out of the agent's (and the sandbox's) reach from here on.
           mv .git "$RUNNER_TEMP/repo.git"
-          bash scripts/routines/agent-sandbox-setup.sh
+          OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
 
       - name: Build (Claude agent, no GitHub access)
         if: steps.pick.outputs.kind != ''
@@ -109,6 +122,14 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: node "$RUNNER_TEMP/routines/agent.mjs" builder "$RUNNER_TEMP/prompt.md"
+
+      - name: Stop the sandbox and freeze the checkout
+        if: always() && steps.pick.outputs.kind != ''
+        # Nothing the checks started may keep changing files while they're
+        # scanned and committed.
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          chmod -R o-w "$GITHUB_WORKSPACE" || true
 
       - name: Publish
         if: steps.pick.outputs.kind != '' && !cancelled()

@@ -17,6 +17,9 @@ import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
 
 export const CLAIM_TTL_MS = 24 * 3600e3;
 export const RED_CI_MAX_AGE_MS = 7 * 24 * 3600e3;
+/** Fix rounds the builder may spend on one PR before it's parked for the owner. */
+export const MAX_FIX_ROUNDS = 3;
+const UPDATE_MARK = "<!-- octopush-build:update -->";
 const PARKED = ["needs-owner", "proposal", "later"];
 
 export const closingRefs = (text) =>
@@ -49,7 +52,10 @@ export function fixJobs(gh, repo, ids, now) {
     if (reviewRounds(comments, ids.reviewer) >= MAX_REVIEW_ROUNDS) continue; // the reviewer parks these
     const sentBack = verdictFor(comments, p.head.sha, ids.reviewer) === "changes";
     const red = ciStatus(gh, repo, p.head.sha) === "failure";
-    if (sentBack || red) out.push({ pr: p, reason: sentBack ? "changes" : "red-ci", stale: red && now - Date.parse(p.created_at) > RED_CI_MAX_AGE_MS });
+    const rounds = comments.filter((c) => sameLogin(c.user?.login, ids.builder) && (c.body ?? "").trimEnd().endsWith(UPDATE_MARK)).length;
+    if (sentBack || red) {
+      out.push({ pr: p, reason: sentBack ? "changes" : "red-ci", stale: rounds >= MAX_FIX_ROUNDS || (red && now - Date.parse(p.created_at) > RED_CI_MAX_AGE_MS) });
+    }
   }
   return out;
 }
@@ -86,7 +92,7 @@ async function main() {
     for (const j of fixJobs(gh, repo, ids, now)) {
       if (j.stale) {
         gh.send("POST", `repos/${repo}/issues/${j.pr.number}/labels`, { labels: ["needs-owner"] });
-        gh.send("POST", `repos/${repo}/issues/${j.pr.number}/comments`, { body: "CI has been red for over a week — parking for the owner.\n\n<!-- octopush-jobs:stale -->" });
+        gh.send("POST", `repos/${repo}/issues/${j.pr.number}/comments`, { body: `Still failing after ${MAX_FIX_ROUNDS} fix rounds or a week of red CI — parking for the owner.\n\n<!-- octopush-jobs:stale -->` });
         continue;
       }
       console.log(`pr\t${j.pr.number}\t${j.pr.head.ref}\t${j.pr.title}\t${j.pr.html_url}`);

@@ -29,7 +29,10 @@ const GITHUB_FILES_CAP = 3000;
  */
 export const HUMAN_ONLY = [
   /^\.github\//i,
-  /^(vision|claude|agents)\.md$/i,
+  /^vision\.md$/i,
+  // Agent instructions anywhere (a nested CLAUDE.md would brief every later agent).
+  /(^|\/)(claude|agents)(\.local)?\.md$/i, /(^|\/)\.claude\//i,
+  /(^|\/)\.gitattributes$/i, // can hide diffs from the reviewer (-diff, textconv)
   /^scripts\//i, // release, routines, deploy, clips, whats-new — all executed by CI or the Mac
   /^\.npmrc$/i, /^\.nvmrc$/i, /^\.husky\//i,
   /^package(-lock)?\.json$/i, /^npm-shrinkwrap\.json$/i, /^pnpm-lock\.yaml$/i, /^yarn\.lock$/i,
@@ -50,12 +53,19 @@ const CHANGESET = /^whats-new\/unreleased\/[a-z0-9-]+\.md$/;
 export const marker = (sha, verdict) => `<!-- octopush-review:${sha}:${verdict} -->`;
 const markerRe = (sha) => new RegExp(`<!-- octopush-review:${sha}:(approve|changes) -->`, "g");
 
-/** The latest review verdict on `sha` by the reviewer account, or null. */
+/**
+ * The latest review verdict on `sha` by the reviewer account, or null. Only a
+ * marker that ends the comment counts — postReview always appends it last, so
+ * a marker smuggled into other text (a file name in a refusal, say) never does.
+ */
 export function verdictFor(comments, sha, reviewer) {
   let v = null;
   for (const c of comments) {
     if (!sameLogin(c.user?.login, reviewer)) continue;
-    for (const m of (c.body ?? "").matchAll(markerRe(sha))) v = m[1];
+    const body = (c.body ?? "").trimEnd();
+    const all = [...body.matchAll(markerRe(sha))];
+    const last = all.at(-1);
+    if (last && last.index + last[0].length === body.length) v = last[1];
   }
   return v;
 }
@@ -157,7 +167,7 @@ export function tryMerge(gh, actGh, n, ids) {
     if (why.some((w) => !transient(w))) {
       actGh.send("POST", `repos/${APP_REPO}/issues/${n}/labels`, { labels: ["needs-owner"] });
       actGh.send("POST", `repos/${APP_REPO}/issues/${n}/comments`, {
-        body: `Not auto-merged — needs the owner:\n\n${why.map((w) => `- ${w}`).join("\n")}\n\n<!-- octopush-automerge:${pr.head.sha}:refused -->`,
+        body: `Not auto-merged — needs the owner:\n\n${why.map((w) => `- ${sanitize(w)}`).join("\n")}\n\n<!-- octopush-automerge:${pr.head.sha}:refused -->`,
       });
     }
     return { merged: false, why };

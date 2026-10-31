@@ -1,7 +1,7 @@
 # Nightly beta release (VISION.md §8, docs/ROUTINES.md, docs/RELEASING.md).
 #
 # If main moved since the last tag and CI is green: collect the changesets,
-# record the What's new clips, bump, open the release PR, wait for CI, merge,
+# bump, open the release PR, wait for CI, merge,
 # tag, and start release.yml on the tag — which publishes a beta (prerelease).
 # The owner promotes it to stable. No agent involved. 05:00 Bogotá.
 name: nightly-release
@@ -26,14 +26,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      GH_TOKEN: ${{ github.token }}
       OCTOPUSH_DISPATCH: "1"
+      OCTOPUSH_SKIP_CLIPS: "1"
       OCTOPUSH_ROUTINES_KEEP_PATH: "1"
       OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@v5
         with:
@@ -42,6 +43,8 @@ jobs:
 
       - name: Anything to release?
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           bash scripts/routines/release-beta.sh check
@@ -52,15 +55,12 @@ jobs:
             *) exit "$rc" ;;
           esac
 
-      - name: Tools for the What's new clips
-        if: steps.check.outputs.go == '1'
-        run: |
-          npm ci --no-audit --no-fund
-          npx playwright install --with-deps chromium
-          command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq ffmpeg; }
-
       - name: Cut the beta
         if: steps.check.outputs.go == '1'
+        # No agent code runs here: dependencies install without scripts and
+        # clips aren't recorded (scripts/routines/release-beta.sh).
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"

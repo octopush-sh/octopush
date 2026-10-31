@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # The only way a nightly builder agent runs code (scripts/routines/agent.mjs).
 #
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all
@@ -13,9 +13,12 @@
 # runner's files, and has no GitHub credential. Inside GitHub Actions only —
 # on a Mac it refuses, the Mac routines run checks directly.
 set -euo pipefail
+# Never trust the caller's PATH for the tools this script itself runs.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 SANDBOX_USER="${OCTOPUSH_SANDBOX_USER:-octo-sandbox}"
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # replaced with the checkout path when installed
+NODE_DIR=""                                     # replaced with node's directory when installed
 
 if [[ "${GITHUB_ACTIONS:-}" != "true" && "${OCTOPUSH_AGENT_SANDBOX:-}" != "1" ]]; then
   echo "agent-check: only for the GitHub Actions agents (run the checks directly instead)" >&2
@@ -32,12 +35,13 @@ esac
 
 # Files the agent created since setup are the runner's (umask 022): readable by
 # the sandbox; reopen them for writing too, as setup did for the checkout.
-chmod -R o+rwX "$ROOT" 2>/dev/null || true
+/bin/chmod -R o+rwX "$ROOT" 2>/dev/null || true
 
 # sudo -n: the workflow prepared the user and the permissions beforehand
 # (agent-sandbox-setup.sh); never prompt.
-exec sudo -n -u "$SANDBOX_USER" env -i \
-  PATH="/usr/local/bin:/usr/bin:/bin:$(dirname "$(command -v node)")" \
+[[ -n "$NODE_DIR" && -x "$NODE_DIR/node" ]] || { echo "octo-check: node not configured" >&2; exit 2; }
+exec /usr/bin/sudo -n -u "$SANDBOX_USER" /usr/bin/env -i \
+  PATH="$NODE_DIR:/usr/local/bin:/usr/bin:/bin" \
   HOME="/tmp/$SANDBOX_USER-home" \
   CI=true LANG=C.UTF-8 \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ROOT" "${cmd[@]}"

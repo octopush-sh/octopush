@@ -74,17 +74,21 @@ jobs:
             work="/tmp/review/pr-$num"; rm -rf "$work"; mkdir -p "$work"
             # The PR's code without .git; main's agent docs, so the PR can't brief its own reviewer.
             git archive "$sha" | tar -x -C "$work"
-            rm -rf "$work/.claude"
+            # No symlinks (they could point the reviewer at /proc or runner files),
+            # no agent instructions from the PR anywhere in the tree.
+            find "$work" -type l -delete
+            find "$work" \( -iname 'CLAUDE*.md' -o -iname 'AGENTS.md' \) -type f -delete
+            find "$work" -type d -name .claude -prune -exec rm -rf {} +
             for f in CLAUDE.md AGENTS.md VISION.md; do git show "origin/main:$f" > "$work/$f" 2>/dev/null || true; done
             {
-              cat scripts/routines/briefs/reviewer.md
+              cat "$R/briefs/reviewer.md"
               echo
               node "$R/read.mjs" pr "$num"
               for issue in $(gh api "repos/$GITHUB_REPOSITORY/pulls/$num" --jq '.body // ""' | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +#[0-9]+' | grep -oE '[0-9]+$' | head -n 3); do
                 echo; node "$R/read.mjs" issue "$issue"
               done
               echo; echo '## Diff (main...head)'; echo '```diff'
-              git diff "origin/main...$sha"
+              git -c core.attributesFile=/dev/null diff --text --no-textconv --no-ext-diff "origin/main...$sha"
               echo '```'
             } > "$RUNNER_TEMP/prompt-$num.md"
             # The agent gets neither GH_TOKEN nor anything else (agent.mjs rebuilds its env).

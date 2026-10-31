@@ -26,6 +26,13 @@ CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
 # release build on the new tag explicitly.
 DISPATCH="${OCTOPUSH_DISPATCH:-0}"
 
+# In Actions the checkout keeps no credentials (persist-credentials: false):
+# pushes authenticate per command with GH_TOKEN.
+PUSH_AUTH=()
+if [[ "$DISPATCH" == 1 && -n "${GH_TOKEN:-}" ]]; then
+  PUSH_AUTH=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')")
+fi
+
 dispatch() { # <workflow file> <ref>
   [[ "$DISPATCH" == 1 ]] || return 0
   gh api -X POST "repos/$REPO/actions/workflows/$1/dispatches" -f ref="$2" >/dev/null \
@@ -119,7 +126,7 @@ tag_and_push() {
   g tag -d "v$version" >/dev/null 2>&1 || true
   g tag -a "v$version" "$sha" -m "Octopush v$version" || fail "could not create tag v$version"
   TAG_CREATED="v$version"
-  g push origin "refs/tags/v$version" || fail "could not push tag v$version"
+  g "${PUSH_AUTH[@]}" push origin "refs/tags/v$version" || fail "could not push tag v$version"
   TAG_PUSHED=1
   dispatch release.yml "v$version" || fail "could not start release.yml on v$version"
   echo "tagged $sha as v$version and pushed — release.yml now publishes the beta"
@@ -162,13 +169,22 @@ do_run() {
   git -C "$WT" checkout --quiet -B "$BRANCH" || fail "could not create branch $BRANCH"
 
   echo "installing dependencies"
-  (cd "$WT" && npm ci --no-audit --no-fund) || fail "npm ci failed"
+  # In Actions, no install scripts: main's src/ is agent work and must not run where the token is.
+  if [[ "$DISPATCH" == 1 ]]; then
+    (cd "$WT" && npm ci --no-audit --no-fund --ignore-scripts) || fail "npm ci failed"
+  else
+    (cd "$WT" && npm ci --no-audit --no-fund) || fail "npm ci failed"
+  fi
 
   echo "collecting changesets for $next (since v$prev)"
   (cd "$WT" && node scripts/whats-new.mjs collect "$next" --since "v$prev") || fail "whats-new collect failed"
   git -C "$WT" add -A whats-new || fail "git add whats-new failed"
 
-  if grep -q '"clips:record"' "$WT/package.json"; then
+  # Recording clips runs the app's frontend (agent work) — never next to the
+  # GitHub token, so not in Actions. Clips are optional.
+  if [[ "${OCTOPUSH_SKIP_CLIPS:-0}" == 1 ]]; then
+    echo "OCTOPUSH_SKIP_CLIPS=1 — releasing without new clips"
+  elif grep -q '"clips:record"' "$WT/package.json"; then
     echo "recording clips"
     if (cd "$WT" && npm run clips:record -- "$next"); then
       git -C "$WT" add -A whats-new || fail "git add whats-new failed"
@@ -189,7 +205,7 @@ do_run() {
 
 $TRAILERS" || fail "git commit failed"
   head="$(git -C "$WT" rev-parse HEAD)"
-  git -C "$WT" push --quiet --force origin "HEAD:refs/heads/$BRANCH" || fail "could not push $BRANCH"
+  git -C "$WT" "${PUSH_AUTH[@]}" push --quiet --force origin "HEAD:refs/heads/$BRANCH" || fail "could not push $BRANCH"
   dispatch ci.yml "$BRANCH" || fail "could not start CI on $BRANCH"
 
   PR="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH&per_page=1" --jq '.[0].number // empty')" \

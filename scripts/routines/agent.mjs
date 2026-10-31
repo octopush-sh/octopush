@@ -21,28 +21,34 @@
 // checkout's .git is moved out of the agent's reach first (no planted hooks or
 // config can run where the GitHub token is).
 import { spawnSync } from "node:child_process";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, openSync, closeSync } from "node:fs";
+import { join } from "node:path";
 
 export const OUT_DIR = ".agent-out";
 
-const READ_ONLY = ["Read", "Glob", "Grep"];
-
-/** Tools per role. `tools` is the whole tool set; `allow` pre-approves calls. */
+/**
+ * Tools per role. `tools` is the whole tool set; `allow(cwd)` pre-approves
+ * calls — file tools only inside the working directory (an allow-list: with
+ * `dontAsk`, a path not listed here is denied, e.g. the runner's action code or
+ * tool cache, which run later with a token).
+ */
+const inside = (cwd) => `/${cwd}/**`; // "//abs/path/**" — an absolute path rule
+const readHere = (cwd) => ["Read", "Glob", "Grep"].map((t) => `${t}(${inside(cwd)})`);
 export const ROLES = {
   builder: {
     model: "claude-opus-5-5",
-    tools: [...READ_ONLY, "Edit", "Write", "Bash"],
-    allow: [...READ_ONLY, "Edit", "Write", "Bash(octo-check:*)"],
+    tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+    allow: (cwd) => [...readHere(cwd), `Edit(${inside(cwd)})`, `Write(${inside(cwd)})`, "Bash(octo-check:*)"],
   },
   reviewer: {
     model: "claude-opus-5-5",
-    tools: [...READ_ONLY, "Write"],
-    allow: [...READ_ONLY, `Write(${OUT_DIR}/**)`],
+    tools: ["Read", "Glob", "Grep", "Write"],
+    allow: (cwd) => [...readHere(cwd), `Write(/${cwd}/${OUT_DIR}/**)`],
   },
   ideas: {
     model: "claude-opus-5-5",
-    tools: [...READ_ONLY, "Write", "WebSearch", "WebFetch"],
-    allow: [...READ_ONLY, `Write(${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
+    tools: ["Read", "Glob", "Grep", "Write", "WebSearch", "WebFetch"],
+    allow: (cwd) => [...readHere(cwd), `Write(/${cwd}/${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
   },
 };
 
@@ -64,10 +70,10 @@ export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
 }
 
 /** The claude CLI arguments for a role (pure, tested). */
-export function claudeArgs(role, prompt, runnerTemp = process.env.RUNNER_TEMP) {
+export function claudeArgs(role, prompt, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd()) {
   const r = ROLES[role];
   if (!r) throw new Error(`unknown role "${role}" (builder | reviewer | ideas)`);
-  const settings = { permissions: { allow: r.allow, deny: denyRules(runnerTemp) } };
+  const settings = { permissions: { allow: r.allow(cwd), deny: denyRules(runnerTemp) } };
   return [
     "-p", prompt,
     "--model", process.env.OCTOPUSH_AGENT_MODEL || r.model,
@@ -99,10 +105,16 @@ function main() {
   const [role, promptFile] = process.argv.slice(2);
   if (!role || !promptFile) { console.error("usage: agent.mjs <builder|reviewer|ideas> <prompt-file>"); return 64; }
   const env = agentEnv();
-  mkdirSync(env.TMPDIR, { recursive: true });
+  mkdirSync(env.TMPDIR, { recursive: true, mode: 0o700 });
   mkdirSync(OUT_DIR, { recursive: true });
-  const r = spawnSync("claude", claudeArgs(role, readFileSync(promptFile, "utf8")), { stdio: "inherit", env });
+  // The agent's transcript goes to a runner-only file, never to the public
+  // Actions log (GitHub masks only the exact secret, not an encoded copy).
+  const logFile = join(process.env.RUNNER_TEMP || env.TMPDIR, `agent-${role}-${process.pid}.log`);
+  const fd = openSync(logFile, "w", 0o600);
+  const r = spawnSync("claude", claudeArgs(role, readFileSync(promptFile, "utf8")), { stdio: ["ignore", fd, fd], env });
+  closeSync(fd);
   if (r.error) { console.error(`agent: ${r.error.message}`); return 2; }
+  console.log(`agent ${role} exited ${r.status} (transcript kept on the runner, not printed)`);
   return r.status ?? 2;
 }
 

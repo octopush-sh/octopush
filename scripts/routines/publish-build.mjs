@@ -14,14 +14,23 @@
 // reach), OCTOPUSH_SECRETS (newline-separated values that must never be
 // published — the Claude token), GITHUB_REPOSITORY.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { makeGh, labelsOf, sanitize } from "./gh.mjs";
+import { HUMAN_ONLY } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
 export const MAX_TEXT = 6000;
-/** Paths an agent's change may not touch (the token can't push workflows anyway). */
-const FORBIDDEN = [/^\.github\//, /^\.agent-out\//, /^\.git(\/|$)/];
+/** Paths an agent's change may not touch: every human-only path (automerge.mjs), plus the agent's own output and git. */
+const FORBIDDEN = [...HUMAN_ONLY, /^\.agent-out\//, /(^|\/)\.git(\/|$)/];
+/** Caches the checks leave behind — never committed. */
+export const CACHE = [/(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/];
+/** Marks a builder fix round on a PR (jobs.mjs counts them). */
+export const UPDATE_MARK = "<!-- octopush-build:update -->";
+
+/** Keep GitHub from treating agent text as closing other issues ("Closes #5"). */
+export const defuseClosing = (text) =>
+  String(text ?? "").replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(:?\s+)#(\d+)/gi, "$1$2issue $3");
 
 /** Validate the agent's result.json for a job kind. Returns { result } or { error }. */
 export function parseResult(text, kind) {
@@ -91,10 +100,13 @@ async function main() {
   const r = parsed.result;
   if (r.action === "stop") { park(gh, repo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
 
-  const paths = changedPaths(gitDir);
+  const paths = changedPaths(gitDir).filter((p) => !CACHE.some((re) => re.test(p)));
   if (!paths.length) { park(gh, repo, kind, n, "It reported success but changed no files."); return 1; }
   const bad = forbiddenPaths(paths);
   if (bad.length) { park(gh, repo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
+  // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
+  const links = paths.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
+  if (links.length) { park(gh, repo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
   const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
   if (leaks([...contents, r.title ?? "", r.summary ?? ""], secrets)) {
     park(gh, repo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
@@ -103,7 +115,7 @@ async function main() {
 
   const branch = kind === "pr" ? existingBranch : branchFor(n, r.title);
   if (!branch) throw new Error("a PR job needs its branch");
-  git(gitDir, ["add", "-A", "--", "."]);
+  git(gitDir, ["add", "-A", "--", ...paths]);
   git(gitDir, [...BOT, "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\nCloses #${n}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
   git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, "push", "--quiet",
@@ -112,13 +124,13 @@ async function main() {
   let prNumber = n;
   if (kind === "issue") {
     const open = gh.list(`repos/${repo}/pulls?state=open&head=${repo.split("/")[0]}:${branch}`);
-    const body = `Closes #${n}\n\n${sanitize(r.summary)}\n\n---\n_Opened by the nightly builder (\`nightly-build.yml\`). The nightly review decides; see docs/ROUTINES.md._`;
-    const pr = open[0] ?? gh.send("POST", `repos/${repo}/pulls`, { title: sanitize(r.title), head: branch, base: "main", body });
+    const body = `Closes #${n}\n\n${defuseClosing(sanitize(r.summary))}\n\n---\n_Opened by the nightly builder (\`nightly-build.yml\`). The nightly review decides; see docs/ROUTINES.md._`;
+    const pr = open[0] ?? gh.send("POST", `repos/${repo}/pulls`, { title: defuseClosing(sanitize(r.title)), head: branch, base: "main", body });
     prNumber = pr.number;
     if (!labelsOf(pr).includes("agent")) gh.send("POST", `repos/${repo}/issues/${prNumber}/labels`, { labels: ["agent"] });
     gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Opened #${prNumber} for this.` });
   } else {
-    gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Pushed fixes:\n\n${sanitize(r.summary)}` });
+    gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Pushed fixes:\n\n${defuseClosing(sanitize(r.summary))}\n\n${UPDATE_MARK}` });
   }
   // Pushes made with GITHUB_TOKEN don't start workflows; dispatch CI explicitly.
   gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });

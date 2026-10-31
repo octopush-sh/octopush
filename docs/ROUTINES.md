@@ -52,20 +52,32 @@ could be steered by it. So no agent ever holds a GitHub credential, and nothing 
 trusted:
 
 - **Agents run with nothing but the Claude token** (`scripts/routines/agent.mjs`): their environment
-  is rebuilt from scratch, every tool call that isn't explicitly allowed is denied
-  (`--permission-mode dontAsk`), and reads of the process table, system and credential paths,
-  the runner's temp dir and git config are denied on top. The reviewer and the ideas agent have
-  read-only tools; only the ideas agent can use the web.
+  is rebuilt from scratch and every tool call that isn't explicitly allowed is denied
+  (`--permission-mode dontAsk`). File tools are allowed only inside the working directory (so not
+  the runner's action code or tool cache, which run later with a token), and the process table,
+  system and credential paths, the runner's temp dir and git config are denied on top. The
+  reviewer and the ideas agent can only write their output file; only the ideas agent can use the
+  web. Transcripts stay on the runner — public Actions logs show only the exit code.
 - **The builder runs code only through `octo-check`** (typecheck, tests, changeset check) — a
   root-owned copy of `scripts/routines/agent-check.sh` that runs the checks as a separate user with
   an empty environment, so code the agent writes can't reach the token.
 - **Agents only write files.** Fixed steps then validate them, scan everything for the token, and
-  do the GitHub writes with the workflow's token — from a copy of `scripts/routines` taken before
-  the agent started, with the checkout's `.git` moved out of the agent's reach (no planted hooks).
-  Agent text is sanitized so it can't carry a routine marker (a forged review verdict).
+  do the GitHub writes with the workflow's token — from a copy of `scripts/routines` taken from
+  `main` before any agent branch is checked out, with the checkout's `.git` moved out of the
+  agent's reach (no planted hooks), dependencies installed without lifecycle scripts, and the
+  sandbox's processes killed and the checkout frozen before publishing. A change may not touch any
+  human-only path or add a symlink. Agent text is sanitized so it can't carry a routine marker (a
+  forged review verdict), closing keywords in it are defused, and a verdict counts only as the
+  last thing in a reviewer comment.
+- **The reviewer sees the PR without its tricks:** no symlinks, no `CLAUDE.md`/`AGENTS.md`/`.claude`
+  from the PR anywhere in the tree (main's are used), and a diff with no textconv or external
+  diff drivers.
+- **The nightly release runs no agent code:** no credentials persisted in the checkout,
+  dependencies installed without scripts, and no clip recording in Actions (it would run the
+  frontend next to the token).
 - **Agents read GitHub only through `read.mjs`**, which shows text by you and the routines and
-  omits everyone else's (an outsider's issue is shown only once you labelled it `ready`, marked as
-  such).
+  never anyone else's — an outsider can edit their issue after you approve it, so when you mark an
+  outsider's issue `ready`, restate the work in a comment of yours.
 - **Merges re-check every rule** on the PR's head commit (`automerge.mjs`): opened by the
   workflow from a branch of this repo into `main`, labelled `agent`, CI green, an approving review
   on that exact commit, no human-only paths (renames too), ≤ 800 changed lines, a changeset for

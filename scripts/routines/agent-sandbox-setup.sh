@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Prepare a GitHub Actions runner for a builder agent (run once per job, as the
 # runner user, before the agent starts). See agent-check.sh.
 #   - creates the unprivileged `octo-sandbox` user (no shared group);
@@ -8,7 +8,10 @@
 set -euo pipefail
 
 SANDBOX_USER="${OCTOPUSH_SANDBOX_USER:-octo-sandbox}"
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# The checkout to open to the sandbox. The workflow runs this script from a
+# copy taken from main (outside the checkout), so the path comes in explicitly.
+ROOT="${OCTOPUSH_CHECKOUT:?OCTOPUSH_CHECKOUT is required}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || { echo "agent-sandbox-setup: GitHub Actions only" >&2; exit 64; }
 
@@ -31,7 +34,9 @@ done
 
 # The check command the agent may run, installed where it can't edit it
 # (root-owned, outside the checkout), with this checkout's path baked in.
-sed -e "s#^ROOT=.*#ROOT=\"$ROOT\"#" "$ROOT/scripts/routines/agent-check.sh" | sudo tee /usr/local/bin/octo-check >/dev/null
+NODE_DIR="$(dirname "$(readlink -f "$(command -v node)")")"
+sed -e "s#^ROOT=.*#ROOT=\"$ROOT\"#" -e "s#^NODE_DIR=.*#NODE_DIR=\"$NODE_DIR\"#" "$HERE/agent-check.sh" \
+  | sudo tee /usr/local/bin/octo-check >/dev/null
 sudo chown root:root /usr/local/bin/octo-check
 sudo chmod 755 /usr/local/bin/octo-check
 
