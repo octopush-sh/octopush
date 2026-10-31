@@ -7,7 +7,7 @@
 #     and locks the runner's temp dir (step scripts, env files) to the runner.
 set -euo pipefail
 
-SANDBOX_USER="${OCTOPUSH_SANDBOX_USER:-octo-sandbox}"
+SANDBOX_USER=octo-sandbox
 # The checkout to open to the sandbox. The workflow runs this script from a
 # copy taken from main (outside the checkout), so the path comes in explicitly.
 ROOT="${OCTOPUSH_CHECKOUT:?OCTOPUSH_CHECKOUT is required}"
