@@ -16,7 +16,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { makeGh, labelsOf, sanitize } from "./gh.mjs";
+import { makeGh, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { HUMAN_ONLY } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
@@ -143,5 +143,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((c) => process.exit(c), (e) => { console.error(`publish-build: ${e.message}`); process.exit(2); });
+  main().then((c) => process.exit(c), (e) => { reportFatal("publish-build", e); process.exit(2); });
 }

@@ -15,7 +15,7 @@
 //
 // Identities (owner / builder / reviewer) come from identity.mjs.
 import { readFileSync } from "node:fs";
-import { makeGh, ghRunAs, APP_REPO, ciStatus, labelsOf, sanitize } from "./gh.mjs";
+import { makeGh, ghRunAs, APP_REPO, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin } from "./identity.mjs";
 
 export const MAX_CHANGED_LINES = 800;
@@ -214,5 +214,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((code) => process.exit(code), (e) => { console.error(`automerge: ${e.message}`); process.exit(2); });
+  main().then((code) => process.exit(code), (e) => { reportFatal("automerge", e); process.exit(2); });
 }

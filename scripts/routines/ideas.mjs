@@ -15,7 +15,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { makeGh, APP_REPO, API_REPO, WEB_REPO, ALL_REPOS, ciStatus, labelsOf, sanitize } from "./gh.mjs";
+import { makeGh, APP_REPO, API_REPO, WEB_REPO, ALL_REPOS, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions } from "./identity.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -121,7 +121,10 @@ export function waitingItems(gh, ids) {
       if (!labelsOf(p).includes("agent") || p.draft) continue;
       if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== repo || p.base?.ref !== "main") continue;
       const short = repo.endsWith("-web") ? "web" : "api";
-      out.push(`\`merge ${short}#${p.number}\` — [${p.title}](${p.html_url}) · CI ${ciStatus(gh, repo, p.head.sha)}`);
+      // A workflow token may not read another repo's Actions runs: CI is then "unknown".
+      let ci = "unknown";
+      try { ci = ciStatus(gh, repo, p.head.sha); } catch { /* not readable from here */ }
+      out.push(`[${short}#${p.number} ${p.title}](${p.html_url}) · CI ${ci} — merge it on GitHub`);
     }
   }
   for (const p of gh.list(`repos/${APP_REPO}/pulls?state=open`)) {
@@ -236,5 +239,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((c) => process.exit(c), (e) => { console.error(`ideas: ${e.message}`); process.exit(2); });
+  main().then((c) => process.exit(c), (e) => { reportFatal("ideas", e); process.exit(2); });
 }

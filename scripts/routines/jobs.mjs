@@ -11,7 +11,7 @@
 // Only builder-authored, same-repo PRs labelled `agent` count — as jobs and as
 // claims on issues — so an outsider's PR can neither steal nor block work.
 import { execFileSync } from "node:child_process";
-import { makeGh, APP_REPO, ciStatus, labelsOf } from "./gh.mjs";
+import { makeGh, APP_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
 
@@ -114,5 +114,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((c) => process.exit(c), (e) => { console.error(`jobs: ${e.message}`); process.exit(2); });
+  main().then((c) => process.exit(c), (e) => { reportFatal("jobs", e); process.exit(2); });
 }

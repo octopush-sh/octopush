@@ -369,7 +369,7 @@ test("'Needs you' lists only builder PRs", () => {
   const p = (n, login) => ({ number: n, title: `p${n}`, html_url: `u${n}`, user: { login }, labels: [{ name: "agent" }], base: { ref: "main" }, head: { sha: "x", repo: { full_name: WEB_REPO } } });
   const { gh } = fakeGh([[/octopush-web\/pulls\?state=open/, [p(1, "octo-builder"), p(2, "stranger")]]]);
   const w = waitingItems(gh, ids).join("\n");
-  assert.match(w, /merge web#1/);
+  assert.match(w, /web#1 p1.*merge it on GitHub/);
   assert.doesNotMatch(w, /web#2/);
 });
 
