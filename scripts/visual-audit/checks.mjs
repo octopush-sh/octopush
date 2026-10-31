@@ -19,11 +19,15 @@ export function inPageChecks() {
   const vw = window.innerWidth, vh = window.innerHeight;
   const CLIPS = new Set(["hidden", "clip", "auto", "scroll"]);
 
+  // Hidden: display/visibility/opacity, aria-hidden, clipped to nothing (a skip
+  // link, an sr-only label) or inside a closed <details> (not its summary).
   const visible = (el) => {
-    for (let e = el; e && e !== document.documentElement; e = e.parentElement) {
+    for (let e = el, prev = null; e && e !== document.documentElement; prev = e, e = e.parentElement) {
       const cs = getComputedStyle(e);
       if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0) return false;
       if (e.getAttribute("aria-hidden") === "true" && e !== el) return false;
+      if (cs.position !== "static" && cs.clip === "rect(0px, 0px, 0px, 0px)") return false;
+      if (e.tagName === "DETAILS" && !e.open && prev && prev.tagName !== "SUMMARY") return false;
     }
     return true;
   };
@@ -32,7 +36,7 @@ export function inPageChecks() {
   // which often interpolates names), plus the tag and its layout classes
   // (state classes — colours, borders, opacity, rings — are left out, so the
   // active row and the others are one element).
-  const STATE = /^(hover|focus|group-|aria-|data-|disabled|transition|duration|ease|animate|octo-|bg-|border-|text-octo|text-\[var|opacity-|ring-|shadow-|outline-|cursor-)/;
+  const STATE = /^(astro-|hover|focus|group-|aria-|data-|disabled|transition|duration|ease|animate|octo-|bg-|border-|text-octo|text-\[var|opacity-|ring-|shadow-|outline-|cursor-)/;
   const selectorOf = (el) => {
     const parts = [];
     let anchor = null;

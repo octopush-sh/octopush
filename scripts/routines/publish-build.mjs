@@ -3,7 +3,15 @@
 // Runs AFTER the agent, from a copy of scripts/routines taken before it started,
 // with the workflow's GITHUB_TOKEN. The agent itself never touches GitHub.
 //
-//   publish-build.mjs <issue|pr> <number> [branch]
+//   publish-build.mjs <issue|pr|app-issue> <number> [branch]
+//
+// The repo it publishes to is OCTOPUSH_PUBLISH_REPO (default GITHUB_REPOSITORY).
+// For octopush-web (web-build.yml) it pushes and opens the PR with the cycle
+// App's installation token (OCTOPUSH_WEB_TOKEN), refuses the web's human-only
+// paths, and for an `app-issue` job (an app-repo `area:web` issue) names
+// `octopush-sh/octopush#N` in the PR and comments the link on that issue with
+// GH_TOKEN. App-token pushes start the web repo's CI themselves (only
+// GITHUB_TOKEN pushes don't), so nothing is dispatched there.
 //
 // Reads .agent-out/result.json:
 //   { "action": "pr",     "title": "…", "summary": "…" }   new work for an issue
@@ -16,21 +24,25 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { makeGh, labelsOf, sanitize, reportFatal } from "./gh.mjs";
-import { HUMAN_ONLY } from "./automerge.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { humanOnlyFor } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
 export const MAX_TEXT = 6000;
-/** Paths an agent's change may not touch: every human-only path (automerge.mjs), plus the agent's own output and git. */
-const FORBIDDEN = [...HUMAN_ONLY, /^\.agent-out\//, /(^|\/)\.git(\/|$)/];
+/** Reference material a workflow puts next to the agent (the app's stable FEATURES.md…) — never committed. */
+export const REF_DIR = ".agent-ref";
+/** Paths an agent's change may not touch: every human-only path of the repo, plus the agent's own output, references and git. */
+const forbiddenFor = (repo) => [...humanOnlyFor(repo), /^\.agent-out\//, /^\.agent-ref\//, /(^|\/)\.git(\/|$)/];
 /** Caches the checks leave behind — never committed. */
-export const CACHE = [/(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/];
+export const CACHE = [/(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/, /^dist\//, /(^|\/)\.astro\//];
+export const KINDS = ["issue", "pr", "app-issue"];
 /** Marks a builder fix round on a PR (jobs.mjs counts them). */
 export const UPDATE_MARK = "<!-- octopush-build:update -->";
 
 /** Keep GitHub from treating agent text as closing other issues ("Closes #5"). */
 export const defuseClosing = (text) =>
-  String(text ?? "").replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(:?\s+)#(\d+)/gi, "$1$2issue $3");
+  String(text ?? "").replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(:?\s+)([\w.-]+\/[\w.-]+)?#(\d+)/gi,
+    (_, k, sp, r, d) => `${k}${sp}${r ? `${r} ` : ""}issue ${d}`);
 
 /** Shorten text to `max` chars at a word boundary, with an ellipsis (pure). */
 export function fit(text, max) {
@@ -55,7 +67,7 @@ export function parseResult(text, kind) {
   for (const k of ["summary", "reason"]) if (typeof r[k] === "string") r[k] = fit(r[k], MAX_TEXT);
   const str = (k, max) => typeof r[k] === "string" && r[k].trim().length > 0 && r[k].length <= max;
   if (r.action === "stop") return str("reason", MAX_TEXT) ? { result: r } : { error: "stop needs a reason" };
-  if (kind === "issue" && r.action === "pr") {
+  if ((kind === "issue" || kind === "app-issue") && r.action === "pr") {
     if (!str("title", MAX_TITLE)) return { error: `pr needs a title (1–${MAX_TITLE} chars)` };
     if (!str("summary", MAX_TEXT)) return { error: "pr needs a summary" };
     return { result: r };
@@ -70,13 +82,18 @@ export function leaks(texts, secrets) {
   return texts.some((t) => s.some((x) => t.includes(x)));
 }
 
-export const branchFor = (n, title) =>
-  `agent/issue-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
+export const branchFor = (n, title, kind = "issue") =>
+  `agent/${kind === "app-issue" ? "app-issue" : "issue"}-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
 
-/** Paths an agent may not change (pure). */
-export const forbiddenPaths = (paths) => paths.filter((p) => FORBIDDEN.some((re) => re.test(p)));
+/** Paths an agent may not change in `repo` (pure). */
+export const forbiddenPaths = (paths, repo = APP_REPO) => paths.filter((p) => forbiddenFor(repo).some((re) => re.test(p)));
 
-const BOT = ["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com"];
+/** The commit identity: the workflow's bot, or the App's bot in the web repo (OCTOPUSH_GIT_NAME/EMAIL). */
+const botIdentity = (env = process.env) => {
+  const name = /^[a-z0-9-]+\[bot\]$/i.test(env.OCTOPUSH_GIT_NAME ?? "") ? env.OCTOPUSH_GIT_NAME : "github-actions[bot]";
+  const email = /^[0-9]+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com$/i.test(env.OCTOPUSH_GIT_EMAIL ?? "") ? env.OCTOPUSH_GIT_EMAIL : "41898282+github-actions[bot]@users.noreply.github.com";
+  return ["-c", `user.name=${name}`, "-c", `user.email=${email}`];
+};
 // Never run hooks, fsmonitor or filters from anything the agent could have written.
 const SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never"];
 
@@ -95,72 +112,87 @@ function park(gh, repo, kind, n, reason) {
     body: `The nightly builder stopped and needs you:\n\n> ${sanitize(reason).replace(/\n/g, "\n> ")}\n\n<!-- octopush-build:stopped -->`,
   });
   gh.send("POST", `repos/${repo}/issues/${n}/labels`, { labels: ["needs-owner"] });
-  if (kind === "issue") { try { gh.send("DELETE", `repos/${repo}/issues/${n}/labels/ready`); } catch { /* absent */ } }
+  if (kind !== "pr") { try { gh.send("DELETE", `repos/${repo}/issues/${n}/labels/ready`); } catch { /* absent */ } }
 }
 
 async function main() {
   const [kind, num, existingBranch] = process.argv.slice(2);
   const n = Number(num);
-  if (!["issue", "pr"].includes(kind) || !Number.isInteger(n)) { console.error("usage: publish-build.mjs <issue|pr> <n> [branch]"); return 64; }
-  const repo = process.env.GITHUB_REPOSITORY;
+  if (!KINDS.includes(kind) || !Number.isInteger(n)) { console.error("usage: publish-build.mjs <issue|pr|app-issue> <n> [branch]"); return 64; }
+  const repo = process.env.OCTOPUSH_PUBLISH_REPO || process.env.GITHUB_REPOSITORY;
   const gitDir = process.env.OCTOPUSH_GIT_DIR;
-  const token = process.env.GH_TOKEN;
-  if (!repo || !gitDir || !token) throw new Error("GITHUB_REPOSITORY, OCTOPUSH_GIT_DIR and GH_TOKEN are required");
+  const web = repo === WEB_REPO;
+  const token = web ? process.env.OCTOPUSH_WEB_TOKEN : process.env.GH_TOKEN;
+  if (!repo || !gitDir || !token) throw new Error(`the repo, OCTOPUSH_GIT_DIR and ${web ? "OCTOPUSH_WEB_TOKEN" : "GH_TOKEN"} are required`);
+  if (kind === "app-issue" && !web) throw new Error("app-issue jobs are built in octopush-web");
+  if (web && !process.env.GH_TOKEN) throw new Error("GH_TOKEN (the app repo) is required for web jobs");
+  // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
-  return publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: makeGh() });
+  return publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
 }
 
 /**
  * The whole publishing flow, run in the current directory (the agent's
  * checkout). `pushUrl` is only for tests (a local bare repo).
  */
-export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, pushUrl }) {
+export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, appGh = gh, pushUrl }) {
+  // Where the job's issue lives: an app-issue job's issue is in the app repo.
+  const [jobGh, jobRepo] = kind === "app-issue" ? [appGh, APP_REPO] : [gh, repo];
   const file = join(".agent-out", "result.json");
   const parsed = existsSync(file) ? parseResult(readFileSync(file, "utf8"), kind) : { error: "the agent wrote no .agent-out/result.json" };
   rmSync(".agent-out", { recursive: true, force: true });
-  if (parsed.error) { park(gh, repo, kind, n, `Its output was unusable: ${parsed.error}.`); return 1; }
+  rmSync(REF_DIR, { recursive: true, force: true });
+  if (parsed.error) { park(jobGh, jobRepo, kind, n, `Its output was unusable: ${parsed.error}.`); return 1; }
   const r = parsed.result;
-  if (r.action === "stop") { park(gh, repo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
+  if (r.action === "stop") { park(jobGh, jobRepo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
 
   // Every check runs on ALL changed paths first; caches are dropped only after.
   const all = changedPaths(gitDir);
-  if (!all.length) { park(gh, repo, kind, n, "It reported success but changed no files."); return 1; }
-  const bad = forbiddenPaths(all);
-  if (bad.length) { park(gh, repo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
+  if (!all.length) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
+  const bad = forbiddenPaths(all, repo);
+  if (bad.length) { park(jobGh, jobRepo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
   const links = all.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
-  if (links.length) { park(gh, repo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
+  if (links.length) { park(jobGh, jobRepo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
   const paths = all.filter((p) => !CACHE.some((re) => re.test(p)));
-  if (!paths.length) { park(gh, repo, kind, n, "It changed only cache files."); return 1; }
+  if (!paths.length) { park(jobGh, jobRepo, kind, n, "It changed only cache files."); return 1; }
   const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
-  if (leaks([...contents, r.title ?? "", r.summary ?? ""], secrets)) {
-    park(gh, repo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
+  if (leaks([...contents, r.title ?? "", r.summary ?? ""], [...secrets, token])) {
+    park(jobGh, jobRepo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
     return 1;
   }
 
-  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title);
+  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind);
   if (!branch) throw new Error("a PR job needs its branch");
+  const closes = kind === "app-issue" ? `Closes ${APP_REPO}#${n}` : `Closes #${n}`;
   // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
   git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
-  git(gitDir, [...BOT, "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\nCloses #${n}`]);
+  git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
-  git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, ...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
-    "push", "--quiet", ...(kind === "issue" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`]);
+  // The token reaches git through the environment, never argv (visible in the process table).
+  const authEnv = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };
+  git(gitDir, [...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
+    "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`], { env: authEnv });
 
+  const web = repo === WEB_REPO;
+  const workflow = web ? "web-build.yml" : "nightly-build.yml";
   let prNumber = n;
-  if (kind === "issue") {
+  if (kind !== "pr") {
     const open = gh.list(`repos/${repo}/pulls?state=open&head=${repo.split("/")[0]}:${branch}`);
-    const body = `Closes #${n}\n\n${defuseClosing(sanitize(r.summary))}\n\n---\n_Opened by the nightly builder (\`nightly-build.yml\`). The nightly review decides; see docs/ROUTINES.md._`;
+    const decides = web ? "The web review judges it; the owner merges website PRs (merging publishes)" : "The nightly review decides";
+    const body = `${closes}\n\n${defuseClosing(sanitize(r.summary))}\n\n---\n_Opened by the nightly builder (\`${workflow}\` in ${APP_REPO}). ${decides}; see docs/ROUTINES.md._`;
     const pr = open[0] ?? gh.send("POST", `repos/${repo}/pulls`, { title: defuseClosing(sanitize(r.title)), head: branch, base: "main", body });
     prNumber = pr.number;
     if (!labelsOf(pr).includes("agent")) gh.send("POST", `repos/${repo}/issues/${prNumber}/labels`, { labels: ["agent"] });
-    gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Opened #${prNumber} for this.` });
+    const link = kind === "app-issue" ? `${repo}#${prNumber}${pr.html_url ? ` (${pr.html_url})` : ""}` : `#${prNumber}`;
+    jobGh.send("POST", `repos/${jobRepo}/issues/${n}/comments`, { body: `Opened ${link} for this.` });
   } else {
     gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Pushed fixes:\n\n${defuseClosing(sanitize(r.summary))}\n\n${UPDATE_MARK}` });
   }
-  // Pushes made with GITHUB_TOKEN don't start workflows; dispatch CI explicitly.
-  gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
-  console.log(`published ${kind} #${n} → PR #${prNumber} (${branch})`);
+  // Pushes made with GITHUB_TOKEN don't start workflows: dispatch the app's CI
+  // explicitly. App installation-token pushes (the web repo) start it on their own.
+  if (!web) gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
+  console.log(`published ${kind} #${n} → ${web ? "web" : "PR "}#${prNumber} (${branch})`);
   return 0;
 }
 

@@ -64,3 +64,4 @@ octopus.db-journal
 .claude/worktrees/
 .claire/
 .visual-audit/
+.web-audit/

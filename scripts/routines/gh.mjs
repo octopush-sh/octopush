@@ -22,6 +22,20 @@ export function ghRun(args, input, token) {
 /** A runner that authenticates with `token` instead of the default gh login. */
 export const ghRunAs = (token) => (args, input) => ghRun(args, input, token);
 
+/**
+ * The client for a repo. In GitHub Actions the workflow's GITHUB_TOKEN (GH_TOKEN)
+ * only reaches the app repo; octopush-web is reached with a short-lived
+ * installation token of the "Octopush Cycle" GitHub App (OCTOPUSH_WEB_TOKEN),
+ * which fixed workflow steps mint and never hand to an agent. Without it, the
+ * default login is used (on a Mac, the owner's `gh` setup).
+ */
+export function ghForRepo(repo, env = process.env) {
+  if (repo === WEB_REPO && env.OCTOPUSH_WEB_TOKEN) return makeGh(ghRunAs(env.OCTOPUSH_WEB_TOKEN));
+  return makeGh();
+}
+/** Is octopush-web reachable with its own token in this process? */
+export const hasWebToken = (env = process.env) => !!env.OCTOPUSH_WEB_TOKEN;
+
 export function makeGh(run = ghRun) {
   const parse = (out) => (out && out.trim() ? JSON.parse(out) : null);
   const gh = {

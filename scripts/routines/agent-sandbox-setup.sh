@@ -12,6 +12,9 @@ SANDBOX_USER=octo-sandbox
 # copy taken from main (outside the checkout), so the path comes in explicitly.
 ROOT="${OCTOPUSH_CHECKOUT:?OCTOPUSH_CHECKOUT is required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Which checks octo-check runs: app (this repo) or web (octopush-web). Baked in below.
+PROFILE="${OCTO_CHECK_PROFILE:-app}"
+[[ "$PROFILE" == app || "$PROFILE" == web ]] || { echo "agent-sandbox-setup: OCTO_CHECK_PROFILE is app or web" >&2; exit 64; }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || { echo "agent-sandbox-setup: GitHub Actions only" >&2; exit 64; }
 
@@ -33,11 +36,11 @@ done
 [[ -n "${RUNNER_TEMP:-}" ]] && chmod 700 "$RUNNER_TEMP"
 
 # The check command the agent may run, installed where it can't edit it
-# (root-owned, outside the checkout), with this checkout's path baked in.
+# (root-owned, outside the checkout), with this checkout's path and the profile baked in.
 NODE_DIR="$(dirname "$(readlink -f "$(command -v node)")")"
-sed -e "s#^ROOT=.*#ROOT=\"$ROOT\"#" -e "s#^NODE_DIR=.*#NODE_DIR=\"$NODE_DIR\"#" "$HERE/agent-check.sh" \
+sed -e "s#^ROOT=.*#ROOT=\"$ROOT\"#" -e "s#^NODE_DIR=.*#NODE_DIR=\"$NODE_DIR\"#" -e "s#^PROFILE=.*#PROFILE=\"$PROFILE\"#" "$HERE/agent-check.sh" \
   | sudo tee /usr/local/bin/octo-check >/dev/null
 sudo chown root:root /usr/local/bin/octo-check
 sudo chmod 755 /usr/local/bin/octo-check
 
-echo "sandbox user $SANDBOX_USER ready for $ROOT; checks: octo-check"
+echo "sandbox user $SANDBOX_USER ready for $ROOT; checks: octo-check ($PROFILE)"

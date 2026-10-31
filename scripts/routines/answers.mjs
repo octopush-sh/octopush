@@ -8,11 +8,16 @@
 // Grammar (one instruction per line or ';'; case and accents don't matter):
 //   1 yes | 2 no | 3 later        also sí/si/ok/dale, aún no/luego/después/not yet;
 //   1, 4 y 6 sí — una nota        several numbers; text after the verb is a note
-//   merge web#12 | merge api#5    merge a waiting website/API PR (CI must be green)
+//   merge web#12 | merge api#5    merge a waiting website/API PR. A website PR is merged with the
+//                                 cycle App's token only if it is still what the web review
+//                                 approved: CI green and an approving verdict on its exact head,
+//                                 no human-only path (automerge.mjs webMergeRefusals)
 //   promote 0.4.91                dispatch the stable promotion workflow
 //   idea: <text>                  file a new idea for tomorrow's digest to estimate
-import { makeGh, APP_REPO, API_REPO, WEB_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
-import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions } from "./identity.mjs";
+import { makeGh, ghForRepo, hasWebToken, APP_REPO, API_REPO, WEB_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
+import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions, idsForRepo } from "./identity.mjs";
+import { verdictFor, webMergeRefusals } from "./automerge.mjs";
+import { appRefs, WEB_AREA } from "./jobs.mjs";
 
 const MARK = "<!-- octopush-";
 // No bare "y": in Spanish it means "and" ("4 y 5 sí").
@@ -113,12 +118,14 @@ function splitRef(ref) {
 const semver = (v) => v.replace(/^v/, "").split(".").map(Number);
 export const newer = (a, b) => { const x = semver(a), y = semver(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; };
 
-function applyOne(gh, digest, action, ids) {
+function applyOne(gh, digest, action, ids, ghFor) {
   const link = `[${digest.title}](${digest.html_url})`;
   if (action.type === "verdict") {
     const ref = digestMap(digest.body)[String(action.n)];
     if (!ref) return `${action.n}: no such item in this digest`;
     const { repo, n } = splitRef(ref);
+    if (![APP_REPO, API_REPO, WEB_REPO].includes(repo) || !Number.isInteger(n)) return `${action.n}: not a cycle issue`;
+    gh = ghFor(repo); // octopush-web is written with the cycle App's token
     const note = action.note ? `\n\n> ${action.note}` : "";
     const drop = (label) => { try { gh.send("DELETE", `repos/${repo}/issues/${n}/labels/${label}`); } catch { /* absent */ } };
     if (action.verdict === "yes") {
@@ -138,6 +145,7 @@ function applyOne(gh, digest, action, ids) {
     gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Parked as **later** by the owner in ${link}; it may come back in a month.${note}` });
     return `${action.n} → later (${ref})${action.note ? ` — note: “${action.note}”` : ""}`;
   }
+  if (action.type === "merge" && action.repo === WEB_REPO && (hasWebToken() || !inActions())) return mergeWeb(ghFor(WEB_REPO), action.n, ids, { appGh: ghFor(APP_REPO) });
   if (action.type === "merge") {
     const pr = gh.get(`repos/${action.repo}/pulls/${action.n}`);
     const short = action.repo.endsWith("-web") ? "web" : "api";
@@ -178,17 +186,63 @@ function applyOne(gh, digest, action, ids) {
   return "unknown action";
 }
 
+/**
+ * `merge web#N`: the owner's OK for a website PR (merging publishes it). Merged
+ * with `webGh` (the App token in Actions) only after re-checking, on the PR's
+ * current head, every rule the review relied on.
+ */
+export function mergeWeb(webGh, n, ids, { waitMs = 3000, tries = 5, appGh = null } = {}) {
+  const webIds = idsForRepo(ids, WEB_REPO);
+  // GitHub computes mergeability lazily (null right after main moves): ask again briefly.
+  let pr = webGh.get(`repos/${WEB_REPO}/pulls/${n}`);
+  for (let i = 1; pr.mergeable === null && i < tries; i++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    pr = webGh.get(`repos/${WEB_REPO}/pulls/${n}`);
+  }
+  const files = webGh.list(`repos/${WEB_REPO}/pulls/${n}/files`, 3000);
+  const ci = ciStatus(webGh, WEB_REPO, pr.head.sha);
+  const verdict = verdictFor(webGh.list(`repos/${WEB_REPO}/issues/${n}/comments`), pr.head.sha, webIds.reviewer);
+  const why = webMergeRefusals({ pr, files, ci, verdict, ids: webIds });
+  if (why.length) return `merge web#${n}: not merged — ${why.join("; ")}${pr.html_url ? ` (${pr.html_url})` : ""}`;
+  // `sha` pins the merge to the commit just checked: if it moved since, GitHub refuses.
+  const r = webGh.send("PUT", `repos/${WEB_REPO}/pulls/${n}/merge`, { merge_method: "merge", sha: pr.head.sha });
+  if (!r?.merged) return `merge web#${n}: ${r?.message ?? "failed"}`;
+  const closed = appGh ? closeAppIssues(appGh, pr) : [];
+  return `merged web#${n} at ${pr.head.sha.slice(0, 7)} — it goes live at the next deploy window, once CI passes on main${closed.length ? `; closed ${closed.map((x) => `#${x}`).join(", ")}` : ""}`;
+}
+
+/**
+ * The app-repo `area:web` issues a merged web PR was built for (`Closes
+ * octopush-sh/octopush#N` — publish-build.mjs defuses any other closing
+ * reference in agent text). A closing keyword in another repo's PR can't close
+ * them for the App's bot, so they are closed here with the workflow's token,
+ * and only if they are open `area:web` issues. Returns the numbers closed.
+ */
+export function closeAppIssues(appGh, pr) {
+  const out = [];
+  for (const k of [...new Set(appRefs(pr.body ?? ""))].slice(0, 3)) {
+    let issue;
+    try { issue = appGh.get(`repos/${APP_REPO}/issues/${k}`); } catch { continue; }
+    if (!issue || issue.pull_request || issue.state !== "open" || !labelsOf(issue).includes(WEB_AREA)) continue;
+    appGh.send("POST", `repos/${APP_REPO}/issues/${k}/comments`, { body: `Done in ${WEB_REPO}#${pr.number}${pr.html_url ? ` (${pr.html_url})` : ""}, merged by the owner.` });
+    try { appGh.send("DELETE", `repos/${APP_REPO}/issues/${k}/labels/ready`); } catch { /* absent */ }
+    appGh.send("PATCH", `repos/${APP_REPO}/issues/${k}`, { state: "closed", state_reason: "completed" });
+    out.push(k);
+  }
+  return out;
+}
+
 /** Recent digests, only those the builder account opened. */
 export const digests = (gh, ids) =>
   gh.list(`repos/${APP_REPO}/issues?state=all&labels=digest&sort=created&direction=desc`, 5).filter((d) => sameLogin(d.user?.login, ids.builder));
 
-export function applyAll(gh, ids) {
+export function applyAll(gh, ids, ghFor = () => gh) {
   let applied = 0;
   for (const d of digests(gh, ids)) {
     const comments = gh.list(`repos/${APP_REPO}/issues/${d.number}/comments`);
     for (const c of pending(comments, ids.owner)) {
       const { actions, unknown } = parseAnswers(c.body ?? "");
-      const results = actions.map((a) => { try { return applyOne(gh, d, a, ids); } catch (e) { return `${a.type}: error — ${String(e.message).split("\n")[0]}`; } });
+      const results = actions.map((a) => { try { return applyOne(gh, d, a, ids, ghFor); } catch (e) { return `${a.type}: error — ${String(e.message).split("\n")[0]}`; } });
       const lines = [...results.map((r) => `- ${r}`), ...unknown.map((u) => `- didn't understand: “${u}”`)];
       gh.send("POST", `repos/${APP_REPO}/issues/${d.number}/comments`, {
         body: `${lines.length ? lines.join("\n") : "- nothing to apply"}\n\n<!-- octopush-applied:${c.id} -->`,
@@ -210,7 +264,12 @@ async function main() {
     console.log("no new answers");
     return 1;
   }
-  if (cmd === "apply") { assertActingAs(gh, ids.builder, ids); console.log(`applied ${applyAll(gh, ids)} comment(s)`); return 0; }
+  if (cmd === "apply") {
+    assertActingAs(gh, ids.builder, ids);
+    const web = ghForRepo(WEB_REPO);
+    console.log(`applied ${applyAll(gh, ids, (repo) => (repo === WEB_REPO ? web : gh))} comment(s)`);
+    return 0;
+  }
   console.error("usage: answers.mjs check | apply");
   return 64;
 }

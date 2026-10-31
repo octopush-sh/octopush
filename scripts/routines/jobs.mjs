@@ -8,11 +8,17 @@
 //   jobs.mjs claim issue|pr <n>    label it `in-progress` (claims expire after 24 h)
 //   jobs.mjs release issue|pr <n>  remove the claim
 //
+//   jobs.mjs --repo octopush-sh/octopush-web next|claim|release …   the web builder (web-build.yml):
+//                                  fixes on web PRs first, then the oldest `ready` web issue, then the
+//                                  oldest app-repo issue labelled `area:web` + `ready`:
+//                                    app-issue<TAB>number<TAB>title<TAB>url
+//                                  (claim/release app-issue <n> label it in the app repo)
+//
 // Only builder-authored, same-repo PRs labelled `agent` count — as jobs and as
 // claims on issues — so an outsider's PR can neither steal nor block work.
 import { execFileSync } from "node:child_process";
-import { makeGh, APP_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
-import { loadIdentities, requireIdentities, assertActingAs, sameLogin } from "./identity.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
+import { loadIdentities, requireIdentities, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
 
 export const CLAIM_TTL_MS = 24 * 3600e3;
@@ -23,9 +29,14 @@ const UPDATE_MARK = "<!-- octopush-build:update -->";
 const PARKED = ["needs-owner", "proposal", "later"];
 /** Ideas for the website/API live here too (area:web|api) but this repo's builder can't build them. */
 const OTHER_AREA = ["area:web", "area:api"];
+/** App-repo issues the web builder takes (VISION.md §8: website work queued in the hub). */
+export const WEB_AREA = "area:web";
 
 export const closingRefs = (text) =>
   [...(text ?? "").matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)\b/gi)].map((m) => Number(m[1]));
+/** `Closes octopush-sh/octopush#N` — how a web PR built for an app-repo issue names it (publish-build.mjs). */
+export const appRefs = (text) =>
+  [...(text ?? "").matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+octopush-sh\/octopush#(\d+)\b/gi)].map((m) => Number(m[1]));
 
 /** When the `in-progress` label was last added, or null. */
 function claimedAt(gh, repo, n) {
@@ -46,7 +57,6 @@ export function builderPrs(gh, repo, ids) {
 
 /** Builder PRs that need another pass: the reviewer sent them back, or CI is red. */
 export function fixJobs(gh, repo, ids, now) {
-  if (repo !== APP_REPO) return [];
   const out = [];
   for (const p of builderPrs(gh, repo, ids)) {
     if (labelsOf(p).includes("needs-owner") || isFreshClaim(gh, repo, p, now)) continue;
@@ -64,9 +74,34 @@ export function fixJobs(gh, repo, ids, now) {
 
 export function issueJobs(gh, repo, ids, now) {
   const claimed = new Set(builderPrs(gh, repo, ids).flatMap((p) => closingRefs(`${p.title}\n${p.body}`)));
+  // In the app repo, website/API work waits for its own builder; in the web repo every issue is web work.
+  const skip = repo === APP_REPO ? OTHER_AREA : [];
   return gh.list(`repos/${repo}/issues?labels=ready&state=open&sort=created&direction=asc`)
-    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l) || OTHER_AREA.includes(l)) && !claimed.has(i.number))
+    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l) || skip.includes(l)) && !claimed.has(i.number))
     .filter((i) => !isFreshClaim(gh, repo, i, now));
+}
+
+/**
+ * App-repo issues for the web builder: `area:web` + `ready`, not parked, not
+ * claimed (a fresh `in-progress`, or an open web builder PR that references
+ * `octopush-sh/octopush#N`). `appGh` reads the app repo, `webGh` the web repo;
+ * `webIds` are the web repo's identities (its builder is the App's bot).
+ */
+export const MERGED_CLAIM_MS = 14 * 24 * 3600e3;
+export function appWebIssueJobs(appGh, webGh, webIds, now) {
+  const claimed = new Set(builderPrs(webGh, WEB_REPO, webIds).flatMap((p) => appRefs(`${p.title}\n${p.body}`)));
+  // Done already: a web builder PR merged in the last two weeks names it. (The
+  // App's bot can't close app-repo issues through a closing keyword; answers.mjs
+  // closes them on `merge web#N`, and this keeps one that slipped through from
+  // being rebuilt every two hours.)
+  for (const p of webGh.list(`repos/${WEB_REPO}/pulls?state=closed&sort=updated&direction=desc`, 100)) {
+    if (!p.merged_at || now - Date.parse(p.merged_at) > MERGED_CLAIM_MS) continue;
+    if (!sameLogin(p.user?.login, webIds.builder) || p.head?.repo?.full_name !== WEB_REPO || p.base?.ref !== "main") continue;
+    for (const n of appRefs(`${p.title}\n${p.body}`)) claimed.add(n);
+  }
+  return appGh.list(`repos/${APP_REPO}/issues?labels=ready,${WEB_AREA}&state=open&sort=created&direction=asc`)
+    .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
+    .filter((i) => !isFreshClaim(appGh, APP_REPO, i, now));
 }
 
 function thisRepo() {
@@ -76,11 +111,16 @@ function thisRepo() {
 }
 
 async function main() {
-  const [cmd, kind, num] = process.argv.slice(2);
-  const ids = requireIdentities(loadIdentities());
-  const gh = makeGh();
-  const repo = thisRepo();
+  let argv = process.argv.slice(2);
+  let repo = null;
+  if (argv[0] === "--repo") { repo = argv[1]; argv = argv.slice(2); }
+  repo ??= thisRepo();
+  const [cmd, kind, num] = argv;
+  const baseIds = requireIdentities(loadIdentities());
+  const ids = idsForRepo(baseIds, repo);
+  const gh = ghForRepo(repo);
   const now = Date.now();
+  if (repo === WEB_REPO) return webMain({ cmd, kind, num, gh, ids, baseIds, now });
   if (cmd === "check") {
     const f = fixJobs(gh, repo, ids, now).filter((j) => !j.stale);
     if (f.length) { console.log(`work: pr #${f[0].pr.number} (${f[0].reason})`); return 0; }
@@ -112,6 +152,43 @@ async function main() {
     return 0;
   }
   console.error("usage: jobs.mjs check | next | claim issue|pr <n> | release issue|pr <n>");
+  return 64;
+}
+
+/** The web builder's queue: web PR fixes, web `ready` issues, then app-repo `area:web` issues. */
+export function nextWebJob(webGh, appGh, ids, now) {
+  for (const j of fixJobs(webGh, WEB_REPO, ids, now)) {
+    if (j.stale) {
+      webGh.send("POST", `repos/${WEB_REPO}/issues/${j.pr.number}/labels`, { labels: ["needs-owner"] });
+      webGh.send("POST", `repos/${WEB_REPO}/issues/${j.pr.number}/comments`, { body: `Still failing after ${MAX_FIX_ROUNDS} fix rounds or a week of red CI — parking for the owner.\n\n<!-- octopush-jobs:stale -->` });
+      continue;
+    }
+    return { kind: "pr", n: j.pr.number, branch: j.pr.head.ref, title: j.pr.title, url: j.pr.html_url };
+  }
+  const [i] = issueJobs(webGh, WEB_REPO, ids, now);
+  if (i) return { kind: "issue", n: i.number, title: i.title, url: i.html_url };
+  const [a] = appWebIssueJobs(appGh, webGh, ids, now);
+  if (a) return { kind: "app-issue", n: a.number, title: a.title, url: a.html_url };
+  return null;
+}
+
+function webMain({ cmd, kind, num, gh, ids, now }) {
+  const appGh = makeGh(); // GH_TOKEN: the app repo (area:web issues live there)
+  if (cmd === "next") {
+    assertActingAs(gh, ids.builder, ids);
+    const j = nextWebJob(gh, appGh, ids, now);
+    if (!j) { console.error(`nothing to do for ${WEB_REPO}`); return 1; }
+    console.log(j.kind === "pr" ? `pr\t${j.n}\t${j.branch}\t${j.title}\t${j.url}` : `${j.kind}\t${j.n}\t${j.title}\t${j.url}`);
+    return 0;
+  }
+  if ((cmd === "claim" || cmd === "release") && ["issue", "pr", "app-issue"].includes(kind) && /^\d+$/.test(num ?? "")) {
+    const [g, r] = kind === "app-issue" ? [appGh, APP_REPO] : [gh, WEB_REPO];
+    if (cmd === "claim") g.send("POST", `repos/${r}/issues/${num}/labels`, { labels: ["in-progress"] });
+    else { try { g.send("DELETE", `repos/${r}/issues/${num}/labels/in-progress`); } catch { /* not claimed */ } }
+    console.log(`${cmd}ed ${kind} #${num}`);
+    return 0;
+  }
+  console.error(`usage: jobs.mjs --repo ${WEB_REPO} next | claim|release issue|pr|app-issue <n>`);
   return 64;
 }
 

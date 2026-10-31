@@ -11,6 +11,14 @@
 //   - already open, or closed as "not planned" by the owner → left alone.
 // At most MAX_NEW new issues per run, so a bad night can't flood the tracker.
 //
+//   node scripts/visual-audit/file.mjs --repo octopush-sh/octopush-web <findings.json> [--dry-run]
+//
+// files the nightly web audit's findings (scripts/web-audit/) in octopush-web
+// instead, with the cycle App's token (OCTOPUSH_WEB_TOKEN): labelled `visual`
+// (+ `bug` for broken links, missing meta and placeholder copy), same
+// fingerprints, caps and reopen rules. A finding only on human-only pages
+// (legal, pricing) is never `ready`: the owner decides those.
+//
 //   node scripts/visual-audit/file.mjs --design <design.json> <findings.json> [--dry-run]
 //
 // files the design reviewer's findings instead: validated (a real screenshot
@@ -18,12 +26,31 @@
 // night and OPEN_DESIGN_CAP open, labelled `idea` + `proposal` so they show up
 // in the owner's daily digest — an AI's taste never goes straight to the builder.
 import { readFileSync } from "node:fs";
-import { APP_REPO, makeGh, labelsOf, sanitize, reportFatal } from "../routines/gh.mjs";
+import { APP_REPO, WEB_REPO, ghForRepo, labelsOf, sanitize, reportFatal } from "../routines/gh.mjs";
 import { issueTitle, issueBody, MARK, fingerprint } from "./checks.mjs";
+import { webIssueTitle, webIssueBody, BUG_CHECKS, OWNER_CHECKS } from "../web-audit/checks.mjs";
 
 export const MAX_NEW = 5;
 export const READY_CAP = 2;
 export const LABELS = ["visual", "area:app"];
+export const WEB_LABELS = ["visual"];
+/**
+ * Website pages whose source is human-only (octopush-web CLAUDE.md: legal pages,
+ * the Free/Pro page). A finding seen only there goes to the owner, not the builder.
+ */
+export const WEB_HUMAN_PAGES = [/^\/(privacy|terms|refunds)(\/|\.html)?$/, /^\/docs\/free-vs-pro\/?$/];
+export const humanOnlyFinding = (f) => (f.surfaces ?? [f.surface]).every((p) => WEB_HUMAN_PAGES.some((re) => re.test(p)));
+
+/** How findings become issues in each repo. */
+export const TARGETS = {
+  [APP_REPO]: { labels: () => LABELS, title: issueTitle, body: issueBody, canBeReady: () => true },
+  [WEB_REPO]: {
+    labels: (f) => [...WEB_LABELS, ...(BUG_CHECKS.has(f.check) ? ["bug"] : [])],
+    title: webIssueTitle,
+    body: (f, o) => webIssueBody(f, o),
+    canBeReady: (f) => !humanOnlyFinding(f) && !OWNER_CHECKS.has(f.check),
+  },
+};
 export const MAX_DESIGN = 3;
 export const OPEN_DESIGN_CAP = 6;  // open design proposals; past this, nothing new until some are answered
 export const OPEN_VISUAL_CAP = 10; // open check-found issues; past this, nothing new
@@ -92,7 +119,7 @@ export const fpOf = (body) => (String(body ?? "").match(FP_RE) ?? [])[1] ?? null
 //   - only issues closed as *completed* are reopened (not duplicates, not
 //     "not planned");
 //   - new issues stop once OPEN_VISUAL_CAP check-found issues are open.
-export function planFiling(findings, existing, { maxNew = MAX_NEW, readyCap = READY_CAP, maxReopen = MAX_REOPEN, openCap = OPEN_VISUAL_CAP, engine, runUrl } = {}) {
+export function planFiling(findings, existing, { maxNew = MAX_NEW, readyCap = READY_CAP, maxReopen = MAX_REOPEN, openCap = OPEN_VISUAL_CAP, engine, runUrl, target = TARGETS[APP_REPO] } = {}) {
   const byFp = new Map();
   for (const i of existing) { const fp = fpOf(i.body); if (fp && !i.pull_request) byFp.set(fp, i); }
   const openChecks = existing.filter((i) => i.state === "open" && !i.pull_request && !isDesign(i));
@@ -106,36 +133,42 @@ export function planFiling(findings, existing, { maxNew = MAX_NEW, readyCap = RE
     if (known) {
       if (known.state === "closed" && known.state_reason === "completed" && reopened < maxReopen) {
         reopened++;
-        actions.push({ type: "reopen", number: known.number, comment: `The nightly visual audit reports this again (${f.sizes.join(", ")}, ${engine ?? "WebKit"}) — it came back after the fix. Moved to \`${NEEDS_OWNER}\` so the builder doesn't loop on it.${runUrl ? ` [Audit run](${runUrl}).` : ""}` });
+        actions.push({ type: "reopen", number: known.number, comment: `The nightly ${target === TARGETS[WEB_REPO] ? "web" : "visual"} audit reports this again (${f.sizes.join(", ")}, ${engine ?? "WebKit"}) — it came back after the fix. Moved to \`${NEEDS_OWNER}\` so the builder doesn't loop on it.${runUrl ? ` [Audit run](${runUrl}).` : ""}` });
       }
       continue;
     }
     if (created >= maxNew || openChecks.length + created >= openCap) continue;
     created++;
     // Keep the builder's visual queue short: never more than readyCap open `ready` visual issues.
-    const labels = [...LABELS];
-    if (openReady + ready < readyCap) { labels.push("ready"); ready++; }
-    actions.push({ type: "create", title: issueTitle(f), body: sanitize(issueBody(f, { engine, runUrl })).replace(sanitize(MARK(f.fp)), MARK(f.fp)), labels });
+    const labels = [...target.labels(f)];
+    if (!target.canBeReady(f)) labels.push("proposal");
+    else if (openReady + ready < readyCap) { labels.push("ready"); ready++; }
+    actions.push({ type: "create", title: target.title(f), body: sanitize(target.body(f, { engine, runUrl })).replace(sanitize(MARK(f.fp)), MARK(f.fp)), labels });
   }
   return actions;
 }
 
 function main() {
-  const args = process.argv.slice(2);
+  let args = process.argv.slice(2);
   const dry = args.includes("--dry-run");
+  const ri = args.indexOf("--repo");
+  const repoArg = ri >= 0 ? args[ri + 1] : null;
+  if (ri >= 0) args = args.filter((_, i) => i !== ri && i !== ri + 1);
+  if (repoArg && !TARGETS[repoArg]) { console.error(`file.mjs: --repo is ${Object.keys(TARGETS).join(" or ")}`); return 64; }
   const rest = args.filter((a) => a !== "--dry-run");
   const di = rest.indexOf("--design");
   const designFile = di >= 0 ? rest[di + 1] : null;
   const file = rest.find((a, i) => !a.startsWith("--") && (di < 0 || i !== di + 1));
   if (!file || (di >= 0 && (!designFile || designFile.startsWith("--")))) { console.error("usage: file.mjs [--design <design.json>] <findings.json> [--dry-run]"); return 64; }
   const report = JSON.parse(readFileSync(file, "utf8"));
-  const gh = makeGh();
-  const repo = process.env.OCTOPUSH_ROUTINE_REPO || APP_REPO;
+  const repo = repoArg || process.env.OCTOPUSH_ROUTINE_REPO || APP_REPO;
+  if (designFile && repo !== APP_REPO) { console.error("file.mjs: --design files in the app repo only"); return 64; }
+  const gh = ghForRepo(repo);
   const runUrl = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : undefined;
   const existing = gh.list(`repos/${repo}/issues?state=all&labels=visual`, 2000);
   const actions = designFile
     ? planDesign(validDesignFindings(JSON.parse(readFileSync(designFile, "utf8")), report.visited ?? []), existing, { runUrl })
-    : planFiling(report.findings ?? [], existing, { engine: { webkit: "WebKit", safari: "Safari", chromium: "Chromium" }[report.engine] ?? report.engine, runUrl });
+    : planFiling(report.findings ?? [], existing, { engine: { webkit: "WebKit", safari: "Safari", chromium: "Chromium" }[report.engine] ?? report.engine, runUrl, target: TARGETS[repo] ?? TARGETS[APP_REPO] });
   for (const a of actions) {
     if (dry) { console.log(`[dry-run] ${a.type} ${a.number ?? a.title} ${a.labels ? `(${a.labels.join(", ")})` : ""}`); continue; }
     if (a.type === "create") {

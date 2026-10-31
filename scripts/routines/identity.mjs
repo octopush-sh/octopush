@@ -1,4 +1,4 @@
-import { reportFatal } from "./gh.mjs";
+import { reportFatal, WEB_REPO } from "./gh.mjs";
 // Who is who in the nightly cycle (VISION.md §8, docs/ROUTINES.md).
 //
 //   owner     — the human. Only their comments count as answers; never used by routines.
@@ -12,6 +12,12 @@ import { reportFatal } from "./gh.mjs";
 // every GitHub write, and they neutralise markers in agent text (gh.mjs
 // `sanitize`), so an agent can't forge a review verdict. The owner must always
 // be a different account.
+//
+// In octopush-web the cycle acts as the "Octopush Cycle" GitHub App instead
+// (OCTOPUSH_APP_BOT_LOGIN, e.g. `octopush-cycle[bot]`): its installation token
+// is the only credential that reaches that private repo, so there the App's bot
+// is both builder and reviewer (`idsForRepo`). Same reasoning: no agent ever
+// holds its token.
 //
 // On a Mac (the earlier setup) all three must differ: two bot accounts, the
 // builder as the default `gh` login and the reviewer's token in the Keychain.
@@ -28,6 +34,8 @@ const FILE = join(homedir(), ".config", "octopush-routines", "identity.env");
 /** The login of a workflow's GITHUB_TOKEN. */
 export const ACTIONS_BOT = "github-actions[bot]";
 export const inActions = (env = process.env) => env.GITHUB_ACTIONS === "true";
+/** A GitHub App's bot login (`name[bot]`): never a person's account. */
+export const isBotLogin = (login) => /^[a-z0-9-]+\[bot\]$/i.test(login ?? "");
 
 export function loadIdentities(env = process.env, file = FILE) {
   const fromFile = {};
@@ -57,13 +65,26 @@ export function requireIdentities(ids, env = process.env) {
     throw new Error("the owner's account can never be the builder or the reviewer");
   }
   const shared = sameLogin(ids.builder, ids.reviewer);
-  if (shared && !(inActions(env) && sameLogin(ids.builder, ACTIONS_BOT))) {
+  if (shared && !(inActions(env) && isBotLogin(ids.builder))) {
     throw new Error("outside GitHub Actions, builder and reviewer must be two different GitHub accounts");
   }
   return ids;
 }
 
 export const sameLogin = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The identities that act in `repo`. For octopush-web in GitHub Actions that's
+ * the GitHub App's bot (OCTOPUSH_APP_BOT_LOGIN) as builder and reviewer; the
+ * owner is the same person everywhere. Elsewhere, `ids` unchanged.
+ */
+export function idsForRepo(ids, repo, env = process.env) {
+  const bot = env.OCTOPUSH_APP_BOT_LOGIN;
+  if (repo !== WEB_REPO || !inActions(env) || !bot) return ids;
+  if (!isBotLogin(bot)) throw new Error(`OCTOPUSH_APP_BOT_LOGIN must be an App bot login (name[bot]), got ${bot}`);
+  if (sameLogin(bot, ids.owner)) throw new Error("the owner's account can never be the builder or the reviewer");
+  return { ...ids, builder: bot, reviewer: bot };
+}
 
 /** The reviewer's token: env OCTOPUSH_REVIEWER_TOKEN, else the macOS Keychain. */
 export function reviewerToken(env = process.env) {
@@ -81,8 +102,9 @@ export function reviewerToken(env = process.env) {
  * particular, never as the owner.
  */
 export function assertActingAs(gh, expected, ids, env = process.env) {
-  // A workflow's GITHUB_TOKEN can't call GET /user; inside Actions it is the bot by construction.
-  if (inActions(env) && sameLogin(expected, ACTIONS_BOT)) return ACTIONS_BOT;
+  // A workflow's GITHUB_TOKEN and an App installation token can't call GET /user;
+  // inside Actions they are those bots by construction (never a person).
+  if (inActions(env) && isBotLogin(expected) && !sameLogin(expected, ids.owner)) return expected;
   const who = gh.viewer();
   if (sameLogin(who, ids.owner)) throw new Error(`refusing to run as the owner account (${who}); routines run as ${expected}`);
   if (!sameLogin(who, expected)) throw new Error(`gh is authenticated as ${who}, expected ${expected}`);

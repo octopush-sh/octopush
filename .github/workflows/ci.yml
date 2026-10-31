@@ -94,5 +94,8 @@ jobs:
       - name: visual audit logic
         # Pure parts only (merging, fingerprints, issue filing). The audit itself runs nightly (visual-audit.yml).
         run: node --test scripts/visual-audit/visual-audit.test.mjs
+      - name: web audit logic
+        # Pure parts only (pages, links, issue text). The audit itself runs nightly (web-audit.yml).
+        run: node --test scripts/web-audit/web-audit.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done

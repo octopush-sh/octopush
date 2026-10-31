@@ -1,0 +1,218 @@
+# Nightly web audit (scripts/web-audit/README.md, docs/ROUTINES.md).
+#
+# Builds octopush-web's main (what merging publishes), serves dist/ and renders
+# every page in Playwright Chromium at 1440×900, 1024×700 and 390×844: the app
+# audit's layout checks (scripts/visual-audit/checks.mjs) plus website checks —
+# content past the window edge on mobile, placeholder copy, retired glyphs,
+# italics, missing title/description/social tags, broken internal links and
+# anchors, built files that would shadow /download, /api or /update. New
+# defects become `visual` issues in octopush-web (deduplicated by fingerprint,
+# capped like the app audit; the first two `ready` for the web builder). No
+# agent runs here.
+#
+# The build is the website's own code (Astro config, integrations,
+# dependencies), so it runs the way web-build.yml runs it: as the unprivileged
+# `octo-sandbox` user through the root-owned `octo-check` (no sudo, another
+# uid, an empty environment, only the site checkout open to it), after the
+# read token has been revoked, and every sandbox process is killed — and proved
+# gone — before anything else runs. The audit (whose Chromium runs the site's
+# JavaScript) runs as octo-sandbox too, from scripts and a browser installed
+# root-owned in /opt/pw before the checkout; only regular, size-capped result
+# files come back out. A separate job on a fresh runner mints an issues-only
+# token and files the findings.
+# 00:49 Bogotá, after the app audit.
+name: web-audit
+
+on:
+  schedule:
+    - cron: "49 5 * * *"
+  workflow_dispatch:
+    inputs:
+      file_issues:
+        description: "File issues for the findings"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-audit
+  cancel-in-progress: false
+
+env:
+  PLAYWRIGHT_VERSION: "1.64.1"
+
+jobs:
+  audit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      rc: ${{ steps.audit.outputs.rc }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Trusted scripts and Chromium, root-owned (before the site is checked out)
+        # /opt/pw: read-only for everyone else. The sandbox runs the audit from
+        # here and can't change a byte of it; the runner keeps its own copy of
+        # the routines for the sandbox setup.
+        run: |
+          set -euo pipefail
+          cp -R scripts "$RUNNER_TEMP/scripts"
+          sudo install -d -o root -g root -m 755 /opt/pw
+          sudo cp -R scripts /opt/pw/scripts
+          sudo npm install --prefix /opt/pw --no-save --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
+          sudo env PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers /opt/pw/node_modules/.bin/playwright install --with-deps chromium
+          sudo chown -R root:root /opt/pw
+          sudo chmod -R a+rX,go-w /opt/pw
+
+      - name: Web token (check out — revoked before the build)
+        id: read-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below, before any of the site's code runs
+          permission-contents: read
+
+      - name: Check out octopush-web (main)
+        uses: actions/checkout@v7
+        with:
+          repository: octopush-sh/octopush-web
+          token: ${{ steps.read-token.outputs.token }}
+          path: site
+          persist-credentials: false
+
+      - name: Revoke the read token and prove it dead
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          gh api -X DELETE installation/token >/dev/null 2>&1
+          if gh api repos/octopush-sh/octopush-web --silent >/dev/null 2>&1; then
+            echo "::error::the read token still works after revoking it — not building the site"; exit 1
+          fi
+
+      - name: Build the site as octo-sandbox (no token, no sudo, another user)
+        env:
+          OCTO_CHECK_PROFILE: web
+        run: |
+          set -euo pipefail
+          OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"
+          octo-check install
+          octo-check site
+
+      - name: Nothing of the site's code is still running
+        if: always()
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sudo find "$GITHUB_WORKSPACE/site" -type l -user octo-sandbox -delete || true
+          chmod -R o-w "$GITHUB_WORKSPACE/site" || true
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
+          fi
+
+      - name: Audit as octo-sandbox (Chromium over the static dist/, every page, three window sizes)
+        id: audit
+        # The built site's JavaScript runs in Chromium (which Playwright starts
+        # without its own sandbox on Linux): so the whole audit runs as
+        # octo-sandbox, with an empty environment, from the root-owned /opt/pw.
+        # A hard timeout, so nothing the site does can hang the job.
+        run: |
+          set +e
+          node_dir="$(dirname "$(readlink -f "$(command -v node)")")"
+          timeout --kill-after=30 1800 sudo -n -u octo-sandbox /usr/bin/env -i \
+            PATH="$node_dir:/usr/bin:/bin" HOME=/tmp/octo-sandbox-home LANG=C.UTF-8 \
+            NODE_PATH=/opt/pw/node_modules PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers \
+            "$node_dir/node" /opt/pw/scripts/web-audit/audit.mjs --site "$GITHUB_WORKSPACE/site" --out /tmp/octo-sandbox-home/out
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # 0 = clean, 1 = findings (filed by the next job); anything else is the audit failing.
+          [ "$rc" -le 1 ] || exit "$rc"
+
+      - name: Nothing of the audit is still running
+        if: always()
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
+          fi
+
+      - name: Take the results out of the sandbox (regular files only, size-capped)
+        if: always() && steps.audit.outputs.rc != ''
+        # Nothing of the sandbox runs any more, so nothing can swap a file for a
+        # link between the check and the copy. find -P never follows links,
+        # starting point included; only findings.json and shots/*.png, by name.
+        run: |
+          set -euo pipefail
+          src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
+          mkdir -p "$dst/shots"
+          if ! sudo test -d "$src" || sudo test -L "$src"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          sudo find -P "$src" -maxdepth 2 -type f -size -20M -print0 | while IFS= read -r -d '' f; do
+            rel="${f#"$src"/}"
+            [[ "$rel" =~ ^(findings\.json|shots/[A-Za-z0-9._-]+\.png)$ ]] || continue
+            # The repo is private but this repo's artifacts are public: no
+            # screenshots of the legal pages (they are the owner's to publish).
+            [[ "$rel" =~ ^shots/(privacy|terms|refunds)-- ]] && continue
+            sudo cat -- "$f" > "$dst/$rel"
+          done
+          [ -f "$dst/findings.json" ] || echo "::warning::the audit left no findings.json"
+
+      - name: Keep the findings and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-audit
+          path: ${{ runner.temp }}/web-audit
+          retention-days: 3
+          if-no-files-found: ignore
+
+  file:
+    needs: audit
+    if: needs.audit.outputs.rc == '1' && (github.event_name == 'schedule' || inputs.file_issues)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # A fresh runner and this repo's own scripts: nothing from the website ran here.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-audit
+          path: ${{ runner.temp }}/web-audit
+
+      - name: Web token (file issues)
+        id: file-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+
+      - name: File issues in octopush-web
+        # findings.json came from the audit job: it is data. file.mjs caps what it
+        # files (5 new, 10 open, 2 ready, 3 reopened), neutralises routine
+        # markers and @mentions in page text.
+        env:
+          OCTOPUSH_WEB_TOKEN: ${{ steps.file-token.outputs.token }}
+        run: node scripts/visual-audit/file.mjs --repo octopush-sh/octopush-web "$RUNNER_TEMP/web-audit/findings.json"

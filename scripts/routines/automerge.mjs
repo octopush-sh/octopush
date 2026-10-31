@@ -14,10 +14,14 @@
 //   automerge.mjs approved                      builder PRs already approved on their head (merge retries)
 //   automerge.mjs merge <n>                     verify every rule, merge; exit 0 merged, 1 refused, 2 error
 //
+//   --repo octopush-sh/octopush-web (before the command) runs queue / review-json for the
+//   website's agent PRs (web-review.yml). Website PRs never auto-merge (VISION.md §8): there is
+//   no `merge` for them here — the owner answers `merge web#N` in the digest (answers.mjs).
+//
 // Identities (owner / builder / reviewer) come from identity.mjs.
 import { readFileSync } from "node:fs";
-import { makeGh, ghRunAs, APP_REPO, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
-import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin } from "./identity.mjs";
+import { makeGh, ghRunAs, ghForRepo, APP_REPO, WEB_REPO, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 
 export const MAX_CHANGED_LINES = 800;
 export const MAX_REVIEW_ROUNDS = 3;
@@ -45,6 +49,64 @@ export const HUMAN_ONLY = [
   /^src\/lib\/(entitlement|auth)[^/]*\.ts$/i,
   /^clips\.html$/i, /^index\.html$/i,
 ];
+
+/**
+ * octopush-web's human-only paths (its CLAUDE.md "Human-only areas"), plus the
+ * same agent-instruction, git-attribute and dependency guards as the app. An
+ * agent's web PR may not touch them (publish-build.mjs), and `merge web#N`
+ * refuses a PR that does — the owner merges those on GitHub after reading them.
+ */
+export const WEB_HUMAN_ONLY = [
+  /^\.github\//i,
+  /(^|\/)(claude|agents)(\.local)?\.md$/i, /(^|\/)\.claude\//i,
+  /(^|\/)\.gitattributes$/i,
+  /^\.npmrc$/i, /^\.nvmrc$/i,
+  /^package(-lock)?\.json$/i, /^npm-shrinkwrap\.json$/i, /^pnpm-lock\.yaml$/i, /^yarn\.lock$/i, /^tsconfig[^/]*\.json$/i,
+  // Legal pages (any format: .astro, .md, .mdx, .html, or a folder).
+  /^src\/pages\/(terms|privacy|refunds)(\.|\/)/i, /^src\/layouts\/legallayout\.astro$/i, /^src\/legal-config\.ts$/i,
+  // Prices and the Free/Pro boundary (release.ts holds the prices and the version).
+  /^src\/data\/release\.ts$/i, /^src\/content\/docs\/docs\/free-vs-pro\.mdx?$/i,
+  // Privacy copy and analytics (astro.config.mjs carries the analytics snippet).
+  /^src\/components\/analytics\.astro$/i, /^astro\.config\.[cm]?[jt]s$/i,
+  // Deploy, the /download edge function, updater redirects, the truth gate and build scripts.
+  /^scripts\//i, /^vercel\.json$/i, /^api\//i, /^\.vercel\//i, /^\.vercelignore$/i,
+  // A real file wins over a vercel.json rewrite/redirect: a page or static file at
+  // /download, /api or /update would shadow the download path or the updater feeds.
+  /^src\/pages\/(download|api|update)(\.|\/)/i, /^public\/(download|api|update)(\.|\/|$)/i,
+  // A root dynamic route ([slug].astro, [...path].astro) can generate any of them.
+  /^src\/pages\/\[/i,
+  // Content collections config (drafts, what gets published).
+  /^src\/content\.config\.[cm]?[jt]s$/i,
+];
+/** Human-only paths per repo. */
+export const humanOnlyFor = (repo) => (repo === WEB_REPO ? WEB_HUMAN_ONLY : HUMAN_ONLY);
+
+/**
+ * Why `merge web#N` must NOT merge a website PR (pure). The owner's answer is
+ * the OK; these re-check that it is still the PR the review approved: opened by
+ * the cycle's App from a branch of the web repo into main, labelled `agent`, CI
+ * green and an approving review on the exact head commit, no human-only path,
+ * the full file list, no conflicts.
+ */
+export function webMergeRefusals({ pr, files, ci, verdict, ids }) {
+  const r = [];
+  const labels = labelsOf(pr);
+  if (pr.state !== "open") r.push("not open");
+  if (pr.draft) r.push("a draft");
+  if (!labels.includes("agent")) r.push("not labelled `agent`");
+  if (labels.includes("needs-owner")) r.push("labelled `needs-owner` — read it and merge it on GitHub yourself");
+  if (labels.includes("in-progress")) r.push("the web builder is working on it (`in-progress`) — answer again after its next push is reviewed");
+  if (!sameLogin(pr.user?.login, ids.builder)) r.push("not opened by the web builder");
+  if (pr.head?.repo?.full_name !== WEB_REPO || pr.base?.ref !== "main") r.push("must be a same-repo PR into main");
+  if (ci !== "success") r.push(`CI is ${ci}`);
+  if (verdict !== "approve") r.push(verdict === "changes" ? "the review asked for changes" : `no approving review on ${String(pr.head?.sha).slice(0, 7)}`);
+  if (files.length >= GITHUB_FILES_CAP || (Number.isInteger(pr.changed_files) && files.length !== pr.changed_files)) r.push("file list incomplete");
+  const blocked = [...new Set(files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean)).filter((n) => WEB_HUMAN_ONLY.some((re) => re.test(n))))];
+  if (blocked.length) r.push(`touches human-only paths (${blocked.join(", ")}) — read it and merge it on GitHub yourself`);
+  if (pr.mergeable === false) r.push("has merge conflicts");
+  if (pr.mergeable == null) r.push("GitHub hasn't computed mergeability yet — answer again in a minute");
+  return r;
+}
 
 /** User-visible change heuristic: non-test code under src/ (frontend) or src-tauri/src/. */
 const isTest = (n) => /\.test\.[cm]?[jt]sx?$/i.test(n) || /(^|\/)tests?\.rs$/i.test(n) || /(^|\/)tests?\//i.test(n);
@@ -124,34 +186,34 @@ export function betaChannelLive(gh) {
   try { return !!gh.get(`repos/${APP_REPO}/contents/.github/workflows/promote.yml?ref=main`)?.sha; } catch { return false; }
 }
 
-export function reviewQueue(gh, ids) {
+export function reviewQueue(gh, ids, repo = APP_REPO) {
   const out = [];
-  for (const p of gh.list(`repos/${APP_REPO}/pulls?state=open`)) {
+  for (const p of gh.list(`repos/${repo}/pulls?state=open`)) {
     const l = labelsOf(p);
     if (!l.includes("agent") || l.includes("needs-owner") || l.includes("in-progress") || p.draft) continue;
-    if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== APP_REPO) continue;
-    if (ciStatus(gh, APP_REPO, p.head.sha) !== "success") continue;
-    if (verdictFor(gh.list(`repos/${APP_REPO}/issues/${p.number}/comments`), p.head.sha, ids.reviewer)) continue;
+    if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== repo || p.base?.ref !== "main") continue;
+    if (ciStatus(gh, repo, p.head.sha) !== "success") continue;
+    if (verdictFor(gh.list(`repos/${repo}/issues/${p.number}/comments`), p.head.sha, ids.reviewer)) continue;
     out.push(p);
   }
   return out;
 }
 
-export function postReview(gh, reviewerGh, ids, n, sha, verdict, body) {
+export function postReview(gh, reviewerGh, ids, n, sha, verdict, body, repo = APP_REPO) {
   if (!["approve", "changes"].includes(verdict)) throw new Error("verdict must be approve|changes");
-  const pr = gh.get(`repos/${APP_REPO}/pulls/${n}`);
+  const pr = gh.get(`repos/${repo}/pulls/${n}`);
   if (pr.head.sha !== sha) throw new Error(`head moved: reviewed ${sha.slice(0, 7)}, PR is now at ${pr.head.sha.slice(0, 7)} — review it again`);
   // With separate bot accounts the reviewer must not have opened the PR. In
   // Actions both are github-actions[bot]; independence comes from the agents
   // holding no token (identity.mjs).
   if (!sameLogin(ids.builder, ids.reviewer) && sameLogin(pr.user?.login, ids.reviewer)) throw new Error("the reviewer can't review its own PR");
   assertActingAs(reviewerGh, ids.reviewer, ids);
-  reviewerGh.send("POST", `repos/${APP_REPO}/issues/${n}/comments`, { body: `${sanitize(body).trim()}\n\n${marker(sha, verdict)}` });
+  reviewerGh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `${sanitize(body).trim()}\n\n${marker(sha, verdict)}` });
   if (verdict === "changes") {
-    const rounds = reviewRounds(gh.list(`repos/${APP_REPO}/issues/${n}/comments`), ids.reviewer);
+    const rounds = reviewRounds(gh.list(`repos/${repo}/issues/${n}/comments`), ids.reviewer);
     if (rounds >= MAX_REVIEW_ROUNDS) {
-      reviewerGh.send("POST", `repos/${APP_REPO}/issues/${n}/labels`, { labels: ["needs-owner"] });
-      reviewerGh.send("POST", `repos/${APP_REPO}/issues/${n}/comments`, { body: `Sent back ${rounds} times — parking for the owner instead of another nightly round.\n\n<!-- octopush-automerge:${sha}:rounds -->` });
+      reviewerGh.send("POST", `repos/${repo}/issues/${n}/labels`, { labels: ["needs-owner"] });
+      reviewerGh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Sent back ${rounds} times — parking for the owner instead of another nightly round.\n\n<!-- octopush-automerge:${sha}:rounds -->` });
     }
   }
   return pr;
@@ -195,8 +257,27 @@ export function tryMerge(gh, actGh, n, ids, { waitMs = 3000, tries = 6 } = {}) {
 }
 
 async function main() {
-  const [cmd, a, b, c, d] = process.argv.slice(2);
-  const ids = requireIdentities(loadIdentities());
+  let argv = process.argv.slice(2);
+  let repo = APP_REPO;
+  if (argv[0] === "--repo") { repo = argv[1]; argv = argv.slice(2); }
+  if (![APP_REPO, WEB_REPO].includes(repo)) throw new Error(`--repo is ${APP_REPO} or ${WEB_REPO}`);
+  const [cmd, a, b, c, d] = argv;
+  const ids = idsForRepo(requireIdentities(loadIdentities()), repo);
+  if (repo === WEB_REPO) {
+    // Website PRs: review only. The web token (OCTOPUSH_WEB_TOKEN) reads and posts.
+    const gh = ghForRepo(WEB_REPO);
+    if (cmd === "queue") { for (const p of reviewQueue(gh, ids, repo)) console.log(`${p.number}\t${p.head.sha}\t${p.title}\t${p.html_url}`); return 0; }
+    if (cmd === "review-json") {
+      if (!/^\d+$/.test(a ?? "") || !/^[0-9a-f]{40}$/.test(b ?? "") || !c) throw new Error("usage: --repo <web> review-json <n> <head-sha> <file>");
+      const v = parseVerdict(readFileSync(c, "utf8"), (process.env.OCTOPUSH_SECRETS ?? "").split("\n"));
+      if (v.error) { console.error(`not posted web#${a}: ${v.error}`); return 1; }
+      postReview(gh, gh, ids, Number(a), b, v.verdict, v.body, repo);
+      console.log(`posted ${v.verdict} on web#${a} at ${b.slice(0, 7)}`);
+      return 0;
+    }
+    console.error(`usage: automerge.mjs --repo ${WEB_REPO} queue | review-json <n> <sha> <file> (website PRs never auto-merge)`);
+    return 64;
+  }
   const gh = makeGh(); // the builder's default login — used for reads
   const reviewerGh = () => makeGh(ghRunAs(reviewerToken()));
   if (cmd === "approved") {

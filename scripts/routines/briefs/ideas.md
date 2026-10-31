@@ -16,7 +16,8 @@ docs/FEATURES.md first. You can search and read the web, read this checkout, and
    `value` (1–5: how much it helps the primary user or the business), `difficulty` (S | M | L for
    the nightly builder), `estimate` (e.g. "2–4 h", "1–2 d"), `why` (the problem or opportunity,
    with evidence), `proposal` (concrete enough to become a `ready` issue), `evidence` (URLs), and
-   `resurface` (an issue number) only when bringing back a `later` item.
+   `resurface` (the issue reference exactly as the context lists it, e.g. `"octopush-web#12"`) only
+   when bringing back a `later` item. Website ideas are filed in octopush-web and built there.
    Mix areas; at least one fix or quality improvement; respect the non-goals; nothing that only
    adds complexity.
 
