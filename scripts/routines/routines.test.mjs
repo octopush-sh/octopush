@@ -630,3 +630,12 @@ test("CI status ignores runs that say nothing about the code (bot runs awaiting 
   assert.equal(ciStatus(runs([run("1", "completed", "action_required")]), "o/r", "x"), "none");
   assert.equal(ciStatus(runs([run("1", "waiting", null), run("0", "in_progress", null)]), "o/r", "x"), "pending");
 });
+
+test("tryMerge waits while GitHub computes mergeability, then merges", () => {
+  let calls = 0;
+  const r = fakeGh(mergeRoutes([{ filename: "src/a.ts" }, changeset], "success").map(([re, v]) =>
+    String(re) === String(/pulls\/7$/) ? [re, () => (++calls < 3 ? { ...basePr(), mergeable: null } : basePr())] : [re, v]));
+  const act = fakeGh([]);
+  assert.equal(tryMerge(r.gh, act.gh, 7, ids, { waitMs: 1 }).merged, true);
+  assert.equal(calls, 3);
+});

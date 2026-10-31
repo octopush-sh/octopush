@@ -22,7 +22,7 @@ You approve ideas; everything else happens overnight (VISION.md §8–§9). Time
 | Time | Workflow | What happens |
 |---|---|---|
 | 01:07, 01:47 | [`nightly-build.yml`](../.github/workflows/nightly-build.yml) | each run takes one job — a PR the review sent back or whose CI is red, else the oldest `ready` issue — and a Claude agent builds it; the workflow opens or updates the PR (label `agent`) and starts CI |
-| 03:23 | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones, or parks them as `needs-owner` |
+| 03:23 | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason), or parks them as `needs-owner` |
 | 05:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed (label `area:app\|api\|web`) and one digest issue lists them |
 | any time | [`answers.yml`](../.github/workflows/answers.yml) | the moment you comment on the digest, your answers are applied and confirmed in a reply |

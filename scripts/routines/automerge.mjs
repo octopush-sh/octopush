@@ -11,6 +11,7 @@
 //   automerge.mjs review-json <n> <sha> <file>  post a reviewer agent's verdict file
 //                                               ({"verdict":"approve|changes","body":"…"}) after
 //                                               validating it and scanning it for secrets
+//   automerge.mjs approved                      builder PRs already approved on their head (merge retries)
 //   automerge.mjs merge <n>                     verify every rule, merge; exit 0 merged, 1 refused, 2 error
 //
 // Identities (owner / builder / reviewer) come from identity.mjs.
@@ -156,8 +157,25 @@ export function postReview(gh, reviewerGh, ids, n, sha, verdict, body) {
   return pr;
 }
 
-export function tryMerge(gh, actGh, n, ids) {
-  const pr = gh.get(`repos/${APP_REPO}/pulls/${n}`);
+/** Approved-on-head builder PRs still open (a merge left for a transient reason). */
+export function approvedQueue(gh, ids) {
+  const out = [];
+  for (const p of gh.list(`repos/${APP_REPO}/pulls?state=open`)) {
+    const l = labelsOf(p);
+    // in-progress: the builder has claimed it for another round — not now.
+    if (!l.includes("agent") || l.includes("needs-owner") || l.includes("in-progress") || p.draft) continue;
+    if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== APP_REPO) continue;
+    if (verdictFor(gh.list(`repos/${APP_REPO}/issues/${p.number}/comments`), p.head.sha, ids.reviewer) === "approve") out.push(p);
+  }
+  return out;
+}
+
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // sleeps, doesn't spin
+
+export function tryMerge(gh, actGh, n, ids, { waitMs = 3000, tries = 6 } = {}) {
+  // GitHub computes mergeability lazily (null right after main moves): ask again briefly.
+  let pr = gh.get(`repos/${APP_REPO}/pulls/${n}`);
+  for (let i = 1; pr.mergeable == null && i < tries; i++) { sleepMs(waitMs); pr = gh.get(`repos/${APP_REPO}/pulls/${n}`); }
   const files = gh.list(`repos/${APP_REPO}/pulls/${n}/files`, GITHUB_FILES_CAP);
   const comments = gh.list(`repos/${APP_REPO}/issues/${n}/comments`);
   const ci = ciStatus(gh, APP_REPO, pr.head.sha);
@@ -181,6 +199,10 @@ async function main() {
   const ids = requireIdentities(loadIdentities());
   const gh = makeGh(); // the builder's default login — used for reads
   const reviewerGh = () => makeGh(ghRunAs(reviewerToken()));
+  if (cmd === "approved") {
+    for (const p of approvedQueue(gh, ids)) console.log(String(p.number)); // numbers only: titles never reach the log
+    return 0;
+  }
   if (cmd === "check" || cmd === "queue") {
     const q = reviewQueue(gh, ids);
     if (cmd === "queue") { for (const p of q) console.log(`${p.number}\t${p.head.sha}\t${p.title}\t${p.html_url}`); return 0; }
@@ -209,7 +231,7 @@ async function main() {
     console.log(`not merged #${a}:\n${r.why.map((w) => `  - ${w}`).join("\n")}`);
     return 1;
   }
-  console.error("usage: automerge.mjs check | queue | review <n> <sha> approve|changes <file> | merge <n>");
+  console.error("usage: automerge.mjs check | queue | approved | review <n> <sha> approve|changes <file> | merge <n>");
   return 64;
 }
 

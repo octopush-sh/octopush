@@ -63,8 +63,8 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 
 | Role          | Family | Size | Weight | Style  | Tracking |
 |---------------|--------|------|--------|--------|----------|
-| Display       | Serif  | 28px | 400    | italic | −0.01em  |
-| H1 Page       | Serif  | 22px | 400    | italic | −0.005em |
+| Display       | Serif  | 28px | 400    | upright | −0.01em  |
+| H1 Page       | Serif  | 22px | 400    | upright | −0.005em |
 | H2 Section    | Sans   | 16px | 600    | normal | −0.005em |
 | Body          | Sans   | 13px | 400    | normal | normal   |
 | Small / Meta  | Sans   | 11px | 400    | normal | normal   |
@@ -72,7 +72,7 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 | Code / Mono   | Mono   | 12px | 400    | normal | normal   |
 
 **Where each voice goes:**
-- **Spectral italic** — display, "the key phrase" of model responses, ceremonial CTAs, input placeholders.
+- **Spectral (upright)** — display, "the key phrase" of model responses, ceremonial CTAs, input placeholders. Never italic (§9).
 - **Sans** — bulk reading text, settings, body of messages.
 - **Mono** — eyebrows (`— Claude`, `WORKSPACE`), code, kbd, file paths, terminal.
 
@@ -92,7 +92,7 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 ### Primary CTA — ceremonial
 ```tsx
 <button className="rounded-lg border border-octo-brass-dim bg-octo-brass-ghost
-                   px-4 py-2 font-serif italic text-octo-brass text-sm">
+                   px-4 py-2 font-serif text-octo-brass text-sm">
   Begin a new study
 </button>
 ```
@@ -114,8 +114,8 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 
 ### Key phrase (model response lead sentence)
 ```tsx
-<p className="font-serif italic text-[22px] leading-[1.15] tracking-[-0.005em] text-octo-ivory">
-  Because <code className="font-mono not-italic text-octo-brass">skipRefreshCheck</code> is true.
+<p className="font-serif text-[22px] leading-[1.15] tracking-[-0.005em] text-octo-ivory">
+  Because <code className="font-mono text-octo-brass">skipRefreshCheck</code> is true.
 </p>
 ```
 
@@ -133,12 +133,12 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 ```
 The `§` prefix is retired — the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
-### Input with italic-serif placeholder
+### Input with serif placeholder
 ```tsx
 <input
   className="border border-octo-hairline rounded-lg px-3 py-2 bg-octo-onyx
              text-octo-ivory focus:border-octo-brass-dim
-             placeholder:font-serif placeholder:italic placeholder:text-octo-mute"
+             placeholder:font-serif placeholder:text-octo-mute"
   placeholder="Ask Octopush anything…"
 />
 ```
@@ -458,7 +458,7 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
 | Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
 | Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
-| Input bar     | flex  | Italic-serif placeholder, ⌘K kbd hint. |
+| Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.

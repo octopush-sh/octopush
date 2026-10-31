@@ -29,7 +29,7 @@ env:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -108,3 +108,19 @@ jobs:
             fi
             echo "::endgroup::"
           done < "$RUNNER_TEMP/queue.tsv"
+
+      - name: Merge PRs approved earlier
+        # An approval whose merge was skipped for a transient reason (CI not
+        # finished, mergeability not computed yet) is retried here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          R="$RUNNER_TEMP/routines"; [ -d "$R" ] || { R="$RUNNER_TEMP/routines"; cp -R scripts/routines "$R"; }
+          node "$R/automerge.mjs" approved | while read -r num; do
+            [[ "$num" =~ ^[0-9]+$ ]] || continue
+            echo "retrying merge of #$num"
+            if OCTOPUSH_REVIEWER_TOKEN="$GH_TOKEN" node "$R/automerge.mjs" merge "$num"; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref=main >/dev/null || true
+            fi
+          done

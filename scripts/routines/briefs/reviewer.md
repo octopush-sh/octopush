@@ -14,6 +14,15 @@ itself a reason to request changes).
 - It does what the issue asked, and nothing else.
 - Correctness and edge cases; tests that would fail without the change.
 - CLAUDE.md's design and code rules (tokens not literals, motion primitives, English copy, …).
+- Design system, enforced on the diff: no hex literals or font-family strings; no `italic` classes
+  (italics are retired); no native `<select>`/checkbox (use `src/components/controls/`); none of
+  the retired glyphs (`§`, Roman numerals, `✦`, a fourth `⟶`) or gradient dividers; dialogs use
+  `ModalShell`, menus/reveals use the motion primitives, reduced motion respected; no new top-level
+  chrome; brass only for active/eyebrow/signature details (warnings use the warning token, never
+  brass); controls use `border-strong`, live numbers `.octo-tabular`; every icon has a `title`;
+  all copy English and literally true of what the code does; unknown costs read "unpriced", never
+  `$0`; new shortcuts checked against the design spec's shortcut appendix.
+- Vitest covers the states you can't see (loading, error, empty, Escape).
 - docs/FEATURES.md updated for user-facing changes; the changeset's note is true and its `steps`
   point at `data-tour` ids that exist.
 - Nothing in a human-only area (VISION.md §8), nothing that reaches for credentials, the network,
