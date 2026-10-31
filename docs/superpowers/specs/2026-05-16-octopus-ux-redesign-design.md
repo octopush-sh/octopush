@@ -1,5 +1,8 @@
 # Octopus UX Redesign — Atelier in Onyx & Brass
 
+> **Superseded on type (2026-07-11, restated 2026-10-31):** italics are retired app-wide. Wherever this spec says "Spectral italic", "italic serif" or "italic-serif CTAs/placeholders", read **upright** Spectral. `docs/design-system.md` §9 and CLAUDE.md take precedence over this document.
+
+
 **Date:** 2026-05-16
 **Status:** Design approved, pending implementation
 **Scope:** Full UX overhaul of the Octopus desktop app (Tauri 2 + React 19 + TypeScript)
