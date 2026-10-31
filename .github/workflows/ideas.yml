@@ -1,8 +1,11 @@
 # Daily ideas digest (VISION.md §9, docs/ROUTINES.md). 06:00 Bogotá.
 #
 # A Claude agent (web search, read-only repo, no GitHub access) researches and
-# writes ideas.json; ideas.mjs validates it, files the ideas in this repo
-# (labelled area:app|api|web) and posts the digest the owner answers.
+# writes ideas.json; ideas.mjs validates it, files the ideas — app and API ones
+# in this repo (labelled area:app|api), website ones in octopush-web — and posts
+# the one digest the owner answers. octopush-web is reached with installation
+# tokens of the "Octopush Cycle" GitHub App: a read-only one for the context
+# (revoked before the agent starts) and a fresh one to file and post.
 name: ideas
 
 on:
@@ -44,15 +47,37 @@ jobs:
         run: |
           if node scripts/routines/ideas.mjs check; then echo "go=1" >> "$GITHUB_OUTPUT"; fi
 
+      - name: Web token (context — revoked before the agent)
+        id: read-token
+        if: steps.check.outputs.go == '1'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true
+          permission-issues: read
+          permission-pull-requests: read
+          permission-actions: read
+
       - name: Context and brief
         if: steps.check.outputs.go == '1'
         env:
           GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
           cp -R scripts/routines "$RUNNER_TEMP/routines"
           { cat scripts/routines/briefs/ideas.md; echo; node scripts/routines/ideas.mjs context; } > "$RUNNER_TEMP/prompt.md"
           npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+
+      - name: Revoke the context token
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
 
       - name: Research (Claude agent, no GitHub access)
         if: steps.check.outputs.go == '1'
@@ -61,10 +86,25 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: node "$RUNNER_TEMP/routines/agent.mjs" ideas "$RUNNER_TEMP/prompt.md"
 
+      - name: Web token (file website ideas)
+        id: post-token
+        if: steps.check.outputs.go == '1'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+          permission-pull-requests: read
+          permission-actions: read
+
       - name: Post the digest
         if: steps.check.outputs.go == '1'
         env:
           GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.post-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.post-token.outputs.app-slug }}[bot]
           OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set -euo pipefail

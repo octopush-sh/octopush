@@ -30,7 +30,7 @@ function fakeGh(routes) {
       const [, method, path] = args;
       const body = JSON.parse(input ?? "{}");
       writes.push({ method, path, body });
-      if (method === "POST" && /\/issues$/.test(path)) return JSON.stringify({ number: 900 + writes.length, html_url: `https://gh/${path}/${900 + writes.length}` });
+      if (method === "POST" && /\/(issues|pulls)$/.test(path)) return JSON.stringify({ number: 900 + writes.length, html_url: `https://gh/${path}/${900 + writes.length}` });
       if (method === "PUT" && /\/merge$/.test(path)) return JSON.stringify({ merged: true });
       return "{}";
     }
@@ -144,13 +144,14 @@ test("digests not opened by the builder are ignored", () => {
   assert.equal(writes.length, 0);
 });
 
-test("merge answers require a builder agent PR into main with green CI", () => {
-  const goodPr = { state: "open", user: { login: "octo-builder" }, labels: [{ name: "agent" }], base: { ref: "main" }, head: { sha: "abc", repo: { full_name: WEB_REPO } } };
+test("merge answers: an API PR needs the builder, the label, main and green CI", () => {
+  const API = "octopush-sh/octopush-api";
+  const goodPr = { state: "open", user: { login: "octo-builder" }, labels: [{ name: "agent" }], base: { ref: "main" }, head: { sha: "abc", repo: { full_name: API } } };
   const run = (pr, conclusion) => {
     const { gh, writes } = fakeGh([
       [/issues\?state=all&labels=digest/, [digestOf(51, {})]],
-      [/issues\/51\/comments$/, [{ id: 5, user: { login: "johnatan" }, body: "merge web#12" }]],
-      [/octopush-web\/pulls\/12$/, pr],
+      [/issues\/51\/comments$/, [{ id: 5, user: { login: "johnatan" }, body: "merge api#12" }]],
+      [/octopush-api\/pulls\/12$/, pr],
       [/actions\/runs\?head_sha=abc/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion }] }],
     ]);
     applyAll(gh, ids);
@@ -162,12 +163,12 @@ test("merge answers require a builder agent PR into main with green CI", () => {
   assert.match(run({ ...goodPr, head: { sha: "abc", repo: { full_name: "evil/fork" } } }, "success").reply, /same-repo PR into main/);
   const ok = run(goodPr, "success");
   assert.ok(ok.merged);
-  assert.match(ok.reply, /merged web#12/);
+  assert.match(ok.reply, /merged api#12/);
   process.env.GITHUB_ACTIONS = "true";
   try {
-    const inActions = run({ ...goodPr, html_url: "https://github.com/octopush-sh/octopush-web/pull/12" }, "success");
+    const inActions = run({ ...goodPr, html_url: "https://github.com/octopush-sh/octopush-api/pull/12" }, "success");
     assert.ok(!inActions.merged, "a workflow token can't merge in another repo");
-    assert.match(inActions.reply, /merge it on GitHub: https:\/\/github.com\/octopush-sh\/octopush-web\/pull\/12/);
+    assert.match(inActions.reply, /merge it on GitHub: https:\/\/github.com\/octopush-sh\/octopush-api\/pull\/12/);
   } finally { delete process.env.GITHUB_ACTIONS; }
 });
 
@@ -365,12 +366,20 @@ test("resurfacing needs an open, trusted idea parked as later", () => {
   assert.ok(!canResurface(i({ pull_request: {} }), ids));
 });
 
-test("'Needs you' lists only builder PRs", () => {
-  const p = (n, login) => ({ number: n, title: `p${n}`, html_url: `u${n}`, user: { login }, labels: [{ name: "agent" }], base: { ref: "main" }, head: { sha: "x", repo: { full_name: WEB_REPO } } });
-  const { gh } = fakeGh([[/octopush-web\/pulls\?state=open/, [p(1, "octo-builder"), p(2, "stranger")]]]);
+test("'Needs you' lists only builder PRs: approved website PRs with `merge web#N`, API PRs to merge on GitHub", () => {
+  const p = (n, login, repo = WEB_REPO, sha = "x") => ({ number: n, title: `p${n}`, html_url: `u${n}`, user: { login }, labels: [{ name: "agent" }], base: { ref: "main" }, head: { sha, repo: { full_name: repo } } });
+  const { gh } = fakeGh([
+    [/octopush-web\/pulls\?state=open/, [p(1, "octo-builder", WEB_REPO, "s1"), p(2, "stranger", WEB_REPO, "s1"), p(3, "octo-builder", WEB_REPO, "s3")]],
+    [/octopush-web\/issues\/1\/comments/, [{ user: { login: "octo-reviewer" }, body: marker("s1", "approve") }]],
+    [/octopush-web\/issues\/3\/comments/, [{ user: { login: "octo-reviewer" }, body: marker("s3", "changes") }]],
+    [/actions\/runs\?head_sha=/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+    [/octopush-api\/pulls\?state=open/, [p(4, "octo-builder", "octopush-sh/octopush-api")]],
+  ]);
   const w = waitingItems(gh, ids).join("\n");
-  assert.match(w, /web#1 p1.*merge it on GitHub/);
-  assert.doesNotMatch(w, /web#2/);
+  assert.match(w, /web#1 p1.*approved by the web review.*`merge web#1`/);
+  assert.doesNotMatch(w, /web#2/, "not the builder's");
+  assert.doesNotMatch(w, /web#3/, "sent back: the builder's business, not the owner's");
+  assert.match(w, /api#4 p4.*merge it on GitHub/);
 });
 
 test("difficulty must be S, M or L (no prototype keys)", () => {
@@ -638,4 +647,269 @@ test("tryMerge waits while GitHub computes mergeability, then merges", () => {
   const act = fakeGh([]);
   assert.equal(tryMerge(r.gh, act.gh, 7, ids, { waitMs: 1 }).merged, true);
   assert.equal(calls, 3);
+});
+
+// ---------------------------------------------------------------- the website lane (web-build / web-review / web-audit)
+import { ghForRepo, hasWebToken } from "./gh.mjs";
+import { idsForRepo, isBotLogin } from "./identity.mjs";
+import { appRefs, appWebIssueJobs, nextWebJob } from "./jobs.mjs";
+import { WEB_HUMAN_ONLY, webMergeRefusals, reviewQueue, humanOnlyFor, HUMAN_ONLY } from "./automerge.mjs";
+import { resurfaceRef, post as postIdeas } from "./ideas.mjs";
+import { mergeWeb } from "./answers.mjs";
+
+const APP_BOT = "octopush-cycle[bot]";
+const WEB_ENV = { GITHUB_ACTIONS: "true", OCTOPUSH_APP_BOT_LOGIN: APP_BOT };
+const actIds = { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT };
+const withEnv = (env, fn) => {
+  const prev = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, env);
+  try { return fn(); } finally { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+};
+
+test("web identities: the App's bot builds and reviews in octopush-web, never the owner", () => {
+  assert.deepEqual(idsForRepo(actIds, WEB_REPO, WEB_ENV), { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT });
+  assert.deepEqual(idsForRepo(actIds, APP_REPO, WEB_ENV), actIds, "the app repo keeps github-actions[bot]");
+  assert.deepEqual(idsForRepo(actIds, WEB_REPO, { OCTOPUSH_APP_BOT_LOGIN: APP_BOT }), actIds, "outside Actions nothing changes");
+  assert.throws(() => idsForRepo(actIds, WEB_REPO, { ...WEB_ENV, OCTOPUSH_APP_BOT_LOGIN: "johnatan" }), /App bot login/);
+  assert.ok(isBotLogin(APP_BOT) && !isBotLogin("johnatan") && !isBotLogin("x[bot] y"));
+  // A shared App bot is allowed in Actions (no agent holds its token); a person's account never.
+  assert.doesNotThrow(() => requireIdentities({ owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT }, ACT));
+  assert.equal(assertActingAs({ viewer: () => { throw new Error("403 integration"); } }, APP_BOT, { owner: "johnatan" }, ACT), APP_BOT,
+    "an installation token can't call GET /user; inside Actions it is the App's bot");
+});
+
+test("ghForRepo: octopush-web gets the App token, everything else the default login", () => {
+  assert.ok(hasWebToken({ OCTOPUSH_WEB_TOKEN: "t" }) && !hasWebToken({}));
+  assert.equal(typeof ghForRepo(WEB_REPO, { OCTOPUSH_WEB_TOKEN: "t" }).list, "function");
+  assert.equal(typeof ghForRepo(APP_REPO, {}).list, "function");
+});
+
+test("web jobs: web PR fixes first, then web `ready` issues, then app-repo `area:web` issues; claims respected", () => {
+  const now = Date.parse("2026-10-31T12:00:00Z");
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const wpr = (n, over = {}) => ({ number: n, title: `w${n}`, body: "", created_at: "2026-10-30T00:00:00Z", html_url: `u${n}`, state: "open", draft: false, user: { login: APP_BOT }, labels: [{ name: "agent" }], head: { sha: `h${n}`, ref: `agent/issue-${n}`, repo: { full_name: WEB_REPO } }, base: { ref: "main", repo: { full_name: WEB_REPO } }, ...over });
+  const routes = (prs, webIssues, appIssues, comments = {}) => fakeGh([
+    [/octopush-web\/pulls\?state=open/, prs],
+    [/octopush-web\/issues\/(\d+)\/comments/, (p) => comments[p.match(/issues\/(\d+)\//)[1]] ?? []],
+    [/actions\/runs/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+    [/octopush-web\/issues\?labels=ready/, webIssues],
+    [/octopush\/issues\?labels=ready,area:web/, appIssues],
+  ]).gh;
+  const sentBack = { 1: [{ user: { login: APP_BOT }, body: marker("h1", "changes") }] };
+  let gh = routes([wpr(1)], [{ number: 5, labels: [{ name: "ready" }, { name: "visual" }] }], [{ number: 40, labels: [{ name: "ready" }, { name: "area:web" }] }], sentBack);
+  assert.deepEqual(nextWebJob(gh, gh, wIds, now), { kind: "pr", n: 1, branch: "agent/issue-1", title: "w1", url: "u1" });
+  gh = routes([wpr(1)], [{ number: 5, labels: [{ name: "ready" }, { name: "area:web" }] }], []);
+  assert.equal(nextWebJob(gh, gh, wIds, now).n, 5, "in the web repo an area label doesn't exclude an issue");
+  // An open web PR that closes octopush-sh/octopush#40 claims it; #41 is free.
+  gh = routes([wpr(2, { body: "Closes octopush-sh/octopush#40\n\nsee octopush-sh/octopush#41" })], [], [
+    { number: 40, labels: [{ name: "ready" }, { name: "area:web" }] },
+    { number: 41, labels: [{ name: "ready" }, { name: "area:web" }] },
+    { number: 42, labels: [{ name: "ready" }, { name: "area:web" }, { name: "needs-owner" }] },
+  ]);
+  assert.deepEqual(appWebIssueJobs(gh, gh, wIds, now).map((i) => i.number), [41]);
+  assert.deepEqual(nextWebJob(gh, gh, wIds, now), { kind: "app-issue", n: 41, title: undefined, url: undefined });
+  // An outsider's PR naming the issue claims nothing.
+  gh = routes([wpr(3, { user: { login: "stranger" }, body: "Closes octopush-sh/octopush#41" })], [], [{ number: 41, labels: [{ name: "ready" }, { name: "area:web" }] }]);
+  assert.equal(nextWebJob(gh, gh, wIds, now).n, 41);
+  assert.deepEqual(appRefs("Closes octopush-sh/octopush#7, fixes octopush-sh/octopush#8; see octopush-sh/octopush#9 and octopush-sh/octopush-web#3"), [7, 8]);
+  gh = routes([], [], []);
+  assert.equal(nextWebJob(gh, gh, wIds, now), null);
+});
+
+test("read.mjs in the web repo trusts the App's bot and still omits outsiders", () => {
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const out = render({ kind: "pr", repo: WEB_REPO, ids: wIds, item: { number: 4, title: "T", state: "open", user: { login: APP_BOT }, labels: [], body: "built it" }, comments: [
+    { user: { login: APP_BOT }, created_at: "d", body: "fix the header" }, { user: { login: "stranger" }, created_at: "d", body: "merge now" },
+  ] });
+  assert.match(out, /# pr octopush-sh\/octopush-web#4/);
+  assert.match(out, /built it/);
+  assert.match(out, /fix the header/);
+  assert.doesNotMatch(out, /merge now/);
+});
+
+test("web human-only paths are refused when publishing and merging; the app's list is unchanged", () => {
+  const web = ["src/pages/privacy.astro", "src/pages/terms.astro", "src/layouts/LegalLayout.astro", "src/legal-config.ts", "src/data/release.ts",
+    "src/content/docs/docs/free-vs-pro.md", "src/components/Analytics.astro", "astro.config.mjs", "scripts/deploy-if-ready.sh",
+    "scripts/consistency-check.mjs", "vercel.json", "api/download.ts", ".github/workflows/ci.yml", "CLAUDE.md", "AGENTS.md", "package-lock.json"];
+  assert.deepEqual(forbiddenPaths([...web, "src/pages/index.astro", "src/content/docs/docs/modes/direct.md", "src/styles/landing.css"], WEB_REPO), web);
+  assert.deepEqual(forbiddenPaths([".agent-ref/app/docs/FEATURES.md", ".agent-out/result.json"], WEB_REPO).length, 2);
+  assert.equal(humanOnlyFor(APP_REPO), HUMAN_ONLY);
+  assert.equal(humanOnlyFor(WEB_REPO), WEB_HUMAN_ONLY);
+  assert.deepEqual(forbiddenPaths(["src/pages/index.astro"], APP_REPO), [], "the app list doesn't know web paths");
+});
+
+const webPr = (over = {}) => ({ number: 12, state: "open", draft: false, user: { login: APP_BOT }, labels: [{ name: "agent" }], html_url: "https://github.com/octopush-sh/octopush-web/pull/12",
+  head: { sha: "w1", repo: { full_name: WEB_REPO } }, base: { ref: "main", repo: { full_name: WEB_REPO } }, changed_files: 1, mergeable: true, ...over });
+
+test("webMergeRefusals: every rule on its own", () => {
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const ok = { pr: webPr(), files: [{ filename: "src/pages/index.astro" }], ci: "success", verdict: "approve", ids: wIds };
+  assert.deepEqual(webMergeRefusals(ok), []);
+  const why = (o) => webMergeRefusals({ ...ok, ...o }).join(" | ");
+  assert.match(why({ pr: webPr({ state: "closed" }) }), /not open/);
+  assert.match(why({ pr: webPr({ labels: [] }) }), /not labelled/);
+  assert.match(why({ pr: webPr({ user: { login: "johnatan" } }) }), /not opened by the web builder/);
+  assert.match(why({ pr: webPr({ head: { sha: "w1", repo: { full_name: "evil/fork" } } }) }), /same-repo/);
+  assert.match(why({ ci: "pending" }), /CI is pending/);
+  assert.match(why({ verdict: null }), /no approving review on w1/);
+  assert.match(why({ verdict: "changes" }), /asked for changes/);
+  assert.match(why({ files: [{ filename: "src/legal-config.ts" }] }), /human-only paths \(src\/legal-config\.ts\)/);
+  assert.match(why({ files: [{ filename: "src/x.astro", previous_filename: "vercel.json" }] }), /human-only/, "renames count");
+  assert.match(why({ pr: webPr({ changed_files: 2 }) }), /file list incomplete/);
+  assert.match(why({ pr: webPr({ mergeable: false }) }), /conflicts/);
+});
+
+test("merge web#N: merged with the web token only on the approved head, else the reasons", () => {
+  const run = (pr, verdictSha = "w1", conclusion = "success") => {
+    const web = fakeGh([
+      [/octopush-web\/pulls\/12$/, pr],
+      [/octopush-web\/pulls\/12\/files/, [{ filename: "src/pages/index.astro" }]],
+      [/octopush-web\/issues\/12\/comments/, [{ user: { login: APP_BOT }, body: `ok\n\n${marker(verdictSha, "approve")}` }]],
+      [/actions\/runs\?head_sha=w1/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion }] }],
+    ]);
+    const app = fakeGh([
+      [/issues\?state=all&labels=digest/, [digestOf(60, {}, { user: { login: ACTIONS_BOT } })]],
+      [/issues\/60\/comments$/, [{ id: 9, user: { login: "johnatan" }, body: "merge web#12" }]],
+    ]);
+    withEnv({ ...WEB_ENV, OCTOPUSH_WEB_TOKEN: "t" }, () => applyAll(app.gh, actIds, (r) => (r === WEB_REPO ? web.gh : app.gh)));
+    return { merge: web.writes.find((w) => w.method === "PUT"), appWrites: app.writes, reply: app.writes.at(-1).body.body };
+  };
+  const ok = run(webPr());
+  assert.deepEqual(ok.merge?.body, { merge_method: "merge", sha: "w1" }, "pinned to the checked head");
+  assert.match(ok.reply, /merged web#12 at w1/);
+  assert.ok(!ok.appWrites.some((w) => w.method === "PUT"), "the app token never merges website PRs");
+  const moved = run(webPr(), "w0");
+  assert.equal(moved.merge, undefined);
+  assert.match(moved.reply, /no approving review on w1/);
+  assert.match(run(webPr(), "w1", "failure").reply, /CI is failure/);
+  // Without the web token in Actions: the old one-click link.
+  const app = fakeGh([
+    [/issues\?state=all&labels=digest/, [digestOf(61, {}, { user: { login: ACTIONS_BOT } })]],
+    [/issues\/61\/comments$/, [{ id: 10, user: { login: "johnatan" }, body: "merge web#12" }]],
+    [/octopush-web\/pulls\/12$/, webPr({ user: { login: ACTIONS_BOT } })],
+    [/actions\/runs\?head_sha=w1/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+  ]);
+  withEnv({ GITHUB_ACTIONS: "true" }, () => applyAll(app.gh, actIds));
+  assert.match(app.writes.at(-1).body.body, /merge it on GitHub/);
+  assert.equal(typeof mergeWeb, "function");
+});
+
+test("`1 yes` on a website idea labels it ready in octopush-web with the web token", () => {
+  const web = fakeGh([]);
+  const app = fakeGh([
+    [/issues\?state=all&labels=digest/, [digestOf(62, { 1: `${WEB_REPO}#30`, 2: `${APP_REPO}#31` }, { user: { login: ACTIONS_BOT } })]],
+    [/issues\/62\/comments$/, [{ id: 11, user: { login: "johnatan" }, body: "1, 2 yes" }]],
+  ]);
+  withEnv(WEB_ENV, () => applyAll(app.gh, actIds, (r) => (r === WEB_REPO ? web.gh : app.gh)));
+  assert.ok(web.writes.some((w) => w.path === `repos/${WEB_REPO}/issues/30/labels` && w.body.labels[0] === "ready"));
+  assert.ok(app.writes.some((w) => w.path === `repos/${APP_REPO}/issues/31/labels` && w.body.labels[0] === "ready"));
+  assert.ok(!app.writes.some((w) => w.path.includes("octopush-web")), "nothing for the web repo goes through the app token");
+});
+
+test("ideas: website ideas go to octopush-web when its token is there, and are never filed twice", () => {
+  assert.equal(repoForIdea("web", true, true), WEB_REPO);
+  assert.equal(repoForIdea("web", true, false), APP_REPO);
+  assert.equal(repoForIdea("app", true, true), APP_REPO);
+  assert.deepEqual(ideaLabels("web", true, true), ["proposal", "idea"]);
+  assert.deepEqual(ideaLabels("web", true, false), ["proposal", "idea", "area:web"]);
+  assert.deepEqual(resurfaceRef({ resurface: "octopush-web#12", area: "app" }, true, true), { repo: WEB_REPO, n: 12 });
+  assert.deepEqual(resurfaceRef({ resurface: 12, area: "web" }, true, true), { repo: WEB_REPO, n: 12 });
+  assert.deepEqual(resurfaceRef({ resurface: "octopush#9", area: "web" }, true, true), { repo: APP_REPO, n: 9 });
+  const five = [1, 2, 3, 4].map((i) => idea({ title: `App idea ${i}` }));
+  const ideasList = [...five, idea({ title: "Fix the mobile header", area: "web" }), idea({ title: "Docs search", area: "web" })];
+  assert.deepEqual(validateIdeas([...ideasList.slice(0, 5), idea({ title: "R", resurface: "octopush-web#3" })]), []);
+  const dir = mkdtempSync(join(tmpdir(), "ideas-web-"));
+  writeFileSync(join(dir, "ideas.json"), JSON.stringify(ideasList));
+  const web = fakeGh([[/octopush-web\/issues\?state=open&labels=idea$/, []]]);
+  const app = fakeGh([
+    [/octopush\/issues\?state=all&labels=digest/, []],
+    // Filed in the app repo before the web token existed: reused, not filed again.
+    [/octopush\/issues\?state=open&labels=idea$/, [{ number: 77, title: "Docs search", user: { login: ACTIONS_BOT }, html_url: "u77", labels: [{ name: "idea" }, { name: "area:web" }] }]],
+  ]);
+  const code = withEnv({ ...WEB_ENV, OCTOPUSH_WEB_TOKEN: "t" }, () => postIdeas(app.gh, join(dir, "ideas.json"), new Date(2026, 9, 31), actIds, (r) => (r === WEB_REPO ? web.gh : app.gh)));
+  assert.equal(code, 0);
+  const webFiled = web.writes.filter((w) => w.method === "POST" && w.path === `repos/${WEB_REPO}/issues`);
+  assert.deepEqual(webFiled.map((w) => w.body.title), ["Fix the mobile header"]);
+  assert.deepEqual(webFiled[0].body.labels, ["proposal", "idea"]);
+  const appFiled = app.writes.filter((w) => w.method === "POST" && w.path === `repos/${APP_REPO}/issues`);
+  assert.equal(appFiled.filter((w) => w.body.labels?.includes("idea")).length, 4, "the app ideas");
+  const digest = appFiled.find((w) => w.body.labels?.includes("digest"));
+  const map = digestMap(digest.body.body);
+  assert.ok(Object.values(map).includes(`${APP_REPO}#77`), "the earlier web idea keeps its app-repo issue");
+  assert.ok(Object.values(map).some((r) => r.startsWith(`${WEB_REPO}#`)));
+});
+
+test("web review queue: App-bot PRs into main with green CI and no verdict on the head", () => {
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const { gh } = fakeGh([
+    [/octopush-web\/pulls\?state=open/, [webPr({ number: 1, head: { sha: "a1", repo: { full_name: WEB_REPO } } }), webPr({ number: 2, head: { sha: "a2", repo: { full_name: WEB_REPO } } }), webPr({ number: 3, user: { login: "stranger" } })]],
+    [/octopush-web\/issues\/2\/comments/, [{ user: { login: APP_BOT }, body: marker("a2", "approve") }]],
+    [/actions\/runs/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+  ]);
+  assert.deepEqual(reviewQueue(gh, wIds, WEB_REPO).map((p) => p.number), [1]);
+});
+
+test("publish-build for an app-repo `area:web` issue: PR in octopush-web naming the app issue, link on it, no CI dispatch", async () => {
+  const { publish } = await import("./publish-build.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdirSync, existsSync } = await import("node:fs");
+  const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  const run = async (prep, result) => {
+    const root = mkdtempSync(join(tmpdir(), "pubweb-"));
+    const bare = join(root, "origin.git"); sh(root, "init", "-q", "--bare", bare);
+    const work = join(root, "work"); mkdirSync(work); sh(work, "init", "-q");
+    writeFileSync(join(work, "README.md"), "x\n"); sh(work, "add", "."); sh(work, "commit", "-qm", "init");
+    const gitDir = join(root, "repo.git"); execFileSync("mv", [join(work, ".git"), gitDir]);
+    prep(work);
+    mkdirSync(join(work, ".agent-out")); writeFileSync(join(work, ".agent-out", "result.json"), JSON.stringify(result));
+    mkdirSync(join(work, ".agent-ref", "app", "docs"), { recursive: true }); writeFileSync(join(work, ".agent-ref", "app", "docs", "FEATURES.md"), "ref");
+    const web = fakeGh([[/pulls\?state=open/, []]]);
+    const app = fakeGh([]);
+    const cwd = process.cwd(); process.chdir(work);
+    try {
+      const code = await publish({ kind: "app-issue", n: 40, repo: WEB_REPO, gitDir, token: "web-installation-token", secrets: ["sk-very-secret-1"], gh: web.gh, appGh: app.gh, pushUrl: bare });
+      return { code, web: web.writes, app: app.writes, branches: execFileSync("git", ["--git-dir", bare, "branch", "--list"], { encoding: "utf8" }), refGone: !existsSync(join(work, ".agent-ref")) };
+    } finally { process.chdir(cwd); }
+  };
+  const ok = await run((w) => { mkdirSync(join(w, "src", "pages"), { recursive: true }); writeFileSync(join(w, "src", "pages", "index.astro"), "<h1>Hi</h1>\n"); },
+    { action: "pr", title: "Fix the mobile header", summary: "Shorter nav. Closes octopush-sh/octopush#41 too." });
+  assert.equal(ok.code, 0);
+  assert.ok(ok.refGone, "the reference material never reaches a commit");
+  assert.match(ok.branches, /agent\/app-issue-40-fix-the-mobile-header/);
+  const pr = ok.web.find((w) => w.method === "POST" && /\/pulls$/.test(w.path));
+  assert.equal(pr.path, `repos/${WEB_REPO}/pulls`);
+  assert.match(pr.body.body, /^Closes octopush-sh\/octopush#40\n/);
+  assert.match(pr.body.body, /octopush-sh\/octopush issue 41/, "agent text can't close or claim other app issues");
+  assert.deepEqual(appRefs(pr.body.body), [40]);
+  assert.ok(ok.web.some((w) => /issues\/\d+\/labels$/.test(w.path) && w.body.labels?.includes("agent")));
+  assert.ok(ok.app.some((w) => w.path === `repos/${APP_REPO}/issues/40/comments` && /Opened octopush-sh\/octopush-web#\d+/.test(w.body.body)), "the link goes on the app issue");
+  assert.ok(![...ok.web, ...ok.app].some((w) => /dispatches$/.test(w.path)), "App-token pushes start the web CI themselves");
+
+  const legal = await run((w) => { mkdirSync(join(w, "src"), { recursive: true }); writeFileSync(join(w, "src", "legal-config.ts"), "x"); }, { action: "pr", title: "T", summary: "S" });
+  assert.equal(legal.code, 1);
+  assert.doesNotMatch(legal.branches, /agent\//, "nothing pushed");
+  assert.ok(legal.app.some((w) => w.path === `repos/${APP_REPO}/issues/40/labels` && w.body.labels.includes("needs-owner")), "parked on the app issue");
+  assert.ok(legal.app.some((w) => w.method === "DELETE" && /issues\/40\/labels\/ready$/.test(w.path)));
+
+  const leak = await run((w) => { writeFileSync(join(w, "README.md"), "token web-installation-token\n"); }, { action: "pr", title: "T", summary: "S" });
+  assert.equal(leak.code, 1, "the push token itself is scanned for too");
+});
+
+test("octo-check: the installed copy runs only its profile's commands", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("./agent-check.sh", import.meta.url), "utf8");
+  const nodeDir = process.execPath.replace(/\/node$/, "");
+  const install = (profile) => {
+    const f = join(mkdtempSync(join(tmpdir(), "oc-")), "octo-check");
+    writeFileSync(f, src.replace(/^ROOT=.*$/m, 'ROOT="/nonexistent"').replace(/^NODE_DIR=.*$/m, `NODE_DIR="${nodeDir}"`).replace(/^PROFILE=.*$/m, `PROFILE="${profile}"`));
+    return (arg) => spawnSync("bash", [f, arg], { encoding: "utf8" });
+  };
+  const web = install("web"), app = install("app"), bad = install("evil");
+  assert.equal(web("typecheck").status, 64);
+  assert.match(web("typecheck").stderr, /build \| check \| consistency \| all/);
+  assert.equal(app("build").status, 64);
+  assert.match(app("build").stderr, /typecheck \| test/);
+  assert.match(bad("all").stderr, /unknown profile/);
+  assert.equal(spawnSync("bash", [new URL("./agent-check.sh", import.meta.url).pathname, "all"], { encoding: "utf8" }).status, 64, "the repo copy refuses: not installed");
 });

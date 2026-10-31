@@ -1,0 +1,120 @@
+# Nightly web audit (scripts/web-audit/README.md, docs/ROUTINES.md).
+#
+# Builds octopush-web's main (what merging publishes), serves dist/ and renders
+# every page in Playwright Chromium at 1440×900, 1024×700 and 390×844: the app
+# audit's layout checks (scripts/visual-audit/checks.mjs) plus website checks —
+# content past the window edge on mobile, placeholder copy, retired glyphs,
+# italics, missing title/description/social tags, broken internal links and
+# anchors. New defects become `visual` issues in octopush-web (deduplicated by
+# fingerprint, capped like the app audit; the first two `ready` for the web
+# builder). No agent runs here. Installation tokens of the "Octopush Cycle"
+# GitHub App reach the private repo: a read-only one for the checkout (revoked
+# before the site's own code builds) and an issues-only one to file.
+# 00:49 Bogotá, after the app audit.
+name: web-audit
+
+on:
+  schedule:
+    - cron: "49 5 * * *"
+  workflow_dispatch:
+    inputs:
+      file_issues:
+        description: "File issues for the findings"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-audit
+  cancel-in-progress: false
+
+env:
+  PLAYWRIGHT_VERSION: "1.64.1"
+
+jobs:
+  audit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Web token (check out — revoked before the build)
+        id: read-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true
+          permission-contents: read
+
+      - name: Check out octopush-web (main)
+        uses: actions/checkout@v7
+        with:
+          repository: octopush-sh/octopush-web
+          token: ${{ steps.read-token.outputs.token }}
+          path: site
+          persist-credentials: false
+
+      - name: Revoke the read token
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+
+      - name: Build the site and install Chromium (no token in this step)
+        env:
+          ASTRO_TELEMETRY_DISABLED: "1"
+        run: |
+          set -euo pipefail
+          (cd site && npm ci --no-audit --no-fund --ignore-scripts && npm run build)
+          npm install --prefix "$RUNNER_TEMP/pw" --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
+          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Audit (Chromium, every page, three window sizes)
+        id: audit
+        env:
+          NODE_PATH: ${{ runner.temp }}/pw/node_modules
+        run: |
+          set +e
+          node scripts/web-audit/audit.mjs --site site --out "$RUNNER_TEMP/web-audit"
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # 0 = clean, 1 = findings (filed below); anything else is the audit failing.
+          [ "$rc" -le 1 ] || exit "$rc"
+
+      - name: Keep the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-audit
+          path: ${{ runner.temp }}/web-audit
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Web token (file issues)
+        id: file-token
+        if: steps.audit.outputs.rc == '1' && (github.event_name == 'schedule' || inputs.file_issues)
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+
+      - name: File issues in octopush-web
+        if: steps.audit.outputs.rc == '1' && (github.event_name == 'schedule' || inputs.file_issues)
+        env:
+          OCTOPUSH_WEB_TOKEN: ${{ steps.file-token.outputs.token }}
+        run: node scripts/visual-audit/file.mjs --repo octopush-sh/octopush-web "$RUNNER_TEMP/web-audit/findings.json"

@@ -1,6 +1,9 @@
 # Apply the owner's answers on the daily digest the moment they're posted
 # (VISION.md §9, docs/ROUTINES.md). Deterministic — no agent. Only comments by
 # the owner (repo variable OCTOPUSH_OWNER_LOGIN) on a `digest` issue count.
+# Website ideas and PRs live in the private octopush-web: an installation token
+# of the "Octopush Cycle" GitHub App labels them (`1 yes` → `ready`) and merges
+# an approved website PR on `merge web#N`, after re-checking it (answers.mjs).
 name: answers
 
 on:
@@ -37,4 +40,20 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - run: node scripts/routines/answers.mjs apply
+      - name: Web token (website ideas and merges)
+        id: web-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: read
+      - name: Apply
+        env:
+          OCTOPUSH_WEB_TOKEN: ${{ steps.web-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.web-token.outputs.app-slug }}[bot]
+        run: node scripts/routines/answers.mjs apply

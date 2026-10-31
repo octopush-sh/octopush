@@ -1,0 +1,234 @@
+# Web builder (VISION.md §8, docs/ROUTINES.md): the nightly builder for octopush-web.
+#
+# Takes ONE job — a website PR the web review sent back or whose CI is red,
+# else the oldest `ready` octopush-web issue, else the oldest app-repo issue
+# labelled `area:web` + `ready` — and has a Claude agent build it in a checkout
+# of octopush-web, with that repo's CLAUDE.md. Same hardening as
+# nightly-build.yml: the agent holds no GitHub credential, its checks run
+# through the root-owned `octo-check` (web profile: build, astro check, the
+# consistency gate) as an unprivileged user, the checkout's .git is moved out of
+# its reach, and publishing runs a copy of scripts/routines taken from main
+# before anything else.
+#
+# Credentials: octopush-web is private, so the workflow mints short-lived
+# installation tokens of the "Octopush Cycle" GitHub App, scoped to that one
+# repo: one to pick, claim and check out (revoked before the agent starts), a
+# fresh one to publish after it has finished. GITHUB_TOKEN covers the app repo
+# (claims and comments on `area:web` issues). No token is ever in the agent's
+# environment (agent.mjs rebuilds it). Website PRs never auto-merge: the owner
+# answers `merge web#N` in the digest. Every two hours at :37, between the app
+# builder (:07) and the reviewers.
+name: web-build
+
+on:
+  schedule:
+    - cron: "37 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write         # claim / comment on app-repo `area:web` issues
+
+concurrency:
+  group: web-build
+  cancel-in-progress: false
+
+env:
+  OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+  OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+  WEB_REPO: octopush-sh/octopush-web
+  CLAUDE_CODE_VERSION: "2.1.314"
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # tags: the app's latest stable release is the truth reference
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Trusted copy of the routines (from main)
+        # Taken BEFORE anything else: everything that runs with a token from
+        # here on comes from main, never from the web repo or the agent's work.
+        run: cp -R scripts/routines "$RUNNER_TEMP/routines"
+
+      - name: Web token (pick, claim, check out — revoked before the agent)
+        id: pick-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below, before the agent runs
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: read
+
+      - name: Pick a job
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          echo "bot=${OCTOPUSH_APP_BOT_LOGIN}" >> "$GITHUB_OUTPUT"
+          if node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" next > "$RUNNER_TEMP/job.tsv"; then
+            IFS=$'\t' read -r kind num third _ < "$RUNNER_TEMP/job.tsv"
+            [[ "$kind" =~ ^(pr|issue|app-issue)$ && "$num" =~ ^[0-9]+$ ]] || { echo "unexpected job line"; exit 1; }
+            ref=main
+            if [ "$kind" = pr ]; then
+              [[ "$third" =~ ^agent/[A-Za-z0-9._/-]+$ ]] || { echo "unexpected branch name"; exit 1; }
+              ref="$third"
+              echo "branch=$third" >> "$GITHUB_OUTPUT"
+            fi
+            echo "kind=$kind" >> "$GITHUB_OUTPUT"
+            echo "num=$num" >> "$GITHUB_OUTPUT"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            echo "job: $kind #$num"
+          else
+            echo "nothing to build"
+          fi
+
+      - name: Claim it
+        if: steps.pick.outputs.kind != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" claim "$KIND" "$NUM"
+
+      - name: Check out octopush-web
+        if: steps.pick.outputs.kind != ''
+        uses: actions/checkout@v7
+        with:
+          repository: octopush-sh/octopush-web
+          token: ${{ steps.pick-token.outputs.token }}
+          ref: ${{ steps.pick.outputs.ref }}
+          path: web
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Context, references and brief
+        if: steps.pick.outputs.kind != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/routines"
+          # The truth reference: the app at its latest STABLE release (not main,
+          # not a beta) — FEATURES.md, the design system, the files the web's
+          # consistency gate reads — and VISION.md from main. Removed again
+          # before publishing (publish-build.mjs), never committed.
+          tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected stable tag"; exit 1; }
+          ref=web/.agent-ref; mkdir -p "$ref/app/docs" "$ref/app/src-tauri"
+          for f in docs/FEATURES.md docs/design-system.md src-tauri/tauri.conf.json README.md; do git show "$tag:$f" > "$ref/app/$f"; done
+          git show HEAD:VISION.md > "$ref/app/VISION.md"
+          echo "$tag" > "$ref/app/STABLE_VERSION"
+          {
+            cat "$R/briefs/web-builder.md"
+            echo; echo "The app's latest stable release is **$tag**."; echo
+            if [ "$KIND" = app-issue ]; then node "$R/read.mjs" issue "$NUM"; else node "$R/read.mjs" "$KIND" "$NUM" "$WEB_REPO"; fi
+            if [ "$KIND" = pr ]; then
+              echo; echo "## Failing CI checks on the PR's head (if any)"
+              sha="$(git -C web rev-parse HEAD)"
+              GH_TOKEN="$OCTOPUSH_WEB_TOKEN" gh api "repos/$WEB_REPO/commits/$sha/check-runs" \
+                --jq '.check_runs[] | select(.conclusion == "failure") | .id' |
+              while read -r id; do
+                GH_TOKEN="$OCTOPUSH_WEB_TOKEN" gh api "repos/$WEB_REPO/check-runs/$id/annotations" --jq '.[] | "- \(.path):\(.start_line) \(.message)"' | head -n 40
+              done
+            fi
+          } > "$RUNNER_TEMP/prompt.md"
+
+      - name: Revoke the pick token
+        if: always() && steps.pick-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.pick-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+
+      - name: Install and sandbox (no GitHub token in this step)
+        if: steps.pick.outputs.kind != ''
+        run: |
+          set -euo pipefail
+          # The web repo's dependencies, without lifecycle scripts.
+          (cd web && npm ci --no-audit --no-fund --ignore-scripts)
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          # Out of the agent's (and the sandbox's) reach from here on.
+          mv web/.git "$RUNNER_TEMP/web.git"
+          OCTO_CHECK_PROFILE=web OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/web" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
+
+      - name: Build (Claude agent, no GitHub access)
+        if: steps.pick.outputs.kind != ''
+        timeout-minutes: 75
+        working-directory: web
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node "$RUNNER_TEMP/routines/agent.mjs" builder "$RUNNER_TEMP/prompt.md"
+
+      - name: Stop the sandbox and freeze the checkout
+        if: always() && steps.pick.outputs.kind != ''
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sudo find "$GITHUB_WORKSPACE/web" -type l -user octo-sandbox -delete || true
+          chmod -R o-w "$GITHUB_WORKSPACE/web" || true
+
+      - name: Web token (publish)
+        id: pub-token
+        if: always() && steps.pick.outputs.kind != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Publish
+        if: steps.pick.outputs.kind != '' && !cancelled()
+        working-directory: web
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.pub-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          OCTOPUSH_PUBLISH_REPO: octopush-sh/octopush-web
+          OCTOPUSH_GIT_DIR: ${{ runner.temp }}/web.git
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+          BRANCH: ${{ steps.pick.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # Commits are the App's bot's (its noreply address needs the bot's user id).
+          id="$(gh api "users/$OCTOPUSH_APP_BOT_LOGIN" --jq .id 2>/dev/null || true)"
+          if [[ "$id" =~ ^[0-9]+$ ]]; then
+            export OCTOPUSH_GIT_NAME="$OCTOPUSH_APP_BOT_LOGIN" OCTOPUSH_GIT_EMAIL="$id+$OCTOPUSH_APP_BOT_LOGIN@users.noreply.github.com"
+          fi
+          node "$RUNNER_TEMP/routines/publish-build.mjs" "$KIND" "$NUM" "$BRANCH"
+
+      - name: Release the claim
+        if: always() && steps.pick.outputs.kind != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.pub-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" release "$KIND" "$NUM" || true

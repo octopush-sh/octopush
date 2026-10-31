@@ -1,0 +1,186 @@
+# Web review (VISION.md §8, docs/ROUTINES.md): the independent reviewer for
+# the web builder's PRs in octopush-web.
+#
+# For each agent PR there with green CI and no verdict on its head commit, a
+# Claude reviewer agent (read-only tools, no GitHub access) judges the change
+# against the web repo's CLAUDE.md, the truth rule (the app's FEATURES.md at
+# its latest STABLE release), the design rules and the human-only areas, and
+# writes a verdict file; a fixed step posts it as the cycle App's bot. It NEVER
+# merges: website merges publish, so they need the owner's OK (`merge web#N`
+# in the digest, answers.mjs). Same hardening as nightly-review.yml (the PR as
+# a git archive, no symlinks, main's agent docs), and stricter on tokens: the
+# installation token that reads the PRs is revoked before any agent runs; a
+# fresh one posts the verdicts afterwards. Every two hours at :07 on odd hours.
+name: web-review
+
+on:
+  schedule:
+    - cron: "7 1-23/2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-review
+  cancel-in-progress: false
+
+env:
+  OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+  OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+  WEB_REPO: octopush-sh/octopush-web
+  CLAUDE_CODE_VERSION: "2.1.314"
+  MAX_PRS: "3"
+
+jobs:
+  review:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # tags: the app's latest stable release is the truth reference
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Trusted copy of the routines (from main)
+        run: cp -R scripts/routines "$RUNNER_TEMP/routines"
+
+      - name: Web token (read — revoked before the agents)
+        id: read-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below, before any agent runs
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
+          permission-actions: read
+
+      - name: Queue
+        id: queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          echo "bot=${OCTOPUSH_APP_BOT_LOGIN}" >> "$GITHUB_OUTPUT"
+          node "$RUNNER_TEMP/routines/automerge.mjs" --repo "$WEB_REPO" queue | head -n "$MAX_PRS" > "$RUNNER_TEMP/queue.tsv"
+          echo "count=$(wc -l < "$RUNNER_TEMP/queue.tsv" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          cut -f1,2 "$RUNNER_TEMP/queue.tsv"   # numbers and commits only: the repo is private
+
+      - name: Check out octopush-web (main)
+        if: steps.queue.outputs.count != '0'
+        uses: actions/checkout@v7
+        with:
+          repository: octopush-sh/octopush-web
+          token: ${{ steps.read-token.outputs.token }}
+          path: web-main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare each PR (archive, references, prompt)
+        if: steps.queue.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.queue.outputs.bot }}
+        run: |
+          set -uo pipefail
+          R="$RUNNER_TEMP/routines"
+          tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected stable tag"; exit 1; }
+          # The token reaches git through the environment, never a command line or a config file.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$OCTOPUSH_WEB_TOKEN" | base64 -w0)"
+          : > "$RUNNER_TEMP/ready.tsv"
+          while IFS=$'\t' read -r num sha title url; do
+            [[ "$num" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            echo "::group::web#$num"
+            if ! GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$auth" \
+                 git -C web-main fetch --quiet origin "pull/$num/head"; then echo "fetch failed"; echo "::endgroup::"; continue; fi
+            work="/tmp/web-review/pr-$num"; rm -rf "$work"; mkdir -p "$work"
+            # The PR's code without .git; main's agent docs, so the PR can't brief its own reviewer.
+            git -C web-main archive "$sha" | tar -x -C "$work"
+            find "$work" -type l -delete
+            find "$work" \( -iname 'CLAUDE*.md' -o -iname 'AGENTS.md' \) -type f -delete
+            find "$work" -type d \( -name .claude -o -name .agent-ref -o -name .agent-out \) -prune -exec rm -rf {} +
+            for f in CLAUDE.md AGENTS.md; do git -C web-main show "origin/main:$f" > "$work/$f" 2>/dev/null || true; done
+            # The truth reference: the app at its latest stable release, and VISION.md.
+            mkdir -p "$work/.agent-ref/app/docs"
+            for f in docs/FEATURES.md docs/design-system.md; do git show "$tag:$f" > "$work/.agent-ref/app/$f"; done
+            git show HEAD:VISION.md > "$work/.agent-ref/app/VISION.md"
+            {
+              cat "$R/briefs/web-reviewer.md"
+              echo; echo "The app's latest stable release is **$tag**."; echo
+              node "$R/read.mjs" pr "$num" "$WEB_REPO"
+              body="$(GH_TOKEN="$OCTOPUSH_WEB_TOKEN" gh api "repos/$WEB_REPO/pulls/$num" --jq '.body // ""')"
+              for issue in $(printf '%s' "$body" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +#[0-9]+' | grep -oE '[0-9]+$' | head -n 3); do
+                echo; node "$R/read.mjs" issue "$issue" "$WEB_REPO"
+              done
+              for issue in $(printf '%s' "$body" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +octopush-sh/octopush#[0-9]+' | grep -oE '[0-9]+$' | head -n 3); do
+                echo; node "$R/read.mjs" issue "$issue"
+              done
+              echo; echo '## Diff (main...head)'; echo '```diff'
+              git -C web-main -c core.attributesFile=/dev/null diff --text --no-textconv --no-ext-diff "origin/main...$sha"
+              echo '```'
+            } > "$RUNNER_TEMP/prompt-$num.md"
+            printf '%s\t%s\n' "$num" "$sha" >> "$RUNNER_TEMP/ready.tsv"
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/queue.tsv"
+
+      - name: Revoke the read token
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+
+      - name: Review each PR (Claude agent, no GitHub access)
+        if: steps.queue.outputs.count != '0'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -uo pipefail
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          R="$RUNNER_TEMP/routines"
+          while IFS=$'\t' read -r num sha; do
+            work="/tmp/web-review/pr-$num"
+            (cd "$work" && node "$R/agent.mjs" reviewer "$RUNNER_TEMP/prompt-$num.md") || echo "reviewer agent failed on web#$num"
+            if [ -f "$work/.agent-out/review.json" ]; then cp "$work/.agent-out/review.json" "$RUNNER_TEMP/review-$num.json"
+            else echo "no verdict for web#$num — it stays in the queue"; fi
+          done < "$RUNNER_TEMP/ready.tsv"
+
+      - name: Web token (post verdicts)
+        id: post-token
+        if: steps.queue.outputs.count != '0'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Post verdicts (never merges)
+        if: steps.queue.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.post-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.queue.outputs.bot }}
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -uo pipefail
+          while IFS=$'\t' read -r num sha; do
+            f="$RUNNER_TEMP/review-$num.json"
+            [ -f "$f" ] || continue
+            # Refuses if the head moved since the review; validates and scans the file first.
+            node "$RUNNER_TEMP/routines/automerge.mjs" --repo "$WEB_REPO" review-json "$num" "$sha" "$f" || true
+          done < "$RUNNER_TEMP/ready.tsv"
