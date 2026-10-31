@@ -287,7 +287,8 @@ impl Orchestrator {
 
     /// Fire-and-forget: replicate a just-terminal run's metadata to the cloud so
     /// it appears in the user's cross-machine History (Pro-real Part B / B1b).
-    /// No-op unless the user is Pro with `history.sync`. **Never blocks the run** —
+    /// No-op unless the user turned on history sync AND is Pro with
+    /// `history.sync`. **Never blocks the run** —
     /// builds the payload under a short DB lock, then spawns the network push, so
     /// an abort still feels instant. The server upserts by run id, so a re-fire on
     /// an already-terminal run (e.g. abort of an aborted run) is a harmless no-op.
@@ -298,9 +299,9 @@ impl Orchestrator {
         if self.headless {
             return;
         }
-        if !crate::entitlement::Entitlement::current()
-            .has_feature(crate::entitlement::feature::HISTORY_SYNC)
-        {
+        // Opt-in (off by default) AND Pro — the opt-in is read first, so with
+        // sync off neither the keychain nor the network is touched.
+        if !crate::sync::sync_active(crate::sync::SyncKind::History) {
             return;
         }
         // Metadata payload under ONE short lock (the B1 shape). The heavy B2

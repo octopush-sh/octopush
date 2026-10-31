@@ -461,6 +461,14 @@ export interface GitCredentialEntry {
   token: string;
 }
 
+/** The user's two cloud-sync opt-ins — both **off** by default. */
+export interface SyncPrefs {
+  historySync: boolean;
+  librarySync: boolean;
+}
+
+export type SyncKind = "history" | "library";
+
 export interface AppSettings {
   providerKeys: Record<string, string>;
   providerBaseUrls: Record<string, string>;
@@ -483,6 +491,15 @@ export interface AppSettings {
   modelTiers?: Record<string, string> | null;
   /** Jira/issue-tracker connection config (preserved across saves). */
   issueTracker?: IssueTrackerConfig | null;
+  /** Cloud run-history sync opt-in (default off). Owned by `set_sync_pref` —
+   *  read-modify-write saves carry it through untouched. */
+  historySyncEnabled?: boolean;
+  /** Cloud Library sync opt-in (default off). Owned by `set_sync_pref`. */
+  librarySyncEnabled?: boolean;
+  /** Update channel. Owned by `set_update_channel` — carried through saves. */
+  updateChannel?: "stable" | "beta";
+  /** Version skipped in the launch alert. Owned by `set_skipped_update_version`. */
+  skippedUpdateVersion?: string | null;
   /** @deprecated use providerKeys.anthropic */
   anthropicApiKey?: string | null;
   /** @deprecated use providerKeys.openai */

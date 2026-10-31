@@ -15,7 +15,8 @@
     "release": "node scripts/release.mjs",
     "mcp:build": "cd src-tauri && cargo build --release --bin octopush-mcp",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "clips:record": "node scripts/clips/record.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.3",
@@ -43,7 +44,6 @@
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.0.1",
-    "@tauri-apps/plugin-updater": "^2.10.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/xterm": "^5.5.0",
@@ -58,6 +58,7 @@
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
     "remark-gfm": "^4.0.1",
+    "yaml": "^2.9.1",
     "zustand": "^5.0.2"
   },
   "devDependencies": {

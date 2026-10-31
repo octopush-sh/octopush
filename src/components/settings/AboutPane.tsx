@@ -1,9 +1,17 @@
 // Settings → About — installed version and the in-app updater flow.
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { Download, RefreshCw, CheckCircle, Loader2 } from "lucide-react";
-import { useUpdaterStore } from "../../stores/updaterStore";
-import { PaneHeader, formatRelative } from "./shared";
+import { useUpdaterStore, type UpdateChannel } from "../../stores/updaterStore";
+import { PaneHeader, SegmentedRow, formatRelative } from "./shared";
 import { OctoMark } from "../icons/OctoMark";
+import { openWhatsNewForCurrentVersion } from "../../lib/whatsNewLaunch";
+import { ReleaseNotes } from "../ReleaseNotes";
+import { installedNotes } from "../../lib/releaseNotes";
+
+const CHANNEL_OPTIONS: ReadonlyArray<{ value: UpdateChannel; label: string }> = [
+  { value: "stable", label: "Stable" },
+  { value: "beta", label: "Beta" },
+];
 
 export function AboutPane() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -14,12 +22,17 @@ export function AboutPane() {
   const lastCheckedAt = useUpdaterStore((s) => s.lastCheckedAt);
   const checkForUpdates = useUpdaterStore((s) => s.checkForUpdates);
   const installAndRelaunch = useUpdaterStore((s) => s.installAndRelaunch);
+  const channel = useUpdaterStore((s) => s.channel);
+  const setChannel = useUpdaterStore((s) => s.setChannel);
+  const loadPrefs = useUpdaterStore((s) => s.loadPrefs);
+  const notesForInstalled = useMemo(() => installedNotes(currentVersion), [currentVersion]);
 
   const checking = phase === "checking";
   const installing = phase === "downloading" || phase === "installing";
 
   // Resolve the version once on mount via the updater store helper.
   useEffect(() => {
+    void loadPrefs().catch(() => {});
     if (!currentVersion) {
       // Triggering a check side-effect populates currentVersion.
       checkForUpdates(false);
@@ -55,6 +68,7 @@ export function AboutPane() {
           </div>
           <button
             type="button"
+            data-tour="about-check-updates"
             onClick={() => checkForUpdates(true)}
             disabled={checking || installing}
             className="flex items-center gap-1.5 rounded px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors disabled:opacity-40"
@@ -63,6 +77,19 @@ export function AboutPane() {
             {checking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
             {checking ? "Checking…" : "Check for updates"}
           </button>
+        </div>
+
+        {/* Update channel */}
+        <div data-tour="about-update-channel">
+          <SegmentedRow
+            label="Update channel"
+            description="Beta gets the nightly builds first; Stable gets them once they are promoted. Going back to Stable never downgrades — it just stops offering betas."
+            value={channel}
+            options={CHANNEL_OPTIONS}
+            onChange={(c) => void setChannel(c)}
+            ariaLabel="Update channel"
+            testId="update-channel-segmented"
+          />
         </div>
 
         {/* State feedback */}
@@ -80,9 +107,9 @@ export function AboutPane() {
                 <div className="mt-0.5 font-serif text-[16px] leading-tight text-octo-ivory">
                   Octopush {update.version} is ready.
                 </div>
-                {update.body && (
-                  <div className="mt-1.5 whitespace-pre-line text-[12px] leading-[1.55] text-octo-sage">
-                    {update.body}
+                {update.body?.trim() && (
+                  <div className="octo-selectable mt-2 max-h-[280px] overflow-y-auto">
+                    <ReleaseNotes markdown={update.body} />
                   </div>
                 )}
               </div>
@@ -111,7 +138,7 @@ export function AboutPane() {
                 style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
               >
                 {installing ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}
-                Install & restart
+                Install and relaunch
               </button>
             </div>
           </div>
@@ -133,18 +160,41 @@ export function AboutPane() {
           </div>
         )}
 
+        {/* Notes for the installed version, when known */}
+        {notesForInstalled && currentVersion && (
+          <div className="rounded-lg px-4 py-3 octo-fade-in" style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}>
+            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-brass">
+              In v{currentVersion}
+            </div>
+            <div className="octo-selectable mt-2 max-h-[320px] overflow-y-auto" data-testid="installed-notes">
+              <ReleaseNotes markdown={notesForInstalled} />
+            </div>
+          </div>
+        )}
+
         {/* Reference info */}
         <ul className="space-y-1.5 text-[12px] leading-[1.55] text-octo-sage">
           <li>
             ·{" "}
             <a
-              href="https://github.com/johnatan-velez/octopush"
+              href="https://github.com/octopush-sh/octopush"
               target="_blank"
               rel="noopener"
               className="text-octo-brass underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
             >
-              github.com/johnatan-velez/octopush
+              github.com/octopush-sh/octopush
             </a>
+          </li>
+          <li>
+            ·{" "}
+            <button
+              type="button"
+              data-tour="about-whats-new"
+              onClick={() => void openWhatsNewForCurrentVersion()}
+              className="font-serif text-[13px] text-octo-brass underline decoration-[var(--brass-dim)] underline-offset-2 transition-colors hover:decoration-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              What's in this version
+            </button>
           </li>
           <li>· Last checked for updates: <span className="font-mono text-octo-ivory">{lastChecked}</span></li>
           <li>· Updates are verified with an Ed25519 signature before install.</li>

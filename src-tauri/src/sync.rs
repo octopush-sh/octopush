@@ -1,13 +1,27 @@
-//! Cross-machine run-history sync (Pro-real Part B / B1).
+//! Cross-machine sync to Octopush's sync API (`octopush-api.vercel.app`) —
+//! run history (Pro-real Part B: B1 metadata + B2 detail) and Library sync.
 //!
-//! A Pro user's TERMINAL Direct-run **metadata** is replicated to the Octopush
-//! sync API so it shows up on every machine they sign in on (a read-only History
-//! view). Terminal runs are immutable ⇒ append-only upsert by run id; the server
-//! owns the row by the authenticated Clerk principal and never trusts the client
-//! for ownership. Only metadata (task / status / cost / tokens / roles /
-//! timestamps) is synced — never journals, diffs, artifacts, or prompts beyond
-//! the run's own task. Everything here is **best-effort**: a failed sync never
-//! affects the run itself.
+//! **Opt-in, off by default.** Nothing in this module talks to the network
+//! unless the user turned the matching toggle on (Settings › Account ›
+//! Sync; persisted in `settings.json` as `historySyncEnabled` /
+//! `librarySyncEnabled`, both `false` when absent) **and** holds the Pro
+//! entitlement. Every network function re-checks the opt-in itself
+//! ([`opted_in`]) as defense in depth, so a call site that forgets the gate
+//! still sends nothing.
+//!
+//! What travels when on:
+//! - **Run history** — each TERMINAL Direct run's metadata (task / status /
+//!   cost / tokens / per-stage role+model+status / timestamps / machine name)
+//!   **and** its detail: per-stage journals, artifact texts and worktree
+//!   **diff snapshots** (capped — see [`enforce_detail_budget`]).
+//! - **Library** — custom pipelines and roles (definitions + tombstones).
+//!
+//! The server owns each row by the authenticated Clerk principal and never
+//! trusts the client for ownership. Terminal runs are immutable ⇒
+//! append-only upsert by run id. Everything here is **best-effort**: a failed
+//! sync never affects the run or the local library. Turning a toggle off stops
+//! future uploads; it does not delete what was already synced (there is no
+//! delete endpoint yet).
 
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
@@ -15,6 +29,79 @@ use serde::{Deserialize, Serialize};
 
 /// Production Octopush sync API (the same Vercel project as the billing webhook).
 const SYNC_API_BASE: &str = "https://octopush-api.vercel.app";
+
+/// Which cloud-sync stream a gate is about — each has its own user opt-in and
+/// its own Pro feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncKind {
+    /// Run-history sync (`history.sync`): metadata + journals/artifacts/diffs.
+    History,
+    /// Library sync (`library.sync`): custom pipelines & roles.
+    Library,
+}
+
+impl SyncKind {
+    /// The entitlement feature that must ALSO be granted.
+    pub fn feature(self) -> &'static str {
+        match self {
+            SyncKind::History => crate::entitlement::feature::HISTORY_SYNC,
+            SyncKind::Library => crate::entitlement::feature::LIBRARY_SYNC,
+        }
+    }
+
+    /// Parse the IPC spelling (`"history"` / `"library"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "history" => Some(SyncKind::History),
+            "library" => Some(SyncKind::Library),
+            _ => None,
+        }
+    }
+}
+
+/// Has the user turned this sync on? (Local settings read — no network.)
+pub fn opted_in(kind: SyncKind) -> bool {
+    crate::settings::sync_opted_in(kind)
+}
+
+/// The gate every call site uses: opted in (checked FIRST — a cheap local read
+/// that also spares the keychain-backed entitlement lookup when off) and Pro.
+pub fn sync_active(kind: SyncKind) -> bool {
+    // Short-circuit: when off, the entitlement (keychain) is never consulted.
+    opted_in(kind) && crate::entitlement::Entitlement::current().has_feature(kind.feature())
+}
+
+/// The error a pull/fetch returns when its sync is turned off — the network
+/// is never touched.
+pub fn sync_off_error(kind: SyncKind) -> AppError {
+    AppError::Other(match kind {
+        SyncKind::History => "History sync is off".into(),
+        SyncKind::Library => "Library sync is off".into(),
+    })
+}
+
+/// What a best-effort push did — lets tests prove the opt-in short-circuits
+/// before any token lookup or request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The user has not opted in — nothing was read or sent.
+    Disabled,
+    /// Nothing to send — no request made.
+    Empty,
+    /// No valid session — no request made.
+    SignedOut,
+    /// Every request succeeded.
+    Sent,
+    /// A request failed (network or non-2xx); logged.
+    Failed,
+}
+
+impl PushOutcome {
+    /// Whether the caller should report the push as having failed.
+    pub fn is_failure(self) -> bool {
+        matches!(self, PushOutcome::Failed | PushOutcome::SignedOut)
+    }
+}
 
 /// Cap a single push batch to the server's documented limit.
 pub(crate) const MAX_PUSH: usize = 500;
@@ -55,7 +142,8 @@ pub struct SyncRun {
 }
 
 /// A compact per-stage summary — which role ran on which model, and its outcome.
-/// Deliberately excludes artifacts, diffs, and feedback (kept out of the cloud).
+/// The list-row summary only — the heavy per-stage detail (journals, artifacts,
+/// diffs) travels separately as [`SyncRunDetail`], and only when opted in.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SyncStage {
     #[serde(default)]
@@ -244,18 +332,28 @@ pub fn enforce_detail_budget(detail: &mut SyncRunDetail) {
 
 /// POST a run's detail blob. **Best-effort** — logs and returns on any error;
 /// the run (and its already-pushed metadata) are never affected.
-pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) {
+pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) -> PushOutcome {
+    if !opted_in(SyncKind::History) {
+        return PushOutcome::Disabled;
+    }
     let Some(token) = crate::auth::current_access_token().await else {
-        return; // signed out → skip silently
+        return PushOutcome::SignedOut; // signed out → skip silently
     };
     let body = serde_json::json!({ "run_id": detail.run_id, "data": detail });
     let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
     match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed run detail");
+            PushOutcome::Sent
         }
-        Ok(resp) => tracing::warn!("history sync detail push failed: HTTP {}", resp.status()),
-        Err(e) => tracing::warn!("history sync detail push error: {e}"),
+        Ok(resp) => {
+            tracing::warn!("history sync detail push failed: HTTP {}", resp.status());
+            PushOutcome::Failed
+        }
+        Err(e) => {
+            tracing::warn!("history sync detail push error: {e}");
+            PushOutcome::Failed
+        }
     }
 }
 
@@ -265,6 +363,9 @@ pub async fn pull_run_detail(
     client: &reqwest::Client,
     run_id: &str,
 ) -> AppResult<Option<SyncRunDetail>> {
+    if !opted_in(SyncKind::History) {
+        return Err(sync_off_error(SyncKind::History));
+    }
     let token = crate::auth::current_access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
@@ -335,12 +436,15 @@ pub fn build_run_payload(db: &Db, run: &crate::db::RunRow, machine_id: &str) -> 
 /// error (signed-out, network, non-2xx). A failed sync must never surface to the
 /// run. The batch is capped at [`MAX_PUSH`]; the server upserts by run id so a
 /// re-push of an already-synced terminal run is a harmless no-op.
-pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) {
+pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutcome {
+    if !opted_in(SyncKind::History) {
+        return PushOutcome::Disabled;
+    }
     if runs.is_empty() {
-        return;
+        return PushOutcome::Empty;
     }
     let Some(token) = crate::auth::current_access_token().await else {
-        return; // signed out / no valid token → skip silently
+        return PushOutcome::SignedOut; // signed out / no valid token → skip silently
     };
     let batch: Vec<SyncRun> = runs.into_iter().take(MAX_PUSH).collect();
     let count = batch.len();
@@ -349,9 +453,16 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) {
     match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed {count} run(s)");
+            PushOutcome::Sent
         }
-        Ok(resp) => tracing::warn!("history sync push failed: HTTP {}", resp.status()),
-        Err(e) => tracing::warn!("history sync push error: {e}"),
+        Ok(resp) => {
+            tracing::warn!("history sync push failed: HTTP {}", resp.status());
+            PushOutcome::Failed
+        }
+        Err(e) => {
+            tracing::warn!("history sync push error: {e}");
+            PushOutcome::Failed
+        }
     }
 }
 
@@ -359,6 +470,9 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) {
 /// — any blob this build can't read is skipped (forward/back compat) rather than
 /// failing the whole pull.
 pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
+    if !opted_in(SyncKind::History) {
+        return Err(sync_off_error(SyncKind::History));
+    }
     let token = crate::auth::current_access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
@@ -465,29 +579,50 @@ impl SyncLibraryItem {
 /// can never be rejected wholesale.
 const LIBRARY_PUSH_CHUNK: usize = 200;
 
-pub async fn push_library_items(client: &reqwest::Client, items: Vec<SyncLibraryItem>) {
+pub async fn push_library_items(
+    client: &reqwest::Client,
+    items: Vec<SyncLibraryItem>,
+) -> PushOutcome {
+    if !opted_in(SyncKind::Library) {
+        return PushOutcome::Disabled;
+    }
     if items.is_empty() {
-        return;
+        return PushOutcome::Empty;
     }
     let Some(token) = crate::auth::current_access_token().await else {
-        return; // signed out → skip silently
+        return PushOutcome::SignedOut; // signed out → skip silently
     };
     let url = format!("{SYNC_API_BASE}/api/sync-library");
+    let mut outcome = PushOutcome::Sent;
     for chunk in items.chunks(LIBRARY_PUSH_CHUNK) {
+        // Re-check between chunks: turning sync off mid-heal stops the rest.
+        if !opted_in(SyncKind::Library) {
+            return PushOutcome::Disabled;
+        }
         let body = serde_json::json!({ "items": chunk });
         match client.post(&url).bearer_auth(token.clone()).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!("library sync: pushed {} item(s)", chunk.len());
             }
-            Ok(resp) => tracing::warn!("library sync push failed: HTTP {}", resp.status()),
-            Err(e) => tracing::warn!("library sync push error: {e}"),
+            Ok(resp) => {
+                tracing::warn!("library sync push failed: HTTP {}", resp.status());
+                outcome = PushOutcome::Failed;
+            }
+            Err(e) => {
+                tracing::warn!("library sync push error: {e}");
+                outcome = PushOutcome::Failed;
+            }
         }
     }
+    outcome
 }
 
 /// GET the user's whole library (items + tombstones). Lenient: an item this
 /// build can't parse is skipped by the caller, never fatal.
 pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibraryItem>> {
+    if !opted_in(SyncKind::Library) {
+        return Err(sync_off_error(SyncKind::Library));
+    }
     let token = crate::auth::current_access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;

@@ -364,6 +364,26 @@
 .octo-pop-in        { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
 .octo-rise-in       { animation: octo-enter-rise var(--dur-standard) var(--ease-octo) both; }
 
+/* Guided-tour spotlight (TourOverlay; docs/design-system.md §4 "Tour
+   spotlight"). One element does both jobs: its huge spread shadow IS the scrim
+   (same onyx/80 wash as ModalShell), leaving its own box as the cut-out, and
+   its outline is the hairline brass edge. It glides between targets on the
+   standard clock; no glow, no pulse. The global reduced-motion neutralizer
+   collapses the glide to a jump. */
+.octo-tour-spot {
+  position: fixed;
+  pointer-events: none;
+  border-radius: 8px;
+  box-shadow: 0 0 0 200vmax color-mix(in srgb, var(--color-octo-onyx) 80%, transparent);
+  outline: 1px solid var(--brass-dim);
+  outline-offset: 0;
+  transition:
+    top var(--dur-standard) var(--ease-octo),
+    left var(--dur-standard) var(--ease-octo),
+    width var(--dur-standard) var(--ease-octo),
+    height var(--dur-standard) var(--ease-octo);
+}
+
 /* Calm pulse for the active pipeline stage in the Direct run track. */
 @keyframes octo-stage-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }

@@ -181,7 +181,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
         <p className="mb-7 mt-1 text-[12px] text-octo-sage">A crew of agents, your brief, one run.</p>
 
         {/* The brief — the noblest object: serif on panel. ⌘⏎ begins. */}
-        <div className="mb-8 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
+        <div data-tour="direct-launcher-brief" className="mb-8 rounded-lg border border-octo-hairline bg-octo-panel px-4 py-3 transition-colors duration-[180ms] focus-within:border-[var(--brass-dim)]">
           {/* `@file` points the crew at code; `/skill` is resolved when the
               stage runs, so the role that needs it gets its instructions. */}
           <RichPromptTextarea
@@ -395,6 +395,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
               <div className="ml-auto flex flex-col items-end gap-1.5">
                 <button
                   type="button"
+                  data-tour="direct-launcher-begin"
                   disabled={!ready}
                   onClick={beginNow}
                   className={`rounded-lg border px-6 py-2.5 font-serif text-base transition-[color,background-color,border-color,opacity] duration-[180ms] ${

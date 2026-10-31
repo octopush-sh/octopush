@@ -1661,9 +1661,7 @@ pub async fn save_pipeline(
     let saved_id = state.db.lock().save_pipeline(pipeline_id, &name, &description, &stages)?;
     // Library sync (Pro): fire-and-forget the edited item to the cloud so it
     // follows the user to their other machines. Never affects the save.
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         // Best-effort from here: the save already COMMITTED — a bookkeeping
         // read failure must never turn a successful save into an error.
         let item = {
@@ -1692,9 +1690,7 @@ pub async fn delete_pipeline(
     state.db.lock().delete_pipeline(&pipeline_id)?;
     // Tombstone so the deletion follows the user (an edit made LATER on
     // another machine revives the item — newest intent wins).
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         let item = crate::sync::SyncLibraryItem::tombstone("pipeline", &pipeline_id);
         tokio::spawn(async move {
             let client = crate::chat_engine::shared_http_client();
@@ -1953,8 +1949,42 @@ fn require_feature_gate(feature: &str) -> AppResult<()> {
     }
 }
 
+/// Gate for a sync pull/fetch: Pro first (so a Free user still gets the
+/// upgrade sheet), then the user's opt-in — off ⇒ an error and **no network**.
+fn require_sync(kind: crate::sync::SyncKind) -> AppResult<()> {
+    require_feature_gate(kind.feature())?;
+    if crate::sync::opted_in(kind) {
+        Ok(())
+    } else {
+        Err(crate::sync::sync_off_error(kind))
+    }
+}
+
 fn require_history_sync() -> AppResult<()> {
-    require_feature_gate(crate::entitlement::feature::HISTORY_SYNC)
+    require_sync(crate::sync::SyncKind::History)
+}
+
+/// The signed-in user's two cloud-sync opt-ins (both default **off**; both
+/// read OFF for anyone but the account that granted them). Local read only.
+#[tauri::command]
+pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
+    crate::settings::current_sync_prefs()
+}
+
+/// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
+/// the new pair. The opt-in is bound to the signed-in Clerk user. Turning ON
+/// requires the matching Pro feature (the UI disables
+/// the toggle for Free; this is the backstop). Turning OFF is always allowed and
+/// only stops future uploads/downloads — nothing is deleted server-side. The
+/// frontend runs the existing one-shot backfill after a successful turn-on.
+#[tauri::command]
+pub async fn set_sync_pref(kind: String, enabled: bool) -> AppResult<crate::settings::SyncPrefs> {
+    let kind = crate::sync::SyncKind::parse(&kind)
+        .ok_or_else(|| AppError::Other(format!("unknown sync kind: {kind}")))?;
+    if enabled {
+        require_feature_gate(kind.feature())?;
+    }
+    crate::settings::set_sync_opted_in(kind, enabled)
 }
 
 /// Cross-mission Logbook rollups + export are Pro; per-mission is free.
@@ -1999,13 +2029,14 @@ pub async fn history_sync_pull(
 
 /// One-shot backfill: push this machine's terminal runs (newest first, capped at
 /// [`crate::sync::MAX_PUSH`]) so a Pro user's existing history is populated
-/// immediately — not only from the next run onward. No-op for non-Pro; the server
-/// upserts by run id so re-running it is idempotent. Returns the count attempted.
+/// immediately — not only from the next run onward. Runs when the user turns
+/// history sync ON (and on launch while it stays on). No-op unless opted in
+/// AND Pro; the server
+/// upserts by run id so re-running it is idempotent. Returns the count pushed;
+/// errors when the metadata push itself failed (the detail heal stays silent).
 #[tauri::command]
 pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
-    if !crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::HISTORY_SYNC)
-    {
+    if !crate::sync::sync_active(crate::sync::SyncKind::History) {
         return Ok(0);
     }
     let runs = {
@@ -2022,7 +2053,11 @@ pub async fn history_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
     };
     let count = runs.len();
     let client = crate::chat_engine::shared_http_client();
-    crate::sync::push_runs(client, runs).await;
+    // Report a failed metadata push (offline / 5xx / no session) so the first
+    // backfill after turning sync on can say so; the launch caller ignores it.
+    if crate::sync::push_runs(client, runs).await.is_failure() {
+        return Err(AppError::Other("Couldn't reach Octopush's sync service".into()));
+    }
 
     // Heal the B2 detail for the MOST RECENT terminal runs. The terminal-time
     // detail push is fire-and-forget with no retry — a run finishing offline
@@ -2066,12 +2101,11 @@ pub async fn history_run_detail(
 /// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
 /// heal for edits made offline or whose fire-and-forget push failed. The server
 /// does per-item LWW, so re-pushing is idempotent and never regresses a newer
-/// edit from another machine. No-op for non-Pro. Returns the count pushed.
+/// edit from another machine. No-op unless library sync is turned on AND Pro.
+/// Returns the count pushed.
 #[tauri::command]
 pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usize> {
-    if !crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if !crate::sync::sync_active(crate::sync::SyncKind::Library) {
         return Ok(0);
     }
     let items: Vec<crate::sync::SyncLibraryItem> = {
@@ -2089,7 +2123,12 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
         items
     };
     let count = items.len();
-    crate::sync::push_library_items(crate::chat_engine::shared_http_client(), items).await;
+    if crate::sync::push_library_items(crate::chat_engine::shared_http_client(), items)
+        .await
+        .is_failure()
+    {
+        return Err(AppError::Other("Couldn't reach Octopush's sync service".into()));
+    }
     Ok(count)
 }
 
@@ -2100,7 +2139,7 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
 /// the number of items applied.
 #[tauri::command]
 pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
-    require_feature_gate(crate::entitlement::feature::LIBRARY_SYNC)?;
+    require_sync(crate::sync::SyncKind::Library)?;
     let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
     let mut applied = 0usize;
 
@@ -2195,6 +2234,9 @@ pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
 #[tauri::command]
 pub async fn auth_sign_out(state: State<'_, AppState>) -> AppResult<()> {
     crate::auth::sign_out()?;
+    // The sync opt-ins belong to the account that granted them — forget them
+    // so whoever signs in next starts with sync OFF.
+    let _ = crate::settings::clear_sync_opt_ins();
     let _ = state.db.lock().clear_synced_runs();
     Ok(())
 }
@@ -3790,9 +3832,121 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
 
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
-    crate::settings::save_settings(&settings)?;
+    // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
+    // from a settings pane must never flip them — carried over from disk.
+    crate::settings::save_settings_from_ui(settings)?;
     // A key or base URL may have changed: re-detect gateways on the next read.
     state.gateways.invalidate();
+    Ok(())
+}
+
+// ─── Updater (channels + launch alert) ────────────────────────────
+
+/// The persisted update channel: `"stable"` (default) or `"beta"`.
+#[tauri::command]
+pub async fn get_update_channel() -> AppResult<String> {
+    Ok(crate::settings::update_channel().as_str().to_string())
+}
+
+/// Persist the update channel. Only writer of `updateChannel`.
+#[tauri::command]
+pub async fn set_update_channel(
+    channel: String,
+    pending: State<'_, crate::updater::PendingUpdate>,
+) -> AppResult<String> {
+    let parsed = crate::updater::UpdateChannel::parse(&channel)
+        .ok_or_else(|| AppError::Other(format!("unknown update channel: {channel}")))?;
+    crate::settings::set_update_channel(parsed)?;
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = None;
+    Ok(parsed.as_str().to_string())
+}
+
+/// The version the user chose to skip in the launch alert, if any.
+#[tauri::command]
+pub async fn get_skipped_update_version() -> AppResult<Option<String>> {
+    Ok(crate::settings::skipped_update_version())
+}
+
+/// Persist (or clear) the skipped version. Only writer of `skippedUpdateVersion`.
+#[tauri::command]
+pub async fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
+    crate::settings::set_skipped_update_version(version)
+}
+
+/// Check the current channel's manifest. Stable reads the endpoints in
+/// `tauri.conf.json`; beta overrides them with `updater::BETA_ENDPOINTS`.
+/// The pubkey always comes from the plugin config. The found update is
+/// kept for `updater_install`.
+#[tauri::command]
+pub async fn updater_check(
+    app: AppHandle,
+    pending: State<'_, crate::updater::PendingUpdate>,
+) -> AppResult<Option<crate::updater::UpdateInfo>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let channel = crate::settings::update_channel();
+    let mut builder = app.updater_builder();
+    if let Some(eps) = crate::updater::endpoint_override(channel) {
+        let urls = eps
+            .into_iter()
+            .map(|e| tauri::Url::parse(e).map_err(|err| AppError::Other(err.to_string())))
+            .collect::<AppResult<Vec<_>>>()?;
+        builder = builder
+            .endpoints(urls)
+            .map_err(|e| AppError::Other(e.to_string()))?;
+    }
+    let updater = builder.build().map_err(|e| AppError::Other(e.to_string()))?;
+    let found = updater.check().await.map_err(|e| AppError::Other(e.to_string()))?;
+    let info = found.as_ref().map(|u| crate::updater::UpdateInfo {
+        version: u.version.clone(),
+        current_version: u.current_version.clone(),
+        date: crate::updater::manifest_date(&u.raw_json),
+        body: u.body.clone(),
+        channel,
+    });
+    // The channel may have changed while the check was in flight: drop a
+    // result that no longer matches, so it can't be shown or installed.
+    if crate::settings::update_channel() != channel {
+        return Ok(None);
+    }
+    *pending.0.lock().map_err(|e| AppError::Other(e.to_string()))? = found.map(|u| (channel, u));
+    Ok(info)
+}
+
+/// Download + install the update found by the last `updater_check`,
+/// streaming progress on `on_event`. The frontend relaunches afterwards.
+#[tauri::command]
+pub async fn updater_install(
+    pending: State<'_, crate::updater::PendingUpdate>,
+    on_event: tauri::ipc::Channel<crate::updater::DownloadEvent>,
+) -> AppResult<()> {
+    use crate::updater::DownloadEvent;
+    let update = pending
+        .0
+        .lock()
+        .map_err(|e| AppError::Other(e.to_string()))?
+        .clone()
+        .ok_or_else(|| AppError::Other("No update to install — check again".into()))?;
+    let (found_on, update) = update;
+    if found_on != crate::settings::update_channel() {
+        return Err(AppError::Other("The update channel changed — check again".into()));
+    }
+    let mut started = false;
+    let progress = on_event.clone();
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = progress.send(DownloadEvent::Started { content_length });
+                }
+                let _ = progress.send(DownloadEvent::Progress { chunk_length });
+            },
+            move || {
+                let _ = on_event.send(DownloadEvent::Finished);
+            },
+        )
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
     Ok(())
 }
 
@@ -5910,9 +6064,7 @@ pub async fn save_role(state: State<'_, AppState>, role: crate::orchestrator::ro
         .map(|(updated_at, _)| crate::sync::SyncLibraryItem::role(&role, &updated_at));
     drop(db);
     // Library sync (Pro): the edited role follows the user. Best-effort.
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         if let Some(item) = sync_item {
             tokio::spawn(async move {
                 let client = crate::chat_engine::shared_http_client();
@@ -5934,9 +6086,7 @@ pub async fn delete_role(state: State<'_, AppState>, key: String) -> AppResult<(
     if db.role_in_use(&key)? { return Err(crate::error::AppError::Other(format!("role '{key}' is used by a pipeline"))); }
     db.delete_role(&key)?;
     drop(db);
-    if crate::entitlement::Entitlement::current()
-        .has_feature(crate::entitlement::feature::LIBRARY_SYNC)
-    {
+    if crate::sync::sync_active(crate::sync::SyncKind::Library) {
         let item = crate::sync::SyncLibraryItem::tombstone("role", &key);
         tokio::spawn(async move {
             let client = crate::chat_engine::shared_http_client();

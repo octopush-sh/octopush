@@ -55,9 +55,11 @@ import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
 import { initGenesisRename } from "./lib/genesisRename";
 import { deriveProjectName } from "./lib/genesis";
-import { useHistoryStore } from "./stores/historyStore";
+import { useSyncPrefsStore } from "./stores/syncPrefsStore";
+import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
+import { WhatsNewHost } from "./components/WhatsNewHost";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
@@ -68,7 +70,6 @@ import { useTerminalsStore } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
-import { useRolesStore } from "./stores/rolesStore";
 import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
@@ -80,6 +81,7 @@ import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
+import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
@@ -166,39 +168,43 @@ function App() {
     initGenesisRename();
   }, [loadActiveRuns]);
 
-  // Cross-machine run history (Pro-real Part B / B1): once the user is Pro with
-  // `history.sync`, backfill this machine's runs + pull the full history so the
-  // History sheet opens populated. Runs when the entitlement flips to granted
-  // (on load, or right after an upgrade). Best-effort/silent for everyone else.
+  // Cloud sync is OPT-IN (Settings › Account › Sync; both off by default).
+  // Load the two opt-ins once; the effects below only fire while BOTH the
+  // entitlement and the user's toggle are on — so turning a toggle on runs the
+  // same one-shot backfill a Pro user gets on launch, and with it off nothing
+  // is sent or fetched (the Rust core re-checks before every request).
+  useEffect(() => {
+    void useSyncPrefsStore.getState().load();
+  }, []);
+
+  // Cross-machine run history (Pro-real Part B): backfill this machine's runs
+  // + pull the full history so the History sheet opens populated. Runs when
+  // entitled-and-opted-in flips true (on load, after an upgrade, or the moment
+  // the user turns history sync on). Best-effort/silent.
   const historySyncEntitled = useEntitlementStore((s) =>
     s.entitlement.features.includes("history.sync"),
   );
+  const historySyncOn = useSyncPrefsStore((s) => s.historySync);
   useEffect(() => {
-    if (historySyncEntitled) void useHistoryStore.getState().syncOnLaunch();
-  }, [historySyncEntitled]);
+    if (!historySyncEntitled || !historySyncOn) return;
+    // Toast the outcome only for the first backfill after the user turned it on.
+    const announce = useSyncPrefsStore.getState().consumeJustEnabled("history");
+    void runSyncBackfill("history", { announce });
+  }, [historySyncEntitled, historySyncOn]);
 
-  // Library sync (Pro): once entitled, heal-push the whole custom library,
-  // pull + merge the other machines' edits (per-item LWW), and refresh the
-  // stores that render it. Best-effort and silent — offline just means the
-  // library syncs on a later launch.
+  // Library sync (Pro, opt-in): heal-push the whole custom library, pull +
+  // merge the other machines' edits (per-item LWW), and refresh the stores
+  // that render it. Best-effort and silent — offline just means the library
+  // syncs on a later launch.
   const librarySyncEntitled = useEntitlementStore((s) =>
     s.entitlement.features.includes("library.sync"),
   );
+  const librarySyncOn = useSyncPrefsStore((s) => s.librarySync);
   useEffect(() => {
-    if (!librarySyncEntitled) return;
-    void (async () => {
-      try {
-        await ipc.librarySyncPushAll();
-        const applied = await ipc.librarySyncPull();
-        if (applied > 0) {
-          await usePipelineStore.getState().load();
-          await useRolesStore.getState().load();
-        }
-      } catch {
-        // Offline / transient — the local library is untouched.
-      }
-    })();
-  }, [librarySyncEntitled]);
+    if (!librarySyncEntitled || !librarySyncOn) return;
+    const announce = useSyncPrefsStore.getState().consumeJustEnabled("library");
+    void runSyncBackfill("library", { announce });
+  }, [librarySyncEntitled, librarySyncOn]);
   const terminalBusyIds = useTerminalsStore(
     useShallow((s) =>
       Object.keys(s.terminalsByWs).filter((id) => (s.terminalsByWs[id] ?? []).some((t) => t.busy)),
@@ -815,6 +821,27 @@ function App() {
     },
     [activeWorkspaceId],
   );
+
+  // Named-surface navigation for guided tours and recorded demos
+  // (src/lib/tour/surfaces.ts, docs/WHATS-NEW.md §3).
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const d = (e as CustomEvent<NavigateDetail>).detail;
+      switch (d?.kind) {
+        case "settings": setSettingsTab(d.tab); break;
+        case "close-settings": setSettingsTab(null); break;
+        case "close-overlays":
+          setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
+          break;
+        case "mode": setSettingsTab(null); setMode(d.mode); break;
+        case "palette": setShowPalette(true); break;
+        case "mission-control": setMissionControlOpen(true); break;
+        case "logbook": setLogbookOpen(true); break;
+      }
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [setMode]);
 
   // Cross-mode action (P9): take a chat tool's shell command to RUN mode.
   // Switches to the terminal and copies the command to the clipboard so the
@@ -2033,6 +2060,7 @@ function App() {
           onSketch={handleSketch}
         />
         <ToastContainer />
+        <WhatsNewHost />
       </div>
     );
   }
@@ -2883,6 +2911,7 @@ function App() {
 
       <ToastContainer />
       <UpdateNotifier />
+      <WhatsNewHost />
       <UpgradeSheet />
       <HistorySheet />
       {/* Mounted only while open — the room subscribes to the whole runs

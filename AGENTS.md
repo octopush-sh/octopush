@@ -6,6 +6,12 @@ This file is a mirror of [`CLAUDE.md`](CLAUDE.md) for AI tools that read `AGENTS
 
 ---
 
+## Direction — read before proposing or planning anything
+
+[`VISION.md`](VISION.md) holds who Octopush is for, its principles and non-goals, the current priorities, and the **rules for autonomous agents** (what you may open a PR for, what must stay a proposal issue, the `ready` / `proposal` / `agent-ok` labels). If a task conflicts with it, say so in the issue or PR and stop — don't resolve the conflict yourself.
+
+---
+
 ## Feature map — the source of truth for what Octopush does
 
 [`docs/FEATURES.md`](docs/FEATURES.md) is the canonical, exhaustive catalogue of **every** Octopush feature and **how** it is implemented (Tauri commands, Zustand stores, components, mechanisms, data model). Read it to learn what already exists before you add or change behaviour — it is the fastest way to understand the product surface end-to-end.
@@ -95,6 +101,7 @@ These complement the design rules above and govern all new surfaces:
 - [ ] No abrupt mount/unmount of overlays, menus, or panels — used the motion primitives (`.octo-modal-enter` / `.octo-menu-enter` / `.octo-fade-in` / grid-rows). Motion respects `prefers-reduced-motion`.
 - [ ] If you added a visual pattern not in the spec/cheatsheet, either reuse an existing one or propose extending the design system first.
 - [ ] **Updated [`docs/FEATURES.md`](docs/FEATURES.md)** if this change adds, removes, or alters any user-facing feature (backend or frontend).
+- [ ] **Added a changeset** (`whats-new/unreleased/<slug>.md`, see [`docs/WHATS-NEW.md`](docs/WHATS-NEW.md)) for any user-visible change, with `data-tour` ids on the elements its demo steps point at.
 - [ ] `npm run typecheck` passes.
 
 ---
@@ -110,6 +117,7 @@ These complement the design rules above and govern all new surfaces:
 | `npm test`                    | Vitest |
 | `cd src-tauri && cargo test`  | Rust tests |
 | `node scripts/check-agents-md.mjs` | Checks `AGENTS.md` still mirrors this file |
+| `node scripts/whats-new.mjs check` | Validates `whats-new/` changesets ([`docs/WHATS-NEW.md`](docs/WHATS-NEW.md)) |
 
 CI (`.github/workflows/ci.yml`) runs typecheck + Vitest (Linux), `cargo test` + `cargo clippy` (macOS) and the `AGENTS.md` mirror check on every pull request. **When you edit this file, copy it over `AGENTS.md`** (keep that file's line 3).
 

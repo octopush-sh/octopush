@@ -3,7 +3,18 @@
  * Octopush release script.
  *
  * Usage:
- *   npm run release -- 0.1.1
+ *   npm run release -- 0.1.1 [--channel beta|stable]
+ *
+ * Channels (docs/RELEASING.md): every release is published to the BETA channel
+ * by default — a GitHub prerelease (never GitHub "latest") whose latest.json is
+ * also uploaded to the moving `beta-channel` release. The owner promotes a beta
+ * to stable with .github/workflows/promote.yml. `--channel stable` publishes a
+ * full release directly (and refreshes `beta-channel` too, so beta users never
+ * see an older version than stable).
+ *
+ * Notes: when whats-new/<version>/notes.md exists (written by
+ * `node scripts/whats-new.mjs collect`), it tops the GitHub release body and,
+ * trimmed to 4000 chars, becomes latest.json `notes`.
  *
  * What it does, in order:
  *   1. Validates the working tree is clean and on `main`.
@@ -14,8 +25,9 @@
  *   4. Generates latest.json describing the release in the format the
  *      Tauri updater expects.
  *   5. Commits the version bump, tags v<version>, pushes both.
- *   6. Creates a GitHub release via `gh` and uploads the DMG +
- *      .app.tar.gz + .sig + latest.json as assets.
+ *   6. Creates a GitHub release via `gh` (a prerelease on the beta channel)
+ *      and uploads the DMG + .app.tar.gz + .sig + latest.json as assets.
+ *   7. Refreshes latest.json on the `beta-channel` release.
  *
  * Pre-reqs (must already be set up; this script doesn't bootstrap them):
  *   - `gh` CLI authed (token with `repo` scope).
@@ -40,13 +52,23 @@ import { execSync, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, copyFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  BETA_TAG,
+  BETA_TITLE,
+  buildManifest,
+  bumpVersionFiles,
+  channelCreateArgs,
+  ciPublishDecision,
+  pendingChangesets,
+  parseChannel,
+  releaseBody,
+  shouldRefreshBetaManifest,
+} from "./release-lib.mjs";
 
 // ── Paths ──────────────────────────────────────────────────────────
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const REPO = resolve(__dirname, "..");
-const PKG = join(REPO, "package.json");
-const CARGO = join(REPO, "src-tauri/Cargo.toml");
 const TAURI_CONF = join(REPO, "src-tauri/tauri.conf.json");
 // Universal build emits to a per-target dir. Releases always ship
 // universal so the same DMG runs on Intel + Apple Silicon.
@@ -62,6 +84,15 @@ const KEY_PATH = join(process.env.HOME || "", ".octopush-keys/updater_key");
 // and go straight to build → verify → publish. One source of build+publish
 // logic serves both the local one-command flow and CI. See docs/RELEASING.md.
 const CI = process.env.CI === "true" || process.argv.includes("--ci");
+
+// Release channel: beta (default) or stable. See the header and docs/RELEASING.md.
+let CHANNEL;
+try {
+  CHANNEL = parseChannel(process.argv.slice(2));
+} catch (e) {
+  console.error(`\x1b[31m✗\x1b[0m ${e.message}`);
+  process.exit(1);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -129,16 +160,24 @@ if (!CI) {
   }
 } else {
   // Sanity-check the tag matches the version we're about to publish.
+  // On a tag push a mismatch would republish (and clobber) another version.
   const ref = process.env.GITHUB_REF_NAME;
-  if (ref && ref !== `v${newVersion}`) {
-    console.log(
-      `\x1b[33m▸\x1b[0m Tag ${ref} does not match tauri.conf.json version ` +
-        `v${newVersion}. Publishing v${newVersion}.`,
+  if (process.env.GITHUB_REF_TYPE === "tag" && ref && ref !== `v${newVersion}`) {
+    die(`Tag ${ref} does not match tauri.conf.json version v${newVersion} — refusing to publish.`);
+  }
+  // Changesets still in unreleased/ with no whats-new/<version>/ means the
+  // notes were never collected: the release would ship without its tips, and
+  // the in-app What's new would skip them for good.
+  const pending = pendingChangesets(join(REPO, "whats-new"));
+  if (pending.length && !existsSync(join(REPO, "whats-new", newVersion))) {
+    die(
+      `whats-new/unreleased/ has ${pending.length} changeset(s) but whats-new/${newVersion}/ doesn't exist — ` +
+        `run \`node scripts/whats-new.mjs collect ${newVersion}\` and commit it before tagging.`,
     );
   }
 }
 
-step(`Releasing Octopush v${newVersion}${CI ? " (CI mode)" : ""}`);
+step(`Releasing Octopush v${newVersion} on the ${CHANNEL} channel${CI ? " (CI mode)" : ""}`);
 
 // ── Apple signing posture ─────────────────────────────────────────
 // Signing + notarization are fully env-driven: the build spawn below already
@@ -174,26 +213,15 @@ if (NOTARIZED) {
 if (CI) {
   ok(`Version ${newVersion} taken from the tagged commit (no bump in CI)`);
 } else {
-  step("Bumping version in package.json, Cargo.toml, tauri.conf.json");
+  step("Bumping version in package.json, Cargo.toml, Cargo.lock, tauri.conf.json");
 
-  // package.json
-  const pkg = JSON.parse(readFileSync(PKG, "utf8"));
-  pkg.version = newVersion;
-  writeFileSync(PKG, JSON.stringify(pkg, null, 2) + "\n");
-
-  // Cargo.toml — only the [package] version, not deps
-  const cargo = readFileSync(CARGO, "utf8");
-  const cargoBumped = cargo.replace(
-    /^(\[package\][\s\S]*?\nversion\s*=\s*)"[^"]+"/m,
-    `$1"${newVersion}"`,
-  );
-  if (cargoBumped === cargo) die("Failed to bump Cargo.toml version");
-  writeFileSync(CARGO, cargoBumped);
-
-  // tauri.conf.json
-  const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8"));
-  conf.version = newVersion;
-  writeFileSync(TAURI_CONF, JSON.stringify(conf, null, 2) + "\n");
+  // Only the version line of each file changes (same helper the nightly beta
+  // routine uses, so manual and automatic release commits look identical).
+  try {
+    bumpVersionFiles(REPO, newVersion);
+  } catch (e) {
+    die(`Failed to bump versions: ${e.message}`);
+  }
 
   ok(`Bumped to ${newVersion}`);
 }
@@ -350,16 +378,19 @@ const releaseUrl = `https://github.com/octopush-sh/octopush/releases/download/v$
   tarball,
 )}`;
 
-const updaterEntry = { signature, url: releaseUrl };
-const latestJson = {
+// Release notes from the changesets (docs/WHATS-NEW.md §5), when collected.
+const NOTES_MD = join(REPO, "whats-new", newVersion, "notes.md");
+const changesetNotes = existsSync(NOTES_MD) ? readFileSync(NOTES_MD, "utf8") : "";
+if (changesetNotes) ok(`Release notes: whats-new/${newVersion}/notes.md`);
+else console.log(`\x1b[33m▸\x1b[0m No whats-new/${newVersion}/notes.md — using the generic notes`);
+
+const latestJson = buildManifest({
   version: newVersion,
-  notes: `Octopush ${newVersion}`,
-  pub_date: new Date().toISOString(),
-  platforms: {
-    "darwin-aarch64": updaterEntry,
-    "darwin-x86_64": updaterEntry,
-  },
-};
+  notes: changesetNotes,
+  signature,
+  url: releaseUrl,
+  pubDate: new Date().toISOString(),
+});
 const latestPath = join(BUNDLE_DIR, "latest.json");
 writeFileSync(latestPath, JSON.stringify(latestJson, null, 2));
 ok(`latest.json written (darwin-aarch64 + darwin-x86_64 → universal)`);
@@ -386,40 +417,7 @@ step("Creating GitHub release + uploading assets");
 // we drop the `xattr` step entirely (shipping it on a notarized build would be
 // wrong and read as amateurish). An unsigned build keeps the unblock. Either
 // way, users already on a prior version update in-app and never see this.
-const notesBody = NOTARIZED
-  ? `Octopush ${newVersion}
-
-Universal binary — runs natively on both **Apple Silicon** and **Intel** Macs.
-Signed with a Developer ID certificate and notarized by Apple.
-
-## Install
-
-1. Download the \`.dmg\` below.
-2. Open it and drag **Octopush.app** to **Applications**.
-3. Launch Octopush from Applications.
-
-Future versions arrive in-app via the auto-updater.
-`
-  : `Octopush ${newVersion}
-
-Universal binary — runs natively on both **Apple Silicon** and **Intel** Macs.
-
-## Install (first time only)
-
-1. Download the \`.dmg\` below.
-2. Open it and drag **Octopush.app** to **Applications**.
-3. Open Terminal and run:
-
-   \`\`\`
-   xattr -cr /Applications/Octopush.app
-   \`\`\`
-
-4. Launch Octopush from Applications.
-
-The \`xattr\` step removes macOS Gatekeeper's quarantine flag. It's only
-needed for the first manual install — after that, future versions
-arrive in-app via the auto-updater.
-`;
+const notesBody = releaseBody({ version: newVersion, notes: changesetNotes, notarized: NOTARIZED });
 
 // Write notes to a temp file so multi-line markdown survives the shell.
 const notesFile = join(BUNDLE_DIR, ".release-notes.md");
@@ -432,27 +430,87 @@ const ghCmd = [
   `gh release create v${newVersion}`,
   `--title "v${newVersion}"`,
   `--notes-file "${notesFile}"`,
+  ...channelCreateArgs(CHANNEL),
   ...assets.map((p) => `"${p}"`),
 ].join(" ");
-// In CI a release for the tag may already exist (e.g. a re-run) — fall back to
-// uploading assets with --clobber so a retry is idempotent.
-try {
-  run(ghCmd);
-} catch (e) {
-  if (CI) {
-    console.log("\x1b[33m▸\x1b[0m release create failed (may already exist) — uploading assets with --clobber");
-    run(
-      [`gh release upload v${newVersion}`, ...assets.map((p) => `"${p}"`), "--clobber"].join(" "),
+// In CI a release for the tag may already exist (a re-run). Re-upload only
+// into an existing *beta* (draft or prerelease) — never over a promoted stable
+// release — and make sure it ends up published as a prerelease.
+let existing = null;
+if (CI) {
+  try {
+    existing = JSON.parse(
+      execSync(`gh api repos/{owner}/{repo}/releases/tags/v${newVersion}`, {
+        cwd: REPO,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).toString(),
     );
-  } else {
-    throw e;
+  } catch {
+    existing = null; // 404: create it below
   }
+}
+const decision = ciPublishDecision(CI, existing, CHANNEL);
+if (decision === "refuse") {
+  die(`v${newVersion} is already a published stable release — refusing to overwrite its assets.`);
+} else if (decision === "reupload") {
+  console.log(`\x1b[33m▸\x1b[0m v${newVersion} already exists as a beta — re-uploading its assets`);
+  run([`gh release upload v${newVersion}`, ...assets.map((p) => `"${p}"`), "--clobber"].join(" "));
+  run(`gh release edit v${newVersion} --draft=false --prerelease --latest=false`);
+} else {
+  run(ghCmd);
+}
+
+// ── 7. Beta channel manifest ─────────────────────────────────────
+// `beta-channel` is a moving prerelease whose only asset is the newest
+// latest.json (beta builds and stable ones alike). It never moves backwards.
+
+step(`Refreshing the ${BETA_TAG} manifest`);
+
+let betaExists = true;
+try {
+  execSync(`gh release view ${BETA_TAG} --json tagName`, { cwd: REPO, stdio: "ignore" });
+} catch {
+  betaExists = false;
+}
+if (!betaExists) {
+  const betaNotes = join(BUNDLE_DIR, ".beta-channel-notes.md");
+  writeFileSync(
+    betaNotes,
+    "Moving manifest for the Octopush beta update channel. Its `latest.json` always " +
+      "describes the newest release. Not an installable release — see the versioned releases.\n",
+  );
+  run(
+    `gh release create ${BETA_TAG} --prerelease --latest=false --title "${BETA_TITLE}" --notes-file "${betaNotes}"`,
+  );
+}
+let currentBeta = null;
+if (betaExists) {
+  try {
+    const cur = execSync(`gh release download ${BETA_TAG} --pattern latest.json --output -`, {
+      cwd: REPO,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).toString();
+    currentBeta = JSON.parse(cur).version ?? null;
+  } catch {
+    currentBeta = null; // no manifest yet (or unreadable) — replace it
+  }
+}
+if (shouldRefreshBetaManifest(currentBeta, newVersion)) {
+  run(`gh release upload ${BETA_TAG} "${latestPath}" --clobber`);
+  ok(`${BETA_TAG}/latest.json → v${newVersion}`);
+} else {
+  console.log(
+    `\x1b[33m▸\x1b[0m ${BETA_TAG} already advertises v${currentBeta} (newer than v${newVersion}) — left as is`,
+  );
 }
 
 console.log("");
 ok(
-  `Released v${newVersion} — clients with auto-update will see it within 6h ` +
-    `or on next launch.`,
+  CHANNEL === "beta"
+    ? `Released v${newVersion} on the beta channel (prerelease). Promote it to stable ` +
+        `with the promote workflow: gh workflow run promote.yml -f version=${newVersion}`
+    : `Released v${newVersion} — clients with auto-update will see it within 6h ` +
+        `or on next launch.`,
 );
 console.log("");
 console.log(

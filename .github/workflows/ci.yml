@@ -5,6 +5,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The nightly workflows push with GITHUB_TOKEN, which starts no workflows;
+  # they dispatch CI on their branches instead (docs/ROUTINES.md).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,7 +33,7 @@ jobs:
 
   backend:
     # Keychain, the seatbelt sandbox and PTY code are macOS-only.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -78,3 +81,15 @@ jobs:
           node-version: 22
       - name: AGENTS.md mirrors CLAUDE.md
         run: node scripts/check-agents-md.mjs
+      - run: npm ci
+      - name: what's-new changesets are valid
+        run: node --test scripts/whats-new.test.mjs && node scripts/whats-new.mjs check
+      - name: clip recorder logic
+        # Pure parts only (selection, size fitting). Browser recording is not run in CI.
+        run: node --test scripts/clips/lib.test.mjs
+      - name: release helpers and the nightly beta routine
+        run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs
+      - name: routine scripts
+        run: node --test scripts/routines/routines.test.mjs
+      - name: routine scripts parse
+        run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done

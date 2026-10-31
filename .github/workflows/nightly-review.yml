@@ -1,0 +1,110 @@
+# Nightly review + guarded auto-merge (VISION.md §8, docs/ROUTINES.md).
+#
+# For each builder PR with green CI and no verdict on its head commit, a Claude
+# reviewer agent (read-only tools, no GitHub access) judges the code and writes
+# a verdict file. A fixed step posts it as github-actions[bot], then
+# automerge.mjs re-checks every rule on that exact commit and merges — or parks
+# the PR for the owner. 03:00 Bogotá.
+name: nightly-review
+
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write       # merge
+  pull-requests: write  # merge
+  issues: write         # verdict comments, labels
+
+concurrency:
+  group: nightly-review
+  cancel-in-progress: false
+
+env:
+  OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+  OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+  CLAUDE_CODE_VERSION: "2.1.314"
+  MAX_PRS: "3"
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Queue
+        id: queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/routines/automerge.mjs queue | head -n "$MAX_PRS" > "$RUNNER_TEMP/queue.tsv"
+          echo "count=$(wc -l < "$RUNNER_TEMP/queue.tsv" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/queue.tsv"
+
+      - name: Prepare
+        if: steps.queue.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          cp -R scripts/routines "$RUNNER_TEMP/routines"
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+
+      - name: Review each PR
+        if: steps.queue.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -uo pipefail
+          R="$RUNNER_TEMP/routines"
+          while IFS=$'\t' read -r num sha title url; do
+            [[ "$num" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            echo "::group::#$num $title"
+            git fetch --quiet origin "pull/$num/head" || { echo "fetch failed"; echo "::endgroup::"; continue; }
+            work="/tmp/review/pr-$num"; rm -rf "$work"; mkdir -p "$work"
+            # The PR's code without .git; main's agent docs, so the PR can't brief its own reviewer.
+            git archive "$sha" | tar -x -C "$work"
+            # No symlinks (they could point the reviewer at /proc or runner files),
+            # no agent instructions from the PR anywhere in the tree.
+            find "$work" -type l -delete
+            find "$work" \( -iname 'CLAUDE*.md' -o -iname 'AGENTS.md' \) -type f -delete
+            find "$work" -type d -name .claude -prune -exec rm -rf {} +
+            for f in CLAUDE.md AGENTS.md VISION.md; do git show "origin/main:$f" > "$work/$f" 2>/dev/null || true; done
+            {
+              cat "$R/briefs/reviewer.md"
+              echo
+              node "$R/read.mjs" pr "$num"
+              for issue in $(gh api "repos/$GITHUB_REPOSITORY/pulls/$num" --jq '.body // ""' | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +#[0-9]+' | grep -oE '[0-9]+$' | head -n 3); do
+                echo; node "$R/read.mjs" issue "$issue"
+              done
+              echo; echo '## Diff (main...head)'; echo '```diff'
+              git -c core.attributesFile=/dev/null diff --text --no-textconv --no-ext-diff "origin/main...$sha"
+              echo '```'
+            } > "$RUNNER_TEMP/prompt-$num.md"
+            # The agent gets neither GH_TOKEN nor anything else (agent.mjs rebuilds its env).
+            (cd "$work" && env -u GH_TOKEN -u OCTOPUSH_SECRETS node "$R/agent.mjs" reviewer "$RUNNER_TEMP/prompt-$num.md") \
+              || echo "reviewer agent failed on #$num"
+            if [ -f "$work/.agent-out/review.json" ]; then
+              cp "$work/.agent-out/review.json" "$RUNNER_TEMP/review-$num.json"
+              out="$(OCTOPUSH_REVIEWER_TOKEN="$GH_TOKEN" node "$R/automerge.mjs" review-json "$num" "$sha" "$RUNNER_TEMP/review-$num.json")" || true
+              echo "$out"
+              # Only an approval goes on to the merge check; "changes" goes back to the builder.
+              if [[ "$out" == "posted approve "* ]] && node "$R/automerge.mjs" merge "$num"; then
+                # A GITHUB_TOKEN merge starts no workflows: run CI on main for the nightly release.
+                gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref=main >/dev/null || true
+              fi
+            else
+              echo "no verdict for #$num — it stays in the queue for tomorrow"
+            fi
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/queue.tsv"

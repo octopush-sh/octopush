@@ -1,5 +1,10 @@
 import { create } from "zustand";
 import { ipc, type SyncedRun, type SyncedRunDetail } from "../lib/ipc";
+import { useSyncPrefsStore } from "./syncPrefsStore";
+
+/** History sync is opt-in (off by default). With it off this store never
+ *  touches the network — the sheet shows a "turned off" state instead. */
+const historySyncOn = () => useSyncPrefsStore.getState().historySync;
 
 /** Cross-machine run history (Pro-real Part B). Holds the read-only mirror of
  *  the signed-in Pro user's Direct-run history synced from the cloud (B1), the
@@ -8,7 +13,8 @@ import { ipc, type SyncedRun, type SyncedRunDetail } from "../lib/ipc";
  *
  *  The Pro-vs-upgrade decision lives at the trigger (the top-bar button) — this
  *  store is only opened once the user is entitled, so its network calls never hit
- *  the upgrade path in the normal flow. */
+ *  the upgrade path in the normal flow. Every network call is additionally
+ *  skipped while the user's history-sync opt-in is off. */
 interface HistoryState {
   open: boolean;
   runs: SyncedRun[];
@@ -32,6 +38,10 @@ interface HistoryState {
   /** Once-per-launch backfill push + pull. Best-effort/silent; Pro-only (the
    *  caller gates on the entitlement). */
   syncOnLaunch: () => Promise<void>;
+  /** The backfill push + pull itself, THROWING on failure (so the first
+   *  backfill after turning sync on can report it). Returns the count pushed;
+   *  0 without a call when sync is off. */
+  backfill: () => Promise<number>;
   /** Drill into one run — serves the cached detail instantly, else fetches. */
   openRun: (runId: string) => Promise<void>;
   /** Back to the list (keeps the cache). */
@@ -65,6 +75,10 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   close: () => set({ open: false, viewedRunId: null, detailError: null }),
 
   refresh: async () => {
+    if (!historySyncOn()) {
+      set({ loading: false, error: null });
+      return;
+    }
     set({ loading: true, error: null });
     try {
       const runs = await ipc.historySyncPull();
@@ -74,11 +88,17 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
     }
   },
 
+  backfill: async () => {
+    if (!historySyncOn()) return 0;
+    const pushed = await ipc.historySyncPushAll();
+    const runs = await ipc.historySyncPull();
+    set({ runs, loaded: true });
+    return pushed;
+  },
+
   syncOnLaunch: async () => {
     try {
-      await ipc.historySyncPushAll();
-      const runs = await ipc.historySyncPull();
-      set({ runs, loaded: true });
+      await get().backfill();
     } catch {
       // Offline / not entitled → leave the mirror as-is; History opens on demand.
     }
@@ -87,6 +107,10 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
   openRun: async (runId) => {
     set({ viewedRunId: runId, detailError: null });
     if (runId in get().detailByRun) return; // cached (incl. a cached "none")
+    if (!historySyncOn()) {
+      set({ detailError: "History sync is off." });
+      return;
+    }
     set({ detailLoading: runId });
     try {
       const detail = await ipc.historyRunDetail(runId);
