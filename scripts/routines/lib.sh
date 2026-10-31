@@ -32,7 +32,10 @@ days_ago_iso() { node -e "console.log(new Date(Date.now()-$1*864e5).toISOString(
 # success | pending | failure | none — latest "CI" workflow run for a commit.
 ci_status_for() {
   gh api "repos/$1/actions/runs?head_sha=$2&per_page=50" --jq '
-    [.workflow_runs[] | select(.name == "CI")] | sort_by(.created_at) | last |
+    [.workflow_runs[] | select(.name == "CI")
+      | select(.status != "waiting")
+      | select((.status == "completed" and ((.conclusion // "") | IN("action_required", "cancelled", "skipped", "stale", "neutral"))) | not)]
+    | sort_by(.created_at) | last |
     if . == null then "none"
     elif .status != "completed" then "pending"
     elif .conclusion == "success" then "success"

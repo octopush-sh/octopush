@@ -620,3 +620,13 @@ test("publish-build end to end: a real git repo, a fake GitHub — PR opened, CI
   const none = await run(() => {}, { action: "pr", title: "T", summary: "S" });
   assert.equal(none.code, 1, "no changes → parked, not a crash");
 });
+
+test("CI status ignores runs that say nothing about the code (bot runs awaiting approval, superseded)", async () => {
+  const { ciStatus } = await import("./gh.mjs");
+  const runs = (list) => fakeGh([[/actions\/runs\?head_sha=x/, { workflow_runs: list }]]).gh;
+  const run = (created_at, status, conclusion) => ({ name: "CI", created_at, status, conclusion });
+  assert.equal(ciStatus(runs([run("1", "completed", "success"), run("2", "completed", "action_required")]), "o/r", "x"), "success");
+  assert.equal(ciStatus(runs([run("1", "completed", "failure"), run("2", "completed", "cancelled")]), "o/r", "x"), "failure");
+  assert.equal(ciStatus(runs([run("1", "completed", "action_required")]), "o/r", "x"), "none");
+  assert.equal(ciStatus(runs([run("1", "waiting", null), run("0", "in_progress", null)]), "o/r", "x"), "pending");
+});

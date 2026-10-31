@@ -9,7 +9,7 @@ name: nightly-review
 
 on:
   schedule:
-    - cron: "0 8 * * *"
+    - cron: "23 8 * * *"
   workflow_dispatch:
 
 permissions:

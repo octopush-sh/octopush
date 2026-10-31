@@ -8,7 +8,7 @@ name: nightly-release
 
 on:
   schedule:
-    - cron: "0 10 * * *"
+    - cron: "13 10 * * *"
   workflow_dispatch:
 
 permissions:
