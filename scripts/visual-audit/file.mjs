@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+// File the visual audit's findings as issues (scripts/visual-audit/README.md).
+//
+//   node scripts/visual-audit/file.mjs <findings.json> [--dry-run]
+//
+// One issue per defect (fingerprint marker in the body, label `visual`):
+//   - new defect            → new issue; the first READY_CAP get `ready` so the
+//                             nightly builder fixes them (deterministic checks
+//                             only — they can't hallucinate);
+//   - defect fixed earlier  → reopened: it came back (a regression);
+//   - already open, or closed as "not planned" by the owner → left alone.
+// At most MAX_NEW new issues per run, so a bad night can't flood the tracker.
+//
+//   node scripts/visual-audit/file.mjs --design <design.json> <findings.json> [--dry-run]
+//
+// files the design reviewer's findings instead: validated (a real screenshot,
+// a region inside it), high/medium only, at most MAX_DESIGN a night, labelled
+// `proposal` (the owner or PM decides) — an AI's taste never goes straight to
+// the builder.
+import { readFileSync } from "node:fs";
+import { APP_REPO, makeGh, labelsOf, sanitize, reportFatal } from "../routines/gh.mjs";
+import { issueTitle, issueBody, MARK, fingerprint } from "./checks.mjs";
+
+export const MAX_NEW = 5;
+export const READY_CAP = 2;
+export const LABELS = ["visual", "area:app"];
+export const MAX_DESIGN = 3;
+const SHOT_RE = /^shots\/[A-Za-z0-9._-]+\.png$/;
+const clip = (t, n) => String(t ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+
+/**
+ * Validate the design reviewer's output against tonight's screenshots (pure,
+ * tested). Returns findings shaped like the checks' (fp, surface, …) plus
+ * the reviewer's text. Anything malformed is dropped, never "fixed up".
+ */
+export function validDesignFindings(design, visited, { size = "1280x800" } = {}) {
+  const shots = new Map(visited.map((v) => [`shots/${v.shot}`, v]));
+  const [W, H] = size.split("x").map(Number);
+  const out = [];
+  for (const f of Array.isArray(design?.findings) ? design.findings.slice(0, 5) : []) {
+    if (!f || !SHOT_RE.test(String(f.screenshot)) || !shots.has(f.screenshot)) continue;
+    if (!["high", "medium"].includes(f.severity)) continue;
+    const r = f.region ?? {};
+    const nums = [r.x, r.y, r.w, r.h].map(Number);
+    if (nums.some((n) => !Number.isFinite(n) || n < 0) || nums[2] < 4 || nums[3] < 4 || nums[0] + nums[2] > W + 1 || nums[1] + nums[3] > H + 1) continue;
+    const rule = clip(f.rule, 160), problem = clip(f.problem, 400), fix = clip(f.fix, 400);
+    if (!rule || !problem || !fix) continue;
+    const v = shots.get(f.screenshot);
+    out.push({ fp: fingerprint({ check: "design", selector: `${v.surface}|${rule.toLowerCase().slice(0, 60)}` }), check: "design", surface: v.surface, rule, problem, fix, severity: f.severity, shot: v.shot, region: { x: nums[0], y: nums[1], w: nums[2], h: nums[3] } });
+  }
+  return out;
+}
+
+/** Issues for validated design findings (pure, tested). */
+export function planDesign(findings, existing, { max = MAX_DESIGN, runUrl } = {}) {
+  const known = new Set(existing.map((i) => fpOf(i.body)).filter(Boolean));
+  return findings.filter((f) => !known.has(f.fp)).slice(0, max).map((f) => ({
+    type: "create",
+    title: `Visual design: ${clip(f.problem, 60)} (${f.surface})`.slice(0, 90),
+    labels: [...LABELS, "proposal"],
+    body: sanitize([
+      `The nightly design review (a Claude agent reading tonight's WebKit screenshots against the design system) flagged this. **Owner/PM:** say yes to make it \`ready\`.`,
+      "",
+      `- **Surface:** \`${f.surface}\` · severity ${f.severity}`,
+      `- **Rule:** ${f.rule}`,
+      `- **Problem:** ${f.problem}`,
+      `- **Suggested fix:** ${f.fix}`,
+      `- **Where:** \`${f.shot}\`, region x=${f.region.x} y=${f.region.y} w=${f.region.w} h=${f.region.h}${runUrl ? ` ([screenshots](${runUrl}))` : ""}`,
+    ].join("\n")) + `\n\n${MARK(f.fp)}`,
+  }));
+}
+
+const FP_RE = /<!-- octopush-visual:([0-9a-f]{8}) -->/;
+export const fpOf = (body) => (String(body ?? "").match(FP_RE) ?? [])[1] ?? null;
+
+/** What to do with each finding (pure, tested). */
+export function planFiling(findings, existing, { maxNew = MAX_NEW, readyCap = READY_CAP, engine, runUrl, openReady = 0 } = {}) {
+  const byFp = new Map();
+  for (const i of existing) { const fp = fpOf(i.body); if (fp && !i.pull_request) byFp.set(fp, i); }
+  const actions = [];
+  let created = 0;
+  let ready = 0;
+  for (const f of findings) {
+    const known = byFp.get(f.fp);
+    if (known) {
+      if (known.state === "closed" && known.state_reason !== "not_planned") {
+        actions.push({ type: "reopen", number: known.number, comment: `The nightly visual audit reports this again (${f.sizes.join(", ")}, ${engine ?? "WebKit"}) — it came back after the fix.${runUrl ? ` [Audit run](${runUrl}).` : ""}` });
+      }
+      continue;
+    }
+    if (created >= maxNew) continue;
+    created++;
+    // Keep the builder's visual queue short: never more than readyCap open `ready` visual issues.
+    const labels = [...LABELS];
+    if (openReady + ready < readyCap) { labels.push("ready"); ready++; }
+    actions.push({ type: "create", title: issueTitle(f), body: sanitize(issueBody(f, { engine, runUrl })).replace(sanitize(MARK(f.fp)), MARK(f.fp)), labels });
+  }
+  return actions;
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const di = args.indexOf("--design");
+  const designFile = di >= 0 ? args[di + 1] : null;
+  const file = args.find((a, i) => !a.startsWith("--") && (di < 0 || i !== di + 1));
+  const dry = args.includes("--dry-run");
+  if (!file || (di >= 0 && !designFile)) { console.error("usage: file.mjs [--design <design.json>] <findings.json> [--dry-run]"); return 64; }
+  const report = JSON.parse(readFileSync(file, "utf8"));
+  const gh = makeGh();
+  const repo = process.env.OCTOPUSH_ROUTINE_REPO || APP_REPO;
+  const runUrl = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : undefined;
+  const existing = gh.list(`repos/${repo}/issues?state=all&labels=visual`, 500);
+  const openReady = existing.filter((i) => i.state === "open" && !i.pull_request && labelsOf(i).includes("ready")).length;
+  const actions = designFile
+    ? planDesign(validDesignFindings(JSON.parse(readFileSync(designFile, "utf8")), report.visited ?? []), existing, { runUrl })
+    : planFiling(report.findings ?? [], existing, { engine: report.engine === "webkit" ? "WebKit" : "Chromium", runUrl, openReady });
+  for (const a of actions) {
+    if (dry) { console.log(`[dry-run] ${a.type} ${a.number ?? a.title} ${a.labels ? `(${a.labels.join(", ")})` : ""}`); continue; }
+    if (a.type === "create") {
+      const i = gh.send("POST", `repos/${repo}/issues`, { title: a.title, body: a.body, labels: a.labels });
+      console.log(`filed #${i.number} ${a.title} (${a.labels.join(", ")})`);
+    } else {
+      gh.send("PATCH", `repos/${repo}/issues/${a.number}`, { state: "open" });
+      gh.send("POST", `repos/${repo}/issues/${a.number}/comments`, { body: a.comment });
+      console.log(`reopened #${a.number}`);
+    }
+  }
+  if (!actions.length) console.log("nothing new to file");
+  return 0;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  try { process.exit(main()); } catch (e) { reportFatal("visual-audit/file", e); process.exit(1); }
+}

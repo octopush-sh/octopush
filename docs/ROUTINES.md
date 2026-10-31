@@ -21,6 +21,7 @@ You approve ideas; everything else happens overnight (VISION.md §8–§9). Time
 
 | Time | Workflow | What happens |
 |---|---|---|
+| 00:29 | [`visual-audit.yml`](../.github/workflows/visual-audit.yml) | renders every surface in **WebKit** (the macOS engine) with real-world data at three window sizes and runs layout checks (text escaping its box, text over text, sideways scroll, unlabeled controls); new defects become `visual` issues, the first two `ready` for the builder; then a Claude design reviewer reads the screenshots against the design system and files at most 3 findings as `proposal` ([scripts/visual-audit/](../scripts/visual-audit/README.md)) |
 | 01:07, 01:47 | [`nightly-build.yml`](../.github/workflows/nightly-build.yml) | each run takes one job — a PR the review sent back or whose CI is red, else the oldest `ready` issue — and a Claude agent builds it; the workflow opens or updates the PR (label `agent`) and starts CI |
 | 03:23 | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason), or parks them as `needs-owner` |
 | 05:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
@@ -56,7 +57,7 @@ trusted:
   (`--permission-mode dontAsk`). File tools are allowed only inside the working directory (so not
   the runner's action code or tool cache, which run later with a token), and the process table,
   system and credential paths, the runner's temp dir and git config are denied on top. The
-  reviewer and the ideas agent can only write their output file; only the ideas agent can use the
+  reviewer, the design reviewer (`visual-audit.yml`) and the ideas agent can only write their output file; only the ideas agent can use the
   web. Transcripts stay on the runner — public Actions logs show only the exit code.
 - **The builder runs code only through `octo-check`** (typecheck, tests, changeset check) — a
   root-owned copy of `scripts/routines/agent-check.sh` that runs the checks as a separate user with

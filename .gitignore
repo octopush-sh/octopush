@@ -63,3 +63,4 @@ octopus.db-journal
 # Local git worktrees created by EnterWorktree
 .claude/worktrees/
 .claire/
+.visual-audit/
