@@ -6035,9 +6035,10 @@ mod orchestrator_tests {
 
     // ── Routine pre-fire condition (`fire_condition`) ───────────────────────
 
-    /// The pure condition evaluator, gated purely on exit code: 0 ⇒ Met,
-    /// non-zero ⇒ NotMet, and a command that outruns the timeout ⇒ Error (the
-    /// child is killed) — a hung check can never stall the scheduler tick.
+    /// The pure condition evaluator, gated on exit code: 0 ⇒ Met, 1 ⇒ NotMet,
+    /// any other exit ⇒ Error (a broken check never reads as "nothing to do"),
+    /// and a command that outruns the timeout ⇒ Error (the child is killed) — a
+    /// hung check can never stall the scheduler tick.
     #[tokio::test]
     async fn routine_condition_evaluates_by_exit_code() {
         use crate::routines::{evaluate_condition, ConditionEval};
@@ -6045,10 +6046,119 @@ mod orchestrator_tests {
         let dir = std::env::temp_dir();
         assert_eq!(evaluate_condition("true", &dir, Duration::from_secs(5)).await, ConditionEval::Met);
         assert_eq!(evaluate_condition("false", &dir, Duration::from_secs(5)).await, ConditionEval::NotMet);
-        assert_eq!(evaluate_condition("exit 7", &dir, Duration::from_secs(5)).await, ConditionEval::NotMet);
+        assert_eq!(evaluate_condition("exit 1", &dir, Duration::from_secs(5)).await, ConditionEval::NotMet);
+        assert_eq!(evaluate_condition("exit 7", &dir, Duration::from_secs(5)).await, ConditionEval::Error("exit 7".into()));
         // Outruns the timeout ⇒ Error (skip, fail-safe).
         let timed_out = evaluate_condition("sleep 5", &dir, Duration::from_millis(100)).await;
         assert!(matches!(timed_out, ConditionEval::Error(_)), "{timed_out:?}");
+    }
+
+    /// The production bug (#247): `deploy-if-ready.sh check` exited 2 with
+    /// `gh: command not found` and showed "condition not met". Exit 2 is now an
+    /// error that keeps the last stderr lines; exit 1 stays "not met".
+    #[tokio::test]
+    async fn routine_condition_exit_2_is_an_error_with_stderr_tail() {
+        use crate::routines::{evaluate_condition, ConditionEval, SkipReason};
+        use std::time::Duration;
+        let dir = std::env::temp_dir();
+        let cmd = "echo 'checking…' >&2; echo 'deploy-if-ready: step one' >&2; echo 'gh: command not found' >&2; exit 2";
+        match evaluate_condition(cmd, &dir, Duration::from_secs(5)).await {
+            ConditionEval::Error(msg) => {
+                assert_eq!(msg, "exit 2 · deploy-if-ready: step one · gh: command not found");
+                assert_eq!(
+                    SkipReason::ConditionError(msg).label(),
+                    "condition error: exit 2 · deploy-if-ready: step one · gh: command not found",
+                );
+            }
+            other => panic!("exit 2 must be an error, got {other:?}"),
+        }
+        let not_met = evaluate_condition("echo 'nothing to deploy' >&2; exit 1", &dir, Duration::from_secs(5)).await;
+        assert_eq!(not_met, ConditionEval::NotMet);
+        // A missing program (127) is an error too, never "not met".
+        let missing = evaluate_condition("octopush-no-such-program-247", &dir, Duration::from_secs(5)).await;
+        match missing {
+            ConditionEval::Error(msg) => {
+                assert!(msg.starts_with("exit 127 · "), "{msg}");
+                assert!(msg.contains("octopush-no-such-program-247"), "{msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// Exit classification and the stderr tail, pure.
+    #[test]
+    fn routine_condition_exit_classification_and_stderr_tail() {
+        use crate::routines::{classify_condition_exit, stderr_tail, ConditionEval};
+        assert_eq!(classify_condition_exit(Some(0), "noise"), ConditionEval::Met);
+        assert_eq!(classify_condition_exit(Some(1), "noise"), ConditionEval::NotMet);
+        assert_eq!(classify_condition_exit(Some(2), ""), ConditionEval::Error("exit 2".into()));
+        assert_eq!(classify_condition_exit(Some(2), "a\n\nb\nc\n"), ConditionEval::Error("exit 2 · b · c".into()));
+        assert_eq!(classify_condition_exit(None, "x"), ConditionEval::Error("killed by a signal · x".into()));
+        let long = "e".repeat(500);
+        let tail = stderr_tail(&long);
+        assert_eq!(tail.chars().count(), 160);
+        assert!(tail.ends_with('…'));
+        assert_eq!(stderr_tail("  \n"), "");
+    }
+
+    /// The condition runs with the PATH it's given (the login-shell PATH in
+    /// production), so a tool that lives only there resolves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_condition_runs_with_the_given_path() {
+        use crate::routines::{evaluate_condition_with_path, ConditionEval};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("login-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tool = bin.join("octo-fake-gh");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let eval = evaluate_condition_with_path("octo-fake-gh", dir.path(), Duration::from_secs(5), &path).await;
+        assert_eq!(eval, ConditionEval::Met);
+        let without = evaluate_condition_with_path("octo-fake-gh", dir.path(), Duration::from_secs(5), "/usr/bin:/bin").await;
+        assert!(matches!(without, ConditionEval::Error(ref m) if m.starts_with("exit 127")), "{without:?}");
+    }
+
+    /// The login-shell PATH comes from the user's `$SHELL -l -i -c`, read between
+    /// markers so rc-file chatter is ignored; a shell that hangs is bounded by
+    /// the timeout and yields `None` (the inherited PATH is used instead).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_login_shell_path_is_resolved_and_bounded() {
+        use crate::routines::{extract_marked_path, login_shell_path};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        assert_eq!(
+            extract_marked_path("Welcome!\n__OCTOPUSH_PATH__/opt/homebrew/bin:/usr/bin__OCTOPUSH_PATH__"),
+            Some("/opt/homebrew/bin:/usr/bin".into()),
+        );
+        assert_eq!(extract_marked_path("no markers here"), None);
+        assert_eq!(extract_marked_path("__OCTOPUSH_PATH____OCTOPUSH_PATH__"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        // A fake login shell: chatty rc output, then runs the `-c` script with a
+        // PATH that has the login-only entries (as ~/.zprofile would).
+        let shell = dir.path().join("fake-zsh");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\necho 'rc banner'\nPATH=/fake/homebrew/bin:/fake/.local/bin:/usr/bin:/bin\nexport PATH\nshift 3\nexec /bin/sh -c \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = login_shell_path(shell.to_str().unwrap(), Duration::from_secs(5)).await.expect("resolved");
+        assert!(path.split(':').any(|d| d == "/fake/homebrew/bin"), "{path}");
+        assert!(path.split(':').any(|d| d == "/fake/.local/bin"), "{path}");
+
+        // A shell whose rc file never returns can't hang a routine.
+        let hung = dir.path().join("hung-zsh");
+        std::fs::write(&hung, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hung, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        assert_eq!(login_shell_path(hung.to_str().unwrap(), Duration::from_millis(200)).await, None);
+        assert!(started.elapsed() < Duration::from_secs(3), "bounded by the timeout");
     }
 
     /// On timeout the WHOLE process group is killed, not just `bash`: a
@@ -6073,7 +6183,7 @@ mod orchestrator_tests {
         assert!(!marker.exists(), "the backgrounded child must be killed with the group");
     }
 
-    /// A condition that exits non-zero skips the window with NO run created (zero
+    /// A condition that exits 1 skips the window with NO run created (zero
     /// tokens), the window still advanced FIRST (crash-safe), and the skip is
     /// legible (`last_outcome`/`last_checked_at`). `run_routine_now` surfaces the
     /// reason, so "Run now" is an honest test of the gated path.
@@ -6107,6 +6217,34 @@ mod orchestrator_tests {
         assert_eq!(r.last_outcome.as_deref(), Some("condition not met"), "the skip is legible");
         assert!(r.last_checked_at.is_some(), "checked_at stamped on a skip");
         assert!(r.last_run_id.is_none(), "no run stamped on a skip");
+    }
+
+    /// A condition that exits 2 is a fail-safe skip with no run, and the
+    /// Routines list says why (`last_outcome` = "condition error: exit 2 · …"),
+    /// not "condition not met".
+    #[tokio::test]
+    async fn routine_condition_error_exit_is_legible_in_last_outcome() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("RCX", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let mut input = routine_input(&pid, "interval", "3600");
+        input.fire_condition = Some("echo 'gh: command not found' >&2; exit 2".into());
+        db.lock().insert_routine("r-cond-err", &input, Some("2000-01-01T00:00:00+00:00"), true).unwrap();
+
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = orch.run_routine_now("r-cond-err").await.unwrap();
+        assert_eq!(
+            outcome,
+            FireOutcome::Skipped(SkipReason::ConditionError("exit 2 · gh: command not found".into())),
+        );
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "an erroring condition never fires");
+        let r = db.lock().get_routine("r-cond-err").unwrap().unwrap();
+        assert_eq!(r.last_outcome.as_deref(), Some("condition error: exit 2 · gh: command not found"));
     }
 
     /// A fixed routine whose workspace has a live run is `Busy` (not mislabelled
@@ -6171,9 +6309,9 @@ mod orchestrator_tests {
     async fn routine_condition_error_is_a_failsafe_skip() {
         use crate::routines::{evaluate_condition, ConditionEval};
         use std::time::Duration;
-        // A genuinely unresolvable program under `bash -lc` still exits (127),
-        // which is a NotMet skip; the Error branch is the un-evaluable case
-        // (spawn failure / timeout) — assert the timeout maps to Error.
+        // An unresolvable program exits 127 (an Error, see
+        // `routine_condition_exit_2_is_an_error_with_stderr_tail`); here assert
+        // the un-evaluable case — a timeout — maps to Error too.
         let dir = std::env::temp_dir();
         let evaluated = evaluate_condition("sleep 30", &dir, Duration::from_millis(50)).await;
         match evaluated {

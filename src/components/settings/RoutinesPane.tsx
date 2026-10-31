@@ -472,7 +472,7 @@ function RoutineEditor({
               mono
             />
             <p className="mt-1 text-[11px] leading-snug text-octo-mute">
-              Runs before each fire in the routine&rsquo;s workspace; the routine fires only if this command exits 0. Leave empty to always fire.
+              Runs before each fire in the routine&rsquo;s workspace; the routine fires only if this command exits 0. Exit 1 skips the window; any other exit shows as a condition error with its last stderr lines. Leave empty to always fire.
             </p>
           </Field>
 

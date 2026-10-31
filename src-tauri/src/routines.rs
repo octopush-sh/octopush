@@ -46,10 +46,11 @@ const MIN_WINDOW_STEP_MIN: i64 = 15;
 pub enum SkipReason {
     /// The target workspace already has a live run (or the launch was refused).
     Busy,
-    /// The `fire_condition` command exited non-zero — nothing to do this window.
+    /// The `fire_condition` command exited 1 — nothing to do this window.
     ConditionNotMet,
-    /// The `fire_condition` couldn't be evaluated (spawn failure / timeout) —
-    /// fail-SAFE: skip rather than fire blindly, and surface why.
+    /// The `fire_condition` couldn't be evaluated (spawn failure / timeout / an
+    /// exit other than 0 or 1) — fail-SAFE: skip rather than fire blindly, and
+    /// surface why.
     ConditionError(String),
     /// The workspace couldn't be resolved (deleted / off-disk / unconfigured).
     WorkspaceUnavailable,
@@ -130,29 +131,162 @@ enum FixedResolve {
 pub enum ConditionEval {
     /// exit 0 — fire.
     Met,
-    /// non-zero exit — skip this window (nothing to do).
+    /// exit 1 — skip this window (nothing to do).
     NotMet,
-    /// couldn't evaluate (spawn failure or timeout) — skip, fail-safe.
+    /// couldn't evaluate (spawn failure, timeout, or any exit other than 0/1,
+    /// e.g. `127` command not found) — skip, fail-safe, and say why.
     Error(String),
 }
 
-/// Run a routine's `fire_condition` shell command in `cwd`, bounded by `timeout`.
-/// A login shell (`bash -lc`) so the user's PATH + `gh` auth are present — the
-/// SAME trust model as a run's `run_command` (their command, their machine).
-/// exit 0 ⇒ `Met`; non-zero ⇒ `NotMet`; spawn failure / timeout ⇒ `Error`.
+/// How long resolving the user's login-shell PATH may take. A slow or
+/// interactive rc file (a prompt, a `read`, a network call) can never hang a
+/// routine: past this, the condition falls back to the inherited PATH.
+const LOGIN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Delimits `$PATH` in the login shell's stdout, so whatever the rc files print
+/// (banners, `nvm` notices) can't be mistaken for it.
+const PATH_MARKER: &str = "__OCTOPUSH_PATH__";
+
+/// How many trailing stderr lines a condition error keeps for `last_outcome`.
+const STDERR_TAIL_LINES: usize = 2;
+
+/// Cap on the stderr part of a condition error, so one noisy line can't flood
+/// the Routines list.
+const STDERR_TAIL_MAX_CHARS: usize = 160;
+
+/// Pull the PATH printed between two `PATH_MARKER`s out of a login shell's
+/// stdout. `None` when the markers are missing or the PATH is empty.
+pub fn extract_marked_path(stdout: &str) -> Option<String> {
+    let start = stdout.find(PATH_MARKER)? + PATH_MARKER.len();
+    let len = stdout[start..].find(PATH_MARKER)?;
+    let path = stdout[start..start + len].trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// Ask `shell` for the PATH a login + interactive session would have
+/// (`$SHELL -l -i -c`, so `~/.zprofile` AND `~/.zshrc` are sourced — where
+/// Homebrew, nvm and `~/.local/bin` usually land). Bounded by `timeout`; the
+/// shell gets no stdin and its own session, and the whole group is killed on
+/// timeout. `None` on any failure.
+pub async fn login_shell_path(shell: &str, timeout: Duration) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.args(["-l", "-i", "-c"])
+        .arg(format!("printf '%s%s%s' '{PATH_MARKER}' \"$PATH\" '{PATH_MARKER}'"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: as in `evaluate_condition_with_path`.
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let read = tokio::spawn(read_to_string_lossy(stdout));
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            kill_process_group(&mut child);
+            let _ = child.wait().await;
+            return None;
+        }
+    }
+    // The marker is printed before exit; a backgrounded rc job still holding
+    // the pipe must not stall us either.
+    let out = tokio::time::timeout(Duration::from_secs(1), read).await.ok()?.ok()?;
+    extract_marked_path(&out)
+}
+
+/// The PATH a fire condition runs with: the user's login-shell PATH (resolved
+/// once per app session and cached), then the app's inherited PATH. GUI apps
+/// start from launchd's minimal `/usr/bin:/bin:/usr/sbin:/sbin`, and `bash -l`
+/// alone never reads zsh's rc files, so without this `gh`/`node`/`claude` are
+/// "command not found".
+async fn condition_path() -> String {
+    static LOGIN_PATH: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+    let login = LOGIN_PATH
+        .get_or_init(|| async {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let path = login_shell_path(&shell, LOGIN_PATH_TIMEOUT).await;
+            if path.is_none() {
+                tracing::warn!(%shell, "could not resolve the login-shell PATH for routine conditions — using the inherited PATH");
+            }
+            path
+        })
+        .await;
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    crate::orchestrator::cli_runner::merge_path_dirs(&[login.as_deref().unwrap_or(""), &inherited])
+}
+
+/// The last `STDERR_TAIL_LINES` non-empty lines of `stderr`, joined with
+/// " · " and capped at `STDERR_TAIL_MAX_CHARS` (an ellipsis marks the cut).
+pub fn stderr_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join(" · ");
+    if tail.chars().count() <= STDERR_TAIL_MAX_CHARS {
+        return tail;
+    }
+    let cut: String = tail.chars().take(STDERR_TAIL_MAX_CHARS - 1).collect();
+    format!("{cut}…")
+}
+
+/// Classify a finished condition: exit 0 ⇒ `Met`, exit 1 ⇒ `NotMet`, anything
+/// else (exit 2, 127, killed by a signal) ⇒ `Error` carrying the stderr tail,
+/// so a broken check never reads as a legitimate "nothing to do".
+pub fn classify_condition_exit(code: Option<i32>, stderr: &str) -> ConditionEval {
+    let what = match code {
+        Some(0) => return ConditionEval::Met,
+        Some(1) => return ConditionEval::NotMet,
+        Some(n) => format!("exit {n}"),
+        None => "killed by a signal".to_string(),
+    };
+    let tail = stderr_tail(stderr);
+    if tail.is_empty() {
+        ConditionEval::Error(what)
+    } else {
+        ConditionEval::Error(format!("{what} · {tail}"))
+    }
+}
+
+/// Read a child pipe to the end, lossily (a condition's stderr is shown, never
+/// parsed, so bad UTF-8 must not lose the rest).
+async fn read_to_string_lossy(mut pipe: impl tokio::io::AsyncRead + Unpin) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Run a routine's `fire_condition` shell command in `cwd`, bounded by `timeout`,
+/// with the user's login-shell PATH (`condition_path`) so `gh`, `node`, `npx`
+/// and `claude` resolve — the SAME trust model as a run's `run_command` (their
+/// command, their machine). See `evaluate_condition_with_path`.
+pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) -> ConditionEval {
+    let path = condition_path().await;
+    evaluate_condition_with_path(command, cwd, timeout, &path).await
+}
+
+/// Run `command` under `bash -c` with `PATH = path`. exit 0 ⇒ `Met`; exit 1 ⇒
+/// `NotMet`; any other exit, spawn failure or timeout ⇒ `Error` (with the last
+/// stderr lines, so the Routines list shows *why*).
 ///
 /// The child is launched as its OWN process-group/session leader (`setsid`), so
 /// on timeout the WHOLE group is killed — a pipeline like `gh … | grep -q .`
 /// leaves no orphaned `gh` reparented past the tick. `kill_on_drop` is the
 /// backstop.
-pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) -> ConditionEval {
+pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
     let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-lc")
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .env("PATH", path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     // Own session/process group so a timeout can kill the whole pipeline, not
     // just `bash` (mirrors how the detached worker isolates its group).
@@ -169,13 +303,21 @@ pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) ->
         Ok(child) => child,
         Err(e) => return ConditionEval::Error(format!("could not launch condition: {e}")),
     };
+    // Drain stderr concurrently so a chatty command can't block on a full pipe.
+    let stderr = child.stderr.take().map(|pipe| tokio::spawn(read_to_string_lossy(pipe)));
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
-            if status.success() {
-                ConditionEval::Met
-            } else {
-                ConditionEval::NotMet
-            }
+            // A backgrounded grandchild may still hold stderr open — never wait
+            // on it past a moment.
+            let err = match stderr {
+                Some(task) => tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            classify_condition_exit(status.code(), &err)
         }
         Ok(Err(e)) => ConditionEval::Error(format!("condition wait failed: {e}")),
         Err(_) => {
