@@ -1,3 +1,4 @@
+import { reportFatal } from "./gh.mjs";
 // Who is who in the nightly cycle (VISION.md §8, docs/ROUTINES.md).
 //
 //   owner     — the human. Only their comments count as answers; never used by routines.
@@ -100,5 +101,5 @@ async function doctor() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   if (process.argv[2] !== "doctor") { console.error("usage: identity.mjs doctor"); process.exit(64); }
-  doctor().then((c) => process.exit(c), (e) => { console.error(`identity: ${e.message}`); process.exit(2); });
+  doctor().then((c) => process.exit(c), (e) => { reportFatal("identity", e); process.exit(2); });
 }

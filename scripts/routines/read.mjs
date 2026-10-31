@@ -6,7 +6,7 @@
 //
 //   read.mjs issue <n> [owner/repo]
 //   read.mjs pr <n> [owner/repo]       (body + trusted comments; use `gh pr diff <n>` for the code)
-import { makeGh, APP_REPO, labelsOf } from "./gh.mjs";
+import { makeGh, APP_REPO, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, sameLogin } from "./identity.mjs";
 
 export function render({ item, comments, ids, kind }) {
@@ -38,5 +38,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((c) => process.exit(c), (e) => { console.error(`read: ${e.message}`); process.exit(2); });
+  main().then((c) => process.exit(c), (e) => { reportFatal("read", e); process.exit(2); });
 }

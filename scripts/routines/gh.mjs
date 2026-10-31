@@ -66,3 +66,17 @@ export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (type
  * review verdicts, digest maps and applied-answer records are such markers.
  */
 export const sanitize = (text) => String(text ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+
+/**
+ * Report a script's fatal error. In GitHub Actions it is also an annotation,
+ * which shows on the run's summary page (and through the checks API) without
+ * opening the logs.
+ */
+export function reportFatal(name, e) {
+  const msg = String(e?.message ?? e);
+  console.error(`${name}: ${msg}`);
+  if (process.env.GITHUB_ACTIONS === "true") {
+    const one = msg.slice(0, 1500).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+    console.log(`::error title=${name}::${one}`);
+  }
+}

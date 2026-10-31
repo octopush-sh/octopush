@@ -11,7 +11,7 @@
 //   merge web#12 | merge api#5    merge a waiting website/API PR (CI must be green)
 //   promote 0.4.91                dispatch the stable promotion workflow
 //   idea: <text>                  file a new idea for tomorrow's digest to estimate
-import { makeGh, APP_REPO, API_REPO, WEB_REPO, ciStatus, labelsOf } from "./gh.mjs";
+import { makeGh, APP_REPO, API_REPO, WEB_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions } from "./identity.mjs";
 
 const MARK = "<!-- octopush-";
@@ -214,5 +214,5 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((c) => process.exit(c), (e) => { console.error(`answers: ${e.message}`); process.exit(2); });
+  main().then((c) => process.exit(c), (e) => { reportFatal("answers", e); process.exit(2); });
 }
