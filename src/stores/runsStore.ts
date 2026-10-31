@@ -60,6 +60,12 @@ interface RunsState {
    *  epoch ms). Drives Mission Control's time-in-state timer; best-effort — a
    *  run hydrated at launch has no entry and falls back to createdAt. */
   statusSince: Record<string, number>;
+  /** Runs seeded onto the Settled band at launch because they settled while
+   *  the app was closed ("While you were away"). A run leaves the line when its
+   *  card is dismissed (it's no longer in `settledAt`). */
+  awayRunIds: string[];
+  /** The launch-time away fetch: idle → loading → loaded (once per session). */
+  awayStatus: "idle" | "loading" | "loaded";
 
   getRuns: (workspaceId: string) => Run[];
   getActiveRunId: (workspaceId: string) => string | null;
@@ -83,6 +89,9 @@ interface RunsState {
   /** Hydrate the `running`/`paused` runs across ALL workspaces (incl. ones not
    *  opened this session) — drives the global "Runs in progress" tray. */
   loadActiveRuns: () => Promise<void>;
+  /** Seed the Settled band with runs that settled since the app was last quit.
+   *  Runs once per session: a dismissed card never comes back. */
+  loadSettledWhileAway: () => Promise<void>;
   refreshDetail: (runId: string) => Promise<void>;
   begin: (
     workspaceId: string,
@@ -177,6 +186,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   launcherPrefill: null,
   settledAt: {},
   statusSince: {},
+  awayRunIds: [],
+  awayStatus: "idle",
 
   getRuns: (workspaceId) => get().runsByWs[workspaceId] ?? EMPTY_RUNS,
   getActiveRunId: (workspaceId) => get().activeRunIdByWs[workspaceId] ?? null,
@@ -270,6 +281,37 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         activeRunIdByWs[run.workspaceId] = run.id;
       }
       return { runsByWs, activeRunIdByWs, ...acc };
+    });
+  },
+
+  loadSettledWhileAway: async () => {
+    if (get().awayStatus !== "idle") return;
+    set({ awayStatus: "loading" });
+    let settled: Run[];
+    try {
+      settled = await ipc.listRunsSettledSince();
+    } catch (e) {
+      console.error("Failed to load runs settled while away:", e);
+      set({ awayStatus: "loaded" });
+      return;
+    }
+    set((s) => {
+      const runsByWs = { ...s.runsByWs };
+      const settledAt = { ...s.settledAt };
+      const awayRunIds: string[] = [];
+      for (const run of settled) {
+        if (!TERMINAL.has(run.status)) continue;
+        // Keep a fresher row this session already holds (e.g. a re-run).
+        const held = (runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id);
+        if (held && !TERMINAL.has(held.status)) continue;
+        if (!held) runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
+        // Stamp with the real finish time — hours ago, so the just-settled
+        // ceremony never replays for these.
+        const at = Date.parse(run.finishedAt ?? "");
+        settledAt[run.id] = s.settledAt[run.id] ?? (Number.isNaN(at) ? 0 : at);
+        awayRunIds.push(run.id);
+      }
+      return { runsByWs, settledAt, awayRunIds, awayStatus: "loaded" };
     });
   },
 
@@ -445,7 +487,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return { settledAt: next };
     }),
 
-  clearSettled: () => set({ settledAt: {} }),
+  clearSettled: () => set({ settledAt: {}, awayRunIds: [] }),
 
   applyStageUpdate: (runId, run) => {
     set((s) => {

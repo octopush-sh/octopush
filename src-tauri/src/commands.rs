@@ -1777,6 +1777,22 @@ pub async fn list_active_runs(
     state.db.lock().list_active_runs()
 }
 
+/// Runs that settled (`completed`/`aborted`) after `since` — by default after
+/// the app was last quit (`last_quit_at`, falling back to 24 h ago). Read-only;
+/// seeds Mission Control's Settled band with what finished while you were away.
+#[tauri::command]
+pub async fn list_runs_settled_since(
+    state: State<'_, AppState>,
+    since: Option<String>,
+) -> AppResult<Vec<crate::db::RunRow>> {
+    let db = state.db.lock();
+    let since = match since {
+        Some(s) => s,
+        None => db.away_since(chrono::Utc::now())?,
+    };
+    db.list_runs_settled_since(&since)
+}
+
 /// The current entitlement (derived from the signed-in user's Clerk plan). The
 /// frontend mirrors this for UX; the meaningful gates live in the Rust core.
 #[tauri::command]

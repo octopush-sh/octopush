@@ -69,6 +69,7 @@ Current anchors:
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
+| `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 
 A target only counts as found when it is visible; the tour waits up to 2s for it after
 opening the step's surface, then skips the step.

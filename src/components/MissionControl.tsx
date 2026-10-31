@@ -56,6 +56,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   const settledAt = useRunsStore((s) => s.settledAt);
   const statusSince = useRunsStore((s) => s.statusSince);
   const refreshDetail = useRunsStore((s) => s.refreshDetail);
+  const awayRunIds = useRunsStore((s) => s.awayRunIds);
   const flagsByWs = useAttentionStore((s) => s.flagsByWs);
   const missionByWorkspaceId = useMissionsStore((s) => s.missionByWorkspaceId);
 
@@ -136,50 +137,66 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   const isEmpty =
     board.needsYou.length === 0 && board.inFlight.length === 0 && board.settled.length === 0;
 
+  // "While you were away" — the settled cards seeded at launch that are still
+  // on the board. Dismissing a card takes it off this line too.
+  const away = awayLine(board.settled, awayRunIds);
+
   return (
     <OverlayRoom onClose={onClose} ariaLabel="Mission Control">
-      <header className="flex items-baseline gap-4 border-b border-octo-hairline px-8 py-6">
-        <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
-          Mission Control
-        </span>
-        <span className="flex min-w-0 items-baseline gap-2 font-mono text-[11px]">
-          {counts
-            .filter((c) => c.n > 0)
-            .map((c, i) => (
-              <span key={c.label} className="flex items-baseline gap-2 whitespace-nowrap">
-                {i > 0 && <span className="text-octo-mute">·</span>}
-                <span className={`octo-tabular ${c.cls}`}>
-                  {c.n} {c.label}
+      <header className="border-b border-octo-hairline px-8 py-6">
+        <div className="flex items-baseline gap-4">
+          <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
+            Mission Control
+          </span>
+          <span className="flex min-w-0 items-baseline gap-2 font-mono text-[11px]">
+            {counts
+              .filter((c) => c.n > 0)
+              .map((c, i) => (
+                <span key={c.label} className="flex items-baseline gap-2 whitespace-nowrap">
+                  {i > 0 && <span className="text-octo-mute">·</span>}
+                  <span className={`octo-tabular ${c.cls}`}>
+                    {c.n} {c.label}
+                  </span>
                 </span>
+              ))}
+          </span>
+          <span className="ml-auto flex shrink-0 items-baseline gap-3">
+            {activeRuns.length > 0 && (
+              <span
+                className="hidden items-baseline gap-2 font-mono text-[11px] sm:flex"
+                title="Combined live cost across all active runs"
+              >
+                {baseline > 0 && (
+                  <>
+                    <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
+                    <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
+                  </>
+                )}
+                <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
               </span>
-            ))}
-        </span>
-        <span className="ml-auto flex shrink-0 items-baseline gap-3">
-          {activeRuns.length > 0 && (
-            <span
-              className="hidden items-baseline gap-2 font-mono text-[11px] sm:flex"
-              title="Combined live cost across all active runs"
+            )}
+            <button
+              type="button"
+              onClick={onDispatch}
+              aria-label="Send out a crew"
+              title="Send out a crew"
+              className="flex shrink-0 items-center justify-center self-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
-              {baseline > 0 && (
-                <>
-                  <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
-                  <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
-                </>
-              )}
-              <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={onDispatch}
-            aria-label="Send out a crew"
-            title="Send out a crew"
-            className="flex shrink-0 items-center justify-center self-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              <Plus size={12} />
+            </button>
+            <RoomClose onClose={onClose} label="Close Mission Control" />
+          </span>
+        </div>
+        {away && (
+          <p
+            data-tour="mission-control-away"
+            className="octo-rise-in mt-2 font-mono text-[11px] text-octo-sage"
+            title="Runs that settled while Octopush was closed"
           >
-            <Plus size={12} />
-          </button>
-          <RoomClose onClose={onClose} label="Close Mission Control" />
-        </span>
+            While you were away · <span className="octo-tabular">{away.count}</span> settled ·{" "}
+            <span className="octo-tabular">{away.saved}</span>
+          </p>
+        )}
       </header>
 
       {isEmpty ? (
@@ -619,6 +636,20 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
       </span>
     </span>
   );
+}
+
+/** The header's "While you were away" figures over the launch-seeded settled
+ *  cards still on the board, or null when there are none. A run with no
+ *  baseline can't be priced, so it stays out of the saving; when none can be
+ *  priced the line reads "unpriced", never "$0.00". */
+export function awayLine(settled: Run[], awayRunIds: string[]): { count: number; saved: string } | null {
+  const ids = new Set(awayRunIds);
+  const away = settled.filter((r) => ids.has(r.id));
+  if (away.length === 0) return null;
+  const priced = away.filter((r) => r.baselineUsd > 0);
+  if (priced.length === 0) return { count: away.length, saved: "unpriced" };
+  const saved = priced.reduce((sum, r) => sum + Math.max(0, r.baselineUsd - r.costUsd), 0);
+  return { count: away.length, saved: `saved $${saved.toFixed(2)}` };
 }
 
 /** True while the run settled within the last few seconds — gates the one-shot
