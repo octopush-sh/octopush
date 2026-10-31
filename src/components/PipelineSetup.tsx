@@ -10,7 +10,7 @@ import { StageFlow } from "./direct/StageFlow";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
-import { Github } from "lucide-react";
+import { CircleDot } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
 import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
@@ -209,7 +209,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
               title="Ship a GitHub issue — the crew plans, builds, reviews, tests, and opens the PR"
               className="ml-auto flex items-center gap-1 rounded p-1 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
-              <Github size={11} aria-hidden />
+              <CircleDot size={11} aria-hidden />
               ship an issue
             </button>
             <span className="font-mono text-[9px] text-octo-mute">⌘⏎ to begin</span>
