@@ -8,11 +8,14 @@
 //   automerge.mjs queue                         those PRs: number<TAB>head-sha<TAB>title<TAB>url
 //   automerge.mjs review <n> <sha> approve|changes <body-file>
 //                                               post the review as the reviewer (refuses if the head moved)
+//   automerge.mjs review-json <n> <sha> <file>  post a reviewer agent's verdict file
+//                                               ({"verdict":"approve|changes","body":"…"}) after
+//                                               validating it and scanning it for secrets
 //   automerge.mjs merge <n>                     verify every rule, merge; exit 0 merged, 1 refused, 2 error
 //
 // Identities (owner / builder / reviewer) come from identity.mjs.
 import { readFileSync } from "node:fs";
-import { makeGh, ghRunAs, APP_REPO, ciStatus, labelsOf } from "./gh.mjs";
+import { makeGh, ghRunAs, APP_REPO, ciStatus, labelsOf, sanitize } from "./gh.mjs";
 import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin } from "./identity.mjs";
 
 export const MAX_CHANGED_LINES = 800;
@@ -92,6 +95,17 @@ export function refusals({ pr, files, ci, verdict, ids, betaLive }) {
   return r;
 }
 
+/** Validate a reviewer agent's verdict file. Returns { verdict, body } or { error }. */
+export function parseVerdict(text, secrets = []) {
+  let v;
+  try { v = JSON.parse(text); } catch { return { error: "verdict file is not valid JSON" }; }
+  if (!v || !["approve", "changes"].includes(v.verdict)) return { error: 'verdict must be "approve" or "changes"' };
+  if (typeof v.body !== "string" || v.body.trim().length < 20 || v.body.length > 20000) return { error: "body must be 20–20000 chars" };
+  const s = secrets.map((x) => x.trim()).filter((x) => x.length >= 8);
+  if (s.some((x) => v.body.includes(x))) return { error: "the review contains a secret value — not posted" };
+  return { verdict: v.verdict, body: v.body };
+}
+
 /** "Not yet" reasons that shouldn't park a PR. */
 const transient = (w) => /^CI is (pending|none)|^no approving review|^GitHub hasn't computed|^the beta channel isn't live/.test(w);
 
@@ -116,9 +130,12 @@ export function postReview(gh, reviewerGh, ids, n, sha, verdict, body) {
   if (!["approve", "changes"].includes(verdict)) throw new Error("verdict must be approve|changes");
   const pr = gh.get(`repos/${APP_REPO}/pulls/${n}`);
   if (pr.head.sha !== sha) throw new Error(`head moved: reviewed ${sha.slice(0, 7)}, PR is now at ${pr.head.sha.slice(0, 7)} — review it again`);
-  if (sameLogin(pr.user?.login, ids.reviewer)) throw new Error("the reviewer can't review its own PR");
+  // With separate bot accounts the reviewer must not have opened the PR. In
+  // Actions both are github-actions[bot]; independence comes from the agents
+  // holding no token (identity.mjs).
+  if (!sameLogin(ids.builder, ids.reviewer) && sameLogin(pr.user?.login, ids.reviewer)) throw new Error("the reviewer can't review its own PR");
   assertActingAs(reviewerGh, ids.reviewer, ids);
-  reviewerGh.send("POST", `repos/${APP_REPO}/issues/${n}/comments`, { body: `${body.trim()}\n\n${marker(sha, verdict)}` });
+  reviewerGh.send("POST", `repos/${APP_REPO}/issues/${n}/comments`, { body: `${sanitize(body).trim()}\n\n${marker(sha, verdict)}` });
   if (verdict === "changes") {
     const rounds = reviewRounds(gh.list(`repos/${APP_REPO}/issues/${n}/comments`), ids.reviewer);
     if (rounds >= MAX_REVIEW_ROUNDS) {
@@ -165,6 +182,14 @@ async function main() {
     if (!/^\d+$/.test(a ?? "") || !/^[0-9a-f]{40}$/.test(b ?? "") || !d) throw new Error("usage: review <n> <head-sha> approve|changes <body-file>");
     postReview(gh, reviewerGh(), ids, Number(a), b, c, readFileSync(d, "utf8"));
     console.log(`posted ${c} on #${a} at ${b.slice(0, 7)}`);
+    return 0;
+  }
+  if (cmd === "review-json") {
+    if (!/^\d+$/.test(a ?? "") || !/^[0-9a-f]{40}$/.test(b ?? "") || !c) throw new Error("usage: review-json <n> <head-sha> <file>");
+    const v = parseVerdict(readFileSync(c, "utf8"), (process.env.OCTOPUSH_SECRETS ?? "").split("\n"));
+    if (v.error) { console.error(`not posted #${a}: ${v.error}`); return 1; }
+    postReview(gh, reviewerGh(), ids, Number(a), b, v.verdict, v.body);
+    console.log(`posted ${v.verdict} on #${a} at ${b.slice(0, 7)}`);
     return 0;
   }
   if (cmd === "merge") {

@@ -21,6 +21,16 @@ REPO="${OCTOPUSH_ROUTINE_REPO:-$(cd "$ROOT" && this_repo)}"
 OWNER="${REPO%%/*}"
 CI_TIMEOUT="${OCTOPUSH_RELEASE_CI_TIMEOUT:-2700}"   # seconds (45 min)
 CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
+# In GitHub Actions (nightly-release.yml) pushes made with GITHUB_TOKEN start no
+# workflows: OCTOPUSH_DISPATCH=1 dispatches CI on the release branch and the
+# release build on the new tag explicitly.
+DISPATCH="${OCTOPUSH_DISPATCH:-0}"
+
+dispatch() { # <workflow file> <ref>
+  [[ "$DISPATCH" == 1 ]] || return 0
+  gh api -X POST "repos/$REPO/actions/workflows/$1/dispatches" -f ref="$2" >/dev/null \
+    && echo "dispatched $1 on $2"
+}
 # Optional commit trailers (e.g. attribution), one per line; none by default.
 TRAILERS="${OCTOPUSH_RELEASE_TRAILERS:-}"
 
@@ -111,6 +121,7 @@ tag_and_push() {
   TAG_CREATED="v$version"
   g push origin "refs/tags/v$version" || fail "could not push tag v$version"
   TAG_PUSHED=1
+  dispatch release.yml "v$version" || fail "could not start release.yml on v$version"
   echo "tagged $sha as v$version and pushed — release.yml now publishes the beta"
   echo "release: https://github.com/$REPO/releases/tag/v$version"
   echo "build:   https://github.com/$REPO/actions/workflows/release.yml"
@@ -179,6 +190,7 @@ do_run() {
 $TRAILERS" || fail "git commit failed"
   head="$(git -C "$WT" rev-parse HEAD)"
   git -C "$WT" push --quiet --force origin "HEAD:refs/heads/$BRANCH" || fail "could not push $BRANCH"
+  dispatch ci.yml "$BRANCH" || fail "could not start CI on $BRANCH"
 
   PR="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH&per_page=1" --jq '.[0].number // empty')" \
     || fail "could not look up an existing PR for $BRANCH"
