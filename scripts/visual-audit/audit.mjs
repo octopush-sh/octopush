@@ -143,6 +143,11 @@ async function main() {
   writeFileSync(join(opts.out, "findings.json"), JSON.stringify({ engine: opts.engine, scenarios: opts.scenarios, sizes: opts.sizes, visited, pageErrors, findings }, null, 2));
   console.log(`visual-audit: ${visited.length} screens (${opts.engine}), ${findings.length} distinct finding(s)`);
   for (const f of findings) console.log(`  [${f.check}] ${f.surface} @ ${f.sizes.join(",")} — ${f.selector}${f.examples[0] ? ` — "${f.examples[0]}"` : ""} (×${f.count})`);
+  // A one-line summary on the run page (and through the checks API) without opening logs.
+  if (process.env.GITHUB_ACTIONS === "true") {
+    const kinds = [...new Set(findings.map((f) => f.check))].join(", ") || "none";
+    console.log(`::notice title=visual-audit (${opts.engine})::${visited.length} screens, ${findings.length} finding(s) [${kinds}], ${pageErrors.length} page error(s)`);
+  }
   if (pageErrors.length) { console.log("page errors:"); for (const e of pageErrors.slice(0, 20)) console.log(`  - ${e}`); }
   if (!visited.length || unknown) return 2;
   if (attempted && crashed / attempted >= 0.25) { console.error(`visual-audit: ${crashed}/${attempted} surfaces crashed — the harness is broken, not the UI`); return 2; }
