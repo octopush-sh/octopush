@@ -15,7 +15,7 @@ import { ACTIONS_BOT, reviewerToken } from "./identity.mjs";
 import { parseVerdict } from "./automerge.mjs";
 import { parseResult, leaks, branchFor, forbiddenPaths } from "./publish-build.mjs";
 import { claudeArgs, agentEnv, denyRules, ROLES, denialSummary } from "./agent.mjs";
-import { repoForIdea, ideaLabels, areaOf, ideaBody, listOrEmpty } from "./ideas.mjs";
+import { repoForIdea, ideaLabels, areaOf, ideaBody, listOrEmpty, usableIdeas, fitTitle } from "./ideas.mjs";
 import { render } from "./read.mjs";
 
 const ids = { owner: "johnatan", builder: "octo-builder", reviewer: "octo-reviewer" };
@@ -538,4 +538,17 @@ test("agent denial summary shows tool and path, never content", () => {
   ] }));
   assert.deepEqual(out, ["denied: Write /w/.agent-out/ideas.json", "denied: Bash curl"]);
   assert.match(denialSummary("not json")[0], /no result/);
+});
+
+test("ideas: long titles are shortened, invalid entries dropped, ≥ 5 usable still post", () => {
+  const long = "Show the per-stage cost and token burn inline on every Direct run-track card, with a budget warning";
+  assert.ok(fitTitle(long).length <= 90 && fitTitle(long).endsWith("…"));
+  assert.equal(fitTitle("Short"), "Short");
+  const good = [1, 2, 3, 4, 5].map((i) => idea({ title: `Idea ${i}` }));
+  const r = usableIdeas([...good, idea({ title: long }), idea({ title: "Bad", value: 9 }), idea({ title: "Idea 1" })]);
+  assert.equal(r.ideas.length, 6, "five good + the shortened one");
+  assert.equal(r.dropped.length, 2);
+  assert.deepEqual(r.errors, []);
+  assert.match(usableIdeas(good.slice(0, 4)).errors[0], /only 4 usable/);
+  assert.match(usableIdeas({}).errors[0], /array/);
 });
