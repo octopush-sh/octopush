@@ -19,10 +19,15 @@ import { dirname, join, resolve } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { inPageChecks, mergeFindings } from "./checks.mjs";
+import { launchSafari } from "./safari.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const require = createRequire(import.meta.url);
 const FIXED_NOW = "2026-10-28T15:00:00Z"; // scenarios/shared.ts NOW
+
+// webkit / chromium: Playwright's builds. safari: the system Safari through
+// safaridriver — the same WebKit as the app's WKWebView (safari.mjs).
+export const ENGINES = ["webkit", "chromium", "safari"];
 
 export function parseArgs(argv) {
   const o = { engine: "webkit", scenarios: ["stress"], surfaces: null, sizes: ["1280x800", "1440x900", "1024x700"], out: join(ROOT, ".visual-audit") };
@@ -35,7 +40,7 @@ export function parseArgs(argv) {
     else if (a === "--out") o.out = resolve(v());
     else throw new Error(`unknown argument ${a}`);
   }
-  if (!["webkit", "chromium"].includes(o.engine)) throw new Error("--engine is webkit or chromium");
+  if (!ENGINES.includes(o.engine)) throw new Error(`--engine is one of ${ENGINES.join(", ")}`);
   for (const s of o.sizes) if (!/^\d+x\d+$/.test(s)) throw new Error(`bad size ${s}`);
   return o;
 }
@@ -63,9 +68,11 @@ async function openHarness(context, url, scenario) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   let pw;
-  try { pw = require("playwright"); } catch {
-    console.error("visual-audit: Playwright is not installed (not a project dependency):\n  npm i --no-save playwright && npx playwright install webkit");
-    return 2;
+  if (opts.engine !== "safari") {
+    try { pw = require("playwright"); } catch {
+      console.error("visual-audit: Playwright is not installed (not a project dependency):\n  npm i --no-save playwright && npx playwright install webkit");
+      return 2;
+    }
   }
   // Only ever wipe a previous audit's output, never an arbitrary --out.
   if (existsSync(opts.out) && readdirSync(opts.out).length && !existsSync(join(opts.out, "findings.json")) && !existsSync(join(opts.out, "shots"))) {
@@ -80,7 +87,7 @@ async function main() {
   const server = await createServer({ root: ROOT, clearScreen: false, logLevel: "warn", server: { port, strictPort: true, host: "127.0.0.1", hmr: false } });
   await server.listen();
   const url = `http://127.0.0.1:${port}/clips.html`;
-  const browser = await pw[opts.engine].launch();
+  const browser = opts.engine === "safari" ? await launchSafari() : await pw[opts.engine].launch();
   const raw = [];
   const pageErrors = [];
   const visited = [];
@@ -115,6 +122,7 @@ async function main() {
             const shot = `${scenario}--${surface.replace(/\//g, "-")}--${size}.png`;
             await page.screenshot({ path: join(opts.out, "shots", shot) });
             const found = await page.evaluate(inPageChecks);
+            if (page.errors) for (const m of await page.errors()) if (!pageErrors.includes(`${scenario}/${surface}: ${m}`)) pageErrors.push(`${scenario}/${surface}: ${m}`);
             for (const f of found) raw.push({ ...f, surface, size, scenario, shot });
             visited.push({ scenario, surface, size, shot, findings: found.length });
           }

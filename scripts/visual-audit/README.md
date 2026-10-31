@@ -31,6 +31,17 @@ Text hidden under an opaque layer (a dialog, a popover) is ignored, so a
 Settings dialog over the app doesn't count as an overlap. Mark a region that is
 meant to break these rules (a terminal, a canvas) with `data-audit-ignore`.
 
+## Engines
+
+Each night runs two passes with the same checks: Playwright's **WebKit**
+(fast, both scenarios, its screenshots feed the design review) and the
+**system Safari** through `safaridriver` (`safari.mjs`). Safari uses the
+WebKit that ships with macOS, the same engine as the app's WKWebView, and
+Playwright's build is newer. #312 showed on the owner's macOS 15.7 and not in
+Playwright WebKit. Fingerprints don't include the engine, so a defect that both
+passes see is one issue. Locally: `sudo safaridriver --enable` once, then
+`--engine safari`.
+
 ## Design review
 
 After the checks, `visual-audit.yml` hands the 1280×800 screenshots, `CLAUDE.md`

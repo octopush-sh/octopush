@@ -262,8 +262,9 @@ export const MARK = (fp) => `<!-- octopush-visual:${fp} -->`;
 
 /** The issue body: what, where, how to reproduce, what done means. */
 export function issueBody(m, { engine, runUrl } = {}) {
+  const engineFlag = engine === "Safari" ? "safari" : engine === "Chromium" ? "chromium" : "webkit";
   const lines = [
-    `The nightly visual audit found this in **${engine ?? "WebKit"}** (the engine Octopush uses on macOS).`,
+    `The nightly visual audit found this in **${engine ?? "WebKit"}**${engine === "Safari" ? " (the system WebKit — the same engine as the app's webview)" : " (the engine family Octopush uses on macOS)"}.`,
     "",
     `- **Check:** ${CHECK_TITLES[m.check] ?? m.check} — \`${String(m.detail).replace(/`/g, "'")}\``,
     `- **Surfaces:** ${m.surfaces.map((x) => `\`${x}\``).join(", ")} · window ${m.sizes.join(", ")} · scenario ${m.scenarios.join(", ")}`,
@@ -276,7 +277,7 @@ export function issueBody(m, { engine, runUrl } = {}) {
     "## Reproduce",
     "",
     "```bash",
-    `node scripts/visual-audit/audit.mjs --engine webkit --surface ${m.surface} --scenario ${m.scenarios[0] ?? "stress"}`,
+    `node scripts/visual-audit/audit.mjs --engine ${engineFlag} --surface ${m.surface} --scenario ${m.scenarios[0] ?? "stress"}`,
     "```",
     "",
     "## Done when",
