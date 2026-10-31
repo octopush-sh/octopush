@@ -108,3 +108,18 @@ jobs:
             fi
             echo "::endgroup::"
           done < "$RUNNER_TEMP/queue.tsv"
+
+      - name: Merge PRs approved earlier
+        # An approval whose merge was skipped for a transient reason (CI not
+        # finished, mergeability not computed yet) is retried here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          node scripts/routines/automerge.mjs approved | while IFS=$'\t' read -r num sha title url; do
+            [[ "$num" =~ ^[0-9]+$ ]] || continue
+            echo "retrying merge of #$num ($title)"
+            if OCTOPUSH_REVIEWER_TOKEN="$GH_TOKEN" node scripts/routines/automerge.mjs merge "$num"; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref=main >/dev/null || true
+            fi
+          done
