@@ -72,7 +72,7 @@ jobs:
         # in; #312 only showed in the system one. Same checks, same stress data.
         run: |
           set +e
-          echo "macOS $(sw_vers -productVersion) · Safari $(defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString)"
+          echo "::notice title=Safari pass::macOS $(sw_vers -productVersion) · Safari $(defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString)"
           sudo safaridriver --enable
           node scripts/visual-audit/audit.mjs --engine safari --scenario stress --out "$RUNNER_TEMP/visual-audit-safari"
           rc=$?
