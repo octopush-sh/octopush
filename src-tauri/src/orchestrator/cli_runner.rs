@@ -322,8 +322,10 @@ pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 /// as defence in depth). Since Claude Code 2.1.314, Write/Edit/NotebookEdit
 /// refuse paths outside the working directories in every permission mode,
 /// `bypassPermissions` included — so a stage can't write to the main checkout,
-/// a sibling workspace or `~/`. Older CLIs ignore the unknown key. `Bash` is
-/// not covered (the Seatbelt sandbox is what limits it). The argv goes
+/// a sibling workspace or `~/`. Needs Claude Code >= 2.1.314: older CLIs
+/// ignore the unknown key, so the guard is off there. `Bash` is not covered
+/// and stays unconfined unless the mission's `exec_isolation` is `sandbox`
+/// (Seatbelt, see `sandbox.rs`). The argv goes
 /// straight to `Command::args` with no shell, so the JSON needs no quoting.
 pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true}}"#;
 
