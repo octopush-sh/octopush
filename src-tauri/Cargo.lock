@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "octopush"
-version = "0.4.88"
+version = "0.4.89"
 dependencies = [
  "anyhow",
  "async-trait",
