@@ -54,10 +54,38 @@ export function localDate(now = new Date()) {
 }
 export const digestTitle = (date) => `Ideas — ${date}`;
 
-export function validateIdeas(ideas) {
+/** Shorten a title to ≤ 90 chars at a word boundary (pure). */
+export function fitTitle(t) {
+  const s = String(t ?? "").replace(/\s+/g, " ").trim();
+  if (s.length <= 90) return s;
+  const cut = s.slice(0, 89);
+  return `${cut.slice(0, cut.lastIndexOf(" ") > 50 ? cut.lastIndexOf(" ") : 89).replace(/[\s,;:.-]+$/, "")}…`;
+}
+
+/**
+ * Keep what's usable from an agent's ideas.json (pure): fix what can be fixed
+ * mechanically (long titles), drop ideas that are still invalid, and fail only
+ * when fewer than MIN_IDEAS survive — a whole night's research isn't thrown
+ * away for one bad entry. Returns { ideas, dropped, errors }.
+ */
+export function usableIdeas(raw) {
+  if (!Array.isArray(raw)) return { ideas: [], dropped: [], errors: ["ideas.json must be a JSON array"] };
+  const fixed = raw.map((it) => (it && typeof it === "object" && typeof it.title === "string" ? { ...it, title: fitTitle(it.title) } : it));
+  const ideas = [], dropped = [];
+  for (const [i, it] of fixed.entries()) {
+    // Validate each alone (count rule off), plus duplicate titles against the kept ones.
+    const errs = validateIdeas([it], 1).map((e) => e.replace(/^ideas\[0\]/, `ideas[${i}]`));
+    if (!errs.length && ideas.some((k) => k.title.toLowerCase() === it.title.toLowerCase())) errs.push(`ideas[${i}].title duplicates another idea`);
+    if (errs.length) dropped.push(...errs); else ideas.push(it);
+  }
+  const errors = ideas.length < MIN_IDEAS ? [`only ${ideas.length} usable ideas (at least ${MIN_IDEAS})`, ...dropped] : [];
+  return { ideas, dropped, errors };
+}
+
+export function validateIdeas(ideas, min = MIN_IDEAS) {
   const errs = [];
   if (!Array.isArray(ideas)) return ["ideas.json must be a JSON array"];
-  if (ideas.length < MIN_IDEAS) errs.push(`only ${ideas.length} ideas (at least ${MIN_IDEAS})`);
+  if (ideas.length < min) errs.push(`only ${ideas.length} ideas (at least ${min})`);
   const seen = new Set();
   ideas.forEach((it, i) => {
     const at = `ideas[${i}]`;
@@ -188,9 +216,11 @@ function context(gh, now, ids) {
 }
 
 function post(gh, file, now, ids) {
-  const ideas = JSON.parse(readFileSync(file, "utf8"));
-  const errs = validateIdeas(ideas);
-  if (errs.length) { console.error(errs.join("\n")); return 2; }
+  let raw;
+  try { raw = JSON.parse(readFileSync(file, "utf8")); } catch (e) { console.error(`ideas.json is not valid JSON: ${e.message}`); return 2; }
+  const { ideas, dropped, errors } = usableIdeas(raw);
+  if (errors.length) { console.error(errors.join("\n")); return 2; }
+  if (dropped.length) console.error(`dropped ${dropped.length} invalid entr${dropped.length === 1 ? "y" : "ies"}:\n${dropped.join("\n")}`);
   const date = localDate(now);
   const existing = gh.list(`repos/${APP_REPO}/issues?state=all&labels=digest`, 100);
   if (existing.some((i) => i.title === digestTitle(date) && sameLogin(i.user?.login, ids.builder))) { console.error(`${digestTitle(date)} already exists`); return 1; }
