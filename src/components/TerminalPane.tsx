@@ -197,6 +197,7 @@ export function TerminalPane({
         if (altArrow) {
           term.input(altArrow, true);
           e.preventDefault();
+          e.stopPropagation();
           return false;
         }
         // Zoom: Cmd/Ctrl with +, -, or 0. `+` is Shift+= on most layouts, so

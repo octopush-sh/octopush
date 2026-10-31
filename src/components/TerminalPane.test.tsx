@@ -402,9 +402,10 @@ describe("TerminalPane — zoom", () => {
     try {
       await mounted();
       const handler = keyHandler();
-      const ev = { type: "keydown", altKey: true, key: "ArrowLeft", preventDefault: vi.fn() };
+      const ev = { type: "keydown", altKey: true, key: "ArrowLeft", preventDefault: vi.fn(), stopPropagation: vi.fn() };
       expect(handler(ev)).toBe(false); // handled — xterm must not also encode it
       expect(ev.preventDefault).toHaveBeenCalled();
+      expect(ev.stopPropagation).toHaveBeenCalled();
       expect(xtermHoisted.last!.input).toHaveBeenCalledWith("\x1bb", true);
       // A plain arrow is left to xterm.
       expect(handler({ type: "keydown", key: "ArrowLeft", preventDefault: vi.fn() })).toBe(true);

@@ -35,4 +35,9 @@ describe("legacyAltArrowSequence", () => {
     expect(legacyAltArrowSequence(key("b", { altKey: true }), true)).toBeNull();
     expect(legacyAltArrowSequence(key("ArrowLeft", { altKey: true }, "keyup"), true)).toBeNull();
   });
+
+  it("never fires while an IME is composing", () => {
+    expect(legacyAltArrowSequence({ ...key("ArrowLeft", { altKey: true }), isComposing: true }, true)).toBeNull();
+    expect(legacyAltArrowSequence({ ...key("ArrowLeft", { altKey: true }), keyCode: 229 }, true)).toBeNull();
+  });
 });

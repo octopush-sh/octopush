@@ -16,12 +16,15 @@
 
 const ESC = "\x1b";
 
-type KeyLike = Pick<KeyboardEvent, "type" | "key" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey">;
+type KeyLike = Pick<KeyboardEvent, "type" | "key" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey"> &
+  Partial<Pick<KeyboardEvent, "isComposing" | "keyCode">>;
 
 /** The bytes xterm.js 5 would have sent for this Alt+arrow keydown, or null
  *  when the event isn't one it rewrote (leave it to xterm). */
 export function legacyAltArrowSequence(e: KeyLike, mac: boolean): string | null {
   if (e.type !== "keydown") return null;
+  // Never while an IME is composing (xterm 5 checked composition first).
+  if (e.isComposing || e.keyCode === 229) return null;
   if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return null;
   switch (e.key) {
     case "ArrowLeft":

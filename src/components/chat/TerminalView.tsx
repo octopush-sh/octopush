@@ -76,6 +76,7 @@ export function TerminalView({ callId, threadId, className }: Props) {
       if (!altArrow) return true;
       term.input(altArrow, true);
       e.preventDefault();
+      e.stopPropagation();
       return false;
     });
 
