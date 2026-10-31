@@ -28,7 +28,7 @@
 import { readFileSync } from "node:fs";
 import { APP_REPO, WEB_REPO, ghForRepo, labelsOf, sanitize, reportFatal } from "../routines/gh.mjs";
 import { issueTitle, issueBody, MARK, fingerprint } from "./checks.mjs";
-import { webIssueTitle, webIssueBody, BUG_CHECKS } from "../web-audit/checks.mjs";
+import { webIssueTitle, webIssueBody, BUG_CHECKS, OWNER_CHECKS } from "../web-audit/checks.mjs";
 
 export const MAX_NEW = 5;
 export const READY_CAP = 2;
@@ -48,7 +48,7 @@ export const TARGETS = {
     labels: (f) => [...WEB_LABELS, ...(BUG_CHECKS.has(f.check) ? ["bug"] : [])],
     title: webIssueTitle,
     body: (f, o) => webIssueBody(f, o),
-    canBeReady: (f) => !humanOnlyFinding(f),
+    canBeReady: (f) => !humanOnlyFinding(f) && !OWNER_CHECKS.has(f.check),
   },
 };
 export const MAX_DESIGN = 3;

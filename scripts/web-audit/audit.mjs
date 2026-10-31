@@ -16,7 +16,7 @@ import { createServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { inPageChecks, mergeFindings } from "../visual-audit/checks.mjs";
-import { webInPageChecks, pagesFromDist, fileFor, linkFindings, readPages, routedPaths, WEB_SIZES } from "./checks.mjs";
+import { webInPageChecks, pagesFromDist, fileFor, linkFindings, readPages, routedPaths, shadowedRoutes, WEB_SIZES } from "./checks.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -74,7 +74,8 @@ async function main() {
   const unknown = pages.filter((p) => !all.includes(p));
   if (unknown.length) { console.error(`web-audit: not pages of the site: ${unknown.join(", ")}`); return 2; }
   const vercel = join(opts.site, "vercel.json");
-  const raw = linkFindings(readPages(dist, all).filter((p) => pages.includes(p.path)), { dist, routes: existsSync(vercel) ? routedPaths(readFileSync(vercel, "utf8")) : [] });
+  const raw = shadowedRoutes(dist);
+  raw.push(...linkFindings(readPages(dist, all).filter((p) => pages.includes(p.path)), { dist, routes: existsSync(vercel) ? routedPaths(readFileSync(vercel, "utf8")) : [] }));
 
   const server = await serve(dist);
   const base = `http://127.0.0.1:${server.address().port}`;

@@ -6,13 +6,14 @@ run against the built site. Runs nightly in `web-audit.yml`; no agent.
 
 ## How it works
 
-1. The workflow checks out octopush-web's `main` (what merging publishes) with
-   a `contents: read` installation token of the "Octopush Cycle" GitHub App,
-   minted in a separate job (`scripts/routines/app-token.mjs`), revokes it and
-   checks it is dead, then `npm ci --ignore-scripts && npm run build`. That job
-   references no secret: the build is the website's own code. Findings and
-   screenshots (3 days, none of the legal pages) go to an artifact; a third job
-   on a fresh runner files them.
+1. The workflow copies these scripts aside, checks out octopush-web's `main`
+   (what merging publishes) with a `contents: read` installation token of the
+   "Octopush Cycle" GitHub App, revokes it and checks it is dead, then installs
+   and builds the site as the unprivileged `octo-sandbox` user (`octo-check
+   install`, `octo-check site` — the website's code never runs as the runner
+   user, which holds the job's secrets and has sudo) and kills every sandbox
+   process before going on. Findings and screenshots (3 days, none of the legal
+   pages) go to an artifact; a second job on a fresh runner files them.
 2. `audit.mjs` serves `dist/` on a local port and opens every page (every
    `.html` in `dist/`, without Pagefind's or Astro's assets) in Playwright
    **Chromium** at 1440×900, 1024×700 and 390×844, takes a screenshot and runs
@@ -38,6 +39,7 @@ run against the built site. Runs nightly in `web-audit.yml`; no agent.
 | `italic-text` | Text drawn in an italic or oblique face |
 | `missing-meta` | No `<title>`, meta description, `og:title`, `og:description` or `og:image` (pages marked `noindex` are skipped) |
 | `broken-link` | An internal link (relative, root-relative or on octopush.sh) to a page or file that isn't in `dist/` and isn't a `vercel.json` route |
+| `shadowed-route` | A built `dist/download*`, `dist/api` or `dist/update`, which Vercel would serve instead of the `vercel.json` routes (the download funnel, edge functions, the updater feeds). Filed for the owner, never `ready` |
 | `missing-anchor` | A `#fragment` with no matching `id` on the target page (`#_top` is Starlight's and always fine) |
 | `text-escapes`, `text-overlap`, `text-cut`, `unlabeled-control` | As in the app audit |
 

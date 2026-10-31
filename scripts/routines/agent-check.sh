@@ -2,7 +2,8 @@
 # The only way a nightly builder agent runs code (scripts/routines/agent.mjs).
 #
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all     (profile app)
-#   agent-check.sh build | check | consistency | all                     (profile web: octopush-web)
+#   agent-check.sh build | check | consistency | routes | all            (profile web: octopush-web)
+#   agent-check.sh install | site                                        (web: used by web-audit.yml)
 #
 # agent-sandbox-setup.sh installs it as root-owned /usr/local/bin/octo-check
 # (with the checkout's path and the check profile baked in); the agent may run
@@ -44,12 +45,19 @@ case "$PROFILE" in
     esac ;;
   web)
     [[ -f "$APP_REF/src-tauri/tauri.conf.json" ]] && extra_env=(OCTOPUSH_APP_DIR="$APP_REF")
+    # A real file wins over vercel.json's rewrites and redirects: nothing built
+    # may answer /download, /api/… or /update/… (a page, a static file, or a
+    # dynamic route that happens to generate one).
+    routes='shadow=$(cd dist 2>/dev/null && ls -d download* api update 2>/dev/null); if [ -n "$shadow" ]; then echo "octo-check: the build has $shadow in dist/ — it would shadow the /download, /api or /update routes in vercel.json (human-only)" >&2; exit 1; fi'
     case "${1:-}" in
-      build) cmd=(npm run --silent build) ;;
+      install) cmd=(npm ci --no-audit --no-fund --ignore-scripts) ;;
+      site) cmd=(npm run --silent build) ;;
+      build) cmd=(bash -c "npm run --silent build && { $routes; }") ;;
+      routes) cmd=(bash -c "$routes") ;;
       check) cmd=(npm run --silent check) ;;
       consistency) cmd=(npm run --silent consistency) ;;
-      all) cmd=(bash -c 'npm run --silent build && npm run --silent check && npm run --silent consistency') ;;
-      *) echo "usage: octo-check build | check | consistency | all" >&2; exit 64 ;;
+      all) cmd=(bash -c "npm run --silent build && { $routes; } && npm run --silent check && npm run --silent consistency") ;;
+      *) echo "usage: octo-check build | check | consistency | routes | all" >&2; exit 64 ;;
     esac ;;
   *) echo "octo-check: unknown profile $PROFILE" >&2; exit 64 ;;
 esac

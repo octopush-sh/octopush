@@ -5,19 +5,19 @@
 # audit's layout checks (scripts/visual-audit/checks.mjs) plus website checks —
 # content past the window edge on mobile, placeholder copy, retired glyphs,
 # italics, missing title/description/social tags, broken internal links and
-# anchors. New defects become `visual` issues in octopush-web (deduplicated by
-# fingerprint, capped like the app audit; the first two `ready` for the web
-# builder). No agent runs here.
+# anchors, built files that would shadow /download, /api or /update. New
+# defects become `visual` issues in octopush-web (deduplicated by fingerprint,
+# capped like the app audit; the first two `ready` for the web builder). No
+# agent runs here.
 #
-# Three jobs, so the website's own code never runs where the GitHub App's
-# private key is (a job's secrets are on its runner, and the build — Astro
-# config, integrations, dependencies — is the website's code):
-#   token  mints a read-only (contents: read) installation token for
-#          octopush-web with the key and hands it on as a job output;
-#   audit  references NO secret: masks that token, checks out with it, revokes
-#          it and proves it dead, and only then builds and renders the site;
-#   file   a fresh runner with this repo's trusted scripts: downloads the
-#          findings, mints an issues-only token and files them.
+# The build is the website's own code (Astro config, integrations,
+# dependencies), so it runs the way web-build.yml runs it: as the unprivileged
+# `octo-sandbox` user through the root-owned `octo-check` (no sudo, another
+# uid, an empty environment, only the site checkout open to it), after the
+# read token has been revoked, and every sandbox process is killed — and proved
+# gone — before anything else runs. Then trusted scripts (copied before the
+# checkout) serve dist/ as static files and render it. A separate job on a
+# fresh runner mints an issues-only token and files the findings.
 # 00:49 Bogotá, after the app audit.
 name: web-audit
 
@@ -42,42 +42,13 @@ env:
   PLAYWRIGHT_VERSION: "1.64.1"
 
 jobs:
-  token:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      read: ${{ steps.mint.outputs.read }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: Read-only token for the checkout (contents:read, octopush-web only)
-        id: mint
-        env:
-          OCTOPUSH_APP_ID: ${{ secrets.OCTOPUSH_APP_ID }}
-          OCTOPUSH_APP_PRIVATE_KEY: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          t="$(node scripts/routines/app-token.mjs read-token)"
-          echo "read=$t" >> "$GITHUB_OUTPUT"
-
   audit:
-    needs: token
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       rc: ${{ steps.audit.outputs.rc }}
-    # This job references no secret at all: it runs the website's code.
     steps:
-      - name: Mask the read token
-        env:
-          READ_TOKEN: ${{ needs.token.outputs.read }}
-        run: echo "::add-mask::$READ_TOKEN"
-
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -85,42 +56,72 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+
+      - name: Trusted copy of the scripts, and Chromium (before the site is checked out)
+        run: |
+          set -euo pipefail
+          cp -R scripts "$RUNNER_TEMP/scripts"
+          npm install --prefix "$RUNNER_TEMP/pw" --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
+          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Web token (check out — revoked before the build)
+        id: read-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below, before any of the site's code runs
+          permission-contents: read
 
       - name: Check out octopush-web (main)
         uses: actions/checkout@v7
         with:
           repository: octopush-sh/octopush-web
-          token: ${{ needs.token.outputs.read }}
+          token: ${{ steps.read-token.outputs.token }}
           path: site
           persist-credentials: false
 
-      - name: Revoke the read token (before any of the site's code runs)
+      - name: Revoke the read token and prove it dead
+        if: always() && steps.read-token.outputs.token != ''
         env:
-          GH_TOKEN: ${{ needs.token.outputs.read }}
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
         run: |
           set -uo pipefail
           gh api -X DELETE installation/token >/dev/null 2>&1
-          # Proven dead, or the build doesn't start.
           if gh api repos/octopush-sh/octopush-web --silent >/dev/null 2>&1; then
             echo "::error::the read token still works after revoking it — not building the site"; exit 1
           fi
 
-      - name: Build the site and install Chromium (no token in this job any more)
+      - name: Build the site as octo-sandbox (no token, no sudo, another user)
         env:
-          ASTRO_TELEMETRY_DISABLED: "1"
+          OCTO_CHECK_PROFILE: web
         run: |
           set -euo pipefail
-          (cd site && npm ci --no-audit --no-fund --ignore-scripts && npm run build)
-          npm install --prefix "$RUNNER_TEMP/pw" --no-audit --no-fund --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
-          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+          OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"
+          octo-check install
+          octo-check site
 
-      - name: Audit (Chromium, every page, three window sizes)
+      - name: Nothing of the site's code is still running
+        if: always()
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sudo find "$GITHUB_WORKSPACE/site" -type l -user octo-sandbox -delete || true
+          chmod -R o-w "$GITHUB_WORKSPACE/site" || true
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
+          fi
+
+      - name: Audit (Chromium over the static dist/, every page, three window sizes)
         id: audit
         env:
           NODE_PATH: ${{ runner.temp }}/pw/node_modules
         run: |
           set +e
-          node scripts/web-audit/audit.mjs --site site --out "$RUNNER_TEMP/web-audit"
+          # Static files only: no code of the site runs on this side, only in the browser's sandbox.
+          node "$RUNNER_TEMP/scripts/web-audit/audit.mjs" --site site --out "$RUNNER_TEMP/web-audit"
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           # The repo is private but this repo's artifacts are public: no
@@ -169,9 +170,9 @@ jobs:
           permission-issues: write
 
       - name: File issues in octopush-web
-        # findings.json came from a job that ran the website's code: it is data.
-        # file.mjs caps what it files (5 new, 10 open, 2 ready, 3 reopened),
-        # neutralises routine markers and @mentions in page text.
+        # findings.json came from the audit job: it is data. file.mjs caps what it
+        # files (5 new, 10 open, 2 ready, 3 reopened), neutralises routine
+        # markers and @mentions in page text.
         env:
           OCTOPUSH_WEB_TOKEN: ${{ steps.file-token.outputs.token }}
         run: node scripts/visual-audit/file.mjs --repo octopush-sh/octopush-web "$RUNNER_TEMP/web-audit/findings.json"

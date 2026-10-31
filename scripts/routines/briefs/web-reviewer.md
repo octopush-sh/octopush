@@ -26,7 +26,8 @@ itself a reason to request changes).
   `api/`, `.github/`. Any such change is `changes`, however small. So is any page or static file
   that would answer `/download`, `/api/…` or `/update/…` (`src/pages/download…`,
   `public/update/…` and the like): Vercel serves a real file before the `vercel.json` rewrite, so
-  it would hijack the download or the updater feed.
+  it would hijack the download or the updater feed. The same for a root dynamic route
+  (`src/pages/[…].astro`), which could generate such a page.
 - CLAUDE.md's design rules, enforced on the diff: tokens not literals (no hex/rgb or font stacks
   outside the token blocks; `theme-color` is the one exception), no new colors, brass ≤ 5% and only
   for active/eyebrow/accent, three type voices (Fraunces only for the wordmark), no italics, none

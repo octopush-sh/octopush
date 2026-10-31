@@ -104,18 +104,21 @@ trusted:
   an agent step or an environment an agent inherits: a token used before an agent runs (to pick a
   job, read PRs, build context, check out) is **revoked before the agent starts**, and a fresh one
   is minted afterwards to publish. **No job that runs the website's own code ever holds the App's
-  private key** (a job's secrets are on its runner, and the runner user has sudo): `web-audit`'s
-  build-and-render job references no secret at all — a separate job mints a `contents: read`
-  token for its checkout (`app-token.mjs`), which it revokes and proves dead before building, and a
-  third job, on a fresh runner, files the findings. In `web-build` the website's code (build,
+  private key** where that code could reach it (a job's secrets are on its runner, and the runner
+  user has sudo). In both `web-build` and `web-audit` the website's code (`npm ci`, the build,
   `astro check`, the consistency gate) runs only through `octo-check` as `octo-sandbox` — another
-  user, without sudo, that can't read the runner's processes — and the key is used only before the
-  sandbox exists and after a step has checked that none of its processes survived. Publishing to
+  user, without sudo, with an empty environment, that can't read the runner's processes — and the
+  key is used only before the sandbox exists and after a step has killed every sandbox process and
+  checked that none survived. The web audit's read token is revoked (`if: always()`) and proved dead
+  before the build; trusted scripts copied beforehand then serve `dist/` as static files to
+  Chromium; a separate job on a fresh runner mints an issues-only token and files the findings. Publishing to
   octopush-web refuses its human-only paths (legal pages in any format, `src/legal-config.ts`,
   `src/data/release.ts`, `free-vs-pro`, analytics and `astro.config.mjs`, `src/content.config.ts`,
-  `scripts/`, `vercel.json`, `.vercel/`, `api/`, `.github/`, agent docs, manifests, and any page or
-  static file at `/download`, `/api` or `/update`, which Vercel would serve before the rewrites —
-  `WEB_HUMAN_ONLY` in `automerge.mjs`) and scans for the push token as well as the Claude token;
+  `scripts/`, `vercel.json`, `.vercel/`, `api/`, `.github/`, agent docs, manifests, any page or
+  static file at `/download`, `/api` or `/update`, which Vercel would serve before the rewrites, and
+  root dynamic routes (`src/pages/[…].astro`), which could generate one — `WEB_HUMAN_ONLY` in
+  `automerge.mjs`; `octo-check build` also fails if the built `dist/` has `download*`, `api` or
+  `update`, and the web audit files that as an issue for you) and scans for the push token as well as the Claude token;
   the push token reaches git through the environment, never its command line. Pushes made with an
   installation token start octopush-web's CI on their own (only `GITHUB_TOKEN` pushes don't), so
   nothing is dispatched there. Website PRs never merge without your `merge web#N`; after the merge

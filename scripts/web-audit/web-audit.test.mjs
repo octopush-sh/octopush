@@ -85,3 +85,15 @@ test("parseArgs: the site is required, three window sizes by default", () => {
   assert.deepEqual(o.pages, ["/", "/docs/"]);
   assert.throws(() => parseArgs(["--site", "x", "--sizes", "big"]));
 });
+
+import { shadowedRoutes } from "./checks.mjs";
+
+test("the audit reports built files that would shadow /download, /api or /update — for the owner, never `ready`", () => {
+  const dist = site({ "index.html": html(""), "download/index.html": html(""), "api/x.json": "{}", "downloads.txt": "", "docs/index.html": html("") });
+  const found = shadowedRoutes(dist);
+  assert.deepEqual(found.map((f) => f.selector), ["dist/api", "dist/download", "dist/downloads.txt"]);
+  const [m] = mergeFindings(found.slice(1, 2).map((f) => ({ size: "", ...f })));
+  const [a] = planFiling([m], [], { target: TARGETS[WEB_REPO] });
+  assert.deepEqual(a.labels, ["visual", "bug", "proposal"]);
+  assert.deepEqual(shadowedRoutes(site({ "index.html": html(""), "updates/index.html": html("") })), []);
+});

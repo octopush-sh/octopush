@@ -73,6 +73,8 @@ export const WEB_HUMAN_ONLY = [
   // A real file wins over a vercel.json rewrite/redirect: a page or static file at
   // /download, /api or /update would shadow the download path or the updater feeds.
   /^src\/pages\/(download|api|update)(\.|\/)/i, /^public\/(download|api|update)(\.|\/|$)/i,
+  // A root dynamic route ([slug].astro, [...path].astro) can generate any of them.
+  /^src\/pages\/\[/i,
   // Content collections config (drafts, what gets published).
   /^src\/content\.config\.[cm]?[jt]s$/i,
 ];

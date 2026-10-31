@@ -907,7 +907,7 @@ test("octo-check: the installed copy runs only its profile's commands", async ()
   };
   const web = install("web"), app = install("app"), bad = install("evil");
   assert.equal(web("typecheck").status, 64);
-  assert.match(web("typecheck").stderr, /build \| check \| consistency \| all/);
+  assert.match(web("typecheck").stderr, /build \| check \| consistency \| routes \| all/);
   assert.equal(app("build").status, 64);
   assert.match(app("build").stderr, /typecheck \| test/);
   assert.match(bad("all").stderr, /unknown profile/);
@@ -916,7 +916,6 @@ test("octo-check: the installed copy runs only its profile's commands", async ()
 
 // ---------------------------------------------------------------- website lane: security review fixes
 import { closeAppIssues } from "./answers.mjs";
-import { appJwt, tokenRequest } from "./app-token.mjs";
 
 test("web human-only: no page or file may shadow /download, /api or /update; legal pages in any format; Vercel and content config", () => {
   const blocked = ["src/pages/download.astro", "src/pages/download/index.astro", "src/pages/Download.md", "src/pages/api/x.ts", "src/pages/update/latest.json.ts",
@@ -983,34 +982,53 @@ test("publishing pushes with the token in the environment, never in git's argv",
   assert.match(src, /GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic \$\{auth\}`/);
 });
 
-test("app-token: a signed RS256 App JWT and a contents:read request for octopush-web only", async () => {
-  const { generateKeyPairSync, createVerify } = await import("node:crypto");
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  const jwt = appJwt("5559111", privateKey.export({ type: "pkcs8", format: "pem" }), 1_000_000);
-  const [h, b, sig] = jwt.split(".");
-  const dec = (x) => JSON.parse(Buffer.from(x.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
-  assert.deepEqual(dec(h), { alg: "RS256", typ: "JWT" });
-  assert.deepEqual(dec(b), { iat: 999_940, exp: 1_000_540, iss: "5559111" });
-  assert.ok(createVerify("RSA-SHA256").update(`${h}.${b}`).verify(publicKey, Buffer.from(sig.replace(/-/g, "+").replace(/_/g, "/"), "base64")));
-  assert.throws(() => appJwt("abc", "k"), /numeric/);
-  assert.deepEqual(tokenRequest(), { repositories: ["octopush-web"], permissions: { contents: "read" } });
-});
-
-test("workflows: no job that runs the website's code ever holds the App's private key", async () => {
+test("workflows: website code runs only as octo-sandbox, and the App key only outside that window", async () => {
   const { readFileSync } = await import("node:fs");
   const wf = (f) => readFileSync(new URL(`../../.github/workflows/${f}`, import.meta.url), "utf8");
+  const keyOutside = (text, start, end) => {
+    assert.ok(start > 0 && end > start, "sandbox window found");
+    for (let i = text.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = text.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) {
+      assert.ok(i < start || i > end, "the App key appears only before the sandbox exists or after it is proved gone");
+    }
+  };
+  // web-audit: one job builds (as octo-sandbox) and renders; a fresh job files.
   const audit = wf("web-audit.yml");
   const job = audit.slice(audit.indexOf("\n  audit:\n"), audit.indexOf("\n  file:\n"));
-  assert.ok(job.length > 100 && job.includes("npm run build"));
-  assert.doesNotMatch(job, /secrets\./, "the job that builds the site references no secret");
+  assert.doesNotMatch(audit, /needs\.\w+\.outputs\.(read|token)/, "no token handed over as a job output (it would print in the public log)");
+  assert.doesNotMatch(job, /npm run build|npm ci/, "the site is never installed or built as the runner user");
+  assert.match(job, /octo-check install\n\s*octo-check site/);
+  assert.match(job, /skip-token-revoke: true/);
+  assert.match(job, /Revoke the read token and prove it dead\n\s*if: always\(\)/);
+  assert.match(job, /pgrep -u octo-sandbox/);
+  keyOutside(job, job.indexOf("agent-sandbox-setup.sh"), job.indexOf("pgrep -u octo-sandbox"));
+  assert.ok(job.indexOf("Trusted copy of the scripts") < job.indexOf("Check out octopush-web"), "trusted scripts are copied before the site arrives");
   assert.match(audit.slice(audit.indexOf("\n  file:\n")), /download-artifact/);
-  // web-build: the website's code runs only as octo-sandbox (no sudo, another uid), between
-  // the sandbox setup and its kill; the key is used only before the one and after the other.
+  // web-build: the same window, the sandbox's setup to the survivor check.
   const build = wf("web-build.yml");
-  const start = build.indexOf("name: Install and sandbox"), end = build.indexOf("id: sandbox-gone");
-  assert.ok(start > 0 && end > start);
-  for (let i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) {
-    assert.ok(i < start || i > end, "the App key appears only outside the sandbox window");
-  }
+  keyOutside(build, build.indexOf("name: Install and sandbox"), build.indexOf("id: sandbox-gone"));
   assert.match(build, /pgrep -u octo-sandbox/);
+});
+
+test("octo-check web: install, site, routes; build and all fail on a dist that shadows /download, /api or /update", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { readFileSync, mkdirSync } = await import("node:fs");
+  const src = readFileSync(new URL("./agent-check.sh", import.meta.url), "utf8");
+  const f = join(mkdtempSync(join(tmpdir(), "oc-")), "octo-check");
+  writeFileSync(f, src.replace(/^ROOT=.*$/m, 'ROOT="/nonexistent"').replace(/^NODE_DIR=.*$/m, `NODE_DIR="${process.execPath.replace(/\/node$/, "")}"`).replace(/^PROFILE=.*$/m, 'PROFILE="web"'));
+  assert.match(spawnSync("bash", [f, "nope"], { encoding: "utf8" }).stderr, /build \| check \| consistency \| routes \| all/);
+  // The route guard itself, run on a fake dist (it is a fixed shell fragment in the script).
+  const guard = /routes='([^']+)'/.exec(src)[1];
+  const dir = mkdtempSync(join(tmpdir(), "routes-"));
+  mkdirSync(join(dir, "dist", "docs"), { recursive: true });
+  assert.equal(spawnSync("bash", ["-c", guard], { cwd: dir }).status, 0);
+  writeFileSync(join(dir, "dist", "download.html"), "x");
+  const r = spawnSync("bash", ["-c", guard], { cwd: dir, encoding: "utf8" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /download\.html in dist\/ — it would shadow/);
+  assert.match(src, /build\) cmd=\(bash -c "npm run --silent build && \{ \$routes; \}"\)/);
+  assert.match(src, /all\) cmd=\(bash -c "npm run --silent build && \{ \$routes; \} && /);
+});
+
+test("web human-only: a root dynamic route could generate /download — refused", () => {
+  assert.deepEqual(forbiddenPaths(["src/pages/[slug].astro", "src/pages/[...path].astro", "src/pages/blog/[...slug].astro"], WEB_REPO), ["src/pages/[slug].astro", "src/pages/[...path].astro"]);
 });

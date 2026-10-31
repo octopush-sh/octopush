@@ -143,9 +143,24 @@ export const WEB_CHECK_TITLES = {
   "missing-meta": "Missing title, description or social-card tag",
   "broken-link": "Internal link to a page that doesn't exist",
   "missing-anchor": "Link to a heading that doesn't exist",
+  "shadowed-route": "The build shadows /download, /api or /update",
 };
 /** Checks that are about content and wiring rather than layout: labelled `bug` too. */
-export const BUG_CHECKS = new Set(["broken-link", "missing-anchor", "missing-meta", "placeholder-text"]);
+export const BUG_CHECKS = new Set(["broken-link", "missing-anchor", "missing-meta", "placeholder-text", "shadowed-route"]);
+/** Checks about human-only wiring: filed for the owner, never `ready`. */
+export const OWNER_CHECKS = new Set(["shadowed-route"]);
+
+/**
+ * Built files that would answer a vercel.json route before its rewrite or
+ * redirect — /download (the download funnel), /api/… (edge functions),
+ * /update/… (the app's updater feeds). Raw findings (pure over the file system).
+ */
+export function shadowedRoutes(dist) {
+  return readdirSync(dist).filter((n) => /^download/i.test(n) || /^(api|update)$/i.test(n)).sort().map((n) => ({
+    check: "shadowed-route", selector: `dist/${n}`, text: n, rect: { x: 0, y: 0, w: 0, h: 0 },
+    detail: `dist/${n} would be served instead of the vercel.json route for /${n.replace(/\..*$/, "")}`, surface: "/",
+  }));
+}
 export const WEB_SIZES = ["1440x900", "1024x700", "390x844"];
 
 /**
