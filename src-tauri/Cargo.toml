@@ -60,7 +60,21 @@ parking_lot = "0.12"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# reqwest 0.13 made rustls (aws-lc) the default TLS backend and turned
+# `query`/`form` into opt-in features. Default features are off so this keeps
+# 0.12's behaviour: native-tls (OS trust store) without ALPN, i.e. HTTP/1.1 over
+# TLS, as before, plus charset, http2 and the system proxy (0.12's
+# `macos-system-configuration`, now `system-proxy`).
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls-no-alpn",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "stream",
+    "form",
+    "query",
+] }
 futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"
