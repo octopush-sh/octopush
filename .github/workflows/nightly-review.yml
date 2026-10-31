@@ -12,6 +12,12 @@ on:
   schedule:
     - cron: "47 1-23/2 * * *"
   workflow_dispatch:
+  # GitHub's scheduler delays or drops crons for hours on busy days, so the
+  # cycle also chains on events: an agent branch's CI finishing starts a
+  # review right away (the crons stay as a fallback).
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   contents: write       # merge
@@ -31,6 +37,12 @@ env:
 
 jobs:
   review:
+    # From workflow_run: only for a green CI on an agent branch (the queue
+    # re-checks everything anyway; this just avoids empty runs).
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'agent/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -126,3 +138,16 @@ jobs:
               gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" -f ref=main >/dev/null || true
             fi
           done
+
+      - name: Keep the builder going
+        # A "changes" verdict or a merge can leave work for the builder: start it
+        # now instead of waiting for its cron. jobs.mjs only reads.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if node scripts/routines/jobs.mjs next > /dev/null 2>&1; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-build.yml/dispatches" -f ref=main >/dev/null && echo "builder started"
+          else
+            echo "nothing for the builder"
+          fi
