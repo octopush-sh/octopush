@@ -15,7 +15,7 @@ import { ACTIONS_BOT, reviewerToken } from "./identity.mjs";
 import { parseVerdict } from "./automerge.mjs";
 import { parseResult, leaks, branchFor, forbiddenPaths } from "./publish-build.mjs";
 import { claudeArgs, agentEnv, denyRules, ROLES } from "./agent.mjs";
-import { repoForIdea, ideaLabels, areaOf, ideaBody } from "./ideas.mjs";
+import { repoForIdea, ideaLabels, areaOf, ideaBody, listOrEmpty } from "./ideas.mjs";
 import { render } from "./read.mjs";
 
 const ids = { owner: "johnatan", builder: "octo-builder", reviewer: "octo-reviewer" };
@@ -521,4 +521,10 @@ test("jobs: a PR that already used its fix rounds is parked, not rebuilt", () =>
   const j = fixJobs(gh, APP_REPO, a, now);
   assert.equal(j.length, 1);
   assert.equal(j[0].stale, true);
+});
+
+test("a sibling repo the token can't read (private, 404) is skipped, not fatal", () => {
+  const gh = makeGh((args) => { if (String(args[0]).includes("octopush-api")) throw new Error("gh: Not Found (HTTP 404)"); return "[]"; });
+  assert.deepEqual(listOrEmpty(gh, "repos/octopush-sh/octopush-api/issues?state=all"), []);
+  assert.doesNotThrow(() => waitingItems(gh, { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT }));
 });

@@ -38,6 +38,15 @@ const DIFF_RANK = { S: 0, M: 1, L: 2 };
 export const MIN_IDEAS = 5;
 const DAY = 864e5;
 
+/**
+ * List from another repo, or [] when this token can't read it: a workflow's
+ * GITHUB_TOKEN only reaches its own repo, so a private sibling (octopush-api)
+ * answers 404. The digest then simply leaves that repo out.
+ */
+export function listOrEmpty(gh, path, max) {
+  try { return gh.list(path, max); } catch { return []; }
+}
+
 /** YYYY-MM-DD in the machine's local time zone (the owner's day). */
 export function localDate(now = new Date()) {
   const p = (n) => String(n).padStart(2, "0");
@@ -117,7 +126,7 @@ export function cmpVersion(a, b) {
 export function waitingItems(gh, ids) {
   const out = [];
   for (const repo of [API_REPO, WEB_REPO]) {
-    for (const p of gh.list(`repos/${repo}/pulls?state=open`)) {
+    for (const p of listOrEmpty(gh, `repos/${repo}/pulls?state=open`)) {
       if (!labelsOf(p).includes("agent") || p.draft) continue;
       if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== repo || p.base?.ref !== "main") continue;
       const short = repo.endsWith("-web") ? "web" : "api";
@@ -159,7 +168,7 @@ function context(gh, now, ids) {
   const lines = ["# Context for today's ideas", "", pri.trim(), "", "## Every existing idea / proposal (do not repeat these)", ""];
   const later = [];
   for (const repo of ALL_REPOS) {
-    for (const i of gh.list(`repos/${repo}/issues?state=all&labels=idea`, 500).concat(gh.list(`repos/${repo}/issues?state=all&labels=proposal`, 500))) {
+    for (const i of listOrEmpty(gh, `repos/${repo}/issues?state=all&labels=idea`, 500).concat(listOrEmpty(gh, `repos/${repo}/issues?state=all&labels=proposal`, 500))) {
       if (i.pull_request) continue;
       const l = labelsOf(i);
       lines.push(`- ${repo.split("/")[1]}#${i.number} [${i.state}${l.length ? `; ${l.join(", ")}` : ""}] ${i.title}`);
@@ -170,7 +179,7 @@ function context(gh, now, ids) {
   lines.push("", "## Shipped in the last 7 days", "");
   const since = new Date(now - 7 * DAY).toISOString();
   for (const repo of ALL_REPOS) {
-    for (const p of gh.list(`repos/${repo}/pulls?state=closed&sort=updated&direction=desc`, 100)) {
+    for (const p of listOrEmpty(gh, `repos/${repo}/pulls?state=closed&sort=updated&direction=desc`, 100)) {
       if (p.merged_at && p.merged_at >= since) lines.push(`- ${repo.split("/")[1]}#${p.number} ${p.title}`);
     }
   }
@@ -208,7 +217,7 @@ function post(gh, file, now, ids) {
   // Unanswered ideas from earlier digests, so nothing silently drops off the list.
   const listed = new Set(rows.map((r) => r.ref));
   for (const repo of ALL_REPOS) {
-    for (const i of gh.list(`repos/${repo}/issues?state=open&labels=idea,proposal&sort=created&direction=asc`, 20)) {
+    for (const i of listOrEmpty(gh, `repos/${repo}/issues?state=open&labels=idea,proposal&sort=created&direction=asc`, 20)) {
       const ref = `${repo}#${i.number}`;
       if (i.pull_request || listed.has(ref) || rows.length >= 25 || !trustedAuthor(i, ids)) continue;
       const m = /\*\*Value\*\* [●○]+ \((\d)\/5\) · \*\*Difficulty\*\* ([SML]) · \*\*Estimate\*\* ([^·]+?) ·/.exec(i.body ?? "");
