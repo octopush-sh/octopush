@@ -70,7 +70,8 @@ export function inPageChecks() {
     const cs = getComputedStyle(e);
     const border = ["Top", "Right", "Bottom", "Left"].some((s) => parseFloat(cs[`border${s}Width`]) > 0 && cs[`border${s}Style`] !== "none");
     const bg = alphaOf(cs.backgroundColor) > 0.05;
-    const ring = cs.boxShadow && cs.boxShadow !== "none";
+    // A ring/shadow draws an edge only if some part of it is visible.
+    const ring = cs.boxShadow && cs.boxShadow !== "none" && (cs.boxShadow.match(/rgba?\([^)]*\)|oklab\([^)]*\)|color\([^)]*\)/g) ?? []).some((c) => alphaOf(c) > 0.05);
     const outline = cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0;
     return border || bg || ring || outline;
   };
@@ -83,20 +84,26 @@ export function inPageChecks() {
   // absolutely positioned room stacked above the workspace (z ≥ 10). A
   // solid badge or button in normal flow is NOT a layer: text under it is an
   // overlap to report, not something to ignore.
-  const isLayer = (e) => {
+  // The overlay root `e` belongs to, or null.
+  const layerOf = (e) => {
     for (let x = e; x && x !== document.body; x = x.parentElement) {
-      if (/^(dialog|alertdialog|menu|listbox|tooltip)$/.test(x.getAttribute("role") || "")) return true;
+      if (/^(dialog|alertdialog|menu|listbox|tooltip)$/.test(x.getAttribute("role") || "")) return x;
       const xcs = getComputedStyle(x);
-      if (xcs.position === "fixed") return true;
+      if (xcs.position === "fixed") return x;
       // An in-app room laid over the workspace (Settings, Mission Control…).
-      if (xcs.position === "absolute" && Number(xcs.zIndex) >= 10) return true;
+      if (xcs.position === "absolute" && Number(xcs.zIndex) >= 10) return x;
     }
-    return false;
+    return null;
   };
-  const opaque = (e) => {
+  // Does `e` hide `under`? Only if it's solid AND part of an overlay that
+  // `under` is not in — inside one dialog, a solid badge over a label is an
+  // overlap to report, not a layer.
+  const hides = (e, under) => {
     const ecs = getComputedStyle(e);
     const solid = (ecs.backdropFilter && ecs.backdropFilter !== "none") || alphaOf(ecs.backgroundColor) * opacityChain(e) >= 0.9;
-    return solid && isLayer(e);
+    if (!solid) return false;
+    const layer = layerOf(e);
+    return !!layer && !layer.contains(under);
   };
   // At a point where two texts meet: is the lower one hidden under an opaque layer?
   const lowerHiddenAt = (x, y, a, b) => {
@@ -107,13 +114,13 @@ export function inPageChecks() {
     const lowerEl = ia > ib ? a : b, lower = Math.max(ia, ib);
     // An opaque layer above the lower text that isn't part of it (e.g. the
     // dialog panel behind the upper text) hides it: not an overlap.
-    for (let k = 0; k < lower; k++) if (!stack[k].contains(lowerEl) && !rel(stack[k], lowerEl) && opaque(stack[k])) return true;
+    for (let k = 0; k < lower; k++) if (!stack[k].contains(lowerEl) && !rel(stack[k], lowerEl) && hides(stack[k], lowerEl)) return true;
     return false;
   };
   const coveredAt = (x, y, el) => {
     for (const e of document.elementsFromPoint(x, y)) {
       if (e === el || el.contains(e) || e.contains(el)) return false;
-      if (opaque(e)) return true;
+      if (hides(e, el)) return true;
     }
     return false;
   };

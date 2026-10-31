@@ -98,10 +98,11 @@ async function main() {
         if (surface !== "home" && !all.includes(surface)) { console.error(`visual-audit: unknown surface ${surface}`); unknown++; continue; }
         attempted++;
         let page;
+        // A crash = the surface couldn't be rendered and checked at all. Stray
+        // page errors (an unmocked IPC call) are only logged.
         try {
           page = await openHarness(context, url, scenario);
-          let crashedHere = false;
-          page.on("pageerror", (e) => { pageErrors.push(`${scenario}/${surface}: ${e.message}`); if (!crashedHere) { crashedHere = true; crashed++; } });
+          page.on("pageerror", (e) => pageErrors.push(`${scenario}/${surface}: ${e.message}`));
           if (surface !== "home") {
             const ok = await page.evaluate((n) => window.__octoClips.openSurface(n), surface);
             if (!ok) { console.error(`visual-audit: surface ${surface} didn't open`); unknown++; continue; }

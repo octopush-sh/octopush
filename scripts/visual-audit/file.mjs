@@ -58,7 +58,8 @@ export function validDesignFindings(design, visited, { size = "1280x800" } = {})
 }
 
 /** Issues for validated design findings (pure, tested). */
-export const isDesign = (i) => labelsOf(i).includes("proposal");
+// Design issues carry `idea` for good (answers.mjs only swaps proposal/ready/later).
+export const isDesign = (i) => labelsOf(i).includes("idea");
 export function planDesign(findings, existing, { max = MAX_DESIGN, openCap = OPEN_DESIGN_CAP, runUrl } = {}) {
   const known = new Set(existing.map((i) => fpOf(i.body)).filter(Boolean));
   const open = existing.filter((i) => i.state === "open" && !i.pull_request && isDesign(i)).length;
@@ -141,14 +142,21 @@ function main() {
       const i = gh.send("POST", `repos/${repo}/issues`, { title: a.title, body: a.body, labels: a.labels });
       console.log(`filed #${i.number} ${a.title} (${a.labels.join(", ")})`);
     } else {
-      gh.send("PATCH", `repos/${repo}/issues/${a.number}`, { state: "open" });
+      // Labels first: an issue must never come back open and still `ready`.
       try { gh.send("DELETE", `repos/${repo}/issues/${a.number}/labels/ready`); } catch { /* not labelled */ }
       gh.send("POST", `repos/${repo}/issues/${a.number}/labels`, { labels: [NEEDS_OWNER] });
+      gh.send("PATCH", `repos/${repo}/issues/${a.number}`, { state: "open" });
       gh.send("POST", `repos/${repo}/issues/${a.number}/comments`, { body: a.comment });
       console.log(`reopened #${a.number}`);
     }
   }
-  if (!actions.length) console.log("nothing new to file");
+  if (!actions.length) {
+    const openChecks = existing.filter((i) => i.state === "open" && !i.pull_request && !isDesign(i)).length;
+    const openDesign = existing.filter((i) => i.state === "open" && !i.pull_request && isDesign(i)).length;
+    if (!designFile && openChecks >= OPEN_VISUAL_CAP) console.log(`::warning::visual audit: ${openChecks} open visual issues (cap ${OPEN_VISUAL_CAP}) — nothing new filed until some are fixed`);
+    else if (designFile && openDesign >= OPEN_DESIGN_CAP) console.log(`::warning::design review: ${openDesign} open design ideas (cap ${OPEN_DESIGN_CAP}) — answer some in the digest`);
+    else console.log("nothing new to file");
+  }
   return 0;
 }
 

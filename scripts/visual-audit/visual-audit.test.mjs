@@ -129,7 +129,7 @@ test("design findings are proposals, deduplicated, capped, and can't forge marke
   const many = Array.from({ length: 5 }, (_, i) => ({ ...fs[0], fp: `0000000${i}` }));
   assert.equal(planDesign(many, []).length, MAX_DESIGN);
   // Six open design proposals already → nothing until some are answered.
-  const open = Array.from({ length: 6 }, (_, n) => ({ number: n, body: "x", state: "open", labels: [{ name: "visual" }, { name: "proposal" }] }));
+  const open = Array.from({ length: 6 }, (_, n) => ({ number: n, body: "x", state: "open", labels: [{ name: "visual" }, { name: "idea" }] }));
   assert.deepEqual(planDesign(many, open), []);
   // No @mentions from agent text.
   const [m] = planDesign(validDesignFindings({ findings: [{ ...good, problem: "ping @johnatan-velez now" }] }, visited), []);

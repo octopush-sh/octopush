@@ -36,6 +36,8 @@ jobs:
   audit:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-15
+    outputs:
+      rc: ${{ steps.audit.outputs.rc }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -85,8 +87,8 @@ jobs:
     # tools, no GitHub access (agent.mjs); its findings are validated and filed
     # as `proposal` issues — never straight to the builder.
     needs: audit
-    # Even if filing failed: the screenshots are uploaded either way.
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.audit.result != 'skipped' }}
+    # When the audit itself worked (0 clean, 1 findings) — even if filing failed.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (needs.audit.outputs.rc == '0' || needs.audit.outputs.rc == '1') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -105,10 +107,15 @@ jobs:
           name: visual-audit
           path: ${{ runner.temp }}/visual-audit
 
-      - name: Prepare
-        id: prep
+      - name: Earlier design ideas
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues?state=all&labels=visual,idea&per_page=100" \
+            --jq '.[] | "- \(.title) [\(.state)]"' > "$RUNNER_TEMP/earlier-design.md" || echo "(couldn't list them)" > "$RUNNER_TEMP/earlier-design.md"
+
+      - name: Prepare
+        id: prep
         run: |
           set -euo pipefail
           cp -R scripts "$RUNNER_TEMP/scripts"   # trusted copy, outside the agent's directory
@@ -125,8 +132,7 @@ jobs:
             node -e 'const r=require(process.argv[1]); for (const f of r.findings) console.log(`- ${f.check}: ${f.surfaces.join(", ")} — ${f.selector}`); if(!r.findings.length) console.log("(none)")' "$RUNNER_TEMP/visual-audit/findings.json" || echo "(no findings file)"
             echo
             echo "# Already proposed (open, or declined — don't propose these again)"
-            gh api "repos/$GITHUB_REPOSITORY/issues?state=all&labels=visual,proposal&per_page=100" \
-              --jq '.[] | "- \(.title) [\(.state)]"' || echo "(couldn't list them)"
+            cat "$RUNNER_TEMP/earlier-design.md"
           } > "$RUNNER_TEMP/design-prompt.md"
           npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
