@@ -135,3 +135,12 @@ test("design findings are proposals, deduplicated, capped, and can't forge marke
   const [m] = planDesign(validDesignFindings({ findings: [{ ...good, problem: "ping @johnatan-velez now" }] }, visited), []);
   assert.ok(!/@johnatan/.test(m.body));
 });
+
+import { scriptFor } from "./safari.mjs";
+
+test("Safari: functions are sent to WebDriver as a script that applies the arguments", () => {
+  const fn = (n) => n * 2;
+  const body = scriptFor(fn);
+  assert.equal(new Function(body)(21), 42);
+  assert.equal(parseArgs(["--engine", "safari"]).engine, "safari");
+});

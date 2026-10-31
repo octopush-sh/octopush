@@ -66,12 +66,28 @@ jobs:
           # 0 = clean, 1 = findings (filed below); anything else is the audit failing.
           [ "$rc" -le 1 ] || exit "$rc"
 
+      - name: Audit (system Safari — the app's own WebKit)
+        id: safari
+        # Playwright's WebKit is a newer build than the WKWebView the app runs
+        # in; #312 only showed in the system one. Same checks, same stress data.
+        run: |
+          set +e
+          echo "macOS $(sw_vers -productVersion) · Safari $(defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString)"
+          sudo safaridriver --enable
+          node scripts/visual-audit/audit.mjs --engine safari --scenario stress --out "$RUNNER_TEMP/visual-audit-safari"
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # A broken Safari pass is reported but doesn't block the WebKit results.
+          [ "$rc" -le 1 ] || echo "::warning::the Safari pass failed (rc $rc)"
+
       - name: Keep the screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: visual-audit
-          path: ${{ runner.temp }}/visual-audit
+          path: |
+            ${{ runner.temp }}/visual-audit
+            ${{ runner.temp }}/visual-audit-safari
           retention-days: 14
           if-no-files-found: ignore
 
@@ -80,6 +96,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/visual-audit/file.mjs "$RUNNER_TEMP/visual-audit/findings.json"
+
+      - name: File issues (Safari)
+        # Same fingerprints as the WebKit pass, so a defect both see is one issue.
+        if: steps.safari.outputs.rc == '1' && (github.event_name == 'schedule' || inputs.file_issues)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/visual-audit/file.mjs "$RUNNER_TEMP/visual-audit-safari/findings.json"
 
   design-review:
     # A Claude agent reads tonight's screenshots against the design system for
@@ -105,7 +128,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: visual-audit
-          path: ${{ runner.temp }}/visual-audit
+          # The artifact holds visual-audit/ and visual-audit-safari/.
+          path: ${{ runner.temp }}
 
       - name: Earlier design ideas
         env:

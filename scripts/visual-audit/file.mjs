@@ -135,7 +135,7 @@ function main() {
   const existing = gh.list(`repos/${repo}/issues?state=all&labels=visual`, 2000);
   const actions = designFile
     ? planDesign(validDesignFindings(JSON.parse(readFileSync(designFile, "utf8")), report.visited ?? []), existing, { runUrl })
-    : planFiling(report.findings ?? [], existing, { engine: report.engine === "webkit" ? "WebKit" : "Chromium", runUrl });
+    : planFiling(report.findings ?? [], existing, { engine: { webkit: "WebKit", safari: "Safari", chromium: "Chromium" }[report.engine] ?? report.engine, runUrl });
   for (const a of actions) {
     if (dry) { console.log(`[dry-run] ${a.type} ${a.number ?? a.title} ${a.labels ? `(${a.labels.join(", ")})` : ""}`); continue; }
     if (a.type === "create") {
