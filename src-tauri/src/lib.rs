@@ -389,6 +389,7 @@ pub fn run() {
             // MCP server integration (Connect to Claude Code)
             commands::mcp_connection_status,
             commands::connect_claude_code,
+            commands::claude_cli_version,
             // Role commands
             commands::list_roles,
             commands::save_role,

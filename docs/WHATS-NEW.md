@@ -65,8 +65,10 @@ Current anchors:
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
 | `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
+| `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
+| `settings-claude-code-card` · `settings-claude-cli-version` | Settings › Integrations: the Claude Code card · its installed-CLI version line | `settings/IntegrationsPane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 

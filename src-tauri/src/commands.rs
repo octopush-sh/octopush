@@ -6023,6 +6023,17 @@ pub async fn mcp_connection_status() -> AppResult<crate::mcp_setup::McpStatus> {
         .map_err(|e| AppError::Other(format!("status task failed: {e}")))
 }
 
+/// The installed Claude Code CLI's version against the tested floor (probed
+/// once per app session) — drives the Integrations card's update row.
+#[tauri::command]
+pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVersion> {
+    // The first call runs `claude --version` (and may resolve the login
+    // shell); keep it off the async runtime.
+    tokio::task::spawn_blocking(crate::agent_adapter::claude_cli_version)
+        .await
+        .map_err(|e| AppError::Other(format!("version task failed: {e}")))
+}
+
 /// One-click: register the bundled `octopush-mcp` server with Claude Code at
 /// user scope. Returns a structured result (with a manual fallback command) so
 /// the UI can guide the user when the CLI isn't found.

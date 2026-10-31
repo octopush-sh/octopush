@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type PipelineWithStages } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type PipelineWithStages } from "../lib/ipc";
+import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
 import { savingsVsBaseline } from "../lib/runStatus";
@@ -150,6 +151,18 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     }
     prevSig.current = { id: selectedId, sig: stageSig };
   }, [selectedId, stageSig]);
+  // Preflight: a crew with a Claude Code CLI stage on an old CLI gets an
+  // amber note under the foot. Informational only — it never gates Begin.
+  const usesClaudeCode = !!selected && crewUsesClaudeCode(selected.stages, overrides);
+  const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
+  useEffect(() => {
+    if (!usesClaudeCode) return;
+    let alive = true;
+    void loadClaudeCliVersion().then((v) => { if (alive) setCli(v); });
+    return () => { alive = false; };
+  }, [usesClaudeCode]);
+  const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
+
   const { saved, pct: savedPct } = estimate
     ? savingsVsBaseline(estimate.estimateUsd, estimate.baselineUsd)
     : { saved: 0, pct: 0 };
@@ -415,6 +428,20 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 </p>
               </div>
             </div>
+            {cliUpdate && cli?.version && (
+              <div
+                data-tour="direct-launcher-cli-version"
+                data-testid="launcher-claude-cli-update"
+                className="octo-rise-in mt-4 rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2"
+              >
+                <div className="font-mono text-[11px] text-octo-warning">
+                  {cliUpdate} · installed <span className="octo-tabular">{cli.version}</span>
+                </div>
+                <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">
+                  {CLAUDE_UPDATE_REASON} The run can still begin.
+                </p>
+              </div>
+            )}
           </>
         )}
       </div>

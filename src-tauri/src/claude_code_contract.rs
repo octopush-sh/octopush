@@ -121,6 +121,19 @@ fn versions_sort_numerically() {
     assert_eq!(v, ["2.0.100", "2.1.9", "2.1.10", "10.0.0"]);
 }
 
+#[test]
+fn tested_claude_floor_names_a_recorded_version() {
+    // The Settings row and the run preflight warn below this version, so it
+    // must be one the contract tests actually ran against.
+    let floor = crate::agent_adapter::TESTED_CLAUDE_FLOOR;
+    let versions: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
+    assert!(
+        versions.iter().any(|v| v == floor),
+        "agent_adapter::TESTED_CLAUDE_FLOOR is {floor}, but the recorded fixtures are {versions:?} — \
+         bump the floor together with the fixtures"
+    );
+}
+
 /// Walk a dotted path (`message.usage.input_tokens`, `message.content.0.id`).
 /// `Err` names the fixture, the field, and the event type it was read from.
 fn try_require<'a>(fixture: &str, v: &'a Value, path: &str) -> Result<&'a Value, String> {

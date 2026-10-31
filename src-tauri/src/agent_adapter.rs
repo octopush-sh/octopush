@@ -8,6 +8,10 @@
 use crate::token_engine::TokenEvent;
 use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Trait for pluggable agent adapters.
 pub trait AgentAdapter: Send + Sync {
@@ -170,9 +174,194 @@ pub fn adapter_info_list() -> Vec<AdapterInfo> {
         .collect()
 }
 
+// ─── Claude Code CLI version ──────────────────────────────────────
+
+/// The oldest Claude Code release Octopush is tested against: the version of
+/// the contract fixtures (`tests/fixtures/claude-code/<version>/`). The
+/// release-watch routine bumps it when it refreshes them; a contract test
+/// keeps it naming a recorded version.
+pub const TESTED_CLAUDE_FLOOR: &str = "2.1.314";
+
+/// How long `claude --version` may take before the version counts as unknown.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The installed Claude Code CLI's version against the tested floor — drives
+/// the Settings row and the run preflight warning. Never blocks a run.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCliVersion {
+    /// `x.y.z` from `claude --version`; `None` when the CLI isn't found or
+    /// didn't print a version.
+    pub version: Option<String>,
+    pub floor: String,
+    /// True only when the version is known AND older than the floor.
+    pub below_floor: bool,
+}
+
+impl ClaudeCliVersion {
+    pub fn new(version: Option<String>, floor: &str) -> Self {
+        let below_floor = version.as_deref().is_some_and(|v| version_below(v, floor));
+        Self { version, floor: floor.to_string(), below_floor }
+    }
+
+    /// The journal notice for a CLI stage on an old CLI; `None` otherwise.
+    pub fn update_notice(&self) -> Option<String> {
+        let v = self.version.as_deref().filter(|_| self.below_floor)?;
+        Some(format!(
+            "Claude Code {v} is older than {floor}, the version Octopush is tested with. \
+             Older releases can record wrong token usage and skip sandbox rules on resumed \
+             sessions. Update Claude Code ({floor} or newer recommended); the run continues.",
+            floor = self.floor
+        ))
+    }
+}
+
+/// `x.y.z` as numbers; a pre-release/build suffix (`-beta.1`, `+abc`) is ignored.
+fn version_key(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let key = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(key)
+}
+
+/// The first `x.y.z` token in `claude --version`'s output, e.g.
+/// `2.1.316 (Claude Code)` → `2.1.316`. A leading `v` is accepted.
+pub fn parse_claude_version(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|tok| {
+        let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let t = t.strip_prefix('v').unwrap_or(t);
+        version_key(t)?;
+        Some(t.split(['-', '+']).next().unwrap_or(t).to_string())
+    })
+}
+
+/// True when `version` is strictly older than `floor`. Unparseable input on
+/// either side is never "below" — an unknown version must not warn.
+pub fn version_below(version: &str, floor: &str) -> bool {
+    match (version_key(version), version_key(floor)) {
+        (Some(v), Some(f)) => v < f,
+        _ => false,
+    }
+}
+
+/// The installed CLI's version, probed once per app session with the same
+/// login-shell PATH and environment the CLI stages run with.
+pub fn claude_cli_version() -> ClaudeCliVersion {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    let version = CACHE.get_or_init(probe_claude_version).clone();
+    ClaudeCliVersion::new(version, TESTED_CLAUDE_FLOOR)
+}
+
+fn probe_claude_version() -> Option<String> {
+    use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
+    let path_env = resolved_cli_path();
+    let bin = resolve_executable("claude", &path_env)?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    for (k, v) in login_shell_env() {
+        cmd.env(k, v);
+    }
+    cmd.env("PATH", &path_env);
+    parse_claude_version(&run_bounded(cmd, VERSION_TIMEOUT)?)
+}
+
+/// Run `cmd` to completion and return its stdout, or `None` when it can't
+/// start, exits non-zero, or outlives `timeout` (then it is killed).
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out);
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_version_is_parsed_from_cli_output() {
+        assert_eq!(parse_claude_version("2.1.316 (Claude Code)\n").as_deref(), Some("2.1.316"));
+        assert_eq!(parse_claude_version("2.1.9").as_deref(), Some("2.1.9"));
+        assert_eq!(parse_claude_version("Claude Code v2.2.0").as_deref(), Some("2.2.0"));
+        assert_eq!(parse_claude_version("(2.1.320-beta.1)").as_deref(), Some("2.1.320"));
+        assert_eq!(parse_claude_version("claude: command not found"), None);
+        assert_eq!(parse_claude_version("2.1 (Claude Code)"), None);
+        assert_eq!(parse_claude_version("1.2.3.4"), None);
+        assert_eq!(parse_claude_version(""), None);
+    }
+
+    #[test]
+    fn floor_comparison_is_numeric() {
+        assert!(version_below("2.1.307", "2.1.314"));
+        assert!(version_below("2.1.99", "2.1.314"));
+        assert!(version_below("1.9.999", "2.0.0"));
+        assert!(!version_below("2.1.314", "2.1.314"));
+        assert!(!version_below("2.1.316", "2.1.314"));
+        assert!(!version_below("2.2.0", "2.1.314"));
+        assert!(!version_below("garbage", "2.1.314"));
+        assert!(!version_below("2.1.0", "garbage"));
+    }
+
+    #[test]
+    fn only_a_known_old_version_warns() {
+        let old = ClaudeCliVersion::new(Some("2.1.307".into()), "2.1.314");
+        assert!(old.below_floor);
+        let note = old.update_notice().expect("old CLI warns");
+        assert!(note.contains("2.1.307") && note.contains("2.1.314 or newer"), "{note}");
+
+        let current = ClaudeCliVersion::new(Some("2.1.316".into()), "2.1.314");
+        assert!(!current.below_floor);
+        assert_eq!(current.update_notice(), None);
+
+        let unknown = ClaudeCliVersion::new(None, "2.1.314");
+        assert!(!unknown.below_floor);
+        assert_eq!(unknown.update_notice(), None);
+    }
+
+    #[test]
+    fn tested_floor_is_a_version() {
+        assert_eq!(parse_claude_version(TESTED_CLAUDE_FLOOR).as_deref(), Some(TESTED_CLAUDE_FLOOR));
+    }
+
+    #[test]
+    fn version_probe_is_bounded() {
+        let mut ok = Command::new("/bin/sh");
+        ok.args(["-c", "echo '2.1.316 (Claude Code)'"]);
+        assert_eq!(run_bounded(ok, Duration::from_secs(5)).as_deref().and_then(parse_claude_version).as_deref(), Some("2.1.316"));
+
+        let mut failing = Command::new("/bin/sh");
+        failing.args(["-c", "echo 2.1.316; exit 1"]);
+        assert_eq!(run_bounded(failing, Duration::from_secs(5)), None);
+
+        let mut hung = Command::new("/bin/sh");
+        hung.args(["-c", "sleep 5"]);
+        let started = Instant::now();
+        assert_eq!(run_bounded(hung, Duration::from_millis(200)), None);
+        assert!(started.elapsed() < Duration::from_secs(4), "a hung CLI must be killed at the timeout");
+
+        assert_eq!(run_bounded(Command::new("/nonexistent/claude"), Duration::from_secs(1)), None);
+    }
 
     #[test]
     fn claude_code_command() {

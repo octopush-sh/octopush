@@ -1379,6 +1379,9 @@ export const ipc = {
     invoke<McpStatus>("mcp_connection_status"),
   connectClaudeCode: () =>
     invoke<McpConnectResult>("connect_claude_code"),
+  /** Installed Claude Code CLI version vs the tested floor (cached per app session). */
+  claudeCliVersion: () =>
+    invoke<ClaudeCliVersion>("claude_cli_version"),
 };
 
 /** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */
@@ -1405,6 +1408,15 @@ export interface McpStatus {
   claudeFound: boolean;
   registered: boolean;
   manualCommand: string;
+}
+
+/** The installed Claude Code CLI's version against the tested floor. */
+export interface ClaudeCliVersion {
+  /** `x.y.z` from `claude --version`; null when the CLI isn't found. */
+  version: string | null;
+  floor: string;
+  /** True only when the version is known and older than the floor. */
+  belowFloor: boolean;
 }
 
 /** Result of a one-click "Connect to Claude Code". */
