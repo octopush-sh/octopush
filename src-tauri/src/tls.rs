@@ -479,6 +479,12 @@ impl DenylistVerifier {
     }
 }
 
+// MIRRORS rustls-platform-verifier 0.6.2, `src/verification/apple.rs`
+// (`Verifier::verify_certificate` and its error mapping), minus `extra_roots`
+// (unused here) and the test-only root override. Re-diff against that file on
+// every rustls-platform-verifier bump: a change upstream (policy, date, OCSP,
+// error mapping) is not picked up automatically, because this function
+// replaces the platform verifier's certificate evaluation on macOS.
 /// Evaluates the presented certificates with macOS `SecTrust` exactly as
 /// `rustls_platform_verifier` does (SSL server policy for `server_name`, the
 /// handshake's verify date, the stapled OCSP response) and returns the chain
@@ -1070,6 +1076,91 @@ c247eaebe3d4d78c71e133a51c8e9bb83ce12ebdc924ed589e00bb02204e69b100d475bd34aee1f5
         assert!(v.check_built_chain(&[]).is_err());
         // A denylisted issuer in the built chain is still refused.
         assert!(v.check_built_chain(&[unhex(LEAF_UNDER_DV_G3B), leaf]).is_err());
+    }
+
+    /// A real public chain: `letsencrypt.org` (EC leaf) and its intermediate
+    /// `Let's Encrypt E6`, anchored in ISRG Root X1 in the macOS system store.
+    /// Captured 2025-08-13 by rustls-platform-verifier 0.6.2
+    /// (`src/tests/verification_real_world/letsencrypt_org_valid_{1,2}.crt`,
+    /// SHA-256 8589023b…ab43 and 76e9e288…ab85), which runs the same success
+    /// case on macOS CI with the same verification time.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    const LETSENCRYPT_ORG_LEAF: &str = "\
+308203de30820364a0030201020212062c2f9447974e6eebd163f15bc14f492887300a06082a8648ce3d040303303231\
+0b300906035504061302555331163014060355040a130d4c6574277320456e6372797074310b30090603550403130245\
+36301e170d3235303830343131323430345a170d3235313130323131323430335a301a311830160603550403130f6c65\
+7473656e63727970742e6f72673059301306072a8648ce3d020106082a8648ce3d0301070342000478b408de11de66c2\
+2fc9354e6b75a0dcb577ba5e1d3f0a77dc166b8fa4ebdb76fdb1977331a587eb6878e8f35030dd1ff3f36418d4a87a03\
+22fa7686dc4967dea38202703082026c300e0603551d0f0101ff040403020780301d0603551d250416301406082b0601\
+050507030106082b06010505070302300c0603551d130101ff04023000301d0603551d0e04160414bc89fab9832a1cfc\
+e35e5fdfa3aabada1b8c71ad301f0603551d230418301680149327469803a951688e98d6c44248db23bf5894d2303206\
+082b0601050507010104263024302206082b060105050730028616687474703a2f2f65362e692e6c656e63722e6f7267\
+2f306f0603551d110468306682096c656e63722e6f7267820f6c657473656e63727970742e636f6d820f6c657473656e\
+63727970742e6f7267820d7777772e6c656e63722e6f726782137777772e6c657473656e63727970742e636f6d821377\
+77772e6c657473656e63727970742e6f726730130603551d20040c300a3008060667810c010201302c0603551d1f0425\
+30233021a01fa01d861b687474703a2f2f65362e632e6c656e63722e6f72672f382e63726c30820103060a2b06010401\
+d6790204020481f40481f100ef007500ed3c4bd6e806c2a4a20057dbcb24e23801df512fedc486c5700f20ddb73e3fe0\
+000001987508995800000403004630440220538edb08e32fbcf3fc2ced0ad43cc5b262888f9c98b923b580814cc3d8e2\
+effe02202ae9cd901c8debe5af651bb78e7dac5a8243abbeb6e0a90cb8074f4fd6923219007600dddcca3495d7e11605\
+e79532fac79ff83d1c50dfdb003a1412760a2cacbbc82a000001987508997c0000040300473045022100ab40271c3bc6\
+e961415c40d77c01fe5fdab844c0baa4905411f0b90494ca8be40220158d22d924979f3044ea477f4736eb7b20ea1c28\
+0de88ce37c2da556f618cb67300a06082a8648ce3d0403030368003065023100c5e61827963f7bc9dd90e758fff305db\
+47830a37d5a758623f1cb477c42f514976d80b22579963c0167d660ab1b07d9e0230078ae30393305944fc02119fbf65\
+8e77e4f9197f21d4b71ff44190fd43287874ae285b47d4d5fcf4be5cf32d31d27be9";
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    const LETSENCRYPT_E6: &str = "\
+308204573082023fa003020102021100b0573e9173972770dbb487cb3a452b38300d06092a864886f70d01010b050030\
+4f310b300906035504061302555331293027060355040a1320496e7465726e6574205365637572697479205265736561\
+7263682047726f7570311530130603550403130c4953524720526f6f74205831301e170d323430333133303030303030\
+5a170d3237303331323233353935395a3032310b300906035504061302555331163014060355040a130d4c6574277320\
+456e6372797074310b30090603550403130245363076301006072a8648ce3d020106052b8104002203620004d9f19e46\
+87f8217160a826eba3fab9eada1db912a7d426d95114b1617c7596bf220b391fd5bed10a46aa2d3c4a09842ebe409555\
+e91940376675ed324e770449f8707bc318e7cef77110feac74d800d4ed6d1c731633109c3ab2ea6c62f4bdb8a381f830\
+81f5300e0603551d0f0101ff040403020186301d0603551d250416301406082b0601050507030206082b060105050703\
+0130120603551d130101ff040830060101ff020100301d0603551d0e041604149327469803a951688e98d6c44248db23\
+bf5894d2301f0603551d2304183016801479b459e67bb6e5e40173800888c81a58f6e99b6e303206082b060105050701\
+0104263024302206082b060105050730028616687474703a2f2f78312e692e6c656e63722e6f72672f30130603551d20\
+040c300a3008060667810c01020130270603551d1f0420301e301ca01aa0188616687474703a2f2f78312e632e6c656e\
+63722e6f72672f300d06092a864886f70d01010b050003820201007d8b7b4a2035b20586088a6e9e4e3aaf8004c4845c\
+33190a81484d96baefd41db584e69737fe66884f8b3936eb72653f33dcaf0ba31563bdf418d1682fc22127c8fcbeb38b\
+a4c636d8e3fa6da4b593d60caed0d3970247a066f2d384e14d47810e4b12f518ae1ef89c66a05e75074817ae6966e869\
+78370605c2e261ab10aff10ee60c71b4bc939a0b0748e55205c14e9fd960bfb2c408fabd8bb99f1f79a9c60ad1292c47\
+a4ea19d0a5cc701fa11eebe59251e7b6f708d2630c4349a1623eaab4c152b64175469086dc83dd230a55090aaef0657b\
+b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df69054509316bcb994ae\
+878693226171927bb7f70681c484571388cac6502641ce108c5668ab52a642a420d09ff5245f11945bc96acd557232ef\
+625bd4076b7a9e93baa108c1de5f8f35fd03a501fb894c775b3e408d00a2e8bdb9163c84d3aaba059fd0966b58765ffc\
+6586a8e1246a3c4b3fe9c02217e41fe73836524696b43a619752ca32e4cd2e8b6fb17f7d1cfebd5767da3727a0a1d434\
+2f24c0a6bfef4f4d583c4e3abcdb032e02bee1c2fa4ebcc2fdae1672617949127ddfccebbff76e2472d740892ee6fd3e\
+1303b2e7d1dd9b43d3fc4afff387435740928dd47fd97b99337929cac48a2e00f570a88303e21182e3830b17cef5cc98\
+220e3abfd985981bf21f4e";
+
+    /// Guards the success path of `evaluate_on_macos`: a broken verify date,
+    /// policy or chain extraction would otherwise reject every connection on
+    /// macOS while the failure-path tests stayed green.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_accepts_a_real_public_chain_and_returns_the_built_chain() {
+        use std::time::Duration;
+        // Wed, 13 August 2025 19:31:46 UTC: inside both certificates' validity.
+        let now = UnixTime::since_unix_epoch(Duration::from_secs(1_755_113_506));
+        let leaf = CertificateDer::from(unhex(LETSENCRYPT_ORG_LEAF));
+        let intermediates = [CertificateDer::from(unhex(LETSENCRYPT_E6))];
+        let name = ServerName::try_from("letsencrypt.org").unwrap();
+
+        let built = evaluate_on_macos(&leaf, &intermediates, &name, &[], now).expect("SecTrust accepts");
+        assert!(built.len() >= 3, "leaf, intermediate and anchor, got {}", built.len());
+        assert_eq!(built[0], leaf.as_ref());
+        assert_eq!(built[1], intermediates[0].as_ref());
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let v = DenylistVerifier::platform(rustls_platform_verifier::Verifier::new(provider).unwrap());
+        v.verify_server_cert(&leaf, &intermediates, &name, &[], now).expect("production verifier accepts");
+        // And the hostname is enforced on the same chain.
+        let other = ServerName::try_from("example.com").unwrap();
+        assert_eq!(
+            v.verify_server_cert(&leaf, &intermediates, &other, &[], now).unwrap_err(),
+            TlsError::InvalidCertificate(CertificateError::NotValidForName)
+        );
     }
 
     /// macOS only: the production verifier evaluates with `SecTrust` itself and
