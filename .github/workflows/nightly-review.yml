@@ -16,6 +16,7 @@ permissions:
   contents: write       # merge
   pull-requests: write  # merge
   issues: write         # verdict comments, labels
+  actions: write        # start CI on main after a merge (GITHUB_TOKEN merges trigger nothing)
 
 concurrency:
   group: nightly-review
