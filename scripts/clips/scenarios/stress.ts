@@ -90,7 +90,23 @@ export const stress: Scenario = {
     list_pipelines: PIPELINES,
     get_pipeline: (a) => PIPELINES.find((p) => p.pipeline.id === a.pipelineId || p.pipeline.id === a.id) ?? PIPELINES[0],
     list_runs: (a) => (a.workspaceId === ACTIVE.id ? RUNS : []),
-    get_run: (a) => ({ run: RUNS.find((r) => r.id === a.runId) ?? null, stages: a.runId === F.RUN.id ? F.RUN_STAGES : [] }),
+    // Consistent everywhere: every run has its stages, and the live ones are
+    // what Mission Control and the top bar see (a mismatch here reads as an
+    // app bug to the design review).
+    get_run: (a) => {
+      const run = RUNS.find((r) => r.id === a.runId) ?? null;
+      if (!run) return { run: null, stages: [] };
+      const live = run.status === "running" || run.status === "paused";
+      return {
+        run,
+        stages: F.RUN_STAGES.map((s, i, all) => ({
+          ...s, id: `${run.id}-${s.id}`, runId: run.id,
+          status: live && i === all.length - 1 ? (run.status === "paused" ? "awaiting_checkpoint" : "running") : run.status === "failed" && i === all.length - 1 ? "failed" : "done",
+          finishedAt: live && i === all.length - 1 ? null : s.finishedAt,
+        })),
+      };
+    },
+    list_active_runs: RUNS.filter((r) => r.status === "running" || r.status === "paused"),
     list_chat_threads: (a) => (a.workspaceId === ACTIVE.id ? THREADS : []),
     list_chat_messages: (a) => (a.threadId === F.THREAD.id ? F.MESSAGES : []),
     list_models: MODELS,
