@@ -1,7 +1,7 @@
 //! Anthropic Messages API implementation of the LlmProvider trait.
 
 use super::{
-    network_error, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
+    Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
     LlmStopReason, LlmToolUse, RateLimitSnapshot,
 };
 use crate::error::{AppError, AppResult, ProviderErrorKind};
@@ -38,7 +38,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             // A request that never reached the server is transient — let the
             // retry layer ride it out rather than halting the stage.
-            .map_err(|e| network_error(format!("Anthropic request failed: {}", crate::tls::describe_request_error(&e))))?;
+            .map_err(|e| super::request_error("Anthropic request failed", &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

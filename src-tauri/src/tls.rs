@@ -25,12 +25,15 @@
 //!    the key rather than the certificate fingerprint means Sectigo's
 //!    cross-signs of the same keys match too).
 //! 2. **Presented chain, issuer names.** Any presented certificate whose
-//!    issuer `Name` is byte-for-byte the subject of one of the compromised
-//!    intermediates ([`DISTRUSTED_CA_SUBJECTS`]) is refused, so a server cannot
-//!    dodge layer 1 by sending only a forged leaf and letting the OS fetch the
-//!    intermediate itself (AIA `caIssuers`, or a keychain-cached copy).
-//! 3. **The chain the OS built (macOS).** After the platform accepts, the chain
-//!    `SecTrust` actually built is re-checked with layers 1 and 2. This is the
+//!    issuer `Name` matches the subject of one of the compromised
+//!    intermediates ([`DISTRUSTED_CA_SUBJECTS`]) — byte for byte, or after
+//!    normalization (case, whitespace, ASN.1 string type) — is refused, so a
+//!    server cannot dodge layer 1 by sending only a forged leaf and letting the
+//!    OS fetch the intermediate itself (AIA `caIssuers`, or a keychain copy).
+//! 3. **The chain the OS built (macOS).** Octopush runs the single `SecTrust`
+//!    evaluation itself (`evaluate_on_macos`, same policy, date and OCSP
+//!    input as the platform verifier): an evaluation error rejects, and the
+//!    chain `SecTrust` built is re-checked with layers 1 and 2. This is the
 //!    chain Go filters; it covers paths the OS completed on its own through
 //!    attacker-controlled sub-CAs. On Linux the platform verifier is webpki on
 //!    the presented certificates plus the system roots, with no AIA fetching,
@@ -249,6 +252,89 @@ pub fn spki_sha256(cert_der: &[u8]) -> Option<[u8; 32]> {
     subject_public_key_info(cert_der).map(|spki| Sha256::digest(spki).into())
 }
 
+// ─── Name comparison ──────────────────────────────────────────────────────
+
+/// A `Name` reduced to what path builders compare: per RDN, the sorted
+/// `(attribute OID, value)` pairs, with string values decoded whatever their
+/// ASN.1 string type, case-folded and whitespace-collapsed (RFC 5280 §7.1 /
+/// RFC 4518-style; macOS normalizes names this way when it builds paths).
+/// Non-string values are kept as `tag:hex`. `None` when not a well-formed Name.
+type NormalizedName = Vec<Vec<(Vec<u8>, String)>>;
+
+const TAG_SET: u8 = 0x31;
+const TAG_OID: u8 = 0x06;
+
+fn normalized_name(der: &[u8]) -> Option<NormalizedName> {
+    let (rdns, whole) = Der::new(der).expect(TAG_SEQUENCE)?;
+    if whole.len() != der.len() {
+        return None;
+    }
+    let mut rdns = Der::new(rdns);
+    let mut out = Vec::new();
+    while rdns.peek_tag().is_some() {
+        let (set, _) = rdns.expect(TAG_SET)?;
+        let mut set = Der::new(set);
+        let mut rdn = Vec::new();
+        while set.peek_tag().is_some() {
+            let (atv, _) = set.expect(TAG_SEQUENCE)?;
+            let mut atv = Der::new(atv);
+            let (oid, _) = atv.expect(TAG_OID)?;
+            let (tag, value, _) = atv.next()?;
+            if atv.peek_tag().is_some() {
+                return None;
+            }
+            rdn.push((oid.to_vec(), normalize_value(tag, value)));
+        }
+        rdn.sort();
+        out.push(rdn);
+    }
+    Some(out)
+}
+
+fn normalize_value(tag: u8, v: &[u8]) -> String {
+    let decoded: Option<String> = match tag {
+        // UTF8String, PrintableString, IA5String, VisibleString
+        0x0c | 0x13 | 0x16 | 0x1a => std::str::from_utf8(v).ok().map(str::to_owned),
+        // TeletexString: treated as Latin-1, as most implementations do.
+        0x14 => Some(v.iter().map(|&b| b as char).collect()),
+        // BMPString: UTF-16BE.
+        0x1e if v.len().is_multiple_of(2) => {
+            char::decode_utf16(v.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])))
+                .collect::<Result<String, _>>()
+                .ok()
+        }
+        // UniversalString: UTF-32BE.
+        0x1c if v.len().is_multiple_of(4) => v
+            .chunks(4)
+            .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
+            .collect::<Option<String>>(),
+        _ => None,
+    };
+    match decoded {
+        Some(s) => s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" "),
+        None => {
+            let mut raw = format!("{tag:02x}:");
+            for b in v {
+                raw.push_str(&format!("{b:02x}"));
+            }
+            raw
+        }
+    }
+}
+
+/// The denylisted CA `issuer` names, matched exactly or after normalization
+/// (so a PrintableString or case-changed re-encoding of a compromised CA's
+/// name, which macOS would still chain to the real intermediate, is caught).
+fn denylisted_issuer(issuers: &'static [DistrustedCa], issuer: &[u8]) -> Option<&'static DistrustedCa> {
+    if let Some(ca) = issuers.iter().find(|ca| ca.subject_der == issuer) {
+        return Some(ca);
+    }
+    let candidate = normalized_name(issuer)?;
+    issuers
+        .iter()
+        .find(|ca| normalized_name(ca.subject_der).as_ref() == Some(&candidate))
+}
+
 // ─── The verifier ─────────────────────────────────────────────────────────
 
 /// The error a connection fails with when its chain carries a compromised key.
@@ -312,6 +398,11 @@ pub struct DenylistVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     keys: &'static [[u8; 32]],
     issuers: &'static [DistrustedCa],
+    /// macOS production mode: evaluate with `SecTrust` here (one evaluation
+    /// whose verdict *and* built chain are both used) instead of delegating
+    /// `verify_server_cert` to `inner`. Off everywhere else and in tests.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    os_eval: bool,
 }
 
 impl DenylistVerifier {
@@ -327,7 +418,15 @@ impl DenylistVerifier {
         keys: &'static [[u8; 32]],
         issuers: &'static [DistrustedCa],
     ) -> Self {
-        Self { inner, keys, issuers }
+        Self { inner, keys, issuers, os_eval: false }
+    }
+
+    /// Production: wrap the OS platform verifier. On macOS the server
+    /// certificate is evaluated by `evaluate_on_macos` (same `SecTrust` policy
+    /// as the platform verifier, plus the built-chain check); `inner` still
+    /// verifies the handshake signatures. Elsewhere this is [`Self::new`].
+    pub fn platform(inner: rustls_platform_verifier::Verifier) -> Self {
+        Self { os_eval: cfg!(target_os = "macos"), ..Self::new(Arc::new(inner)) }
     }
 
     /// `Ok(())` when no certificate in `chain` carries a denylisted key or was
@@ -335,16 +434,42 @@ impl DenylistVerifier {
     /// closed as `BadEncoding` — the platform would reject it too, and a check
     /// that can be skipped by malforming the input is no check.
     fn check_chain<'a>(&self, chain: impl Iterator<Item = &'a [u8]>) -> Result<(), TlsError> {
-        for der in chain {
-            let fields = tbs_fields(der)
-                .ok_or(TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+        self.check_certs(&chain.collect::<Vec<_>>(), false)
+    }
+
+    /// The chain the OS built ends in the trust anchor it chose. An anchor is
+    /// by definition not one of the compromised intermediates, so a quirky
+    /// (corporate/MDM) root that our minimal DER walk cannot parse is skipped
+    /// instead of breaking every connection; every other certificate still
+    /// fails closed.
+    #[cfg(any(target_os = "macos", test))]
+    fn check_built_chain(&self, chain: &[Vec<u8>]) -> Result<(), TlsError> {
+        if chain.is_empty() {
+            return Err(TlsError::General("tls: the OS returned an empty certificate chain".into()));
+        }
+        self.check_certs(&chain.iter().map(|c| c.as_slice()).collect::<Vec<_>>(), true)
+    }
+
+    fn check_certs(
+        &self,
+        chain: &[&[u8]],
+        tolerate_unparseable_anchor: bool,
+    ) -> Result<(), TlsError> {
+        let last = chain.len().saturating_sub(1);
+        for (i, &der) in chain.iter().enumerate() {
+            let Some(fields) = tbs_fields(der) else {
+                if tolerate_unparseable_anchor && i == last && last > 0 {
+                    continue;
+                }
+                return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding));
+            };
             let hash: [u8; 32] = Sha256::digest(fields.spki).into();
             if self.keys.contains(&hash) {
                 return Err(TlsError::InvalidCertificate(CertificateError::Other(OtherError(
                     Arc::new(DistrustedKey { spki_sha256: hash }),
                 ))));
             }
-            if let Some(ca) = self.issuers.iter().find(|ca| ca.subject_der == fields.issuer) {
+            if let Some(ca) = denylisted_issuer(self.issuers, fields.issuer) {
                 return Err(TlsError::InvalidCertificate(CertificateError::Other(OtherError(
                     Arc::new(DistrustedIssuer { name: ca.name }),
                 ))));
@@ -354,21 +479,40 @@ impl DenylistVerifier {
     }
 }
 
-/// The chain macOS `SecTrust` builds for the presented certificates (leaf
-/// first, anchor last), including intermediates it completed on its own from
-/// AIA or the keychain. Evaluated with the same SSL policy the platform
-/// verifier uses; the outcome is ignored — the platform verifier has already
-/// accepted the chain, this only recovers which certificates it used.
+/// Evaluates the presented certificates with macOS `SecTrust` exactly as
+/// `rustls_platform_verifier` does (SSL server policy for `server_name`, the
+/// handshake's verify date, the stapled OCSP response) and returns the chain
+/// it built — leaf first, anchor last, including intermediates the OS found
+/// on its own via AIA or the keychain. One evaluation: its verdict is the
+/// verdict (an error is a rejection), and its chain is what the denylist then
+/// re-checks, so the two can never disagree.
 #[cfg(target_os = "macos")]
-fn os_built_chain(
+fn evaluate_on_macos(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     server_name: &ServerName<'_>,
+    ocsp_response: &[u8],
+    now: UnixTime,
 ) -> Result<Vec<Vec<u8>>, TlsError> {
+    use core_foundation::date::CFDate;
     use security_framework::certificate::SecCertificate;
     use security_framework::policy::SecPolicy;
     use security_framework::secure_transport::SslProtocolSide;
     use security_framework::trust::SecTrust;
+
+    /// Seconds between the UNIX epoch and Apple's (2001-01-01T00:00:00Z),
+    /// i.e. `kCFAbsoluteTimeIntervalSince1970`.
+    const APPLE_EPOCH_OFFSET: u64 = 978_307_200;
+    // OSStatus codes, as in security-framework-sys `base.rs`.
+    const ERR_SEC_HOST_NAME_MISMATCH: isize = -67602;
+    const ERR_SEC_CREATE_CHAIN_FAILED: isize = -25318;
+    const ERR_SEC_CERTIFICATE_REVOKED: isize = -67820;
+
+    let invalid = |reason: String| {
+        TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::from(Box::<
+            dyn std::error::Error + Send + Sync,
+        >::from(reason)))))
+    };
 
     let certs = std::iter::once(end_entity.as_ref())
         .chain(intermediates.iter().map(|c| c.as_ref()))
@@ -379,9 +523,29 @@ fn os_built_chain(
         .collect::<Result<Vec<_>, _>>()?;
     let name = server_name.to_str();
     let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(name.as_ref()));
-    let trust = SecTrust::create_with_certificates(&certs, &[policy])
-        .map_err(|e| TlsError::General(format!("tls: could not re-evaluate the chain: {e}")))?;
-    let _ = trust.evaluate_with_error();
+    let mut trust = SecTrust::create_with_certificates(&certs, &[policy])
+        .map_err(|e| TlsError::General(e.to_string()))?;
+    let secs = now
+        .as_secs()
+        .checked_sub(APPLE_EPOCH_OFFSET)
+        .ok_or(TlsError::FailedToGetCurrentTime)?;
+    trust
+        .set_trust_verify_date(&CFDate::new(secs as f64))
+        .map_err(|e| invalid(e.to_string()))?;
+    if !ocsp_response.is_empty() {
+        trust
+            .set_trust_ocsp_response(std::iter::once(ocsp_response))
+            .map_err(|e| invalid(e.to_string()))?;
+    }
+    if let Err(e) = trust.evaluate_with_error() {
+        let code = e.code();
+        return Err(match code {
+            ERR_SEC_HOST_NAME_MISMATCH => TlsError::InvalidCertificate(CertificateError::NotValidForName),
+            ERR_SEC_CREATE_CHAIN_FAILED => TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
+            ERR_SEC_CERTIFICATE_REVOKED => TlsError::InvalidCertificate(CertificateError::Revoked),
+            _ => invalid(format!("{e}: {code}")),
+        });
+    }
     Ok(evaluated_chain(&trust))
 }
 
@@ -411,15 +575,14 @@ impl ServerCertVerifier for DenylistVerifier {
         self.check_chain(
             std::iter::once(end_entity.as_ref()).chain(intermediates.iter().map(|c| c.as_ref())),
         )?;
-        let verified = self
-            .inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
         #[cfg(target_os = "macos")]
-        {
-            let built = os_built_chain(end_entity, intermediates, server_name)?;
-            self.check_chain(built.iter().map(|c| c.as_slice()))?;
+        if self.os_eval {
+            let built = evaluate_on_macos(end_entity, intermediates, server_name, ocsp_response, now)?;
+            self.check_built_chain(&built)?;
+            return Ok(ServerCertVerified::assertion());
         }
-        Ok(verified)
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
@@ -459,7 +622,7 @@ impl ServerCertVerifier for DenylistVerifier {
 pub fn rustls_client_config() -> Result<ClientConfig, TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let platform = rustls_platform_verifier::Verifier::new(provider.clone())?;
-    let verifier = DenylistVerifier::new(Arc::new(platform));
+    let verifier = DenylistVerifier::platform(platform);
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()
@@ -474,31 +637,60 @@ pub fn rustls_client_config() -> Result<ClientConfig, TlsError> {
 
 // ─── Error text ───────────────────────────────────────────────────────────
 
-/// The TLS failure behind a request error, as one sentence a developer can act
-/// on, or `None` when the failure was not TLS. Walks the `source()` chain and
-/// looks inside `io::Error`s, which is where hyper leaves the rustls error.
-pub fn tls_failure(err: &(dyn std::error::Error + 'static)) -> Option<String> {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+/// The rustls error behind a request error, if any. Walks the `source()` chain
+/// and looks inside `io::Error`s, which is where hyper leaves the rustls error
+/// (`io::Error::source` skips the wrapped error itself).
+fn find_tls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a TlsError> {
+    let mut cur: Option<&'a (dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cur {
-        let tls = e.downcast_ref::<TlsError>().or_else(|| {
-            e.downcast_ref::<std::io::Error>()
-                .and_then(|io| io.get_ref())
-                .and_then(|inner| inner.downcast_ref::<TlsError>())
-        });
-        if let Some(tls) = tls {
-            return Some(explain(tls));
+        if let Some(tls) = e.downcast_ref::<TlsError>() {
+            return Some(tls);
+        }
+        if let Some(tls) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<TlsError>())
+        {
+            return Some(tls);
         }
         cur = e.source();
     }
     None
 }
 
-fn explain(err: &TlsError) -> String {
+/// True for the failures retrying cannot fix: a denylist refusal, or a server
+/// that only offers TLS versions / suites this client does not speak.
+fn is_permanent(err: &TlsError) -> bool {
     use rustls::AlertDescription as A;
     match err {
-        TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) => inner.to_string(),
+        TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) => {
+            inner.downcast_ref::<DistrustedKey>().is_some()
+                || inner.downcast_ref::<DistrustedIssuer>().is_some()
+        }
         TlsError::PeerIncompatible(_)
-        | TlsError::AlertReceived(A::ProtocolVersion | A::HandshakeFailure | A::InsufficientSecurity) => format!(
+        | TlsError::AlertReceived(A::ProtocolVersion | A::HandshakeFailure | A::InsufficientSecurity) => true,
+        _ => false,
+    }
+}
+
+/// The TLS failure behind a request error, as one sentence a developer can act
+/// on, or `None` when the failure was not TLS.
+pub fn tls_failure(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    find_tls_error(err).map(explain)
+}
+
+/// Whether a request failed for a TLS reason no retry can fix (see
+/// [`is_permanent`]); the provider retry layer treats these as non-transient.
+pub fn is_permanent_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    find_tls_error(err).is_some_and(is_permanent)
+}
+
+fn explain(err: &TlsError) -> String {
+    match err {
+        TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) if is_permanent(err) => {
+            inner.to_string()
+        }
+        _ if is_permanent(err) => format!(
             "TLS handshake failed ({err}). Octopush requires TLS 1.2 or newer with modern cipher suites (ECDHE with AES-GCM or ChaCha20); this server, or a proxy in front of it, offers only older ones"
         ),
         _ => format!("TLS error: {err}"),
@@ -634,6 +826,23 @@ cf3b1179ee5dba978e3ea36b3069300c0603551d130101ff0402300030190603551d110412301082
 1680144c030ce3036080e90d8c5907d6b10e63398b3415300a06082a8648ce3d040302034800304502207834d5e1821e\
 641a5256b557d960e9997dbb6d4b90d11ed0872fd648f3862b78022100e61e49befd6064b27377d28b38ac542ce22699\
 55888f967b85afc2c9a60c3c32";
+
+    /// Same forged leaf, but its issuer is `EM DV TLS CA - G3B` re-encoded as
+    /// PrintableString and lower-cased (`C=NL, O=emudhra bv, CN=em dv tls ca -
+    /// g3b`, `openssl req` with `string_mask=default`): different bytes, a name
+    /// macOS would still chain to the real intermediate.
+    const LEAF_UNDER_REENCODED_DV_G3B: &str = "\
+30820200308201a7a0030201020209008609a696e02e6c03300a06082a8648ce3d040302303f310b3009060355040613\
+024e4c31133011060355040a130a656d7564687261206276311b301906035504031312656d20647620746c7320636120\
+2d20673362301e170d3236313033313231303835375a170d3236313133303231303835375a3019311730150603550403\
+0c0e666f726765642e6578616d706c653059301306072a8648ce3d020106082a8648ce3d030107034200040de0313561\
+d5f92615d07aea3cad8c3acbde4f9da6e0daef114453965aacb1b93126d14d6731c2b6dc3b1d95a2c87c15b58f2f2718\
+16421812f2739d8c80fb40a381b13081ae300c0603551d130101ff0402300030190603551d1104123010820e666f7267\
+65642e6578616d706c65301d0603551d0e04160414b15f175fa02dcaccc10de335ab71a6cd112b910c30640603551d23\
+045d305ba143a441303f310b3009060355040613024e4c31133011060355040a130a656d7564687261206276311b3019\
+06035504031312656d20647620746c73206361202d2067336282142991c65b2c96cdfab7ef630479e76b47557131ec30\
+0a06082a8648ce3d040302034700304402201c96a84f52b3cacee9d0926abcbecfb33becdaae93b3b6fb1696640ea19d\
+7d360220330f6c96a6c938fe40b15648cfa1fc5f835081bc66d3fe7261a6b0413e251082";
 
     /// Same leaf, issued under the near-miss name `EM DV TLS CA - G3D`.
     const LEAF_UNDER_LOOKALIKE: &str = "\
@@ -821,6 +1030,63 @@ c247eaebe3d4d78c71e133a51c8e9bb83ce12ebdc924ed589e00bb02204e69b100d475bd34aee1f5
     }
 
     #[test]
+    fn a_reencoded_or_case_changed_denylisted_issuer_is_refused() {
+        let leaf = unhex(LEAF_UNDER_REENCODED_DV_G3B);
+        let issuer = issuer_name(&leaf).unwrap();
+        assert_ne!(issuer, DISTRUSTED_CA_SUBJECTS[0].subject_der, "the fixture must differ in bytes");
+        assert_eq!(normalized_name(issuer), normalized_name(DISTRUSTED_CA_SUBJECTS[0].subject_der));
+        let v = DenylistVerifier::new(Arc::new(Permissive));
+        let msg = verify(&v, LEAF_UNDER_REENCODED_DV_G3B, &[]).unwrap_err().to_string();
+        assert!(msg.contains("EM DV TLS CA - G3B"), "{msg}");
+    }
+
+    #[test]
+    fn name_normalization_folds_case_whitespace_and_string_type() {
+        assert_eq!(normalize_value(0x0c, "EM DV  TLS CA - G3B ".as_bytes()), "em dv tls ca - g3b");
+        assert_eq!(normalize_value(0x13, b"em dv tls ca - g3b"), "em dv tls ca - g3b");
+        let bmp: Vec<u8> = "EM".encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        assert_eq!(normalize_value(0x1e, &bmp), "em");
+        // Non-string values are compared raw, never folded.
+        assert_eq!(normalize_value(0x04, &[0xAB]), "04:ab");
+        // The near-miss name stays different after normalization.
+        let near = unhex(LEAF_UNDER_LOOKALIKE);
+        assert_ne!(
+            normalized_name(issuer_name(&near).unwrap()),
+            normalized_name(DISTRUSTED_CA_SUBJECTS[0].subject_der)
+        );
+        assert!(normalized_name(b"garbage").is_none());
+    }
+
+    #[test]
+    fn the_built_chain_check_tolerates_only_an_unparseable_anchor() {
+        let v = DenylistVerifier::new(Arc::new(Permissive));
+        let leaf = unhex(RSA_V3);
+        let quirky_root = b"not DER the minimal walk understands".to_vec();
+        // Anchor last: skipped.
+        assert!(v.check_built_chain(&[leaf.clone(), quirky_root.clone()]).is_ok());
+        // Anywhere else, or as the only certificate: fails closed.
+        assert!(v.check_built_chain(&[quirky_root.clone(), leaf.clone()]).is_err());
+        assert!(v.check_built_chain(&[quirky_root]).is_err());
+        assert!(v.check_built_chain(&[]).is_err());
+        // A denylisted issuer in the built chain is still refused.
+        assert!(v.check_built_chain(&[unhex(LEAF_UNDER_DV_G3B), leaf]).is_err());
+    }
+
+    /// macOS only: the production verifier evaluates with `SecTrust` itself and
+    /// a chain the OS cannot build to a trusted anchor is rejected (fail closed),
+    /// not waved through on the strength of a partial chain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_a_chain_sectrust_cannot_build() {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let platform = rustls_platform_verifier::Verifier::new(provider).unwrap();
+        let v = DenylistVerifier::platform(platform);
+        assert!(v.os_eval);
+        assert!(verify(&v, LEAF_UNDER_LOOKALIKE, &[]).is_err());
+        assert!(verify(&v, RSA_V3, &[]).is_err());
+    }
+
+    #[test]
     fn an_unrelated_issuer_passes() {
         let v = DenylistVerifier::new(Arc::new(Permissive));
         assert!(verify(&v, LEAF_UNDER_LOOKALIKE, &[]).is_ok());
@@ -845,6 +1111,17 @@ c247eaebe3d4d78c71e133a51c8e9bb83ce12ebdc924ed589e00bb02204e69b100d475bd34aee1f5
 
         let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
         assert!(tls_failure(&plain).is_none());
+
+        // Retry classification: denylist and incompatibility are permanent,
+        // everything else (incl. ordinary certificate errors) is left alone.
+        assert!(is_permanent_tls_failure(&wrapped));
+        assert!(is_permanent_tls_failure(&old));
+        assert!(!is_permanent_tls_failure(&plain));
+        let expired = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            TlsError::InvalidCertificate(CertificateError::Expired),
+        );
+        assert!(!is_permanent_tls_failure(&expired));
     }
 
     #[test]

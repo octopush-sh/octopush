@@ -690,7 +690,12 @@ async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
         .await
     {
         Ok(r) => r,
-        Err(_) => return RefreshOutcome::TransientError, // offline / DNS / TLS
+        Err(e) => {
+            // Offline / DNS / TLS. Even a denylist refusal stays transient here:
+            // a forged certificate must not sign the user out.
+            tracing::warn!(error = %crate::tls::describe_request_error(&e), "auth: token refresh request failed");
+            return RefreshOutcome::TransientError;
+        }
     };
     let status = resp.status();
     if !status.is_success() {

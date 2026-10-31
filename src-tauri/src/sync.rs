@@ -351,7 +351,7 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
             PushOutcome::Failed
         }
         Err(e) => {
-            tracing::warn!("history sync detail push error: {e}");
+            tracing::warn!("history sync detail push error: {}", crate::tls::describe_request_error(&e));
             PushOutcome::Failed
         }
     }
@@ -460,7 +460,7 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
             PushOutcome::Failed
         }
         Err(e) => {
-            tracing::warn!("history sync push error: {e}");
+            tracing::warn!("history sync push error: {}", crate::tls::describe_request_error(&e));
             PushOutcome::Failed
         }
     }
@@ -609,7 +609,7 @@ pub async fn push_library_items(
                 outcome = PushOutcome::Failed;
             }
             Err(e) => {
-                tracing::warn!("library sync push error: {e}");
+                tracing::warn!("library sync push error: {}", crate::tls::describe_request_error(&e));
                 outcome = PushOutcome::Failed;
             }
         }

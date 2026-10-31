@@ -4951,7 +4951,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .send()
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "find_pr_for_branch: network error");
+            tracing::warn!(error = %crate::tls::describe_request_error(&e), "find_pr_for_branch: network error");
             AppError::Other(format!("github request failed: {}", crate::tls::describe_request_error(&e)))
         })?;
 
