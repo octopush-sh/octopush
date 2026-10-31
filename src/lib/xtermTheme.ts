@@ -24,6 +24,8 @@ export const XTERM_FONT_FAMILY =
 const FALLBACK = {
   terminalBg: "#0c0a08",
   panel2: "#1a160f",
+  border: "#2a2419",
+  borderStrong: "#786747",
   brass: "#d4a574",
   ivory: "#f4ecdb",
   sage: "#95897a",
@@ -56,6 +58,8 @@ export function getXtermTheme(): ITheme {
   const danger = readVar("--color-octo-rouge", FALLBACK.rouge);
   const warning = readVar("--color-octo-warning", FALLBACK.warning);
   const panel2 = readVar("--color-octo-panel-2", FALLBACK.panel2);
+  const border = readVar("--color-octo-border", FALLBACK.border);
+  const borderStrong = readVar("--color-octo-border-strong", FALLBACK.borderStrong);
   // Blue/purple have no per-theme token — Onyx & Brass's semantic palette
   // only covers accent/success/warning/danger. Reuse the static state-blue /
   // state-purple tokens that already stand in for "info" hues elsewhere
@@ -72,6 +76,12 @@ export function getXtermTheme(): ITheme {
     cursor: accent,
     cursorAccent: terminalBg,
     selectionBackground: panel2,
+    // xterm 6 draws its own scrollbar (VS Code's scrollable element) instead of
+    // the native one styles.css used to tint; without these it would be the
+    // foreground at 20% alpha. Same resting thumb as before — the border token.
+    scrollbarSliderBackground: border,
+    scrollbarSliderHoverBackground: borderStrong,
+    scrollbarSliderActiveBackground: borderStrong,
     black: terminalBg,
     red: danger,
     green: success,

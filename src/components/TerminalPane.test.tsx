@@ -46,6 +46,7 @@ const xtermHoisted = vi.hoisted(() => ({
      *  that turned mouse tracking on. */
     modes: { mouseTrackingMode: string };
     attachCustomKeyEventHandler: ReturnType<typeof vi.fn>;
+    input: ReturnType<typeof vi.fn>;
     write: ReturnType<typeof vi.fn>;
     /** OSC handlers the component registered, by identifier (52 = clipboard). */
     oscHandlers: Record<number, (data: string) => boolean>;
@@ -80,6 +81,10 @@ vi.mock("@xterm/xterm", () => {
     dispose = vi.fn();
     getSelection = vi.fn(() => "");
     attachCustomKeyEventHandler = vi.fn();
+    // Real xterm routes `input(data, true)` through onData, like a keystroke.
+    input = vi.fn((data: string) => {
+      this.dataHandler?.(data);
+    });
     parser = {
       registerOscHandler: vi.fn((ident: number, cb: (data: string) => boolean) => {
         this.oscHandlers[ident] = cb;
@@ -390,6 +395,22 @@ describe("TerminalPane — zoom", () => {
     expect(handler(ev)).toBe(true); // forwarded to the PTY
     expect(ev.preventDefault).not.toHaveBeenCalled();
     expect(xtermHoisted.last!.options.fontSize).toBe(13);
+  });
+
+  it("sends Option+Left as a word jump (xterm 5's mapping, gone in xterm 6)", async () => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    try {
+      await mounted();
+      const handler = keyHandler();
+      const ev = { type: "keydown", altKey: true, key: "ArrowLeft", preventDefault: vi.fn() };
+      expect(handler(ev)).toBe(false); // handled — xterm must not also encode it
+      expect(ev.preventDefault).toHaveBeenCalled();
+      expect(xtermHoisted.last!.input).toHaveBeenCalledWith("\x1bb", true);
+      // A plain arrow is left to xterm.
+      expect(handler({ type: "keydown", key: "ArrowLeft", preventDefault: vi.fn() })).toBe(true);
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it("zooms with Ctrl + mouse wheel", async () => {

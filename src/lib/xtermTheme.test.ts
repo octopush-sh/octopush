@@ -35,4 +35,14 @@ describe("xtermTheme", () => {
     // Foreground must not equal background — the bug this fixes.
     expect(theme.foreground).not.toBe(theme.background);
   });
+
+  it("tints xterm's own scrollbar from the border tokens", () => {
+    const root = document.documentElement;
+    root.style.setProperty("--color-octo-border", "#c9ba95");
+    root.style.setProperty("--color-octo-border-strong", "#8a7a5c");
+    const theme = getXtermTheme();
+    expect(theme.scrollbarSliderBackground).toBe("#c9ba95");
+    expect(theme.scrollbarSliderHoverBackground).toBe("#8a7a5c");
+    expect(theme.scrollbarSliderActiveBackground).toBe("#8a7a5c");
+  });
 });
