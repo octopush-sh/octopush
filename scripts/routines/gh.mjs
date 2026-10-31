@@ -48,9 +48,16 @@ export function makeGh(run = ghRun) {
 }
 
 /** success | pending | failure | none — latest "CI" workflow run for a commit. */
+/**
+ * Run outcomes that say nothing about the code: a bot's pull_request run
+ * waiting for approval ("action_required"), a run superseded by a newer one
+ * ("cancelled"), skipped or stale runs. They're ignored.
+ */
+export const NON_VERDICT = ["action_required", "cancelled", "skipped", "stale", "neutral"];
+
 export function ciStatus(gh, repo, sha) {
   const runs = (gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`)?.workflow_runs ?? [])
-    .filter((r) => r.name === "CI")
+    .filter((r) => r.name === "CI" && !(r.status === "completed" && NON_VERDICT.includes(r.conclusion)) && r.status !== "waiting")
     .sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
   const last = runs.at(-1);
   if (!last) return "none";
