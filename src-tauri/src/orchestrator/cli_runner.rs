@@ -318,12 +318,22 @@ pub fn parse_cli_result(
 /// builds/tests), so this is a guardrail, not a sandbox.
 pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 
+/// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
+/// as defence in depth). Since Claude Code 2.1.314, Write/Edit/NotebookEdit
+/// refuse paths outside the working directories in every permission mode,
+/// `bypassPermissions` included — so a stage can't write to the main checkout,
+/// a sibling workspace or `~/`. Older CLIs ignore the unknown key. `Bash` is
+/// not covered (the Seatbelt sandbox is what limits it). The argv goes
+/// straight to `Command::args` with no shell, so the JSON needs no quoting.
+pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true}}"#;
+
 /// Build the argv (after the program name) for a headless `claude -p` run.
 /// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
-/// independently and non-JSON log lines are simply skipped. `read_only` adds
-/// the review-stage tool denial (see [`REVIEW_DISALLOWED_TOOLS`]).
+/// independently and non-JSON log lines are simply skipped. Every stage
+/// carries [`CLAUDE_STAGE_SETTINGS`]; `read_only` adds the review-stage tool
+/// denial (see [`REVIEW_DISALLOWED_TOOLS`]).
 pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -338,6 +348,8 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_onl
         "bypassPermissions".to_string(),
         "--max-turns".to_string(),
         max_turns.max(1).to_string(),
+        "--settings".to_string(),
+        CLAUDE_STAGE_SETTINGS.to_string(),
     ];
     if read_only {
         args.push("--disallowedTools".to_string());
@@ -358,6 +370,8 @@ pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read
         "--resume".to_string(), session_id.to_string(),
         "--permission-mode".to_string(), "bypassPermissions".to_string(),
         "--max-turns".to_string(), max_turns.max(1).to_string(),
+        // The resume path needs the guard too (2.1.314 fixed it for --resume).
+        "--settings".to_string(), CLAUDE_STAGE_SETTINGS.to_string(),
     ];
     if read_only {
         args.push("--disallowedTools".to_string());
