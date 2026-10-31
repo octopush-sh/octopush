@@ -266,6 +266,7 @@ export const defaultScenario: Scenario = {
     detect_editors: [],
     // run (terminals): the app opens one on first visit to a workspace
     list_terminals: [],
+    spawn_or_attach_terminal: { mode: "Spawned", pid: 4242 },
     create_terminal: (a): TerminalRecord => ({
       id: `term-${String(a.workspaceId)}`, workspaceId: String(a.workspaceId), label: String(a.label ?? "zsh"), position: 0, createdAt: Date.parse(NOW),
     }),
