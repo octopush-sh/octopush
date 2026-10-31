@@ -32,11 +32,27 @@ export const UPDATE_MARK = "<!-- octopush-build:update -->";
 export const defuseClosing = (text) =>
   String(text ?? "").replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(:?\s+)#(\d+)/gi, "$1$2issue $3");
 
-/** Validate the agent's result.json for a job kind. Returns { result } or { error }. */
+/** Shorten text to `max` chars at a word boundary, with an ellipsis (pure). */
+export function fit(text, max) {
+  const s = String(text).replace(/[ \t]+/g, " ").trim();
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max - 1);
+  const sp = cut.lastIndexOf(" ");
+  return `${(sp > max * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,;:.-]+$/, "")}…`;
+}
+
+/**
+ * Validate the agent's result.json for a job kind. Returns { result } or
+ * { error }. Over-long text is shortened, not rejected — a night's work isn't
+ * thrown away for a long title.
+ */
 export function parseResult(text, kind) {
   let r;
   try { r = JSON.parse(text); } catch { return { error: "result.json is not valid JSON" }; }
   if (!r || typeof r !== "object") return { error: "result.json must be an object" };
+  r = { ...r };
+  if (typeof r.title === "string") r.title = fit(r.title.split("\n")[0], MAX_TITLE);
+  for (const k of ["summary", "reason"]) if (typeof r[k] === "string") r[k] = fit(r[k], MAX_TEXT);
   const str = (k, max) => typeof r[k] === "string" && r[k].trim().length > 0 && r[k].length <= max;
   if (r.action === "stop") return str("reason", MAX_TEXT) ? { result: r } : { error: "stop needs a reason" };
   if (kind === "issue" && r.action === "pr") {
