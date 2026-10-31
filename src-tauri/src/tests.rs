@@ -7866,6 +7866,56 @@ mod cli_args_tests {
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sess-9"), "{args:?}");
         assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"), "{args:?}");
     }
+
+    #[test]
+    fn every_claude_stage_blocks_writes_outside_its_worktree() {
+        // #276: bypassPermissions alone lets a stage write anywhere; the inline
+        // settings make Write/Edit refuse paths outside the working directories
+        // — on fresh and resumed runs, read-only stages included.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            let v: serde_json::Value = serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON");
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn codex_stages_carry_no_claude_settings() {
+        use crate::orchestrator::cli_runner::CliDialect;
+        for ro in [false, true] {
+            let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro);
+            assert!(!args.contains(&"--settings".to_string()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_blocked_outside_the_worktree_shows_as_a_failed_tool_call() {
+        // The CLI reports a refused write as an `is_error` tool_result; the
+        // stage journal must show it as a failed call with the CLI's reason.
+        use crate::orchestrator::live::entries_from_stream_event;
+        let ev = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_01",
+                "is_error": true,
+                "content": "Write to /Users/me/project/main.rs was blocked: the path is outside the working directories."
+            }]},
+            "parent_tool_use_id": null,
+            "session_id": "sess"
+        });
+        let entries = entries_from_stream_event(&ev);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["kind"], "tool_result");
+        assert_eq!(entries[0]["ok"], serde_json::json!(false));
+        assert!(entries[0]["detail"].as_str().unwrap_or_default().contains("outside the working directories"), "{entries:?}");
+    }
 }
 
 #[cfg(test)]
