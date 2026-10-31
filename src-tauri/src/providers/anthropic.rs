@@ -38,7 +38,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             // A request that never reached the server is transient — let the
             // retry layer ride it out rather than halting the stage.
-            .map_err(|e| network_error(format!("Anthropic request failed: {e}")))?;
+            .map_err(|e| network_error(format!("Anthropic request failed: {}", crate::tls::describe_request_error(&e))))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

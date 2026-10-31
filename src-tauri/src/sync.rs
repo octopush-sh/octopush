@@ -376,7 +376,7 @@ pub async fn pull_run_detail(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("history detail fetch failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("history detail fetch failed: {}", crate::tls::describe_request_error(&e))))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -482,7 +482,7 @@ pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("history sync pull failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("history sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!(
             "history sync pull failed: HTTP {}",
@@ -632,7 +632,7 @@ pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibrary
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("library sync pull failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("library sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!(
             "library sync pull failed: HTTP {}",

@@ -3605,7 +3605,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
         .get(LITELLM_URL)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("pricing fetch failed: {e}")))?
+        .map_err(|e| AppError::Other(format!("pricing fetch failed: {}", crate::tls::describe_request_error(&e))))?
         .text()
         .await
         .map_err(|e| AppError::Other(format!("pricing read failed: {e}")))?;
@@ -4952,7 +4952,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "find_pr_for_branch: network error");
-            AppError::Other(format!("github request failed: {e}"))
+            AppError::Other(format!("github request failed: {}", crate::tls::describe_request_error(&e)))
         })?;
 
     let status = resp.status();

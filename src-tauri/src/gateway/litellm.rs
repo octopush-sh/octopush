@@ -65,7 +65,7 @@ async fn get_json(client: &reqwest::Client, url: &str, api_key: &str) -> Result<
         .header("accept", "application/json")
         .send()
         .await
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| crate::tls::describe_request_error(&e))?;
     let status = resp.status().as_u16();
     let truncated = resp
         .headers()

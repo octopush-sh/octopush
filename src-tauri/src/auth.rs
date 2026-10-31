@@ -442,7 +442,7 @@ async fn exchange_code(
         ])
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("token exchange request failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("token exchange request failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -466,7 +466,7 @@ async fn fetch_userinfo(
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("userinfo request failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("userinfo request failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!("userinfo failed: {}", resp.status())));
     }

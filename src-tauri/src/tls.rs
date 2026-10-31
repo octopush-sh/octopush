@@ -18,13 +18,25 @@
 //! **Mechanism.** [`client_builder`] is the one place a `reqwest` client starts
 //! from. It runs on rustls with `rustls_platform_verifier` — the OS trust store
 //! and the OS's own policy are honoured exactly as before — wrapped in a
-//! [`DenylistVerifier`] that refuses any presented chain containing a
-//! certificate whose SPKI hash is on [`DISTRUSTED_SPKI_SHA256`], before the
-//! platform ever sees it. Keying on the key rather than the certificate
-//! fingerprint means cross-signed copies of the same keys are rejected too. The
-//! check covers the chain the server *presents*; a chain the platform completes
-//! on its own (AIA fetching on macOS/Windows) is the platform's call, and there
-//! the OS blocklists apply.
+//! [`DenylistVerifier`] with three layers:
+//!
+//! 1. **Presented chain, before the OS sees it.** Any presented certificate
+//!    whose SPKI hash is on [`DISTRUSTED_SPKI_SHA256`] is refused (keying on
+//!    the key rather than the certificate fingerprint means Sectigo's
+//!    cross-signs of the same keys match too).
+//! 2. **Presented chain, issuer names.** Any presented certificate whose
+//!    issuer `Name` is byte-for-byte the subject of one of the compromised
+//!    intermediates ([`DISTRUSTED_CA_SUBJECTS`]) is refused, so a server cannot
+//!    dodge layer 1 by sending only a forged leaf and letting the OS fetch the
+//!    intermediate itself (AIA `caIssuers`, or a keychain-cached copy).
+//! 3. **The chain the OS built (macOS).** After the platform accepts, the chain
+//!    `SecTrust` actually built is re-checked with layers 1 and 2. This is the
+//!    chain Go filters; it covers paths the OS completed on its own through
+//!    attacker-controlled sub-CAs. On Linux the platform verifier is webpki on
+//!    the presented certificates plus the system roots, with no AIA fetching,
+//!    so layers 1 and 2 already see every non-root certificate of the path.
+//!    Windows (CryptoAPI, which does fetch AIA) is not a shipped platform and
+//!    gets layers 1 and 2 only.
 //!
 //! If the platform verifier cannot be initialised (no CA bundle on an exotic
 //! Linux box), the builder falls back to reqwest's default OS-backed TLS so the
@@ -56,6 +68,57 @@ pub const DISTRUSTED_SPKI_SHA256: [[u8; 32]; 8] = [
     hex32("ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6"),
     hex32("92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30"),
 ];
+
+/// Decode a hex string literal into a `&'static [u8]` at compile time.
+macro_rules! hex {
+    ($s:literal) => {{
+        const S: &str = $s;
+        const N: usize = S.len() / 2;
+        const B: [u8; N] = hex_bytes::<N>(S);
+        &B
+    }};
+}
+const fn hex_bytes<const N: usize>(s: &str) -> [u8; N] {
+    let b = s.as_bytes();
+    assert!(b.len() == 2 * N, "odd-length hex literal");
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = (nibble(b[2 * i]) << 4) | nibble(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// Subject `Name`s of the eight compromised intermediates, as the exact DER bytes
+/// of the certificates' `subject` field (each name is shared by the emSign-root
+/// issued certificate and the Sectigo `AAA Certificate Services` cross-sign).
+///
+/// Source: the 16 certificates in Mozilla's incident data,
+/// `impacted-intermediates.json` in github.com/galadran/we-have-a-problem.com
+/// (the repo behind emudhra.we-have-a-problem.com). Each certificate was checked
+/// before its subject was copied here: its SPKI SHA-256 equals the matching
+/// entry of [`DISTRUSTED_SPKI_SHA256`] (Go's list), its signature verifies
+/// against `emSign Root TLS/CS CA - G3` or `AAA Certificate Services`, and the
+/// `EM DV TLS CA - G3B` certificate's SHA-256 (42c4accd…1493) matches Chromium's
+/// `net/data/ssl/blocklist` entry.
+pub const DISTRUSTED_CA_SUBJECTS: [DistrustedCa; 8] = [
+    DistrustedCa { name: "EM DV TLS CA - G3B", subject_der: hex!("303f310b3009060355040613024e4c31133011060355040a0c0a654d7564687261204256311b301906035504030c12454d20445620544c53204341202d20473342") },
+    DistrustedCa { name: "EM OV TLS CA - G3B", subject_der: hex!("303f310b3009060355040613024e4c31133011060355040a0c0a654d7564687261204256311b301906035504030c12454d204f5620544c53204341202d20473342") },
+    DistrustedCa { name: "EM EV TLS CA - G3B", subject_der: hex!("303f310b3009060355040613024e4c31133011060355040a0c0a654d7564687261204256311b301906035504030c12454d20455620544c53204341202d20473342") },
+    DistrustedCa { name: "EM DV TLS CA - G3C", subject_der: hex!("3040310b300906035504061302555331143012060355040a0c0b654d756468726120496e63311b301906035504030c12454d20445620544c53204341202d20473343") },
+    DistrustedCa { name: "EM OV TLS CA - G3C", subject_der: hex!("3040310b300906035504061302555331143012060355040a0c0b654d756468726120496e63311b301906035504030c12454d204f5620544c53204341202d20473343") },
+    DistrustedCa { name: "EM EV TLS CA - G3C", subject_der: hex!("3040310b300906035504061302555331143012060355040a0c0b654d756468726120496e63311b301906035504030c12454d20455620544c53204341202d20473343") },
+    DistrustedCa { name: "EM OV CS CA - G3B", subject_der: hex!("303e310b3009060355040613024e4c31133011060355040a0c0a654d7564687261204256311a301806035504030c11454d204f56204353204341202d20473342") },
+    DistrustedCa { name: "EM OV CS CA - G3C", subject_der: hex!("303f310b300906035504061302555331143012060355040a0c0b654d756468726120496e63311a301806035504030c11454d204f56204353204341202d20473343") },
+];
+
+/// A compromised intermediate, by display name and DER subject `Name`.
+#[derive(Debug)]
+pub struct DistrustedCa {
+    pub name: &'static str,
+    pub subject_der: &'static [u8],
+}
 
 /// Decode a 64-character hex string at compile time. A malformed entry in the
 /// denylist is a build error, not a silently-missing block.
@@ -147,6 +210,25 @@ impl<'a> Der<'a> {
 /// Chrome's CRLSet, HPKP). `None` when the input is not a well-formed
 /// certificate.
 pub fn subject_public_key_info(cert_der: &[u8]) -> Option<&[u8]> {
+    tbs_fields(cert_der).map(|f| f.spki)
+}
+
+/// The DER-encoded issuer `Name` of an X.509 certificate (the whole TLV, the
+/// bytes a path builder matches against an issuer's subject). `None` when the
+/// input is not a well-formed certificate.
+pub fn issuer_name(cert_der: &[u8]) -> Option<&[u8]> {
+    tbs_fields(cert_der).map(|f| f.issuer)
+}
+
+/// The two `TBSCertificate` fields the denylist looks at.
+struct TbsFields<'a> {
+    /// `issuer` `Name`, header included.
+    issuer: &'a [u8],
+    /// `subjectPublicKeyInfo`, header included.
+    spki: &'a [u8],
+}
+
+fn tbs_fields(cert_der: &[u8]) -> Option<TbsFields<'_>> {
     let (cert, _) = Der::new(cert_der).expect(TAG_SEQUENCE)?;
     let (tbs, _) = Der::new(cert).expect(TAG_SEQUENCE)?;
     let mut tbs = Der::new(tbs);
@@ -155,11 +237,11 @@ pub fn subject_public_key_info(cert_der: &[u8]) -> Option<&[u8]> {
     }
     tbs.expect(TAG_INTEGER)?; // serialNumber
     tbs.expect(TAG_SEQUENCE)?; // signature
-    tbs.expect(TAG_SEQUENCE)?; // issuer
+    let (_, issuer) = tbs.expect(TAG_SEQUENCE)?; // issuer
     tbs.expect(TAG_SEQUENCE)?; // validity
     tbs.expect(TAG_SEQUENCE)?; // subject
     let (_, spki) = tbs.expect(TAG_SEQUENCE)?; // subjectPublicKeyInfo
-    Some(spki)
+    Some(TbsFields { issuer, spki })
 }
 
 /// SHA-256 of a certificate's SPKI, or `None` when it cannot be parsed.
@@ -197,44 +279,124 @@ impl fmt::Display for DistrustedKey {
 
 impl std::error::Error for DistrustedKey {}
 
+/// The error a connection fails with when a certificate in its chain was issued
+/// under the name of a compromised intermediate.
+pub struct DistrustedIssuer {
+    name: &'static str,
+}
+
+impl fmt::Debug for DistrustedIssuer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for DistrustedIssuer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the server's certificate chain was issued by the compromised eMudhra intermediate CA \"{}\"; refusing to connect",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for DistrustedIssuer {}
+
 /// Wraps any `ServerCertVerifier` (in production, the OS platform verifier) and
-/// rejects a presented chain outright when any certificate in it — leaf or
-/// intermediate — has an SPKI hash on the denylist.
+/// rejects a chain when any certificate in it — leaf or intermediate — has an
+/// SPKI hash on the key denylist or an issuer name on the subject denylist.
+/// See the module docs for which chains are checked on which platform.
 #[derive(Debug)]
 pub struct DenylistVerifier {
     inner: Arc<dyn ServerCertVerifier>,
-    denylist: &'static [[u8; 32]],
+    keys: &'static [[u8; 32]],
+    issuers: &'static [DistrustedCa],
 }
 
 impl DenylistVerifier {
-    /// Wrap `inner` with the production denylist, [`DISTRUSTED_SPKI_SHA256`].
+    /// Wrap `inner` with the production denylists, [`DISTRUSTED_SPKI_SHA256`]
+    /// and [`DISTRUSTED_CA_SUBJECTS`].
     pub fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
-        Self::with_denylist(inner, &DISTRUSTED_SPKI_SHA256)
+        Self::with_denylists(inner, &DISTRUSTED_SPKI_SHA256, &DISTRUSTED_CA_SUBJECTS)
     }
 
-    /// Wrap `inner` with an explicit denylist (tests).
-    pub fn with_denylist(inner: Arc<dyn ServerCertVerifier>, denylist: &'static [[u8; 32]]) -> Self {
-        Self { inner, denylist }
+    /// Wrap `inner` with explicit denylists (tests).
+    pub fn with_denylists(
+        inner: Arc<dyn ServerCertVerifier>,
+        keys: &'static [[u8; 32]],
+        issuers: &'static [DistrustedCa],
+    ) -> Self {
+        Self { inner, keys, issuers }
     }
 
-    /// `Ok(())` when no certificate in `chain` carries a denylisted key. A
-    /// certificate we cannot parse fails closed as `BadEncoding` — the platform
-    /// would reject it too, and a check that can be skipped by malforming the
-    /// input is no check.
+    /// `Ok(())` when no certificate in `chain` carries a denylisted key or was
+    /// issued under a denylisted name. A certificate we cannot parse fails
+    /// closed as `BadEncoding` — the platform would reject it too, and a check
+    /// that can be skipped by malforming the input is no check.
     fn check_chain<'a>(&self, chain: impl Iterator<Item = &'a [u8]>) -> Result<(), TlsError> {
         for der in chain {
-            match spki_sha256(der) {
-                None => return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding)),
-                Some(hash) if self.denylist.contains(&hash) => {
-                    return Err(TlsError::InvalidCertificate(CertificateError::Other(OtherError(
-                        Arc::new(DistrustedKey { spki_sha256: hash }),
-                    ))));
-                }
-                Some(_) => {}
+            let fields = tbs_fields(der)
+                .ok_or(TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+            let hash: [u8; 32] = Sha256::digest(fields.spki).into();
+            if self.keys.contains(&hash) {
+                return Err(TlsError::InvalidCertificate(CertificateError::Other(OtherError(
+                    Arc::new(DistrustedKey { spki_sha256: hash }),
+                ))));
+            }
+            if let Some(ca) = self.issuers.iter().find(|ca| ca.subject_der == fields.issuer) {
+                return Err(TlsError::InvalidCertificate(CertificateError::Other(OtherError(
+                    Arc::new(DistrustedIssuer { name: ca.name }),
+                ))));
             }
         }
         Ok(())
     }
+}
+
+/// The chain macOS `SecTrust` builds for the presented certificates (leaf
+/// first, anchor last), including intermediates it completed on its own from
+/// AIA or the keychain. Evaluated with the same SSL policy the platform
+/// verifier uses; the outcome is ignored — the platform verifier has already
+/// accepted the chain, this only recovers which certificates it used.
+#[cfg(target_os = "macos")]
+fn os_built_chain(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+) -> Result<Vec<Vec<u8>>, TlsError> {
+    use security_framework::certificate::SecCertificate;
+    use security_framework::policy::SecPolicy;
+    use security_framework::secure_transport::SslProtocolSide;
+    use security_framework::trust::SecTrust;
+
+    let certs = std::iter::once(end_entity.as_ref())
+        .chain(intermediates.iter().map(|c| c.as_ref()))
+        .map(|der| {
+            SecCertificate::from_der(der)
+                .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadEncoding))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let name = server_name.to_str();
+    let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(name.as_ref()));
+    let trust = SecTrust::create_with_certificates(&certs, &[policy])
+        .map_err(|e| TlsError::General(format!("tls: could not re-evaluate the chain: {e}")))?;
+    let _ = trust.evaluate_with_error();
+    Ok(evaluated_chain(&trust))
+}
+
+/// `SecTrustCopyCertificateChain` needs macOS 12 (security-framework's
+/// `macos-12` feature); the index API it deprecates works on every release.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn evaluated_chain(trust: &security_framework::trust::SecTrust) -> Vec<Vec<u8>> {
+    let mut chain = Vec::new();
+    let mut ix = 0;
+    while let Some(cert) = trust.certificate_at_index(ix) {
+        chain.push(cert.to_der());
+        ix += 1;
+    }
+    chain
 }
 
 impl ServerCertVerifier for DenylistVerifier {
@@ -249,8 +411,15 @@ impl ServerCertVerifier for DenylistVerifier {
         self.check_chain(
             std::iter::once(end_entity.as_ref()).chain(intermediates.iter().map(|c| c.as_ref())),
         )?;
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        let verified = self
+            .inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        #[cfg(target_os = "macos")]
+        {
+            let built = os_built_chain(end_entity, intermediates, server_name)?;
+            self.check_chain(built.iter().map(|c| c.as_slice()))?;
+        }
+        Ok(verified)
     }
 
     fn verify_tls12_signature(
@@ -301,6 +470,49 @@ pub fn rustls_client_config() -> Result<ClientConfig, TlsError> {
     // exactly as before. reqwest leaves a preconfigured config's ALPN alone.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+// ─── Error text ───────────────────────────────────────────────────────────
+
+/// The TLS failure behind a request error, as one sentence a developer can act
+/// on, or `None` when the failure was not TLS. Walks the `source()` chain and
+/// looks inside `io::Error`s, which is where hyper leaves the rustls error.
+pub fn tls_failure(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        let tls = e.downcast_ref::<TlsError>().or_else(|| {
+            e.downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<TlsError>())
+        });
+        if let Some(tls) = tls {
+            return Some(explain(tls));
+        }
+        cur = e.source();
+    }
+    None
+}
+
+fn explain(err: &TlsError) -> String {
+    use rustls::AlertDescription as A;
+    match err {
+        TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) => inner.to_string(),
+        TlsError::PeerIncompatible(_)
+        | TlsError::AlertReceived(A::ProtocolVersion | A::HandshakeFailure | A::InsufficientSecurity) => format!(
+            "TLS handshake failed ({err}). Octopush requires TLS 1.2 or newer with modern cipher suites (ECDHE with AES-GCM or ChaCha20); this server, or a proxy in front of it, offers only older ones"
+        ),
+        _ => format!("TLS error: {err}"),
+    }
+}
+
+/// `reqwest`'s own `Display` stops at "error sending request for url (…)";
+/// this appends the TLS reason when there is one. Use it wherever a request
+/// error reaches the user.
+pub fn describe_request_error(err: &reqwest::Error) -> String {
+    match tls_failure(err) {
+        Some(why) => format!("{err}: {why}"),
+        None => err.to_string(),
+    }
 }
 
 // ─── reqwest glue ─────────────────────────────────────────────────────────
@@ -406,6 +618,35 @@ bc9503f088beca4ac0bab6122af4d5ff1575c96e24db2748bbb7ed095a7a21a211904fd593d97740
 350f20390db3e33210e3846b4c4bbe48b2b6c37123126f42a88fd40227d98f97f9b2b5d888266a893439240b013c86ca\
 fc57f0acf12ceb666d9665a6f1fa9f1d3c5e2454b8d0837fe4fd95e9a7";
     const RSA_SPKI_SHA256: &str = "7cf26b7ec7e9dc7932503ba447bc97c948c221b0c2111140ebad3c44d1466bfa";
+
+    /// EC P-256 leaf for `forged.example`, signed by a throwaway key whose CA
+    /// certificate carries the exact subject of `EM DV TLS CA - G3B`
+    /// (`openssl req -subj "/C=NL/O=eMudhra BV/CN=EM DV TLS CA - G3B"`): what an
+    /// attacker holding the real key would send, minus the intermediate.
+    const LEAF_UNDER_DV_G3B: &str = "\
+308201b93082015fa0030201020208056ceee85f720eb7300a06082a8648ce3d040302303f310b300906035504061302\
+4e4c31133011060355040a0c0a654d7564687261204256311b301906035504030c12454d20445620544c53204341202d\
+20473342301e170d3236313033313230353334355a170d3236313133303230353334355a30193117301506035504030c\
+0e666f726765642e6578616d706c653059301306072a8648ce3d020106082a8648ce3d030107034200049c08d1811cd1\
+ee2ec7f43cca61561bfe4052ad44dc9649ebd122e56a92c022734b63f6f2ecdb7c9e09f48a91a50d394ef843368de031\
+cf3b1179ee5dba978e3ea36b3069300c0603551d130101ff0402300030190603551d1104123010820e666f726765642e\
+6578616d706c65301d0603551d0e0416041407a9cb5d2abdd03d2905edd0d68c8f6681b7c188301f0603551d23041830\
+1680144c030ce3036080e90d8c5907d6b10e63398b3415300a06082a8648ce3d040302034800304502207834d5e1821e\
+641a5256b557d960e9997dbb6d4b90d11ed0872fd648f3862b78022100e61e49befd6064b27377d28b38ac542ce22699\
+55888f967b85afc2c9a60c3c32";
+
+    /// Same leaf, issued under the near-miss name `EM DV TLS CA - G3D`.
+    const LEAF_UNDER_LOOKALIKE: &str = "\
+308201b93082015fa0030201020208282d6ba072aafc35300a06082a8648ce3d040302303f310b300906035504061302\
+4e4c31133011060355040a0c0a654d7564687261204256311b301906035504030c12454d20445620544c53204341202d\
+20473344301e170d3236313033313230353334355a170d3236313133303230353334355a30193117301506035504030c\
+0e666f726765642e6578616d706c653059301306072a8648ce3d020106082a8648ce3d030107034200049c08d1811cd1\
+ee2ec7f43cca61561bfe4052ad44dc9649ebd122e56a92c022734b63f6f2ecdb7c9e09f48a91a50d394ef843368de031\
+cf3b1179ee5dba978e3ea36b3069300c0603551d130101ff0402300030190603551d1104123010820e666f726765642e\
+6578616d706c65301d0603551d0e0416041407a9cb5d2abdd03d2905edd0d68c8f6681b7c188301f0603551d23041830\
+1680144c030ce3036080e90d8c5907d6b10e63398b3415300a06082a8648ce3d0403020348003045022100d0b37195f2\
+c247eaebe3d4d78c71e133a51c8e9bb83ce12ebdc924ed589e00bb02204e69b100d475bd34aee1f54d49cfe3b131d5cb\
+1d1171ada8887a298f89736336";
 
     #[test]
     fn spki_of_a_v3_ec_certificate_matches_openssl() {
@@ -521,7 +762,7 @@ fc57f0acf12ceb666d9665a6f1fa9f1d3c5e2454b8d0837fe4fd95e9a7";
 
     #[test]
     fn a_clean_chain_reaches_the_inner_verifier() {
-        let v = DenylistVerifier::with_denylist(Arc::new(Permissive), &EC_KEY_ONLY);
+        let v = DenylistVerifier::with_denylists(Arc::new(Permissive), &EC_KEY_ONLY, &[]);
         assert!(verify(&v, RSA_V3, &[]).is_ok());
         assert!(verify(&v, RSA_V3, &[RSA_V3]).is_ok());
         // The production list never matches an ordinary key either.
@@ -531,7 +772,7 @@ fc57f0acf12ceb666d9665a6f1fa9f1d3c5e2454b8d0837fe4fd95e9a7";
 
     #[test]
     fn a_denylisted_leaf_is_rejected() {
-        let v = DenylistVerifier::with_denylist(Arc::new(Permissive), &EC_KEY_ONLY);
+        let v = DenylistVerifier::with_denylists(Arc::new(Permissive), &EC_KEY_ONLY, &[]);
         let err = verify(&v, EC_V3, &[]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("compromised eMudhra intermediate CA key"), "{msg}");
@@ -540,14 +781,75 @@ fc57f0acf12ceb666d9665a6f1fa9f1d3c5e2454b8d0837fe4fd95e9a7";
 
     #[test]
     fn a_denylisted_intermediate_is_rejected_whatever_the_leaf() {
-        let v = DenylistVerifier::with_denylist(Arc::new(Permissive), &EC_KEY_ONLY);
+        let v = DenylistVerifier::with_denylists(Arc::new(Permissive), &EC_KEY_ONLY, &[]);
         assert!(verify(&v, RSA_V3, &[EC_V3]).is_err());
         assert!(verify(&v, RSA_V3, &[RSA_V3, EC_V1]).is_err());
     }
 
     #[test]
+    fn the_subject_denylist_has_the_eight_names_in_der() {
+        assert_eq!(DISTRUSTED_CA_SUBJECTS.len(), 8);
+        let distinct: std::collections::HashSet<_> =
+            DISTRUSTED_CA_SUBJECTS.iter().map(|ca| ca.subject_der).collect();
+        assert_eq!(distinct.len(), 8);
+        for ca in &DISTRUSTED_CA_SUBJECTS {
+            // Each entry is one well-formed DER SEQUENCE and carries its CN.
+            let (_, whole) = Der::new(ca.subject_der).expect(TAG_SEQUENCE).expect(ca.name);
+            assert_eq!(whole.len(), ca.subject_der.len(), "{}", ca.name);
+            assert!(ca.subject_der.windows(ca.name.len()).any(|w| w == ca.name.as_bytes()), "{}", ca.name);
+        }
+    }
+
+    #[test]
+    fn the_fixture_issuer_is_byte_for_byte_a_denylisted_name() {
+        let leaf = unhex(LEAF_UNDER_DV_G3B);
+        assert_eq!(issuer_name(&leaf).unwrap(), DISTRUSTED_CA_SUBJECTS[0].subject_der);
+        assert_ne!(issuer_name(&unhex(LEAF_UNDER_LOOKALIKE)).unwrap(), DISTRUSTED_CA_SUBJECTS[0].subject_der);
+    }
+
+    #[test]
+    fn a_leaf_issued_under_a_denylisted_name_is_refused_without_its_intermediate() {
+        // Only the leaf is presented: the key denylist sees nothing, the issuer
+        // name gives it away.
+        let v = DenylistVerifier::new(Arc::new(Permissive));
+        let err = verify(&v, LEAF_UNDER_DV_G3B, &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("issued by the compromised eMudhra intermediate CA"), "{msg}");
+        assert!(msg.contains("EM DV TLS CA - G3B"), "{msg}");
+        // Same when the server sends an unrelated certificate alongside it.
+        assert!(verify(&v, RSA_V3, &[LEAF_UNDER_DV_G3B]).is_err());
+    }
+
+    #[test]
+    fn an_unrelated_issuer_passes() {
+        let v = DenylistVerifier::new(Arc::new(Permissive));
+        assert!(verify(&v, LEAF_UNDER_LOOKALIKE, &[]).is_ok());
+        assert!(verify(&v, EC_V3, &[RSA_V3]).is_ok());
+    }
+
+    #[test]
+    fn tls_failures_are_explained_through_io_errors() {
+        let v = DenylistVerifier::new(Arc::new(Permissive));
+        let refused = verify(&v, LEAF_UNDER_DV_G3B, &[]).unwrap_err();
+        // hyper hands rustls errors up wrapped in `io::Error`.
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, refused);
+        let why = tls_failure(&wrapped).unwrap();
+        assert!(why.starts_with("the server's certificate chain was issued by"), "{why}");
+
+        let old = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            TlsError::AlertReceived(rustls::AlertDescription::ProtocolVersion),
+        );
+        let why = tls_failure(&old).unwrap();
+        assert!(why.contains("requires TLS 1.2 or newer"), "{why}");
+
+        let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(tls_failure(&plain).is_none());
+    }
+
+    #[test]
     fn an_unparseable_certificate_fails_closed() {
-        let v = DenylistVerifier::with_denylist(Arc::new(Permissive), &EC_KEY_ONLY);
+        let v = DenylistVerifier::with_denylists(Arc::new(Permissive), &EC_KEY_ONLY, &[]);
         let leaf = CertificateDer::from(b"garbage".to_vec());
         let name = ServerName::try_from("example.com").unwrap();
         let err = v

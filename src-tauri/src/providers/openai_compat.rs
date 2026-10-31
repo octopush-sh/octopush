@@ -39,7 +39,7 @@ impl LlmProvider for OpenAICompatibleProvider {
 
         let resp = request.send().await
             // A request that never reached the server is transient.
-            .map_err(|e| network_error(format!("OpenAI-compat request failed: {e}")))?;
+            .map_err(|e| network_error(format!("OpenAI-compat request failed: {}", crate::tls::describe_request_error(&e))))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
