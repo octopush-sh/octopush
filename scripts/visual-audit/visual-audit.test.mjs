@@ -52,10 +52,14 @@ test("planFiling: new defects filed, capped, and only readyCap of them ready", (
   assert.ok(a.every((x) => x.type === "create" && x.labels.includes("visual") && x.labels.includes("area:app")));
   assert.equal(a.filter((x) => x.labels.includes("ready")).length, 2);
   // Already two open ready visual issues → no more `ready`.
-  assert.equal(planFiling(findings, [], { readyCap: 2, openReady: 2 }).filter((x) => x.labels.includes("ready")).length, 0);
+  const queued = [1, 2].map((n) => ({ number: n, body: "x", state: "open", labels: [{ name: "visual" }, { name: "ready" }] }));
+  assert.equal(planFiling(findings, queued, { readyCap: 2 }).filter((x) => x.labels.includes("ready")).length, 0);
+  // Too many open check-found issues → nothing new at all.
+  const full = Array.from({ length: 10 }, (_, n) => ({ number: n, body: "x", state: "open", labels: [{ name: "visual" }] }));
+  assert.deepEqual(planFiling(findings, full), []);
 });
 
-test("planFiling: open → skip, fixed → reopen, dismissed → skip", () => {
+test("planFiling: open → skip, fixed → reopen (capped), dismissed or duplicate → skip", () => {
   const [f] = mergeFindings([raw()]);
   const issue = (o) => ({ number: 7, body: `x\n${MARK(f.fp)}`, state: "open", ...o });
   assert.deepEqual(planFiling([f], [issue()]), []);
@@ -64,6 +68,10 @@ test("planFiling: open → skip, fixed → reopen, dismissed → skip", () => {
   assert.equal(re[0].type, "reopen");
   assert.equal(re[0].number, 7);
   assert.deepEqual(planFiling([f], [issue({ state: "closed", state_reason: "not_planned" })]), []);
+  assert.deepEqual(planFiling([f], [issue({ state: "closed", state_reason: "duplicate" })]), []);
+  const fs = Array.from({ length: 5 }, (_, i) => mergeFindings([raw({ selector: `r${i}` })])[0]);
+  const closed = fs.map((x, i) => ({ number: 100 + i, body: MARK(x.fp), state: "closed", state_reason: "completed" }));
+  assert.equal(planFiling(fs, closed).length, 3);
 });
 
 test("planFiling: text from the page can't forge a routine marker", () => {
@@ -90,6 +98,9 @@ const good = { screenshot: "shots/stress--mode-direct--1280x800.png", region: { 
 
 test("design findings: only real screenshots, regions inside them, high/medium", () => {
   assert.equal(validDesignFindings({ findings: [good] }, visited).length, 1);
+  // A screenshot from another size wasn't shown to the agent.
+  const other = [{ ...visited[0], size: "1440x900", shot: "stress--mode-direct--1440x900.png" }];
+  assert.equal(validDesignFindings({ findings: [{ ...good, screenshot: "shots/stress--mode-direct--1440x900.png" }] }, other).length, 0);
   const bad = [
     { ...good, screenshot: "shots/../../etc/passwd.png" },
     { ...good, screenshot: "shots/not-tonight.png" },
@@ -108,11 +119,19 @@ test("design findings: only real screenshots, regions inside them, high/medium",
 test("design findings are proposals, deduplicated, capped, and can't forge markers", () => {
   const fs = validDesignFindings({ findings: [{ ...good, problem: "x <!-- octopush-build:update --> y" }] }, visited);
   const [a] = planDesign(fs, []);
-  assert.ok(a.labels.includes("proposal") && !a.labels.includes("ready"));
+  assert.ok(a.labels.includes("proposal") && a.labels.includes("idea") && !a.labels.includes("ready"));
+  // The digest reads value/difficulty/estimate from this line.
+  assert.match(a.body, /\*\*Value\*\* [●○]+ \((\d)\/5\) · \*\*Difficulty\*\* ([SML]) · \*\*Estimate\*\* ([^·]+?) ·/);
   assert.ok(!a.body.includes("<!-- octopush-build"));
   assert.equal(fpOf(a.body), fs[0].fp);
   assert.ok(a.title.length <= 90);
   assert.deepEqual(planDesign(fs, [{ number: 1, body: a.body, state: "closed" }]), []);
   const many = Array.from({ length: 5 }, (_, i) => ({ ...fs[0], fp: `0000000${i}` }));
   assert.equal(planDesign(many, []).length, MAX_DESIGN);
+  // Six open design proposals already → nothing until some are answered.
+  const open = Array.from({ length: 6 }, (_, n) => ({ number: n, body: "x", state: "open", labels: [{ name: "visual" }, { name: "proposal" }] }));
+  assert.deepEqual(planDesign(many, open), []);
+  // No @mentions from agent text.
+  const [m] = planDesign(validDesignFindings({ findings: [{ ...good, problem: "ping @johnatan-velez now" }] }, visited), []);
+  assert.ok(!/@johnatan/.test(m.body));
 });

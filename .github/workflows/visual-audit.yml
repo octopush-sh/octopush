@@ -5,8 +5,9 @@
 # sizes, and runs deterministic layout checks: text escaping its box, text over
 # text, text cut without an ellipsis, sideways scroll, controls without a
 # label. New defects become `visual` issues; the first few are `ready`, so the
-# nightly builder fixes them the same night. No agent and no secret here.
-# 00:29 Bogotá — before the builder (01:07).
+# nightly builder fixes them the same night. Then a read-only Claude design
+# reviewer looks at the screenshots; its findings go to the digest as ideas.
+# Runs on main only. 00:29 Bogotá — before the builder (01:07).
 name: visual-audit
 
 on:
@@ -33,6 +34,7 @@ env:
 
 jobs:
   audit:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -83,7 +85,8 @@ jobs:
     # tools, no GitHub access (agent.mjs); its findings are validated and filed
     # as `proposal` issues — never straight to the builder.
     needs: audit
-    if: always() && needs.audit.result == 'success'
+    # Even if filing failed: the screenshots are uploaded either way.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.audit.result != 'skipped' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -104,19 +107,26 @@ jobs:
 
       - name: Prepare
         id: prep
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cp -R scripts "$RUNNER_TEMP/scripts"   # trusted copy, outside the agent's directory
           work=/tmp/design-review; rm -rf "$work"; mkdir -p "$work/shots" "$work/docs"
           # One size is enough for taste; it keeps the agent's reading bounded.
-          find "$RUNNER_TEMP/visual-audit/shots" -name '*--1280x800.png' -exec cp {} "$work/shots/" \;
+          find "$RUNNER_TEMP/visual-audit/shots" -name '*--1280x800.png' -exec cp {} "$work/shots/" \; 2>/dev/null || true
           n=$(ls "$work/shots" | wc -l | tr -d ' ')
+          [ -f "$RUNNER_TEMP/visual-audit/findings.json" ] || n=0
           echo "shots=$n" >> "$GITHUB_OUTPUT"
           cp CLAUDE.md "$work/"; cp docs/design-system.md "$work/docs/"
           {
             cat "$RUNNER_TEMP/scripts/visual-audit/design-brief.md"
             echo
-            node -e 'const r=require(process.argv[1]); for (const f of r.findings) console.log(`- ${f.check}: ${f.surfaces.join(", ")} — ${f.selector}`); if(!r.findings.length) console.log("(none)")' "$RUNNER_TEMP/visual-audit/findings.json"
+            node -e 'const r=require(process.argv[1]); for (const f of r.findings) console.log(`- ${f.check}: ${f.surfaces.join(", ")} — ${f.selector}`); if(!r.findings.length) console.log("(none)")' "$RUNNER_TEMP/visual-audit/findings.json" || echo "(no findings file)"
+            echo
+            echo "# Already proposed (open, or declined — don't propose these again)"
+            gh api "repos/$GITHUB_REPOSITORY/issues?state=all&labels=visual,proposal&per_page=100" \
+              --jq '.[] | "- \(.title) [\(.state)]"' || echo "(couldn't list them)"
           } > "$RUNNER_TEMP/design-prompt.md"
           npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
@@ -139,4 +149,4 @@ jobs:
           if node -e 'const s=process.env.OCTOPUSH_SECRETS.trim(); process.exit(s.length>=8 && require("fs").readFileSync(process.argv[1],"utf8").includes(s)?0:1)' "$f"; then
             echo "::error::design.json contains a secret value — not filed"; exit 1
           fi
-          node "$RUNNER_TEMP/scripts/visual-audit/file.mjs" --design "$f" "$RUNNER_TEMP/visual-audit/findings.json"
+          env -u OCTOPUSH_SECRETS node "$RUNNER_TEMP/scripts/visual-audit/file.mjs" --design "$f" "$RUNNER_TEMP/visual-audit/findings.json"

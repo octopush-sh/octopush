@@ -10,9 +10,11 @@
 // it opens a fresh page, then for each window size runs the deterministic
 // checks (checks.mjs) and saves a screenshot. Writes <out>/findings.json
 // (merged, one entry per defect) and <out>/shots/*.png.
-// Exit code: 0 = no findings, 1 = findings, 2 = the audit itself failed.
+// Exit code: 0 = no findings, 1 = findings, 2 = the audit itself failed
+// (an unknown surface, or a quarter or more of the screens crashed — a surface
+// that can't render isn't a clean surface).
 import { createRequire } from "node:module";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -65,6 +67,11 @@ async function main() {
     console.error("visual-audit: Playwright is not installed (not a project dependency):\n  npm i --no-save playwright && npx playwright install webkit");
     return 2;
   }
+  // Only ever wipe a previous audit's output, never an arbitrary --out.
+  if (existsSync(opts.out) && readdirSync(opts.out).length && !existsSync(join(opts.out, "findings.json")) && !existsSync(join(opts.out, "shots"))) {
+    console.error(`visual-audit: ${opts.out} isn't empty and isn't a previous audit's output — pick another --out`);
+    return 2;
+  }
   rmSync(opts.out, { recursive: true, force: true });
   mkdirSync(join(opts.out, "shots"), { recursive: true });
 
@@ -77,6 +84,7 @@ async function main() {
   const raw = [];
   const pageErrors = [];
   const visited = [];
+  let unknown = 0, crashed = 0, attempted = 0;
   try {
     const [w0, h0] = opts.sizes[0].split("x").map(Number);
     const context = await browser.newContext({ viewport: { width: w0, height: h0 }, deviceScaleFactor: 1, colorScheme: "dark", reducedMotion: "reduce" });
@@ -87,13 +95,16 @@ async function main() {
       // "home" = the app as it boots (no surface opened).
       const surfaces = opts.surfaces ?? ["home", ...all];
       for (const surface of surfaces) {
+        if (surface !== "home" && !all.includes(surface)) { console.error(`visual-audit: unknown surface ${surface}`); unknown++; continue; }
+        attempted++;
         let page;
         try {
           page = await openHarness(context, url, scenario);
-          page.on("pageerror", (e) => pageErrors.push(`${scenario}/${surface}: ${e.message}`));
+          let crashedHere = false;
+          page.on("pageerror", (e) => { pageErrors.push(`${scenario}/${surface}: ${e.message}`); if (!crashedHere) { crashedHere = true; crashed++; } });
           if (surface !== "home") {
             const ok = await page.evaluate((n) => window.__octoClips.openSurface(n), surface);
-            if (!ok) { console.warn(`visual-audit: unknown surface ${surface}`); continue; }
+            if (!ok) { console.error(`visual-audit: surface ${surface} didn't open`); unknown++; continue; }
             await page.waitForTimeout(1200);
           }
           for (const size of opts.sizes) {
@@ -108,6 +119,7 @@ async function main() {
           }
         } catch (e) {
           pageErrors.push(`${scenario}/${surface}: audit failed — ${e.message.split("\n")[0]}`);
+          crashed++;
         } finally {
           await page?.close().catch(() => {});
         }
@@ -123,7 +135,8 @@ async function main() {
   console.log(`visual-audit: ${visited.length} screens (${opts.engine}), ${findings.length} distinct finding(s)`);
   for (const f of findings) console.log(`  [${f.check}] ${f.surface} @ ${f.sizes.join(",")} — ${f.selector}${f.examples[0] ? ` — "${f.examples[0]}"` : ""} (×${f.count})`);
   if (pageErrors.length) { console.log("page errors:"); for (const e of pageErrors.slice(0, 20)) console.log(`  - ${e}`); }
-  if (!visited.length) return 2;
+  if (!visited.length || unknown) return 2;
+  if (attempted && crashed / attempted >= 0.25) { console.error(`visual-audit: ${crashed}/${attempted} surfaces crashed — the harness is broken, not the UI`); return 2; }
   return findings.length ? 1 : 0;
 }
 

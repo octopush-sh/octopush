@@ -2,7 +2,7 @@
 //
 // `inPageChecks` runs INSIDE the page (Playwright `page.evaluate`), so it must
 // be self-contained: no imports, no closures over module scope. Everything
-// else here is pure and unit-tested (checks.test.mjs).
+// else here is pure and unit-tested (visual-audit.test.mjs).
 
 /**
  * Find layout defects on the current screen. Returns raw findings:
@@ -27,18 +27,24 @@ export function inPageChecks() {
     }
     return true;
   };
-  // A short, stable selector: nearest data-tour / aria-label / role anchor + tag + a few classes.
+  // A short selector that stays the same across fixture data and row state:
+  // the nearest data-tour id or static landmark role (never aria-label text,
+  // which often interpolates names), plus the tag and its layout classes
+  // (state classes — colours, borders, opacity, rings — are left out, so the
+  // active row and the others are one element).
+  const STATE = /^(hover|focus|group-|aria-|data-|disabled|transition|duration|ease|animate|octo-|bg-|border-|text-octo|text-\[var|opacity-|ring-|shadow-|outline-|cursor-)/;
   const selectorOf = (el) => {
     const parts = [];
     let anchor = null;
     for (let e = el; e && e !== document.body; e = e.parentElement) {
       const t = e.getAttribute("data-tour");
       if (t) { anchor = `[data-tour="${t}"]`; break; }
-      const a = e.getAttribute("aria-label");
-      if (a && e !== el) { anchor = `${e.tagName.toLowerCase()}[aria-label="${a.slice(0, 40)}"]`; break; }
+      const role = e.getAttribute("role");
+      if (e !== el && role && /^(dialog|navigation|complementary|toolbar|tablist|menu|listbox|banner|main)$/.test(role)) { anchor = `[role="${role}"]`; break; }
+      if (e !== el && ["ASIDE", "NAV", "HEADER", "MAIN"].includes(e.tagName)) { anchor = e.tagName.toLowerCase(); break; }
     }
     const cls = (el.getAttribute("class") || "").split(/\s+/)
-      .filter((c) => c && !/^(hover|focus|group-hover|transition|duration|ease|animate|octo-.*-in|octo-.*-enter)/.test(c))
+      .filter((c) => c && !STATE.test(c))
       .slice(0, 4).join(".");
     parts.push(el.tagName.toLowerCase() + (cls ? "." + cls : ""));
     return (anchor ? anchor + " " : "") + parts.join(" ");
@@ -49,19 +55,48 @@ export function inPageChecks() {
     const r = Math.min(a.right, b.right), btm = Math.min(a.bottom, b.bottom);
     return r > l && btm > t ? { left: l, top: t, right: r, bottom: btm, width: r - l, height: btm - t } : null;
   };
+  // Alpha of any computed colour: rgb()/rgba(), and the "/ a" form of
+  // oklab()/color()/… that Tailwind's opacity modifiers compile to.
+  const alphaOf = (c) => {
+    c = String(c || "").trim();
+    if (!c || c === "transparent") return 0;
+    const slash = /\/\s*([\d.]+)(%?)\s*\)$/.exec(c);
+    if (slash) return parseFloat(slash[1]) / (slash[2] ? 100 : 1);
+    const m = /^rgba?\(([^)]+)\)$/.exec(c);
+    if (m) { const p = m[1].split(","); return p.length > 3 ? parseFloat(p[3]) : 1; }
+    return 1;
+  };
   const isBox = (e) => {
     const cs = getComputedStyle(e);
     const border = ["Top", "Right", "Bottom", "Left"].some((s) => parseFloat(cs[`border${s}Width`]) > 0 && cs[`border${s}Style`] !== "none");
-    const bg = cs.backgroundColor && !/rgba\(.*,\s*0\)$/.test(cs.backgroundColor) && cs.backgroundColor !== "transparent";
-    return border || bg;
+    const bg = alphaOf(cs.backgroundColor) > 0.05;
+    const ring = cs.boxShadow && cs.boxShadow !== "none";
+    const outline = cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0;
+    return border || bg || ring || outline;
   };
   // Is this point of `el` hidden under an opaque layer (a dialog, a popover)?
   // Text under another piece of text is NOT hidden — that is an overlap.
-  const alphaOf = (c) => { const m = /rgba?\(([^)]+)\)/.exec(c || ""); if (!m) return 0; const p = m[1].split(","); return p.length > 3 ? parseFloat(p[3]) : 1; };
+
   const opacityChain = (e) => { let o = 1; for (let x = e; x && x !== document.documentElement; x = x.parentElement) o *= Number(getComputedStyle(x).opacity); return o; };
+  // A layer that hides what's under it: an opaque (or frosted) element that is
+  // part of an overlay — a dialog, menu, popover, anything fixed on top, or an
+  // absolutely positioned room stacked above the workspace (z ≥ 10). A
+  // solid badge or button in normal flow is NOT a layer: text under it is an
+  // overlap to report, not something to ignore.
+  const isLayer = (e) => {
+    for (let x = e; x && x !== document.body; x = x.parentElement) {
+      if (/^(dialog|alertdialog|menu|listbox|tooltip)$/.test(x.getAttribute("role") || "")) return true;
+      const xcs = getComputedStyle(x);
+      if (xcs.position === "fixed") return true;
+      // An in-app room laid over the workspace (Settings, Mission Control…).
+      if (xcs.position === "absolute" && Number(xcs.zIndex) >= 10) return true;
+    }
+    return false;
+  };
   const opaque = (e) => {
     const ecs = getComputedStyle(e);
-    return (ecs.backdropFilter && ecs.backdropFilter !== "none") || alphaOf(ecs.backgroundColor) * opacityChain(e) >= 0.9;
+    const solid = (ecs.backdropFilter && ecs.backdropFilter !== "none") || alphaOf(ecs.backgroundColor) * opacityChain(e) >= 0.9;
+    return solid && isLayer(e);
   };
   // At a point where two texts meet: is the lower one hidden under an opaque layer?
   const lowerHiddenAt = (x, y, a, b) => {
@@ -78,9 +113,7 @@ export function inPageChecks() {
   const coveredAt = (x, y, el) => {
     for (const e of document.elementsFromPoint(x, y)) {
       if (e === el || el.contains(e) || e.contains(el)) return false;
-      const ecs = getComputedStyle(e);
-      if (ecs.backdropFilter && ecs.backdropFilter !== "none") return true; // a frosted layer
-      if (alphaOf(ecs.backgroundColor) * opacityChain(e) >= 0.9) return true;
+      if (opaque(e)) return true;
     }
     return false;
   };
@@ -127,7 +160,8 @@ export function inPageChecks() {
       if (by > 2) out.push({ check: "text-escapes", selector: selectorOf(el), group: selectorOf(boxEl), text, rect: box(seen), detail: `drawn ${Math.round(by)}px outside its box (${selectorOf(boxEl)})` });
     }
     const cs = getComputedStyle(el);
-    if (CLIPS.has(cs.overflowX) && cs.textOverflow !== "ellipsis" && el.scrollWidth > el.clientWidth + 2 && cs.whiteSpace.startsWith("nowrap")) {
+    // Cut = clipped by hidden/clip (a scroller isn't cut), and not a screen-reader-only label.
+    if ((cs.overflowX === "hidden" || cs.overflowX === "clip") && el.clientWidth > 2 && cs.position !== "absolute" && cs.textOverflow !== "ellipsis" && el.scrollWidth > el.clientWidth + 2 && cs.whiteSpace.startsWith("nowrap")) {
       out.push({ check: "text-cut", selector: selectorOf(el), text, rect: box(seen), detail: `${el.scrollWidth - el.clientWidth}px of text hidden with no ellipsis` });
     }
   }
@@ -224,7 +258,7 @@ export function issueBody(m, { engine, runUrl } = {}) {
   const lines = [
     `The nightly visual audit found this in **${engine ?? "WebKit"}** (the engine Octopush uses on macOS).`,
     "",
-    `- **Check:** ${CHECK_TITLES[m.check] ?? m.check} — ${m.detail}`,
+    `- **Check:** ${CHECK_TITLES[m.check] ?? m.check} — \`${String(m.detail).replace(/`/g, "'")}\``,
     `- **Surfaces:** ${m.surfaces.map((x) => `\`${x}\``).join(", ")} · window ${m.sizes.join(", ")} · scenario ${m.scenarios.join(", ")}`,
     `- **Element:** \`${m.selector.replace(/`/g, "'")}\`${m.group !== m.selector ? ` in \`${m.group.replace(/`/g, "'")}\`` : ""} (${m.count} occurrence${m.count === 1 ? "" : "s"})`,
   ];
@@ -241,6 +275,7 @@ export function issueBody(m, { engine, runUrl } = {}) {
     "## Done when",
     "",
     "- The next nightly audit no longer reports it (if it comes back after the fix, the audit reopens this issue).",
+    "- Fixed in the component, not around the audit: the fix PR must not touch `scripts/visual-audit/`, `scripts/clips/scenarios/` or add `data-audit-ignore`.",
     "- The fix is the general one (the pattern, not just this string); other places with the same pattern are fixed too.",
     "- A Vitest test pins the classes/structure that make it hold.",
     "",
