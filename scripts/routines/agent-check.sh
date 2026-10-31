@@ -16,12 +16,14 @@ set -euo pipefail
 # Never trust the caller's PATH for the tools this script itself runs.
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-SANDBOX_USER="${OCTOPUSH_SANDBOX_USER:-octo-sandbox}"
+SANDBOX_USER=octo-sandbox   # fixed: nothing the caller sets may change who runs the checks
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # replaced with the checkout path when installed
 NODE_DIR=""                                     # replaced with node's directory when installed
 
-if [[ "${GITHUB_ACTIONS:-}" != "true" && "${OCTOPUSH_AGENT_SANDBOX:-}" != "1" ]]; then
-  echo "agent-check: only for the GitHub Actions agents (run the checks directly instead)" >&2
+# Only the installed copy works: agent-sandbox-setup.sh bakes NODE_DIR in. (The
+# agent's environment is rebuilt from scratch, so GITHUB_ACTIONS isn't there.)
+if [[ -z "$NODE_DIR" || ! -x "$NODE_DIR/node" ]]; then
+  echo "octo-check: not installed for an agent run (agent-sandbox-setup.sh); run the checks directly instead" >&2
   exit 64
 fi
 
@@ -39,7 +41,6 @@ esac
 
 # sudo -n: the workflow prepared the user and the permissions beforehand
 # (agent-sandbox-setup.sh); never prompt.
-[[ -n "$NODE_DIR" && -x "$NODE_DIR/node" ]] || { echo "octo-check: node not configured" >&2; exit 2; }
 # Not exec: after the checks, remove every symlink the sandbox created (one
 # into the runner's files would let the agent's file tools reach past cwd).
 set +e

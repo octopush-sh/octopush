@@ -563,3 +563,8 @@ test("jobs: ready website/API ideas filed in the app repo aren't built here", ()
   ]]]);
   assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1]);
 });
+
+test("answers: trailing punctuation is not a note", () => {
+  const a = parseAnswers("1 sí.\n2 no — too big.\n3 sí!").actions;
+  assert.deepEqual(a.map((x) => [x.n, x.note]), [[1, ""], [2, "too big."], [3, ""]]);
+});

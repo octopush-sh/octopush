@@ -69,7 +69,9 @@ export function parseAnswers(text) {
       const verb = h[2].replace(/\s+/g, " ");
       const verdict = YES.includes(verb) ? "yes" : NO.includes(verb) ? "no" : "later";
       const from = h.index + h[0].length, to = k + 1 < hits.length ? hits[k + 1].index : f.length;
-      const note = foldedSlice(line, f, from, to).replace(/^[\s,:;—–-]+|[\s,;—–-]+$/g, "");
+      const raw = foldedSlice(line, f, from, to).replace(/^[\s,:;.—–-]+|[\s,;—–-]+$/g, "");
+      // Punctuation alone ("1 sí.") is not a note.
+      const note = /[\p{L}\p{N}]/u.test(raw) ? raw : "";
       for (const n of h[1].match(/\d+/g)) actions.push({ type: "verdict", n: Number(n), verdict, note });
     });
   }
