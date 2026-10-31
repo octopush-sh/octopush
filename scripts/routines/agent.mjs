@@ -33,22 +33,25 @@ export const OUT_DIR = ".agent-out";
  * tool cache, which run later with a token).
  */
 const inside = (cwd) => `/${cwd}/**`; // "//abs/path/**" — an absolute path rule
-const readHere = (cwd) => ["Read", "Glob", "Grep"].map((t) => `${t}(${inside(cwd)})`);
+// Claude Code matches file permissions with two rule kinds: Read(...) covers
+// Read/Grep/Glob, Edit(...) covers every tool that writes files (Edit, Write).
+// A Write(...) rule matches nothing.
+const readHere = (cwd) => [`Read(${inside(cwd)})`];
 export const ROLES = {
   builder: {
     model: "claude-opus-5-5",
     tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
-    allow: (cwd) => [...readHere(cwd), `Edit(${inside(cwd)})`, `Write(${inside(cwd)})`, "Bash(octo-check:*)"],
+    allow: (cwd) => [...readHere(cwd), `Edit(${inside(cwd)})`, "Bash(octo-check:*)"],
   },
   reviewer: {
     model: "claude-opus-5-5",
     tools: ["Read", "Glob", "Grep", "Write"],
-    allow: (cwd) => [...readHere(cwd), `Write(/${cwd}/${OUT_DIR}/**)`],
+    allow: (cwd) => [...readHere(cwd), `Edit(/${cwd}/${OUT_DIR}/**)`],
   },
   ideas: {
     model: "claude-opus-5-5",
     tools: ["Read", "Glob", "Grep", "Write", "WebSearch", "WebFetch"],
-    allow: (cwd) => [...readHere(cwd), `Write(/${cwd}/${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
+    allow: (cwd) => [...readHere(cwd), `Edit(/${cwd}/${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
   },
 };
 
@@ -66,7 +69,7 @@ export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
     ...(runnerTemp ? [`/${runnerTemp}/**`] : []),
     "./.git/config", "./.git/**/config",
   ];
-  return paths.flatMap((p) => [`Read(${p})`, `Grep(${p})`, `Glob(${p})`, `Edit(${p})`, `Write(${p})`]);
+  return paths.flatMap((p) => [`Read(${p})`, `Edit(${p})`]);
 }
 
 /** The claude CLI arguments for a role (pure, tested). */
@@ -83,8 +86,24 @@ export function claudeArgs(role, prompt, runnerTemp = process.env.RUNNER_TEMP, c
     "--setting-sources", "",
     "--strict-mcp-config",
     "--no-session-persistence",
-    "--output-format", "text",
+    "--output-format", "json", // one result object; its permission_denials are summarised
   ];
+}
+
+/**
+ * A safe one-line-per-entry summary of the tool calls Claude denied: tool name
+ * and file path or command only — never content (pure, tested).
+ */
+export function denialSummary(resultJson) {
+  let r;
+  try { r = JSON.parse(resultJson); } catch { return ["(no result object — the agent didn't finish normally)"]; }
+  const lines = (r.permission_denials ?? []).map((d) => {
+    const i = d.tool_input ?? {};
+    const what = i.file_path ?? i.path ?? i.pattern ?? (typeof i.command === "string" ? i.command.split(/\s+/)[0] : "");
+    return `denied: ${d.tool_name}${what ? ` ${String(what).slice(0, 200)}` : ""}`;
+  });
+  if (r.is_error || r.subtype && r.subtype !== "success") lines.push(`result: ${r.subtype ?? "error"}`);
+  return lines;
 }
 
 /** The agent's whole environment (pure, tested). */
@@ -115,6 +134,7 @@ function main() {
   closeSync(fd);
   if (r.error) { console.error(`agent: ${r.error.message}`); return 2; }
   console.log(`agent ${role} exited ${r.status} (transcript kept on the runner, not printed)`);
+  for (const line of denialSummary(readFileSync(logFile, "utf8"))) console.log(`  ${line}`);
   return r.status ?? 2;
 }
 

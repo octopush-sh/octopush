@@ -14,7 +14,7 @@ import { sanitize } from "./gh.mjs";
 import { ACTIONS_BOT, reviewerToken } from "./identity.mjs";
 import { parseVerdict } from "./automerge.mjs";
 import { parseResult, leaks, branchFor, forbiddenPaths } from "./publish-build.mjs";
-import { claudeArgs, agentEnv, denyRules, ROLES } from "./agent.mjs";
+import { claudeArgs, agentEnv, denyRules, ROLES, denialSummary } from "./agent.mjs";
 import { repoForIdea, ideaLabels, areaOf, ideaBody, listOrEmpty } from "./ideas.mjs";
 import { render } from "./read.mjs";
 
@@ -470,7 +470,9 @@ test("agents: no GitHub token in their environment, dontAsk, system paths denied
   assert.ok(settings.permissions.allow.includes("Edit(//home/runner/work/o/o/**)"));
   assert.ok(settings.permissions.allow.every((x) => !/^(Read|Glob|Grep|Edit|Write)$/.test(x)), "no unscoped file tool: everything else is denied");
   const rev = JSON.parse(claudeArgs("reviewer", "x", undefined, "/tmp/review/pr-3").find((a) => a.startsWith("{")));
-  assert.deepEqual(rev.permissions.allow.filter((x) => x.startsWith("Write")), ["Write(//tmp/review/pr-3/.agent-out/**)"]);
+  assert.deepEqual(rev.permissions.allow.filter((x) => x.startsWith("Edit")), ["Edit(//tmp/review/pr-3/.agent-out/**)"],
+    "writes are Edit(...) rules — Claude Code has no Write(...) rule kind");
+  assert.ok([...settings.permissions.allow, ...settings.permissions.deny].every((x) => !/^(Write|Grep|Glob)\(/.test(x)));
   assert.ok(!ROLES.reviewer.tools.includes("Bash") && !ROLES.ideas.tools.includes("Bash"));
   assert.ok(!ROLES.reviewer.tools.includes("WebFetch"), "the reviewer has no network tools");
   assert.ok(denyRules(undefined).every((r) => !r.includes("undefined")));
@@ -527,4 +529,13 @@ test("a sibling repo the token can't read (private, 404) is skipped, not fatal",
   const gh = makeGh((args) => { if (String(args[0]).includes("octopush-api")) throw new Error("gh: Not Found (HTTP 404)"); return "[]"; });
   assert.deepEqual(listOrEmpty(gh, "repos/octopush-sh/octopush-api/issues?state=all"), []);
   assert.doesNotThrow(() => waitingItems(gh, { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT }));
+});
+
+test("agent denial summary shows tool and path, never content", () => {
+  const out = denialSummary(JSON.stringify({ subtype: "success", permission_denials: [
+    { tool_name: "Write", tool_input: { file_path: "/w/.agent-out/ideas.json", content: "SECRET-CONTENT" } },
+    { tool_name: "Bash", tool_input: { command: "curl https://x?t=abc" } },
+  ] }));
+  assert.deepEqual(out, ["denied: Write /w/.agent-out/ideas.json", "denied: Bash curl"]);
+  assert.match(denialSummary("not json")[0], /no result/);
 });
