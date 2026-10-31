@@ -21,6 +21,8 @@ export const RED_CI_MAX_AGE_MS = 7 * 24 * 3600e3;
 export const MAX_FIX_ROUNDS = 3;
 const UPDATE_MARK = "<!-- octopush-build:update -->";
 const PARKED = ["needs-owner", "proposal", "later"];
+/** Ideas for the website/API live here too (area:web|api) but this repo's builder can't build them. */
+const OTHER_AREA = ["area:web", "area:api"];
 
 export const closingRefs = (text) =>
   [...(text ?? "").matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)\b/gi)].map((m) => Number(m[1]));
@@ -63,7 +65,7 @@ export function fixJobs(gh, repo, ids, now) {
 export function issueJobs(gh, repo, ids, now) {
   const claimed = new Set(builderPrs(gh, repo, ids).flatMap((p) => closingRefs(`${p.title}\n${p.body}`)));
   return gh.list(`repos/${repo}/issues?labels=ready&state=open&sort=created&direction=asc`)
-    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
+    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l) || OTHER_AREA.includes(l)) && !claimed.has(i.number))
     .filter((i) => !isFreshClaim(gh, repo, i, now));
 }
 
