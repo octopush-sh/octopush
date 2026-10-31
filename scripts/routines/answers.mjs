@@ -12,7 +12,7 @@
 //   promote 0.4.91                dispatch the stable promotion workflow
 //   idea: <text>                  file a new idea for tomorrow's digest to estimate
 import { makeGh, APP_REPO, API_REPO, WEB_REPO, ciStatus, labelsOf } from "./gh.mjs";
-import { loadIdentities, requireIdentities, assertActingAs, sameLogin } from "./identity.mjs";
+import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions } from "./identity.mjs";
 
 const MARK = "<!-- octopush-";
 // No bare "y": in Spanish it means "and" ("4 y 5 sí").
@@ -145,6 +145,9 @@ function applyOne(gh, digest, action, ids) {
     if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== action.repo) return `merge ${short}#${action.n}: must be a same-repo PR into main`;
     const ci = ciStatus(gh, action.repo, pr.head.sha);
     if (ci !== "success") return `merge ${short}#${action.n}: CI is ${ci} — not merged`;
+    // A workflow token only reaches its own repo: from Actions the owner merges
+    // website/API PRs with one click (merging them deploys).
+    if (inActions()) return `merge ${short}#${action.n}: checks pass — merge it on GitHub: ${pr.html_url}`;
     const r = gh.send("PUT", `repos/${action.repo}/pulls/${action.n}/merge`, { merge_method: "merge", sha: pr.head.sha });
     return r?.merged ? `merged ${short}#${action.n} (it deploys at the next deploy window)` : `merge ${short}#${action.n}: ${r?.message ?? "failed"}`;
   }

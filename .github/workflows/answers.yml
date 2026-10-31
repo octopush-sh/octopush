@@ -1,0 +1,40 @@
+# Apply the owner's answers on the daily digest the moment they're posted
+# (VISION.md §9, docs/ROUTINES.md). Deterministic — no agent. Only comments by
+# the owner (repo variable OCTOPUSH_OWNER_LOGIN) on a `digest` issue count.
+name: answers
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write        # labels, comments, idea issues
+  pull-requests: read
+  actions: write       # `promote <version>` dispatches promote.yml
+
+concurrency:
+  group: answers
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.issue.pull_request &&
+       contains(github.event.issue.labels.*.name, 'digest') &&
+       github.event.comment.user.login == vars.OCTOPUSH_OWNER_LOGIN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: node scripts/routines/answers.mjs apply

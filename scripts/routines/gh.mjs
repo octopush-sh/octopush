@@ -59,3 +59,10 @@ export function ciStatus(gh, repo, sha) {
 }
 
 export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (typeof l === "string" ? l : l.name));
+
+/**
+ * Make agent-written text safe to post: neutralise HTML comments, so text from
+ * an agent can never carry a routine marker (`<!-- octopush-… -->`) — the
+ * review verdicts, digest maps and applied-answer records are such markers.
+ */
+export const sanitize = (text) => String(text ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");

@@ -15,11 +15,25 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { makeGh, APP_REPO, API_REPO, WEB_REPO, ALL_REPOS, ciStatus, labelsOf } from "./gh.mjs";
-import { loadIdentities, requireIdentities, assertActingAs, sameLogin } from "./identity.mjs";
+import { makeGh, APP_REPO, API_REPO, WEB_REPO, ALL_REPOS, ciStatus, labelsOf, sanitize } from "./gh.mjs";
+import { loadIdentities, requireIdentities, assertActingAs, sameLogin, inActions } from "./identity.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const REPO_FOR_AREA = { app: APP_REPO, api: API_REPO, web: WEB_REPO };
+
+/**
+ * Where an idea is filed. A workflow token can only write to its own repo, so
+ * in GitHub Actions every idea lives in the app repo, tagged `area:<area>`.
+ */
+export const repoForIdea = (area, actions = inActions()) => (actions ? APP_REPO : REPO_FOR_AREA[area]);
+export const ideaLabels = (area, actions = inActions()) => ["proposal", "idea", ...(actions ? [`area:${area}`] : [])];
+
+/** The area of an existing idea issue: its `area:` label, else its repo. */
+export function areaOf(issue, repo) {
+  const l = labelsOf(issue).find((x) => /^area:(app|api|web)$/.test(x));
+  if (l) return l.slice(5);
+  return repo === APP_REPO ? "app" : repo === API_REPO ? "api" : "web";
+}
 const DIFF_RANK = { S: 0, M: 1, L: 2 };
 export const MIN_IDEAS = 5;
 const DAY = 864e5;
@@ -59,10 +73,11 @@ export function rank(ideas) {
 }
 
 export function ideaBody(it, date) {
-  const ev = (it.evidence ?? []).map((u) => `- ${u}`).join("\n");
+  // Agent-written text: sanitized so it can't carry a routine marker.
+  const ev = (it.evidence ?? []).map((u) => `- ${sanitize(u)}`).join("\n");
   return [
-    `**Value** ${"●".repeat(it.value)}${"○".repeat(5 - it.value)} (${it.value}/5) · **Difficulty** ${it.difficulty} · **Estimate** ${it.estimate} · **Kind** ${it.kind}`,
-    "", "### Why", it.why.trim(), "", "### Proposal", it.proposal.trim(),
+    `**Value** ${"●".repeat(it.value)}${"○".repeat(5 - it.value)} (${it.value}/5) · **Difficulty** ${it.difficulty} · **Estimate** ${sanitize(it.estimate)} · **Kind** ${it.kind}`,
+    "", "### Why", sanitize(it.why).trim(), "", "### Proposal", sanitize(it.proposal).trim(),
     ev ? `\n### Evidence\n${ev}` : "",
     "", `_Suggested by the ideas routine on ${date}. Answer it in that day's digest issue._`,
   ].join("\n");
@@ -70,7 +85,7 @@ export function ideaBody(it, date) {
 
 /** The digest body; `rows` are [{n, ref, title, area, value, difficulty, estimate, url, earlier?}]. */
 export function digestBody({ date, rows, waiting }) {
-  const fmt = (r) => `| ${r.n} | [${r.title.replace(/\|/g, "\\|")}](${r.url}) | ${r.area} | ${"●".repeat(r.value)} | ${r.difficulty} | ${r.estimate} |`;
+  const fmt = (r) => `| ${r.n} | [${sanitize(r.title).replace(/\|/g, "\\|")}](${r.url}) | ${r.area} | ${"●".repeat(r.value)} | ${r.difficulty} | ${r.estimate} |`;
   const fresh = rows.filter((r) => !r.earlier), earlier = rows.filter((r) => r.earlier);
   const map = Object.fromEntries(rows.map((r) => [String(r.n), r.ref]));
   return [
@@ -171,7 +186,7 @@ function post(gh, file, now, ids) {
   const rows = [];
   let n = 1;
   for (const it of rank(ideas)) {
-    const repo = REPO_FOR_AREA[it.area];
+    const repo = repoForIdea(it.area);
     let issue;
     if (it.resurface) {
       issue = gh.get(`repos/${repo}/issues/${it.resurface}`);
@@ -183,7 +198,7 @@ function post(gh, file, now, ids) {
       // Idempotent: a rerun after a partial failure reuses the open idea it already filed.
       issue = gh.list(`repos/${repo}/issues?state=open&labels=idea`, 500)
         .find((i) => !i.pull_request && i.title === it.title && sameLogin(i.user?.login, ids.builder))
-        ?? gh.send("POST", `repos/${repo}/issues`, { title: it.title, body: ideaBody(it, date), labels: ["proposal", "idea"] });
+        ?? gh.send("POST", `repos/${repo}/issues`, { title: sanitize(it.title), body: ideaBody(it, date), labels: ideaLabels(it.area) });
     }
     rows.push({ n: n++, ref: `${repo}#${issue.number}`, title: it.title, area: it.area, value: it.value, difficulty: it.difficulty, estimate: it.estimate, url: issue.html_url });
   }
@@ -194,7 +209,7 @@ function post(gh, file, now, ids) {
       const ref = `${repo}#${i.number}`;
       if (i.pull_request || listed.has(ref) || rows.length >= 25 || !trustedAuthor(i, ids)) continue;
       const m = /\*\*Value\*\* [●○]+ \((\d)\/5\) · \*\*Difficulty\*\* ([SML]) · \*\*Estimate\*\* ([^·]+?) ·/.exec(i.body ?? "");
-      rows.push({ n: n++, ref, title: i.title, area: repo === APP_REPO ? "app" : repo === API_REPO ? "api" : "web", value: Number(m?.[1] ?? 3), difficulty: m?.[2] ?? "M", estimate: m?.[3]?.trim() ?? "?", url: i.html_url, earlier: true });
+      rows.push({ n: n++, ref, title: i.title, area: areaOf(i, repo), value: Number(m?.[1] ?? 3), difficulty: m?.[2] ?? "M", estimate: m?.[3]?.trim() ?? "?", url: i.html_url, earlier: true });
     }
   }
   for (const old of existing.filter((i) => i.state === "open" && sameLogin(i.user?.login, ids.builder))) gh.send("PATCH", `repos/${APP_REPO}/issues/${old.number}`, { state: "closed", state_reason: "completed" });

@@ -5,6 +5,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The nightly workflows push with GITHUB_TOKEN, which starts no workflows;
+  # they dispatch CI on their branches instead (docs/ROUTINES.md).
+  workflow_dispatch:
 
 permissions:
   contents: read
