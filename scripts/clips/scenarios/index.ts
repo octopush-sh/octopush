@@ -3,8 +3,10 @@
 import type { Scenario } from "./types";
 import { defaultScenario } from "./default";
 import { empty } from "./empty";
+import { stress } from "./stress";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
   empty,
+  stress,
 };

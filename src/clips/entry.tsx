@@ -10,6 +10,7 @@
 //   scenario     — the scenario name in use
 //   log          — { calls, defaulted, failed } (see ./dispatcher)
 //   openSurface  — the real named-surface registry (src/lib/tour/surfaces.ts)
+//   surfaces     — its names (the visual audit walks all of them)
 //   emit         — fire a backend event at the app's listeners
 import React, { Suspense } from "react";
 import ReactDOM from "react-dom/client";
@@ -26,6 +27,7 @@ declare global {
       scenario: string;
       log: CallLog;
       openSurface: (name: string) => boolean;
+      surfaces: string[];
       emit: (event: string, payload?: unknown) => Promise<void>;
       error?: string;
     };
@@ -54,11 +56,11 @@ async function boot() {
   const { handle, log } = createDispatcher(scenario);
   mockIPC(handle, { shouldMockEvents: true });
 
-  const [{ default: App }, { openSurface }] = await Promise.all([
+  const [{ default: App }, { openSurface, SURFACES }] = await Promise.all([
     import("../App"),
     import("../lib/tour/surfaces"),
   ]);
-  window.__octoClips = { ready: false, scenario: name, log, openSurface, emit: (e, p) => emit(e, p) };
+  window.__octoClips = { ready: false, scenario: name, log, openSurface, surfaces: Object.keys(SURFACES), emit: (e, p) => emit(e, p) };
 
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
@@ -75,5 +77,5 @@ async function boot() {
 boot().catch((e: unknown) => {
   const msg = e instanceof Error ? e.message : String(e);
   console.error("[clips] harness failed:", msg);
-  window.__octoClips = { ready: false, scenario: "", log: { calls: {}, defaulted: [], failed: [] }, openSurface: () => false, emit: async () => {}, error: msg };
+  window.__octoClips = { ready: false, scenario: "", log: { calls: {}, defaulted: [], failed: [] }, openSurface: () => false, surfaces: [], emit: async () => {}, error: msg };
 });

@@ -16,6 +16,8 @@ export const empty: Scenario = {
     list_closed_projects: [],
     get_settings: { providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} } satisfies AppSettings,
     auth_status: { signedIn: false, email: null, name: null } satisfies AuthStatus,
+    auth_refresh: { signedIn: false, email: null, name: null } satisfies AuthStatus,
+    detect_editors: [],
     get_entitlement: { plan: "free", features: [], directRunsPerMonth: 5 } satisfies Entitlement,
     direct_run_usage: { used: 0, limit: 5, remaining: 5 },
     get_sync_prefs: { historySync: false, librarySync: false } satisfies SyncPrefs,

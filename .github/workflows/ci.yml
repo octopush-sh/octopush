@@ -91,5 +91,8 @@ jobs:
         run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs
       - name: routine scripts
         run: node --test scripts/routines/routines.test.mjs
+      - name: visual audit logic
+        # Pure parts only (merging, fingerprints, issue filing). The audit itself runs nightly (visual-audit.yml).
+        run: node --test scripts/visual-audit/visual-audit.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done

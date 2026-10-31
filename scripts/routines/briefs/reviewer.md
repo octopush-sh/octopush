@@ -25,6 +25,8 @@ itself a reason to request changes).
 - Vitest covers the states you can't see (loading, error, empty, Escape).
 - docs/FEATURES.md updated for user-facing changes; the changeset's note is true and its `steps`
   point at `data-tour` ids that exist.
+- A fix for a `visual` issue changes the component itself — request changes if it touches
+  `scripts/visual-audit/`, `scripts/clips/scenarios/` or adds `data-audit-ignore` to get past the audit.
 - Nothing in a human-only area (VISION.md §8), nothing that reaches for credentials, the network,
   the user's files or telemetry it shouldn't, nothing obfuscated.
 

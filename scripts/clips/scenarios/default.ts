@@ -263,6 +263,7 @@ export const defaultScenario: Scenario = {
     get_settings: SETTINGS,
     get_sync_prefs: { historySync: false, librarySync: false } satisfies SyncPrefs,
     sketchbook_path: "/Users/dev/.octopush/sketchbook",
+    detect_editors: [],
     // run (terminals): the app opens one on first visit to a workspace
     list_terminals: [],
     create_terminal: (a): TerminalRecord => ({
@@ -283,6 +284,7 @@ export const defaultScenario: Scenario = {
     estimate_run_cost: { estimateUsd: 0.43, baselineUsd: 1.95 },
     // account & usage
     auth_status: AUTH,
+    auth_refresh: AUTH,
     get_entitlement: ENTITLEMENT,
     direct_run_usage: RUN_USAGE,
     get_token_report: TOKEN_REPORT,
@@ -291,3 +293,6 @@ export const defaultScenario: Scenario = {
     mcp_connection_status: { binaryFound: true, claudeFound: true, registered: true, manualCommand: "claude mcp add octopush -s user -- octopush-mcp" },
   },
 };
+
+/** The building blocks above, for scenarios that vary them (e.g. `stress`). */
+export const DEFAULT_FIXTURES = { PROJECT, WORKSPACES, GIT_SUMMARIES, PIPELINES, ROLES, RUN, RUN_STAGES, THREAD, MESSAGES, PROVIDERS, MODELS };
