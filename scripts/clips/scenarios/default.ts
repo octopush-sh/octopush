@@ -15,6 +15,7 @@ import type {
 } from "../../../src/lib/ipc";
 import type {
   AppSettings,
+  DirectoryEntry,
   BranchList,
   BranchPr,
   ChatMessage,
@@ -265,6 +266,22 @@ export const defaultScenario: Scenario = {
     sketchbook_path: "/Users/dev/.octopush/sketchbook",
     detect_editors: [],
     // run (terminals): the app opens one on first visit to a workspace
+    // files (Review's tree, @file completion)
+    read_directory: (a) => {
+      const root = String(a.path ?? "");
+      const tree: Record<string, Array<[string, boolean]>> = {
+        "": [["src", true], ["src-tauri", true], ["package.json", false], ["README.md", false]],
+        src: [["components", true], ["App.tsx", false]],
+        "src/components": [["settings", true]],
+        "src/components/settings": [["AccountPane.tsx", false]],
+        "src-tauri": [["src", true], ["Cargo.toml", false]],
+        "src-tauri/src": [["sync.rs", false], ["lib.rs", false]],
+      };
+      const rel = root.replace(/^\/Users\/dev\/code\/octopush(\/\.octopus-worktrees\/[^/]+)?\/?/, "");
+      return (tree[rel] ?? []).map(([name, isDir]): DirectoryEntry => ({ name, path: `${root.replace(/\/$/, "")}/${name}`, isDir, isIgnored: false }));
+    },
+    list_workspace_files: ["package.json", "README.md", "src/App.tsx", "src/components/settings/AccountPane.tsx", "src-tauri/Cargo.toml", "src-tauri/src/lib.rs", "src-tauri/src/sync.rs"],
+    list_file_edits: [],
     list_terminals: [],
     spawn_or_attach_terminal: { mode: "Spawned", pid: 4242 },
     create_terminal: (a): TerminalRecord => ({
