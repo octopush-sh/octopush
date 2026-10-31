@@ -7,8 +7,12 @@ run against the built site. Runs nightly in `web-audit.yml`; no agent.
 ## How it works
 
 1. The workflow checks out octopush-web's `main` (what merging publishes) with
-   a read-only installation token of the "Octopush Cycle" GitHub App, revokes
-   it, then `npm ci --ignore-scripts && npm run build`.
+   a `contents: read` installation token of the "Octopush Cycle" GitHub App,
+   minted in a separate job (`scripts/routines/app-token.mjs`), revokes it and
+   checks it is dead, then `npm ci --ignore-scripts && npm run build`. That job
+   references no secret: the build is the website's own code. Findings and
+   screenshots (3 days, none of the legal pages) go to an artifact; a third job
+   on a fresh runner files them.
 2. `audit.mjs` serves `dist/` on a local port and opens every page (every
    `.html` in `dist/`, without Pagefind's or Astro's assets) in Playwright
    **Chromium** at 1440×900, 1024×700 and 390×844, takes a screenshot and runs

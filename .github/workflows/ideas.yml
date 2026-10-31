@@ -71,13 +71,16 @@ jobs:
           set -euo pipefail
           cp -R scripts/routines "$RUNNER_TEMP/routines"
           { cat scripts/routines/briefs/ideas.md; echo; node scripts/routines/ideas.mjs context; } > "$RUNNER_TEMP/prompt.md"
-          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
       - name: Revoke the context token
         if: always() && steps.read-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.read-token.outputs.token }}
-        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
+
+      - name: Install Claude Code (no token in this step)
+        if: steps.check.outputs.go == '1'
+        run: npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
       - name: Research (Claude agent, no GitHub access)
         if: steps.check.outputs.go == '1'

@@ -913,3 +913,104 @@ test("octo-check: the installed copy runs only its profile's commands", async ()
   assert.match(bad("all").stderr, /unknown profile/);
   assert.equal(spawnSync("bash", [new URL("./agent-check.sh", import.meta.url).pathname, "all"], { encoding: "utf8" }).status, 64, "the repo copy refuses: not installed");
 });
+
+// ---------------------------------------------------------------- website lane: security review fixes
+import { closeAppIssues } from "./answers.mjs";
+import { appJwt, tokenRequest } from "./app-token.mjs";
+
+test("web human-only: no page or file may shadow /download, /api or /update; legal pages in any format; Vercel and content config", () => {
+  const blocked = ["src/pages/download.astro", "src/pages/download/index.astro", "src/pages/Download.md", "src/pages/api/x.ts", "src/pages/update/latest.json.ts",
+    "public/download/index.html", "public/download", "public/api/download", "public/update/latest.json",
+    "src/pages/privacy.md", "src/pages/terms.mdx", "src/pages/refunds.html", "src/pages/privacy/index.astro",
+    ".vercel/project.json", ".vercelignore", "src/content.config.ts"];
+  assert.deepEqual(forbiddenPaths(blocked, WEB_REPO), blocked);
+  const fine = ["src/pages/updates.astro", "src/pages/downloads-guide.astro", "public/og.png", "src/content/docs/docs/download.md", "src/pages/privacy-faq-draft.txt".replace("privacy-", "privacyx-")];
+  assert.deepEqual(forbiddenPaths(fine, WEB_REPO), []);
+});
+
+test("webMergeRefusals: a parked or claimed PR is not merged by `merge web#N`", () => {
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const base = { files: [{ filename: "src/pages/index.astro" }], ci: "success", verdict: "approve", ids: wIds };
+  assert.match(webMergeRefusals({ ...base, pr: webPr({ labels: [{ name: "agent" }, { name: "needs-owner" }] }) }).join(), /needs-owner/);
+  assert.match(webMergeRefusals({ ...base, pr: webPr({ labels: [{ name: "agent" }, { name: "in-progress" }] }) }).join(), /in-progress/);
+});
+
+test("merge web#N closes the app-repo `area:web` issue it was built for — and nothing else", () => {
+  const issue = (n, over = {}) => ({ number: n, state: "open", labels: [{ name: "area:web" }, { name: "ready" }], ...over });
+  const app = fakeGh([
+    [/octopush\/issues\/40$/, issue(40)],
+    [/octopush\/issues\/41$/, issue(41, { labels: [{ name: "area:app" }] })],
+    [/octopush\/issues\/42$/, issue(42, { state: "closed" })],
+  ]);
+  const pr = { number: 12, html_url: "https://github.com/octopush-sh/octopush-web/pull/12", body: "Closes octopush-sh/octopush#40\n\nCloses octopush-sh/octopush#41\nfixes octopush-sh/octopush#42\nsee octopush-sh/octopush#43" };
+  assert.deepEqual(closeAppIssues(app.gh, pr), [40]);
+  assert.ok(app.writes.some((w) => w.method === "PATCH" && w.path === `repos/${APP_REPO}/issues/40` && w.body.state === "closed"));
+  assert.match(app.writes.find((w) => /issues\/40\/comments$/.test(w.path)).body.body, /Done in octopush-sh\/octopush-web#12/);
+  assert.ok(!app.writes.some((w) => /issues\/4[123]/.test(w.path)), "not an area:web issue, already closed, or only mentioned");
+  // End to end through `merge web#N`.
+  const web = fakeGh([
+    [/octopush-web\/pulls\/12$/, webPr({ body: "Closes octopush-sh/octopush#40" })],
+    [/octopush-web\/pulls\/12\/files/, [{ filename: "src/pages/index.astro" }]],
+    [/octopush-web\/issues\/12\/comments/, [{ user: { login: APP_BOT }, body: marker("w1", "approve") }]],
+    [/actions\/runs\?head_sha=w1/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+  ]);
+  const hub = fakeGh([
+    [/issues\?state=all&labels=digest/, [digestOf(63, {}, { user: { login: ACTIONS_BOT } })]],
+    [/issues\/63\/comments$/, [{ id: 12, user: { login: "johnatan" }, body: "merge web#12" }]],
+    [/octopush\/issues\/40$/, issue(40)],
+  ]);
+  withEnv({ ...WEB_ENV, OCTOPUSH_WEB_TOKEN: "t" }, () => applyAll(hub.gh, actIds, (r) => (r === WEB_REPO ? web.gh : hub.gh)));
+  assert.match(hub.writes.at(-1).body.body, /merged web#12 at w1.*closed #40/);
+  assert.ok(hub.writes.some((w) => w.method === "PATCH" && /octopush\/issues\/40$/.test(w.path)));
+});
+
+test("web jobs: an app issue a recently merged web PR was built for isn't rebuilt", () => {
+  const now = Date.parse("2026-10-31T12:00:00Z");
+  const wIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+  const merged = (n, ref, at, login = APP_BOT) => webPr({ number: n, state: "closed", merged_at: at, user: { login }, body: `Closes octopush-sh/octopush#${ref}` });
+  const { gh } = fakeGh([
+    [/octopush-web\/pulls\?state=open/, []],
+    [/octopush-web\/pulls\?state=closed/, [merged(1, 40, "2026-10-30T00:00:00Z"), merged(2, 41, "2026-09-01T00:00:00Z"), merged(3, 42, "2026-10-30T00:00:00Z", "stranger"), { ...merged(4, 43, null) }]],
+    [/octopush\/issues\?labels=ready,area:web/, [40, 41, 42, 43].map((number) => ({ number, labels: [{ name: "ready" }, { name: "area:web" }] }))],
+  ]);
+  assert.deepEqual(appWebIssueJobs(gh, gh, wIds, now).map((i) => i.number), [41, 42, 43], "only #40: merged by the web builder in the last two weeks");
+});
+
+test("publishing pushes with the token in the environment, never in git's argv", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("./publish-build.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /"-c",\s*`http\.https:\/\/github\.com\/\.extraheader=/);
+  assert.match(src, /GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic \$\{auth\}`/);
+});
+
+test("app-token: a signed RS256 App JWT and a contents:read request for octopush-web only", async () => {
+  const { generateKeyPairSync, createVerify } = await import("node:crypto");
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwt = appJwt("5559111", privateKey.export({ type: "pkcs8", format: "pem" }), 1_000_000);
+  const [h, b, sig] = jwt.split(".");
+  const dec = (x) => JSON.parse(Buffer.from(x.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+  assert.deepEqual(dec(h), { alg: "RS256", typ: "JWT" });
+  assert.deepEqual(dec(b), { iat: 999_940, exp: 1_000_540, iss: "5559111" });
+  assert.ok(createVerify("RSA-SHA256").update(`${h}.${b}`).verify(publicKey, Buffer.from(sig.replace(/-/g, "+").replace(/_/g, "/"), "base64")));
+  assert.throws(() => appJwt("abc", "k"), /numeric/);
+  assert.deepEqual(tokenRequest(), { repositories: ["octopush-web"], permissions: { contents: "read" } });
+});
+
+test("workflows: no job that runs the website's code ever holds the App's private key", async () => {
+  const { readFileSync } = await import("node:fs");
+  const wf = (f) => readFileSync(new URL(`../../.github/workflows/${f}`, import.meta.url), "utf8");
+  const audit = wf("web-audit.yml");
+  const job = audit.slice(audit.indexOf("\n  audit:\n"), audit.indexOf("\n  file:\n"));
+  assert.ok(job.length > 100 && job.includes("npm run build"));
+  assert.doesNotMatch(job, /secrets\./, "the job that builds the site references no secret");
+  assert.match(audit.slice(audit.indexOf("\n  file:\n")), /download-artifact/);
+  // web-build: the website's code runs only as octo-sandbox (no sudo, another uid), between
+  // the sandbox setup and its kill; the key is used only before the one and after the other.
+  const build = wf("web-build.yml");
+  const start = build.indexOf("name: Install and sandbox"), end = build.indexOf("id: sandbox-gone");
+  assert.ok(start > 0 && end > start);
+  for (let i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) {
+    assert.ok(i < start || i > end, "the App key appears only outside the sandbox window");
+  }
+  assert.match(build, /pgrep -u octo-sandbox/);
+});

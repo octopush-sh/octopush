@@ -62,14 +62,19 @@ export const WEB_HUMAN_ONLY = [
   /(^|\/)\.gitattributes$/i,
   /^\.npmrc$/i, /^\.nvmrc$/i,
   /^package(-lock)?\.json$/i, /^npm-shrinkwrap\.json$/i, /^pnpm-lock\.yaml$/i, /^yarn\.lock$/i, /^tsconfig[^/]*\.json$/i,
-  // Legal pages.
-  /^src\/pages\/(terms|privacy|refunds)(\.astro|\/)/i, /^src\/layouts\/legallayout\.astro$/i, /^src\/legal-config\.ts$/i,
+  // Legal pages (any format: .astro, .md, .mdx, .html, or a folder).
+  /^src\/pages\/(terms|privacy|refunds)(\.|\/)/i, /^src\/layouts\/legallayout\.astro$/i, /^src\/legal-config\.ts$/i,
   // Prices and the Free/Pro boundary (release.ts holds the prices and the version).
   /^src\/data\/release\.ts$/i, /^src\/content\/docs\/docs\/free-vs-pro\.mdx?$/i,
   // Privacy copy and analytics (astro.config.mjs carries the analytics snippet).
   /^src\/components\/analytics\.astro$/i, /^astro\.config\.[cm]?[jt]s$/i,
   // Deploy, the /download edge function, updater redirects, the truth gate and build scripts.
-  /^scripts\//i, /^vercel\.json$/i, /^api\//i,
+  /^scripts\//i, /^vercel\.json$/i, /^api\//i, /^\.vercel\//i, /^\.vercelignore$/i,
+  // A real file wins over a vercel.json rewrite/redirect: a page or static file at
+  // /download, /api or /update would shadow the download path or the updater feeds.
+  /^src\/pages\/(download|api|update)(\.|\/)/i, /^public\/(download|api|update)(\.|\/|$)/i,
+  // Content collections config (drafts, what gets published).
+  /^src\/content\.config\.[cm]?[jt]s$/i,
 ];
 /** Human-only paths per repo. */
 export const humanOnlyFor = (repo) => (repo === WEB_REPO ? WEB_HUMAN_ONLY : HUMAN_ONLY);
@@ -87,6 +92,8 @@ export function webMergeRefusals({ pr, files, ci, verdict, ids }) {
   if (pr.state !== "open") r.push("not open");
   if (pr.draft) r.push("a draft");
   if (!labels.includes("agent")) r.push("not labelled `agent`");
+  if (labels.includes("needs-owner")) r.push("labelled `needs-owner` — read it and merge it on GitHub yourself");
+  if (labels.includes("in-progress")) r.push("the web builder is working on it (`in-progress`) — answer again after its next push is reviewed");
   if (!sameLogin(pr.user?.login, ids.builder)) r.push("not opened by the web builder");
   if (pr.head?.repo?.full_name !== WEB_REPO || pr.base?.ref !== "main") r.push("must be a same-repo PR into main");
   if (ci !== "success") r.push(`CI is ${ci}`);

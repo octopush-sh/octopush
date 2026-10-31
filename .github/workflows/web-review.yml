@@ -140,7 +140,7 @@ jobs:
         if: always() && steps.read-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.read-token.outputs.token }}
-        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
 
       - name: Review each PR (Claude agent, no GitHub access)
         if: steps.queue.outputs.count != '0'

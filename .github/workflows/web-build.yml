@@ -160,7 +160,7 @@ jobs:
         if: always() && steps.pick-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.pick-token.outputs.token }}
-        run: gh api -X DELETE installation/token >/dev/null 2>&1 || true
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
 
       - name: Install and sandbox (no GitHub token in this step)
         if: steps.pick.outputs.kind != ''
@@ -188,9 +188,23 @@ jobs:
           sudo find "$GITHUB_WORKSPACE/web" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE/web" || true
 
+      - name: Nothing of the website's code is still running
+        id: sandbox-gone
+        # The website's code (its build, astro check, the consistency gate) only
+        # ever runs as octo-sandbox, through octo-check: a separate user without
+        # sudo, which can't read the runner's processes. The App's private key is
+        # used again only after this step (the publish token, and the token
+        # action's post steps) — refuse if any sandbox process survived.
+        if: always() && steps.pick.outputs.kind != ''
+        run: |
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — not minting the publish token"; exit 1
+          fi
+
       - name: Web token (publish)
         id: pub-token
-        if: always() && steps.pick.outputs.kind != ''
+        if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.OCTOPUSH_APP_ID }}
@@ -202,7 +216,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Publish
-        if: steps.pick.outputs.kind != '' && !cancelled()
+        if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
         working-directory: web
         env:
           GH_TOKEN: ${{ github.token }}

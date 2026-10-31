@@ -238,7 +238,8 @@ export function webIssueTitle(m) {
 
 /** The issue body: what, where, how to reproduce, what done means. */
 export function webIssueBody(m, { runUrl } = {}) {
-  const tick = (s) => String(s).replace(/`/g, "'");
+  // Page text is data: no backticks breaking the code spans, no @mentions notifying anyone.
+  const tick = (s) => String(s).replace(/`/g, "'").replace(/@/g, "@\u200b");
   const pages = m.surfaces.slice(0, 12).map((x) => `\`${tick(x)}\``).join(", ") + (m.surfaces.length > 12 ? ` and ${m.surfaces.length - 12} more` : "");
   const lines = [
     "The nightly web audit (`web-audit.yml` in octopush-sh/octopush) found this on the built site, in **Chromium**.",
@@ -247,7 +248,7 @@ export function webIssueBody(m, { runUrl } = {}) {
     `- **Pages:** ${pages} · window ${m.sizes.filter(Boolean).join(", ") || "any"}`,
     `- **Element:** \`${tick(m.selector)}\`${m.group !== m.selector ? ` in \`${tick(m.group)}\`` : ""} (${m.count} occurrence${m.count === 1 ? "" : "s"})`,
   ];
-  if (m.examples.length) lines.push(`- **Text:** ${m.examples.map((e) => `"${e.replace(/[`<>]/g, "")}"`).join(", ")}`);
+  if (m.examples.length) lines.push(`- **Text:** ${m.examples.map((e) => `"${e.replace(/[`<>]/g, "").replace(/@/g, "@\u200b")}"`).join(", ")}`);
   if (runUrl) lines.push(`- **Screenshots:** artifact of [this audit run](${runUrl})`);
   lines.push(
     "",

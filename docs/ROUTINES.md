@@ -103,13 +103,26 @@ trusted:
   `web-build`, `web-review`, `web-audit`, `ideas` and `answers` (as `OCTOPUSH_WEB_TOKEN`), never to
   an agent step or an environment an agent inherits: a token used before an agent runs (to pick a
   job, read PRs, build context, check out) is **revoked before the agent starts**, and a fresh one
-  is minted afterwards to publish. The web audit's read token is revoked before the site's own code
-  is built. Publishing to octopush-web refuses its human-only paths (legal pages,
-  `src/legal-config.ts`, `src/data/release.ts`, `free-vs-pro`, analytics and `astro.config.mjs`,
-  `scripts/`, `vercel.json`, `api/`, `.github/`, agent docs, manifests — `WEB_HUMAN_ONLY` in
-  `automerge.mjs`) and scans for the push token as well as the Claude token. Pushes made with an
+  is minted afterwards to publish. **No job that runs the website's own code ever holds the App's
+  private key** (a job's secrets are on its runner, and the runner user has sudo): `web-audit`'s
+  build-and-render job references no secret at all — a separate job mints a `contents: read`
+  token for its checkout (`app-token.mjs`), which it revokes and proves dead before building, and a
+  third job, on a fresh runner, files the findings. In `web-build` the website's code (build,
+  `astro check`, the consistency gate) runs only through `octo-check` as `octo-sandbox` — another
+  user, without sudo, that can't read the runner's processes — and the key is used only before the
+  sandbox exists and after a step has checked that none of its processes survived. Publishing to
+  octopush-web refuses its human-only paths (legal pages in any format, `src/legal-config.ts`,
+  `src/data/release.ts`, `free-vs-pro`, analytics and `astro.config.mjs`, `src/content.config.ts`,
+  `scripts/`, `vercel.json`, `.vercel/`, `api/`, `.github/`, agent docs, manifests, and any page or
+  static file at `/download`, `/api` or `/update`, which Vercel would serve before the rewrites —
+  `WEB_HUMAN_ONLY` in `automerge.mjs`) and scans for the push token as well as the Claude token;
+  the push token reaches git through the environment, never its command line. Pushes made with an
   installation token start octopush-web's CI on their own (only `GITHUB_TOKEN` pushes don't), so
-  nothing is dispatched there. Website PRs never merge without your `merge web#N`.
+  nothing is dispatched there. Website PRs never merge without your `merge web#N`; after the merge
+  the app-repo `area:web` issue it was built for is closed with a link (the App can't close
+  another repo's issue through a closing keyword). This repo is public: website PR titles, file
+  names in refusals, and the web audit's findings and screenshots (kept 3 days, never of the legal
+  pages) show up here.
 
 **Residual risk:** an agent steered by a hostile issue or web page could still write bad code into
 its PR or a misleading review — which is why merges need the independent review *and* every

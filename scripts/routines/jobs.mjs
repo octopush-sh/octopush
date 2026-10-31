@@ -87,8 +87,18 @@ export function issueJobs(gh, repo, ids, now) {
  * `octopush-sh/octopush#N`). `appGh` reads the app repo, `webGh` the web repo;
  * `webIds` are the web repo's identities (its builder is the App's bot).
  */
+export const MERGED_CLAIM_MS = 14 * 24 * 3600e3;
 export function appWebIssueJobs(appGh, webGh, webIds, now) {
   const claimed = new Set(builderPrs(webGh, WEB_REPO, webIds).flatMap((p) => appRefs(`${p.title}\n${p.body}`)));
+  // Done already: a web builder PR merged in the last two weeks names it. (The
+  // App's bot can't close app-repo issues through a closing keyword; answers.mjs
+  // closes them on `merge web#N`, and this keeps one that slipped through from
+  // being rebuilt every two hours.)
+  for (const p of webGh.list(`repos/${WEB_REPO}/pulls?state=closed&sort=updated&direction=desc`, 100)) {
+    if (!p.merged_at || now - Date.parse(p.merged_at) > MERGED_CLAIM_MS) continue;
+    if (!sameLogin(p.user?.login, webIds.builder) || p.head?.repo?.full_name !== WEB_REPO || p.base?.ref !== "main") continue;
+    for (const n of appRefs(`${p.title}\n${p.body}`)) claimed.add(n);
+  }
   return appGh.list(`repos/${APP_REPO}/issues?labels=ready,${WEB_AREA}&state=open&sort=created&direction=asc`)
     .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
     .filter((i) => !isFreshClaim(appGh, APP_REPO, i, now));

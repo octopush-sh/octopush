@@ -169,8 +169,10 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
   git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
-  git(gitDir, ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}`, ...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
-    "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`]);
+  // The token reaches git through the environment, never argv (visible in the process table).
+  const authEnv = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };
+  git(gitDir, [...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
+    "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`], { env: authEnv });
 
   const web = repo === WEB_REPO;
   const workflow = web ? "web-build.yml" : "nightly-build.yml";
