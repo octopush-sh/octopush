@@ -3596,7 +3596,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     const LITELLM_URL: &str =
         "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::Other(format!("failed to build http client: {e}")))?;
@@ -3605,7 +3605,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
         .get(LITELLM_URL)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("pricing fetch failed: {e}")))?
+        .map_err(|e| AppError::Other(format!("pricing fetch failed: {}", crate::tls::describe_request_error(&e))))?
         .text()
         .await
         .map_err(|e| AppError::Other(format!("pricing read failed: {e}")))?;
@@ -4937,7 +4937,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         "find_pr_for_branch: querying github",
     );
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .user_agent("octopush/0.1")
         .build()
         .map_err(|e| AppError::Other(format!("http client: {e}")))?;
@@ -4951,8 +4951,8 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .send()
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "find_pr_for_branch: network error");
-            AppError::Other(format!("github request failed: {e}"))
+            tracing::warn!(error = %crate::tls::describe_request_error(&e), "find_pr_for_branch: network error");
+            AppError::Other(format!("github request failed: {}", crate::tls::describe_request_error(&e)))
         })?;
 
     let status = resp.status();

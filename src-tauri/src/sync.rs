@@ -351,7 +351,7 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
             PushOutcome::Failed
         }
         Err(e) => {
-            tracing::warn!("history sync detail push error: {e}");
+            tracing::warn!("history sync detail push error: {}", crate::tls::describe_request_error(&e));
             PushOutcome::Failed
         }
     }
@@ -376,7 +376,7 @@ pub async fn pull_run_detail(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("history detail fetch failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("history detail fetch failed: {}", crate::tls::describe_request_error(&e))))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -460,7 +460,7 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
             PushOutcome::Failed
         }
         Err(e) => {
-            tracing::warn!("history sync push error: {e}");
+            tracing::warn!("history sync push error: {}", crate::tls::describe_request_error(&e));
             PushOutcome::Failed
         }
     }
@@ -482,7 +482,7 @@ pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("history sync pull failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("history sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!(
             "history sync pull failed: HTTP {}",
@@ -609,7 +609,7 @@ pub async fn push_library_items(
                 outcome = PushOutcome::Failed;
             }
             Err(e) => {
-                tracing::warn!("library sync push error: {e}");
+                tracing::warn!("library sync push error: {}", crate::tls::describe_request_error(&e));
                 outcome = PushOutcome::Failed;
             }
         }
@@ -632,7 +632,7 @@ pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibrary
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("library sync pull failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("library sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!(
             "library sync pull failed: HTTP {}",

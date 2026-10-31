@@ -5,7 +5,7 @@
 //! (vllm, llama.cpp server, LMStudio, LocalAI, etc.).
 
 use super::{
-    network_error, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
+    Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
     LlmStopReason, LlmToolUse,
 };
 use crate::error::{AppError, AppResult, ProviderErrorKind};
@@ -39,7 +39,7 @@ impl LlmProvider for OpenAICompatibleProvider {
 
         let resp = request.send().await
             // A request that never reached the server is transient.
-            .map_err(|e| network_error(format!("OpenAI-compat request failed: {e}")))?;
+            .map_err(|e| super::request_error("OpenAI-compat request failed", &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

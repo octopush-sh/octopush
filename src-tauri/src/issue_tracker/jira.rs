@@ -20,7 +20,7 @@ pub struct JiraClient {
 
 impl JiraClient {
     pub fn new(cfg: JiraConfig) -> Self {
-        Self { cfg, http: reqwest::Client::new() }
+        Self { cfg, http: crate::tls::client() }
     }
 
     fn auth_header(&self) -> String {
@@ -152,7 +152,7 @@ impl IssueTracker for JiraClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("jira search: {e}")))?;
+            .map_err(|e| AppError::Other(format!("jira search: {}", crate::tls::describe_request_error(&e))))?;
         if !resp.status().is_success() {
             return Err(AppError::Other(format!("jira search HTTP {}", resp.status())));
         }
@@ -189,7 +189,7 @@ impl IssueTracker for JiraClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("jira epic search: {e}")))?;
+            .map_err(|e| AppError::Other(format!("jira epic search: {}", crate::tls::describe_request_error(&e))))?;
         if !resp.status().is_success() {
             // Try the legacy `Epic Link` custom field. If both fail we
             // surface the second status — usually 400 for "field unknown",
@@ -210,7 +210,7 @@ impl IssueTracker for JiraClient {
                 .json(&body2)
                 .send()
                 .await
-                .map_err(|e| AppError::Other(format!("jira epic search legacy: {e}")))?;
+                .map_err(|e| AppError::Other(format!("jira epic search legacy: {}", crate::tls::describe_request_error(&e))))?;
             if !resp2.status().is_success() {
                 return Err(AppError::Other(format!(
                     "jira epic search HTTP {}",
@@ -245,7 +245,7 @@ impl IssueTracker for JiraClient {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("jira issue: {e}")))?;
+            .map_err(|e| AppError::Other(format!("jira issue: {}", crate::tls::describe_request_error(&e))))?;
         if !resp.status().is_success() {
             return Err(AppError::Other(format!("jira issue HTTP {}", resp.status())));
         }

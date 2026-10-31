@@ -65,8 +65,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 0.12's behaviour: native-tls (OS trust store) without ALPN, i.e. HTTP/1.1 over
 # TLS, as before, plus charset, http2 and the system proxy (0.12's
 # `macos-system-configuration`, now `system-proxy`).
+# `rustls-no-provider` lets `tls.rs` hand reqwest a rustls config (ring
+# provider) that runs the OS trust store behind the eMudhra compromised-key
+# denylist; native-tls stays compiled in as the fallback and stays reqwest's
+# default backend. tauri-plugin-updater already enables this feature on the
+# same reqwest, so it adds no crates.
 reqwest = { version = "0.13", default-features = false, features = [
     "native-tls-no-alpn",
+    "rustls-no-provider",
     "charset",
     "http2",
     "system-proxy",
@@ -75,6 +81,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
     "query",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.6"
 futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"
@@ -88,6 +96,14 @@ keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 ctrlc = "3"
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+
+# `tls.rs` evaluates server certificates with macOS `SecTrust` itself (one
+# evaluation whose verdict and built chain, incl. AIA / keychain completion,
+# both feed the eMudhra denylist). Both crates are already in the tree via
+# rustls-platform-verifier and native-tls; no new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", default-features = false }
+core-foundation = "0.10"
 
 [dev-dependencies]
 serial_test = "3"

@@ -442,7 +442,7 @@ async fn exchange_code(
         ])
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("token exchange request failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("token exchange request failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -466,7 +466,7 @@ async fn fetch_userinfo(
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|e| AppError::Other(format!("userinfo request failed: {e}")))?;
+        .map_err(|e| AppError::Other(format!("userinfo request failed: {}", crate::tls::describe_request_error(&e))))?;
     if !resp.status().is_success() {
         return Err(AppError::Other(format!("userinfo failed: {}", resp.status())));
     }
@@ -557,7 +557,7 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
 
     // One shared client (avoids a per-request connection pool and the panic path
     // of `Client::new()` on a TLS-init failure).
-    let http = reqwest::Client::builder()
+    let http = crate::tls::client_builder()
         .build()
         .map_err(|e| AppError::Other(format!("http client init failed: {e}")))?;
 
@@ -675,7 +675,7 @@ async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
         return RefreshOutcome::TokenRevoked; // nothing to refresh with → dead
     };
     let cfg = ClerkConfig::current();
-    let client = match reqwest::Client::builder().build() {
+    let client = match crate::tls::client_builder().build() {
         Ok(c) => c,
         Err(_) => return RefreshOutcome::TransientError,
     };
@@ -690,7 +690,12 @@ async fn refresh_session(session: &StoredSession) -> RefreshOutcome {
         .await
     {
         Ok(r) => r,
-        Err(_) => return RefreshOutcome::TransientError, // offline / DNS / TLS
+        Err(e) => {
+            // Offline / DNS / TLS. Even a denylist refusal stays transient here:
+            // a forged certificate must not sign the user out.
+            tracing::warn!(error = %crate::tls::describe_request_error(&e), "auth: token refresh request failed");
+            return RefreshOutcome::TransientError;
+        }
     };
     let status = resp.status();
     if !status.is_success() {
@@ -818,7 +823,7 @@ async fn refresh_identity_inner(force_token_refresh: bool) -> AppResult<AuthStat
         }
     }
     let cfg = ClerkConfig::current();
-    let client = match reqwest::Client::builder().build() {
+    let client = match crate::tls::client_builder().build() {
         Ok(c) => c,
         Err(_) => return Ok(here(&session)),
     };

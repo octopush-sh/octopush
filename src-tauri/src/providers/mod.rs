@@ -295,6 +295,20 @@ pub async fn complete_with_retry(
     }
 }
 
+/// Build an [`AppError::Provider`] for a `reqwest` send error, prefixed with
+/// `what`. Classified as [`network_error`] (transient: the retry layer rides
+/// it out) unless it is a TLS failure no retry can fix — a compromised-CA
+/// denylist refusal or a TLS version/suite mismatch — which surfaces at once
+/// as `ProviderErrorKind::Other`. The message carries the TLS reason.
+pub fn request_error(what: &str, e: &reqwest::Error) -> AppError {
+    let message = format!("{what}: {}", crate::tls::describe_request_error(e));
+    if crate::tls::is_permanent_tls_failure(e) {
+        AppError::Provider { kind: ProviderErrorKind::Other, retry_after: None, message }
+    } else {
+        network_error(message)
+    }
+}
+
 /// Build an [`AppError::Provider`] for a request that never reached the server
 /// (connection reset, DNS failure, timeout). Always transient.
 pub fn network_error(message: impl Into<String>) -> AppError {

@@ -1489,11 +1489,12 @@ pub(crate) fn execute_tool_cancellable(
 /// connection pool behind an `Arc`, so cloning it shares the pool — every
 /// LLM caller (ChatEngine, `ai_complete`, orchestrator) should go through
 /// this instead of `Client::new()`, which would pay a fresh TLS handshake
-/// on every call.
+/// on every call. Built by `tls::client`, so it carries the compromised-key
+/// denylist like every other Octopush client.
 static SHARED_HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 pub(crate) fn shared_http_client() -> &'static Client {
-    SHARED_HTTP.get_or_init(Client::new)
+    SHARED_HTTP.get_or_init(crate::tls::client)
 }
 
 /// Build the static tool list as normalized `LlmTool[]`.
