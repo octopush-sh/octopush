@@ -19,6 +19,9 @@ import { repoForIdea, ideaLabels, areaOf, ideaBody } from "./ideas.mjs";
 import { render } from "./read.mjs";
 
 const ids = { owner: "johnatan", builder: "octo-builder", reviewer: "octo-reviewer" };
+// Deterministic whether or not the suite itself runs in GitHub Actions; the
+// Actions-specific tests set GITHUB_ACTIONS explicitly.
+delete process.env.GITHUB_ACTIONS;
 /** In-memory GitHub: routes GETs to fixtures, records every write. */
 function fakeGh(routes) {
   const writes = [];
@@ -160,6 +163,12 @@ test("merge answers require a builder agent PR into main with green CI", () => {
   const ok = run(goodPr, "success");
   assert.ok(ok.merged);
   assert.match(ok.reply, /merged web#12/);
+  process.env.GITHUB_ACTIONS = "true";
+  try {
+    const inActions = run({ ...goodPr, html_url: "https://github.com/octopush-sh/octopush-web/pull/12" }, "success");
+    assert.ok(!inActions.merged, "a workflow token can't merge in another repo");
+    assert.match(inActions.reply, /merge it on GitHub: https:\/\/github.com\/octopush-sh\/octopush-web\/pull\/12/);
+  } finally { delete process.env.GITHUB_ACTIONS; }
 });
 
 test("promote only dispatches for an existing prerelease newer than stable", () => {
