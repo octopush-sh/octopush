@@ -98,10 +98,13 @@ jobs:
           GH_TOKEN: ${{ steps.read-token.outputs.token }}
         run: |
           set -uo pipefail
-          gh api -X DELETE installation/token >/dev/null 2>&1
-          if gh api repos/octopush-sh/octopush-web --silent >/dev/null 2>&1; then
-            echo "::error::the read token still works after revoking it — not building the site"; exit 1
-          fi
+          gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::the revoke call failed; checking whether the token is dead anyway"
+          # Revocation takes a few seconds to reach every API node: look for up to ~1 min.
+          for i in $(seq 1 12); do
+            if ! gh api repos/octopush-sh/octopush-web --silent >/dev/null 2>&1; then echo "read token revoked"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::the read token still works a minute after revoking it — not building the site"; exit 1
 
       - name: Build the site as octo-sandbox (no token, no sudo, another user)
         env:
