@@ -151,6 +151,37 @@ describe("MissionControl", () => {
     expect(onJumpToRun).toHaveBeenCalledWith("ws-a");
   });
 
+  it("titles each card with its task (serif, full-task tooltip) and puts the workspace in the mono meta row", () => {
+    useRunsStore.setState({
+      runsByWs: {
+        "ws-a": [
+          mkRun("a", "paused", { task: "Production deploy: fix the flaky health check" }),
+          mkRun("b", "paused", { workspaceId: "ws-a", task: "Rotate the staging keys" }),
+        ],
+      },
+    });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-a", name: "run-history-sync" }] },
+    } as any);
+    const { container } = renderRoom();
+    const titles = [...container.querySelectorAll('[data-tour="mission-control-card-task"]')];
+    expect(titles.map((t) => t.textContent)).toEqual([
+      "Production deploy: fix the flaky health check",
+      "Rotate the staging keys",
+    ]);
+    for (const t of titles) {
+      expect(t.className).toContain("font-serif");
+      expect(t.getAttribute("title")).toBe(t.textContent);
+    }
+    const wsLabels = [...container.querySelectorAll('[data-tour="mission-control-card-workspace"]')];
+    expect(wsLabels).toHaveLength(2);
+    for (const w of wsLabels) {
+      expect(w.textContent).toBe("run-history-sync");
+      expect(w.className).not.toContain("font-serif");
+      expect(w.parentElement?.className).toContain("font-mono");
+    }
+  });
+
   it("a run in an UNLOADED workspace renders inert — no jump, but abort still works", () => {
     const onJumpToRun = vi.fn();
     useRunsStore.setState({ runsByWs: { "ws-gone": [mkRun("g", "running")] } });
