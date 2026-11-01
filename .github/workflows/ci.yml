@@ -99,3 +99,21 @@ jobs:
         run: node --test scripts/web-audit/web-audit.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
+
+  review-next:
+    # The nightly builder dispatches CI on its agent/… branch with GITHUB_TOKEN,
+    # and GitHub emits no workflow_run for such runs, so the reviewer never
+    # heard about a green agent PR until its cron. Start it from here once every
+    # check passed. Agents can't change .github/ (publish-build refuses it), so
+    # this is main's job definition.
+    needs: [frontend, backend, repo-rules]
+    if: github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'agent/') && success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-review.yml/dispatches" -f ref=main >/dev/null && echo "reviewer started" || echo "::warning::reviewer dispatch failed"
