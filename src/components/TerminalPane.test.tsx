@@ -520,7 +520,7 @@ describe("TerminalPane — spawn failure", () => {
 
   it("shows a designed error state instead of a raw error line in the terminal", async () => {
     const { getByTestId, getByText, onSpawn, onSpawnError } = await mountFailing(
-      "Daemon error: connection refused",
+      "daemon unavailable",
     );
     expect(getByTestId("terminal-spawn-failed")).toBeTruthy();
     expect(getByText("Session didn't start")).toBeTruthy();
@@ -530,6 +530,14 @@ describe("TerminalPane — spawn failure", () => {
     expect(onSpawn).not.toHaveBeenCalled();
     // Nothing is written into xterm itself.
     expect(xtermHoisted.last!.writeln).not.toHaveBeenCalled();
+  });
+
+  it("names the real cause when the daemon answered with an OS error", async () => {
+    const { getByText, queryByText } = await mountFailing(
+      "daemon error: No such file or directory (os error 2)",
+    );
+    expect(getByText("The shell or the workspace folder couldn't be found.")).toBeTruthy();
+    expect(queryByText("The background terminal service isn't responding.")).toBeNull();
   });
 
   it("keeps the raw error behind a disclosure", async () => {
